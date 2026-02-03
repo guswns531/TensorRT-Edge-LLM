@@ -45,6 +45,14 @@ add_library(
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 
+# Shared library for Go integration
+add_library(edge_llm_runtime SHARED
+    runtime/c_api.cpp
+    runtime/engine_manager.cpp
+)
+target_include_directories(edge_llm_runtime PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(edge_llm_runtime PRIVATE edgellmCore edgellmKernels edgellmTokenizer -Wl,--whole-archive NvInfer_edgellm_plugin -Wl,--no-whole-archive commonLibraryExt)
+
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
 add_library(edgellmTokenizer STATIC ${TOKENIZER_CPP_SRCS})

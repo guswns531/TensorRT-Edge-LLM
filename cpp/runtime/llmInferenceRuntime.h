@@ -55,6 +55,13 @@ public:
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    /*! \brief Construct an LLM Inference Runtime with already created engine runner
+     *  \param engineRunner The engine runner instance
+     *  \param tokenizer The tokenizer instance
+     *  \param stream CUDA stream for initialization
+     */
+    LLMInferenceRuntime(std::unique_ptr<LLMEngineRunner> engineRunner, std::shared_ptr<tokenizer::Tokenizer> tokenizer, cudaStream_t stream);
+
     /*! \brief Destructor
      */
     ~LLMInferenceRuntime() = default;
@@ -63,9 +70,10 @@ public:
      *  \param request The generation request containing prompt and generation parameters
      *  \param response The generation response to be filled with output
      *  \param stream CUDA stream for execution
+     *  \param streamCallback Optional callback function to be called when the stream is completed
      *  \return True if request was handled successfully, false otherwise
      */
-    bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
+    bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(std::string const&, bool)> streamCallback = nullptr);
 
     /*! \brief Capture CUDA graph for the decoding step to optimize performance
      *  \param stream CUDA stream for graph capture
@@ -126,7 +134,7 @@ private:
 
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};   //!< LLM engine runner instance
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner instance (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};    //!< Tokenizer instance
+    std::shared_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};    //!< Tokenizer instance
     std::unordered_map<size_t, SystemPromptKVCache>
         mSystemPromptKVCache{}; //!< Cache of system prompts and their KV caches
 
@@ -150,7 +158,8 @@ private:
     //! Examine and validate the generation request.
     //! \param request The generation request to examine
     //! \return True if request is valid, false otherwise
-    bool examineRequest(LLMGenerationRequest const& request);
+    void allocateTensors();
+    bool examineRequest(LLMGenerationRequest const& request); 
 
     //! Set up tensors and state for prefill execution.
     //! \param batchedInputIds Batched input token IDs

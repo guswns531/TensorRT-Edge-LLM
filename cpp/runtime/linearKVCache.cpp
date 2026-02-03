@@ -37,7 +37,7 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     int64_t const kvCacheVolume = mConfig.numDecoderLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
         * mConfig.maxSequenceLength * mConfig.headDim;
     CUDA_CHECK(cudaMalloc(&mDeviceKVCache, kvCacheVolume * sizeof(KVCacheType)));
-    LOG_DEBUG("KVCache of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
+    LOG_INFO("KVCache of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
         mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
         mConfig.headDim, kvCacheVolume * sizeof(KVCacheType),
         static_cast<float>(kvCacheVolume * sizeof(KVCacheType)) / (1024.0 * 1024.0));

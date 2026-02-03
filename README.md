@@ -4,6 +4,77 @@
 
 ---
 
+
+docker run --gpus all -it --name tensorrt --net=host -v /home/sslab/nfs/TensorRT-Edge-LLM:/workspace -w /workspace nvcr.io/nvidia/tensorrt:25.10-py3
+
+git submodule update --init --recursive
+
+apt update ; apt install cmake build-essential
+pip3 install .
+
+mkdir build ; cd build
+cmake ..     -DTRT_PACKAGE_DIR=/usr
+make -j$(nproc)
+
+tensorrt-edgellm-quantize-llm \
+    --model_dir Qwen/Qwen3-0.6B \
+    --output_dir ./quantized/qwen3-0.6b \
+    --quantization int4_awq
+
+tensorrt-edgellm-export-llm \
+    --model_dir ./quantized/qwen3-0.6b \
+    --output_dir ./onnx_models/qwen3-0.6b
+
+./build/examples/llm/llm_build \
+    --onnxDir ./onnx_models/qwen3-0.6b \
+    --engineDir ./engines/qwen3-0.6b
+
+./build/examples/llm/llm_inference \
+    --engineDir ./engines/qwen3-0.6b \
+    --inputFile input.json \
+    --outputFile output.json
+
+docker exec -it 4f54eee2e87e /bin/bash
+
+
+wget https://go.dev/dl/go1.25.6.linux-amd64.tar.gz && rm -rf /usr/local/go && tar -C /usr/local -xzf go1.25.6.linux-amd64.tar.gz && rm go1.25.6.linux-amd64.tar.gz
+export PATH=\$PATH:/usr/local/go/bin
+
+Here are the commands to compile and run the project from the container.
+
+1. Compile C++ Backend (edge_llm_runtime)
+This builds the shared library (libedge_llm_runtime.so) that Go will link against.
+
+```bash
+cd /workspace/build
+make -j$(nproc) edge_llm_runtime
+```
+
+2. Compile Go Application
+This builds the Go executable.
+
+```bash
+export PATH=$PATH:/usr/local/go/bin
+cd /workspace/go-edgellm
+go mod tidy
+go build -o go-edgellm-app .
+```
+
+3. Run Application
+You must set LD_LIBRARY_PATH so the system finds the C++ libraries, and EDGELLM_PLUGIN_PATH so TensorRT finds the custom plugins.
+
+```bash
+cd /workspace/go-edgellm
+# Set environment variables
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/workspace/build/cpp:/workspace/build
+export EDGELLM_PLUGIN_PATH=/workspace/build/libNvInfer_edgellm_plugin.so
+# Run
+./go-edgellm-app
+```
+
+
+4f54eee2e87e    nvcr.io/nvidia/tensorrt:25.10-py3                                                                                                      "/opt/nvidia/nvidia_…"    4 minutes ago     Up                 tensorrt
+
 ## Overview
 
 TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson and NVIDIA DRIVE platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai). Engine build and end-to-end inference runs entirely on Edge platforms.

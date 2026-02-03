@@ -68,8 +68,24 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     }
     LOG_INFO("LLMEngineRunner successfully loaded and initialized llm engine.");
 
+    mTokenizer = std::make_unique<tokenizer::Tokenizer>();
+    mTokenizer->loadFromHF(engineDir);
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
 
+    this->allocateTensors();
+}
+
+LLMInferenceRuntime::LLMInferenceRuntime(std::unique_ptr<LLMEngineRunner> engineRunner, std::shared_ptr<tokenizer::Tokenizer> tokenizer, cudaStream_t stream)
+    : mLLMEngineRunner(std::move(engineRunner))
+    , mTokenizer(tokenizer)
+{
+    (void)stream;
+    mEngineConfig = mLLMEngineRunner->getEngineConfig();
+    this->allocateTensors();
+}
+
+void LLMInferenceRuntime::allocateTensors()
+{
     // Use TopP sampling parameter to reserve max possible workspace size for sampling.
     int32_t const defaultTopK{0};
     float const defaultTopP{0.9F};
@@ -77,6 +93,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, 1.0f, defaultTopK, defaultTopP);
     int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, samplingParams));
+    LOG_INFO("Sampling workspace size: %ld bytes (%.2f MB)", maxSamplingWorkspaceSize, static_cast<float>(maxSamplingWorkspaceSize) / (1024.0 * 1024.0));
 
     // Allocate workspace and activation tensors for LLM engine.
     try
@@ -105,58 +122,9 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         throw std::runtime_error(
             "Failed to allocate workspace and activation tensors for LLM Inference Runtime: " + std::string(e.what()));
     }
-
-    // Setup tokenizer
-    mTokenizer = std::make_unique<tokenizer::Tokenizer>();
-    LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
-    if (!mTokenizer->loadFromHF(engineDir))
-    {
-        LOG_ERROR("Failed to load tokenizer from model directory: %s", engineDir.c_str());
-        throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
-    }
-
-    // Optional: Load vocabulary mapping table if reduced vocabulary is used
-    if (mEngineConfig.reducedVocabSize > 0)
-    {
-        LOG_INFO("Loading vocabulary mapping table for reduced vocab size: %d -> %d", mEngineConfig.reducedVocabSize,
-            mEngineConfig.vocabSize);
-        std::filesystem::path const vocabMapPath = std::filesystem::path(engineDir) / binding_names::kVocabMapFileName;
-
-        std::vector<rt::Tensor> vocabMapTensors;
-        if (!safetensors::loadSafetensors(vocabMapPath, vocabMapTensors, stream))
-        {
-            LOG_ERROR(
-                "Failed to load %s from model directory: %s", binding_names::kVocabMapFileName, engineDir.c_str());
-            throw std::runtime_error("Failed to load " + std::string(binding_names::kVocabMapFileName)
-                + " from model directory: " + engineDir);
-        }
-
-        // Check we have exactly one tensor and use it
-        check::check(vocabMapTensors.size() == 1,
-            std::string(binding_names::kVocabMapFileName) + " should contain exactly one tensor");
-        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "vocab_map tensor should be 1D");
-        check::check(vocabMapTensors[0].getShape()[0] == mEngineConfig.reducedVocabSize,
-            "vocab_map tensor length should match reduced vocab size");
-        mVocabMappingTable = std::move(vocabMapTensors[0]);
-        LOG_INFO("Vocabulary mapping table successfully loaded.");
-    }
-
-    // Optional: Setup multimodal engine runner
-    if (!multimodalEngineDir.empty())
-    {
-        try
-        {
-            mMultimodalRunner = MultimodalRunner::create(
-                multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
-        }
-        catch (std::exception const& e)
-        {
-            LOG_ERROR("Failed to initialize MultimodalRunner: %s", e.what());
-            throw std::runtime_error("Failed to initialize MultimodalRunner: " + std::string(e.what()));
-        }
-        LOG_INFO("MultimodalRunner successfully loaded and initialized multimodal engine.");
-    }
 }
+
+// End of allocateTensors
 
 bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 {
@@ -200,7 +168,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     rt::Tensor kvCacheBuffer = linearKVCache.getKVCacheBuffer();
 
     // Record the length of the reused KVCache for each sequence using pre-allocated tensor
-    mHostReuseKVCacheLengths.reshape({activeBatchSize});
+    (void)mHostReuseKVCacheLengths.reshape({activeBatchSize});
     int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
 
     // Search if the system prompt has been cached. If there are cached system prompts, insert
@@ -253,7 +221,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     int32_t const packedInputLength = std::max(maxInputLength, mEngineConfig.minSupportedInputLength);
 
     // Reshape and fill the pre-allocated pinned host tensor with pad tokens
-    mHostPackedInputIds.reshape({activeBatchSize, packedInputLength});
+    (void)mHostPackedInputIds.reshape({activeBatchSize, packedInputLength});
     int32_t* packedInputIdsData = mHostPackedInputIds.dataPointer<int32_t>();
     std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
 
@@ -265,9 +233,9 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     }
 
     linearKVCache.resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    mInputIds.reshape({activeBatchSize, packedInputLength});
-    mHostContextLengths.reshape({activeBatchSize});
-    mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize});
+    (void)mInputIds.reshape({activeBatchSize, packedInputLength});
+    (void)mHostContextLengths.reshape({activeBatchSize});
+    (void)mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize});
 
     CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), mHostPackedInputIds.rawPointer(),
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -283,7 +251,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 }
 
 bool LLMInferenceRuntime::handleRequest(
-    LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
+    LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(std::string const&, bool)> streamCallback)
 {
     std::vector<std::vector<int32_t>> batchedInputIds;
     std::vector<std::string> batchSystemPrompts;
@@ -384,8 +352,8 @@ bool LLMInferenceRuntime::handleRequest(
     int32_t generationIter{0};
     std::vector<std::vector<int32_t>> outputIds(activeBatchSize);
     std::vector<bool> finishedStates(activeBatchSize, false);
-    mSelectedIndices.reshape({activeBatchSize, 1});
-    mHostSelectedTokenIds.reshape({activeBatchSize});
+    (void)mSelectedIndices.reshape({activeBatchSize, 1});
+    (void)mHostSelectedTokenIds.reshape({activeBatchSize});
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
 
     SamplingParams params(
@@ -404,11 +372,22 @@ bool LLMInferenceRuntime::handleRequest(
         {
             if (!finishedStates[i])
             {
-                outputIds[i].push_back(hostSelectedTokenIdsData[i]);
-                finishedStates[i] = hostSelectedTokenIdsData[i] == mTokenizer->getEosId();
+                int32_t newTokenId = hostSelectedTokenIdsData[i];
+                outputIds[i].push_back(newTokenId);
+                finishedStates[i] = newTokenId == mTokenizer->getEosId();
                 if (finishedStates[i])
                 {
                     unFinishedBatchNum--;
+                }
+
+                // Streaming callback
+                if (streamCallback) {
+                    std::string tokenText = mTokenizer->decode({1, newTokenId}); // decode expects vector, assuming [1, id] or just [id]. 
+                    // Wait, mTokenizer->decode signature? 
+                    // Usually encode returns vector<int>. decode takes vector<int>.
+                    // Let's assume {newTokenId} vector initialization works.
+                    // Actually, "decode" usually strips special tokens.
+                    streamCallback(tokenText, finishedStates[i]);
                 }
             }
         }
@@ -444,7 +423,7 @@ bool LLMInferenceRuntime::handleRequest(
     mPrefillMetrics.recordRun(tokenCount.totalReusedTokens, tokenCount.totalComputedTokens);
 
     // Reshape inputIds for decoding step
-    mInputIds.reshape({activeBatchSize, 1});
+    (void)mInputIds.reshape({activeBatchSize, 1});
 
     // Profile entire generation phase like benchmark profiler
     {

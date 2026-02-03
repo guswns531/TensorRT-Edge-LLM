@@ -45,12 +45,12 @@ macro(add_cross_build_link_options target)
 endmacro(add_cross_build_link_options)
 
 # CUDA flags and dependencies.
-set_ifndef(CUDA_VERSION 12.8)
+set_ifndef(CUDA_VERSION 13.0)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 
 if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
-  if(CUDA_VERSION VERSION_GREATER_EQUAL 12.8)
+  if(CUDA_VERSION VERSION_GREATER_EQUAL 13.0)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100 120)
   endif()
 endif()

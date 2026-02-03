@@ -85,6 +85,27 @@ public:
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    /*!
+     * @brief Construct LLM engine runner with a shared engine
+     * @param engine Shared TensorRT engine
+     * @param config Engine configuration
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     */
+    LLMEngineRunner(std::shared_ptr<nvinfer1::ICudaEngine> engine, LLMEngineRunnerConfig const& config,
+        nlohmann::json const& configJson, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+        cudaStream_t stream);
+
+    /*!
+     * @brief Helper to load configuration and engine from disk
+     * @param enginePath Path to engine file
+     * @param configPath Path to config file
+     * @param engine Out parameter for loaded engine
+     * @param config Out parameter for loaded config
+     */
+    static bool loadEngineAndConfig(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
+        std::shared_ptr<nvinfer1::ICudaEngine>& engine, LLMEngineRunnerConfig& config, Json& configJson);
+
     //! @brief Destructor
     ~LLMEngineRunner();
 
@@ -191,7 +212,7 @@ public:
 
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                          //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                        //!< TensorRT engine
+    std::shared_ptr<nvinfer1::ICudaEngine> mEngine;                        //!< TensorRT engine
     rt::Tensor mExecContextMemory{};                                       //!< Device memory for the execution contexts
     std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext; //!< Prefill execution context
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
@@ -239,10 +260,11 @@ private:
     rt::Tensor mEagleBasePackedMask{};
 
     /*!
-     * @brief Initialize configuration from JSON file
-     * @param configJson JSON configuration object
-     * @return True on success, false on failure
+     * @brief Common initialization logic for the engine runner
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
      */
+    void initialize(std::unordered_map<std::string, std::string> const& loraWeightsMap, Json const& configJson, cudaStream_t stream);
     bool initializeConfigFromJson(Json const& configJson);
 
     /*!

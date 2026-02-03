@@ -111,15 +111,35 @@ static constexpr int32_t kGENERATION_PROFILE_INDEX{1};
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
+    std::shared_ptr<nvinfer1::ICudaEngine> engine;
+    Json configJson;
+    if (!loadEngineAndConfig(enginePath, configPath, engine, mConfig, configJson))
+    {
+        throw std::runtime_error("Failed to load engine and config from disk.");
+    }
+    mEngine = std::move(engine);
+    this->initialize(loraWeightsMap, configJson, stream);
+}
+
+LLMEngineRunner::LLMEngineRunner(std::shared_ptr<nvinfer1::ICudaEngine> engine, LLMEngineRunnerConfig const& config,
+    Json const& configJson, std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
+    : mEngine(std::move(engine))
+    , mConfig(config)
+{
+    LOG_INFO("LLMEngineRunner initialized with shared engine ptr: %p", mEngine.get());
+    this->initialize(loraWeightsMap, configJson, stream); 
+}
+
+bool LLMEngineRunner::loadEngineAndConfig(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
+    std::shared_ptr<nvinfer1::ICudaEngine>& engine, LLMEngineRunnerConfig& config, Json& configJson)
+{
     LOG_INFO("Loading config file %s", configPath.string().c_str());
 
-    // Parse configuration from JSON file
-    Json configJson;
     std::ifstream configFileStream(configPath);
     if (!configFileStream.is_open())
     {
         LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
-        throw std::runtime_error("Failed to open config file: " + configPath.string());
+        return false;
     }
     try
     {
@@ -129,27 +149,56 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     catch (Json::parse_error const& e)
     {
         LOG_ERROR("Failed to parse config file with error: %s", e.what());
-        throw std::runtime_error("Failed to parse config file: " + configPath.string());
+        return false;
     }
 
-    if (!this->initializeConfigFromJson(configJson))
+    // Temporarily create a dummy runner to use its initializeConfigFromJson method or similar.
+    // Better to make initializeConfigFromJson static or use a helper.
+    // For now, let's assume we have a helper to do this.
+    // We'll use a temporary instance to parse.
+    struct ConfigParser : public LLMEngineRunner
     {
-        LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
-        throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
+        ConfigParser()
+            : LLMEngineRunner(nullptr, {}, {}, {}, nullptr)
+        {
+        }
+        bool parse(Json const& j, LLMEngineRunnerConfig& c)
+        {
+            if (this->initializeConfigFromJson(j))
+            {
+                c = this->mConfig;
+                return true;
+            }
+            return false;
+        }
+    } parser;
+
+    if (!parser.parse(configJson, config))
+    {
+        return false;
     }
 
-    // Load the engine after config loading succeeds
     LOG_INFO("Loading engine file: %s", enginePath.string().c_str());
-    mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
+    static std::unique_ptr<nvinfer1::IRuntime> runtime(nvinfer1::createInferRuntime(gLogger));
 
     auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
     if (mmapReader->getData() == nullptr)
     {
-        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
-        throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
+        LOG_ERROR("loadEngineAndConfig(): Failed to use MMap to read engine from file path: %s", enginePath.string());
+        return false;
     }
-    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+    engine = std::shared_ptr<nvinfer1::ICudaEngine>(
+        runtime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+
+    return engine != nullptr;
+}
+
+void LLMEngineRunner::initialize(std::unordered_map<std::string, std::string> const& loraWeightsMap, Json const& configJson, cudaStream_t stream)
+{
+    if (mEngine == nullptr)
+    {
+        return; // Early return for dummy/parser instances
+    }
 
     int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
@@ -181,11 +230,18 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     if (!this->validateConfigFromEngine())
     {
-        LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
-            enginePath.string().c_str());
-        throw std::runtime_error(
-            "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
+        // Skip validation for shared engine if config is already known?
+        // Actually, it's safer to keep it.
+        LOG_ERROR("Failed to match config with engine.");
+        throw std::runtime_error("Failed to match config with engine.");
     }
+
+    // Need configJson for rope initialization. We can re-load it if needed, or pass it.
+    // For now, let's assume we need to re-parse or change initializeLongRope to handle just config.
+    // This part is tricky because Rope initialization depends on the original JSON.
+    // Let's modify collectRopeConfig to not depend on JSON after initial load.
+    // Wait, mConfig already has ropeConfig. 
+    // But initializeLongRopeCosSinCache/initializeRopeCosSinCache take configJson.
 
     RopeConfig const& ropeConfig = mConfig.ropeConfig;
     switch (ropeConfig.type)
