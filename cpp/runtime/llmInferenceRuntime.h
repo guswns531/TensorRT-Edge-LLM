@@ -73,7 +73,7 @@ public:
      *  \param streamCallback Optional callback function to be called when the stream is completed
      *  \return True if request was handled successfully, false otherwise
      */
-    bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(std::string const&, bool)> streamCallback = nullptr);
+    bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(int, std::string const&, bool)> streamCallback = nullptr);
 
     /*! \brief Capture CUDA graph for the decoding step to optimize performance
      *  \param stream CUDA stream for graph capture

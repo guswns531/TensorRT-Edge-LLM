@@ -55,7 +55,10 @@ This builds the Go executable.
 
 ```bash
 export PATH=$PATH:/usr/local/go/bin
+
 cd /workspace/go-edgellm
+
+export PATH=$PATH:/usr/local/go/bin
 go mod tidy
 go build -o go-edgellm-app .
 ```
@@ -72,8 +75,27 @@ export EDGELLM_PLUGIN_PATH=/workspace/build/libNvInfer_edgellm_plugin.so
 ./go-edgellm-app
 ```
 
+c
 
 4f54eee2e87e    nvcr.io/nvidia/tensorrt:25.10-py3                                                                                                      "/opt/nvidia/nvidia_…"    4 minutes ago     Up                 tensorrt
+
+
+
+ 이걸 이제 serving 관점으로 htttp 요청을 8000 으로 받아서 queue상태에 따라 worker가 꺼내서 dynamic batching 이 가능케 하는것까지 수정하고싶어. 그리고 지금처럼 benchmark 나 테스트가 되는것까지 고려하면 좋을거 같아
+
+sslab@node3:~/nfs/TensorRT-Edge-LLM$ curl "http://localhost:8000/benchmark?requests=20000&concurrency=16&batch_size=4"
+Server Batch Size Set to 4
+Starting Benchmark: Requests=20000, Concurrency=16, BatchSizeLimit=4
+
+Benchmark Complete:
+Total Time: 1m26.918819803s
+Total Tokens: 180000
+Throughput: 2070.90 tokens/sec
+Avg Latency: 68.917196ms
+Avg TTFT: 22.580865ms
+Avg ITL: 5.149451ms
+Avg TPOT: 5.79204ms
+
 
 ## Overview
 

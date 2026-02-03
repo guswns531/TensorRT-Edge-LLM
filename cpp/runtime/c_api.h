@@ -23,7 +23,7 @@ typedef struct {
     bool stream_output;
 } EdgeLLMRequest;
 
-typedef void (*EdgeLLMStreamCallback)(const char* token, bool is_finished, void* ctx);
+typedef void (*EdgeLLMStreamCallback)(int batchIndex, const char* token, bool is_finished, void* ctx);
 
 typedef struct {
     char* text;
@@ -33,6 +33,8 @@ typedef struct {
 EdgeLLMManagerHandle EdgeLLMManagerCreate(const char* engineDir, int numWorkers);
 
 bool EdgeLLMManagerInfer(EdgeLLMManagerHandle handle, int workerIdx, const EdgeLLMRequest* request, EdgeLLMResponse* response, EdgeLLMStreamCallback callback, void* ctx);
+
+bool EdgeLLMManagerInferBatch(EdgeLLMManagerHandle handle, int workerIdx, const EdgeLLMRequest* requests, int numRequests, EdgeLLMResponse* responses, EdgeLLMStreamCallback callback, void* ctx);
 
 void EdgeLLMManagerDestroy(EdgeLLMManagerHandle handle);
 

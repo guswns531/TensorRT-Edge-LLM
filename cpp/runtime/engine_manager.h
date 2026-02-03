@@ -25,7 +25,7 @@ class EngineManager
 public:
     EngineManager(std::string const& engineDir, int numWorkers, cudaStream_t stream);
     ~EngineManager();
-    bool handleRequest(int workerIdx, LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(std::string const&, bool)> streamCallback = nullptr);
+    bool handleRequest(int workerIdx, LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(int, std::string const&, bool)> streamCallback = nullptr);
 
     LLMEngineRunnerConfig getEngineConfig() const { return mConfig; }
 

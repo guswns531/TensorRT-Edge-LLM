@@ -251,7 +251,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 }
 
 bool LLMInferenceRuntime::handleRequest(
-    LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(std::string const&, bool)> streamCallback)
+    LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(int, std::string const&, bool)> streamCallback)
 {
     std::vector<std::vector<int32_t>> batchedInputIds;
     std::vector<std::string> batchSystemPrompts;
@@ -382,12 +382,8 @@ bool LLMInferenceRuntime::handleRequest(
 
                 // Streaming callback
                 if (streamCallback) {
-                    std::string tokenText = mTokenizer->decode({1, newTokenId}); // decode expects vector, assuming [1, id] or just [id]. 
-                    // Wait, mTokenizer->decode signature? 
-                    // Usually encode returns vector<int>. decode takes vector<int>.
-                    // Let's assume {newTokenId} vector initialization works.
-                    // Actually, "decode" usually strips special tokens.
-                    streamCallback(tokenText, finishedStates[i]);
+                    std::string tokenText = mTokenizer->decode({1, newTokenId}); 
+                    streamCallback(i, tokenText, finishedStates[i]);
                 }
             }
         }

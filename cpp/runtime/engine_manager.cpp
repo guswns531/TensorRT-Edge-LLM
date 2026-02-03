@@ -71,7 +71,7 @@ EngineManager::~EngineManager()
     }
 }
 
-bool EngineManager::handleRequest(int workerIdx, LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(std::string const&, bool)> streamCallback)
+bool EngineManager::handleRequest(int workerIdx, LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(int, std::string const&, bool)> streamCallback)
 {
     (void)stream;
     if (workerIdx < 0 || workerIdx >= static_cast<int>(mWorkers.size()))
