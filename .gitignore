@@ -28,11 +28,17 @@ nvidia0
 nvidiactl
 
 engines/
-
 quantized/
 onnx_models/
+visual_engines/
+
 input.json
 output.json
+input_with_images.json
+output_with_images.json
 
 build/
+build_thor/
 go-edgellm/go-edgellm-app
+examples/accuracy/datasets
+examples/accuracy/mmlu_predictions.json

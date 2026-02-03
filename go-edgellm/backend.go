@@ -11,6 +11,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"log"
 	"unsafe"
 	"sync"
 	"sync/atomic"
@@ -20,11 +21,22 @@ type Manager struct {
 	handle C.EdgeLLMManagerHandle
 }
 
-func NewManager(engineDir string, numWorkers int) (*Manager, error) {
+type Content struct {
+    Type string // "text" or "image"
+    Data string // text content or image path
+}
+
+func NewManager(engineDir string, multimodalEngineDir string, numWorkers int) (*Manager, error) {
 	cDir := C.CString(engineDir)
 	defer C.free(unsafe.Pointer(cDir))
+    
+    var cMmDir *C.char
+    if multimodalEngineDir != "" {
+        cMmDir = C.CString(multimodalEngineDir)
+        defer C.free(unsafe.Pointer(cMmDir))
+    }
 
-	handle := C.EdgeLLMManagerCreate(cDir, C.int(numWorkers))
+	handle := C.EdgeLLMManagerCreate(cDir, cMmDir, C.int(numWorkers))
 	if handle == nil {
 		return nil, errors.New("failed to create EdgeLLMManager")
 	}
@@ -39,7 +51,7 @@ func (m *Manager) Close() {
 }
 
 type Request struct {
-	Prompt       string
+	Contents     []Content
 	MaxNewTokens int
 	Temperature  float32
 	TopP         float32
@@ -91,13 +103,61 @@ func (m *Manager) InferBatchStream(workerIdx int, reqs []Request, onToken func(i
 
 	// Prepare C requests array
 	cReqs := make([]C.EdgeLLMRequest, len(reqs))
-	// Keep track of CStrings to free them
-	cPrompts := make([]*C.char, len(reqs))
-	
+    
+    // We need to keep track of allocation to free them
+    type ReqAlloc struct {
+        contentsPtr *C.EdgeLLMContent // Pointer to C-allocated array
+        dataPtrs    []*C.char         // Pointers to strings inside contents
+        typePtrs    []*C.char         // Pointers to type strings
+    }
+    allocs := make([]ReqAlloc, len(reqs))
+
 	for i, r := range reqs {
-		cPrompts[i] = C.CString(r.Prompt)
+		if i > 0 {
+			// Check for parameter consistency warnings
+			r0 := reqs[0]
+			if r.Temperature != r0.Temperature || r.TopP != r0.TopP || r.TopK != r0.TopK || r.MaxNewTokens != r0.MaxNewTokens {
+				log.Printf("WARNING: Request %d has different sampling params than Request 0 in current batch. C++ runtime currently uses Request 0 params for the whole batch.", i)
+			}
+		}
+        
+        // Convert Go Contents to C Contents
+        numContents := len(r.Contents)
+        
+        // Allocate C array for contents to avoid Go-pointer-to-Go-pointer violation
+        var cContentsPtr *C.EdgeLLMContent
+        if numContents > 0 {
+            cContentsPtr = (*C.EdgeLLMContent)(C.calloc(C.size_t(numContents), C.size_t(unsafe.Sizeof(C.EdgeLLMContent{}))))
+        }
+        
+        allocs[i].contentsPtr = cContentsPtr
+        allocs[i].dataPtrs = make([]*C.char, numContents)
+        allocs[i].typePtrs = make([]*C.char, numContents)
+        
+        // Use unsafe.Slice to access the C array as a Go slice for easy population
+        // (safe because we just allocated it)
+        var cContentsSlice []C.EdgeLLMContent
+        if numContents > 0 {
+             cContentsSlice = unsafe.Slice(cContentsPtr, numContents)
+        }
+        
+        for j, c := range r.Contents {
+            cType := C.CString(c.Type)
+            cData := C.CString(c.Data)
+            
+            allocs[i].typePtrs[j] = cType
+            allocs[i].dataPtrs[j] = cData
+            
+            cContentsSlice[j] = C.EdgeLLMContent{
+                _type:    cType,
+                data:     cData,
+                data_len: C.int(len(c.Data)),
+            }
+        }
+
 		cReqs[i] = C.EdgeLLMRequest{
-			prompt:         cPrompts[i],
+			contents:       cContentsPtr,
+            num_contents:   C.int(numContents),
 			max_new_tokens: C.int32_t(r.MaxNewTokens),
 			temperature:    C.float(r.Temperature),
 			top_p:          C.float(r.TopP),
@@ -107,8 +167,18 @@ func (m *Manager) InferBatchStream(workerIdx int, reqs []Request, onToken func(i
 	}
 
 	defer func() {
-		for _, p := range cPrompts {
-			C.free(unsafe.Pointer(p))
+		for _, a := range allocs {
+            // Free the C array of structs
+            if a.contentsPtr != nil {
+                C.free(unsafe.Pointer(a.contentsPtr))
+            }
+            // Free the strings
+            for _, p := range a.dataPtrs {
+                C.free(unsafe.Pointer(p))
+            }
+            for _, p := range a.typePtrs {
+                C.free(unsafe.Pointer(p))
+            }
 		}
 	}()
 
@@ -138,17 +208,11 @@ func (m *Manager) InferBatchStream(workerIdx int, reqs []Request, onToken func(i
 
 	responses := make([]Response, len(reqs))
 	for i := 0; i < len(reqs); i++ {
-		// EdgeLLMResponse text needs to be freed? 
-		// Yes, in C++ we strdup it. We should assume we need to free it.
-		// But EdgeLLMFreeResponse only frees a single one. 
-		// We should probably call cleanup manually or loop.
-		// Wait, C-API `EdgeLLMFreeResponse` takes a pointer.
-		// I should call it for each response.
-		
 		responses[i] = Response{
 			Text:      C.GoString(cResps[i].text),
 			NumTokens: int(cResps[i].num_tokens),
 		}
+		// Free the C string allocated by the runtime
 		C.EdgeLLMFreeResponse(&cResps[i])
 	}
 

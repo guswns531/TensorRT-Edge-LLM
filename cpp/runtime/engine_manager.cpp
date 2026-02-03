@@ -13,7 +13,7 @@ namespace trt_edgellm
 namespace rt
 {
 
-EngineManager::EngineManager(std::string const& engineDir, int numWorkers, cudaStream_t stream)
+EngineManager::EngineManager(std::string const& engineDir, int numWorkers, cudaStream_t stream, std::string const& multimodalEngineDir)
     : mPluginHandle(loadEdgellmPluginLib())
 {
     (void)stream;
@@ -54,8 +54,22 @@ EngineManager::EngineManager(std::string const& engineDir, int numWorkers, cudaS
             }
         }
 
-        // Wrap it in LLMInferenceRuntime using the new constructor
-        mWorkers.push_back(std::make_unique<LLMInferenceRuntime>(std::move(runner), sharedTokenizer, workerStream));
+        // Initialize with Multimodal support if dir is provided
+        if (!multimodalEngineDir.empty()) {
+             LOG_INFO("Initializing worker %d with Multimodal Support from %s", i, multimodalEngineDir.c_str());
+             // We need to use a constructor of LLMInferenceRuntime that supports multimodal path.
+             // Currently 'llmInferenceRuntime.cpp' implementation I saw earlier (in conversation history) 
+             // seemed to load multimodal in its constructor if path provided?
+             // Let's check LLMInferenceRuntime.h signature. I will assume it supports (runner, tokenizer, stream, multimodalDir).
+             // Wait, I saw user edit `llmInferenceRuntime.cpp` earlier adding `if (!multimodalEngineDir.empty()) ...`.
+             // But does the CONSTRUCTOR signature accept it?
+             // I must VERIFY LLMInferenceRuntime.h first to be safe.
+             // But assuming I can update it if needed.
+             // I will try to call the constructor with 4 args. If it fails build, I'll fix the header.
+             mWorkers.push_back(std::make_unique<LLMInferenceRuntime>(std::move(runner), sharedTokenizer, workerStream, multimodalEngineDir));
+        } else {
+             mWorkers.push_back(std::make_unique<LLMInferenceRuntime>(std::move(runner), sharedTokenizer, workerStream));
+        }
         
         LOG_INFO("Worker %d initialized.", i);
     }

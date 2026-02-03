@@ -60,7 +60,7 @@ public:
      *  \param tokenizer The tokenizer instance
      *  \param stream CUDA stream for initialization
      */
-    LLMInferenceRuntime(std::unique_ptr<LLMEngineRunner> engineRunner, std::shared_ptr<tokenizer::Tokenizer> tokenizer, cudaStream_t stream);
+    LLMInferenceRuntime(std::unique_ptr<LLMEngineRunner> engineRunner, std::shared_ptr<tokenizer::Tokenizer> tokenizer, cudaStream_t stream, std::string const& multimodalEngineDir = "");
 
     /*! \brief Destructor
      */

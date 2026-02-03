@@ -72,15 +72,28 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     mTokenizer->loadFromHF(engineDir);
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
 
+    if (!multimodalEngineDir.empty())
+    {
+        mMultimodalRunner = MultimodalRunner::create(
+            multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
+    }
+
     this->allocateTensors();
 }
 
-LLMInferenceRuntime::LLMInferenceRuntime(std::unique_ptr<LLMEngineRunner> engineRunner, std::shared_ptr<tokenizer::Tokenizer> tokenizer, cudaStream_t stream)
+LLMInferenceRuntime::LLMInferenceRuntime(std::unique_ptr<LLMEngineRunner> engineRunner, std::shared_ptr<tokenizer::Tokenizer> tokenizer, cudaStream_t stream, std::string const& multimodalEngineDir)
     : mLLMEngineRunner(std::move(engineRunner))
     , mTokenizer(tokenizer)
 {
     (void)stream;
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
+
+    if (!multimodalEngineDir.empty())
+    {
+        mMultimodalRunner = MultimodalRunner::create(
+            multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
+    }
+
     this->allocateTensors();
 }
 
@@ -382,7 +395,7 @@ bool LLMInferenceRuntime::handleRequest(
 
                 // Streaming callback
                 if (streamCallback) {
-                    std::string tokenText = mTokenizer->decode({1, newTokenId}); 
+                    std::string tokenText = mTokenizer->decode({newTokenId}); 
                     streamCallback(i, tokenText, finishedStates[i]);
                 }
             }

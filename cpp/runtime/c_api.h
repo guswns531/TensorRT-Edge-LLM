@@ -15,7 +15,14 @@ extern "C" {
 typedef void* EdgeLLMManagerHandle;
 
 typedef struct {
-    const char* prompt;
+    const char* type; // "text" or "image"
+    const char* data; // text string or image path
+    int data_len;
+} EdgeLLMContent;
+
+typedef struct {
+    const EdgeLLMContent* contents;
+    int num_contents;
     int32_t max_new_tokens;
     float temperature;
     float top_p;
@@ -30,7 +37,7 @@ typedef struct {
     int32_t num_tokens;
 } EdgeLLMResponse;
 
-EdgeLLMManagerHandle EdgeLLMManagerCreate(const char* engineDir, int numWorkers);
+EdgeLLMManagerHandle EdgeLLMManagerCreate(const char* engineDir, const char* multimodalEngineDir, int numWorkers);
 
 bool EdgeLLMManagerInfer(EdgeLLMManagerHandle handle, int workerIdx, const EdgeLLMRequest* request, EdgeLLMResponse* response, EdgeLLMStreamCallback callback, void* ctx);
 

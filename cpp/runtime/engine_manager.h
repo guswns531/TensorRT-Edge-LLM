@@ -23,7 +23,7 @@ namespace rt
 class EngineManager
 {
 public:
-    EngineManager(std::string const& engineDir, int numWorkers, cudaStream_t stream);
+    EngineManager(std::string const& engineDir, int numWorkers, cudaStream_t stream, std::string const& multimodalEngineDir = "");
     ~EngineManager();
     bool handleRequest(int workerIdx, LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream, std::function<void(int, std::string const&, bool)> streamCallback = nullptr);
 

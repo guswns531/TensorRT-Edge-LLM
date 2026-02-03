@@ -15,9 +15,10 @@ import (
 
 // Config
 var (
-	EngineDir     string
-	NumWorkers    int
-	ListenAddress string
+	EngineDir           string
+    MultimodalEngineDir string
+	NumWorkers          int
+	ListenAddress       string
 )
 
 var (
@@ -39,11 +40,12 @@ var (
 
 func main() {
 	flag.StringVar(&EngineDir, "engine-dir", "/workspace/engines/qwen3-0.6b", "Path to engine directory")
+    flag.StringVar(&MultimodalEngineDir, "multimodal-engine-dir", "", "Path to multimodal engine directory (optional)")
 	flag.IntVar(&NumWorkers, "workers", 4, "Number of concurrent TRT-LLM runtime instances")
 	flag.StringVar(&ListenAddress, "addr", ":8000", "Address to listen on")
 	flag.Parse()
 	// Initialize Engine Manager
-	manager, err := NewManager(EngineDir, NumWorkers)
+	manager, err := NewManager(EngineDir, MultimodalEngineDir, NumWorkers)
 	if err != nil {
 		log.Fatalf("Failed to initialize manager: %v", err)
 	}
@@ -95,6 +97,9 @@ func main() {
 	http.HandleFunc("/benchmark", handleBenchmark) 
 
 	log.Printf("Starting server on %s with %d workers", ListenAddress, NumWorkers)
+	if MultimodalEngineDir != "" {
+		log.Printf("Multimodal support enabled with engine: %s", MultimodalEngineDir)
+	}
 	log.Fatal(http.ListenAndServe(ListenAddress, nil))
 }
 
@@ -129,11 +134,25 @@ func processBatch(manager *Manager, workerIdx int, batch []*RequestJob) {
 	}
 }
 
-// HTTP Handler
+// HTTP Handler Structures
+type MessageContent struct {
+    Type      string `json:"type"`      // "text" or "image"
+    Text      string `json:"text,omitempty"`
+    Image     string `json:"image,omitempty"` // For simple image field
+    ImagePath string `json:"media_path,omitempty"` // Matches user example
+    Data      string `json:"data,omitempty"` // Fallback
+}
+
+type Message struct {
+    Role    string           `json:"role"`
+    Content []MessageContent `json:"content"`
+}
+
 type APIGenRequest struct {
-	Prompt      string  `json:"prompt"`
-	MaxTokens   int     `json:"max_tokens"`
-	Temperature float32 `json:"temperature"`
+	Prompt      string       `json:"prompt"` // Legacy simple prompt
+    Messages    []Message    `json:"messages"` // Structured chat input
+	MaxTokens   int          `json:"max_tokens"`
+	Temperature float32      `json:"temperature"`
 }
 
 func handleGenerate(w http.ResponseWriter, r *http.Request) {
@@ -152,9 +171,40 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if apiReq.MaxTokens == 0 { apiReq.MaxTokens = 50 }
 	if apiReq.Temperature == 0 { apiReq.Temperature = 0.7 }
 
+    var contents []Content
+
+    // 1. Handle Messages (VLM/Chat style)
+    if len(apiReq.Messages) > 0 {
+        // Flatten user messages content
+        for _, msg := range apiReq.Messages {
+            if msg.Role == "user" {
+                for _, c := range msg.Content {
+                    if c.Type == "text" {
+                        text := c.Text
+                        if text == "" { text = c.Data }
+                         contents = append(contents, Content{Type: "text", Data: text})
+                    } else if c.Type == "image" {
+                        path := c.ImagePath
+                        if path == "" { path = c.Image }
+                        if path == "" { path = c.Data }
+                        contents = append(contents, Content{Type: "image", Data: path})
+                    }
+                }
+            }
+        }
+    } else {
+        // 2. Handle Legacy Prompt
+        contents = append(contents, Content{Type: "text", Data: apiReq.Prompt})
+    }
+    
+    if len(contents) == 0 {
+        http.Error(w, "No content provided", http.StatusBadRequest)
+        return
+    }
+
 	job := &RequestJob{
 		Req: Request{
-			Prompt:       apiReq.Prompt,
+			Contents:     contents,
 			MaxNewTokens: apiReq.MaxTokens,
 			Temperature:  apiReq.Temperature,
 			TopP:         0.9,
@@ -209,6 +259,17 @@ func handleBenchmark(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(n, "%d", &numRequests)
 	}
 
+	// Benchmark Content Config
+	imagePath := r.URL.Query().Get("image")
+	promptText := r.URL.Query().Get("prompt")
+	if promptText == "" {
+		if imagePath != "" {
+			promptText = "Describe this image."
+		} else {
+			promptText = "What is the capital of France?"
+		}
+	}
+
 	// Update Server Batch Size if requested
 	if bs := r.URL.Query().Get("batch_size"); bs != "" {
 			var val int64
@@ -224,7 +285,7 @@ func handleBenchmark(w http.ResponseWriter, r *http.Request) {
 	currentBS := atomic.LoadInt64(&CurrentBatchSize)
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "Starting Benchmark: Requests=%d, Concurrency=%d, BatchSizeLimit=%d\n", numRequests, concurrency, currentBS)
+	fmt.Fprintf(w, "Starting Benchmark: Requests=%d, Concurrency=%d, BatchSizeLimit=%d, Image=%s\n", numRequests, concurrency, currentBS, imagePath)
 	if f, ok := w.(http.Flusher); ok { f.Flush() }
 
 	start := time.Now()
@@ -252,9 +313,18 @@ func handleBenchmark(w http.ResponseWriter, r *http.Request) {
 
 				reqStart := time.Now()
 				
+				// Construct Request Content
+				var contents []Content
+				if imagePath != "" {
+					contents = append(contents, Content{Type: "image", Data: imagePath})
+					contents = append(contents, Content{Type: "text", Data: promptText})
+				} else {
+					contents = append(contents, Content{Type: "text", Data: promptText})
+				}
+
 				job := &RequestJob{
 					Req: Request{
-						Prompt:       "What is the capital of France?",
+						Contents:     contents,
 						MaxNewTokens: 50,
 						Temperature:  0.7,
 						TopP:         0.9,
