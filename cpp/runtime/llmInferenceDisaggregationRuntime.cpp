@@ -26,6 +26,7 @@
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -37,6 +38,12 @@ namespace trt_edgellm
 {
 namespace
 {
+constexpr size_t kCuda130MaskOffsetJetson = 0x54c;
+constexpr std::array<uint32_t, 3> kJetsonThorGpcMasks{
+    0x049, // GPC0 -> TPC {0,3,6}
+    0x092, // GPC1 -> TPC {1,4,7}
+    0x324 // GPC2 -> TPC {2,5,8,9}
+};
 
 size_t hashSystemPromptWithLoraWeights(std::string const& systemPrompt, std::string const& loraWeightsName)
 {
@@ -53,7 +60,7 @@ namespace rt
 
 LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string const& engineDir,
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
-    cudaStream_t stream)
+    cudaStream_t stream, int32_t decodeTpcCount)
 {
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
@@ -110,6 +117,10 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
     CUDA_CHECK(cudaStreamCreate(&mMultimodalStream));
     CUDA_CHECK(cudaStreamCreate(&mPrefillStream));
     CUDA_CHECK(cudaStreamCreate(&mDecodeStream));
+    if (decodeTpcCount > 0 && !applyDisaggregatedTpcMasks(decodeTpcCount))
+    {
+        throw std::runtime_error("Failed to apply disaggregated TPC masks to runtime streams.");
+    }
 
     mMultimodalWorker = std::thread(&LLMInferenceDisaggregationRuntime::multimodalWorkerMain, this);
     mPrefillWorker = std::thread(&LLMInferenceDisaggregationRuntime::prefillWorkerMain, this);
@@ -155,6 +166,99 @@ void LLMInferenceDisaggregationRuntime::stopWorkers()
     {
         mDecodeWorker.join();
     }
+}
+
+std::vector<uint32_t> LLMInferenceDisaggregationRuntime::getJetsonThorTpcOrderFromGpcMasks()
+{
+    std::vector<uint32_t> order;
+    order.reserve(10);
+    for (auto const gpcMask : kJetsonThorGpcMasks)
+    {
+        for (uint32_t bit = 0; bit < 32; ++bit)
+        {
+            if (gpcMask & (1u << bit))
+            {
+                order.push_back(bit);
+            }
+        }
+    }
+    return order;
+}
+
+bool LLMInferenceDisaggregationRuntime::applyTpcMaskToStream(
+    cudaStream_t stream, __uint128_t mask, char const* streamName) const
+{
+    int cudaRuntimeVersion = 0;
+    if (cudaRuntimeGetVersion(&cudaRuntimeVersion) != cudaSuccess)
+    {
+        LOG_ERROR("Failed to get CUDA runtime version for TPC mask.");
+        return false;
+    }
+    if (cudaRuntimeVersion / 1000 != 13)
+    {
+        LOG_ERROR("TPC mask currently supports CUDA 13.x only. Detected runtime version=%d", cudaRuntimeVersion);
+        return false;
+    }
+
+    auto streamStructBase = *reinterpret_cast<char**>(stream);
+    if (streamStructBase == nullptr)
+    {
+        LOG_ERROR("Failed to resolve internal stream struct for TPC mask (%s).", streamName);
+        return false;
+    }
+
+    struct StreamSmMaskV2
+    {
+        uint32_t enabled;
+        uint32_t mask[4];
+    };
+
+    auto* hwMask = reinterpret_cast<StreamSmMaskV2*>(streamStructBase + kCuda130MaskOffsetJetson);
+    hwMask->enabled = 1;
+    hwMask->mask[0] = static_cast<uint32_t>(mask);
+    hwMask->mask[1] = static_cast<uint32_t>(mask >> 32);
+    hwMask->mask[2] = static_cast<uint32_t>(mask >> 64);
+    hwMask->mask[3] = static_cast<uint32_t>(mask >> 96);
+
+    LOG_INFO("Applied disaggregated TPC mask to %s stream: mask64=0x%016llx", streamName,
+        static_cast<unsigned long long>(mask));
+    return true;
+}
+
+bool LLMInferenceDisaggregationRuntime::applyDisaggregatedTpcMasks(int32_t decodeTpcCount)
+{
+    auto const tpcOrder = getJetsonThorTpcOrderFromGpcMasks();
+    int32_t const totalTpcCount = static_cast<int32_t>(tpcOrder.size());
+    if (decodeTpcCount <= 0 || decodeTpcCount >= totalTpcCount)
+    {
+        LOG_ERROR("Invalid decode tpcCount=%d. Expected range is [1, %d).", decodeTpcCount, totalTpcCount);
+        return false;
+    }
+
+    // libsmctrl semantics: 0-bit means enabled TPC, 1-bit means disabled TPC.
+    __uint128_t decodeMask = ~static_cast<__uint128_t>(0);
+    __uint128_t prefillEncodingMask = ~static_cast<__uint128_t>(0);
+
+    for (int32_t i = 0; i < decodeTpcCount; ++i)
+    {
+        decodeMask &= ~(static_cast<__uint128_t>(1) << tpcOrder[static_cast<size_t>(i)]);
+    }
+    for (int32_t i = decodeTpcCount; i < totalTpcCount; ++i)
+    {
+        prefillEncodingMask &= ~(static_cast<__uint128_t>(1) << tpcOrder[static_cast<size_t>(i)]);
+    }
+
+    bool const decodeStatus = applyTpcMaskToStream(mDecodeStream, decodeMask, "decode");
+    bool const prefillStatus = applyTpcMaskToStream(mPrefillStream, prefillEncodingMask, "prefill");
+    bool const multimodalStatus = applyTpcMaskToStream(mMultimodalStream, prefillEncodingMask, "multimodal");
+    if (!decodeStatus || !prefillStatus || !multimodalStatus)
+    {
+        return false;
+    }
+
+    LOG_INFO("TPC split applied. decode tpcCount=%d, prefill/encoding tpcCount=%d", decodeTpcCount,
+        totalTpcCount - decodeTpcCount);
+    return true;
 }
 
 std::future<LLMInferenceDisaggregationRuntime::AsyncRequestResult> LLMInferenceDisaggregationRuntime::submitRequestAsync(
@@ -335,6 +439,8 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
     std::shared_ptr<StageContext> context;
     while (mMultimodalQueue.pop(context))
     {
+        // Keep lock scope conservative until per-request runtime state is isolated.
+        // Future queue-aware scheduling can narrow this guard to stage-specific critical sections.
         context->pipelineLock = std::make_unique<std::unique_lock<std::mutex>>(mExecutionMutex);
         if (!examineRequest(*context->request))
         {

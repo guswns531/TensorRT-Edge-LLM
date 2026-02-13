@@ -167,58 +167,27 @@ request          200   1161.719   1128.481  1332.889      0.861 req/s
 | Decode latency | 9.12 ms/tok | 8.28 ms/tok | **-9.2%** |
 | Request throughput | 0.782 req/s | 0.861 req/s | **+10.1%** |
 
-### 향후 계획
+### TPC 분할 실행 (`--disaggregation --tpcCount`)
 
-현재 구현은 단일 GPU 내에서 스트림만 분리한 상태입니다. 다음 단계는 libsmctrl 등을 활용하여 GPC/TPC를 단계별로 실제 파티셔닝함으로써 prefill과 decode를 물리적으로 동시에 실행하는 것입니다.
+현재 `llm_benchmark`의 disaggregation 경로에서는 `--tpcCount`를 **decode 전용 TPC 개수**로 사용합니다.
 
+- `decode stream`에는 앞쪽 `tpcCount` TPC를 할당
+- `prefill stream`과 `multimodal(encoding) stream`은 나머지 TPC를 공유
+- 적용 예시:
+
+```bash
+./build/examples/llm/llm_benchmark \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile output.json \
+  --disaggregation \
+  --tpcCount 3
 ```
-[목표 구조]
-GPC0           (3 TPCs) ─── Decode worker    (memory-BW 최적화)
-GPC1+GPC2      (7 TPCs) ─── Prefill worker   (compute 최적화)
-                         ↕ (CUDA event 동기화, KV cache 공유)
-```
 
-이를 통해 decode 중에 다음 요청의 prefill을 물리적으로 병렬 실행하여 end-to-end 처리량을 더 향상시키는 것이 최종 목표입니다.
+위 예시는 `decode=3 TPC`, `prefill+encoding=7 TPC` 구성이 됩니다.
 
-
-
-```c
-
-#define CU_13_0_MASK_OFF_JETSON 0x54c
-// 13.0 tested on Jetson Thor (Feb 2026)
-
-struct stream_sm_mask_v2 {
-	uint32_t enabled;
-	uint32_t mask[4];
-};
-
-// Should work for CUDA 8.0 through 12.8
-// A cudaStream_t is a CUstream*. We use void* to avoid a cuda.h dependency in
-// our header
-void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
-	// When the old API is used on GPUs with over 64 TPCs, disable all TPCs >64
-	uint128_t full_mask = -1;
-	full_mask <<= 64;
-	full_mask |= mask;
-	libsmctrl_set_stream_mask_ext(stream, full_mask);
-}
-
-void libsmctrl_set_stream_mask_ext(void* stream, uint128_t mask) {
-	char* stream_struct_base = *(char**)stream;
-	struct stream_sm_mask_v2* hw_mask_v2 = NULL;
-  hw_mask_v2 = (void*)(stream_struct_base + CU_13_0_MASK_OFF_JETSON);
-
-   if (hw_mask_v2) {
-		hw_mask_v2->enabled = 1;
-		hw_mask_v2->mask[0] = mask;
-		hw_mask_v2->mask[1] = mask >> 32;
-		hw_mask_v2->mask[2] = mask >> 64;
-		hw_mask_v2->mask[3] = mask >> 96;
-	} else {
-		abort(1, 0, "Stream masking unsupported on this CUDA version (%d), and"
-		            " no fallback MASK_OFF set!", ver);
-	}
-}
-
-
-```
+제약 사항:
+- Jetson Thor CUDA 13.x 기준 내부 stream mask 오프셋(`0x54c`)을 사용합니다.
+- disaggregation 모드에서 `--tpcCount`는 `1 <= tpcCount < totalTPC` 범위를 만족해야 합니다.
+- 현재는 런타임 공유 상태 보호를 위해 `mExecutionMutex`를 유지하고 있으며, 이후 3개 큐 상태 기반 스케줄링 정책으로 lock 범위를 단계적으로 축소할 예정입니다.

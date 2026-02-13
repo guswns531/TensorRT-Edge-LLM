@@ -27,6 +27,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <cstdint>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -64,7 +65,8 @@ public:
      *  \param stream CUDA stream for initialization
      */
     LLMInferenceDisaggregationRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
+        int32_t decodeTpcCount = -1);
 
     //! \brief Destructor
     ~LLMInferenceDisaggregationRuntime();
@@ -191,6 +193,9 @@ private:
     void decodeWorkerMain();
     void finalizeContext(StageContext& context);
     void stopWorkers();
+    bool applyDisaggregatedTpcMasks(int32_t decodeTpcCount);
+    bool applyTpcMaskToStream(cudaStream_t stream, __uint128_t mask, char const* streamName) const;
+    static std::vector<uint32_t> getJetsonThorTpcOrderFromGpcMasks();
 
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
@@ -224,6 +229,8 @@ private:
     std::thread mPrefillWorker;
     std::thread mDecodeWorker;
 
+    // Shared runtime tensors/runner state are currently not request-isolated.
+    // This lock keeps correctness while we stage toward queue-aware scheduling.
     std::mutex mExecutionMutex;
 };
 

@@ -459,7 +459,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     }
     if (args.tpcCount > 0)
     {
-        LOG_INFO("TPC stream mask enabled with tpcCount=%d", args.tpcCount);
+        if (args.disaggregation)
+        {
+            LOG_INFO("Disaggregation TPC split enabled: decode tpcCount=%d, prefill+encoding use remaining TPCs.",
+                args.tpcCount);
+        }
+        else
+        {
+            LOG_INFO("TPC stream mask enabled with tpcCount=%d", args.tpcCount);
+        }
     }
 
     if (args.eagleArgs.enabled)
@@ -477,6 +485,16 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     {
         LOG_ERROR("Cannot enable both --eagle and --disaggregation at the same time.");
         return false;
+    }
+    if (args.disaggregation && args.tpcCount > 0)
+    {
+        auto const tpcLimit = static_cast<int32_t>(getJetsonThorTpcOrderFromGpcMasks().size());
+        if (args.tpcCount >= tpcLimit)
+        {
+            LOG_ERROR("In disaggregation mode, --tpcCount must be in [1, %d) so prefill+encoding can use remaining TPCs.",
+                tpcLimit);
+            return false;
+        }
     }
 
     if (args.debug)
@@ -800,7 +818,7 @@ int main(int argc, char* argv[])
     std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    if (args.tpcCount > 0 && !applyTpcMaskToStream(stream, args.tpcCount))
+    if (!args.disaggregation && args.tpcCount > 0 && !applyTpcMaskToStream(stream, args.tpcCount))
     {
         LOG_ERROR("Failed to apply TPC stream mask for tpcCount=%d", args.tpcCount);
         return EXIT_FAILURE;
@@ -855,7 +873,7 @@ int main(int argc, char* argv[])
         try
         {
             disaggregationRuntime = std::make_unique<rt::LLMInferenceDisaggregationRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream, args.tpcCount);
         }
         catch (std::exception const& e)
         {
