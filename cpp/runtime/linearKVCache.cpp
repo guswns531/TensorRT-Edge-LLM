@@ -97,6 +97,18 @@ rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
         KVCacheTypeTRT);
 }
 
+rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx, int32_t slotOffset, int32_t activeBatchSize)
+{
+    check::check(slotOffset >= 0 && activeBatchSize >= 0 && slotOffset + activeBatchSize <= mConfig.maxBatchSize,
+        "Invalid KV cache slot range.");
+    int64_t const kvCacheOffset
+        = decoderLayerIdx * mConfig.maxBatchSize * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim
+        + static_cast<int64_t>(slotOffset) * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim;
+    KVCacheType* kvCachePtr = mDeviceKVCache + kvCacheOffset;
+    return rt::Tensor(kvCachePtr, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength, mConfig.headDim},
+        DeviceType::kGPU, KVCacheTypeTRT);
+}
+
 rt::Tensor LinearKVCache::getKVCacheBuffer()
 {
     return rt::Tensor(mDeviceKVCache,
@@ -134,6 +146,24 @@ void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, 
         reuseKVCacheLengths.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
 }
 
+void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, int32_t slotOffset, cudaStream_t stream)
+{
+    int32_t const batchSize = static_cast<int32_t>(reuseKVCacheLengths.getShape()[0]);
+    check::check(slotOffset >= 0 && slotOffset + batchSize <= mConfig.maxBatchSize,
+        "Slot range for reset exceeds max KV cache batch size.");
+    check::check(
+        reuseKVCacheLengths.getDeviceType() == DeviceType::kCPU, "The reuseKVCacheLengths tensor shall reside on CPU.");
+    check::check(reuseKVCacheLengths.getDataType() == mDeviceKVCacheLengths.getDataType(),
+        "The data type of reuseKVCacheLengths shall match Device KVCache Lengths.");
+    auto* dst = static_cast<char*>(mDeviceKVCacheLengths.rawPointer()) + static_cast<size_t>(slotOffset) * sizeof(int32_t);
+    size_t const copyBytes = static_cast<size_t>(batchSize) * sizeof(int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(dst, reuseKVCacheLengths.rawPointer(), copyBytes, cudaMemcpyHostToDevice, stream));
+    if (slotOffset == 0)
+    {
+        mActiveBatchSize = batchSize;
+    }
+}
+
 void LinearKVCache::commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream)
 {
     check::check(newContextLengths.getDataType() == DataType::kINT32,
@@ -149,6 +179,14 @@ void LinearKVCache::commitSequenceLength(rt::Tensor const& newContextLengths, cu
     mKVCacheAllEmpty = false;
 }
 
+void LinearKVCache::commitSequenceLength(rt::Tensor const& newContextLengths, int32_t slotOffset, cudaStream_t stream)
+{
+    int32_t const activeBatchSize = static_cast<int32_t>(newContextLengths.getShape()[0]);
+    auto slotLengths = getKVCacheLengths(slotOffset, activeBatchSize);
+    kernel::incrementLengthTensor(slotLengths, newContextLengths, stream);
+    mKVCacheAllEmpty = false;
+}
+
 void LinearKVCache::commitSequenceLength(int32_t increment, cudaStream_t stream)
 {
     kernel::incrementLengthTensor(mDeviceKVCacheLengths, increment, stream);
@@ -157,9 +195,24 @@ void LinearKVCache::commitSequenceLength(int32_t increment, cudaStream_t stream)
     mKVCacheAllEmpty = false;
 }
 
+void LinearKVCache::commitSequenceLength(int32_t increment, int32_t slotOffset, int32_t activeBatchSize, cudaStream_t stream)
+{
+    auto slotLengths = getKVCacheLengths(slotOffset, activeBatchSize);
+    kernel::incrementLengthTensor(slotLengths, increment, stream);
+    mKVCacheAllEmpty = false;
+}
+
 rt::Tensor& LinearKVCache::getKVCacheLengths()
 {
     return mDeviceKVCacheLengths;
+}
+
+rt::Tensor LinearKVCache::getKVCacheLengths(int32_t slotOffset, int32_t activeBatchSize)
+{
+    check::check(slotOffset >= 0 && activeBatchSize >= 0 && slotOffset + activeBatchSize <= mConfig.maxBatchSize,
+        "Invalid slot range for KV cache lengths.");
+    int32_t* basePtr = mDeviceKVCacheLengths.dataPointer<int32_t>();
+    return rt::Tensor(basePtr + slotOffset, {activeBatchSize}, DeviceType::kGPU, DataType::kINT32);
 }
 
 LinearKVCache::CacheConfig LinearKVCache::getConfig() const

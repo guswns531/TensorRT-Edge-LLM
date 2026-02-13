@@ -67,6 +67,7 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
 
     mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
+    mSlotUsage.assign(static_cast<size_t>(mEngineConfig.maxSupportedBatchSize), false);
 
     int32_t const defaultTopK{0};
     float const defaultTopP{0.9F};
@@ -74,6 +75,7 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, 1.0f, defaultTopK, defaultTopP);
     int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, samplingParams));
+    mMaxSamplingWorkspaceSize = maxSamplingWorkspaceSize;
 
     mSamplingWorkspace = rt::Tensor(
         {maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8, "DisaggRuntime::mSamplingWorkspace");
@@ -265,7 +267,10 @@ std::future<LLMInferenceDisaggregationRuntime::AsyncRequestResult> LLMInferenceD
     LLMGenerationRequest const& request)
 {
     auto context = std::make_shared<StageContext>();
+    context->requestId = mRequestCounter.fetch_add(1, std::memory_order_relaxed) + 1;
     context->request = &request;
+    LOG_INFO("[Disagg][Req=%llu] submitted: batch=%zu", static_cast<unsigned long long>(context->requestId),
+        request.requests.size());
     auto future = context->completionPromise.get_future();
     mMultimodalQueue.push(std::move(context));
     return future;
@@ -306,36 +311,37 @@ bool LLMInferenceDisaggregationRuntime::examineRequest(LLMGenerationRequest cons
     return true;
 }
 
-bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
-    std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream)
+bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(StageContext& context, cudaStream_t stream)
 {
     std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
-    int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
+    int32_t const activeBatchSize = static_cast<int32_t>(context.batchedInputIds.size());
 
     rt::LinearKVCache& linearKVCache = mLLMEngineRunner->getLinearKVCache();
     rt::Tensor kvCacheBuffer = linearKVCache.getKVCacheBuffer();
 
-    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Failed to reshape host reuse KV cache lengths.");
-    int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
+    check::check(
+        context.hostReuseKVCacheLengths.reshape({activeBatchSize}), "Failed to reshape host reuse KV cache lengths.");
+    int32_t* reuseKVCacheLengthsData = context.hostReuseKVCacheLengths.dataPointer<int32_t>();
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+        auto promptHash = hashSystemPromptWithLoraWeights(context.batchSystemPrompts[i], context.loraWeightsName);
         if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
         {
             auto& precachedKVCache = mSystemPromptKVCache[promptHash];
             auto const& kvCacheContent = precachedKVCache.kvCacheContent;
             kernel::instantiateKVCacheFromTensor(kvCacheBuffer, kvCacheContent, i, stream);
             int32_t reuseLength = static_cast<int32_t>(kvCacheContent.getShape()[3]);
-            processedInputIds.emplace_back(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
-            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size() - reuseLength));
+            processedInputIds.emplace_back(
+                context.batchedInputIds[i].begin() + reuseLength, context.batchedInputIds[i].end());
+            processedIdsLengths.emplace_back(static_cast<int32_t>(context.batchedInputIds[i].size() - reuseLength));
             reuseKVCacheLengthsData[i] = reuseLength;
         }
         else
         {
-            processedInputIds.emplace_back(batchedInputIds[i]);
-            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size()));
+            processedInputIds.emplace_back(context.batchedInputIds[i]);
+            processedIdsLengths.emplace_back(static_cast<int32_t>(context.batchedInputIds[i].size()));
             reuseKVCacheLengthsData[i] = 0;
         }
     }
@@ -349,26 +355,30 @@ bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(std::vector<std
     }
 
     int32_t const packedInputLength = std::max(maxInputLength, mEngineConfig.minSupportedInputLength);
-    check::check(mHostPackedInputIds.reshape({activeBatchSize, packedInputLength}), "Failed to reshape packed input IDs.");
-    int32_t* packedInputIdsData = mHostPackedInputIds.dataPointer<int32_t>();
+    check::check(
+        context.hostPackedInputIds.reshape({activeBatchSize, packedInputLength}), "Failed to reshape packed input IDs.");
+    int32_t* packedInputIdsData = context.hostPackedInputIds.dataPointer<int32_t>();
     std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         std::copy(processedInputIds[i].begin(), processedInputIds[i].end(), packedInputIdsData + i * packedInputLength);
     }
 
-    linearKVCache.resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    check::check(mInputIds.reshape({activeBatchSize, packedInputLength}), "Failed to reshape input IDs.");
-    check::check(mHostContextLengths.reshape({activeBatchSize}), "Failed to reshape context lengths.");
-    check::check(mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize}), "Failed to reshape output logits.");
+    linearKVCache.resetForNewSequences(context.hostReuseKVCacheLengths, context.slotOffset, stream);
+    check::check(context.inputIds.reshape({activeBatchSize, packedInputLength}), "Failed to reshape input IDs.");
+    check::check(context.hostContextLengths.reshape({activeBatchSize}), "Failed to reshape context lengths.");
+    check::check(
+        context.outputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize}), "Failed to reshape output logits.");
 
-    CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), mHostPackedInputIds.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(context.inputIds.rawPointer(), context.hostPackedInputIds.rawPointer(),
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    memcpy(mHostContextLengths.dataPointer<int32_t>(), processedIdsLengths.data(), activeBatchSize * sizeof(int32_t));
+    memcpy(context.hostContextLengths.dataPointer<int32_t>(), processedIdsLengths.data(), activeBatchSize * sizeof(int32_t));
 
-    if (mEngineConfig.maxSupportedLoraRank > 0 && !mLLMEngineRunner->switchLoraWeights(loraWeightsName, stream))
+    if (mEngineConfig.maxSupportedLoraRank > 0
+        && mLLMEngineRunner->getActiveLoraWeightsName() != context.loraWeightsName
+        && !mLLMEngineRunner->switchLoraWeights(context.loraWeightsName, stream))
     {
-        LOG_ERROR("Failed to switch LoRA weights to %s", loraWeightsName.c_str());
+        LOG_ERROR("Failed to switch LoRA weights to %s", context.loraWeightsName.c_str());
         return false;
     }
     return true;
@@ -402,16 +412,17 @@ bool LLMInferenceDisaggregationRuntime::sampleTokens(StageContext& context, cuda
 {
     SamplingParams params(context.activeBatchSize, mEngineConfig.outputVocabSize, context.request->temperature,
         context.request->topK, context.request->topP);
-    trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
+    trt_edgellm::topKtopPSamplingFromLogits(
+        context.outputLogits, context.selectedIndices, params, context.samplingWorkspace, stream);
     if (mEngineConfig.reducedVocabSize > 0)
     {
-        trt_edgellm::mapReducedVocabToFullVocab(mSelectedIndices, mVocabMappingTable, stream);
+        trt_edgellm::mapReducedVocabToFullVocab(context.selectedIndices, mVocabMappingTable, stream);
     }
-    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mSelectedIndices.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(context.hostSelectedTokenIds.rawPointer(), context.selectedIndices.rawPointer(),
         context.activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
+    int32_t* hostSelectedTokenIdsData = context.hostSelectedTokenIds.dataPointer<int32_t>();
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
         if (!context.finishedStates[i])
@@ -434,14 +445,64 @@ void LLMInferenceDisaggregationRuntime::setFailedResult(StageContext& context, s
     context.errorMessage = message;
 }
 
+int32_t LLMInferenceDisaggregationRuntime::allocateSlotRange(int32_t slotCount)
+{
+    check::check(slotCount > 0 && slotCount <= mEngineConfig.maxSupportedBatchSize, "Invalid slotCount.");
+    std::unique_lock<std::mutex> lock(mSlotAllocatorMutex);
+    auto hasRange = [&]() {
+        int32_t consecutive = 0;
+        for (bool used : mSlotUsage)
+        {
+            consecutive = used ? 0 : consecutive + 1;
+            if (consecutive >= slotCount)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    mSlotAllocatorCv.wait(lock, hasRange);
+    int32_t consecutive = 0;
+    for (int32_t i = 0; i < mEngineConfig.maxSupportedBatchSize; ++i)
+    {
+        consecutive = mSlotUsage[static_cast<size_t>(i)] ? 0 : consecutive + 1;
+        if (consecutive >= slotCount)
+        {
+            int32_t const slotOffset = i - slotCount + 1;
+            for (int32_t s = slotOffset; s < slotOffset + slotCount; ++s)
+            {
+                mSlotUsage[static_cast<size_t>(s)] = true;
+            }
+            return slotOffset;
+        }
+    }
+    return 0;
+}
+
+void LLMInferenceDisaggregationRuntime::releaseSlotRange(int32_t slotOffset, int32_t slotCount)
+{
+    if (slotCount <= 0)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mSlotAllocatorMutex);
+    for (int32_t s = slotOffset; s < slotOffset + slotCount; ++s)
+    {
+        if (s >= 0 && s < mEngineConfig.maxSupportedBatchSize)
+        {
+            mSlotUsage[static_cast<size_t>(s)] = false;
+        }
+    }
+    mSlotAllocatorCv.notify_all();
+}
+
 void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
 {
     std::shared_ptr<StageContext> context;
     while (mMultimodalQueue.pop(context))
     {
-        // Keep lock scope conservative until per-request runtime state is isolated.
-        // Future queue-aware scheduling can narrow this guard to stage-specific critical sections.
-        context->pipelineLock = std::make_unique<std::unique_lock<std::mutex>>(mExecutionMutex);
+        try
+        {
         if (!examineRequest(*context->request))
         {
             setFailedResult(*context, "request validation failed");
@@ -450,7 +511,26 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
         }
 
         context->activeBatchSize = static_cast<int32_t>(context->request->requests.size());
+        context->slotOffset = allocateSlotRange(context->activeBatchSize);
         context->loraWeightsName = context->request->loraWeightsName;
+        LOG_INFO("[Disagg][Req=%llu] encoding(start): batch=%d slotOffset=%d",
+            static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset);
+        context->samplingWorkspace = rt::Tensor({mMaxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8,
+            "DisaggRuntime::ctxSamplingWorkspace");
+        context->inputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+            rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::ctxInputIds");
+        context->hostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+            rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::ctxHostPackedInputIds");
+        context->hostContextLengths = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::ctxContextLen");
+        context->outputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize},
+            rt::DeviceType::kGPU, DataType::kFLOAT, "DisaggRuntime::ctxOutputLogits");
+        context->selectedIndices = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::ctxSelected");
+        context->hostSelectedTokenIds = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::ctxHostSelected");
+        context->hostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            DataType::kINT32, "DisaggRuntime::ctxReuseKVCacheLengths");
         context->request->formattedRequests.resize(context->activeBatchSize);
         context->batchSystemPrompts.reserve(context->activeBatchSize);
 
@@ -502,9 +582,25 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
 
         context->tokenCount
             = calculateTokenCounts(context->batchedInputIds, context->batchSystemPrompts, context->loraWeightsName);
+        LOG_INFO("[Disagg][Req=%llu] encoding(end): reusedTokens=%d computedTokens=%d",
+            static_cast<unsigned long long>(context->requestId), context->tokenCount.totalReusedTokens,
+            context->tokenCount.totalComputedTokens);
         CUDA_CHECK(cudaEventCreateWithFlags(&context->multimodalDone, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(context->multimodalDone, mMultimodalStream));
         mPrefillQueue.push(std::move(context));
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("multimodalWorkerMain exception: %s", e.what());
+            setFailedResult(*context, e.what());
+            finalizeContext(*context);
+        }
+        catch (...)
+        {
+            LOG_ERROR("multimodalWorkerMain unknown exception.");
+            setFailedResult(*context, "unknown exception in multimodal worker");
+            finalizeContext(*context);
+        }
     }
 }
 
@@ -513,17 +609,18 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
     std::shared_ptr<StageContext> context;
     while (mPrefillQueue.pop(context))
     {
+        try
+        {
         CUDA_CHECK(cudaStreamWaitEvent(mPrefillStream, context->multimodalDone, 0));
 
-        if (!setUpForPrefillExecution(
-                context->batchedInputIds, context->batchSystemPrompts, context->loraWeightsName, mPrefillStream))
+        if (!setUpForPrefillExecution(*context, mPrefillStream))
         {
             setFailedResult(*context, "prefill setup failed");
             finalizeContext(*context);
             continue;
         }
 
-        int32_t const maxInputIdsLength = mInputIds.getShape()[1];
+        int32_t const maxInputIdsLength = context->inputIds.getShape()[1];
         context->maxGenerationLength = context->request->maxGenerateLength;
         if (maxInputIdsLength + context->maxGenerationLength > mEngineConfig.maxKVCacheCapacity)
         {
@@ -534,18 +631,23 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
         context->generationIter = 0;
         context->outputIds.assign(context->activeBatchSize, std::vector<int32_t>{});
         context->finishedStates.assign(context->activeBatchSize, false);
-        check::check(mSelectedIndices.reshape({context->activeBatchSize, 1}), "Failed to reshape selected indices.");
-        check::check(mHostSelectedTokenIds.reshape({context->activeBatchSize}), "Failed to reshape host selected token IDs.");
+        check::check(context->selectedIndices.reshape({context->activeBatchSize, 1}), "Failed to reshape selected indices.");
+        check::check(
+            context->hostSelectedTokenIds.reshape({context->activeBatchSize}), "Failed to reshape host selected token IDs.");
 
         rt::OptionalInputTensor multimodalEmbeddings
             = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
         rt::OptionalInputTensors extraVisualFeatures
             = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
         rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
+        LOG_INFO("[Disagg][Req=%llu] prefill(start): batch=%d slotOffset=%d inputLen=%d maxGen=%d",
+            static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset,
+            maxInputIdsLength, context->maxGenerationLength);
         {
             TIME_STAGE(metrics::StageNames::kLLM_PREFILL, mPrefillStream);
-            if (!mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings, extraVisualFeatures,
-                    mOutputLogits, outputHiddenStates, mPrefillStream))
+            std::lock_guard<std::mutex> runnerLock(mRunnerPrefillMutex);
+            if (!mLLMEngineRunner->executePrefillStep(context->inputIds, context->hostContextLengths, multimodalEmbeddings,
+                    extraVisualFeatures, context->outputLogits, outputHiddenStates, context->slotOffset, mPrefillStream))
             {
                 setFailedResult(*context, "prefill execution failed");
                 finalizeContext(*context);
@@ -553,12 +655,27 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
             }
             sampleTokens(*context, mPrefillStream);
         }
+        LOG_INFO("[Disagg][Req=%llu] prefill(end): generationIter=%d unfinished=%d",
+            static_cast<unsigned long long>(context->requestId), context->generationIter, context->unFinishedBatchNum);
         mPrefillMetrics.recordRun(context->tokenCount.totalReusedTokens, context->tokenCount.totalComputedTokens);
 
-        check::check(mInputIds.reshape({context->activeBatchSize, 1}), "Failed to reshape decode input IDs.");
+        check::check(context->inputIds.reshape({context->activeBatchSize, 1}), "Failed to reshape decode input IDs.");
         CUDA_CHECK(cudaEventCreateWithFlags(&context->prefillDone, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(context->prefillDone, mPrefillStream));
         mDecodeQueue.push(std::move(context));
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("prefillWorkerMain exception: %s", e.what());
+            setFailedResult(*context, e.what());
+            finalizeContext(*context);
+        }
+        catch (...)
+        {
+            LOG_ERROR("prefillWorkerMain unknown exception.");
+            setFailedResult(*context, "unknown exception in prefill worker");
+            finalizeContext(*context);
+        }
     }
 }
 
@@ -567,12 +684,19 @@ void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
     std::shared_ptr<StageContext> context;
     while (mDecodeQueue.pop(context))
     {
+        try
+        {
         CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, context->prefillDone, 0));
+        LOG_INFO("[Disagg][Req=%llu] decode(start): batch=%d slotOffset=%d maxGen=%d",
+            static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset,
+            context->maxGenerationLength);
         {
             TIME_STAGE(metrics::StageNames::kLLM_GENERATION, mDecodeStream);
             while (context->unFinishedBatchNum > 0 && context->generationIter < context->maxGenerationLength)
             {
-                if (!mLLMEngineRunner->executeVanillaDecodingStep(mSelectedIndices, mOutputLogits, mDecodeStream))
+                std::lock_guard<std::mutex> runnerLock(mRunnerDecodeMutex);
+                if (!mLLMEngineRunner->executeVanillaDecodingStep(
+                        context->selectedIndices, context->outputLogits, context->slotOffset, mDecodeStream))
                 {
                     setFailedResult(*context, "decode execution failed");
                     break;
@@ -580,6 +704,9 @@ void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
                 sampleTokens(*context, mDecodeStream);
             }
         }
+        LOG_INFO("[Disagg][Req=%llu] decode(end): generationIter=%d unfinished=%d status=%s",
+            static_cast<unsigned long long>(context->requestId), context->generationIter, context->unFinishedBatchNum,
+            context->errorMessage.empty() ? "ok" : "failed");
 
         if (context->errorMessage.empty())
         {
@@ -604,11 +731,30 @@ void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
         }
 
         finalizeContext(*context);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("decodeWorkerMain exception: %s", e.what());
+            setFailedResult(*context, e.what());
+            finalizeContext(*context);
+        }
+        catch (...)
+        {
+            LOG_ERROR("decodeWorkerMain unknown exception.");
+            setFailedResult(*context, "unknown exception in decode worker");
+            finalizeContext(*context);
+        }
     }
 }
 
 void LLMInferenceDisaggregationRuntime::finalizeContext(StageContext& context)
 {
+    bool expected = false;
+    if (!context.completionSet.compare_exchange_strong(expected, true))
+    {
+        return;
+    }
+
     if (context.multimodalDone)
     {
         CUDA_CHECK(cudaEventDestroy(context.multimodalDone));
@@ -623,31 +769,22 @@ void LLMInferenceDisaggregationRuntime::finalizeContext(StageContext& context)
     AsyncRequestResult result;
     result.success = context.status;
     result.response = std::move(context.response);
-    context.completionPromise.set_value(std::move(result));
-    context.pipelineLock.reset();
+    try
+    {
+        context.completionPromise.set_value(std::move(result));
+    }
+    catch (std::exception const& e)
+    {
+        LOG_WARNING("finalizeContext promise set_value exception: %s", e.what());
+    }
+    releaseSlotRange(context.slotOffset, context.activeBatchSize);
 }
 
 bool LLMInferenceDisaggregationRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
-    bool captureStatus{true};
-    int32_t const minSupportedBatchSize = 1;
-    for (int32_t batchSize = minSupportedBatchSize; batchSize <= mEngineConfig.maxSupportedBatchSize; ++batchSize)
-    {
-        check::check(mSelectedIndices.reshape({batchSize, 1}), "Failed to reshape selected indices for CUDA graph capture.");
-        check::check(
-            mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize}), "Failed to reshape output logits for capture.");
-        captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-            mSelectedIndices, mOutputLogits, mEmptyLoraWeightsName, stream);
-        if (mEngineConfig.maxSupportedLoraRank > 0)
-        {
-            for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
-            {
-                captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-                    mSelectedIndices, mOutputLogits, loraWeightsName, stream);
-            }
-        }
-    }
-    return captureStatus;
+    (void) stream;
+    LOG_WARNING("Disaggregation runtime disables decode CUDA graph for stability.");
+    return false;
 }
 
 bool LLMInferenceDisaggregationRuntime::genAndSaveSystemPromptKVCache(
@@ -674,7 +811,24 @@ bool LLMInferenceDisaggregationRuntime::genAndSaveSystemPromptKVCache(
 
     std::vector<std::vector<int32_t>> batchedInputIds(1, tokenizedPrompt);
     std::vector<std::string> batchedSystemPrompts(1, prompt);
-    if (!setUpForPrefillExecution(batchedInputIds, batchedSystemPrompts, loraWeightsName, stream))
+    StageContext cacheContext;
+    cacheContext.activeBatchSize = 1;
+    cacheContext.slotOffset = 0;
+    cacheContext.batchedInputIds = batchedInputIds;
+    cacheContext.batchSystemPrompts = batchedSystemPrompts;
+    cacheContext.loraWeightsName = loraWeightsName;
+    cacheContext.inputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+        rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::cacheInputIds");
+    cacheContext.hostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+        rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::cacheHostPackedInputIds");
+    cacheContext.hostContextLengths = rt::Tensor(
+        {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::cacheContextLen");
+    cacheContext.outputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize},
+        rt::DeviceType::kGPU, DataType::kFLOAT, "DisaggRuntime::cacheOutputLogits");
+    cacheContext.hostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+        DataType::kINT32, "DisaggRuntime::cacheReuseKVCacheLengths");
+
+    if (!setUpForPrefillExecution(cacheContext, stream))
     {
         return false;
     }
@@ -684,8 +838,8 @@ bool LLMInferenceDisaggregationRuntime::genAndSaveSystemPromptKVCache(
     rt::OptionalInputTensors extraVisualFeatures
         = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
-    if (!mLLMEngineRunner->executePrefillStep(
-            mInputIds, mHostContextLengths, multimodalEmbeddings, extraVisualFeatures, mOutputLogits, outputHiddenStates, stream))
+    if (!mLLMEngineRunner->executePrefillStep(cacheContext.inputIds, cacheContext.hostContextLengths, multimodalEmbeddings,
+            extraVisualFeatures, cacheContext.outputLogits, outputHiddenStates, cacheContext.slotOffset, stream))
     {
         return false;
     }

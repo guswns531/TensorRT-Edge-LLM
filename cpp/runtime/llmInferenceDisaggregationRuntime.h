@@ -27,6 +27,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -157,9 +158,11 @@ private:
 
     struct StageContext
     {
+        uint64_t requestId{0};
         LLMGenerationRequest const* request{nullptr};
         LLMGenerationResponse response{};
         std::promise<AsyncRequestResult> completionPromise;
+        std::atomic<bool> completionSet{false};
         bool status{false};
         std::string errorMessage;
 
@@ -172,17 +175,26 @@ private:
         int32_t maxGenerationLength{0};
         int32_t unFinishedBatchNum{0};
         int32_t generationIter{0};
+        int32_t slotOffset{0};
+
+        rt::Tensor samplingWorkspace{};
+        rt::Tensor inputIds{};
+        rt::Tensor hostPackedInputIds{};
+        rt::Tensor hostContextLengths{};
+        rt::Tensor outputLogits{};
+        rt::Tensor selectedIndices{};
+        rt::Tensor hostSelectedTokenIds{};
+        rt::Tensor hostReuseKVCacheLengths{};
+
         std::vector<std::vector<int32_t>> outputIds;
         std::vector<bool> finishedStates;
 
         cudaEvent_t multimodalDone{nullptr};
         cudaEvent_t prefillDone{nullptr};
-        std::unique_ptr<std::unique_lock<std::mutex>> pipelineLock{};
     };
 
     bool examineRequest(LLMGenerationRequest const& request);
-    bool setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
-        std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream);
+    bool setUpForPrefillExecution(StageContext& context, cudaStream_t stream);
     TokenCountInfo calculateTokenCounts(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const;
     bool sampleTokens(StageContext& context, cudaStream_t stream);
@@ -193,6 +205,8 @@ private:
     void decodeWorkerMain();
     void finalizeContext(StageContext& context);
     void stopWorkers();
+    int32_t allocateSlotRange(int32_t slotCount);
+    void releaseSlotRange(int32_t slotOffset, int32_t slotCount);
     bool applyDisaggregatedTpcMasks(int32_t decodeTpcCount);
     bool applyTpcMaskToStream(cudaStream_t stream, __uint128_t mask, char const* streamName) const;
     static std::vector<uint32_t> getJetsonThorTpcOrderFromGpcMasks();
@@ -211,6 +225,7 @@ private:
     rt::Tensor mHostSelectedTokenIds{};
     rt::Tensor mHostReuseKVCacheLengths{};
     rt::Tensor mVocabMappingTable{};
+    int64_t mMaxSamplingWorkspaceSize{0};
     std::string mEmptyLoraWeightsName{""};
     LLMEngineRunnerConfig mEngineConfig{};
 
@@ -229,9 +244,13 @@ private:
     std::thread mPrefillWorker;
     std::thread mDecodeWorker;
 
-    // Shared runtime tensors/runner state are currently not request-isolated.
-    // This lock keeps correctness while we stage toward queue-aware scheduling.
-    std::mutex mExecutionMutex;
+    std::mutex mSlotAllocatorMutex;
+    std::condition_variable mSlotAllocatorCv;
+    std::vector<bool> mSlotUsage;
+
+    std::mutex mRunnerPrefillMutex;
+    std::mutex mRunnerDecodeMutex;
+    std::atomic<uint64_t> mRequestCounter{0};
 };
 
 } // namespace rt

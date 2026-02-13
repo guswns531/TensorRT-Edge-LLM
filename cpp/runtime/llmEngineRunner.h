@@ -116,6 +116,9 @@ public:
     bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
         rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors,
         rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
+    bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
+        rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors,
+        rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates, int32_t slotOffset, cudaStream_t stream);
 
     //! API entry to execute one vanilla decoding engine action for a batched request. The API will perform decoding
     //!     operations fill the KVCache of the new generated tokens and produce the output logits. The decoding
@@ -127,6 +130,8 @@ public:
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
     bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream);
+    bool executeVanillaDecodingStep(
+        rt::Tensor const& inputIds, rt::Tensor& outputLogits, int32_t slotOffset, cudaStream_t stream);
 
     //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input_token_ids.
     //!     baseTreeDecodingMask denote the relationship between the draft tree nodes.
@@ -192,7 +197,8 @@ public:
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                          //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                        //!< TensorRT engine
-    rt::Tensor mExecContextMemory{};                                       //!< Device memory for the execution contexts
+    rt::Tensor mPrefillExecContextMemory{};                                //!< Device memory for prefill execution context
+    rt::Tensor mGenerationExecContextMemory{};                             //!< Device memory for generation execution context
     std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext; //!< Prefill execution context
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
@@ -257,6 +263,9 @@ private:
      * @return True on success, false on failure
      */
     bool bindKVCacheToEngine(int32_t activeBatchSize);
+    bool bindKVCacheToEngine(int32_t activeBatchSize, int32_t slotOffset);
+    bool bindKVCacheToPrefillEngine(int32_t activeBatchSize, int32_t slotOffset);
+    bool bindKVCacheToGenerationEngine(int32_t activeBatchSize, int32_t slotOffset);
 
     //! @brief Validate inputs for prefill step
     bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
@@ -265,6 +274,8 @@ private:
 
     //! @brief Validate inputs for vanilla decoding step
     bool vanillaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
+    bool vanillaDecodingStepInputValidation(
+        rt::Tensor const& inputIds, rt::Tensor const& outputLogits, int32_t slotOffset);
 
     //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
