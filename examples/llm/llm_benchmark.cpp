@@ -20,12 +20,14 @@
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
+#include "runtime/llmInferenceDisaggregationRuntime.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <getopt.h>
 #include <iomanip>
 #include <iostream>
@@ -60,7 +62,8 @@ enum LLMInferenceOptionId : int
     EAGLE_VERIFY_TREE_SIZE = 913,
     BATCH_SIZE = 914,
     MAX_GENERATE_LENGTH = 915,
-    BENCHMARK_COUNT = 916
+    BENCHMARK_COUNT = 916,
+    DISAGGREGATION = 917
 };
 
 // Struct to hold Eagle-specific arguments for speculative decoding
@@ -99,6 +102,7 @@ struct LLMInferenceArgs
     int32_t batchSize{-1};         // -1 means use value from input file
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     int32_t benchmarkCount{1};     // Repeat full input request set N times
+    bool disaggregation{false};
     EagleArgs eagleArgs;
 };
 
@@ -109,7 +113,7 @@ void printUsage(char const* programName)
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] "
-                 "[--benchmarkCount=<number>] "
+                 "[--benchmarkCount=<number>] [--disaggregation] "
                  "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
                  "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
@@ -127,6 +131,7 @@ void printUsage(char const* programName)
     std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "  --benchmarkCount          Repeat full input requests N times (default: 1)" << std::endl;
+    std::cerr << "  --disaggregation          Enable disaggregation runtime (3-stage async workers)" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
     std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
@@ -156,7 +161,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
-        {"benchmarkCount", required_argument, 0, LLMInferenceOptionId::BENCHMARK_COUNT}, {0, 0, 0, 0}};
+        {"benchmarkCount", required_argument, 0, LLMInferenceOptionId::BENCHMARK_COUNT},
+        {"disaggregation", no_argument, 0, LLMInferenceOptionId::DISAGGREGATION},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -285,6 +292,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::DISAGGREGATION: args.disaggregation = true; break;
         default: return false;
         }
     }
@@ -343,6 +351,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Eagle draft topK: %d", args.eagleArgs.draftTopK);
         LOG_INFO("Eagle draft step: %d", args.eagleArgs.draftStep);
         LOG_INFO("Eagle verify tree size: %d", args.eagleArgs.verifyTreeSize);
+    }
+    if (args.disaggregation)
+    {
+        LOG_INFO("Disaggregation runtime enabled");
+    }
+    if (args.eagleArgs.enabled && args.disaggregation)
+    {
+        LOG_ERROR("Cannot enable both --eagle and --disaggregation at the same time.");
+        return false;
     }
 
     if (args.debug)
@@ -662,6 +679,7 @@ int main(int argc, char* argv[])
 
     // Create runtime based on mode
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
+    std::unique_ptr<rt::LLMInferenceDisaggregationRuntime> disaggregationRuntime{nullptr};
     std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -710,6 +728,23 @@ int main(int argc, char* argv[])
                 "execution.");
         }
     }
+    else if (args.disaggregation)
+    {
+        try
+        {
+            disaggregationRuntime = std::make_unique<rt::LLMInferenceDisaggregationRuntime>(
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize LLMInferenceDisaggregationRuntime: %s", e.what());
+            return EXIT_FAILURE;
+        }
+        if (!disaggregationRuntime->captureDecodingCUDAGraph(stream))
+        {
+            LOG_WARNING("Failed to capture CUDA graph for disaggregation decode usage.");
+        }
+    }
     else
     {
         // Standard mode
@@ -745,6 +780,13 @@ int main(int argc, char* argv[])
             {
                 requestStatus = eagleInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
             }
+            else if (args.disaggregation)
+            {
+                auto warmupFuture = disaggregationRuntime->submitRequestAsync(firstRequest);
+                auto warmupResult = warmupFuture.get();
+                warmupResponse = std::move(warmupResult.response);
+                requestStatus = warmupResult.success;
+            }
             else
             {
                 requestStatus = llmInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
@@ -776,7 +818,105 @@ int main(int argc, char* argv[])
     size_t totalRequests = batchedRequests.size() * static_cast<size_t>(args.benchmarkCount);
     size_t processedRequests = 0;
     LOG_INFO("Processing %zu batched requests (%d repetition(s))...", totalRequests, args.benchmarkCount);
-    for (int32_t repetition = 0; repetition < args.benchmarkCount; ++repetition)
+    if (args.disaggregation)
+    {
+        struct PendingRequest
+        {
+            size_t globalRequestIdx{0};
+            rt::LLMGenerationRequest* request{nullptr};
+            std::future<rt::LLMInferenceDisaggregationRuntime::AsyncRequestResult> future;
+        };
+
+        std::vector<PendingRequest> pendingRequests;
+        pendingRequests.reserve(totalRequests);
+        for (int32_t repetition = 0; repetition < args.benchmarkCount; ++repetition)
+        {
+            for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
+            {
+                auto& request = batchedRequests[requestIdx];
+                size_t globalRequestIdx = static_cast<size_t>(repetition) * batchedRequests.size() + requestIdx;
+                PendingRequest pending;
+                pending.globalRequestIdx = globalRequestIdx;
+                pending.request = &request;
+                pending.future = disaggregationRuntime->submitRequestAsync(request);
+                pendingRequests.emplace_back(std::move(pending));
+            }
+        }
+
+        for (auto& pending : pendingRequests)
+        {
+            auto result = pending.future.get();
+            auto& request = *pending.request;
+            auto& response = result.response;
+            bool const requestStatus = result.success;
+            ++processedRequests;
+
+            size_t progressInterval = std::max(size_t(1), std::min(totalRequests / 10, size_t(100)));
+            if (processedRequests % progressInterval == 0 || processedRequests == 1 || processedRequests == totalRequests)
+            {
+                LOG_INFO("Progress: %zu/%zu (%f%%)", processedRequests, totalRequests,
+                    100.0 * processedRequests / totalRequests);
+            }
+
+            if (requestStatus)
+            {
+                if (args.dumpOutput)
+                {
+                    for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
+                    {
+                        LOG_INFO("Response for request %zu batch %zu: %s", pending.globalRequestIdx, batchIdx,
+                            response.outputTexts[batchIdx].c_str());
+                    }
+                }
+            }
+            else
+            {
+                hasFailedRequest = true;
+                failedCount++;
+                LOG_ERROR("*** FAILED *** Request %zu failed to process!", pending.globalRequestIdx);
+            }
+
+            for (size_t batchIdx = 0; batchIdx < request.requests.size(); ++batchIdx)
+            {
+                nlohmann::json responseJson;
+                std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
+                responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
+                responseJson["request_idx"] = pending.globalRequestIdx;
+                responseJson["batch_idx"] = batchIdx;
+                nlohmann::json messagesJson = nlohmann::json::array();
+                for (auto const& msg : request.requests[batchIdx].messages)
+                {
+                    nlohmann::json msgJson;
+                    msgJson["role"] = msg.role;
+                    msgJson["content"] = nlohmann::json::array();
+                    for (auto const& content : msg.contents)
+                    {
+                        nlohmann::json contentJson;
+                        contentJson["type"] = content.type;
+                        if (content.type == "text")
+                        {
+                            contentJson["text"] = content.content;
+                        }
+                        else if (content.type == "image")
+                        {
+                            contentJson["image"] = content.content;
+                        }
+                        else if (content.type == "video")
+                        {
+                            contentJson["video"] = content.content;
+                        }
+                        msgJson["content"].push_back(contentJson);
+                    }
+                    messagesJson.push_back(msgJson);
+                }
+                responseJson["messages"] = messagesJson;
+                responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
+                responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
+                outputData["responses"].push_back(responseJson);
+            }
+        }
+    }
+    else for (int32_t repetition = 0; repetition < args.benchmarkCount; ++repetition)
     {
         for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
         {
@@ -899,6 +1039,14 @@ int main(int argc, char* argv[])
             outputMultimodalProfile(profileOutput, multimodalMetrics);
             outputMemoryProfile(profileOutput, memoryMonitor);
         }
+        else if (args.disaggregation)
+        {
+            auto multimodalMetrics = disaggregationRuntime->getMultimodalMetrics();
+            outputPrefillProfile(profileOutput, disaggregationRuntime->getPrefillMetrics());
+            outputGenerationProfile(profileOutput, disaggregationRuntime->getGenerationMetrics());
+            outputMultimodalProfile(profileOutput, multimodalMetrics);
+            outputMemoryProfile(profileOutput, memoryMonitor);
+        }
         else
         {
             auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
@@ -921,6 +1069,14 @@ int main(int argc, char* argv[])
             auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
             addJsonPrefillSummary(profileJson, prefillMetrics);
             addJsonEagleGenerationSummary(profileJson, eagleGenerationMetrics);
+            addJsonMultimodalSummary(profileJson, multimodalMetrics);
+            addJsonTimingStages(profileJson);
+        }
+        else if (args.disaggregation)
+        {
+            auto multimodalMetrics = disaggregationRuntime->getMultimodalMetrics();
+            addJsonPrefillSummary(profileJson, disaggregationRuntime->getPrefillMetrics());
+            addJsonGenerationSummary(profileJson, disaggregationRuntime->getGenerationMetrics());
             addJsonMultimodalSummary(profileJson, multimodalMetrics);
             addJsonTimingStages(profileJson);
         }
@@ -994,6 +1150,26 @@ int main(int argc, char* argv[])
             return -1;
         };
 
+        auto getStageTotalGpuTimeMs = [&](std::string const& stageId) -> double {
+            if (!profileJson.contains("stages") || !profileJson["stages"].is_array())
+            {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            for (auto const& stage : profileJson["stages"])
+            {
+                if (!stage.contains("stage_id") || !stage["stage_id"].is_string()
+                    || stage["stage_id"].get<std::string>() != stageId)
+                {
+                    continue;
+                }
+                if (stage.contains("total_gpu_time_ms") && stage["total_gpu_time_ms"].is_number())
+                {
+                    return stage["total_gpu_time_ms"].get<double>();
+                }
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        };
+
         auto getDecodeTokenSampleCount = [&]() -> int64_t {
             if (profileJson.contains("generation") && profileJson["generation"].contains("generated_tokens")
                 && profileJson["generation"]["generated_tokens"].is_number_integer())
@@ -1010,6 +1186,61 @@ int main(int argc, char* argv[])
                 return std::numeric_limits<double>::quiet_NaN();
             }
             return numerator / denominator;
+        };
+
+        auto getTotalResponseCount = [&]() -> int64_t {
+            if (outputData.contains("responses") && outputData["responses"].is_array())
+            {
+                return static_cast<int64_t>(outputData["responses"].size());
+            }
+            return -1;
+        };
+
+        auto getStageRequestMetric = [&](std::string const& stageId, std::string const& metricName) -> double {
+            int64_t totalResponses = getTotalResponseCount();
+            int64_t stageRuns = getStageSampleCount(stageId);
+            if (totalResponses <= 0 || stageRuns <= 0)
+            {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            double requestsPerRun = static_cast<double>(totalResponses) / static_cast<double>(stageRuns);
+            if (metricName == "mean_ms")
+            {
+                return safeDivide(getStageMetric(stageId, "avg_mean_ms"), requestsPerRun);
+            }
+            if (metricName == "median_ms")
+            {
+                return safeDivide(getStageMetric(stageId, "median_ms"), requestsPerRun);
+            }
+            if (metricName == "p99_ms")
+            {
+                return safeDivide(getStageMetric(stageId, "p99_ms"), requestsPerRun);
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        };
+
+        auto getRequestTotalMetric = [&](std::string const& metricName) -> double {
+            double encoding = getStageRequestMetric("multimodal_processing", metricName);
+            double prefill = getStageRequestMetric("llm_prefill", metricName);
+            double decode = getStageRequestMetric("llm_generation", metricName);
+            if (std::isnan(encoding) || std::isnan(prefill) || std::isnan(decode) || std::isinf(encoding)
+                || std::isinf(prefill) || std::isinf(decode))
+            {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return encoding + prefill + decode;
+        };
+
+        auto getRequestTotalThroughput = [&]() -> double {
+            int64_t totalResponses = getTotalResponseCount();
+            double totalPipelineTimeMs = getStageTotalGpuTimeMs("multimodal_processing")
+                + getStageTotalGpuTimeMs("llm_prefill") + getStageTotalGpuTimeMs("llm_generation");
+            if (totalResponses <= 0 || std::isnan(totalPipelineTimeMs) || std::isinf(totalPipelineTimeMs)
+                || totalPipelineTimeMs <= 0.0)
+            {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return static_cast<double>(totalResponses) / (totalPipelineTimeMs / 1000.0);
         };
 
         auto getDecodeTokenMetric = [&](std::string const& metricName) -> double {
@@ -1107,7 +1338,14 @@ int main(int argc, char* argv[])
                     << std::setw(12) << fmt(getDecodeTokenMetric("median_ms"))
                     << std::setw(12) << fmt(getDecodeTokenMetric("p99_ms")) << std::setw(20)
                     << (fmt(getThroughput("decode")) + " tok/s") << "\n";
+        benchOutput << std::left << std::setw(10) << "request" << std::right
+                    << std::setw(10) << fmtCount(getTotalResponseCount())
+                    << std::setw(14) << fmt(getRequestTotalMetric("mean_ms"))
+                    << std::setw(12) << fmt(getRequestTotalMetric("median_ms"))
+                    << std::setw(12) << fmt(getRequestTotalMetric("p99_ms")) << std::setw(20)
+                    << (fmt(getRequestTotalThroughput()) + " req/s") << "\n";
         benchOutput << "decode metrics are per-token latency (ms/token)\n";
+        benchOutput << "request row is end-to-end (encoding+prefill+decode) per request\n";
         benchOutput << "=======================================\n";
         LOG_INFO("%s", benchOutput.str().c_str());
     }

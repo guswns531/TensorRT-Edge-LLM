@@ -20,12 +20,14 @@
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
+#include "runtime/llmInferenceDisaggregationRuntime.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <getopt.h>
 #include <iomanip>
 #include <iostream>
@@ -57,7 +59,8 @@ enum LLMInferenceOptionId : int
     EAGLE_DRAFT_STEP = 912,
     EAGLE_VERIFY_TREE_SIZE = 913,
     BATCH_SIZE = 914,
-    MAX_GENERATE_LENGTH = 915
+    MAX_GENERATE_LENGTH = 915,
+    DISAGGREGATION = 916
 };
 
 // Struct to hold Eagle-specific arguments for speculative decoding
@@ -95,6 +98,7 @@ struct LLMInferenceArgs
     // For other sampling parameters (temperature, top_p, top_k), please specify them in the input JSON file
     int32_t batchSize{-1};         // -1 means use value from input file
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
+    bool disaggregation{false};
     EagleArgs eagleArgs;
 };
 
@@ -104,7 +108,7 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] "
+                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] [--disaggregation] "
                  "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
                  "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
@@ -124,6 +128,7 @@ void printUsage(char const* programName)
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
     std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
+    std::cerr << "  --disaggregation          Enable disaggregation runtime (3-stage async workers)" << std::endl;
     std::cerr << "  --eagleDraftTopK          Number of tokens selected per drafting step (default: 10)" << std::endl;
     std::cerr << "                            Controls branching factor at each draft tree level" << std::endl;
     std::cerr << "  --eagleDraftStep          Number of drafting steps to perform (default: 6)" << std::endl;
@@ -149,7 +154,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
-        {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH}, {0, 0, 0, 0}};
+        {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
+        {"disaggregation", no_argument, 0, LLMInferenceOptionId::DISAGGREGATION},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -262,6 +269,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::DISAGGREGATION: args.disaggregation = true; break;
         default: return false;
         }
     }
@@ -316,6 +324,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Eagle draft topK: %d", args.eagleArgs.draftTopK);
         LOG_INFO("Eagle draft step: %d", args.eagleArgs.draftStep);
         LOG_INFO("Eagle verify tree size: %d", args.eagleArgs.verifyTreeSize);
+    }
+    if (args.disaggregation)
+    {
+        LOG_INFO("Disaggregation runtime enabled");
+    }
+    if (args.eagleArgs.enabled && args.disaggregation)
+    {
+        LOG_ERROR("Cannot enable both --eagle and --disaggregation at the same time.");
+        return false;
     }
 
     if (args.debug)
@@ -634,6 +651,7 @@ int main(int argc, char* argv[])
 
     // Create runtime based on mode
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
+    std::unique_ptr<rt::LLMInferenceDisaggregationRuntime> disaggregationRuntime{nullptr};
     std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -682,6 +700,23 @@ int main(int argc, char* argv[])
                 "execution.");
         }
     }
+    else if (args.disaggregation)
+    {
+        try
+        {
+            disaggregationRuntime = std::make_unique<rt::LLMInferenceDisaggregationRuntime>(
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize LLMInferenceDisaggregationRuntime: %s", e.what());
+            return EXIT_FAILURE;
+        }
+        if (!disaggregationRuntime->captureDecodingCUDAGraph(stream))
+        {
+            LOG_WARNING("Failed to capture CUDA graph for disaggregation decode usage.");
+        }
+    }
     else
     {
         // Standard mode
@@ -716,6 +751,13 @@ int main(int argc, char* argv[])
             if (args.eagleArgs.enabled)
             {
                 requestStatus = eagleInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
+            }
+            else if (args.disaggregation)
+            {
+                auto warmupFuture = disaggregationRuntime->submitRequestAsync(firstRequest);
+                auto warmupResult = warmupFuture.get();
+                warmupResponse = std::move(warmupResult.response);
+                requestStatus = warmupResult.success;
             }
             else
             {
@@ -764,6 +806,13 @@ int main(int argc, char* argv[])
         if (args.eagleArgs.enabled)
         {
             requestStatus = eagleInferenceRuntime->handleRequest(request, response, stream);
+        }
+        else if (args.disaggregation)
+        {
+            auto requestFuture = disaggregationRuntime->submitRequestAsync(request);
+            auto requestResult = requestFuture.get();
+            response = std::move(requestResult.response);
+            requestStatus = requestResult.success;
         }
         else
         {
@@ -866,6 +915,14 @@ int main(int argc, char* argv[])
             outputMultimodalProfile(profileOutput, multimodalMetrics);
             outputMemoryProfile(profileOutput, memoryMonitor);
         }
+        else if (args.disaggregation)
+        {
+            auto multimodalMetrics = disaggregationRuntime->getMultimodalMetrics();
+            outputPrefillProfile(profileOutput, disaggregationRuntime->getPrefillMetrics());
+            outputGenerationProfile(profileOutput, disaggregationRuntime->getGenerationMetrics());
+            outputMultimodalProfile(profileOutput, multimodalMetrics);
+            outputMemoryProfile(profileOutput, memoryMonitor);
+        }
         else
         {
             auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
@@ -895,6 +952,21 @@ int main(int argc, char* argv[])
                 // Add high-level metrics
                 addJsonPrefillSummary(profileJson, prefillMetrics);
                 addJsonEagleGenerationSummary(profileJson, eagleGenerationMetrics);
+                addJsonMultimodalSummary(profileJson, multimodalMetrics);
+
+                // Add detailed timing stages
+                addJsonTimingStages(profileJson);
+
+                // Add memory usage
+                addJsonMemorySummary(profileJson, memoryMonitor);
+            }
+            else if (args.disaggregation)
+            {
+                auto multimodalMetrics = disaggregationRuntime->getMultimodalMetrics();
+
+                // Add high-level metrics
+                addJsonPrefillSummary(profileJson, disaggregationRuntime->getPrefillMetrics());
+                addJsonGenerationSummary(profileJson, disaggregationRuntime->getGenerationMetrics());
                 addJsonMultimodalSummary(profileJson, multimodalMetrics);
 
                 // Add detailed timing stages
