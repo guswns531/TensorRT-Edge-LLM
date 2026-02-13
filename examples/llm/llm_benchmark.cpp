@@ -32,6 +32,8 @@
 #include <iomanip>
 #include <iostream>
 #include <cmath>
+#include <array>
+#include <cstdint>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -63,7 +65,8 @@ enum LLMInferenceOptionId : int
     BATCH_SIZE = 914,
     MAX_GENERATE_LENGTH = 915,
     BENCHMARK_COUNT = 916,
-    DISAGGREGATION = 917
+    DISAGGREGATION = 917,
+    TPC_COUNT = 918
 };
 
 // Struct to hold Eagle-specific arguments for speculative decoding
@@ -101,10 +104,100 @@ struct LLMInferenceArgs
     // For other sampling parameters (temperature, top_p, top_k), please specify them in the input JSON file
     int32_t batchSize{-1};         // -1 means use value from input file
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
+    int32_t tpcCount{-1};          // -1 means disabled
     int32_t benchmarkCount{1};     // Repeat full input request set N times
     bool disaggregation{false};
     EagleArgs eagleArgs;
 };
+
+namespace
+{
+constexpr size_t kCuda130MaskOffsetJetson = 0x54c;
+constexpr std::array<uint32_t, 3> kJetsonThorGpcMasks{
+    0x049, // GPC0 -> TPC {0,3,6}
+    0x092, // GPC1 -> TPC {1,4,7}
+    0x324 // GPC2 -> TPC {2,5,8,9}
+};
+
+struct StreamSmMaskV2
+{
+    uint32_t enabled;
+    uint32_t mask[4];
+};
+
+std::vector<uint32_t> getJetsonThorTpcOrderFromGpcMasks()
+{
+    std::vector<uint32_t> order;
+    order.reserve(10);
+    for (auto const gpcMask : kJetsonThorGpcMasks)
+    {
+        for (uint32_t bit = 0; bit < 32; ++bit)
+        {
+            if (gpcMask & (1u << bit))
+            {
+                order.push_back(bit);
+            }
+        }
+    }
+    return order;
+}
+
+bool applyTpcMaskToStream(cudaStream_t stream, int32_t tpcCount)
+{
+    static const std::vector<uint32_t> kJetsonThorTpcOrder = getJetsonThorTpcOrderFromGpcMasks();
+    if (kJetsonThorTpcOrder.empty())
+    {
+        LOG_ERROR("Failed to build Jetson Thor TPC order from GPC masks.");
+        return false;
+    }
+
+    if (tpcCount <= 0 || tpcCount > static_cast<int32_t>(kJetsonThorTpcOrder.size()))
+    {
+        LOG_ERROR("Invalid tpcCount=%d. Expected range is [1, %zu] for Jetson Thor.", tpcCount,
+            kJetsonThorTpcOrder.size());
+        return false;
+    }
+
+    int cudaRuntimeVersion = 0;
+    if (cudaRuntimeGetVersion(&cudaRuntimeVersion) != cudaSuccess)
+    {
+        LOG_ERROR("Failed to get CUDA runtime version for TPC mask.");
+        return false;
+    }
+    if (cudaRuntimeVersion / 1000 != 13)
+    {
+        LOG_ERROR("TPC mask currently supports CUDA 13.x only. Detected runtime version=%d", cudaRuntimeVersion);
+        return false;
+    }
+
+    auto streamStructBase = *reinterpret_cast<char**>(stream);
+    if (streamStructBase == nullptr)
+    {
+        LOG_ERROR("Failed to resolve internal stream struct for TPC mask.");
+        return false;
+    }
+
+    auto* hwMask = reinterpret_cast<StreamSmMaskV2*>(streamStructBase + kCuda130MaskOffsetJetson);
+
+    // libsmctrl semantics: 0-bit means enabled TPC, 1-bit means disabled TPC.
+    // Start with all disabled and clear bits for selected TPCs.
+    __uint128_t fullMask = ~static_cast<__uint128_t>(0);
+    for (int32_t i = 0; i < tpcCount; ++i)
+    {
+        fullMask &= ~(static_cast<__uint128_t>(1) << kJetsonThorTpcOrder[static_cast<size_t>(i)]);
+    }
+
+    hwMask->enabled = 1;
+    hwMask->mask[0] = static_cast<uint32_t>(fullMask);
+    hwMask->mask[1] = static_cast<uint32_t>(fullMask >> 32);
+    hwMask->mask[2] = static_cast<uint32_t>(fullMask >> 64);
+    hwMask->mask[3] = static_cast<uint32_t>(fullMask >> 96);
+
+    LOG_INFO("Applied TPC mask to stream: tpcCount=%d, mask64=0x%016llx", tpcCount,
+        static_cast<unsigned long long>(fullMask));
+    return true;
+}
+} // namespace
 
 void printUsage(char const* programName)
 {
@@ -112,7 +205,7 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] "
+                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--tpcCount=<number>] [--eagle] "
                  "[--benchmarkCount=<number>] [--disaggregation] "
                  "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
                  "[--eagleVerifyTreeSize=<number>]"
@@ -130,6 +223,7 @@ void printUsage(char const* programName)
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
     std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
+    std::cerr << "  --tpcCount                Enable first N TPCs using Jetson Thor GPC/TPC map (1..10)" << std::endl;
     std::cerr << "  --benchmarkCount          Repeat full input requests N times (default: 1)" << std::endl;
     std::cerr << "  --disaggregation          Enable disaggregation runtime (3-stage async workers)" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
@@ -161,6 +255,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
+        {"tpcCount", required_argument, 0, LLMInferenceOptionId::TPC_COUNT},
         {"benchmarkCount", required_argument, 0, LLMInferenceOptionId::BENCHMARK_COUNT},
         {"disaggregation", no_argument, 0, LLMInferenceOptionId::DISAGGREGATION},
         {0, 0, 0, 0}};
@@ -276,6 +371,24 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::TPC_COUNT:
+            try
+            {
+                args.tpcCount = std::stoi(optarg);
+                auto const tpcLimit = static_cast<int32_t>(getJetsonThorTpcOrderFromGpcMasks().size());
+                if (args.tpcCount <= 0 || args.tpcCount > tpcLimit)
+                {
+                    LOG_ERROR("Invalid tpcCount value: %s (must be in [1, %zu])", optarg,
+                        static_cast<size_t>(tpcLimit));
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid tpcCount value: %s", optarg);
+                return false;
+            }
+            break;
         case LLMInferenceOptionId::BENCHMARK_COUNT:
             try
             {
@@ -343,6 +456,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (args.benchmarkCount > 1)
     {
         LOG_INFO("Benchmark repetitions: %d", args.benchmarkCount);
+    }
+    if (args.tpcCount > 0)
+    {
+        LOG_INFO("TPC stream mask enabled with tpcCount=%d", args.tpcCount);
     }
 
     if (args.eagleArgs.enabled)
@@ -683,6 +800,11 @@ int main(int argc, char* argv[])
     std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
+    if (args.tpcCount > 0 && !applyTpcMaskToStream(stream, args.tpcCount))
+    {
+        LOG_ERROR("Failed to apply TPC stream mask for tpcCount=%d", args.tpcCount);
+        return EXIT_FAILURE;
+    }
 
     if (args.eagleArgs.enabled)
     {
