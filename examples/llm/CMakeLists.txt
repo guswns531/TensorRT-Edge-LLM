@@ -23,3 +23,11 @@ target_include_directories(
   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
+
+add_executable(llm_benchmark llm_benchmark.cpp)
+target_link_libraries(llm_benchmark PRIVATE edgellmCore edgellmTokenizer
+                                            exampleUtils commonLibraryExt)
+target_include_directories(
+  llm_benchmark PRIVATE ${COMMON_INCLUDE_DIRS}
+                        ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(llm_benchmark)

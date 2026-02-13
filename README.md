@@ -1,6 +1,14 @@
 # TensorRT Edge-LLM
 
+## Set up
 ```
+cd build
+cmake .. \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-thor
+make -j$(nproc)
+
 cd ~/Documents/TensorRT-Edge-LLM/
 source .edge/bin/activate
 
@@ -44,4 +52,23 @@ tensorrt-edgellm-export-visual \
   --inputFile input_with_images.json \
   --outputFile output.json
 
+```
+
+```
+./build/examples/llm/llm_benchmark \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile output.json \
+  --benchmarkCount 20
+
+=== Benchmark Summary ===
+count: 20
+stage        samples       mean_ms   median_ms      p99_ms         throughput
+----------------------------------------------------------------------------
+encoding          20       105.219     103.274     141.181   4618.917 imgtok/s
+prefill           20        21.355      20.412      41.316     23975.838 tok/s
+decode          2540         9.319       9.316       9.976       107.304 tok/s
+decode metrics are per-token latency (ms/token)
+=======================================
 ```
