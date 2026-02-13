@@ -20,3 +20,10 @@ docs/build/
 docs/source/cpp_api/
 docs/source/cpp_api.rst
 docs/source/python_api.rst
+
+
+visual_enc_onnx/
+visual_engines/
+engines/
+onnx_models/
+quantized/

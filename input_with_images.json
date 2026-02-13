@@ -1,0 +1,30 @@
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+    "max_generate_length": 128,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
