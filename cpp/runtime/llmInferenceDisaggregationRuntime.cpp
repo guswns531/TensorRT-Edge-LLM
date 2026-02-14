@@ -19,10 +19,8 @@
 
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
-#include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
-#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <algorithm>
@@ -45,14 +43,6 @@ constexpr std::array<uint32_t, 3> kJetsonThorGpcMasks{
     0x324 // GPC2 -> TPC {2,5,8,9}
 };
 
-size_t hashSystemPromptWithLoraWeights(std::string const& systemPrompt, std::string const& loraWeightsName)
-{
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, systemPrompt);
-    hash_utils::hashCombine(hashValue, loraWeightsName);
-    return hashValue;
-}
-
 } // namespace
 
 namespace rt
@@ -62,71 +52,109 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     cudaStream_t stream, int32_t decodeTpcCount)
 {
-    std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
-    std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
-
-    mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
-    mEngineConfig = mLLMEngineRunner->getEngineConfig();
-    mSlotUsage.assign(static_cast<size_t>(mEngineConfig.maxSupportedBatchSize), false);
-
-    int32_t const defaultTopK{0};
-    float const defaultTopP{0.9F};
-    trt_edgellm::SamplingParams samplingParams(
-        mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, 1.0f, defaultTopK, defaultTopP);
-    int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
-        mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, samplingParams));
-    mMaxSamplingWorkspaceSize = maxSamplingWorkspaceSize;
-
-    mSamplingWorkspace = rt::Tensor(
-        {maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8, "DisaggRuntime::mSamplingWorkspace");
-    mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-        rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::mInputIds");
-    mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-        rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::mHostPackedInputIds");
-    mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
-        DataType::kFLOAT, "DisaggRuntime::mOutputLogits");
-    mSelectedIndices = rt::Tensor(
-        {mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::mSelected");
-    mHostSelectedTokenIds = rt::Tensor(
-        {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::mHostSelected");
-    mHostContextLengths = rt::Tensor(
-        {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::mContextLen");
-    mHostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
-        "DisaggRuntime::mReuseKVCacheLengths");
-
-    mTokenizer = std::make_unique<tokenizer::Tokenizer>();
-    if (!mTokenizer->loadFromHF(engineDir))
+    try
     {
-        throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
-    }
+        std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
+        std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
-    if (mEngineConfig.reducedVocabSize > 0)
+        mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
+        mEngineConfig = mLLMEngineRunner->getEngineConfig();
+        mSlotUsage.assign(static_cast<size_t>(mEngineConfig.maxSupportedBatchSize), false);
+
+        int32_t const defaultTopK{0};
+        float const defaultTopP{0.9F};
+        trt_edgellm::SamplingParams samplingParams(
+            mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, 1.0f, defaultTopK, defaultTopP);
+        int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
+            mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, samplingParams));
+        mMaxSamplingWorkspaceSize = maxSamplingWorkspaceSize;
+
+        mSamplingWorkspace = rt::Tensor(
+            {maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8, "DisaggRuntime::mSamplingWorkspace");
+        mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+            rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::mInputIds");
+        mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+            rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::mHostPackedInputIds");
+        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "DisaggRuntime::mOutputLogits");
+        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32,
+            "DisaggRuntime::mSelected");
+        mHostSelectedTokenIds = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::mHostSelected");
+        mHostContextLengths = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::mContextLen");
+        mHostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "DisaggRuntime::mReuseKVCacheLengths");
+
+        mTokenizer = std::make_unique<tokenizer::Tokenizer>();
+        if (!mTokenizer->loadFromHF(engineDir))
+        {
+            throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
+        }
+
+        if (mEngineConfig.reducedVocabSize > 0)
+        {
+            std::filesystem::path const vocabMapPath = std::filesystem::path(engineDir) / binding_names::kVocabMapFileName;
+            std::vector<rt::Tensor> vocabMapTensors;
+            check::check(safetensors::loadSafetensors(vocabMapPath, vocabMapTensors, stream),
+                std::string("Failed to load ") + binding_names::kVocabMapFileName + " from model directory: " + engineDir);
+            check::check(
+                vocabMapTensors.size() == 1, std::string(binding_names::kVocabMapFileName) + " should have 1 tensor");
+            mVocabMappingTable = std::move(vocabMapTensors[0]);
+        }
+
+        if (!multimodalEngineDir.empty())
+        {
+            mMultimodalRunner = MultimodalRunner::create(
+                multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
+        }
+
+        CUDA_CHECK(cudaStreamCreate(&mMultimodalStream));
+        CUDA_CHECK(cudaStreamCreate(&mPrefillStream));
+        CUDA_CHECK(cudaStreamCreate(&mDecodeStream));
+        if (decodeTpcCount > 0 && !applyDisaggregatedTpcMasks(decodeTpcCount))
+        {
+            throw std::runtime_error("Failed to apply disaggregated TPC masks to runtime streams.");
+        }
+
+        mMultimodalWorker = std::thread(&LLMInferenceDisaggregationRuntime::multimodalWorkerMain, this);
+        mPrefillWorker = std::thread(&LLMInferenceDisaggregationRuntime::prefillWorkerMain, this);
+        mDecodeWorker = std::thread(&LLMInferenceDisaggregationRuntime::decodeWorkerMain, this);
+    }
+    catch (...)
     {
-        std::filesystem::path const vocabMapPath = std::filesystem::path(engineDir) / binding_names::kVocabMapFileName;
-        std::vector<rt::Tensor> vocabMapTensors;
-        check::check(safetensors::loadSafetensors(vocabMapPath, vocabMapTensors, stream),
-            std::string("Failed to load ") + binding_names::kVocabMapFileName + " from model directory: " + engineDir);
-        check::check(vocabMapTensors.size() == 1, std::string(binding_names::kVocabMapFileName) + " should have 1 tensor");
-        mVocabMappingTable = std::move(vocabMapTensors[0]);
+        stopWorkers();
+        if (mMultimodalStream)
+        {
+            auto const status = cudaStreamDestroy(mMultimodalStream);
+            if (status != cudaSuccess)
+            {
+                LOG_WARNING("Failed to destroy multimodal stream during constructor cleanup: %s",
+                    cudaGetErrorString(status));
+            }
+            mMultimodalStream = nullptr;
+        }
+        if (mPrefillStream)
+        {
+            auto const status = cudaStreamDestroy(mPrefillStream);
+            if (status != cudaSuccess)
+            {
+                LOG_WARNING(
+                    "Failed to destroy prefill stream during constructor cleanup: %s", cudaGetErrorString(status));
+            }
+            mPrefillStream = nullptr;
+        }
+        if (mDecodeStream)
+        {
+            auto const status = cudaStreamDestroy(mDecodeStream);
+            if (status != cudaSuccess)
+            {
+                LOG_WARNING("Failed to destroy decode stream during constructor cleanup: %s", cudaGetErrorString(status));
+            }
+            mDecodeStream = nullptr;
+        }
+        throw;
     }
-
-    if (!multimodalEngineDir.empty())
-    {
-        mMultimodalRunner = MultimodalRunner::create(
-            multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
-    }
-
-    CUDA_CHECK(cudaStreamCreate(&mMultimodalStream));
-    CUDA_CHECK(cudaStreamCreate(&mPrefillStream));
-    CUDA_CHECK(cudaStreamCreate(&mDecodeStream));
-    if (decodeTpcCount > 0 && !applyDisaggregatedTpcMasks(decodeTpcCount))
-    {
-        throw std::runtime_error("Failed to apply disaggregated TPC masks to runtime streams.");
-    }
-
-    mMultimodalWorker = std::thread(&LLMInferenceDisaggregationRuntime::multimodalWorkerMain, this);
-    mPrefillWorker = std::thread(&LLMInferenceDisaggregationRuntime::prefillWorkerMain, this);
-    mDecodeWorker = std::thread(&LLMInferenceDisaggregationRuntime::decodeWorkerMain, this);
 }
 
 LLMInferenceDisaggregationRuntime::~LLMInferenceDisaggregationRuntime()
@@ -152,18 +180,20 @@ LLMInferenceDisaggregationRuntime::~LLMInferenceDisaggregationRuntime()
 
 void LLMInferenceDisaggregationRuntime::stopWorkers()
 {
+    // Stop and join in pipeline order to avoid dropping downstream push requests.
     mMultimodalQueue.stop();
-    mPrefillQueue.stop();
-    mDecodeQueue.stop();
-
     if (mMultimodalWorker.joinable())
     {
         mMultimodalWorker.join();
     }
+
+    mPrefillQueue.stop();
     if (mPrefillWorker.joinable())
     {
         mPrefillWorker.join();
     }
+
+    mDecodeQueue.stop();
     if (mDecodeWorker.joinable())
     {
         mDecodeWorker.join();
@@ -268,10 +298,36 @@ std::future<LLMInferenceDisaggregationRuntime::AsyncRequestResult> LLMInferenceD
 {
     auto context = std::make_shared<StageContext>();
     context->requestId = mRequestCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-    context->request = &request;
-    LOG_INFO("[Disagg][Req=%llu] submitted: batch=%zu", static_cast<unsigned long long>(context->requestId),
-        request.requests.size());
     auto future = context->completionPromise.get_future();
+
+    if (!examineRequest(request))
+    {
+        setFailedResult(*context, "request validation failed");
+        finalizeContext(*context);
+        return future;
+    }
+
+    if (request.saveSystemPromptKVCache)
+    {
+        bool expected = false;
+        if (mSystemPromptKVCacheDisabledWarningLogged.compare_exchange_strong(expected, true))
+        {
+            LOG_WARNING("Disaggregation runtime has system prompt KV cache disabled. saveSystemPromptKVCache is ignored.");
+        }
+    }
+
+    int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
+    request.formattedRequests.resize(activeBatchSize);
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+            request.addGenerationPrompt, request.enableThinking);
+    }
+
+    context->ownedRequest = request;
+    context->request = &context->ownedRequest;
+    LOG_INFO("[Disagg][Req=%llu] submitted: batch=%zu", static_cast<unsigned long long>(context->requestId),
+        context->request->requests.size());
     mMultimodalQueue.push(std::move(context));
     return future;
 }
@@ -313,37 +369,20 @@ bool LLMInferenceDisaggregationRuntime::examineRequest(LLMGenerationRequest cons
 
 bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(StageContext& context, cudaStream_t stream)
 {
-    std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
     int32_t const activeBatchSize = static_cast<int32_t>(context.batchedInputIds.size());
 
     rt::LinearKVCache& linearKVCache = mLLMEngineRunner->getLinearKVCache();
-    rt::Tensor kvCacheBuffer = linearKVCache.getKVCacheBuffer();
 
     check::check(
         context.hostReuseKVCacheLengths.reshape({activeBatchSize}), "Failed to reshape host reuse KV cache lengths.");
     int32_t* reuseKVCacheLengthsData = context.hostReuseKVCacheLengths.dataPointer<int32_t>();
 
+    processedIdsLengths.reserve(activeBatchSize);
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPromptWithLoraWeights(context.batchSystemPrompts[i], context.loraWeightsName);
-        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
-        {
-            auto& precachedKVCache = mSystemPromptKVCache[promptHash];
-            auto const& kvCacheContent = precachedKVCache.kvCacheContent;
-            kernel::instantiateKVCacheFromTensor(kvCacheBuffer, kvCacheContent, i, stream);
-            int32_t reuseLength = static_cast<int32_t>(kvCacheContent.getShape()[3]);
-            processedInputIds.emplace_back(
-                context.batchedInputIds[i].begin() + reuseLength, context.batchedInputIds[i].end());
-            processedIdsLengths.emplace_back(static_cast<int32_t>(context.batchedInputIds[i].size() - reuseLength));
-            reuseKVCacheLengthsData[i] = reuseLength;
-        }
-        else
-        {
-            processedInputIds.emplace_back(context.batchedInputIds[i]);
-            processedIdsLengths.emplace_back(static_cast<int32_t>(context.batchedInputIds[i].size()));
-            reuseKVCacheLengthsData[i] = 0;
-        }
+        processedIdsLengths.emplace_back(static_cast<int32_t>(context.batchedInputIds[i].size()));
+        reuseKVCacheLengthsData[i] = 0;
     }
 
     int32_t const maxInputLength = *std::max_element(processedIdsLengths.begin(), processedIdsLengths.end());
@@ -361,7 +400,8 @@ bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(StageContext& c
     std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        std::copy(processedInputIds[i].begin(), processedInputIds[i].end(), packedInputIdsData + i * packedInputLength);
+        std::copy(
+            context.batchedInputIds[i].begin(), context.batchedInputIds[i].end(), packedInputIdsData + i * packedInputLength);
     }
 
     linearKVCache.resetForNewSequences(context.hostReuseKVCacheLengths, context.slotOffset, stream);
@@ -388,22 +428,13 @@ LLMInferenceDisaggregationRuntime::TokenCountInfo LLMInferenceDisaggregationRunt
     std::vector<std::vector<int32_t>> const& batchedInputIds, std::vector<std::string> const& systemPrompts,
     std::string const& loraWeightsName) const
 {
+    (void) systemPrompts;
+    (void) loraWeightsName;
     TokenCountInfo tokenCount;
     int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        int32_t contextLength = static_cast<int32_t>(batchedInputIds[i].size());
-        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
-        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
-        {
-            int32_t reusedLength = static_cast<int32_t>(mSystemPromptKVCache.at(promptHash).tokenizedPrompt.size());
-            tokenCount.totalReusedTokens += reusedLength;
-            tokenCount.totalComputedTokens += (contextLength - reusedLength);
-        }
-        else
-        {
-            tokenCount.totalComputedTokens += contextLength;
-        }
+        tokenCount.totalComputedTokens += static_cast<int32_t>(batchedInputIds[i].size());
     }
     return tokenCount;
 }
@@ -503,13 +534,6 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
     {
         try
         {
-        if (!examineRequest(*context->request))
-        {
-            setFailedResult(*context, "request validation failed");
-            finalizeContext(*context);
-            continue;
-        }
-
         context->activeBatchSize = static_cast<int32_t>(context->request->requests.size());
         context->slotOffset = allocateSlotRange(context->activeBatchSize);
         context->loraWeightsName = context->request->loraWeightsName;
@@ -531,27 +555,17 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
             {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::ctxHostSelected");
         context->hostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
             DataType::kINT32, "DisaggRuntime::ctxReuseKVCacheLengths");
-        context->request->formattedRequests.resize(context->activeBatchSize);
+        if (static_cast<int32_t>(context->request->formattedRequests.size()) != context->activeBatchSize)
+        {
+            setFailedResult(*context, "formattedRequests size mismatch");
+            finalizeContext(*context);
+            continue;
+        }
         context->batchSystemPrompts.reserve(context->activeBatchSize);
 
         for (int32_t i = 0; i < context->activeBatchSize; ++i)
         {
-            mTokenizer->applyChatTemplate(context->request->requests[i], context->request->formattedRequests[i],
-                context->request->applyChatTemplate, context->request->addGenerationPrompt, context->request->enableThinking);
             context->batchSystemPrompts.emplace_back(context->request->formattedRequests[i].formattedSystemPrompt);
-
-            if (context->request->saveSystemPromptKVCache)
-            {
-                if (mMultimodalRunner)
-                {
-                    mMultimodalRunner->preprocessSystemPrompt(context->batchSystemPrompts[i], mTokenizer.get(),
-                        mLLMEngineRunner->getRopeCosSinCacheTensor(), mMultimodalStream);
-                }
-                if (!genAndSaveSystemPromptKVCache(context->batchSystemPrompts[i], context->loraWeightsName, mMultimodalStream))
-                {
-                    LOG_WARNING("Failed to save system prompt KVCache. Proceed without saving cache.");
-                }
-            }
         }
 
         if (!mMultimodalRunner)
@@ -587,7 +601,13 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
             context->tokenCount.totalComputedTokens);
         CUDA_CHECK(cudaEventCreateWithFlags(&context->multimodalDone, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(context->multimodalDone, mMultimodalStream));
+        auto contextForPrefillSync = context;
         mPrefillQueue.push(std::move(context));
+        {
+            std::unique_lock<std::mutex> lock(contextForPrefillSync->prefillSyncMutex);
+            contextForPrefillSync->prefillSyncCv.wait(
+                lock, [&]() { return contextForPrefillSync->prefillStageCompleted; });
+        }
         }
         catch (std::exception const& e)
         {
@@ -611,11 +631,20 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
     {
         try
         {
+        auto notifyPrefillStageCompleted = [&context]()
+        {
+            {
+                std::lock_guard<std::mutex> lock(context->prefillSyncMutex);
+                context->prefillStageCompleted = true;
+            }
+            context->prefillSyncCv.notify_all();
+        };
         CUDA_CHECK(cudaStreamWaitEvent(mPrefillStream, context->multimodalDone, 0));
 
         if (!setUpForPrefillExecution(*context, mPrefillStream))
         {
             setFailedResult(*context, "prefill setup failed");
+            notifyPrefillStageCompleted();
             finalizeContext(*context);
             continue;
         }
@@ -650,6 +679,7 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
                     extraVisualFeatures, context->outputLogits, outputHiddenStates, context->slotOffset, mPrefillStream))
             {
                 setFailedResult(*context, "prefill execution failed");
+                notifyPrefillStageCompleted();
                 finalizeContext(*context);
                 continue;
             }
@@ -662,18 +692,29 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
         check::check(context->inputIds.reshape({context->activeBatchSize, 1}), "Failed to reshape decode input IDs.");
         CUDA_CHECK(cudaEventCreateWithFlags(&context->prefillDone, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(context->prefillDone, mPrefillStream));
+        notifyPrefillStageCompleted();
         mDecodeQueue.push(std::move(context));
         }
         catch (std::exception const& e)
         {
             LOG_ERROR("prefillWorkerMain exception: %s", e.what());
             setFailedResult(*context, e.what());
+            {
+                std::lock_guard<std::mutex> lock(context->prefillSyncMutex);
+                context->prefillStageCompleted = true;
+            }
+            context->prefillSyncCv.notify_all();
             finalizeContext(*context);
         }
         catch (...)
         {
             LOG_ERROR("prefillWorkerMain unknown exception.");
             setFailedResult(*context, "unknown exception in prefill worker");
+            {
+                std::lock_guard<std::mutex> lock(context->prefillSyncMutex);
+                context->prefillStageCompleted = true;
+            }
+            context->prefillSyncCv.notify_all();
             finalizeContext(*context);
         }
     }
@@ -790,76 +831,9 @@ bool LLMInferenceDisaggregationRuntime::captureDecodingCUDAGraph(cudaStream_t st
 bool LLMInferenceDisaggregationRuntime::genAndSaveSystemPromptKVCache(
     std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream)
 {
-    if (prompt.empty())
-    {
-        return true;
-    }
-
-    size_t const promptHash = hashSystemPromptWithLoraWeights(prompt, loraWeightsName);
-    if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
-    {
-        return true;
-    }
-
-    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
-    int32_t const promptIdsLength = static_cast<int32_t>(tokenizedPrompt.size());
-    if (promptIdsLength > mEngineConfig.maxSupportedInputLength)
-    {
-        LOG_ERROR("LLMInferenceDisaggregationRuntime(): prompt length exceeds max supported input.");
-        return false;
-    }
-
-    std::vector<std::vector<int32_t>> batchedInputIds(1, tokenizedPrompt);
-    std::vector<std::string> batchedSystemPrompts(1, prompt);
-    StageContext cacheContext;
-    cacheContext.activeBatchSize = 1;
-    cacheContext.slotOffset = 0;
-    cacheContext.batchedInputIds = batchedInputIds;
-    cacheContext.batchSystemPrompts = batchedSystemPrompts;
-    cacheContext.loraWeightsName = loraWeightsName;
-    cacheContext.inputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-        rt::DeviceType::kGPU, DataType::kINT32, "DisaggRuntime::cacheInputIds");
-    cacheContext.hostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-        rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::cacheHostPackedInputIds");
-    cacheContext.hostContextLengths = rt::Tensor(
-        {mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "DisaggRuntime::cacheContextLen");
-    cacheContext.outputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize},
-        rt::DeviceType::kGPU, DataType::kFLOAT, "DisaggRuntime::cacheOutputLogits");
-    cacheContext.hostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
-        DataType::kINT32, "DisaggRuntime::cacheReuseKVCacheLengths");
-
-    if (!setUpForPrefillExecution(cacheContext, stream))
-    {
-        return false;
-    }
-
-    rt::OptionalInputTensor multimodalEmbeddings
-        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors extraVisualFeatures
-        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
-    rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
-    if (!mLLMEngineRunner->executePrefillStep(cacheContext.inputIds, cacheContext.hostContextLengths, multimodalEmbeddings,
-            extraVisualFeatures, cacheContext.outputLogits, outputHiddenStates, cacheContext.slotOffset, stream))
-    {
-        return false;
-    }
-
-    auto& linearKVCache = mLLMEngineRunner->getLinearKVCache();
-    auto cacheConfig = linearKVCache.getConfig();
-    auto kvCacheBuffer = linearKVCache.getKVCacheBuffer();
-    rt::Coords savedKVCacheShape{
-        cacheConfig.numDecoderLayers, 2, cacheConfig.numKVHeads, promptIdsLength, cacheConfig.headDim};
-
-    DisaggregationSystemPromptKVCache savedKVCache;
-    savedKVCache.systemPrompt = prompt;
-    savedKVCache.tokenizedPrompt = tokenizedPrompt;
-    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT,
-        "DisaggRuntime::savedKVCache.kvCacheContent");
-
-    constexpr int32_t cacheBatchIdx{0};
-    kernel::saveKVCacheIntoTensor(savedKVCache.kvCacheContent, kvCacheBuffer, cacheBatchIdx, stream);
-    mSystemPromptKVCache.insert({promptHash, std::move(savedKVCache)});
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    (void) prompt;
+    (void) loraWeightsName;
+    (void) stream;
     return true;
 }
 

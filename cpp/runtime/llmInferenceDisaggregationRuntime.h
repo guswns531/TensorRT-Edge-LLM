@@ -159,6 +159,7 @@ private:
     struct StageContext
     {
         uint64_t requestId{0};
+        LLMGenerationRequest ownedRequest{};
         LLMGenerationRequest const* request{nullptr};
         LLMGenerationResponse response{};
         std::promise<AsyncRequestResult> completionPromise;
@@ -191,6 +192,9 @@ private:
 
         cudaEvent_t multimodalDone{nullptr};
         cudaEvent_t prefillDone{nullptr};
+        std::mutex prefillSyncMutex;
+        std::condition_variable prefillSyncCv;
+        bool prefillStageCompleted{false};
     };
 
     bool examineRequest(LLMGenerationRequest const& request);
@@ -251,6 +255,7 @@ private:
     std::mutex mRunnerPrefillMutex;
     std::mutex mRunnerDecodeMutex;
     std::atomic<uint64_t> mRequestCounter{0};
+    std::atomic<bool> mSystemPromptKVCacheDisabledWarningLogged{false};
 };
 
 } // namespace rt
