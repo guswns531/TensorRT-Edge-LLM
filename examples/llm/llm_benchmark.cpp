@@ -66,7 +66,9 @@ enum LLMInferenceOptionId : int
     MAX_GENERATE_LENGTH = 915,
     BENCHMARK_COUNT = 916,
     DISAGGREGATION = 917,
-    TPC_COUNT = 918
+    TPC_COUNT = 918,
+    QUIET = 919,
+    DISAGG_DECODE_CUDA_GRAPH = 920
 };
 
 // Struct to hold Eagle-specific arguments for speculative decoding
@@ -97,6 +99,7 @@ struct LLMInferenceArgs
     std::string outputFile{""};
     std::string profileOutputFile{""};
     bool debug{false};
+    bool quiet{false};
     bool dumpProfile{false};
     int32_t warmup{0};
     bool dumpOutput{false};
@@ -107,6 +110,7 @@ struct LLMInferenceArgs
     int32_t tpcCount{-1};          // -1 means disabled
     int32_t benchmarkCount{1};     // Repeat full input request set N times
     bool disaggregation{false};
+    bool disaggDecodeCudaGraph{false};
     EagleArgs eagleArgs;
 };
 
@@ -207,6 +211,7 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--tpcCount=<number>] [--eagle] "
                  "[--benchmarkCount=<number>] [--disaggregation] "
+                 "[--quiet] [--disaggDecodeCudaGraph] "
                  "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
                  "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
@@ -220,12 +225,14 @@ void printUsage(char const* programName)
     std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
     std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
+    std::cerr << "  --quiet                   Show only warning/error logs" << std::endl;
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
     std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "  --tpcCount                Enable first N TPCs using Jetson Thor GPC/TPC map (1..10)" << std::endl;
     std::cerr << "  --benchmarkCount          Repeat full input requests N times (default: 1)" << std::endl;
     std::cerr << "  --disaggregation          Enable disaggregation runtime (3-stage async workers)" << std::endl;
+    std::cerr << "  --disaggDecodeCudaGraph   Try capture/use decode CUDA graph in disaggregation mode" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
     std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
@@ -245,6 +252,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
         {"debug", no_argument, 0, LLMInferenceOptionId::DEBUG},
+        {"quiet", no_argument, 0, LLMInferenceOptionId::QUIET},
         {"dumpProfile", no_argument, 0, LLMInferenceOptionId::DUMP_PROFILE},
         {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
         {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
@@ -258,6 +266,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"tpcCount", required_argument, 0, LLMInferenceOptionId::TPC_COUNT},
         {"benchmarkCount", required_argument, 0, LLMInferenceOptionId::BENCHMARK_COUNT},
         {"disaggregation", no_argument, 0, LLMInferenceOptionId::DISAGGREGATION},
+        {"disaggDecodeCudaGraph", no_argument, 0, LLMInferenceOptionId::DISAGG_DECODE_CUDA_GRAPH},
         {0, 0, 0, 0}};
 
     int opt;
@@ -271,6 +280,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case LLMInferenceOptionId::DEBUG: args.debug = true; break;
+        case LLMInferenceOptionId::QUIET: args.quiet = true; break;
         case LLMInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
         case LLMInferenceOptionId::PROFILE_OUTPUT_FILE: args.profileOutputFile = optarg; break;
         case LLMInferenceOptionId::WARMUP:
@@ -406,8 +416,28 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case LLMInferenceOptionId::DISAGGREGATION: args.disaggregation = true; break;
+        case LLMInferenceOptionId::DISAGG_DECODE_CUDA_GRAPH: args.disaggDecodeCudaGraph = true; break;
         default: return false;
         }
+    }
+
+    if (args.debug && args.quiet)
+    {
+        LOG_ERROR("Cannot enable both --debug and --quiet at the same time.");
+        return false;
+    }
+
+    if (args.quiet)
+    {
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kWARNING);
+    }
+    else if (args.debug)
+    {
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
+    }
+    else
+    {
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
     LOG_INFO("args.inputFile: %s", args.inputFile.c_str());
@@ -480,6 +510,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (args.disaggregation)
     {
         LOG_INFO("Disaggregation runtime enabled");
+        if (args.disaggDecodeCudaGraph)
+        {
+            LOG_INFO("Disaggregation decode CUDA graph capture enabled");
+        }
     }
     if (args.eagleArgs.enabled && args.disaggregation)
     {
@@ -495,15 +529,6 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 tpcLimit);
             return false;
         }
-    }
-
-    if (args.debug)
-    {
-        gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
-    }
-    else
-    {
-        gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
     return true;
@@ -873,7 +898,8 @@ int main(int argc, char* argv[])
         try
         {
             disaggregationRuntime = std::make_unique<rt::LLMInferenceDisaggregationRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream, args.tpcCount);
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream, args.tpcCount,
+                args.disaggDecodeCudaGraph);
         }
         catch (std::exception const& e)
         {
@@ -1487,7 +1513,14 @@ int main(int argc, char* argv[])
         benchOutput << "decode metrics are per-token latency (ms/token)\n";
         benchOutput << "request row is end-to-end (encoding+prefill+decode) per request\n";
         benchOutput << "=======================================\n";
-        LOG_INFO("%s", benchOutput.str().c_str());
+        if (args.quiet)
+        {
+            std::cout << benchOutput.str();
+        }
+        else
+        {
+            LOG_INFO("%s", benchOutput.str().c_str());
+        }
     }
 
     // Export profile to JSON file

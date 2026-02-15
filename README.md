@@ -78,7 +78,7 @@ tensorrt-edgellm-export-visual \
   --multimodalEngineDir visual_engines/qwen3-vl-2b \
   --inputFile input_with_images.json \
   --outputFile output.json \
-  --benchmarkCount 200
+  --benchmarkCount 200 
 ```
 
 ---
@@ -181,6 +181,7 @@ request          200   1161.719   1128.481  1332.889      0.861 req/s
   --multimodalEngineDir visual_engines/qwen3-vl-2b \
   --inputFile input_with_images.json \
   --outputFile output.json \
+  --benchmarkCount=20 \
   --disaggregation \
   --tpcCount 3
 ```
@@ -190,4 +191,208 @@ request          200   1161.719   1128.481  1332.889      0.861 req/s
 제약 사항:
 - Jetson Thor CUDA 13.x 기준 내부 stream mask 오프셋(`0x54c`)을 사용합니다.
 - disaggregation 모드에서 `--tpcCount`는 `1 <= tpcCount < totalTPC` 범위를 만족해야 합니다.
-- 현재는 런타임 공유 상태 보호를 위해 `mExecutionMutex`를 유지하고 있으며, 이후 3개 큐 상태 기반 스케줄링 정책으로 lock 범위를 단계적으로 축소할 예정입니다.
+
+### 최근 업데이트 (2026-02)
+
+#### 1) Runner 실행 컨텍스트 메모리 분리
+
+`LLMEngineRunner`에서 prefill/decode 실행 컨텍스트가 같은 device memory를 공유하지 않도록 분리했습니다.
+
+- `mPrefillExecContextMemory`
+- `mGenerationExecContextMemory`
+
+이를 통해 prefill/decode 동시 실행 시 컨텍스트 메모리 충돌 가능성을 줄였습니다.
+
+#### 2) KV cache 바인딩 경로 분리
+
+KV cache 바인딩을 스테이지별로 분리했습니다.
+
+- prefill 경로: `bindKVCacheToPrefillEngine()`
+- decode 경로: `bindKVCacheToGenerationEngine()`
+
+기존처럼 한 경로에서 두 execution context를 동시에 갱신하지 않으므로, 스테이지 간 setTensorAddress/setInputShape 간섭이 감소했습니다.
+
+#### 3) Stage lock 분리
+
+Disaggregation runtime에서 단일 runner lock 대신 stage별 lock을 사용합니다.
+
+- `mRunnerPrefillMutex`
+- `mRunnerDecodeMutex`
+
+#### 4) Front 실행 고정 (queue 구조 유지)
+
+큐는 기존처럼 3개를 유지합니다.
+
+- `multimodalQueue`
+- `prefillQueue`
+- `decodeQueue`
+
+다만 실행 정책은 front 파티션(encoding+prefill) 단위로 고정했습니다.
+
+- 한 요청의 `encoding -> prefill`이 끝난 뒤 다음 요청 encoding을 시작
+- 동시에 decode 파티션은 이전 요청을 계속 처리
+
+즉, 목표 동작은 다음과 같습니다.
+
+- `ReqA`가 decode 중일 때
+- `ReqB`는 encoding+prefill 수행 가능
+- 하지만 서로 다른 요청의 encoding과 prefill이 동시에 섞여 실행되지는 않음
+
+#### 5) 병렬 동작 검증 로그 추가
+
+병렬 동작 확인을 위해 stage 시작/종료 로그를 추가했습니다.
+
+- `encoding(start/end)`
+- `prefill(start/end)`
+- `decode(start/end)`
+- 요청 단위 식별자: `[Disagg][Req=N]`
+
+예시:
+
+```text
+[Disagg][Req=1] prefill(end) ...
+[Disagg][Req=2] encoding(start) ...
+[Disagg][Req=1] decode(start) ...
+```
+
+위와 같이 front/back 파이프라인이 겹쳐 동작하는지 로그로 확인할 수 있습니다.
+
+#### 6) 안정화 과정에서 반영된 주요 수정 사항
+
+아래 이슈들은 `benchmarkCount=20` 반복 테스트 과정에서 실제로 재현되었고, 현재 코드에 반영되어 있습니다.
+
+- `LinearKVCache::resetForNewSequences()`의 H2D 복사 크기를 tensor capacity 기준에서 `batchSize * sizeof(int32_t)` 기준으로 수정
+  - 증상: `cudaMemcpyAsync ... invalid argument`
+- `LLMEngineRunner`의 prefill/decode scratch tensor 수명을 `thread_local`로 보장
+  - 증상: 비동기 커널 이후 `cudaFree` 시점의 illegal memory access
+- `finalizeContext()`를 idempotent하게 변경 (`completionSet` 사용)
+  - 증상: 예외 경로 중복 `set_value()`로 인한 recursive terminate
+- decode CUDA graph는 disaggregation 경로에서 현재 비활성화
+  - 안정화 우선 정책으로 운영 (`captureDecodingCUDAGraph()`는 warning 후 false 반환)
+
+또한 동시성 안전화를 위해 다음 구조 변경이 함께 적용되었습니다.
+
+- slot-aware KV cache API/호출 경로 사용 (`slotOffset` 기반)
+- 요청별 `StageContext` tensor 분리 (runtime 공유 tensor 경합 감소)
+
+#### 7) 검증 커맨드와 최신 결과 (이번 대화 기준)
+
+검증 커맨드:
+
+```bash
+./build/examples/llm/llm_benchmark \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile output.json \
+  --benchmarkCount=20 \
+  --disaggregation \
+  --tpcCount 3
+```
+
+최근 실행 결과 요약(`count=20`):
+
+- encoding mean: `112.746 ms`
+- prefill mean: `51.614 ms`
+- decode mean: `13.941 ms/token`
+- request mean: `1934.857 ms` (`0.517 req/s`)
+- 처리 성공: `20/20`
+
+#### 8) 현재 동작 요약 및 한계
+
+- 현재 disaggregation은 **front(encoding+prefill) + back(decode)** 파이프라인을 목표로 동작
+- front는 요청 단위로 순차 고정 (`encoding -> prefill` 완료 후 다음 요청 encoding 시작)
+- back(decode)은 front와 병렬로 진행
+- `--tpcCount`는 benchmark disaggregation 경로에서 decode 전용 TPC 개수로 해석
+
+현재 알려진 한계:
+
+- decode CUDA graph는 disaggregation 경로에서 비활성화 상태
+- Jetson Thor CUDA 13.x 기준 mask 오프셋에 의존
+
+#### tpcCount 스윕 결과 (qwen3-vl-2b, benchmarkCount=200)
+
+- `tpc=1`은 측정 정체로 `N/A` 처리
+
+**Mean(ms)**
+
+| tpcCount | encoding | prefill | decode | request |
+|---------:|---------:|--------:|-------:|--------:|
+| 1 | N/A | N/A | N/A | N/A |
+| 2 | 250.282 | 46.465 | 14.112 | 2088.927 |
+| 3 | 172.174 | 33.610 | 11.279 | 1638.253 |
+| 4 | 133.209 | 25.903 | 9.322 | 1342.947 |
+| 5 | 115.236 | 23.331 | 8.573 | 1227.312 |
+| 6 | 104.091 | 20.849 | 8.125 | 1156.833 |
+| 7 | 99.398 | 19.852 | 8.106 | 1148.755 |
+| 8 | 96.593 | 18.369 | 7.947 | 1124.194 |
+| 9 | 95.272 | 18.098 | 7.958 | 1124.094 |
+| 10 | 108.016 | 19.938 | 9.014 | 1272.716|
+
+**P99(ms)**
+
+| tpcCount | encoding | prefill | decode | request |
+|---------:|---------:|--------:|-------:|--------:|
+| 1 | N/A | N/A | N/A | N/A |
+| 2 | 251.489 | 46.752 | 14.281 | 2111.922 |
+| 3 | 174.420 | 34.300 | 11.519 | 1671.691 |
+| 4 | 137.862 | 27.572 | 9.660 | 1392.228 |
+| 5 | 118.229 | 23.807 | 8.704 | 1247.495 |
+| 6 | 104.527 | 21.051 | 8.205 | 1167.573 |
+| 7 | 102.316 | 20.379 | 8.231 | 1168.072 |
+| 8 | 97.959 | 18.648 | 8.060 | 1140.234 |
+| 9 | 95.981 | 18.370 | 8.092 | 1142.070 |
+| 10 | 111.342 | 21.492 | 9.672 | 1361.234 |
+
+#### 9) `--quiet` 3회 재측정 결과 (qwen3-vl-2b, benchmarkCount=200)
+
+측정 목적:
+- 동일 입력(`input_with_images.json`)에서 모드별 편차를 줄이기 위해 각 조건을 3회 반복 실행
+- `--quiet`를 사용해 disaggregation 상세 로그 스팸을 제거하고 요약 지표만 비교
+
+측정 커맨드:
+
+```bash
+# Baseline
+./build/examples/llm/llm_benchmark \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile /tmp/llm_bench_q_base_1.json \
+  --benchmarkCount=200 \
+  --quiet
+
+# Disaggregation (decode CUDA graph off; default)
+./build/examples/llm/llm_benchmark \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile /tmp/llm_bench_q_disagg_1.json \
+  --benchmarkCount=200 \
+  --disaggregation \
+  --quiet
+
+# Disaggregation + decode CUDA graph on
+./build/examples/llm/llm_benchmark \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile /tmp/llm_bench_q_disagg_graph_1.json \
+  --benchmarkCount=200 \
+  --disaggregation \
+  --disaggDecodeCudaGraph \
+  --quiet
+```
+
+3회 평균 결과:
+
+| Mode | encoding mean (ms) | prefill mean (ms) | decode mean (ms/token) | request mean (ms) | request p99 (ms) | request throughput (req/s) |
+|------|--------------------:|------------------:|------------------------:|------------------:|-----------------:|---------------------------:|
+| Baseline | 100.823 | 18.714 | 8.468 | 1194.996 | 1257.935 | 0.840 |
+| Disagg (graph off) | 90.147 | 40.591 | 10.307 | 1439.764 | 1509.307 | 0.695 |
+| Disagg (graph on) | 96.545 | 44.171 | 10.993 | 1536.883 | 1651.789 | 0.653 |
+
+요약:
+- Baseline 대비 Disagg(graph off)에서는 `request mean +20.48%`, `throughput -17.27%`로 악화
+- Disagg(graph off) 대비 Disagg(graph on)에서도 `request mean +6.75%`, `throughput -6.00%`로 추가 악화
+- 즉, 현재 환경/설정에서는 disaggregation과 disagg decode CUDA graph 활성화가 모두 E2E 성능 개선으로 이어지지 않음

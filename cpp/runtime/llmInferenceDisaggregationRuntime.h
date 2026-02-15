@@ -67,7 +67,7 @@ public:
      */
     LLMInferenceDisaggregationRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
-        int32_t decodeTpcCount = -1);
+        int32_t decodeTpcCount = -1, bool enableDecodeCudaGraph = false);
 
     //! \brief Destructor
     ~LLMInferenceDisaggregationRuntime();
@@ -256,6 +256,7 @@ private:
     std::mutex mRunnerDecodeMutex;
     std::atomic<uint64_t> mRequestCounter{0};
     std::atomic<bool> mSystemPromptKVCacheDisabledWarningLogged{false};
+    bool mEnableDecodeCudaGraph{false};
 };
 
 } // namespace rt

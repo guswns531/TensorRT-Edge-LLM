@@ -50,7 +50,8 @@ namespace rt
 
 LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string const& engineDir,
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
-    cudaStream_t stream, int32_t decodeTpcCount)
+    cudaStream_t stream, int32_t decodeTpcCount, bool enableDecodeCudaGraph)
+    : mEnableDecodeCudaGraph(enableDecodeCudaGraph)
 {
     try
     {
@@ -823,9 +824,47 @@ void LLMInferenceDisaggregationRuntime::finalizeContext(StageContext& context)
 
 bool LLMInferenceDisaggregationRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
-    (void) stream;
-    LOG_WARNING("Disaggregation runtime disables decode CUDA graph for stability.");
-    return false;
+    if (!mEnableDecodeCudaGraph)
+    {
+        (void) stream;
+        LOG_WARNING("Disaggregation runtime disables decode CUDA graph for stability.");
+        return false;
+    }
+
+    int32_t const maxSupportedBatchSize = mEngineConfig.maxSupportedBatchSize;
+    int32_t const minSupportedBatchSize = 1;
+
+    bool captureStatus{true};
+    for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
+    {
+        check::check(mSelectedIndices.reshape({batchSize, 1}), "Failed to reshape decode selected indices.");
+        check::check(mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize}),
+            "Failed to reshape decode output logits.");
+        captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
+            mSelectedIndices, mOutputLogits, mEmptyLoraWeightsName, stream);
+        if (mEngineConfig.maxSupportedLoraRank > 0)
+        {
+            for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
+            {
+                captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
+                    mSelectedIndices, mOutputLogits, loraWeightsName, stream);
+            }
+        }
+    }
+
+    if (captureStatus)
+    {
+        LOG_INFO(
+            "LLMInferenceDisaggregationRuntime(): Successfully captured the decoding CUDA graph for all execution "
+            "batch sizes and LoRA weights.");
+    }
+    else
+    {
+        LOG_WARNING(
+            "LLMInferenceDisaggregationRuntime(): Failed to capture the decoding CUDA graph for some execution "
+            "batch sizes and LoRA weights.");
+    }
+    return captureStatus;
 }
 
 bool LLMInferenceDisaggregationRuntime::genAndSaveSystemPromptKVCache(
