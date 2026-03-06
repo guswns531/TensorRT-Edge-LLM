@@ -86,6 +86,19 @@ docker run --gpus all --ipc=host \
     --inputFile input_with_images.json \
     --outputFile output.json
 
+docker run --gpus all --ipc=host \
+    --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/Document/TensorRT-Edge-LLM/engines:/workspace/engines \
+    -v ~/Document/TensorRT-Edge-LLM/visual_engines:/workspace/visual_engines \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    ./build/examples/llm/llm_inference \
+    --engineDir engines/qwen3-vl-2b \
+    --multimodalEngineDir visual_engines/qwen3-vl-2b \
+    --inputFile input_with_images.json \
+    --outputFile output.json
+
 ```
 
 
