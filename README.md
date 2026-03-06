@@ -124,6 +124,20 @@ docker run --gpus all --ipc=host \
     --dumpProfile \
     --benchmarkCount 20
 
+=== Benchmark Summary ===
+runtime_mode: baseline
+count: 20
+stage        samples       mean_ms   median_ms      p99_ms         throughput
+----------------------------------------------------------------------------
+encoding          20        43.586      42.953      55.446  11150.485 imgtok/s
+prefill           20        21.076      19.908      44.049     24388.377 tok/s
+decode          2540         8.906       8.897       9.668       112.285 tok/s
+request           20      1195.715    1192.739    1327.290         0.836 req/s
+decode metrics are per-token latency (ms/token)
+request row is end-to-end (encoding+prefill+decode) per request
+=======================================
+
+
 # baseline + TPC limit
 docker run --gpus all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
@@ -141,6 +155,19 @@ docker run --gpus all --ipc=host \
     --dumpProfile \
     --benchmarkCount 20 \
     --tpcCount 4
+
+=== Benchmark Summary ===
+runtime_mode: baseline
+count: 20
+stage        samples       mean_ms   median_ms      p99_ms         throughput
+----------------------------------------------------------------------------
+encoding          20       103.085     102.500     114.062   4714.541 imgtok/s
+prefill           20        35.359      33.827      64.488     14536.780 tok/s
+decode          2540        13.948      13.906      14.395        71.693 tok/s
+request           20      1909.874    1902.393    2006.717         0.524 req/s
+decode metrics are per-token latency (ms/token)
+request row is end-to-end (encoding+prefill+decode) per request
+=======================================
 
 # disaggregation sequential async
 docker run --gpus all --ipc=host \
@@ -160,6 +187,21 @@ docker run --gpus all --ipc=host \
     --benchmarkCount 20 \
     --disaggregation
 
+=== Benchmark Summary ===
+runtime_mode: disaggregation
+submission_mode: sequential_async
+count: 20
+stage        samples       mean_ms   median_ms      p99_ms         throughput
+----------------------------------------------------------------------------
+encoding          20        45.436      42.834      94.877  10696.297 imgtok/s
+prefill           20        33.434      32.044      59.911     15373.643 tok/s
+decode          2540        10.336      10.283      11.442        96.746 tok/s
+request           20      1391.582    1380.768    1607.907         0.719 req/s
+decode metrics are per-token latency (ms/token)
+request row is end-to-end (encoding+prefill+decode) per request
+=======================================
+
+
 # disaggregation pipeline async
 docker run --gpus all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
@@ -178,6 +220,21 @@ docker run --gpus all --ipc=host \
     --benchmarkCount 20 \
     --disaggregation \
     --tpcCount 4
+
+=== Benchmark Summary ===
+runtime_mode: disaggregation
+submission_mode: pipeline_async
+count: 20
+stage        samples       mean_ms   median_ms      p99_ms         throughput
+----------------------------------------------------------------------------
+encoding          20        66.666      63.358     119.248   7290.061 imgtok/s
+prefill           20        55.335      54.452      62.759      9288.843 tok/s
+decode          2288        16.210      17.888      20.069        61.691 tok/s
+request           20      1976.399    2164.222    2477.925         0.506 req/s
+decode metrics are per-token latency (ms/token)
+request row is end-to-end (encoding+prefill+decode) per request
+=======================================
+
 ```
 
 
