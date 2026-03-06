@@ -1,0 +1,36 @@
+{
+    "input_file": "input_with_images.json",
+    "responses": [
+        {
+            "batch_idx": 0,
+            "formatted_complete_request": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Please describe the image in English.<|im_end|>\n<|im_start|>assistant\n",
+            "formatted_system_prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "messages": [
+                {
+                    "content": [
+                        {
+                            "text": "You are a helpful assistant.",
+                            "type": "text"
+                        }
+                    ],
+                    "role": "system"
+                },
+                {
+                    "content": [
+                        {
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg",
+                            "type": "image"
+                        },
+                        {
+                            "text": "Please describe the image in English.",
+                            "type": "text"
+                        }
+                    ],
+                    "role": "user"
+                }
+            ],
+            "output_text": "This is a photograph of a woman and her dog on a beach at sunset. The woman is sitting on the sand, smiling, and wearing a plaid shirt. The dog is a golden-colored Labrador Retriever, sitting on the sand, and is wearing a colorful harness. The dog is looking at the woman, and the woman is looking at the dog. The dog is sitting on the sand, and the woman is sitting on the sand. The dog is sitting on the sand, and the woman is sitting on the sand. The dog is sitting on the sand, and the woman is sitting on the sand. The dog is sitting",
+            "request_idx": 0
+        }
+    ]
+}

@@ -2,6 +2,94 @@
 
 # TensorRT Edge-LLM
 
+
+```bash
+cd build
+cmake .. \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-thor
+make -j$(nproc)
+```
+
+### Docker environment
+
+```bash
+cd ~/Documents/TensorRT-Edge-LLM/
+
+docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    bash
+
+python3 -c "import torch; print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'Torch Version: {torch.__version__}')"
+
+pip install . 
+
+pip show tensorrt-edgellm
+```
+
+### Model export (Qwen3-VL-2B example)
+
+```bash
+tensorrt-edgellm-quantize-llm \
+    --model_dir Qwen/Qwen3-VL-2B-Instruct \
+    --output_dir /workspace/quantized/qwen3-vl-2b \
+    --quantization nvfp4
+
+tensorrt-edgellm-export-llm \
+    --model_dir /workspace/quantized/qwen3-vl-2b \
+    --output_dir /workspace/onnx_models/qwen3-vl-2b
+
+tensorrt-edgellm-export-visual \
+    --model_dir /workspace/quantized/qwen3-vl-2b \
+    --output_dir /workspace/visual_enc_onnx/qwen3-vl-2b
+
+```
+
+### Engine build
+
+```bash
+./build/examples/llm/llm_build \
+  --onnxDir /workspace/onnx_models/qwen3-vl-2b \
+  --engineDir /workspace/engines/qwen3-vl-2b \
+  --maxBatchSize 4 \
+  --maxInputLen=1024 \
+  --maxKVCacheCapacity=4096 
+
+./build/examples/multimodal/visual_build \
+  --onnxDir /workspace/visual_enc_onnx/qwen3-vl-2b \
+  --engineDir /workspace/visual_engines/qwen3-vl-2b
+```
+
+### Inference
+
+```bash
+./build/examples/llm/llm_inference \
+  --engineDir engines/qwen3-vl-2b \
+  --multimodalEngineDir visual_engines/qwen3-vl-2b \
+  --inputFile input_with_images.json \
+  --outputFile output.json
+
+
+docker run --gpus all --ipc=host \
+    --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    ./build/examples/llm/llm_inference \
+    --engineDir engines/qwen3-vl-2b \
+    --multimodalEngineDir visual_engines/qwen3-vl-2b \
+    --inputFile input_with_images.json \
+    --outputFile output.json
+
+```
+
+
+
 **High-Performance Large Language Model Inference Framework for NVIDIA Edge Platforms**
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-Edge-LLM/)
