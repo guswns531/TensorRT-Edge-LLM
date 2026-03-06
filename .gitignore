@@ -29,3 +29,7 @@ engines/
 onnx_models/
 quantized/
 
+@eaDir
+
+3rdParty/googletest
+3rdParty/nlohmannJson
