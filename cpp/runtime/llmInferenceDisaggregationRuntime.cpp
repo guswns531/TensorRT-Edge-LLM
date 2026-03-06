@@ -72,6 +72,9 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
         // performance comparisons easier because only the disaggregation path sees slot-aware changes.
         mLLMEngineRunner = std::make_unique<LLMDisaggregationEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
         mEngineConfig = mLLMEngineRunner->getEngineConfig();
+        mSlotUsage.assign(static_cast<size_t>(mEngineConfig.maxSupportedBatchSize), false);
+        LOG_INFO("[ForDisaggregation] Initialized slot allocator with %d slots.",
+            mEngineConfig.maxSupportedBatchSize);
 
         int32_t const defaultTopK{0};
         float const defaultTopP{0.9F};
@@ -507,6 +510,8 @@ int32_t LLMInferenceDisaggregationRuntime::allocateSlotRange(int32_t slotCount)
 {
     check::check(slotCount > 0 && slotCount <= mEngineConfig.maxSupportedBatchSize, "Invalid slotCount.");
     std::unique_lock<std::mutex> lock(mSlotAllocatorMutex);
+    LOG_INFO("[ForDisaggregation] Waiting for slot range: slotCount=%d currentCapacity=%zu", slotCount,
+        mSlotUsage.size());
     auto hasRange = [&]() {
         int32_t consecutive = 0;
         for (bool used : mSlotUsage)
@@ -531,6 +536,7 @@ int32_t LLMInferenceDisaggregationRuntime::allocateSlotRange(int32_t slotCount)
             {
                 mSlotUsage[static_cast<size_t>(s)] = true;
             }
+            LOG_INFO("[ForDisaggregation] Allocated slot range: offset=%d count=%d", slotOffset, slotCount);
             return slotOffset;
         }
     }
@@ -551,12 +557,14 @@ void LLMInferenceDisaggregationRuntime::releaseSlotRange(int32_t slotOffset, int
             mSlotUsage[static_cast<size_t>(s)] = false;
         }
     }
+    LOG_INFO("[ForDisaggregation] Released slot range: offset=%d count=%d", slotOffset, slotCount);
     mSlotAllocatorCv.notify_all();
 }
 
 void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
 {
     std::shared_ptr<StageContext> context;
+    LOG_INFO("[ForDisaggregation] multimodalWorkerMain started.");
     while (mMultimodalQueue.pop(context))
     {
         try
@@ -670,6 +678,7 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
 void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
 {
     std::shared_ptr<StageContext> context;
+    LOG_INFO("[ForDisaggregation] prefillWorkerMain started.");
     while (mPrefillQueue.pop(context))
     {
         try
@@ -807,6 +816,7 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
 void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
 {
     std::shared_ptr<StageContext> context;
+    LOG_INFO("[ForDisaggregation] decodeWorkerMain started.");
     while (mDecodeQueue.pop(context))
     {
         try

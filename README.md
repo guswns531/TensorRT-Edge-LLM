@@ -101,6 +101,85 @@ docker run --gpus all --ipc=host \
 
 ```
 
+### Benchmark comparison
+
+Use the same docker layout as `llm_inference` and compare baseline vs disaggregation with the same input.
+If the input JSON contains a single request, `--benchmarkCount 20` gives a quick 20-run comparison.
+
+```bash
+# baseline
+docker run --gpus all --ipc=host \
+    --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/Document/TensorRT-Edge-LLM/engines:/workspace/engines \
+    -v ~/Document/TensorRT-Edge-LLM/visual_engines:/workspace/visual_engines \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    ./build/examples/llm/llm_benchmark \
+    --engineDir engines/qwen3-vl-2b \
+    --multimodalEngineDir visual_engines/qwen3-vl-2b \
+    --inputFile input_with_images.json \
+    --outputFile /tmp/baseline_output.json \
+    --profileOutputFile /tmp/baseline_profile.json \
+    --dumpProfile \
+    --benchmarkCount 20
+
+# baseline + TPC limit
+docker run --gpus all --ipc=host \
+    --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/Document/TensorRT-Edge-LLM/engines:/workspace/engines \
+    -v ~/Document/TensorRT-Edge-LLM/visual_engines:/workspace/visual_engines \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    ./build/examples/llm/llm_benchmark \
+    --engineDir engines/qwen3-vl-2b \
+    --multimodalEngineDir visual_engines/qwen3-vl-2b \
+    --inputFile input_with_images.json \
+    --outputFile /tmp/baseline_tpc_output.json \
+    --profileOutputFile /tmp/baseline_tpc_profile.json \
+    --dumpProfile \
+    --benchmarkCount 20 \
+    --tpcCount 4
+
+# disaggregation sequential async
+docker run --gpus all --ipc=host \
+    --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/Document/TensorRT-Edge-LLM/engines:/workspace/engines \
+    -v ~/Document/TensorRT-Edge-LLM/visual_engines:/workspace/visual_engines \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    ./build/examples/llm/llm_benchmark \
+    --engineDir engines/qwen3-vl-2b \
+    --multimodalEngineDir visual_engines/qwen3-vl-2b \
+    --inputFile input_with_images.json \
+    --outputFile /tmp/disagg_seq_output.json \
+    --profileOutputFile /tmp/disagg_seq_profile.json \
+    --dumpProfile \
+    --benchmarkCount 20 \
+    --disaggregation
+
+# disaggregation pipeline async
+docker run --gpus all --ipc=host \
+    --ulimit memlock=-1 --ulimit stack=67108864 -it --rm \
+    -v $(pwd):/workspace \
+    -v ~/Document/TensorRT-Edge-LLM/engines:/workspace/engines \
+    -v ~/Document/TensorRT-Edge-LLM/visual_engines:/workspace/visual_engines \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    ./build/examples/llm/llm_benchmark \
+    --engineDir engines/qwen3-vl-2b \
+    --multimodalEngineDir visual_engines/qwen3-vl-2b \
+    --inputFile input_with_images.json \
+    --outputFile /tmp/disagg_pipe_output.json \
+    --profileOutputFile /tmp/disagg_pipe_profile.json \
+    --dumpProfile \
+    --benchmarkCount 20 \
+    --disaggregation \
+    --tpcCount 4
+```
+
 
 
 **High-Performance Large Language Model Inference Framework for NVIDIA Edge Platforms**
