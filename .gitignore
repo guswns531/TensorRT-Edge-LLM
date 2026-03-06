@@ -14,7 +14,8 @@ data.tar
 *.tar.gz
 internal/
 *.log
-.DS_Store/
+.DS_Store
+
 docs/cpp_docs/
 docs/build/
 docs/source/cpp_api/
@@ -27,3 +28,4 @@ visual_engines/
 engines/
 onnx_models/
 quantized/
+
