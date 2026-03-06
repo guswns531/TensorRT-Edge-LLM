@@ -741,8 +741,8 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         }
     }
 
-    bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mInputsEmbeds, mContextLengthsInput,
-        deepstackEmbeds, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
+    bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput,
+        context.multimodalEmbeddings, deepstackEmbeds, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for base model.");

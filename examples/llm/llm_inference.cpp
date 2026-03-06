@@ -66,7 +66,8 @@ enum LLMInferenceOptionId : int
     BATCH_SIZE = 914,
     MAX_GENERATE_LENGTH = 915,
     DISAGGREGATION = 916,
-    TPC_COUNT = 917
+    TPC_COUNT = 917,
+    DISAGG_DECODE_CUDA_GRAPH = 918
 };
 
 // Struct to hold Eagle-specific arguments for speculative decoding
@@ -106,6 +107,7 @@ struct LLMInferenceArgs
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     int32_t tpcCount{-1};          // -1 means disabled
     bool disaggregation{false};
+    bool disaggDecodeCudaGraph{false};
     EagleArgs eagleArgs;
 };
 
@@ -205,7 +207,7 @@ void printUsage(char const* programName)
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--tpcCount=<number>] [--eagle] "
-                 "[--disaggregation] "
+                 "[--disaggregation] [--disaggDecodeCudaGraph] "
                  "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
                  "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
@@ -227,6 +229,7 @@ void printUsage(char const* programName)
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
     std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
     std::cerr << "  --disaggregation          Enable disaggregation runtime (3-stage async workers)" << std::endl;
+    std::cerr << "  --disaggDecodeCudaGraph   Try capture/use decode CUDA graph in disaggregation mode" << std::endl;
     std::cerr << "  --eagleDraftTopK          Number of tokens selected per drafting step (default: 10)" << std::endl;
     std::cerr << "                            Controls branching factor at each draft tree level" << std::endl;
     std::cerr << "  --eagleDraftStep          Number of drafting steps to perform (default: 6)" << std::endl;
@@ -255,6 +258,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
         {"tpcCount", required_argument, 0, LLMInferenceOptionId::TPC_COUNT},
         {"disaggregation", no_argument, 0, LLMInferenceOptionId::DISAGGREGATION},
+        {"disaggDecodeCudaGraph", no_argument, 0, LLMInferenceOptionId::DISAGG_DECODE_CUDA_GRAPH},
         {0, 0, 0, 0}};
 
     int opt;
@@ -387,6 +391,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case LLMInferenceOptionId::DISAGGREGATION: args.disaggregation = true; break;
+        case LLMInferenceOptionId::DISAGG_DECODE_CUDA_GRAPH: args.disaggDecodeCudaGraph = true; break;
         default: return false;
         }
     }
@@ -445,6 +450,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (args.disaggregation)
     {
         LOG_INFO("Disaggregation runtime enabled");
+        if (args.disaggDecodeCudaGraph)
+        {
+            LOG_INFO("Disaggregation decode CUDA graph capture enabled");
+        }
     }
     if (args.tpcCount > 0)
     {
@@ -454,6 +463,16 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     {
         LOG_ERROR("Cannot enable both --eagle and --disaggregation at the same time.");
         return false;
+    }
+    if (args.disaggregation && args.tpcCount > 0)
+    {
+        auto const tpcLimit = static_cast<int32_t>(getJetsonThorTpcOrderFromGpcMasks().size());
+        if (args.tpcCount >= tpcLimit)
+        {
+            LOG_ERROR("In disaggregation mode, --tpcCount must be in [1, %d) so prefill+encoding can use remaining TPCs.",
+                tpcLimit);
+            return false;
+        }
     }
 
     if (args.debug)
@@ -779,7 +798,7 @@ int main(int argc, char* argv[])
     std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    if (args.tpcCount > 0 && !applyTpcMaskToStream(stream, args.tpcCount))
+    if (!args.disaggregation && args.tpcCount > 0 && !applyTpcMaskToStream(stream, args.tpcCount))
     {
         LOG_ERROR("Failed to apply TPC stream mask for tpcCount=%d", args.tpcCount);
         return EXIT_FAILURE;
@@ -817,7 +836,8 @@ int main(int argc, char* argv[])
         try
         {
             disaggregationRuntime = std::make_unique<rt::LLMInferenceDisaggregationRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream, args.tpcCount,
+                args.disaggDecodeCudaGraph);
         }
         catch (std::exception const& e)
         {

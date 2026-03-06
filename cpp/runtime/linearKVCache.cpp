@@ -107,9 +107,10 @@ rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx, int
     int64_t const kvCacheOffset
         = decoderLayerIdx * mConfig.maxBatchSize * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim
         + static_cast<int64_t>(slotOffset) * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim;
-    KVCacheType* kvCachePtr = mDeviceKVCache + kvCacheOffset;
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheTypeTRT);
+    void* kvCachePtr = static_cast<void*>(static_cast<char*>(mDeviceKVCache.rawPointer()) + kvCacheOffset * elemSize);
     return rt::Tensor(kvCachePtr, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength, mConfig.headDim},
-        DeviceType::kGPU, KVCacheTypeTRT);
+        DeviceType::kGPU, mConfig.kvCacheTypeTRT);
 }
 
 rt::Tensor LinearKVCache::getKVCacheBuffer()

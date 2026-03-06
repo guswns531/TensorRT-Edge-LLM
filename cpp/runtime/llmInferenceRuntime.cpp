@@ -519,7 +519,7 @@ bool LLMInferenceRuntime::handleRequest(
             nvtx_colors::BLUE);
 
         bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-            mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
+            mInputIds, mHostContextLengths, multimodalEmbeddings, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
         if (!prefillStatus)
         {
             LOG_ERROR(
@@ -758,7 +758,7 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
 
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
     bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-        mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
+        mInputIds, mHostContextLengths, multimodalEmbeddings, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
     if (!prefillStatus)
     {
         LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");
