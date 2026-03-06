@@ -67,7 +67,7 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
         check::check(embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
         mEmbeddingTable = std::move(embeddingTensors[0]);
 
-        mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
+        mLLMEngineRunner = std::make_unique<LLMDisaggregationEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
         mEngineConfig = mLLMEngineRunner->getEngineConfig();
 
         int32_t const defaultTopK{0};
@@ -424,7 +424,8 @@ bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(StageContext& c
             context.batchedInputIds[i].begin(), context.batchedInputIds[i].end(), packedInputIdsData + i * packedInputLength);
     }
 
-    mLLMEngineRunner->getLinearKVCache().resetForNewSequences(context.hostReuseKVCacheLengths, stream);
+    mLLMEngineRunner->getLinearKVCache().resetForNewSequences(
+        context.hostReuseKVCacheLengths, context.slotOffset, stream);
     check::check(context.inputIds.reshape({activeBatchSize, packedInputLength}), "Failed to reshape input IDs.");
     check::check(context.hostContextLengths.reshape({activeBatchSize}), "Failed to reshape context lengths.");
     check::check(
@@ -555,7 +556,8 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
         try
         {
         context->activeBatchSize = static_cast<int32_t>(context->request->requests.size());
-        context->slotOffset = 0;
+        context->slotOffset = allocateSlotRange(context->activeBatchSize);
+        context->ownsSlotRange = true;
         context->loraWeightsName = context->request->loraWeightsName;
         LOG_INFO("[Disagg][Req=%llu] encoding(start): batch=%d slotOffset=%d",
             static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset);
@@ -674,6 +676,12 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
         };
         CUDA_CHECK(cudaStreamWaitEvent(mPrefillStream, context->multimodalDone, 0));
 
+        std::unique_lock<std::mutex> runnerLock(mRunnerMutex, std::defer_lock);
+        if (mEngineConfig.maxSupportedLoraRank > 0)
+        {
+            runnerLock.lock();
+        }
+
         if (!setUpForPrefillExecution(*context, mPrefillStream))
         {
             setFailedResult(*context, "prefill setup failed");
@@ -740,10 +748,9 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
             maxInputIdsLength, context->maxGenerationLength);
         {
             TIME_STAGE(metrics::StageNames::kLLM_PREFILL, mPrefillStream);
-            std::lock_guard<std::mutex> runnerLock(mRunnerMutex);
             if (!mLLMEngineRunner->executePrefillStep(
                     context->inputsEmbeds, context->hostContextLengths, deepstackEmbeds, context->outputLogits,
-                    outputHiddenStates, mPrefillStream))
+                    outputHiddenStates, context->slotOffset, mPrefillStream))
             {
                 setFailedResult(*context, "prefill execution failed");
                 notifyPrefillStageCompleted();
@@ -797,6 +804,11 @@ void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
         LOG_INFO("[Disagg][Req=%llu] decode(start): batch=%d slotOffset=%d maxGen=%d",
             static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset,
             context->maxGenerationLength);
+        std::unique_lock<std::mutex> runnerLock(mRunnerMutex, std::defer_lock);
+        if (mEngineConfig.maxSupportedLoraRank > 0)
+        {
+            runnerLock.lock();
+        }
         {
             TIME_STAGE(metrics::StageNames::kLLM_GENERATION, mDecodeStream);
             while (context->unFinishedBatchNum > 0 && context->generationIter < context->maxGenerationLength)
@@ -804,9 +816,8 @@ void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
                 check::check(context->inputsEmbeds.reshape({context->activeBatchSize, 1, mEngineConfig.hiddenSize}),
                     "Failed to reshape decode inputs embeds.");
                 kernel::embeddingLookup(context->selectedIndices, mEmbeddingTable, context->inputsEmbeds, mDecodeStream);
-                std::lock_guard<std::mutex> runnerLock(mRunnerMutex);
                 if (!mLLMEngineRunner->executeVanillaDecodingStep(
-                        context->inputsEmbeds, context->outputLogits, mDecodeStream))
+                        context->inputsEmbeds, context->outputLogits, context->slotOffset, mDecodeStream))
                 {
                     setFailedResult(*context, "decode execution failed");
                     break;
@@ -874,6 +885,11 @@ void LLMInferenceDisaggregationRuntime::finalizeContext(StageContext& context)
     {
         CUDA_CHECK(cudaEventDestroy(context.prefillDone));
         context.prefillDone = nullptr;
+    }
+    if (context.ownsSlotRange)
+    {
+        releaseSlotRange(context.slotOffset, context.activeBatchSize);
+        context.ownsSlotRange = false;
     }
 
     AsyncRequestResult result;

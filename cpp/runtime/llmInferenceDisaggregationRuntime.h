@@ -19,7 +19,7 @@
 
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
-#include "runtime/llmEngineRunner.h"
+#include "runtime/llmDisaggregationEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 #include <condition_variable>
@@ -177,6 +177,7 @@ private:
         int32_t unFinishedBatchNum{0};
         int32_t generationIter{0};
         int32_t slotOffset{0};
+        bool ownsSlotRange{false};
 
         rt::Tensor samplingWorkspace{};
         rt::Tensor inputIds{};
@@ -217,7 +218,7 @@ private:
     bool applyTpcMaskToStream(cudaStream_t stream, __uint128_t mask, char const* streamName) const;
     static std::vector<uint32_t> getJetsonThorTpcOrderFromGpcMasks();
 
-    std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};
+    std::unique_ptr<LLMDisaggregationEngineRunner> mLLMEngineRunner{nullptr};
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};
     std::unordered_map<size_t, DisaggregationSystemPromptKVCache> mSystemPromptKVCache{};
@@ -236,7 +237,7 @@ private:
     std::vector<rt::Tensor> mDeepstackEmbeds;
     int64_t mMaxSamplingWorkspaceSize{0};
     std::string mEmptyLoraWeightsName{""};
-    LLMEngineRunnerConfig mEngineConfig{};
+    LLMDisaggregationEngineRunnerConfig mEngineConfig{};
 
     metrics::LLMPrefillMetrics mPrefillMetrics;
     metrics::LLMGenerationMetrics mGenerationMetrics;
