@@ -201,6 +201,28 @@ bool applyTpcMaskToStream(cudaStream_t stream, int32_t tpcCount)
         static_cast<unsigned long long>(fullMask));
     return true;
 }
+
+std::string getRuntimeModeLabel(LLMInferenceArgs const& args)
+{
+    if (args.eagleArgs.enabled)
+    {
+        return "eagle";
+    }
+    if (args.disaggregation)
+    {
+        return "disaggregation";
+    }
+    return "baseline";
+}
+
+std::string getDisaggregationSubmissionMode(LLMInferenceArgs const& args)
+{
+    if (!args.disaggregation)
+    {
+        return "disabled";
+    }
+    return args.tpcCount > 0 ? "pipeline_async" : "sequential_async";
+}
 } // namespace
 
 void printUsage(char const* programName)
@@ -890,7 +912,7 @@ int main(int argc, char* argv[])
             LOG_ERROR("Failed to initialize LLMInferenceDisaggregationRuntime: %s", e.what());
             return EXIT_FAILURE;
         }
-        if (!disaggregationRuntime->captureDecodingCUDAGraph(stream))
+        if (args.disaggDecodeCudaGraph && !disaggregationRuntime->captureDecodingCUDAGraph(stream))
         {
             LOG_WARNING("Failed to capture CUDA graph for disaggregation decode usage.");
         }
@@ -959,6 +981,11 @@ int main(int argc, char* argv[])
     // Structure to collect all responses for JSON export
     nlohmann::json outputData;
     outputData["input_file"] = args.inputFile;
+    outputData["runtime_mode"] = getRuntimeModeLabel(args);
+    outputData["disaggregation_submission_mode"] = getDisaggregationSubmissionMode(args);
+    outputData["benchmark_count"] = args.benchmarkCount;
+    outputData["tpc_count"] = args.tpcCount;
+    outputData["decode_cuda_graph_enabled"] = args.disaggregation ? args.disaggDecodeCudaGraph : true;
     outputData["responses"] = nlohmann::json::array();
 
     bool hasFailedRequest = false;
@@ -1494,6 +1521,11 @@ int main(int argc, char* argv[])
 
         std::ostringstream benchOutput;
         benchOutput << "\n=== Benchmark Summary ===\n";
+        benchOutput << "runtime_mode: " << getRuntimeModeLabel(args) << "\n";
+        if (args.disaggregation)
+        {
+            benchOutput << "submission_mode: " << getDisaggregationSubmissionMode(args) << "\n";
+        }
         benchOutput << "count: " << args.benchmarkCount << "\n";
         benchOutput << std::left << std::setw(10) << "stage" << std::right << std::setw(10) << "samples"
                     << std::setw(14) << "mean_ms"
@@ -1586,6 +1618,12 @@ int main(int argc, char* argv[])
                 // Add memory usage
                 addJsonMemorySummary(profileJson, memoryMonitor);
             }
+
+            profileJson["runtime_mode"] = getRuntimeModeLabel(args);
+            profileJson["disaggregation_submission_mode"] = getDisaggregationSubmissionMode(args);
+            profileJson["benchmark_count"] = args.benchmarkCount;
+            profileJson["tpc_count"] = args.tpcCount;
+            profileJson["decode_cuda_graph_enabled"] = args.disaggregation ? args.disaggDecodeCudaGraph : true;
 
             std::ofstream profileFile(args.profileOutputFile);
             if (profileFile.is_open())

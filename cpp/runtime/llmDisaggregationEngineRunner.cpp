@@ -64,8 +64,9 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMDisaggregationEngineRunnerCon
     return ss.str();
 }
 
-// Compute a unique key value that can distinguish the various decoding steps.
-// Extend this function when we need to capture more information.
+// [ForDisaggregation] Unlike llmEngineRunner.cpp, this runner cannot key decode CUDA graphs only by
+// batch/IO pointers. Different slotOffset values change both the KV-cache start-index tensor address and
+// the layer KV bindings, so a graph captured for slot 0 is not safe to reuse for slot N.
 trt_edgellm::rt::LLMDisaggregationEngineRunner::DecodingGraphKey decodingKey(
     rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits, std::string const& loraWeightsName,
     int32_t slotOffset)
@@ -143,6 +144,9 @@ LLMDisaggregationEngineRunner::LLMDisaggregationEngineRunner(std::filesystem::pa
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
+    // [ForDisaggregation] llmEngineRunner.cpp intentionally stays close to main and uses a single TRT context.
+    // Here we pay the extra memory cost for two user-managed contexts so prefill and decode can execute on
+    // different streams without rebinding one shared TRT execution context back and forth.
     int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
     mPrefillExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "LLMDisaggregationEngineRunner::mPrefillExecContextMemory");
@@ -684,6 +688,11 @@ bool LLMDisaggregationEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize,
 bool LLMDisaggregationEngineRunner::bindKVCacheToContext(
     nvinfer1::IExecutionContext& executionContext, int32_t activeBatchSize, int32_t slotOffset)
 {
+    // [ForDisaggregation] The baseline runner binds KV-cache as if the active batch always starts at slot 0.
+    // This runner instead binds only the contiguous slot range reserved for the current request batch so:
+    // 1. another request can keep decoding on different slots
+    // 2. prefill can populate fresh slots without touching existing requests
+    // 3. decode can advance exactly the same slots that prefill filled earlier
     // Prepare special input binding shape for prefill stage KVCache input.
     Dims const kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
     bool status{true};
@@ -860,6 +869,9 @@ bool LLMDisaggregationEngineRunner::executePrefillStep(rt::Tensor const& inputsE
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), hostContextLengths.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
+    // [ForDisaggregation] This intentionally mirrors the baseline prefill flow so behavior stays comparable.
+    // The critical difference is that every KV-cache read/write is scoped by slotOffset, which lets one request
+    // prefill into its own reserved slots while other requests may already occupy earlier or later slots.
     bool setEngineIOStatus{true};
     // Engine input tensors - bind inputs_embeds directly
     setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
@@ -1019,6 +1031,8 @@ bool LLMDisaggregationEngineRunner::executeVanillaDecodingStep(
         return false;
     }
 
+    // [ForDisaggregation] Decode must continue from the exact slots reserved during prefill. The baseline runner
+    // assumes a single active batch rooted at slot 0; this variant treats slotOffset as part of request identity.
     int32_t activeBatchSize = inputsEmbeds.getShape()[0];
     // For vanilla decode stage, the selected token indices are always 0.
     // Also setup the sequence length of each sequence for this run based on committed KVCache length.
@@ -1344,6 +1358,8 @@ bool LLMDisaggregationEngineRunner::captureVanillaDecodingCudaGraph(
 bool LLMDisaggregationEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor const& inputsEmbeds,
     rt::Tensor& outputLogits, std::string const& loraWeightsPath, int32_t slotOffset, cudaStream_t stream)
 {
+    // [ForDisaggregation] CUDA graph capture is also slot-aware for the same reason as decode graph lookup:
+    // the captured graph hardcodes the KV binding addresses for one slot range.
     auto const key = decodingKey(inputsEmbeds, outputLogits, loraWeightsPath, slotOffset);
     if (mCudaGraphs.find(key) != mCudaGraphs.end())
     {
@@ -1653,6 +1669,8 @@ bool LLMDisaggregationEngineRunner::resetLoraWeights(cudaStream_t stream)
         return true;
     }
     mActiveLoraWeightsName = "";
+    // [ForDisaggregation] Prefill and generation no longer share a TRT context, so "reset LoRA" has to touch both
+    // contexts. Otherwise prefill and decode could silently run with different adapter state.
     auto resetContextLoraWeights = [&](nvinfer1::IExecutionContext& executionContext) {
         bool status{true};
         for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
@@ -1777,6 +1795,8 @@ bool LLMDisaggregationEngineRunner::switchLoraWeights(std::string const& loraWei
 
     auto& loraTensors = it->second;
 
+    // [ForDisaggregation] Keep the two TRT contexts logically in sync even though the runtime may schedule them on
+    // different streams. Adapter switches are still shared state at the runner level.
     auto applyLoraWeightsToContext = [&](nvinfer1::IExecutionContext& executionContext) {
         for (auto const& loraWeightsTensorName : this->getLoraWeightsTensorNames())
         {

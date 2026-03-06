@@ -67,6 +67,9 @@ LLMInferenceDisaggregationRuntime::LLMInferenceDisaggregationRuntime(std::string
         check::check(embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
         mEmbeddingTable = std::move(embeddingTensors[0]);
 
+        // [ForDisaggregation] This runtime intentionally uses a separate runner implementation so
+        // llmEngineRunner.cpp can remain the baseline/main-compatible path. That separation makes behavior and
+        // performance comparisons easier because only the disaggregation path sees slot-aware changes.
         mLLMEngineRunner = std::make_unique<LLMDisaggregationEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
         mEngineConfig = mLLMEngineRunner->getEngineConfig();
 
@@ -424,6 +427,9 @@ bool LLMInferenceDisaggregationRuntime::setUpForPrefillExecution(StageContext& c
             context.batchedInputIds[i].begin(), context.batchedInputIds[i].end(), packedInputIdsData + i * packedInputLength);
     }
 
+    // [ForDisaggregation] Only reset the slots reserved for this request batch. A different request may still be
+    // decoding on another slot range, so using the baseline "reset active batch from slot 0" behavior would corrupt
+    // live KV-cache state.
     mLLMEngineRunner->getLinearKVCache().resetForNewSequences(
         context.hostReuseKVCacheLengths, context.slotOffset, stream);
     check::check(context.inputIds.reshape({activeBatchSize, packedInputLength}), "Failed to reshape input IDs.");
@@ -556,6 +562,8 @@ void LLMInferenceDisaggregationRuntime::multimodalWorkerMain()
         try
         {
         context->activeBatchSize = static_cast<int32_t>(context->request->requests.size());
+        // [ForDisaggregation] Reserve one contiguous slot range per request batch and keep it until the whole request
+        // finishes. Prefill and all later decode iterations reuse the same slots so KV-cache ownership stays stable.
         context->slotOffset = allocateSlotRange(context->activeBatchSize);
         context->ownsSlotRange = true;
         context->loraWeightsName = context->request->loraWeightsName;
@@ -676,6 +684,9 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
         };
         CUDA_CHECK(cudaStreamWaitEvent(mPrefillStream, context->multimodalDone, 0));
 
+        // [ForDisaggregation] Slot-aware execution removes the old single-context bottleneck, but LoRA adapter
+        // switching is still shared runner state. We therefore allow overlap only for the no-LoRA case and keep
+        // LoRA-enabled requests serialized to avoid switching adapters while another request is running.
         std::unique_lock<std::mutex> runnerLock(mRunnerMutex, std::defer_lock);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
@@ -804,6 +815,8 @@ void LLMInferenceDisaggregationRuntime::decodeWorkerMain()
         LOG_INFO("[Disagg][Req=%llu] decode(start): batch=%d slotOffset=%d maxGen=%d",
             static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset,
             context->maxGenerationLength);
+        // [ForDisaggregation] Decode keeps the same LoRA serialization rule as prefill. The split TRT contexts remove
+        // execution-context contention, but they do not make adapter selection request-local.
         std::unique_lock<std::mutex> runnerLock(mRunnerMutex, std::defer_lock);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
@@ -888,6 +901,8 @@ void LLMInferenceDisaggregationRuntime::finalizeContext(StageContext& context)
     }
     if (context.ownsSlotRange)
     {
+        // [ForDisaggregation] Slot ownership is request-scoped rather than stage-scoped. Always return the entire
+        // reserved range here so failures do not leak slots and starve later requests.
         releaseSlotRange(context.slotOffset, context.activeBatchSize);
         context.ownsSlotRange = false;
     }
