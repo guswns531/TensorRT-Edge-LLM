@@ -278,20 +278,31 @@ LLMDisaggregationEngineRunner::LLMDisaggregationEngineRunner(std::filesystem::pa
             stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
-    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
-        "LLMDisaggregationEngineRunner::mSequenceContextLengths");
+    this->mPrefillSequenceContextLengths
+        = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMDisaggregationEngineRunner::mPrefillSequenceContextLengths");
+    this->mGenerationSequenceContextLengths
+        = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMDisaggregationEngineRunner::mGenerationSequenceContextLengths");
     CUDA_CHECK(
-        cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
+        cudaMemsetAsync(mPrefillSequenceContextLengths.rawPointer(), 0, mPrefillSequenceContextLengths.getMemoryCapacity(),
+            stream));
+    CUDA_CHECK(cudaMemsetAsync(mGenerationSequenceContextLengths.rawPointer(), 0,
+        mGenerationSequenceContextLengths.getMemoryCapacity(), stream));
 
     if (mConfig.enableEagleSpecDecode)
     {
         // For EAGLE: last_token_ids is 2D [batch_size, num_selected_tokens] to support multi-batch
-        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
-            rt::DeviceType::kGPU, DataType::kINT64, "LLMDisaggregationEngineRunner::mSelectTokenIndices");
-        CUDA_CHECK(
-            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
-        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
-            rt::DeviceType::kCPU, DataType::kINT64, "LLMDisaggregationEngineRunner::mHostSelectTokenIndices");
+        this->mGenerationSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
+            rt::DeviceType::kGPU, DataType::kINT64, "LLMDisaggregationEngineRunner::mGenerationSelectTokenIndices");
+        CUDA_CHECK(cudaMemsetAsync(mGenerationSelectTokenIndices.rawPointer(), 0,
+            mGenerationSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mPrefillSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            DataType::kINT64, "LLMDisaggregationEngineRunner::mPrefillSelectTokenIndices");
+        CUDA_CHECK(cudaMemsetAsync(mPrefillSelectTokenIndices.rawPointer(), 0,
+            mPrefillSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mHostPrefillSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
+            DataType::kINT64, "LLMDisaggregationEngineRunner::mHostPrefillSelectTokenIndices");
         this->mEagleBasePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
             rt::DeviceType::kGPU, DataType::kINT32, "LLMDisaggregationEngineRunner::mEagleBasePositionIds");
         CUDA_CHECK(
@@ -305,12 +316,16 @@ LLMDisaggregationEngineRunner::LLMDisaggregationEngineRunner(std::filesystem::pa
     }
     else
     {
-        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
-            DataType::kINT64, "LLMDisaggregationEngineRunner::mSelectTokenIndices");
-        CUDA_CHECK(
-            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
-        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
-            DataType::kINT64, "LLMDisaggregationEngineRunner::mHostSelectTokenIndices");
+        this->mGenerationSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            DataType::kINT64, "LLMDisaggregationEngineRunner::mGenerationSelectTokenIndices");
+        CUDA_CHECK(cudaMemsetAsync(mGenerationSelectTokenIndices.rawPointer(), 0,
+            mGenerationSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mPrefillSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            DataType::kINT64, "LLMDisaggregationEngineRunner::mPrefillSelectTokenIndices");
+        CUDA_CHECK(cudaMemsetAsync(mPrefillSelectTokenIndices.rawPointer(), 0,
+            mPrefillSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mHostPrefillSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
+            DataType::kINT64, "LLMDisaggregationEngineRunner::mHostPrefillSelectTokenIndices");
     }
 
     // Add the LoRA weights to the engine.
@@ -849,24 +864,24 @@ bool LLMDisaggregationEngineRunner::executePrefillStep(rt::Tensor const& inputsE
     bool reshapeStatus{true};
     // conduct preparation work for the engine execution. Provide correct shapes for MISC input tensors.
     // All models (EAGLE and vanilla) now use 2D shape [batch_size, num_tokens] for last_token_ids
-    reshapeStatus &= mSelectTokenIndices.reshape({activeBatchSize, 1});
-    reshapeStatus &= mSequenceContextLengths.reshape({activeBatchSize});
+    reshapeStatus &= mPrefillSelectTokenIndices.reshape({activeBatchSize, 1});
+    reshapeStatus &= mPrefillSequenceContextLengths.reshape({activeBatchSize});
     if (!reshapeStatus)
     {
         LOG_ERROR("Failed to reshape select token indices and sequence context lengths for prefill step.");
         return false;
     }
 
-    mHostSelectTokenIndices.reshape({activeBatchSize, 1});
-    int64_t* selectTokenIndicesData = mHostSelectTokenIndices.dataPointer<int64_t>();
+    mHostPrefillSelectTokenIndices.reshape({activeBatchSize, 1});
+    int64_t* selectTokenIndicesData = mHostPrefillSelectTokenIndices.dataPointer<int64_t>();
     int32_t const* contextLengthsData = hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         selectTokenIndicesData[i] = static_cast<int64_t>(contextLengthsData[i] - 1);
     }
-    CUDA_CHECK(cudaMemcpyAsync(mSelectTokenIndices.rawPointer(), mHostSelectTokenIndices.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(mPrefillSelectTokenIndices.rawPointer(), mHostPrefillSelectTokenIndices.rawPointer(),
         activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), hostContextLengths.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(mPrefillSequenceContextLengths.rawPointer(), hostContextLengths.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
     // [ForDisaggregation] This intentionally mirrors the baseline prefill flow so behavior stays comparable.
@@ -879,13 +894,15 @@ bool LLMDisaggregationEngineRunner::executePrefillStep(rt::Tensor const& inputsE
     setEngineIOStatus
         &= mPrefillExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+        &= mPrefillExecutionContext->setTensorAddress(
+            binding_names::kContextLengths, mPrefillSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+        binding_names::kContextLengths, mPrefillSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        &= mPrefillExecutionContext->setTensorAddress(
+            binding_names::kLastTokenIds, mPrefillSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        binding_names::kLastTokenIds, mPrefillSelectTokenIndices.getShape().getTRTDims());
 
     // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
     // Otherwise, we shall supply the KVCache lengths tensor to the engine.
@@ -966,7 +983,7 @@ bool LLMDisaggregationEngineRunner::executePrefillStep(rt::Tensor const& inputsE
         return false;
     }
     // Prefill operation has completed, commit the new contents with KVCache.
-    mKVCache.commitSequenceLength(mSequenceContextLengths, slotOffset, stream);
+    mKVCache.commitSequenceLength(mPrefillSequenceContextLengths, slotOffset, stream);
 
     LOG_DEBUG("executePrefill(): Prefill stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
@@ -1036,13 +1053,13 @@ bool LLMDisaggregationEngineRunner::executeVanillaDecodingStep(
     int32_t activeBatchSize = inputsEmbeds.getShape()[0];
     // For vanilla decode stage, the selected token indices are always 0.
     // Also setup the sequence length of each sequence for this run based on committed KVCache length.
-    CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(mGenerationSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     rt::Tensor kvCacheLengths = mKVCache.getKVCacheLengths(slotOffset, activeBatchSize);
-    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), kvCacheLengths.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(mGenerationSequenceContextLengths.rawPointer(), kvCacheLengths.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
     // Increment the sequence length due to the implementation constraint of AttentionPlugin.
     constexpr int32_t kDECODE_INCREMENT{1};
-    kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
+    kernel::incrementLengthTensor(mGenerationSequenceContextLengths, kDECODE_INCREMENT, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
     auto const graphHash = decodingKey(inputsEmbeds, outputLogits, mActiveLoraWeightsName, slotOffset);
@@ -1070,13 +1087,14 @@ bool LLMDisaggregationEngineRunner::executeVanillaDecodingStep(
         setEngineIOStatus
             &= mGenerationExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+            binding_names::kContextLengths, mGenerationSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+            binding_names::kContextLengths, mGenerationSequenceContextLengths.getShape().getTRTDims());
         setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+            &= mGenerationExecutionContext->setTensorAddress(
+                binding_names::kLastTokenIds, mGenerationSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+            binding_names::kLastTokenIds, mGenerationSelectTokenIndices.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, kvCacheLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1234,15 +1252,15 @@ bool LLMDisaggregationEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor 
 
     // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
     // indices, sequence context lengths.
-    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
+    mGenerationSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
+    mGenerationSequenceContextLengths.reshape({activeBatchSize});
     mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
     mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
     kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
-        mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
+        mEagleBasePositionIds, mGenerationSelectTokenIndices, mGenerationSequenceContextLengths, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
     auto const graphHash = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
@@ -1271,13 +1289,13 @@ bool LLMDisaggregationEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor 
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kInputsEmbeds, baseTreeDecodingInputsEmbeds.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+            binding_names::kContextLengths, mGenerationSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+            binding_names::kContextLengths, mGenerationSequenceContextLengths.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kLastTokenIds, mGenerationSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+            binding_names::kLastTokenIds, mGenerationSelectTokenIndices.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1403,18 +1421,18 @@ bool LLMDisaggregationEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor c
         return false;
     }
 
-    // Set shape of mSelectTokenIndices and set value to all zero.
+    // Set shape of generation last_token_ids and set value to all zero.
     // Set sequence context length input for decoding step.
-    mSelectTokenIndices.reshape({activeBatchSize, 1});
-    mSequenceContextLengths.reshape({activeBatchSize});
+    mGenerationSelectTokenIndices.reshape({activeBatchSize, 1});
+    mGenerationSequenceContextLengths.reshape({activeBatchSize});
     // Need to reshape the mPosEncCosSinCache for MROPE.
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
-    CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(mGenerationSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     rt::Tensor kvCacheLengths = mKVCache.getKVCacheLengths(slotOffset, activeBatchSize);
-    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), kvCacheLengths.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(mGenerationSequenceContextLengths.rawPointer(), kvCacheLengths.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
 
     // Set engine I/O using the same logic as executeVanillaDecodingStep().
@@ -1423,14 +1441,14 @@ bool LLMDisaggregationEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor c
         binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
     setEngineIOStatus
         &= mGenerationExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kContextLengths, mGenerationSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        binding_names::kContextLengths, mGenerationSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kLastTokenIds, mGenerationSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        binding_names::kLastTokenIds, mGenerationSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kKVCacheStartIndex, kvCacheLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1547,15 +1565,15 @@ bool LLMDisaggregationEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Te
     // indices, sequence context lengths.
     int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
     int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
-    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
+    mGenerationSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
+    mGenerationSequenceContextLengths.reshape({activeBatchSize});
     mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
     mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
 
     rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
 
     kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
-        mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
+        mEagleBasePositionIds, mGenerationSelectTokenIndices, mGenerationSequenceContextLengths, stream);
 
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
@@ -1568,14 +1586,14 @@ bool LLMDisaggregationEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Te
         binding_names::kInputsEmbeds, const_cast<void*>(baseTreeDecodingInputsEmbeds.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         binding_names::kInputsEmbeds, baseTreeDecodingInputsEmbeds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kContextLengths, mGenerationSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        binding_names::kContextLengths, mGenerationSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kLastTokenIds, mGenerationSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        binding_names::kLastTokenIds, mGenerationSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(

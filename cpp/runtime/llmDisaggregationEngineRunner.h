@@ -230,17 +230,19 @@ private:
     //! The design is to produce better performance and accommodate complex context dependent rope.
     rt::Tensor mPosEncCosSinCache{};
 
-    //! The select token indices tensor is used to select indices from hidden states to pass to
-    //! the LM head of LLM model. Enforce to be int64_t to align with ONNX Gather-ND specification.
-    rt::Tensor mSelectTokenIndices{};
-    rt::Tensor mHostSelectTokenIndices{}; //!< Host tensor for select token indices (pinned memory)
+    //! Prefill-only last_token_ids tensor [batch, 1]. Kept separate from generation buffers so prefill/decode can
+    //! execute concurrently on different streams without overwriting in-flight bindings.
+    rt::Tensor mPrefillSelectTokenIndices{};
+    rt::Tensor mHostPrefillSelectTokenIndices{}; //!< Host tensor for prefill select token indices (pinned memory)
 
-    //! The tensor has different meaning for prefill and decoding phase due to implementation of
-    //! the AttentionPlugin. Used as LLM engine input.
-    //! For prefill phase, the field denotes the actual content length of input_ids for each sequence.
-    //! For decoding phase, this field denotes the cumulative length of the sequence length of prefill
-    //!     plus generated tokens (including the length in "current" run).
-    rt::Tensor mSequenceContextLengths{};
+    //! Prefill-only context lengths tensor [batch].
+    rt::Tensor mPrefillSequenceContextLengths{};
+
+    //! Generation-stage last_token_ids tensor. Shape is [batch, 1] for vanilla decode and [batch, tree_size] for Eagle.
+    rt::Tensor mGenerationSelectTokenIndices{};
+
+    //! Generation-stage context lengths tensor [batch].
+    rt::Tensor mGenerationSequenceContextLengths{};
 
     //! The LinearKVCache tensor that carried for the LLM model execution.
     rt::LinearKVCache mKVCache{};
