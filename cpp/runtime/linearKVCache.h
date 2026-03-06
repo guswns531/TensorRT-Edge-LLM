@@ -85,6 +85,8 @@ public:
     //! @param decoderLayerIdx The index of the decoder layer.
     //! @return A non-owned tensor object that points to the KVCache memory with shape information.
     rt::Tensor getKVCacheForDecoderLayer(int32_t decoderLayerIdx);
+    //! Get KVCache view for a specific slot range.
+    rt::Tensor getKVCacheForDecoderLayer(int32_t decoderLayerIdx, int32_t slotOffset, int32_t activeBatchSize);
 
     //! Get the full KVCache buffer as a non-owned tensor.
     rt::Tensor getKVCacheBuffer();
@@ -93,20 +95,28 @@ public:
     //! @param hostReuseKVCacheLengths The lengths of the KVCache to be reused from precomputed KVCache content.
     //! @param stream The stream is used to perform GPU memory operations.
     void resetForNewSequences(rt::Tensor const& hostReuseKVCacheLengths, cudaStream_t stream);
+    //! Slot-scoped reset for concurrent request pipelines.
+    void resetForNewSequences(rt::Tensor const& hostReuseKVCacheLengths, int32_t slotOffset, cudaStream_t stream);
 
     //! Asynchronously commit the KVCache buffer for a prefill request, record stored KVCache lengths.
     //! @param newContextLengths [GPU, Int32]: The context length to commit for the KVCache.
     //! @param stream The stream is used to perform GPU memory operations.
     void commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream);
+    //! Slot-scoped commit for prefill path.
+    void commitSequenceLength(rt::Tensor const& newContextLengths, int32_t slotOffset, cudaStream_t stream);
 
     //! Commit the KVCache buffer for a decode request, increment the KVCache lengths by 1 for active sequences.
     //! @param increment The amount to increment sequence lengths (typically 1 for decode step)
     //! @param stream The stream is used to perform GPU memory operations.
     void commitSequenceLength(int32_t increment, cudaStream_t stream);
+    //! Slot-scoped commit for decode path.
+    void commitSequenceLength(int32_t increment, int32_t slotOffset, int32_t activeBatchSize, cudaStream_t stream);
 
     //! @brief Get KV cache lengths for active sequences
     //! @return Reference to KV cache lengths tensor
     rt::Tensor& getKVCacheLengths();
+    //! @brief Get KV cache lengths for a slot-scoped view
+    rt::Tensor getKVCacheLengths(int32_t slotOffset, int32_t activeBatchSize);
 
     //! @brief Get KV cache configuration
     //! @return Cache configuration
