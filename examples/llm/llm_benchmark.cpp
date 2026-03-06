@@ -986,30 +986,19 @@ int main(int argc, char* argv[])
     LOG_INFO("Processing %zu batched requests (%d repetition(s))...", totalRequests, args.benchmarkCount);
     if (args.disaggregation)
     {
+        bool const enableDisaggPipelineSubmission = args.tpcCount > 0;
+        if (!enableDisaggPipelineSubmission)
+        {
+            LOG_INFO("Disaggregation mode without --tpcCount: sequential request submission enabled.");
+        }
+
         struct PendingRequest
         {
             size_t globalRequestIdx{0};
             rt::LLMGenerationRequest* request{nullptr};
             std::future<rt::LLMInferenceDisaggregationRuntime::AsyncRequestResult> future;
         };
-
-        std::vector<PendingRequest> pendingRequests;
-        pendingRequests.reserve(totalRequests);
-        for (int32_t repetition = 0; repetition < args.benchmarkCount; ++repetition)
-        {
-            for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
-            {
-                auto& request = batchedRequests[requestIdx];
-                size_t globalRequestIdx = static_cast<size_t>(repetition) * batchedRequests.size() + requestIdx;
-                PendingRequest pending;
-                pending.globalRequestIdx = globalRequestIdx;
-                pending.request = &request;
-                pending.future = disaggregationRuntime->submitRequestAsync(request);
-                pendingRequests.emplace_back(std::move(pending));
-            }
-        }
-
-        for (auto& pending : pendingRequests)
+        auto handlePendingResult = [&](PendingRequest& pending)
         {
             auto result = pending.future.get();
             auto& request = *pending.request;
@@ -1079,6 +1068,46 @@ int main(int argc, char* argv[])
                 responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
                 responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
                 outputData["responses"].push_back(responseJson);
+            }
+        };
+
+        if (enableDisaggPipelineSubmission)
+        {
+            std::vector<PendingRequest> pendingRequests;
+            pendingRequests.reserve(totalRequests);
+            for (int32_t repetition = 0; repetition < args.benchmarkCount; ++repetition)
+            {
+                for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
+                {
+                    auto& request = batchedRequests[requestIdx];
+                    size_t globalRequestIdx = static_cast<size_t>(repetition) * batchedRequests.size() + requestIdx;
+                    PendingRequest pending;
+                    pending.globalRequestIdx = globalRequestIdx;
+                    pending.request = &request;
+                    pending.future = disaggregationRuntime->submitRequestAsync(request);
+                    pendingRequests.emplace_back(std::move(pending));
+                }
+            }
+
+            for (auto& pending : pendingRequests)
+            {
+                handlePendingResult(pending);
+            }
+        }
+        else
+        {
+            for (int32_t repetition = 0; repetition < args.benchmarkCount; ++repetition)
+            {
+                for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
+                {
+                    auto& request = batchedRequests[requestIdx];
+                    size_t globalRequestIdx = static_cast<size_t>(repetition) * batchedRequests.size() + requestIdx;
+                    PendingRequest pending;
+                    pending.globalRequestIdx = globalRequestIdx;
+                    pending.request = &request;
+                    pending.future = disaggregationRuntime->submitRequestAsync(request);
+                    handlePendingResult(pending);
+                }
             }
         }
     }
