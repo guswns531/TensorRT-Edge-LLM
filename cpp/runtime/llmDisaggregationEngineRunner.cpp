@@ -1053,6 +1053,14 @@ bool LLMDisaggregationEngineRunner::executeVanillaDecodingStep(
     int32_t activeBatchSize = inputsEmbeds.getShape()[0];
     // For vanilla decode stage, the selected token indices are always 0.
     // Also setup the sequence length of each sequence for this run based on committed KVCache length.
+    bool reshapeStatus{true};
+    reshapeStatus &= mGenerationSelectTokenIndices.reshape({activeBatchSize, 1});
+    reshapeStatus &= mGenerationSequenceContextLengths.reshape({activeBatchSize});
+    if (!reshapeStatus)
+    {
+        LOG_ERROR("executeVanillaDecodingStep(): Failed to reshape generation misc input tensors.");
+        return false;
+    }
     CUDA_CHECK(cudaMemsetAsync(mGenerationSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     rt::Tensor kvCacheLengths = mKVCache.getKVCacheLengths(slotOffset, activeBatchSize);
     CUDA_CHECK(cudaMemcpyAsync(mGenerationSequenceContextLengths.rawPointer(), kvCacheLengths.rawPointer(),
