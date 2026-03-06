@@ -251,10 +251,32 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         throw std::runtime_error("Failed to set rope cos sin cache to the engine");
     }
 
+    // Detect KV cache storage dtype from engine bindings and ensure it is consistent across layers.
+    std::string const kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+    DataType kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
+    auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
+        std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
+        DataType const currentType = mEngine->getTensorDataType(kvBindingName.c_str());
+        if (currentType != kvCacheType)
+        {
+            LOG_ERROR(
+                "KV cache dtype mismatch detected. Expected binding '%s' dtype=%d, but binding '%s' (layer=%d, %s) "
+                "has dtype=%d.",
+                kvBindingName0.c_str(), static_cast<int32_t>(kvCacheType), kvBindingName.c_str(), layerIdx,
+                (isPast ? "past" : "present"), static_cast<int32_t>(currentType));
+            throw std::runtime_error("KV cache dtype mismatch across layers");
+        }
+    };
+    for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+    {
+        checkKVCacheDType(layerIdx, /*isPast=*/true);
+        checkKVCacheDType(layerIdx, /*isPast=*/false);
+    }
+
     // Instantiate the KVCache instance of the EngineRunner.
     this->mKVCache
         = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim},
+                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, kvCacheType},
             stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.

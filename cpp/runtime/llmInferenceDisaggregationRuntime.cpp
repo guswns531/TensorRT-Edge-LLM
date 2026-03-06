@@ -668,7 +668,7 @@ void LLMInferenceDisaggregationRuntime::prefillWorkerMain()
         rt::OptionalInputTensor multimodalEmbeddings
             = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
         rt::OptionalInputTensors extraVisualFeatures
-            = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+            = mMultimodalRunner ? mMultimodalRunner->getDeepstackFeatures() : rt::OptionalInputTensors{};
         rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
         LOG_INFO("[Disagg][Req=%llu] prefill(start): batch=%d slotOffset=%d inputLen=%d maxGen=%d",
             static_cast<unsigned long long>(context->requestId), context->activeBatchSize, context->slotOffset,

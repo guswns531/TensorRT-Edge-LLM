@@ -37,6 +37,13 @@ namespace binding_names
  */
 
 /*!
+ * @brief Input token IDs tensor - tokenized input sequence ids
+ *
+ * Shape: [batch_size, sequence_length] (INT32)
+ */
+inline constexpr char const* kInputIds = "input_ids";
+
+/*!
  * @brief Input embeddings tensor - contains the embedded input sequence
  *
  * Shape: [batch_size, sequence_length, hidden_size] (FLOAT16)
@@ -211,6 +218,13 @@ inline constexpr char const* kFastPosEmbWeight = "fast_pos_embed_weight";
 
 /*!
  * @brief Deepstack features tensor for Qwen3-VL vision model (visual encoder output)
+ *
+ * Shape: [num_image_tokens, hidden_size] (FLOAT16)
+ */
+inline constexpr char const* kImageEmbeds = "image_embeds";
+
+/*!
+ * @brief Multimodal image embeddings tensor for VLM text model
  *
  * Shape: [num_image_tokens, hidden_size] (FLOAT16)
  */
