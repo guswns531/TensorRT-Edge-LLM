@@ -76,6 +76,148 @@ void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrem
         lengthTensor.dataPointer<int32_t>(), newIncrementTensor.dataPointer<int32_t>(), 0, activeBatchSize);
 }
 
+namespace
+{
+
+void validateIndexedLengthTensors(
+    rt::Tensor const& globalLengths, rt::Tensor const& slotIds, rt::Tensor const& phaseLengths)
+{
+    check::check(globalLengths.getDeviceType() == rt::DeviceType::kGPU
+            && slotIds.getDeviceType() == rt::DeviceType::kGPU && phaseLengths.getDeviceType() == rt::DeviceType::kGPU,
+        "Indexed length tensors shall reside on GPU.");
+    check::check(globalLengths.getDataType() == nvinfer1::DataType::kINT32
+            && slotIds.getDataType() == nvinfer1::DataType::kINT32
+            && phaseLengths.getDataType() == nvinfer1::DataType::kINT32,
+        "Indexed length tensors shall have data type int32_t.");
+    check::check(slotIds.getShape()[0] == phaseLengths.getShape()[0],
+        "Slot IDs and phase-local lengths shall have the same batch size.");
+    check::check(globalLengths.rawPointer() != phaseLengths.rawPointer(),
+        "Global and phase-local length tensors shall not alias.");
+}
+
+__global__ void gatherIndexedLengthTensorKernel(int32_t const* globalLengths, int32_t const* slotIds,
+    int32_t* phaseLengths, int32_t activeBatchSize, int32_t physicalSlotCount)
+{
+    int32_t const threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const gridSize = blockDim.x * gridDim.x;
+    for (int32_t row = threadIndex; row < activeBatchSize; row += gridSize)
+    {
+        int32_t const slot = slotIds[row];
+        if (slot >= 0 && slot < physicalSlotCount)
+        {
+            phaseLengths[row] = globalLengths[slot];
+        }
+    }
+}
+
+__global__ void incrementIndexedLengthTensorKernel(int32_t* globalLengths, int32_t const* slotIds,
+    int32_t* phaseLengths, int32_t const* increments, int32_t scalarIncrement, int32_t activeBatchSize,
+    int32_t physicalSlotCount)
+{
+    int32_t const threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const gridSize = blockDim.x * gridDim.x;
+    for (int32_t row = threadIndex; row < activeBatchSize; row += gridSize)
+    {
+        int32_t const slot = slotIds[row];
+        if (slot >= 0 && slot < physicalSlotCount)
+        {
+            int32_t const increment = increments != nullptr ? increments[row] : scalarIncrement;
+            int32_t const updatedLength = globalLengths[slot] + increment;
+            globalLengths[slot] = updatedLength;
+            phaseLengths[row] = updatedLength;
+        }
+    }
+}
+
+__global__ void clearIndexedLengthTensorKernel(
+    int32_t* globalLengths, int32_t const* slotIds, int32_t slotCount, int32_t physicalSlotCount)
+{
+    int32_t const threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const gridSize = blockDim.x * gridDim.x;
+    for (int32_t row = threadIndex; row < slotCount; row += gridSize)
+    {
+        int32_t const slot = slotIds[row];
+        if (slot >= 0 && slot < physicalSlotCount)
+        {
+            globalLengths[slot] = 0;
+        }
+    }
+}
+
+} // namespace
+
+void gatherIndexedLengthTensor(
+    rt::Tensor const& globalLengths, rt::Tensor const& slotIds, rt::Tensor& phaseLengths, cudaStream_t stream)
+{
+    validateIndexedLengthTensors(globalLengths, slotIds, phaseLengths);
+    int32_t const activeBatchSize = slotIds.getShape()[0];
+    if (activeBatchSize == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 32;
+    constexpr int32_t kGRID_SIZE = 1;
+    gatherIndexedLengthTensorKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(globalLengths.dataPointer<int32_t>(),
+        slotIds.dataPointer<int32_t>(), phaseLengths.dataPointer<int32_t>(), activeBatchSize,
+        globalLengths.getShape()[0]);
+}
+
+void incrementIndexedLengthTensor(rt::Tensor& globalLengths, rt::Tensor const& slotIds, rt::Tensor& phaseLengths,
+    int32_t increment, cudaStream_t stream)
+{
+    validateIndexedLengthTensors(globalLengths, slotIds, phaseLengths);
+    int32_t const activeBatchSize = slotIds.getShape()[0];
+    if (activeBatchSize == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 32;
+    constexpr int32_t kGRID_SIZE = 1;
+    incrementIndexedLengthTensorKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(globalLengths.dataPointer<int32_t>(),
+        slotIds.dataPointer<int32_t>(), phaseLengths.dataPointer<int32_t>(), nullptr, increment, activeBatchSize,
+        globalLengths.getShape()[0]);
+}
+
+void incrementIndexedLengthTensor(rt::Tensor& globalLengths, rt::Tensor const& slotIds, rt::Tensor& phaseLengths,
+    rt::Tensor const& increments, cudaStream_t stream)
+{
+    validateIndexedLengthTensors(globalLengths, slotIds, phaseLengths);
+    check::check(
+        increments.getDeviceType() == rt::DeviceType::kGPU && increments.getDataType() == nvinfer1::DataType::kINT32,
+        "Indexed length increments shall be GPU int32_t.");
+    check::check(increments.getShape()[0] == slotIds.getShape()[0],
+        "Indexed length increments shall match the active batch size.");
+    int32_t const activeBatchSize = slotIds.getShape()[0];
+    if (activeBatchSize == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 32;
+    constexpr int32_t kGRID_SIZE = 1;
+    incrementIndexedLengthTensorKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(globalLengths.dataPointer<int32_t>(),
+        slotIds.dataPointer<int32_t>(), phaseLengths.dataPointer<int32_t>(), increments.dataPointer<int32_t>(), 0,
+        activeBatchSize, globalLengths.getShape()[0]);
+}
+
+void clearIndexedLengthTensor(rt::Tensor& globalLengths, rt::Tensor const& releasedSlotIds, cudaStream_t stream)
+{
+    check::check(globalLengths.getDeviceType() == rt::DeviceType::kGPU
+            && releasedSlotIds.getDeviceType() == rt::DeviceType::kGPU,
+        "Indexed length tensors shall reside on GPU.");
+    check::check(globalLengths.getDataType() == nvinfer1::DataType::kINT32
+            && releasedSlotIds.getDataType() == nvinfer1::DataType::kINT32,
+        "Indexed length tensors shall have data type int32_t.");
+    int32_t const slotCount = releasedSlotIds.getShape()[0];
+    if (slotCount == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 32;
+    constexpr int32_t kGRID_SIZE = 1;
+    clearIndexedLengthTensorKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(globalLengths.dataPointer<int32_t>(),
+        releasedSlotIds.dataPointer<int32_t>(), slotCount, globalLengths.getShape()[0]);
+}
+
 // Single-layer tensor<->cache copy. Linear-vectorized per-(kv, head) scheme: one CTA handles one
 // (kv*head) slice for the configured decoder layer, threads iterate linearly over seqLen*HEAD_DIM
 // in VEC_SIZE chunks. HEAD_DIM-agnostic as long as it is a positive multiple of VEC_SIZE.

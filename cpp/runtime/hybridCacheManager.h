@@ -169,8 +169,23 @@ public:
     //! @return Reference to the device tensor of shape [activeBatchSize].
     rt::Tensor& getKVCacheLengths() noexcept;
 
+    //! Physical-slot length store. Indexed mode only; shape remains [maxSlots].
+    rt::Tensor& getGlobalKVCacheLengths();
+
     //! Device INT32 [activeBatchSize] logical-row to stable physical-slot mapping.
     rt::Tensor& getKVSlotIds();
+
+    //! Gather stable physical-slot lengths into an independently owned phase view.
+    void preparePhaseKVCacheLengths(
+        rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, cudaStream_t stream) const;
+
+    //! Commit a scalar phase increment to stable physical slots and refresh the phase view.
+    void commitPhaseSequenceLength(
+        rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, int32_t increment, cudaStream_t stream);
+
+    //! Commit per-row phase increments to stable physical slots and refresh the phase view.
+    void commitPhaseSequenceLength(
+        rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, rt::Tensor const& increments, cudaStream_t stream);
 
     //! Reset state for new sequences. Validates batch size, copies reuse lengths
     //! from host to device, and updates the "all empty" flag.
@@ -259,13 +274,15 @@ private:
         std::vector<kernel::KVLayerInfo> hostInfos; //!< Host copy for building save/restore info arrays
     };
 
-    Config mConfig{};                      //!< Full configuration
-    KVCacheManager mKVCache;               //!< Sub-manager for attention KV caches
-    MambaCacheManager mMambaCache;         //!< Sub-manager for Mamba recurrent / conv states
-    std::vector<int32_t> mAbsToKVIndex;    //!< Absolute layer -> local KV index (-1 if not attention)
-    std::vector<int32_t> mAbsToMambaIndex; //!< Absolute layer -> local Mamba index (-1 if not Mamba)
-    rt::Tensor mDeviceKVCacheLengths{};    //!< Shared KV cache lengths on device [activeBatchSize]
-    rt::Tensor mDeviceKVSlotIds{};         //!< Active logical-row to physical-slot mapping on device
+    Config mConfig{};                         //!< Full configuration
+    KVCacheManager mKVCache;                  //!< Sub-manager for attention KV caches
+    MambaCacheManager mMambaCache;            //!< Sub-manager for Mamba recurrent / conv states
+    std::vector<int32_t> mAbsToKVIndex;       //!< Absolute layer -> local KV index (-1 if not attention)
+    std::vector<int32_t> mAbsToMambaIndex;    //!< Absolute layer -> local Mamba index (-1 if not Mamba)
+    rt::Tensor mDeviceKVCacheLengths{};       //!< Current logical-batch length view [activeBatchSize]
+    rt::Tensor mDeviceGlobalKVCacheLengths{}; //!< Indexed physical-slot lengths [maxBatchSize]
+    rt::Tensor mDeviceKVSlotIds{};            //!< Active logical-row to physical-slot mapping on device
+    rt::Tensor mDeviceReleasedSlotIds{};      //!< Indexed eviction scratch [maxBatchSize]
     std::optional<KVSlotAllocator> mSlotAllocator;
     int32_t mActiveBatchSize{};               //!< Number of active sequences
     bool mKVCacheAllEmpty{true};              //!< True until the first commitSequenceLength call

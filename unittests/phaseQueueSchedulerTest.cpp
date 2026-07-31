@@ -90,6 +90,63 @@ TEST(PhaseQueueSchedulerTest, RejectsDuplicateQueuedRequest)
     EXPECT_THROW(scheduler.enqueueDecode({7, 32}), std::runtime_error);
 }
 
+TEST(PhaseQueueSchedulerTest, RequeuesChunksAndTransitionsToDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({42, 300, 3});
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    EXPECT_EQ(first.prefillBatch[0].kvSlotId, 3);
+    EXPECT_EQ(first.prefillBatch[0].tokenOffset, 0);
+    EXPECT_EQ(first.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(first.prefillBatch[0].promptTokenCount, 300);
+    scheduler.completePrefill(first.prefillBatch[0], 128);
+
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch[0].tokenOffset, 128);
+    EXPECT_EQ(second.prefillBatch[0].tokenCount, 128);
+    scheduler.completePrefill(second.prefillBatch[0], 256);
+
+    PhaseDispatchPlan third = scheduler.next();
+    ASSERT_EQ(third.prefillBatch.size(), 1U);
+    EXPECT_EQ(third.prefillBatch[0].tokenOffset, 256);
+    EXPECT_EQ(third.prefillBatch[0].tokenCount, 44);
+    scheduler.completePrefill(third.prefillBatch[0], 300);
+
+    EXPECT_EQ(scheduler.prefillQueueSize(), 0U);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 1U);
+    PhaseDispatchPlan decode = scheduler.next();
+    ASSERT_EQ(decode.decodeBatch.size(), 1U);
+    EXPECT_EQ(decode.decodeBatch[0].kvSlotId, 3);
+    EXPECT_EQ(decode.decodeBatch[0].tokenCount, 300);
+    scheduler.completeDecode(decode.decodeBatch[0], 301, true);
+    EXPECT_FALSE(scheduler.hasRequest(42));
+}
+
+TEST(PhaseQueueSchedulerTest, UsesChunkCostForOverlapDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 1024, 0});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kOverlap);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsInFlightRequestUnique)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({7, 32});
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_THROW(scheduler.enqueueDecode({7, 32}), std::runtime_error);
+}
+
 } // namespace
 } // namespace rt
 } // namespace trt_edgellm

@@ -47,6 +47,22 @@ void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStre
 //! \throws std::runtime_error if tensor has wrong location, shape or data type
 void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);
 
+//! Gather physical-slot lengths into one phase-local active-row view.
+//! slotIds and phaseLengths must both have shape [activeBatchSize].
+void gatherIndexedLengthTensor(
+    rt::Tensor const& globalLengths, rt::Tensor const& slotIds, rt::Tensor& phaseLengths, cudaStream_t stream);
+
+//! Increment physical-slot lengths by one scalar and update the phase-local view.
+void incrementIndexedLengthTensor(rt::Tensor& globalLengths, rt::Tensor const& slotIds, rt::Tensor& phaseLengths,
+    int32_t increment, cudaStream_t stream);
+
+//! Increment physical-slot lengths element-wise and update the phase-local view.
+void incrementIndexedLengthTensor(rt::Tensor& globalLengths, rt::Tensor const& slotIds, rt::Tensor& phaseLengths,
+    rt::Tensor const& increments, cudaStream_t stream);
+
+//! Clear lengths for released physical slots before those slots can be reused.
+void clearIndexedLengthTensor(rt::Tensor& globalLengths, rt::Tensor const& releasedSlotIds, cudaStream_t stream);
+
 //! \brief Single-layer variant: instantiate KV cache for one layer from a saved tensor.
 //!
 //! \param[in,out] dstKVCacheLayer  [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]

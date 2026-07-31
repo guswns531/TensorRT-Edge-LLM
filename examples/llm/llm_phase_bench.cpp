@@ -21,6 +21,7 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
+#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
@@ -56,6 +57,7 @@ struct Args
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t inputLen{512};
+    int32_t prefillChunkSize{};
     int32_t pastKVLen{512};
     int32_t warmup{20};
     int32_t iterations{100};
@@ -73,7 +75,7 @@ void printUsage(char const* program)
 {
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
-        "[--pastKVLen N] [--warmup N] [--iterations N] [--outputCsv FILE]",
+        "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] [--outputCsv FILE]",
         program);
 }
 
@@ -85,6 +87,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kPrefillBatch,
         kDecodeBatch,
         kInputLen,
+        kPrefillChunkSize,
         kPastKVLen,
         kWarmup,
         kIterations,
@@ -94,6 +97,7 @@ bool parseArgs(Args& args, int argc, char** argv)
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
         {"prefillBatch", required_argument, nullptr, kPrefillBatch},
         {"decodeBatch", required_argument, nullptr, kDecodeBatch}, {"inputLen", required_argument, nullptr, kInputLen},
+        {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
         {"help", no_argument, nullptr, kHelp}, {}};
@@ -107,6 +111,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kPrefillBatch: args.prefillBatch = std::stoi(optarg); break;
         case kDecodeBatch: args.decodeBatch = std::stoi(optarg); break;
         case kInputLen: args.inputLen = std::stoi(optarg); break;
+        case kPrefillChunkSize: args.prefillChunkSize = std::stoi(optarg); break;
         case kPastKVLen: args.pastKVLen = std::stoi(optarg); break;
         case kWarmup: args.warmup = std::stoi(optarg); break;
         case kIterations: args.iterations = std::stoi(optarg); break;
@@ -116,7 +121,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         }
     }
     return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.inputLen > 0
-        && args.pastKVLen >= 0 && args.warmup >= 0 && args.iterations > 0;
+        && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
+        && args.warmup >= 0 && args.iterations > 0;
 }
 
 void uploadInt32(rt::Tensor& tensor, std::vector<int32_t> const& values, cudaStream_t stream)
@@ -196,7 +202,10 @@ int main(int argc, char** argv)
     ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize,
         "Prefill and decode physical slots exceed maxSupportedBatchSize");
     ELLM_CHECK(args.inputLen <= config.maxSupportedInputLength, "inputLen exceeds maxSupportedInputLength");
-    ELLM_CHECK(args.pastKVLen + 1 <= config.maxKVCacheCapacity, "pastKVLen exceeds KV capacity");
+    int32_t const configuredChunkSize = args.prefillChunkSize > 0 ? args.prefillChunkSize : args.inputLen;
+    int32_t const phaseRounds = (args.inputLen + configuredChunkSize - 1) / configuredChunkSize;
+    ELLM_CHECK(args.pastKVLen + phaseRounds <= config.maxKVCacheCapacity, "pastKVLen exceeds KV capacity");
+    LOG_INFO("Phase benchmark work per sample: %d prefill chunk(s), %d decode step(s)", phaseRounds, phaseRounds);
 
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
@@ -247,8 +256,18 @@ int main(int argc, char** argv)
     std::iota(decodeSlots.begin(), decodeSlots.end(), args.prefillBatch);
     uploadInt32(prefillSlotIds, prefillSlots, setupStream);
     uploadInt32(decodeSlotIds, decodeSlots, setupStream);
-    uploadInt32(prefillKVLengths, std::vector<int32_t>(args.prefillBatch, 0), setupStream);
-    uploadInt32(decodeKVLengths, std::vector<int32_t>(args.decodeBatch, args.pastKVLen), setupStream);
+
+    int32_t const phaseSlotCount = args.prefillBatch + args.decodeBatch;
+    std::vector<int32_t> initialSlotLengths(phaseSlotCount, 0);
+    std::fill(initialSlotLengths.begin() + args.prefillBatch, initialSlotLengths.end(), args.pastKVLen);
+    rt::Tensor hostInitialSlotLengths(
+        {phaseSlotCount}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_initial_slot_lengths");
+    std::copy(initialSlotLengths.begin(), initialSlotLengths.end(), hostInitialSlotLengths.dataPointer<int32_t>());
+    auto& cacheManager = *resources->cacheManagers[0];
+    cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
+    cacheManager.preparePhaseKVCacheLengths(prefillSlotIds, prefillKVLengths, setupStream);
+    cacheManager.preparePhaseKVCacheLengths(decodeSlotIds, decodeKVLengths, setupStream);
+
     prefillMap.set(binding_names::kKVSlotIds, prefillSlotIds);
     decodeMap.set(binding_names::kKVSlotIds, decodeSlotIds);
     prefillMap.set(binding_names::kKVCacheStartIndex, prefillKVLengths);
@@ -275,23 +294,57 @@ int main(int argc, char** argv)
     }
     CUDA_CHECK(cudaStreamSynchronize(setupStream));
 
-    auto const prefillDims = config.prefillDims(args.prefillBatch, args.inputLen, true);
     auto const decodeDims = config.decodeDims(args.decodeBatch);
     auto enqueuePrefill = [&](cudaStream_t stream) {
-        if (gemma4Ple)
+        CUDA_CHECK(cudaMemsetAsync(prefillKVLengths.rawPointer(), 0, prefillKVLengths.getMemoryCapacity(), stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            prefillIO.selectTokenIndices.rawPointer(), 0, prefillIO.selectTokenIndices.getMemoryCapacity(), stream));
+        for (int32_t chunkOffset = 0; chunkOffset < args.inputLen; chunkOffset += configuredChunkSize)
         {
-            gemma4Ple->reshapeOutputs(args.prefillBatch, args.inputLen);
+            int32_t const chunkLength = std::min(configuredChunkSize, args.inputLen - chunkOffset);
+            check::check(prefillIO.inputsEmbeds.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                "Prefill input reshape failed");
+            check::check(
+                prefillIO.contextLengths.reshape({args.prefillBatch}), "Prefill context lengths reshape failed");
+            CUDA_CHECK(cudaMemsetAsync(
+                prefillIO.contextLengths.rawPointer(), 0, prefillIO.contextLengths.getMemoryCapacity(), stream));
+            kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, stream);
+            if (gemma4Ple)
+            {
+                gemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
+            }
+            bool const initialChunk = chunkOffset == 0;
+            auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
+            if (!prefillExecutor->prepare(kPrefillProfile, prefillDims, prefillMap, stream)
+                || !prefillExecutor->execute(stream))
+            {
+                return false;
+            }
+            kernel::incrementLengthTensor(prefillKVLengths, chunkLength, stream);
         }
-        return prefillExecutor->prepare(kPrefillProfile, prefillDims, prefillMap, stream)
-            && prefillExecutor->execute(stream);
+        return true;
     };
     auto enqueueDecode = [&](cudaStream_t stream) {
+        CUDA_CHECK(cudaMemsetAsync(decodeKVLengths.rawPointer(), 0, decodeKVLengths.getMemoryCapacity(), stream));
+        kernel::incrementLengthTensor(decodeKVLengths, args.pastKVLen, stream);
+        CUDA_CHECK(cudaMemsetAsync(
+            decodeIO.contextLengths.rawPointer(), 0, decodeIO.contextLengths.getMemoryCapacity(), stream));
+        kernel::incrementLengthTensor(decodeIO.contextLengths, args.pastKVLen + 1, stream);
         if (gemma4Ple)
         {
             gemma4Ple->reshapeOutputs(args.decodeBatch, 1);
         }
-        return decodeExecutor->prepare(kDecodeProfile, decodeDims, decodeMap, stream)
-            && decodeExecutor->execute(stream);
+        for (int32_t round = 0; round < phaseRounds; ++round)
+        {
+            if (!decodeExecutor->prepare(kDecodeProfile, decodeDims, decodeMap, stream)
+                || !decodeExecutor->execute(stream))
+            {
+                return false;
+            }
+            kernel::incrementLengthTensor(decodeKVLengths, 1, stream);
+            kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
+        }
+        return true;
     };
 
     cudaEvent_t start{};

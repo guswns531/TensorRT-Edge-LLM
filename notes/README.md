@@ -24,6 +24,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 7. [Gemma 4 E2B INT4 / indexed-linear 구현과 실험 결과](07-gemma4-e2b-int4-indexed-implementation.md)
 
 8. [Prefill/Decode dual-stream PoC와 queue scheduler](08-dual-stream-phase-scheduler.md)
+9. [Chunked prefill과 physical-slot KV length view](09-chunked-prefill-and-slot-lengths.md)
 
 ## 지금 내린 핵심 결론
 

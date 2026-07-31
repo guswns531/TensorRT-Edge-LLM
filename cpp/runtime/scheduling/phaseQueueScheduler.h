@@ -29,12 +29,17 @@ namespace trt_edgellm
 namespace rt
 {
 
-//! A unit of phase work. tokenCount is prompt length for prefill and current
-//! KV length for decode; it is a scheduling cost hint, not tensor ownership.
+//! A unit of phase work. For prefill, tokenCount is the remaining prompt
+//! length while queued and the dispatched chunk length while in flight.
+//! For decode it is the current KV length. kvSlotId identifies stable physical
+//! cache ownership; tokenOffset and promptTokenCount describe chunk progress.
 struct PhaseWorkItem
 {
     uint64_t requestId{};
     int32_t tokenCount{};
+    int32_t kvSlotId{-1};
+    int32_t tokenOffset{};
+    int32_t promptTokenCount{};
 };
 
 enum class PhaseDispatchKind
@@ -64,6 +69,9 @@ struct PhaseQueueSchedulerConfig
     //! Default policy only overlaps short prefills. The initial value comes from
     //! the Gemma4 E2B RTX 3080 crossover benchmark and remains configurable.
     int32_t maxOverlapPrefillTokens{128};
+    //! Maximum tokens dispatched per request in one prefill turn. Zero keeps
+    //! the legacy whole-prompt behavior.
+    int32_t maxPrefillChunkTokens{};
     //! Admit one prefill batch after this many decode-only decisions so a
     //! continuous decode queue cannot starve new requests forever.
     int32_t decodeBurstLimit{8};
@@ -92,19 +100,31 @@ public:
 
     PhaseDispatchPlan next();
 
+    //! Complete one dispatched prefill chunk. An unfinished prompt is put back
+    //! on the prefill queue; the final chunk transitions to decode.
+    void completePrefill(PhaseWorkItem item, int32_t resultingKVLength);
+
+    //! Complete one decode turn. Unfinished requests are requeued for decode;
+    //! finished requests leave the scheduler.
+    void completeDecode(PhaseWorkItem item, int32_t resultingKVLength, bool finished);
+
     size_t prefillQueueSize() const noexcept;
     size_t decodeQueueSize() const noexcept;
     bool empty() const noexcept;
+    bool hasRequest(uint64_t requestId) const noexcept;
 
 private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseQueueSnapshot snapshot() const;
-    std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize);
+    std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill);
+    void enqueueKnownPrefill(PhaseWorkItem item);
+    void enqueueKnownDecode(PhaseWorkItem item);
 
     PhaseQueueSchedulerConfig mConfig;
     std::deque<PhaseWorkItem> mPrefillQueue;
     std::deque<PhaseWorkItem> mDecodeQueue;
-    std::unordered_set<uint64_t> mQueuedRequestIds;
+    std::unordered_set<uint64_t> mActiveRequestIds;
+    std::unordered_set<uint64_t> mInFlightRequestIds;
     int32_t mConsecutiveDecodeBatches{};
 };
 

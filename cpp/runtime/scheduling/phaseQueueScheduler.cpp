@@ -33,20 +33,38 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
+    check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
     check::check(mConfig.decodeBurstLimit > 0, "decodeBurstLimit must be positive");
 }
 
 void PhaseQueueScheduler::enqueuePrefill(PhaseWorkItem item)
 {
     check::check(item.tokenCount > 0, "Prefill tokenCount must be positive");
-    check::check(mQueuedRequestIds.insert(item.requestId).second, "Request is already queued");
-    mPrefillQueue.push_back(item);
+    check::check(item.tokenOffset >= 0, "Prefill tokenOffset must be non-negative");
+    check::check(mActiveRequestIds.insert(item.requestId).second, "Request is already active");
+    if (item.promptTokenCount == 0)
+    {
+        item.promptTokenCount = item.tokenOffset + item.tokenCount;
+    }
+    check::check(
+        item.promptTokenCount >= item.tokenOffset + item.tokenCount, "Prefill work exceeds the request prompt length");
+    enqueueKnownPrefill(item);
 }
 
 void PhaseQueueScheduler::enqueueDecode(PhaseWorkItem item)
 {
     check::check(item.tokenCount >= 0, "Decode tokenCount must be non-negative");
-    check::check(mQueuedRequestIds.insert(item.requestId).second, "Request is already queued");
+    check::check(mActiveRequestIds.insert(item.requestId).second, "Request is already active");
+    enqueueKnownDecode(item);
+}
+
+void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
+{
+    mPrefillQueue.push_back(item);
+}
+
+void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
+{
     mDecodeQueue.push_back(item);
 }
 
@@ -60,7 +78,10 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     int32_t const decodeCount = std::min<int32_t>(mConfig.maxDecodeBatchSize, mDecodeQueue.size());
     for (int32_t i = 0; i < prefillCount; ++i)
     {
-        result.prefillCandidateTokens += mPrefillQueue[i].tokenCount;
+        int32_t const tokenCount = mConfig.maxPrefillChunkTokens > 0
+            ? std::min(mPrefillQueue[i].tokenCount, mConfig.maxPrefillChunkTokens)
+            : mPrefillQueue[i].tokenCount;
+        result.prefillCandidateTokens += tokenCount;
     }
     for (int32_t i = 0; i < decodeCount; ++i)
     {
@@ -94,16 +115,22 @@ PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const&
     return PhaseDispatchKind::kDecode;
 }
 
-std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize)
+std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
+    std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill)
 {
     int32_t const count = std::min<int32_t>(maxBatchSize, queue.size());
     std::vector<PhaseWorkItem> batch;
     batch.reserve(count);
     for (int32_t i = 0; i < count; ++i)
     {
-        batch.push_back(queue.front());
-        mQueuedRequestIds.erase(queue.front().requestId);
+        PhaseWorkItem item = queue.front();
         queue.pop_front();
+        if (chunkPrefill && mConfig.maxPrefillChunkTokens > 0)
+        {
+            item.tokenCount = std::min(item.tokenCount, mConfig.maxPrefillChunkTokens);
+        }
+        check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
+        batch.push_back(item);
     }
     return batch;
 }
@@ -123,11 +150,11 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.kind = kind;
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize);
+        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true);
     }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.decodeBatch = popBatch(mDecodeQueue, mConfig.maxDecodeBatchSize);
+        plan.decodeBatch = popBatch(mDecodeQueue, mConfig.maxDecodeBatchSize, false);
     }
     if (kind == PhaseDispatchKind::kDecode)
     {
@@ -138,6 +165,41 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         mConsecutiveDecodeBatches = 0;
     }
     return plan;
+}
+
+void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength)
+{
+    check::check(
+        mInFlightRequestIds.erase(item.requestId) == 1, "Completed prefill request is not currently in flight");
+    check::check(item.tokenCount > 0, "Completed prefill chunk must contain tokens");
+    check::check(item.promptTokenCount > 0, "Completed prefill request must have a prompt length");
+    int32_t const nextOffset = item.tokenOffset + item.tokenCount;
+    check::check(nextOffset <= item.promptTokenCount, "Completed prefill chunk exceeds the prompt length");
+    check::check(resultingKVLength >= nextOffset, "Resulting KV length is behind completed prompt progress");
+
+    item.tokenOffset = nextOffset;
+    if (nextOffset < item.promptTokenCount)
+    {
+        item.tokenCount = item.promptTokenCount - nextOffset;
+        enqueueKnownPrefill(item);
+        return;
+    }
+
+    item.tokenCount = resultingKVLength;
+    enqueueKnownDecode(item);
+}
+
+void PhaseQueueScheduler::completeDecode(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
+{
+    check::check(mInFlightRequestIds.erase(item.requestId) == 1, "Completed decode request is not currently in flight");
+    check::check(resultingKVLength >= item.tokenCount, "Resulting KV length cannot move backwards");
+    if (finished)
+    {
+        check::check(mActiveRequestIds.erase(item.requestId) == 1, "Finished decode request is not active");
+        return;
+    }
+    item.tokenCount = resultingKVLength;
+    enqueueKnownDecode(item);
 }
 
 size_t PhaseQueueScheduler::prefillQueueSize() const noexcept
@@ -153,6 +215,11 @@ size_t PhaseQueueScheduler::decodeQueueSize() const noexcept
 bool PhaseQueueScheduler::empty() const noexcept
 {
     return mPrefillQueue.empty() && mDecodeQueue.empty();
+}
+
+bool PhaseQueueScheduler::hasRequest(uint64_t requestId) const noexcept
+{
+    return mActiveRequestIds.find(requestId) != mActiveRequestIds.end();
 }
 
 } // namespace rt

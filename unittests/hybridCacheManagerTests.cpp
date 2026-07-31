@@ -255,6 +255,95 @@ TEST(HybridCacheManagerTests, ResetAndCommitTracksActiveBatchAndEmptyFlag)
     EXPECT_EQ(lengths[1], 12);
 }
 
+TEST(HybridCacheManagerTests, IndexedLengthsRemainPhysicalAcrossLogicalCompaction)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const maxBatch = 4;
+    int32_t const newBatch = 3;
+
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(1, maxBatch, 64, 1, 64);
+    cfg.mambaConfig = makeMambaConfig(0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+    cfg.indexedKVCache = true;
+    rt::HybridCacheManager mgr(cfg, stream);
+
+    std::vector<int32_t> initialLengths{10, 20, 30, 40};
+    rt::Tensor reuseLengths({maxBatch}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(reuseLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+    mgr.resetForNewSequences(reuseLengths, stream);
+
+    std::vector<int32_t> const hostMapping{1, -1, 2, 0};
+    rt::Tensor mapping = uploadMapping(hostMapping);
+    mgr.compactBatch(mapping, maxBatch, newBatch, stream, &hostMapping);
+    mgr.setActiveBatchSize(newBatch);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getKVSlotIds()), (std::vector<int32_t>{3, 0, 2}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getKVCacheLengths()), (std::vector<int32_t>{40, 10, 30}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getGlobalKVCacheLengths()), (std::vector<int32_t>{10, 0, 30, 40}));
+
+    std::vector<int32_t> increments{1, 2, 3};
+    rt::Tensor incrementTensor({newBatch}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(cudaMemcpy(
+        incrementTensor.rawPointer(), increments.data(), increments.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    mgr.commitSequenceLength(incrementTensor, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getKVCacheLengths()), (std::vector<int32_t>{41, 12, 33}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getGlobalKVCacheLengths()), (std::vector<int32_t>{12, 0, 33, 41}));
+}
+
+TEST(HybridCacheManagerTests, IndependentPhaseViewsShareGlobalIndexedLengths)
+{
+    cudaStream_t setupStream{nullptr};
+    int32_t const maxBatch = 4;
+
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(1, maxBatch, 64, 1, 64);
+    cfg.mambaConfig = makeMambaConfig(0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+    cfg.indexedKVCache = true;
+    rt::HybridCacheManager mgr(cfg, setupStream);
+
+    std::vector<int32_t> initialLengths{10, 20, 30, 40};
+    rt::Tensor reuseLengths({maxBatch}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(reuseLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+    mgr.resetForNewSequences(reuseLengths, setupStream);
+    CUDA_CHECK(cudaStreamSynchronize(setupStream));
+
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    rt::Tensor prefillSlots({2}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor decodeSlots({2}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor prefillLengths({2}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor decodeLengths({2}, rt::DeviceType::kGPU, DataType::kINT32);
+    std::vector<int32_t> const prefillSlotIds{3, 0};
+    std::vector<int32_t> const decodeSlotIds{2, 1};
+    CUDA_CHECK(
+        cudaMemcpy(prefillSlots.rawPointer(), prefillSlotIds.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(decodeSlots.rawPointer(), decodeSlotIds.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    mgr.preparePhaseKVCacheLengths(prefillSlots, prefillLengths, prefillStream);
+    mgr.preparePhaseKVCacheLengths(decodeSlots, decodeLengths, decodeStream);
+    mgr.commitPhaseSequenceLength(prefillSlots, prefillLengths, 128, prefillStream);
+    mgr.commitPhaseSequenceLength(decodeSlots, decodeLengths, 1, decodeStream);
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+    CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(prefillLengths), (std::vector<int32_t>{168, 138}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(decodeLengths), (std::vector<int32_t>{31, 21}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getGlobalKVCacheLengths()), (std::vector<int32_t>{138, 21, 31, 168}));
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
 // --- Compaction: attention-only, oldBatch < maxBatch ------------------------
 
 TEST(HybridCacheManagerTests, CompactBatchUniformKVSmallerThanMax)

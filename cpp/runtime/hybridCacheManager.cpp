@@ -77,8 +77,14 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
     if (mConfig.indexedKVCache)
     {
         mSlotAllocator.emplace(mConfig.maxBatchSize);
+        mDeviceGlobalKVCacheLengths = rt::Tensor({mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32,
+            "HybridCacheManager::mDeviceGlobalKVCacheLengths");
         mDeviceKVSlotIds = rt::Tensor(
             {mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32, "HybridCacheManager::mDeviceKVSlotIds");
+        mDeviceReleasedSlotIds = rt::Tensor(
+            {mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32, "HybridCacheManager::mDeviceReleasedSlotIds");
+        CUDA_CHECK(cudaMemsetAsync(
+            mDeviceGlobalKVCacheLengths.rawPointer(), 0, mDeviceGlobalKVCacheLengths.getMemoryCapacity(), stream));
     }
 
     // Pre-build per-headDim groups for batched kernel launches.
@@ -139,7 +145,9 @@ HybridCacheManager::HybridCacheManager(HybridCacheManager&& other) noexcept
     mAbsToKVIndex = std::move(other.mAbsToKVIndex);
     mAbsToMambaIndex = std::move(other.mAbsToMambaIndex);
     mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
+    mDeviceGlobalKVCacheLengths = std::move(other.mDeviceGlobalKVCacheLengths);
     mDeviceKVSlotIds = std::move(other.mDeviceKVSlotIds);
+    mDeviceReleasedSlotIds = std::move(other.mDeviceReleasedSlotIds);
     mSlotAllocator = std::move(other.mSlotAllocator);
     mActiveBatchSize = other.mActiveBatchSize;
     mKVCacheAllEmpty = other.mKVCacheAllEmpty;
@@ -160,7 +168,9 @@ HybridCacheManager& HybridCacheManager::operator=(HybridCacheManager&& other) no
         mAbsToKVIndex = std::move(other.mAbsToKVIndex);
         mAbsToMambaIndex = std::move(other.mAbsToMambaIndex);
         mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
+        mDeviceGlobalKVCacheLengths = std::move(other.mDeviceGlobalKVCacheLengths);
         mDeviceKVSlotIds = std::move(other.mDeviceKVSlotIds);
+        mDeviceReleasedSlotIds = std::move(other.mDeviceReleasedSlotIds);
         mSlotAllocator = std::move(other.mSlotAllocator);
         mActiveBatchSize = other.mActiveBatchSize;
         mKVCacheAllEmpty = other.mKVCacheAllEmpty;
@@ -251,10 +261,39 @@ rt::Tensor& HybridCacheManager::getKVCacheLengths() noexcept
     return mDeviceKVCacheLengths;
 }
 
+rt::Tensor& HybridCacheManager::getGlobalKVCacheLengths()
+{
+    check::check(mConfig.indexedKVCache, "Global KV lengths requested for a non-indexed cache manager.");
+    return mDeviceGlobalKVCacheLengths;
+}
+
 rt::Tensor& HybridCacheManager::getKVSlotIds()
 {
     check::check(mConfig.indexedKVCache, "KV slot IDs requested for a non-indexed cache manager.");
     return mDeviceKVSlotIds;
+}
+
+void HybridCacheManager::preparePhaseKVCacheLengths(
+    rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, cudaStream_t stream) const
+{
+    check::check(mConfig.indexedKVCache, "Phase KV lengths require indexed KV cache mode.");
+    kernel::gatherIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, phaseLengths, stream);
+}
+
+void HybridCacheManager::commitPhaseSequenceLength(
+    rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, int32_t increment, cudaStream_t stream)
+{
+    check::check(mConfig.indexedKVCache, "Phase KV length commit requires indexed KV cache mode.");
+    kernel::incrementIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, phaseLengths, increment, stream);
+    mKVCacheAllEmpty = false;
+}
+
+void HybridCacheManager::commitPhaseSequenceLength(
+    rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, rt::Tensor const& increments, cudaStream_t stream)
+{
+    check::check(mConfig.indexedKVCache, "Phase KV length commit requires indexed KV cache mode.");
+    kernel::incrementIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, phaseLengths, increments, stream);
+    mKVCacheAllEmpty = false;
 }
 
 void HybridCacheManager::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, cudaStream_t stream)
@@ -274,6 +313,10 @@ void HybridCacheManager::resetForNewSequences(rt::Tensor const& reuseKVCacheLeng
         mSlotAllocator->reset(batchSize);
         check::check(mDeviceKVSlotIds.reshape({mActiveBatchSize}), "KV slot IDs reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(mDeviceKVSlotIds.rawPointer(), mSlotAllocator->activeSlots().data(),
+            batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            mDeviceGlobalKVCacheLengths.rawPointer(), 0, mDeviceGlobalKVCacheLengths.getMemoryCapacity(), stream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceGlobalKVCacheLengths.rawPointer(), reuseKVCacheLengths.rawPointer(),
             batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     }
 
@@ -302,7 +345,14 @@ void HybridCacheManager::commitSequenceLength(rt::Tensor const& newContextLength
     check::check(newContextLengths.getShape()[0] == mActiveBatchSize,
         "The newContextLengths tensor shall have the same batch size as the active batch size.");
 
-    kernel::incrementLengthTensor(mDeviceKVCacheLengths, newContextLengths, stream);
+    if (mConfig.indexedKVCache)
+    {
+        commitPhaseSequenceLength(mDeviceKVSlotIds, mDeviceKVCacheLengths, newContextLengths, stream);
+    }
+    else
+    {
+        kernel::incrementLengthTensor(mDeviceKVCacheLengths, newContextLengths, stream);
+    }
 
     // No longer empty after committing a sequence length.
     mKVCacheAllEmpty = false;
@@ -310,7 +360,14 @@ void HybridCacheManager::commitSequenceLength(rt::Tensor const& newContextLength
 
 void HybridCacheManager::commitSequenceLength(int32_t increment, cudaStream_t stream)
 {
-    kernel::incrementLengthTensor(mDeviceKVCacheLengths, increment, stream);
+    if (mConfig.indexedKVCache)
+    {
+        commitPhaseSequenceLength(mDeviceKVSlotIds, mDeviceKVCacheLengths, increment, stream);
+    }
+    else
+    {
+        kernel::incrementLengthTensor(mDeviceKVCacheLengths, increment, stream);
+    }
 
     // No longer empty after committing a sequence length.
     mKVCacheAllEmpty = false;
@@ -353,12 +410,29 @@ void HybridCacheManager::compactBatch(rt::Tensor const& batchMapping, int32_t ol
     {
         check::check(hostBatchMapping != nullptr,
             "Indexed KV cache compaction requires the host batch mapping and must not move KV storage.");
+        std::vector<int32_t> releasedSlots;
+        std::vector<int32_t> const oldActiveSlots = mSlotAllocator->activeSlots();
+        for (int32_t oldRow = 0; oldRow < oldBatch; ++oldRow)
+        {
+            if ((*hostBatchMapping)[oldRow] < 0)
+            {
+                releasedSlots.push_back(oldActiveSlots[oldRow]);
+            }
+        }
         mSlotAllocator->compact(*hostBatchMapping, newBatch);
-        kernel::compactTensorBatch(
-            mDeviceKVCacheLengths, batchMapping, mDeviceKVCacheLengths, oldBatch, newBatch, stream);
         check::check(mDeviceKVSlotIds.reshape({newBatch}), "KV slot IDs reshape failed");
+        check::check(mDeviceKVCacheLengths.reshape({newBatch}), "KV cache lengths reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(mDeviceKVSlotIds.rawPointer(), mSlotAllocator->activeSlots().data(),
             newBatch * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (!releasedSlots.empty())
+        {
+            check::check(mDeviceReleasedSlotIds.reshape({static_cast<int64_t>(releasedSlots.size())}),
+                "Released slot IDs reshape failed");
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceReleasedSlotIds.rawPointer(), releasedSlots.data(),
+                releasedSlots.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            kernel::clearIndexedLengthTensor(mDeviceGlobalKVCacheLengths, mDeviceReleasedSlotIds, stream);
+        }
+        kernel::gatherIndexedLengthTensor(mDeviceGlobalKVCacheLengths, mDeviceKVSlotIds, mDeviceKVCacheLengths, stream);
         return;
     }
 
