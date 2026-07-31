@@ -109,6 +109,19 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     EXPECT_EQ(names.size(), 70u);
 }
 
+TEST(RegistryBuilderTest, IndexedKVSlotBindingIsOptIn)
+{
+    LLMEngineConfig legacy = makeBasicLLMConfig();
+    auto legacyNames = buildRegistryForLLM(legacy).allTensorNames();
+    EXPECT_FALSE(hasName(legacyNames, trt_edgellm::binding_names::kKVSlotIds));
+
+    LLMEngineConfig indexed = makeBasicLLMConfig();
+    indexed.indexedKVCache = true;
+    auto indexedNames = buildRegistryForLLM(indexed).allTensorNames();
+    EXPECT_TRUE(hasName(indexedNames, trt_edgellm::binding_names::kKVSlotIds));
+    EXPECT_EQ(indexedNames.size(), legacyNames.size() + 1);
+}
+
 TEST(RegistryBuilderTest, StandardLLMHasCorrectSpecAttributes)
 {
     LLMEngineConfig cfg = makeBasicLLMConfig();

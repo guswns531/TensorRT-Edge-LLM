@@ -586,6 +586,14 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kContextLengths, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
+    if (mModelConfig.value("indexed_kv_cache", false))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kKVSlotIds, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kKVSlotIds, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    }
+
     // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
     // This can help distinguish the normal prefill and chunked prefill execution.
     result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),

@@ -503,6 +503,27 @@ void writeE2ECsv(std::string const& outputPath, BenchOutputParams const& params,
     LOG_INFO("E2E timing CSV saved to: %s", outputPath.c_str());
 }
 
+void writeE2ESamplesCsv(
+    std::string const& outputPath, BenchOutputParams const& params, std::vector<float> const& samples)
+{
+    std::ofstream csvFile(outputPath);
+    if (!csvFile.is_open())
+    {
+        LOG_ERROR("Failed to open E2E samples CSV file: %s", outputPath.c_str());
+        return;
+    }
+
+    csvFile << "mode,batch_size,input_len,past_kv_len,iteration,latency_ms\n";
+    csvFile << std::fixed << std::setprecision(6);
+    for (size_t iteration = 0; iteration < samples.size(); ++iteration)
+    {
+        csvFile << modeToString(params.mode) << "," << params.batchSize << "," << params.inputLen << ","
+                << params.pastKVLen << "," << iteration << "," << samples[iteration] << "\n";
+    }
+    csvFile.close();
+    LOG_INFO("E2E samples CSV saved to: %s", outputPath.c_str());
+}
+
 std::string buildLayerCsvPath(std::string const& outputDir, BenchOutputParams const& params)
 {
     std::string path = outputDir + "/layer_";
@@ -554,6 +575,13 @@ std::string buildE2ECsvPath(std::string const& outputDir, BenchOutputParams cons
     default: path += modeToString(params.mode); break;
     }
     path += ".csv";
+    return path;
+}
+
+std::string buildE2ESamplesCsvPath(std::string const& outputDir, BenchOutputParams const& params)
+{
+    std::string path = buildE2ECsvPath(outputDir, params);
+    path.insert(path.size() - 4, "_samples");
     return path;
 }
 

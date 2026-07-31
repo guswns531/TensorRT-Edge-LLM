@@ -48,6 +48,12 @@ public:
     //! Reshape already-bound output tensors for a CUDA-graph capture shape.
     void reshapeOutputs(int64_t batchSize, int64_t seqLen);
 
+    //! Bind the owned PLE output views into an additional phase-local tensor map.
+    //!
+    //! This permits sibling TensorRT execution contexts to share the immutable PLE
+    //! table and a precomputed read-only output buffer without loading the table twice.
+    void bindOutputs(TensorMap& tensorMap);
+
 private:
     LLMEngineConfig mConfig{};
     Tensor mPleTable{};

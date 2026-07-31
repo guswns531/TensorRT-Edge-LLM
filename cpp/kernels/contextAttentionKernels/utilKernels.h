@@ -154,7 +154,7 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 //! \param[in]  stream          CUDA stream to launch the kernel on.
 //! \throws std::runtime_error if tensor shapes or data types are invalid.
 void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
-    rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream);
+    rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds = nullptr);
 
 } // namespace kernel
 } // namespace trt_edgellm

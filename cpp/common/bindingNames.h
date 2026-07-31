@@ -59,6 +59,13 @@ inline constexpr char const* kPleTokenEmbedsTemplate = "ple_token_embeds";
 inline constexpr char const* kContextLengths = "context_lengths";
 
 /*!
+ * @brief Stable physical KV-cache slot selected for each active batch row.
+ *
+ * Shape: [batch_size] (INT32). Present only in indexed-linear engines.
+ */
+inline constexpr char const* kKVSlotIds = "kv_slot_ids";
+
+/*!
  * @brief Last token IDs tensor - indices of the last tokens to extract from hidden states
  *
  * Shape: [batch_size] for Eagle models, [batch_size, 1] for vanilla models (INT64)

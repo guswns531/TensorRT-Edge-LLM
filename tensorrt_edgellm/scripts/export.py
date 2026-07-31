@@ -801,7 +801,8 @@ def _export_llm(model_dir: str,
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1,
-                num_decoder_layers: "int | None" = None) -> None:
+                num_decoder_layers: "int | None" = None,
+                indexed_kv_cache: bool = False) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -878,6 +879,9 @@ def _export_llm(model_dir: str,
                 tp_rank=rank,
                 num_decoder_layers=num_decoder_layers,
             )
+            model.config.indexed_kv_cache = indexed_kv_cache
+            if indexed_kv_cache:
+                model.config.use_vision_bidirectional_attention = False
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
@@ -2510,6 +2514,14 @@ def main() -> None:
         help="Path to the DFlash draft checkpoint directory.",
     )
     p.add_argument(
+        "--indexed-kv-cache",
+        action="store_true",
+        help=(
+            "Export a text-only engine with stable kv_slot_ids physical-slot "
+            "indirection. Incompatible with speculative and multimodal modes."
+        ),
+    )
+    p.add_argument(
         "--externalize-weights",
         nargs="+",
         choices=EXTERNAL_WEIGHT_CHOICES,
@@ -2588,6 +2600,15 @@ def main() -> None:
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.indexed_kv_cache and not is_gemma4_target:
+        p.error("--indexed-kv-cache v1 currently supports Gemma4 text only")
+    if args.indexed_kv_cache and (args.eagle_base or args.mtp
+                                  or args.dflash_base or args.dflash_draft):
+        p.error("--indexed-kv-cache v1 supports vanilla decoding only")
+    if args.indexed_kv_cache and (not args.skip_visual or not args.skip_audio):
+        p.error(
+            "--indexed-kv-cache requires --skip-visual and --skip-audio for text-only export"
+        )
     if args.mtp_draft_dir and args.gemma4_mtp_assistant_dir:
         p.error("Use only one MTP draft checkpoint directory option")
     if mtp_draft_dir_arg and args.eagle_base:
@@ -2725,7 +2746,8 @@ def main() -> None:
                      reduced_vocab_dir=args.reduced_vocab_dir,
                      externalize_weights=externalize_weights,
                      tp_size=args.tp_size,
-                     num_decoder_layers=args.num_decoder_layer)),
+                     num_decoder_layers=args.num_decoder_layer,
+                     indexed_kv_cache=args.indexed_kv_cache)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

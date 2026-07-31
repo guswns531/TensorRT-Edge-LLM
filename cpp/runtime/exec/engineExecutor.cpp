@@ -30,6 +30,12 @@ namespace trt_edgellm
 {
 namespace rt
 {
+struct EngineExecutor::SharedEngineState
+{
+    std::unique_ptr<nvinfer1::IRuntime> runtime;
+    std::unique_ptr<nvinfer1::ICudaEngine> engine;
+};
+
 namespace
 {
 bool engineHasIOTensor(nvinfer1::ICudaEngine const& engine, char const* tensorName)
@@ -76,20 +82,15 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
 {
     LOG_INFO("loading engine file: %s", enginePath.string().c_str());
 
-    mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-    ELLM_CHECK(mRuntime != nullptr, "failed to create TRT IRuntime");
+    mEngineState = std::make_shared<SharedEngineState>();
+    mEngineState->runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
+    ELLM_CHECK(mEngineState->runtime != nullptr, "failed to create TRT IRuntime");
 
-    mEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
-
-    // Use USER_MANAGED allocation so context memory can be shared across runners.
-    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(
-        mEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    ELLM_CHECK(mContext != nullptr, "failed to create execution context");
-
-    setNonBlockingAuxStreams(mContext.get(), mEngine.get(), mAuxStreams);
+    mEngineState->engine = deserializeCudaEngineFromFile(*mEngineState->runtime, enginePath);
+    createExecutionContext();
 
     auto registerOptionalTreeMetadata = [&](char const* name) {
-        if (engineHasInputTensor(*mEngine, name) && !mRegistry.contains(name))
+        if (engineHasInputTensor(*mEngineState->engine, name) && !mRegistry.contains(name))
         {
             mRegistry.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kINT32,
                 {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
@@ -98,7 +99,24 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
     registerOptionalTreeMetadata(binding_names::kTreeParentIds);
     registerOptionalTreeMetadata(binding_names::kTreeDepths);
 
-    LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngine->getNbIOTensors());
+    LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngineState->engine->getNbIOTensors());
+}
+
+EngineExecutor::EngineExecutor(std::shared_ptr<SharedEngineState> engineState, TensorRegistry registry)
+    : mEngineState(std::move(engineState))
+    , mRegistry(std::move(registry))
+{
+    ELLM_CHECK(mEngineState != nullptr && mEngineState->engine != nullptr, "invalid shared TRT engine state");
+    createExecutionContext();
+}
+
+void EngineExecutor::createExecutionContext()
+{
+    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+        mEngineState->engine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
+    ELLM_CHECK(mContext != nullptr, "failed to create execution context");
+
+    setNonBlockingAuxStreams(mContext.get(), mEngineState->engine.get(), mAuxStreams);
 }
 
 std::unique_ptr<EngineExecutor> EngineExecutor::createForLLM(std::filesystem::path const& enginePath,
@@ -133,6 +151,11 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
     default: ELLM_CHECK(false, "createForDraft requires a speculative decoding deployment with a draft engine.");
     }
     return nullptr;
+}
+
+std::unique_ptr<EngineExecutor> EngineExecutor::createSibling() const
+{
+    return std::unique_ptr<EngineExecutor>(new EngineExecutor(mEngineState, mRegistry));
 }
 
 EngineExecutor::~EngineExecutor() noexcept
@@ -186,10 +209,10 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
     //
     // LoRA weights are model-dependent and populated into the TensorMap by
     // LoRAManager::refreshTensorMap() before prepare() is called.
-    int32_t const numIO = mEngine->getNbIOTensors();
+    int32_t const numIO = mEngineState->engine->getNbIOTensors();
     for (int32_t i = 0; i < numIO; ++i)
     {
-        char const* name = mEngine->getIOTensorName(i);
+        char const* name = mEngineState->engine->getIOTensorName(i);
         if (mRegistry.contains(name))
         {
             // Already bound by bindAll above; leave alone.
@@ -210,7 +233,7 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
             LOG_ERROR("setTensorAddress failed for binding '%s'", name);
             return false;
         }
-        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
+        if (mEngineState->engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
         {
             if (!mContext->setInputShape(name, tensor->getTRTDims()))
             {
@@ -293,7 +316,7 @@ int64_t EngineExecutor::getRequiredContextMemorySize() const
     // Use getDeviceMemorySizeV2() to get the max across ALL profiles.
     // SpecDecode base engines have multiple profiles (prefill + verification) with
     // different memory requirements. Using per-profile size can underallocate.
-    return mEngine->getDeviceMemorySizeV2();
+    return mEngineState->engine->getDeviceMemorySizeV2();
 }
 
 bool EngineExecutor::setContextMemory(Tensor& sharedMem)
@@ -304,28 +327,28 @@ bool EngineExecutor::setContextMemory(Tensor& sharedMem)
 
 int32_t EngineExecutor::getNumIOTensors() const
 {
-    return mEngine->getNbIOTensors();
+    return mEngineState->engine->getNbIOTensors();
 }
 
 char const* EngineExecutor::getIOTensorName(int32_t index) const
 {
-    return mEngine->getIOTensorName(index);
+    return mEngineState->engine->getIOTensorName(index);
 }
 
 bool EngineExecutor::hasIOTensor(char const* name) const
 {
-    return engineHasIOTensor(*mEngine, name);
+    return engineHasIOTensor(*mEngineState->engine, name);
 }
 
 nvinfer1::DataType EngineExecutor::getBindingDataType(char const* name) const
 {
-    return mEngine->getTensorDataType(name);
+    return mEngineState->engine->getTensorDataType(name);
 }
 
 nvinfer1::Dims EngineExecutor::getProfileShape(
     char const* name, int32_t profileIndex, nvinfer1::OptProfileSelector selector) const
 {
-    return mEngine->getProfileShape(name, profileIndex, selector);
+    return mEngineState->engine->getProfileShape(name, profileIndex, selector);
 }
 
 void EngineExecutor::setProfiler(nvinfer1::IProfiler* profiler) noexcept
@@ -335,7 +358,7 @@ void EngineExecutor::setProfiler(nvinfer1::IProfiler* profiler) noexcept
 
 nvinfer1::ICudaEngine const& EngineExecutor::getEngine() const noexcept
 {
-    return *mEngine;
+    return *mEngineState->engine;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,10 +392,10 @@ bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) con
 size_t EngineExecutor::computeBindingHash() const
 {
     size_t seed = 0;
-    int32_t const numIO = mEngine->getNbIOTensors();
+    int32_t const numIO = mEngineState->engine->getNbIOTensors();
     for (int32_t i = 0; i < numIO; ++i)
     {
-        char const* name = mEngine->getIOTensorName(i);
+        char const* name = mEngineState->engine->getIOTensorName(i);
         auto const addr = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
         nvinfer1::Dims const shape = mContext->getTensorShape(name);
 
@@ -389,11 +412,11 @@ size_t EngineExecutor::computeBindingHash() const
 EngineExecutor::BindingSnapshot EngineExecutor::snapshotBindings() const
 {
     BindingSnapshot snap;
-    int32_t const numIO = mEngine->getNbIOTensors();
+    int32_t const numIO = mEngineState->engine->getNbIOTensors();
     snap.bindings.reserve(numIO);
     for (int32_t i = 0; i < numIO; ++i)
     {
-        char const* name = mEngine->getIOTensorName(i);
+        char const* name = mEngineState->engine->getIOTensorName(i);
         auto const addr = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
         nvinfer1::Dims const shape = mContext->getTensorShape(name);
         snap.bindings.emplace_back(addr, shape);

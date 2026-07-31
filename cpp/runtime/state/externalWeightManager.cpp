@@ -178,5 +178,15 @@ void ExternalWeightManager::registerTensorMapEntries(TensorMap& map)
     mRegistered = true;
 }
 
+void ExternalWeightManager::registerAdditionalTensorMapEntries(TensorMap& map)
+{
+    ELLM_CHECK(mRegistered,
+        "ExternalWeightManager::registerAdditionalTensorMapEntries called before primary map registration");
+    for (auto& tensor : mWeights)
+    {
+        map.set(tensor.getName(), tensor);
+    }
+}
+
 } // namespace rt
 } // namespace trt_edgellm

@@ -106,6 +106,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.kvConfig=*/std::move(kvCfg),
         /*.mambaConfig=*/std::move(mambaCfg),
         /*.maxBatchSize=*/cfg.maxSupportedBatchSize,
+        /*.indexedKVCache=*/cfg.indexedKVCache,
     };
     resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
 
@@ -209,6 +210,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.kvConfig=*/std::move(kvCfg),
             /*.mambaConfig=*/std::move(mambaCfg),
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
+            /*.indexedKVCache=*/false,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
     }
@@ -246,6 +248,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.kvConfig=*/std::move(kvCfg),
             /*.mambaConfig=*/std::move(mambaCfg),
             /*.maxBatchSize=*/bundle.draft->maxSupportedBatchSize,
+            /*.indexedKVCache=*/false,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
     }

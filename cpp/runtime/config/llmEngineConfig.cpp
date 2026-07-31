@@ -482,6 +482,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     LLMEngineConfig cfg;
 
     cfg.specDecodeType = parseSpecDecodeMode(configJson);
+    cfg.indexedKVCache = configJson.value("indexed_kv_cache", false);
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole != "draft", "parseEngineConfig: use parseDraftEngineConfig for engine_role=draft.");
     cfg.isSpecDecodeBase = (engineRole == "base");
@@ -517,8 +518,16 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.useVisionBidirectionalAttention = configJson.value("use_vision_bidirectional_attention", false);
     ELLM_CHECK(!cfg.useVisionBidirectionalAttention || cfg.imageTokenId >= 0,
         "use_vision_bidirectional_attention requires image_token_id in the LLM config.");
-
     cfg.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
+    if (cfg.indexedKVCache)
+    {
+        ELLM_CHECK(
+            cfg.specDecodeType == SpecDecodeMode::kNONE, "indexed_kv_cache v1 does not support speculative decoding.");
+        ELLM_CHECK(cfg.numLinearAttnLayers == 0, "indexed_kv_cache v1 does not support recurrent/Mamba state.");
+        ELLM_CHECK(cfg.numKVHeads == 1, "indexed_kv_cache v1 paged-XQA view currently requires one KV head.");
+        ELLM_CHECK(!cfg.useVisionBidirectionalAttention,
+            "indexed_kv_cache v1 supports text-only inference; multimodal attention is not supported.");
+    }
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     cfg.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
     cfg.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
@@ -1019,6 +1028,12 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
 
         return;
     }
+
+    bool const engineHasKVSlotIds = executor.hasIOTensor(binding_names::kKVSlotIds);
+    ELLM_CHECK(engineHasKVSlotIds == config.indexedKVCache,
+        std::string("Indexed KV binding mismatch (") + engineLabel
+            + "): config indexed_kv_cache=" + (config.indexedKVCache ? "true" : "false") + ", engine kv_slot_ids="
+            + (engineHasKVSlotIds ? "present" : "absent") + ". Re-export and rebuild the engine.");
 
     // KV cache binding: validated on layer 0; all layers share the same dtype.
     // Plugin-path engines use a combined `past_key_values_%d` binding.

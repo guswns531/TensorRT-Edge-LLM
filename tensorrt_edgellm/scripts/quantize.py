@@ -39,6 +39,7 @@ Usage::
 import argparse
 import json
 import os
+import random
 
 from ..quantization.datasets import (DEFAULT_AUDIO_DATASET,
                                      DEFAULT_IMAGE_DATASET,
@@ -114,6 +115,7 @@ def _add_common_args(parser):
               f"Default: {DEFAULT_AUDIO_DATASET}. Available: "
               f"{', '.join(available_datasets('audio'))}."))
     parser.add_argument("--num_samples", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=0)
 
 
 def main():
@@ -165,6 +167,19 @@ def main():
         help="Keep the intermediate full-model export directory.")
 
     args = parser.parse_args()
+
+    seed = getattr(args, "seed", 0)
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch
+        torch.manual_seed(seed)
+    except ImportError:
+        pass
 
     if args.command == "llm":
         from ..quantization.quantize import quantize_and_export

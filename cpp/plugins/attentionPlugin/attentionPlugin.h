@@ -56,7 +56,7 @@ public:
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
         int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
-        std::optional<float> attentionScale = std::nullopt);
+        std::optional<float> attentionScale = std::nullopt, int32_t enableIndexedKVCache = 0);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -104,7 +104,7 @@ private:
     //! The compact form allows downstream kernels to derive batch stride from the output's S dimension.
     static std::pair<rt::Tensor, rt::Tensor> deinterleaveKVCache(rt::Tensor const& kvCacheTensor,
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
-        int32_t seqLen, cudaStream_t stream);
+        int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds = nullptr);
 
     //! enqueue() body. enqueue() wraps it in a try/catch so a thrown error
     //! fails the call instead of terminating the process (enqueue is noexcept).
@@ -145,6 +145,8 @@ protected:
     int32_t mEnableTreeAttention{};
     //! Whether slot 7 carries [B,S] Gemma4 image block IDs.
     int32_t mEnableVisionBlockAttention{};
+    //! Whether input slot 7 selects stable physical KV-cache slots.
+    int32_t mEnableIndexedKVCache{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

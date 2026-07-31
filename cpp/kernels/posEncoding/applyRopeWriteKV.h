@@ -48,7 +48,7 @@ namespace kernel
 //! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
     rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    bool writeKInPlace);
+    bool writeKInPlace, int32_t const* kvSlotIds = nullptr);
 
 //! @brief Launch the kernel when we are performing tree attention for speculative decoding.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
@@ -95,7 +95,7 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
 //! @param[in] qScale Q dequant scale (quant→orig). Only used when fp8QOut is non-null.
 void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q,
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    void* fp8QOut = nullptr, float qScale = 1.0f);
+    void* fp8QOut = nullptr, float qScale = 1.0f, int32_t const* kvSlotIds = nullptr);
 
 //! @brief Launch kernel to apply RoPE to Q only (no KV write).
 //!
@@ -106,6 +106,10 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 //! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], used to compute RoPE position.
 //! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]. RoPE applied in-place.
 //! @param[in] stream CUDA stream to launch the kernel
+//! Build [B, 2, capacity/tokensPerPage] page IDs for a fixed linear slot pool.
+void launchBuildLinearKVPageList(int32_t const* kvSlotIds, int32_t* pageList, int32_t batchSize, int32_t capacity,
+    int32_t tokensPerPage, cudaStream_t stream);
+
 void launchApplyRopeQOnly(
     rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream);
 

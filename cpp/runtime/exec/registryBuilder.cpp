@@ -68,6 +68,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // context_lengths: [batch] INT32
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+    if (cfg.indexedKVCache)
+    {
+        reg.addTensor(
+            {binding_names::kKVSlotIds, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+    }
 
     // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
     reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,

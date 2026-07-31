@@ -193,6 +193,79 @@ def _(query_states,
                         device=past_key_value.device))
 
 
+@torch.library.custom_op("trt::indexed_attention_plugin", mutates_args=())
+def indexed_attention_plugin(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    past_key_value: torch.Tensor,
+    context_lengths: torch.Tensor,
+    rope_rotary_cos_sin: torch.Tensor,
+    kvcache_start_index: torch.Tensor,
+    kv_slot_ids: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    sliding_window_size: int,
+    enable_fp8_kv_cache: bool,
+    attention_scale: float,
+    qkv_scales: Optional[List[float]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """AttentionPlugin variant with stable logical-row to physical-slot mapping."""
+    batch_size, seq_len, _ = query_states.shape
+    past_len = past_key_value.shape[3]
+    return (
+        torch.zeros(batch_size,
+                    seq_len,
+                    num_q_heads,
+                    head_size,
+                    dtype=query_states.dtype,
+                    device=query_states.device),
+        torch.zeros(batch_size,
+                    2,
+                    num_kv_heads,
+                    past_len + seq_len,
+                    head_size,
+                    dtype=past_key_value.dtype,
+                    device=past_key_value.device),
+    )
+
+
+@indexed_attention_plugin.register_fake
+def _(query_states,
+      key_states,
+      value_states,
+      past_key_value,
+      context_lengths,
+      rope_rotary_cos_sin,
+      kvcache_start_index,
+      kv_slot_ids,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      sliding_window_size,
+      enable_fp8_kv_cache,
+      attention_scale,
+      qkv_scales=None):
+    batch_size, seq_len, _ = query_states.shape
+    past_len = past_key_value.shape[3]
+    return (
+        torch.empty(batch_size,
+                    seq_len,
+                    num_q_heads,
+                    head_size,
+                    dtype=query_states.dtype,
+                    device=query_states.device),
+        torch.empty(batch_size,
+                    2,
+                    num_kv_heads,
+                    past_len + seq_len,
+                    head_size,
+                    dtype=past_key_value.dtype,
+                    device=past_key_value.device),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Custom op: trt::vit_attention_plugin  (ViT ragged self-attention)
 # ---------------------------------------------------------------------------

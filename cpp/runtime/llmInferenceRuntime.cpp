@@ -1194,7 +1194,8 @@ bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& requ
         LOG_ERROR("Request contains trajectory history input, but this runtime does not have an action runner.");
         return false;
     }
-    if (mDeployment.base.useVisionBidirectionalAttention && request.saveSystemPromptKVCache)
+    if ((mDeployment.base.useVisionBidirectionalAttention || mDeployment.base.indexedKVCache)
+        && request.saveSystemPromptKVCache)
     {
         LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
         return false;
@@ -1733,6 +1734,11 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
 
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
+    if (mDeployment.base.indexedKVCache)
+    {
+        LOG_ERROR("System-prompt KV-cache reuse is not supported by indexed_kv_cache v1.");
+        return false;
+    }
     if (mDeployment.base.useVisionBidirectionalAttention)
     {
         LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
@@ -1847,6 +1853,11 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream)
 {
+    if (mDeployment.base.indexedKVCache)
+    {
+        LOG_ERROR("System-prompt KV-cache reuse is not supported by indexed_kv_cache v1.");
+        return false;
+    }
     if (mDeployment.base.useVisionBidirectionalAttention)
     {
         LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
@@ -1945,7 +1956,7 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
 
     // Compact base model caches (KV + Mamba) via the HybridCacheManager single-call API.
     mSharedResources->cacheManagers[0]->compactBatch(
-        mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
+        mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream, &batchMapping);
     mSharedResources->cacheManagers[0]->setActiveBatchSize(newActiveBatch);
 
     // Compact base model's RoPE cache (stored per-batch for MRope on mPipelineIO->mropeCosSin).

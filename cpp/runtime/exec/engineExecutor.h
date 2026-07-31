@@ -41,7 +41,8 @@ namespace rt
 /*!
  * @brief Thin TRT wrapper with prepare/execute split.
  *
- * EngineExecutor owns a TRT runtime, engine, and execution context. It replaces both
+ * EngineExecutor owns a TRT execution context and shares the TRT runtime and engine
+ * with any sibling executors. It replaces both
  * LLMEngineRunner and EagleDraftEngineRunner with a single model-agnostic
  * wrapper (~300 LOC).
  *
@@ -69,6 +70,13 @@ public:
     //! factory chooses the draft binding registry from `bundle.specDecodeMode()`.
     static std::unique_ptr<EngineExecutor> createForDraft(
         std::filesystem::path const& enginePath, DeploymentConfig const& bundle);
+
+    //! @brief Create an executor with an independent execution context over the same engine.
+    //!
+    //! The sibling has its own USER_MANAGED context, auxiliary streams, and CUDA graph
+    //! cache. Serialized weights and the ICudaEngine are shared, allowing two phase
+    //! streams to enqueue concurrently without deserializing a second engine.
+    std::unique_ptr<EngineExecutor> createSibling() const;
 
     EngineExecutor(EngineExecutor const&) = delete;
     EngineExecutor& operator=(EngineExecutor const&) = delete;
@@ -167,11 +175,15 @@ private:
      * @param registry TensorRegistry describing the binding layout
      * @throws std::runtime_error On I/O or deserialization failure
      */
+    struct SharedEngineState;
+
     EngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry);
+    EngineExecutor(std::shared_ptr<SharedEngineState> engineState, TensorRegistry registry);
+
+    void createExecutionContext();
 
     AuxStreamSet mAuxStreams{};
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
+    std::shared_ptr<SharedEngineState> mEngineState;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     TensorRegistry mRegistry;
 

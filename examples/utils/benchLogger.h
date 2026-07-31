@@ -173,11 +173,18 @@ void writeLayerInfoCsv(OrderedLayerTimings const& layerTimings, std::string cons
 void writeE2ECsv(std::string const& outputPath, BenchOutputParams const& params, float e2eTimeMs, int32_t numTokens,
     int64_t imageTokens = 0);
 
+//! Write one CUDA-event E2E latency sample per row.
+void writeE2ESamplesCsv(
+    std::string const& outputPath, BenchOutputParams const& params, std::vector<float> const& samples);
+
 //! Build the layer CSV file path based on mode and parameters
 std::string buildLayerCsvPath(std::string const& outputDir, BenchOutputParams const& params);
 
 //! Build the E2E CSV file path based on mode and parameters
 std::string buildE2ECsvPath(std::string const& outputDir, BenchOutputParams const& params);
+
+//! Build the raw E2E sample CSV file path based on mode and parameters.
+std::string buildE2ESamplesCsvPath(std::string const& outputDir, BenchOutputParams const& params);
 
 // ==================== Log Helpers ====================
 

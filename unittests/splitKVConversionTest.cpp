@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -121,6 +121,61 @@ INSTANTIATE_TEST_SUITE_P(SplitKVShapes, SplitKVCpuReferenceTest,
         SplitKVParams{4, 2, 64, 64},               // larger sequence
         SplitKVParams{1, 1, 8, 64}                 // minimal dims
         ));
+
+TEST(SplitKVIndexedTest, GathersStablePhysicalSlots)
+{
+    int32_t const physicalB = 4;
+    int32_t const activeB = 3;
+    int32_t const H = 1;
+    int32_t const S = 4;
+    int32_t const D = 8;
+    std::vector<int32_t> const slotIds{3, 0, 2};
+
+    size_t const srcVol = static_cast<size_t>(physicalB) * 2 * H * S * D;
+    std::vector<half> srcHost(srcVol);
+    for (int32_t b = 0; b < physicalB; ++b)
+    {
+        for (int32_t kv = 0; kv < 2; ++kv)
+        {
+            for (int32_t s = 0; s < S; ++s)
+            {
+                for (int32_t d = 0; d < D; ++d)
+                {
+                    srcHost[srcIdx(b, kv, 0, s, d, H, S, D)]
+                        = __float2half(static_cast<float>(1000 * b + 100 * kv + 10 * s + d));
+                }
+            }
+        }
+    }
+
+    rt::Tensor backing({physicalB, 2, H, S, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    CUDA_CHECK(cudaMemcpy(backing.rawPointer(), srcHost.data(), srcVol * sizeof(half), cudaMemcpyHostToDevice));
+    rt::Tensor activeView(backing.rawPointer(), rt::Coords{activeB, 2, H, S, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor slotTensor({activeB}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(
+        cudaMemcpy(slotTensor.rawPointer(), slotIds.data(), slotIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    rt::Tensor kTensor({activeB, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vTensor({activeB, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    kernel::cvtKVLayoutBHSDToSplitKV(
+        activeView, kTensor, vTensor, rt::Tensor{}, S, nullptr, slotTensor.dataPointer<int32_t>());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const kHost = copyDeviceToHost<half>(kTensor);
+    auto const vHost = copyDeviceToHost<half>(vTensor);
+    for (int32_t b = 0; b < activeB; ++b)
+    {
+        for (int32_t s = 0; s < S; ++s)
+        {
+            for (int32_t d = 0; d < D; ++d)
+            {
+                size_t const out = dstIdx(b, s, 0, d, S, H, D);
+                EXPECT_EQ(kHost[out], srcHost[srcIdx(slotIds[b], 0, 0, s, d, H, S, D)]);
+                EXPECT_EQ(vHost[out], srcHost[srcIdx(slotIds[b], 1, 0, s, d, H, S, D)]);
+            }
+        }
+    }
+}
 
 // ===== 2. FP8 dequantization test =================================================
 

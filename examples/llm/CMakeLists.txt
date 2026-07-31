@@ -39,3 +39,12 @@ target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
                                              ${CMAKE_SOURCE_DIR}/examples/utils)
 target_compile_options(llm_bench PRIVATE -Wno-psabi)
 add_cross_build_link_options(llm_bench)
+
+add_executable(llm_phase_bench llm_phase_bench.cpp)
+target_link_libraries(llm_phase_bench PRIVATE commonLibraryExt edgellmCore
+                                              exampleUtils)
+target_include_directories(
+  llm_phase_bench PRIVATE ${COMMON_INCLUDE_DIRS}
+                          ${CMAKE_SOURCE_DIR}/examples/utils)
+target_compile_options(llm_phase_bench PRIVATE -Wno-psabi)
+add_cross_build_link_options(llm_phase_bench)

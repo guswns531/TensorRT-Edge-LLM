@@ -62,12 +62,20 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
     for (int32_t idx = 0; idx < mConfig.numPleInputs; ++idx)
     {
         mPleOutputViews.emplace_back(makeOutputViewForLayer(idx, maxBatchSize, maxSeqLen));
-        tensorMap.set(mPleOutputViews.back().getName(), mPleOutputViews.back());
     }
+    bindOutputs(tensorMap);
 
     LOG_INFO("Initialized Gemma4 PLE preprocessor: table=%s outputBuffer=%s numPleInputs=%d pleHiddenSize=%d",
         mPleTable.getShape().formatString().c_str(), mPleOutputBuffer.getShape().formatString().c_str(),
         mConfig.numPleInputs, mConfig.pleHiddenSize);
+}
+
+void Gemma4EmbeddingPreprocessor::bindOutputs(TensorMap& tensorMap)
+{
+    for (Tensor& output : mPleOutputViews)
+    {
+        tensorMap.set(output.getName(), output);
+    }
 }
 
 Tensor Gemma4EmbeddingPreprocessor::makeOutputViewForLayer(int32_t layerIdx, int64_t batchSize, int64_t seqLen)

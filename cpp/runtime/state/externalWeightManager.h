@@ -88,6 +88,12 @@ public:
     //! registration has already happened.
     void registerTensorMapEntries(TensorMap& map);
 
+    //! Register the same immutable weight tensors in an additional phase-local map.
+    //!
+    //! The primary map must already have been registered. This does not transfer
+    //! ownership or allocate another copy of any weight tensor.
+    void registerAdditionalTensorMapEntries(TensorMap& map);
+
     //! Number of externalized tensors currently owned by the manager.
     size_t size() const noexcept
     {

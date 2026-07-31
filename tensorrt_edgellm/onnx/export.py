@@ -255,7 +255,14 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
              if a.name == "enable_vision_block_attention"),
             0,
         )
-        optional_count = 2 if tree_attn else (1 if vision_block_attn else 0)
+        indexed_kv = next(
+            (a.i
+             for a in node.attribute if a.name == "enable_indexed_kv_cache"),
+            0,
+        )
+        optional_count = (1 if indexed_kv else
+                          (2 if tree_attn else
+                           (1 if vision_block_attn else 0)))
         keep = _REQUIRED + optional_count
         trailing = list(node.input)[keep:]
         if not trailing or any(i != "" for i in trailing):

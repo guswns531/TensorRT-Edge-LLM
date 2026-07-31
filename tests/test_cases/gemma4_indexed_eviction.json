@@ -1,0 +1,45 @@
+{
+    "batch_size": 4,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 32,
+    "requests": [
+        {
+            "stop": "Here",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Please introduce the company NVIDIA and its CEO."
+                }
+            ]
+        },
+        {
+            "stop": "Here is an",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Please introduce the company NVIDIA and its CEO."
+                }
+            ]
+        },
+        {
+            "stop": "Here is an introduction",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Please introduce the company NVIDIA and its CEO."
+                }
+            ]
+        },
+        {
+            "stop": "Here is an introduction to NVIDIA",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Please introduce the company NVIDIA and its CEO."
+                }
+            ]
+        }
+    ]
+}

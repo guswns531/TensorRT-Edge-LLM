@@ -142,6 +142,10 @@ void buildTensorMap(
     // Hybrid cache routing: walk absolute decoder-layer indices, route by
     // `cfg.layerTypes[absIdx]`, and bind per-layer tensors using LOCAL indices.
     auto& cacheMgr = *res.cacheManagers[kvCacheIndex];
+    if (cfg.indexedKVCache)
+    {
+        map.set(binding_names::kKVSlotIds, cacheMgr.getKVSlotIds());
+    }
     auto& kvMgr = cacheMgr.getKVCacheManager();
     auto& mambaMgr = cacheMgr.getMambaCacheManager();
 

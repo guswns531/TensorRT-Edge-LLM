@@ -534,6 +534,8 @@ class ModelConfig:
     # attention during prefill (bidirectional inside each contiguous vision
     # run, causal everywhere else).  Audio placeholders remain causal.
     use_vision_bidirectional_attention: bool = False
+    # Opt-in stable physical-slot indirection for text attention KV cache.
+    indexed_kv_cache: bool = False
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)

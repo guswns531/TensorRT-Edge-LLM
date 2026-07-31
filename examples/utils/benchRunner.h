@@ -31,6 +31,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -150,7 +151,8 @@ int runLayerProfilingLoop(std::string const& modeName, int32_t iterations, bool 
 template <typename ResetFn, typename StepFn>
 float runRepeatedE2ETiming(
     std::string const& modeName, int32_t iterations, ResetFn const& resetState, StepFn const& step, cudaStream_t stream,
-    bool useCudaGraph = false, std::function<bool()> const& captureGraph = []() { return false; })
+    bool useCudaGraph = false, std::function<bool()> const& captureGraph = []() { return false; },
+    std::vector<float>* e2eSamples = nullptr)
 {
     if (useCudaGraph)
     {
@@ -199,6 +201,10 @@ float runRepeatedE2ETiming(
     std::vector<double> e2eTimesDouble(e2eTimes.begin(), e2eTimes.end());
     auto [mean, std] = computeStats(e2eTimesDouble);
     LOG_INFO("%s E2E Time: %.4f +/- %.4f ms", modeName.c_str(), mean, std);
+    if (e2eSamples != nullptr)
+    {
+        *e2eSamples = std::move(e2eTimes);
+    }
     return static_cast<float>(mean);
 }
 

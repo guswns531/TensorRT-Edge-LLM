@@ -33,6 +33,7 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
@@ -596,6 +597,7 @@ int main(int argc, char** argv)
     std::vector<KernelTimes> timesPerIter;
     timesPerIter.reserve(args.iterations);
     float e2eTimeMsResult = 0.0f;
+    std::vector<float> e2eSamples;
     OrderedLayerTimings layerTimings;
 
     // ===== Phase 1: Initialize Engine =====
@@ -605,6 +607,7 @@ int main(int argc, char** argv)
     rt::TensorMap tensorMap;
     std::unique_ptr<rt::StepPreparer> stepPreparer;
     std::unique_ptr<rt::DeepstackBinding> deepstack;
+    std::unique_ptr<rt::Gemma4EmbeddingPreprocessor> gemma4Ple;
     rt::DeploymentConfig deployment;
     rt::Tensor contextMemory;
 
@@ -807,6 +810,13 @@ int main(int argc, char** argv)
 
         // --- StepPreparer (for prefill/decode metadata) ---
         stepPreparer = std::make_unique<rt::StepPreparer>(activeCfg);
+        if (!useDraftEngine && deployment.base.pleEnabled)
+        {
+            int32_t const maxPleSeqLen
+                = std::max(deployment.base.maxSupportedInputLength, std::max(1, deployment.base.maxVerifyTreeSize));
+            gemma4Ple = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
+                dir, deployment.base, maxBatch, maxPleSeqLen, tensorMap, stream);
+        }
 
         // --- DeepstackBinding (if applicable, base engine only) ---
         if (!useDraftEngine && deployment.base.numDeepstackFeatures > 0)
@@ -851,6 +861,7 @@ int main(int argc, char** argv)
 
     std::vector<int32_t> reuseKVLenVec;
     std::vector<int32_t> pastKVLenVec;
+    rt::Tensor pleTokenIds;
 
     std::function<void(int32_t)> postStep = [](int32_t) {};
     std::function<bool()> captureGraph = []() { return false; };
@@ -875,6 +886,13 @@ int main(int argc, char** argv)
         // Reshape inputsEmbeds for this bench config
         check::check(
             io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        if (gemma4Ple)
+        {
+            pleTokenIds = rt::Tensor(
+                {B, args.inputLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "bench_ple_token_ids");
+            CUDA_CHECK(cudaMemsetAsync(pleTokenIds.rawPointer(), 0, pleTokenIds.getMemoryCapacity(), stream));
+            gemma4Ple->embed(pleTokenIds, stream);
+        }
 
         // Set context lengths on PipelineIO (host side, for StepPreparer)
         int32_t const contextLen = args.reuseKVLen + args.inputLen;
@@ -917,6 +935,12 @@ int main(int argc, char** argv)
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         check::check(io->inputsEmbeds.reshape({B, 1, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        if (gemma4Ple)
+        {
+            pleTokenIds = rt::Tensor({B, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "bench_ple_token_ids");
+            CUDA_CHECK(cudaMemsetAsync(pleTokenIds.rawPointer(), 0, pleTokenIds.getMemoryCapacity(), stream));
+            gemma4Ple->embed(pleTokenIds, stream);
+        }
 
         pastKVLenVec.assign(B, args.pastKVLen);
 
@@ -1137,17 +1161,20 @@ int main(int argc, char** argv)
     int32_t e2eNumTokens = 1;
     if (args.mode == BenchMode::kVISUAL)
     {
-        e2eTimeMsResult = runRepeatedE2ETiming("Visual Encoder", args.iterations, resetState, step, stream);
+        e2eTimeMsResult
+            = runRepeatedE2ETiming("Visual Encoder", args.iterations, resetState, step, stream, false, {}, &e2eSamples);
         e2eNumTokens = 1;
     }
     else if (args.mode == BenchMode::kPREFILL)
     {
-        e2eTimeMsResult = runRepeatedE2ETiming("Prefill", args.iterations, resetState, step, stream);
+        e2eTimeMsResult
+            = runRepeatedE2ETiming("Prefill", args.iterations, resetState, step, stream, false, {}, &e2eSamples);
         e2eNumTokens = args.inputLen;
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
     {
-        e2eTimeMsResult = runRepeatedE2ETiming("Spec Draft Prefill", args.iterations, resetState, step, stream);
+        e2eTimeMsResult = runRepeatedE2ETiming(
+            "Spec Draft Prefill", args.iterations, resetState, step, stream, false, {}, &e2eSamples);
         e2eNumTokens = args.inputLen;
     }
     else if (useSequentialE2E)
@@ -1159,7 +1186,7 @@ int main(int argc, char** argv)
     else
     {
         e2eTimeMsResult = runRepeatedE2ETiming(
-            modeName, args.iterations, resetState, step, stream, !args.noCudaGraph, captureGraph);
+            modeName, args.iterations, resetState, step, stream, !args.noCudaGraph, captureGraph, &e2eSamples);
         e2eNumTokens = 1;
     }
 
@@ -1172,6 +1199,10 @@ int main(int argc, char** argv)
     {
         auto outParams = args.toOutputParams();
         writeE2ECsv(buildE2ECsvPath(args.outputDir, outParams), outParams, e2eTimeMsResult, e2eNumTokens, imageTokens);
+        if (!e2eSamples.empty())
+        {
+            writeE2ESamplesCsv(buildE2ESamplesCsvPath(args.outputDir, outParams), outParams, e2eSamples);
+        }
     }
 
     // ===== Phase 7: Results Summary =====

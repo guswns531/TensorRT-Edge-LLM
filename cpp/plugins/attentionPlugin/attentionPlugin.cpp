@@ -71,6 +71,7 @@ constexpr int32_t kIN_KV_CACHE_IDX{3};
 constexpr int32_t kIN_CONTEXT_LENGTH_IDX{4};
 constexpr int32_t kIN_ROPE_COS_SIN_IDX{5};
 constexpr int32_t kIN_KV_CACHE_START_IDX{6};
+constexpr int32_t kIN_INDEXED_KV_SLOT_IDX{7};
 constexpr int32_t kIN_OPTIONAL_ATTN_MASK_IDX{7};
 constexpr int32_t kIN_OPTIONAL_ATTN_POS_ID_IDX{8};
 constexpr int32_t kOUT_ATTENTION_IDX{0};
@@ -79,6 +80,7 @@ constexpr int32_t kOUT_KV_CACHE_IDX{1};
 // Reflect the count of Inputs and Outputs of the AttentionPlugin,
 // these definitions shall be consistent.
 constexpr int32_t kNUM_REQUIRED_INPUTS{7};
+constexpr int32_t kNUM_INDEXED_KV_INPUTS{1};
 constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
@@ -255,7 +257,7 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 // deinterleaveKVCache call (WAR for current kernel limitation).
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::deinterleaveKVCache(rt::Tensor const& kvCacheTensor,
     std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
-    int32_t seqLen, cudaStream_t stream)
+    int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds)
 {
     // seqLen == 0 means copy full capacity; otherwise copy only first seqLen tokens (compact).
     int32_t const outSeqDim = (seqLen > 0) ? seqLen : kvCacheCapacity;
@@ -269,7 +271,7 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::deinterleaveKVCache(rt::Tenso
         ptr + halfSize, rt::Coords{batchSize, outSeqDim, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
 
     // seqLen > 0: compact copy of first seqLen tokens; seqLen == 0: full copy (also handles FP8 dequant).
-    kernel::cvtKVLayoutBHSDToSplitKV(kvCacheTensor, kTensor, vTensor, rt::Tensor{}, seqLen, stream);
+    kernel::cvtKVLayoutBHSDToSplitKV(kvCacheTensor, kTensor, vTensor, rt::Tensor{}, seqLen, stream, kvSlotIds);
     return std::make_pair(std::move(kTensor), std::move(vTensor));
 }
 
@@ -336,7 +338,8 @@ void AttentionPlugin::enforceVisionBlockKernelSupport() const
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
-    int32_t slidingWindowSize, std::vector<float> const& qkvScales, std::optional<float> attentionScale)
+    int32_t slidingWindowSize, std::vector<float> const& qkvScales, std::optional<float> attentionScale,
+    int32_t enableIndexedKVCache)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
@@ -344,12 +347,15 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mAttentionScale(resolveAttentionScale(attentionScale, headSize))
     , mEnableTreeAttention(enableTreeAttention)
     , mEnableVisionBlockAttention(enableVisionBlockAttention)
+    , mEnableIndexedKVCache(enableIndexedKVCache)
     , mEnableFp8KVCache(enableFp8KVCache)
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
     , mSlidingWindowSize(slidingWindowSize)
 {
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
+    ELLM_CHECK(!mEnableIndexedKVCache || (!mEnableTreeAttention && !mEnableVisionBlockAttention),
+        "Indexed KV cache v1 is mutually exclusive with tree and vision-block attention.");
     ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || mQkvScales.size() == 3,
         "FP8 KV cache enabled but qkv_scales has "
@@ -366,7 +372,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
     // XQA decode kernels are needed for decode path when available.
     bool const useSpecDecode = true;
-    bool const usePagedKVCache = false;
+    bool const usePagedKVCache = mEnableIndexedKVCache != 0;
     mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
         selectKvCacheDataType(mEnableFp8KVCache), usePagedKVCache);
     if (mCanImplementXQA)
@@ -449,8 +455,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
 {
     mEnableVisionBlockAttention = parsePluginScalarField<int32_t>("enable_vision_block_attention", fc).value_or(0);
+    mEnableIndexedKVCache = parsePluginScalarField<int32_t>("enable_indexed_kv_cache", fc).value_or(0);
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
+    ELLM_CHECK(!mEnableIndexedKVCache || (!mEnableTreeAttention && !mEnableVisionBlockAttention),
+        "Indexed KV cache v1 is mutually exclusive with tree and vision-block attention.");
     ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
 
     // Parse qkv_scales float array
@@ -483,7 +492,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
 
     // XQA decode kernels.
-    bool const usePagedKVCache = false;
+    bool const usePagedKVCache = mEnableIndexedKVCache != 0;
     mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
         selectKvCacheDataType(mEnableFp8KVCache), usePagedKVCache);
     if (mCanImplementXQA)
@@ -548,7 +557,8 @@ IPluginV3* AttentionPlugin::clone() noexcept
     try
     {
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
-            mEnableFp8KVCache, mEnableVisionBlockAttention, mSlidingWindowSize, mQkvScales, mAttentionScale);
+            mEnableFp8KVCache, mEnableVisionBlockAttention, mSlidingWindowSize, mQkvScales, mAttentionScale,
+            mEnableIndexedKVCache);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -772,7 +782,8 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableIndexedKVCache ? kNUM_INDEXED_KV_INPUTS : 0)
+        + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
@@ -797,11 +808,17 @@ bool AttentionPlugin::supportsFormatCombination(
         case kIN_CONTEXT_LENGTH_IDX: result = checkSequenceLen(inOut[pos].desc); break;
         case kIN_ROPE_COS_SIN_IDX: result = checkPosEncodingCosSin(inOut[pos].desc); break;
         case kIN_KV_CACHE_START_IDX: result = checkKVCacheStartIdx(inOut[pos].desc); break;
+        case kIN_INDEXED_KV_SLOT_IDX:
+            if (mEnableIndexedKVCache)
+            {
+                result = checkSequenceLen(inOut[pos].desc);
+            }
+            break;
         default: break;
         }
 
         // Handle optional inputs (tree attention mask/pos and FP8 scales) with dynamic ordering
-        if (result && pos > kIN_KV_CACHE_START_IDX)
+        if (result && pos > kIN_KV_CACHE_START_IDX && !mEnableIndexedKVCache)
         {
             int32_t currentOptionalInputIdx = kIN_KV_CACHE_START_IDX + 1;
             if (mEnableTreeAttention)
@@ -853,6 +870,13 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_CACHE_IDX].max.d[3];
     size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
         mNumKVHeads, mHeadSize, mUseCuteDslFMHA, mEnableFp8KVCache, mEnableVisionBlockAttention != 0);
+    if (mEnableIndexedKVCache)
+    {
+        constexpr int64_t tokensPerPage = 128;
+        int64_t const pagesPerSequence = maxKVCacheCapacity / tokensPerPage;
+        return workspaceSize
+            + alignTensorSize(static_cast<size_t>(maxBatchSize * 2 * pagesPerSequence * sizeof(int32_t)));
+    }
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
     return workspaceSize;
@@ -943,6 +967,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     rt::Tensor const kvCacheStartIdxTensor(const_cast<void*>(inputs[kIN_KV_CACHE_START_IDX]),
         rt::Coords{kvCacheStartIdxInputDesc.dims}, rt::DeviceType::kGPU, kvCacheStartIdxInputDesc.type);
 
+    int32_t const* kvSlotIds
+        = mEnableIndexedKVCache ? static_cast<int32_t const*>(inputs[kIN_INDEXED_KV_SLOT_IDX]) : nullptr;
+
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
@@ -1013,6 +1040,19 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         return 1;
     }
 
+    rt::Tensor indexedPageListTensor{};
+    if (mEnableIndexedKVCache)
+    {
+        constexpr int32_t tokensPerPage = 128;
+        check::check(kvCacheCapacity % tokensPerPage == 0,
+            "Indexed KV cache requires capacity divisible by 128 for paged XQA view.");
+        int32_t const pagesPerSequence = kvCacheCapacity / tokensPerPage;
+        indexedPageListTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize, 2, pagesPerSequence}, DataType::kINT32);
+        kernel::launchBuildLinearKVPageList(kvSlotIds, indexedPageListTensor.dataPointer<int32_t>(), runtimeBatchSize,
+            kvCacheCapacity, tokensPerPage, stream);
+    }
+
     // ==================== Prefill path ====================
     // Dispatch order: vision-block attention first (FFPA d512 overlay or FMHA
     // CUSTOM_MASK, early return), then sharedKV (early return), then own-KV.
@@ -1065,7 +1105,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             // and both vision prefill paths read K/V from that canonical
             // cache layout.
             kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor, vInputTensor,
-                kvCacheTensor, kScale, vScale, stream, false);
+                kvCacheTensor, kScale, vScale, stream, false, kvSlotIds);
 
 #ifdef CUTE_DSL_FFPA_ENABLED
             if (canUseFFPAOverlayForVisionPrefill())
@@ -1106,7 +1146,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 // prefill, bottom-right offset 0), so cuQSeqLens bounds both
                 // sides.
                 auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                    mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream);
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream, kvSlotIds);
                 CuteDslFFPAParams ffpaParams{};
                 ffpaParams.q = qInputTensor.dataPointer<half>();
                 ffpaParams.k = kSplit.dataPointer<half>();
@@ -1180,7 +1220,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             // layers).  Compact deinterleave keeps the physical batch
             // stride at runtimeSeqLen, matching s_kv below.
             auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream);
+                mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream, kvSlotIds);
 
             FusedMultiheadAttentionParamsV2 params{};
             fmhaRunner.setupParams(params, mAttentionScale);
@@ -1251,7 +1291,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     // cuKVSeqLens (prefix + chunk) drive the bottom-right causal
                     // offset inside the kernel.
                     auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                        mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream);
+                        mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream, kvSlotIds);
                     dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                         vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                         cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
@@ -1263,7 +1303,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     // keeps the physical stride at runtimeSeqLen; the logical per-batch
                     // lengths (cuKVSeqLens == cuQSeqLens, offset 0) mask ragged padding.
                     auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                        mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream);
+                        mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream, kvSlotIds);
                     dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                         vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                         cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
@@ -1316,7 +1356,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 bool const compact = (executionMode == AttentionExecutionMode::kNORMAL_PREFILL);
                 int32_t const seqLen = compact ? runtimeSeqLen : 0;
                 auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                    mNumKVHeads, kvCacheCapacity, mHeadSize, seqLen, stream);
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, seqLen, stream, kvSlotIds);
 
                 params.s_kv = compact ? runtimeSeqLen : kvCacheCapacity;
                 params.q_ptr = qInputTensor.dataPointer<half>();
@@ -1337,7 +1377,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         {
             // headSize=512 prefill: apply RoPE, write K/V to cache, then use FFPA.
             kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheTensor, kScale, vScale, stream, true);
+                vInputTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds);
 
 #ifdef CUTE_DSL_FFPA_ENABLED
             if (!mCanImplementFFPA)
@@ -1359,7 +1399,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 // read K/V back from the just-updated cache.  Per-batch cuKVSeqLens
                 // (prefix + chunk) drive the bottom-right causal offset inside the kernel.
                 auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                    mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream);
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream, kvSlotIds);
                 dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                     vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                     cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(), runtimeBatchSize,
@@ -1405,7 +1445,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     // Single kernel: RoPE Q → FP8 output, RoPE K + write FP8 K/V to cache.
                     kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
                         kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream, fp8QTensor.rawPointer(),
-                        qScale);
+                        qScale, kvSlotIds);
 
                     runner.run(fp8QTensor.rawPointer(),                 // Q  [b, s_q, h_q, d] FP8
                         kvCacheTensor.rawPointer(),                     // KV [b, 2, h_k, cap, d] FP8
@@ -1417,7 +1457,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 {
                     // FP16 path: RoPE Q in-place, write FP16 K/V to cache.
                     kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
-                        kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream);
+                        kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream, nullptr, 1.0f, kvSlotIds);
 
                     runner.run(qInputTensor.dataPointer<half>(),        // Q  [b, s_q, h_q, d]
                         kvCacheTensor.dataPointer<half>(),              // KV [b, 2, h_k, cap, d]
@@ -1445,10 +1485,10 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 {
                     // kvCache: [b, 2, hkv, s, d] -> split K [b, s, hkv, d] + V [b, s, hkv, d]
                     kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                        vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
+                        vInputTensor, kvCacheTensor, kScale, vScale, stream, false, kvSlotIds);
 
                     auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                        mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream);
+                        mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream, kvSlotIds);
 
                     // Set device ptr for FMHA kernel.
                     params.s_kv = kvCacheCapacity;
@@ -1461,7 +1501,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 else
                 { // SEPARATE_Q_K_V
                     kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor,
-                        vInputTensor, kvCacheTensor, kScale, vScale, stream, true);
+                        vInputTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds);
 
                     params.s_kv = runtimeSeqLen;
                     params.q_ptr = qInputTensor.dataPointer<half>();
@@ -1510,7 +1550,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             else
             {
                 kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
-                    vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
+                    vInputTensor, kvCacheTensor, kScale, vScale, stream, false, kvSlotIds);
             }
         }
 
@@ -1538,6 +1578,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         params.kvCache.data = kvCacheTensor.rawPointer();
         params.kvCache.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
         params.kvCache.capacity = kvCacheCapacity;
+        if (mEnableIndexedKVCache)
+        {
+            params.kvCache.pageList = indexedPageListTensor.dataPointer<int32_t>();
+            params.kvCache.tokensPerPage = 128;
+        }
         params.slidingWinSize = mSlidingWindowSize > 0 ? static_cast<uint32_t>(mSlidingWindowSize) : 0U;
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
@@ -1577,6 +1622,7 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "enable_vision_block_attention", &mEnableVisionBlockAttention, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_indexed_kv_cache", &mEnableIndexedKVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
@@ -1603,6 +1649,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_vision_block_attention", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("enable_indexed_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)
     mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
     // Optional QKV dequant scales [q, k, v] for FP8 attention

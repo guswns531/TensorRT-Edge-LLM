@@ -29,8 +29,9 @@ from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm)
 from ..linear import TPMode, make_linear
-from ..ops import (attention_plugin, nvfp4_moe_plugin,
-                   nvfp4_moe_plugin_geforce, use_geforce_nvfp4_moe)
+from ..ops import (attention_plugin, indexed_attention_plugin,
+                   nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   use_geforce_nvfp4_moe)
 
 __all__ = [
     "Gemma4Attention",
@@ -193,7 +194,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                               use_dual_rope: bool = False,
                               eagle_base: bool = False,
                               vision_block_attention: bool = False,
-                              emit_hidden_states: bool = False) -> nn.Module:
+                              emit_hidden_states: bool = False,
+                              indexed_kv_cache: bool = False) -> nn.Module:
     """Build a Gemma4 export wrapper with explicit PLE/RoPE tensor inputs."""
     has_hidden_output = eagle_base or emit_hidden_states
 
@@ -207,7 +209,10 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
         ]
     else:
         param_names += ["rope_rotary_cos_sin"]
-    param_names += ["context_lengths", "kvcache_start_index", "last_token_ids"]
+    param_names += ["context_lengths", "kvcache_start_index"]
+    if indexed_kv_cache:
+        param_names += ["kv_slot_ids"]
+    param_names += ["last_token_ids"]
     if vision_block_attention:
         param_names += ["vision_block_ids"]
     if eagle_base:
@@ -224,6 +229,7 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                     if eagle_base else "")
     vision_kwargs = (", vision_block_ids=vision_block_ids"
                      if vision_block_attention else "")
+    indexed_kwargs = ", kv_slot_ids=kv_slot_ids" if indexed_kv_cache else ""
     if use_dual_rope:
         rope_arg = "None"
         rope_kwargs = (
@@ -238,6 +244,7 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
             f"context_lengths, kvcache_start_index, last_token_ids"
+            f"{indexed_kwargs}"
             f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
@@ -245,6 +252,7 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
         body = (f"    logits, present_key_values = self._model(\n"
                 f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
                 f"context_lengths, kvcache_start_index, last_token_ids"
+                f"{indexed_kwargs}"
                 f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
                 f"    return (logits,) + tuple(present_key_values)\n")
 
@@ -453,6 +461,7 @@ class Gemma4Attention(Attention):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_slot_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
@@ -523,16 +532,35 @@ class Gemma4Attention(Attention):
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
-        attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
-            past_key_value,
-            context_lengths,
-            rope_rotary_cos_sin,
-            kvcache_start_index,
-            **kwargs,
-        )
+        if kv_slot_ids is not None:
+            attn_output, present_key_value = indexed_attention_plugin(
+                query_states,
+                key_states,
+                value_states,
+                past_key_value,
+                context_lengths,
+                rope_rotary_cos_sin,
+                kvcache_start_index,
+                kv_slot_ids,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                sliding_window_size=self.sliding_window_size,
+                enable_fp8_kv_cache=self.enable_fp8_kv_cache,
+                attention_scale=self.attention_scale,
+                qkv_scales=kwargs["qkv_scales"],
+            )
+        else:
+            attn_output, present_key_value = attention_plugin(
+                query_states,
+                key_states,
+                value_states,
+                past_key_value,
+                context_lengths,
+                rope_rotary_cos_sin,
+                kvcache_start_index,
+                **kwargs,
+            )
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
         return self.o_proj(attn_output), present_key_value
@@ -863,6 +891,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_slot_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
@@ -876,6 +905,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_slot_ids=kv_slot_ids,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,
@@ -1032,6 +1062,7 @@ class Gemma4Transformer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor | None,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_slot_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
@@ -1064,6 +1095,7 @@ class Gemma4Transformer(nn.Module):
                 layer_rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
+                kv_slot_ids=kv_slot_ids,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
                 vision_block_ids=vision_block_ids,
@@ -1110,7 +1142,8 @@ class Gemma4ForCausalLM(CausalLM):
             self.config.use_vision_bidirectional_attention)
         if (not self.ple_enabled and not self.config.use_dual_rope
                 and not vision_block_attention
-                and not self.config.gemma4_mtp_base):
+                and not self.config.gemma4_mtp_base
+                and not self.config.indexed_kv_cache):
             return super().onnx_export_spec()
 
         config = self.config
@@ -1216,11 +1249,17 @@ class Gemma4ForCausalLM(CausalLM):
                                      1,
                                      dtype=torch.int64,
                                      device=device)
+        kv_slot_ids = torch.arange(batch_size,
+                                   dtype=torch.int32,
+                                   device=device)
 
-        args = args + (context_lengths, kvcache_start_index, last_token_ids)
-        input_names = input_names + [
-            "context_lengths", "kvcache_start_index", "last_token_ids"
-        ]
+        args = args + (context_lengths, kvcache_start_index)
+        input_names = input_names + ["context_lengths", "kvcache_start_index"]
+        if config.indexed_kv_cache:
+            args = args + (kv_slot_ids, )
+            input_names = input_names + ["kv_slot_ids"]
+        args = args + (last_token_ids, )
+        input_names = input_names + ["last_token_ids"]
         if vision_block_attention:
             vision_block_ids = torch.full((batch_size, seq_len),
                                           -1,
@@ -1253,6 +1292,8 @@ class Gemma4ForCausalLM(CausalLM):
             all_shapes.append({0: rope_batch, 1: pos})
         all_shapes.append({0: batch})
         all_shapes.append({0: kv_batch})
+        if config.indexed_kv_cache:
+            all_shapes.append({0: batch})
         if tree_attention_base:
             all_shapes.append({0: batch, 1: num_selected})
         else:
@@ -1287,7 +1328,8 @@ class Gemma4ForCausalLM(CausalLM):
             eagle_base=tree_attention_base,
             vision_block_attention=vision_block_attention,
             emit_hidden_states=(self.emit_hidden_states
-                                or config.gemma4_mtp_base))
+                                or config.gemma4_mtp_base),
+            indexed_kv_cache=config.indexed_kv_cache)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1304,6 +1346,7 @@ class Gemma4ForCausalLM(CausalLM):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         last_token_ids: torch.Tensor,
+        kv_slot_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
@@ -1319,6 +1362,7 @@ class Gemma4ForCausalLM(CausalLM):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_slot_ids=kv_slot_ids,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,

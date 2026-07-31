@@ -165,6 +165,12 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="enable_indexed_kv_cache",
+            type=OpSchema.AttrType.INT,
+            description="Use input slot 7 as stable physical KV slot IDs.",
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="sliding_window_size",
             type=OpSchema.AttrType.INT,
             description=
