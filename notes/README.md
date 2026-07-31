@@ -25,6 +25,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 
 8. [Prefill/Decode dual-stream PoC와 queue scheduler](08-dual-stream-phase-scheduler.md)
 9. [Chunked prefill과 physical-slot KV length view](09-chunked-prefill-and-slot-lengths.md)
+10. [Phase batch binding과 CUDA event dispatch worker](10-phase-dispatch-worker.md)
 
 ## 지금 내린 핵심 결론
 

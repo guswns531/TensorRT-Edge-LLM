@@ -16,7 +16,6 @@
  */
 
 #include "benchRunner.h"
-#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -26,6 +25,8 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
+#include "runtime/scheduling/phaseBatchState.h"
+#include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
@@ -241,21 +242,25 @@ int main(int argc, char** argv)
     prefillExecutor->setContextMemory(prefillContext);
     decodeExecutor->setContextMemory(decodeContext);
 
-    rt::Tensor prefillSlotIds(
-        {args.prefillBatch}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_prefill_slot_ids");
-    rt::Tensor decodeSlotIds(
-        {args.decodeBatch}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_decode_slot_ids");
-    rt::Tensor prefillKVLengths(
-        {args.prefillBatch}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_prefill_kv_lengths");
-    rt::Tensor decodeKVLengths(
-        {args.decodeBatch}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_decode_kv_lengths");
-
     std::vector<int32_t> prefillSlots(args.prefillBatch);
     std::iota(prefillSlots.begin(), prefillSlots.end(), 0);
     std::vector<int32_t> decodeSlots(args.decodeBatch);
     std::iota(decodeSlots.begin(), decodeSlots.end(), args.prefillBatch);
-    uploadInt32(prefillSlotIds, prefillSlots, setupStream);
-    uploadInt32(decodeSlotIds, decodeSlots, setupStream);
+    std::vector<rt::PhaseWorkItem> prefillBatch;
+    std::vector<rt::PhaseWorkItem> decodeBatch;
+    for (int32_t row = 0; row < args.prefillBatch; ++row)
+    {
+        prefillBatch.push_back({static_cast<uint64_t>(row), args.inputLen, prefillSlots[row], 0, args.inputLen});
+    }
+    for (int32_t row = 0; row < args.decodeBatch; ++row)
+    {
+        decodeBatch.push_back({static_cast<uint64_t>(args.prefillBatch + row), args.pastKVLen, decodeSlots[row]});
+    }
+
+    rt::PhaseBatchState prefillBatchState(args.prefillBatch, "phase_prefill");
+    rt::PhaseBatchState decodeBatchState(args.decodeBatch, "phase_decode");
+    prefillBatchState.bind(prefillMap);
+    decodeBatchState.bind(decodeMap);
 
     int32_t const phaseSlotCount = args.prefillBatch + args.decodeBatch;
     std::vector<int32_t> initialSlotLengths(phaseSlotCount, 0);
@@ -265,13 +270,6 @@ int main(int argc, char** argv)
     std::copy(initialSlotLengths.begin(), initialSlotLengths.end(), hostInitialSlotLengths.dataPointer<int32_t>());
     auto& cacheManager = *resources->cacheManagers[0];
     cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
-    cacheManager.preparePhaseKVCacheLengths(prefillSlotIds, prefillKVLengths, setupStream);
-    cacheManager.preparePhaseKVCacheLengths(decodeSlotIds, decodeKVLengths, setupStream);
-
-    prefillMap.set(binding_names::kKVSlotIds, prefillSlotIds);
-    decodeMap.set(binding_names::kKVSlotIds, decodeSlotIds);
-    prefillMap.set(binding_names::kKVCacheStartIndex, prefillKVLengths);
-    decodeMap.set(binding_names::kKVCacheStartIndex, decodeKVLengths);
 
     uploadInt32(prefillIO.contextLengths, std::vector<int32_t>(args.prefillBatch, args.inputLen), setupStream);
     uploadInt32(decodeIO.contextLengths, std::vector<int32_t>(args.decodeBatch, args.pastKVLen + 1), setupStream);
@@ -295,8 +293,9 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaStreamSynchronize(setupStream));
 
     auto const decodeDims = config.decodeDims(args.decodeBatch);
-    auto enqueuePrefill = [&](cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(prefillKVLengths.rawPointer(), 0, prefillKVLengths.getMemoryCapacity(), stream));
+    auto enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+        ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.prefillBatch, "Unexpected prefill batch size");
+        prefillBatchState.prepare(batch, cacheManager, stream);
         CUDA_CHECK(cudaMemsetAsync(
             prefillIO.selectTokenIndices.rawPointer(), 0, prefillIO.selectTokenIndices.getMemoryCapacity(), stream));
         for (int32_t chunkOffset = 0; chunkOffset < args.inputLen; chunkOffset += configuredChunkSize)
@@ -320,13 +319,13 @@ int main(int argc, char** argv)
             {
                 return false;
             }
-            kernel::incrementLengthTensor(prefillKVLengths, chunkLength, stream);
+            prefillBatchState.commit(cacheManager, chunkLength, stream);
         }
         return true;
     };
-    auto enqueueDecode = [&](cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(decodeKVLengths.rawPointer(), 0, decodeKVLengths.getMemoryCapacity(), stream));
-        kernel::incrementLengthTensor(decodeKVLengths, args.pastKVLen, stream);
+    auto enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+        ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.decodeBatch, "Unexpected decode batch size");
+        decodeBatchState.prepare(batch, cacheManager, stream);
         CUDA_CHECK(cudaMemsetAsync(
             decodeIO.contextLengths.rawPointer(), 0, decodeIO.contextLengths.getMemoryCapacity(), stream));
         kernel::incrementLengthTensor(decodeIO.contextLengths, args.pastKVLen + 1, stream);
@@ -341,7 +340,7 @@ int main(int argc, char** argv)
             {
                 return false;
             }
-            kernel::incrementLengthTensor(decodeKVLengths, 1, stream);
+            decodeBatchState.commit(cacheManager, 1, stream);
             kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
         }
         return true;
@@ -361,27 +360,53 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaEventCreate(&stop));
 
     auto runOnce = [&](bool concurrent) {
+        cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
         CUDA_CHECK(cudaEventRecord(start, setupStream));
         if (concurrent)
         {
             CUDA_CHECK(cudaStreamWaitEvent(prefillStream, start));
-            CUDA_CHECK(cudaStreamWaitEvent(decodeStream, start));
-            CUDA_CHECK(cudaEventRecord(prefillBegin, prefillStream));
-            ELLM_CHECK(enqueuePrefill(prefillStream), "Prefill enqueue failed");
-            CUDA_CHECK(cudaEventRecord(prefillEnd, prefillStream));
-            CUDA_CHECK(cudaEventRecord(decodeBegin, decodeStream));
-            ELLM_CHECK(enqueueDecode(decodeStream), "Decode enqueue failed");
-            CUDA_CHECK(cudaEventRecord(decodeEnd, decodeStream));
+            rt::PhaseQueueSchedulerConfig schedulerConfig;
+            schedulerConfig.maxPrefillBatchSize = args.prefillBatch;
+            schedulerConfig.maxDecodeBatchSize = args.decodeBatch;
+            schedulerConfig.policy = [](rt::PhaseQueueSnapshot const&) { return rt::PhaseDispatchKind::kOverlap; };
+            rt::PhaseQueueScheduler scheduler(schedulerConfig);
+            for (rt::PhaseWorkItem const& item : prefillBatch)
+            {
+                scheduler.enqueuePrefill(item);
+            }
+            for (rt::PhaseWorkItem const& item : decodeBatch)
+            {
+                scheduler.enqueueDecode(item);
+            }
+
+            rt::PhaseDispatchWorkerCallbacks callbacks;
+            callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+                CUDA_CHECK(cudaEventRecord(prefillBegin, stream));
+                ELLM_CHECK(enqueuePrefill(batch, stream), "Prefill enqueue failed");
+                CUDA_CHECK(cudaEventRecord(prefillEnd, stream));
+            };
+            callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+                CUDA_CHECK(cudaEventRecord(decodeBegin, stream));
+                ELLM_CHECK(enqueueDecode(batch, stream), "Decode enqueue failed");
+                CUDA_CHECK(cudaEventRecord(decodeEnd, stream));
+            };
+            callbacks.completePrefill
+                = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+            callbacks.completeDecode
+                = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+            rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream);
+            ELLM_CHECK(worker.dispatchNext(), "Phase worker failed to dispatch overlap plan");
+            worker.wait();
             CUDA_CHECK(cudaStreamWaitEvent(setupStream, prefillEnd));
             CUDA_CHECK(cudaStreamWaitEvent(setupStream, decodeEnd));
         }
         else
         {
             CUDA_CHECK(cudaEventRecord(prefillBegin, setupStream));
-            ELLM_CHECK(enqueuePrefill(setupStream), "Sequential prefill enqueue failed");
+            ELLM_CHECK(enqueuePrefill(prefillBatch, setupStream), "Sequential prefill enqueue failed");
             CUDA_CHECK(cudaEventRecord(prefillEnd, setupStream));
             CUDA_CHECK(cudaEventRecord(decodeBegin, setupStream));
-            ELLM_CHECK(enqueueDecode(setupStream), "Sequential decode enqueue failed");
+            ELLM_CHECK(enqueueDecode(decodeBatch, setupStream), "Sequential decode enqueue failed");
             CUDA_CHECK(cudaEventRecord(decodeEnd, setupStream));
         }
         CUDA_CHECK(cudaEventRecord(stop, setupStream));
