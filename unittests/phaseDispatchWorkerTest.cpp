@@ -104,6 +104,8 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
 
     int32_t prefillEnqueues{};
     int32_t decodeEnqueues{};
+    int32_t prefillBatchCompletions{};
+    int32_t decodeBatchCompletions{};
     std::unordered_map<uint64_t, int32_t> decodeSteps;
     rt::PhaseDispatchWorkerCallbacks callbacks;
     callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
@@ -113,6 +115,16 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
         ASSERT_EQ(batch.size(), 1U);
         ++decodeEnqueues;
+    };
+    callbacks.completePrefillBatch = [&](std::vector<rt::PhaseWorkItem> const& batch) {
+        EXPECT_EQ(batch.size(), 1U);
+        EXPECT_GT(prefillEnqueues, prefillBatchCompletions);
+        ++prefillBatchCompletions;
+    };
+    callbacks.completeDecodeBatch = [&](std::vector<rt::PhaseWorkItem> const& batch) {
+        EXPECT_EQ(batch.size(), 1U);
+        EXPECT_GT(decodeEnqueues, decodeBatchCompletions);
+        ++decodeBatchCompletions;
     };
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
     callbacks.completeDecode = [&](rt::PhaseWorkItem const& item) {
@@ -126,6 +138,8 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
 
     EXPECT_EQ(prefillEnqueues, 3);
     EXPECT_EQ(decodeEnqueues, 4);
+    EXPECT_EQ(prefillBatchCompletions, prefillEnqueues);
+    EXPECT_EQ(decodeBatchCompletions, decodeEnqueues);
     EXPECT_EQ(worker.dispatchCount(), 4U);
     EXPECT_FALSE(worker.busy());
     EXPECT_TRUE(scheduler.empty());

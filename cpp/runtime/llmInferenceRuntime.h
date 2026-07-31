@@ -309,6 +309,12 @@ private:
     //! @throws std::runtime_error if a CUDA error occurs
     bool runBaseModelPrefill(DecodingInferenceContext& context);
 
+    //! Enqueue base prefill, sampling, and result D2H without synchronizing.
+    bool enqueueBaseModelPrefill(DecodingInferenceContext& context);
+
+    //! Consume an enqueued base prefill after its CUDA work completes.
+    bool completeBaseModelPrefill(DecodingInferenceContext& context, PhaseCompletionMode mode);
+
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
 
@@ -339,6 +345,9 @@ private:
     metrics::LLMPrefillMetrics mPrefillMetrics;
     metrics::SpecDecodeGenerationMetrics mSpecDecodeGenerationMetrics;
     metrics::LLMGenerationMetrics mGenerationMetrics; //!< Vanilla generation metrics (used when no spec-decode)
+
+    DecodingInferenceContext* mPendingPrefillContext{}; //!< Context owning the in-flight asynchronous prefill
+    int32_t mPendingPrefillBatchSize{};                 //!< Batch size captured when prefill was enqueued
 };
 
 } // namespace rt

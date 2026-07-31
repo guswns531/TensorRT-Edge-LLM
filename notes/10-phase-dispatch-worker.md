@@ -2,7 +2,7 @@
 
 ## 이번 단계의 구현 범위
 
-`PhaseQueueScheduler`의 plan을 실제 두 TensorRT execution context에 전달하는 중간 계층을 추가했다.
+`PhaseQueueScheduler`의 plan을 TensorRT 실행 경로에 전달하는 중간 계층을 추가했다.
 
 - `PhaseBatchState`: phase별 고정 주소의 slot ID/length tensor 소유
 - `PhaseDispatchWorker`: scheduler plan dispatch, CUDA event 완료 확인, request requeue
@@ -53,7 +53,7 @@ sequenceDiagram
     H->>P: record dispatch-start
     H->>P: enqueue prefill batch
     H->>P: record prefill-done
-    H->>D: wait dispatch-start
+    H->>D: wait prefill-done (shared context 기본값)
     H->>D: enqueue decode batch
     H->>D: record decode-done
     H->>H: poll() 또는 wait()
@@ -61,9 +61,10 @@ sequenceDiagram
     H->>H: unfinished request requeue
 ```
 
-v1은 plan 하나만 in-flight로 둔다. 한 plan 안의 prefill/decode는 병렬이지만, 다음 plan은 두 완료 event를 확인한
-후 dispatch한다. 이 제한은 phase-local tensor 재사용을 안전하게 만들며, 이후 double buffering을 추가할 때 명시적인
-buffer generation ownership으로 확장할 수 있다.
+v1은 plan 하나만 in-flight로 둔다. `kSharedContextSerialized` 기본 모드는 stream은 분리하지만 같은 TensorRT
+execution context의 동시 enqueue를 막기 위해 decode stream이 `prefill-done`을 기다린다.
+`kIndependentContextsConcurrent`는 prefill/decode가 독립 execution context와 workspace를 가진 benchmark 경로에서만
+명시적으로 선택한다. 다음 plan은 두 완료 event를 확인한 후 dispatch한다.
 
 ## RTX 3080 Gemma 4 E2B 결과
 
@@ -99,8 +100,8 @@ request lifecycle을 연결한 뒤 별도로 측정해야 한다.
 
 ## 다음 구현 경계
 
-현재 production decode 함수는 engine 실행 뒤 sampling 결과를 host로 복사하고 stream synchronize까지 한 함수 안에서
-수행한다. 따라서 public async serving 연결 전에 이 경계를 다음처럼 나눠야 한다.
+production prefill/decode의 enqueue와 host completion 경계는 다음 단계에서 분리했다. 자세한 내용은
+[Production prefill/decode async completion 경계](11-async-phase-completion.md)를 참고한다.
 
 1. `enqueuePrefillCompute()`와 `enqueueDecodeCompute()`는 GPU 작업과 done event만 반환
 2. sampling/finished 판단은 event 완료 후 별도 completion 단계에서 수행

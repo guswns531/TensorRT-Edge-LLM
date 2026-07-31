@@ -55,6 +55,13 @@ enum class DecodingStrategyKind : int32_t
     kGemma4MTP,
 };
 
+//! Controls whether an asynchronous phase completion must wait for its CUDA stream.
+enum class PhaseCompletionMode : int32_t
+{
+    kSynchronizeStream,
+    kStreamAlreadyComplete,
+};
+
 struct SamplingBuffers
 {
     Tensor& workspace;
@@ -127,6 +134,26 @@ public:
     virtual bool isSpeculative() const noexcept = 0;
 
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
+
+    //! Whether decodeStep can be split into GPU enqueue and host completion.
+    virtual bool supportsAsyncDecodeStep() const noexcept
+    {
+        return false;
+    }
+
+    //! Enqueue model execution, sampling, and result D2H without synchronizing.
+    //! Callers must check supportsAsyncDecodeStep() before using this interface.
+    virtual bool enqueueDecodeStep(DecodingInferenceContext&)
+    {
+        return false;
+    }
+
+    //! Consume host results after the enqueued step completes.
+    virtual bool completeDecodeStep(DecodingInferenceContext&, PhaseCompletionMode)
+    {
+        return false;
+    }
+
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
 
     virtual int64_t getRequiredContextMemorySize() const noexcept = 0;

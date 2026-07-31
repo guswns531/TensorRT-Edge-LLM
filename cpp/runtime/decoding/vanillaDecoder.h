@@ -45,6 +45,12 @@ public:
     }
 
     bool decodeStep(DecodingInferenceContext& context) override;
+    bool supportsAsyncDecodeStep() const noexcept override
+    {
+        return true;
+    }
+    bool enqueueDecodeStep(DecodingInferenceContext& context) override;
+    bool completeDecodeStep(DecodingInferenceContext& context, PhaseCompletionMode mode) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
 
     int64_t getRequiredContextMemorySize() const noexcept override
@@ -72,6 +78,8 @@ public:
 
 private:
     DecodingRuntimeContext& mRuntime;
+    DecodingInferenceContext* mPendingContext{};
+    int32_t mPendingBatchSize{};
 };
 
 } // namespace rt

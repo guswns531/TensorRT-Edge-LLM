@@ -85,12 +85,14 @@ struct PhaseDispatchPlan
     std::vector<PhaseWorkItem> decodeBatch;
 };
 
-//! Host-side two-queue batch scheduler for same-context, dual-stream inference.
+//! Host-side two-queue batch scheduler for phase-separated, dual-stream inference.
 //!
 //! This class intentionally owns no CUDA or TensorRT objects. The execution
 //! layer consumes a DispatchPlan, binds each batch's stable KV slots to its
 //! phase-local TensorMap, and records CUDA events around the two enqueues.
 class PhaseQueueScheduler
+//! A shared TensorRT execution context must serialize those enqueues; independent
+//! contexts may opt into overlap.
 {
 public:
     explicit PhaseQueueScheduler(PhaseQueueSchedulerConfig config = {});

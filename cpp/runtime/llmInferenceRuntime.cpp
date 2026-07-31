@@ -1331,8 +1331,15 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_base_prefill,
         ("SPEC_DECODE_BASE_PREFILL[" + std::to_string(context.activeBatchSize) + "]").c_str(), nvtx_colors::BLUE);
+    return enqueueBaseModelPrefill(context)
+        && completeBaseModelPrefill(context, PhaseCompletionMode::kSynchronizeStream);
+}
 
+bool LLMInferenceRuntime::enqueueBaseModelPrefill(DecodingInferenceContext& context)
+{
+    check::check(mPendingPrefillContext == nullptr, "A base prefill step is already in flight.");
     int32_t const activeBatchSize = context.activeBatchSize;
+    check::check(activeBatchSize > 0, "Cannot enqueue base prefill for an empty batch.");
     int32_t const inputIdsLength
         = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
     int32_t const baseOutputHiddenDim
@@ -1456,7 +1463,24 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mSamplingIndices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
-    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    mPendingPrefillContext = &context;
+    mPendingPrefillBatchSize = activeBatchSize;
+    return true;
+}
+
+bool LLMInferenceRuntime::completeBaseModelPrefill(DecodingInferenceContext& context, PhaseCompletionMode mode)
+{
+    check::check(mPendingPrefillContext == &context, "Base prefill completion does not match the in-flight context.");
+    check::check(context.activeBatchSize == mPendingPrefillBatchSize,
+        "Active batch size changed while a base prefill step was in flight.");
+    if (mode == PhaseCompletionMode::kSynchronizeStream)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    }
+
+    int32_t const activeBatchSize = mPendingPrefillBatchSize;
+    int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
 
     // Few-layer-validation debug: dump round 0 (prefill). At this point the KV cache is committed and
     // tokenIds[i].size() == the prefill length == the committed cache length.
@@ -1492,6 +1516,8 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     }
 
     emitTokenCallbacks(context);
+    mPendingPrefillContext = nullptr;
+    mPendingPrefillBatchSize = 0;
     return true;
 }
 

@@ -55,8 +55,14 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
             + "]")
             .c_str(),
         nvtx_colors::BLUE);
+    return enqueueDecodeStep(context) && completeDecodeStep(context, PhaseCompletionMode::kSynchronizeStream);
+}
 
+bool VanillaDecoder::enqueueDecodeStep(DecodingInferenceContext& context)
+{
+    check::check(mPendingContext == nullptr, "A vanilla decode step is already in flight.");
     int32_t const activeBatchSize = context.activeBatchSize;
+    check::check(activeBatchSize > 0, "Cannot enqueue vanilla decode for an empty batch.");
     check::check(mRuntime.sampling.hostPackedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostPackedTokenIdsData = mRuntime.sampling.hostPackedTokenIds.dataPointer<int32_t>();
 
@@ -142,7 +148,24 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     int32_t* hostSelectedTokenIdsData = mRuntime.sampling.hostSelectedTokenIds.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mRuntime.sampling.indices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
-    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    mPendingContext = &context;
+    mPendingBatchSize = activeBatchSize;
+    return true;
+}
+
+bool VanillaDecoder::completeDecodeStep(DecodingInferenceContext& context, PhaseCompletionMode mode)
+{
+    check::check(mPendingContext == &context, "Vanilla decode completion does not match the in-flight context.");
+    check::check(context.activeBatchSize == mPendingBatchSize,
+        "Active batch size changed while a vanilla decode step was in flight.");
+    if (mode == PhaseCompletionMode::kSynchronizeStream)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    }
+
+    int32_t const activeBatchSize = mPendingBatchSize;
+    int32_t* hostSelectedTokenIdsData = mRuntime.sampling.hostSelectedTokenIds.dataPointer<int32_t>();
 
     // Few-layer-validation debug: dump this decode round. The KV cache is committed (line above) so
     // tokenIds[i].size() == the committed cache length for this round.
@@ -173,6 +196,8 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         decoder_utils::collectLogprobsFromHost(mRuntime, context, activeBatchSize, context.numLogprobs);
     }
 
+    mPendingContext = nullptr;
+    mPendingBatchSize = 0;
     return true;
 }
 

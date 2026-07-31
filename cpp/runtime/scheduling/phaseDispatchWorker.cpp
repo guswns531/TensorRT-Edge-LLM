@@ -28,11 +28,12 @@ namespace rt
 {
 
 PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
-    cudaStream_t prefillStream, cudaStream_t decodeStream)
+    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode)
     : mScheduler(scheduler)
     , mCallbacks(std::move(callbacks))
     , mPrefillStream(prefillStream)
     , mDecodeStream(decodeStream)
+    , mExecutionMode(executionMode)
 {
     check::check(static_cast<bool>(mCallbacks.enqueuePrefill), "Prefill enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.enqueueDecode), "Decode enqueue callback is required.");
@@ -69,7 +70,10 @@ bool PhaseDispatchWorker::dispatchNext()
     }
     if (mHasDecode)
     {
-        CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, mDispatchStart));
+        bool const serializeSharedContext
+            = mHasPrefill && mExecutionMode == PhaseStreamExecutionMode::kSharedContextSerialized;
+        cudaEvent_t const decodeStart = serializeSharedContext ? mPrefillDone : mDispatchStart;
+        CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, decodeStart));
         mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
         CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
     }
@@ -123,6 +127,14 @@ void PhaseDispatchWorker::wait()
 
 void PhaseDispatchWorker::completeInFlight()
 {
+    if (mHasPrefill && mCallbacks.completePrefillBatch)
+    {
+        mCallbacks.completePrefillBatch(mInFlight.prefillBatch);
+    }
+    if (mHasDecode && mCallbacks.completeDecodeBatch)
+    {
+        mCallbacks.completeDecodeBatch(mInFlight.decodeBatch);
+    }
     for (PhaseWorkItem const& item : mInFlight.prefillBatch)
     {
         mScheduler.completePrefill(item, mCallbacks.completePrefill(item));

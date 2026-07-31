@@ -37,6 +37,7 @@ struct PhaseDecodeCompletion
 };
 
 using PhaseEnqueueCallback = std::function<void(std::vector<PhaseWorkItem> const&, cudaStream_t)>;
+using PhaseBatchCompletionCallback = std::function<void(std::vector<PhaseWorkItem> const&)>;
 using PrefillCompletionCallback = std::function<int32_t(PhaseWorkItem const&)>;
 using DecodeCompletionCallback = std::function<PhaseDecodeCompletion(PhaseWorkItem const&)>;
 
@@ -44,20 +45,34 @@ struct PhaseDispatchWorkerCallbacks
 {
     PhaseEnqueueCallback enqueuePrefill;
     PhaseEnqueueCallback enqueueDecode;
+    //! Optional batch-level host completion after the corresponding CUDA event.
+    PhaseBatchCompletionCallback completePrefillBatch;
+    PhaseBatchCompletionCallback completeDecodeBatch;
     PrefillCompletionCallback completePrefill;
     DecodeCompletionCallback completeDecode;
 };
 
+//! Controls whether phase enqueues may overlap across streams.
+enum class PhaseStreamExecutionMode
+{
+    //! One TensorRT execution context is shared, so engine enqueues are ordered.
+    kSharedContextSerialized,
+    //! Prefill and decode own independent execution contexts and may overlap.
+    kIndependentContextsConcurrent,
+};
+
 //! CUDA-event handoff between PhaseQueueScheduler and two execution streams.
 //!
-//! V1 permits one DispatchPlan in flight. Prefill and decode from an overlap
-//! plan run concurrently, then completion callbacks update request state and
-//! return unfinished work to the scheduler.
+//! V1 permits one DispatchPlan in flight. The default shared-context mode uses
+//! separate phase streams but orders decode after prefill because one TensorRT
+//! execution context cannot be enqueued concurrently. Independent contexts may
+//! opt into concurrent phase execution.
 class PhaseDispatchWorker
 {
 public:
     PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
-        cudaStream_t prefillStream, cudaStream_t decodeStream);
+        cudaStream_t prefillStream, cudaStream_t decodeStream,
+        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized);
     ~PhaseDispatchWorker() noexcept;
 
     PhaseDispatchWorker(PhaseDispatchWorker const&) = delete;
@@ -89,6 +104,7 @@ private:
     PhaseDispatchWorkerCallbacks mCallbacks;
     cudaStream_t mPrefillStream{};
     cudaStream_t mDecodeStream{};
+    PhaseStreamExecutionMode mExecutionMode{PhaseStreamExecutionMode::kSharedContextSerialized};
     cudaEvent_t mDispatchStart{};
     cudaEvent_t mPrefillDone{};
     cudaEvent_t mDecodeDone{};
