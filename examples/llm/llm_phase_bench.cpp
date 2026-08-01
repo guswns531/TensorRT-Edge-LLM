@@ -437,8 +437,8 @@ int main(int argc, char** argv)
         {
             auto source = std::make_unique<rt::DecodingInferenceContext>();
             source->initialize(1, 2, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
-            source->rawBatchedInputIds = {{0}};
-            source->tokenIds = {{0}};
+            source->rawBatchedInputIds = {std::vector<int32_t>(args.inputLen, 0)};
+            source->tokenIds = source->rawBatchedInputIds;
             source->effectivePrefillLengths = {args.inputLen};
             source->currentGenerateLengths = {0};
             facadeContexts.push_back(std::move(source));
@@ -447,9 +447,39 @@ int main(int argc, char** argv)
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
+        facadeSchedulerConfig.maxPrefillChunkTokens = configuredChunkSize;
         rt::PhaseContextServingCallbacks facadeCallbacks;
-        facadeCallbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
-            ELLM_CHECK(enqueuePrefill(batch, stream), "Serving facade prefill enqueue failed");
+        facadeCallbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
+            int32_t const batchSize = packed.batchSize();
+            int32_t const chunkLength = packed.chunkLength();
+            check::check(prefillIO.inputsEmbeds.reshape({batchSize, chunkLength, config.hiddenSize}),
+                "Serving prefill input reshape failed");
+            check::check(
+                prefillIO.contextLengths.reshape({batchSize}), "Serving prefill context lengths reshape failed");
+            check::check(
+                prefillIO.selectTokenIndices.reshape({batchSize, 1}), "Serving prefill select indices reshape failed");
+            check::check(
+                prefillIO.hostContextLengths.reshape({batchSize}), "Serving host prefill lengths reshape failed");
+            check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
+                "Serving host prefill indices reshape failed");
+            std::fill_n(prefillIO.hostContextLengths.dataPointer<int32_t>(), batchSize, chunkLength);
+            std::fill_n(prefillIO.hostSelectTokenIndices.dataPointer<int64_t>(), batchSize,
+                static_cast<int64_t>(chunkLength - 1));
+            CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(), prefillIO.hostContextLengths.rawPointer(),
+                batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, packed.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
+                prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t), cudaMemcpyHostToDevice,
+                packed.stream()));
+            if (gemma4Ple)
+            {
+                gemma4Ple->embed(packed.tokenIds(), packed.stream());
+                gemma4Ple->reshapeOutputs(batchSize, chunkLength);
+            }
+            auto const dims = config.prefillDims(batchSize, chunkLength, packed.initialChunk());
+            ELLM_CHECK(prefillExecutor->prepare(kPrefillProfile, dims, prefillMap, packed.stream())
+                    && prefillExecutor->execute(packed.stream()),
+                "Serving facade packed prefill enqueue failed");
+            packed.phaseBatchState().commit(cacheManager, chunkLength, packed.stream());
         };
         facadeCallbacks.completePrefill
             = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
@@ -469,14 +499,14 @@ int main(int argc, char** argv)
         auto const facadeMode = args.sharedContext ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
                                                    : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
-            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode);
+            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize);
         for (int32_t row = 0; row < args.prefillBatch; ++row)
         {
             uint64_t const requestId = static_cast<uint64_t>(1000 + row);
             int32_t const slot = facade.submit(requestId, *facadeContexts[static_cast<size_t>(row)], 0, args.inputLen);
             ELLM_CHECK(slot == row, "Serving facade did not preserve deterministic stable slot allocation");
         }
-        facade.runUntilIdle(4);
+        facade.runUntilIdle(static_cast<size_t>(phaseRounds + 2));
         ELLM_CHECK(facade.empty(), "Serving facade engine smoke did not drain all phase queues");
         ELLM_CHECK(facade.availableSlotCount() == phaseSlotCount,
             "Serving facade engine smoke did not release all stable slots");

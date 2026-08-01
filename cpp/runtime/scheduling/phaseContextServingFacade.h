@@ -18,6 +18,7 @@
 #pragma once
 
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
+#include "runtime/scheduling/phasePrefillContextBatchAdapter.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
 
 #include <cstddef>
@@ -33,13 +34,18 @@ namespace rt
 {
 
 using PhasePackedContextCallback = std::function<void(DecodingInferenceContext&)>;
+using PhasePackedPrefillCallback = std::function<void(PhasePrefillContextBatchAdapter&)>;
 using PhaseContextFinishedCallback
     = std::function<bool(uint64_t requestId, DecodingInferenceContext const& context, int32_t contextRow)>;
 
 struct PhaseContextServingCallbacks
 {
-    //! Enqueue one prefill chunk batch on the provided phase stream.
+    //! Legacy work-item-only prefill enqueue callback.
     PhaseEnqueueCallback enqueuePrefill;
+    //! Production prefill callback with packed source tokens and stable KV bindings.
+    PhasePackedPrefillCallback enqueuePackedPrefill;
+    //! Run packed prefill completion after its CUDA event and before binding restore.
+    PhasePackedPrefillCallback completePackedPrefill;
     //! Run batch-level host completion after the prefill CUDA event.
     PhaseBatchCompletionCallback completePrefillBatch;
     //! Return the KV length after an individual prefill chunk completes.
@@ -65,7 +71,8 @@ public:
     PhaseContextServingFacade(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
         PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
-        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized);
+        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
+        TensorMap* prefillTensorMap = nullptr, int32_t maxPrefillChunkTokens = 0);
 
     PhaseContextServingFacade(PhaseContextServingFacade const&) = delete;
     PhaseContextServingFacade& operator=(PhaseContextServingFacade const&) = delete;
@@ -109,6 +116,7 @@ private:
     HybridCacheManager& mCacheManager;
     Tensor mHostAdmissionSlotIds;
     Tensor mDeviceAdmissionSlotIds;
+    std::unique_ptr<PhasePrefillContextBatchAdapter> mPrefillAdapter;
     PhaseContextBatchAdapter mDecodeAdapter;
     std::unordered_map<uint64_t, Registration> mRegistrations;
     std::unique_ptr<PhaseRequestLifecycle> mLifecycle;

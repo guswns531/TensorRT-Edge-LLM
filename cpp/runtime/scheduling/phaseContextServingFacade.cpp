@@ -30,7 +30,8 @@ namespace rt
 
 PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
     PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
-    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode)
+    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode,
+    TensorMap* prefillTensorMap, int32_t maxPrefillChunkTokens)
     : mCallbacks(std::move(callbacks))
     , mCacheManager(cacheManager)
     , mHostAdmissionSlotIds(
@@ -40,7 +41,17 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
 {
     check::check(maxSlots <= cacheManager.getGlobalKVCacheLengths().getShape()[0],
         "Serving facade slot count exceeds the indexed KV cache capacity.");
-    check::check(static_cast<bool>(mCallbacks.enqueuePrefill), "Serving prefill enqueue callback is required.");
+    bool const usesLegacyPrefill = static_cast<bool>(mCallbacks.enqueuePrefill);
+    bool const usesPackedPrefill = static_cast<bool>(mCallbacks.enqueuePackedPrefill);
+    check::check(usesLegacyPrefill != usesPackedPrefill,
+        "Serving facade requires exactly one legacy or packed prefill enqueue callback.");
+    if (usesPackedPrefill)
+    {
+        check::check(prefillTensorMap != nullptr, "Packed prefill serving requires a prefill TensorMap.");
+        check::check(maxPrefillChunkTokens > 0, "Packed prefill serving requires a positive maximum chunk length.");
+        mPrefillAdapter = std::make_unique<PhasePrefillContextBatchAdapter>(schedulerConfig.maxPrefillBatchSize,
+            maxPrefillChunkTokens, cacheManager, *prefillTensorMap, "phase_serving_prefill");
+    }
     check::check(static_cast<bool>(mCallbacks.completePrefill), "Serving prefill completion callback is required.");
     check::check(static_cast<bool>(mCallbacks.enqueueDecode), "Serving decode enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.completeDecode), "Serving decode completion callback is required.");
@@ -54,6 +65,15 @@ PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks
     result.execution.enqueuePrefill
         = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueuePrefillBatch(batch, stream); };
     result.execution.completePrefillBatch = [this](std::vector<PhaseWorkItem> const& batch) {
+        if (mPrefillAdapter)
+        {
+            check::check(mPrefillAdapter->packed(), "Serving prefill completion has no packed context.");
+            if (mCallbacks.completePackedPrefill)
+            {
+                mCallbacks.completePackedPrefill(*mPrefillAdapter);
+            }
+            mPrefillAdapter->complete();
+        }
         if (mCallbacks.completePrefillBatch)
         {
             mCallbacks.completePrefillBatch(batch);
@@ -133,7 +153,22 @@ void PhaseContextServingFacade::enqueuePrefillBatch(std::vector<PhaseWorkItem> c
             newSlotCount * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         mCacheManager.clearPhaseKVCacheLengths(mDeviceAdmissionSlotIds, stream);
     }
-    mCallbacks.enqueuePrefill(batch, stream);
+    if (!mPrefillAdapter)
+    {
+        mCallbacks.enqueuePrefill(batch, stream);
+        return;
+    }
+
+    std::vector<PhasePrefillContextRow> rows;
+    rows.reserve(batch.size());
+    for (PhaseWorkItem const& item : batch)
+    {
+        Registration& source = registration(item.requestId);
+        rows.push_back({item.requestId, source.context, source.contextRow, item.kvSlotId, item.tokenOffset,
+            item.tokenCount, item.promptTokenCount});
+    }
+    mPrefillAdapter->pack(rows, stream);
+    mCallbacks.enqueuePackedPrefill(*mPrefillAdapter);
 }
 
 void PhaseContextServingFacade::enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)

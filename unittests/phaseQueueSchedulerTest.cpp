@@ -90,6 +90,35 @@ TEST(PhaseQueueSchedulerTest, RejectsDuplicateQueuedRequest)
     EXPECT_THROW(scheduler.enqueueDecode({7, 32}), std::runtime_error);
 }
 
+TEST(PhaseQueueSchedulerTest, BucketsPrefillByChunkLengthAndInitialState)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 3;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 300, 0, 0, 300});
+    scheduler.enqueuePrefill({2, 64, 1, 0, 64});
+    scheduler.enqueuePrefill({3, 128, 2, 128, 256});
+    scheduler.enqueuePrefill({4, 256, 3, 0, 256});
+
+    PhaseDispatchPlan const initial128 = scheduler.next();
+    ASSERT_EQ(initial128.prefillBatch.size(), 2U);
+    EXPECT_EQ(initial128.prefillBatch[0].requestId, 1U);
+    EXPECT_EQ(initial128.prefillBatch[1].requestId, 4U);
+    EXPECT_EQ(initial128.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(initial128.prefillBatch[1].tokenCount, 128);
+
+    PhaseDispatchPlan const initial64 = scheduler.next();
+    ASSERT_EQ(initial64.prefillBatch.size(), 1U);
+    EXPECT_EQ(initial64.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(initial64.prefillBatch[0].tokenCount, 64);
+
+    PhaseDispatchPlan const continuation128 = scheduler.next();
+    ASSERT_EQ(continuation128.prefillBatch.size(), 1U);
+    EXPECT_EQ(continuation128.prefillBatch[0].requestId, 3U);
+    EXPECT_EQ(continuation128.prefillBatch[0].tokenOffset, 128);
+}
+
 TEST(PhaseQueueSchedulerTest, RequeuesChunksAndTransitionsToDecode)
 {
     PhaseQueueSchedulerConfig config;

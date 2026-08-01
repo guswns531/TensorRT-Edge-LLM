@@ -121,6 +121,7 @@ public:
 private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseQueueSnapshot snapshot() const;
+    int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill);
     void enqueueKnownPrefill(PhaseWorkItem item);
     void enqueueKnownDecode(PhaseWorkItem item);

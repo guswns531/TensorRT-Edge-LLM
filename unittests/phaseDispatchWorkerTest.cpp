@@ -21,6 +21,7 @@
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
+#include "runtime/scheduling/phasePrefillContextBatchAdapter.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "testUtils.h"
 
@@ -353,6 +354,56 @@ TEST(PhaseContextBatchAdapterTest, RejectsIncompatibleOrDuplicateDecodeRows)
 
     second.temperature = first.temperature;
     EXPECT_THROW(adapter.packDecode({{1, &first, 0, 0, 5}, {2, &second, 0, 0, 5}}, nullptr), std::runtime_error);
+}
+
+TEST(PhasePrefillContextBatchAdapterTest, PacksPromptSlicesAndRestoresStableSlotBindings)
+{
+    int32_t const maxSlots = 4;
+    rt::HybridCacheManager cacheManager = makeIndexedManager(maxSlots);
+    std::vector<int32_t> initialLengths{10, 20, 30, 40};
+    rt::Tensor hostLengths({maxSlots}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(hostLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+    cacheManager.resetForNewSequences(hostLengths, nullptr);
+
+    rt::TensorMap tensorMap;
+    rt::PhaseBatchState previousBindings(maxSlots, "phase_prefill_previous_bindings");
+    previousBindings.bind(tensorMap);
+
+    rt::DecodingInferenceContext first;
+    first.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    first.rawBatchedInputIds = {{10, 11, 12, 13, 14}};
+    first.tokenIds = first.rawBatchedInputIds;
+
+    rt::DecodingInferenceContext second;
+    second.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    second.rawBatchedInputIds = {{20, 21, 22, 23, 24}};
+    second.tokenIds = second.rawBatchedInputIds;
+
+    rt::PhasePrefillContextBatchAdapter adapter(2, 4, cacheManager, tensorMap, "phase_prefill_adapter_test");
+    std::vector<rt::PhasePrefillContextRow> const rows{{101, &first, 0, 3, 2, 2, 5}, {202, &second, 0, 0, 2, 2, 5}};
+    adapter.pack(rows, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    ASSERT_TRUE(adapter.packed());
+    EXPECT_EQ(adapter.batchSize(), 2);
+    EXPECT_EQ(adapter.chunkLength(), 2);
+    EXPECT_FALSE(adapter.initialChunk());
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.tokenIds()), (std::vector<int32_t>{12, 13, 22, 23}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.phaseBatchState().slotIds()), (std::vector<int32_t>{3, 0}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.phaseBatchState().lengths()), (std::vector<int32_t>{40, 10}));
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &adapter.phaseBatchState().slotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &adapter.phaseBatchState().lengths());
+
+    adapter.phaseBatchState().commit(cacheManager, 2, nullptr);
+    adapter.complete();
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &previousBindings.slotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &previousBindings.lengths());
+    EXPECT_EQ(
+        copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{12, 20, 30, 42}));
+
+    EXPECT_THROW(adapter.pack({{1, &first, 0, 0, 0, 2, 5}, {2, &second, 0, 1, 0, 1, 5}}, nullptr), std::runtime_error);
+    EXPECT_THROW(adapter.pack({{1, &first, 0, 0, 0, 2, 5}, {2, &second, 0, 1, 2, 2, 5}}, nullptr), std::runtime_error);
 }
 
 TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)

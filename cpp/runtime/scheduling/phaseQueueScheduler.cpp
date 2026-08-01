@@ -99,15 +99,22 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     result.prefillQueued = mPrefillQueue.size();
     result.decodeQueued = mDecodeQueue.size();
     result.consecutiveDecodeBatches = mConsecutiveDecodeBatches;
-    int32_t const prefillCount = std::min<int32_t>(mConfig.maxPrefillBatchSize, mPrefillQueue.size());
-    int32_t const decodeCount = std::min<int32_t>(mConfig.maxDecodeBatchSize, mDecodeQueue.size());
-    for (int32_t i = 0; i < prefillCount; ++i)
+    if (!mPrefillQueue.empty())
     {
-        int32_t const tokenCount = mConfig.maxPrefillChunkTokens > 0
-            ? std::min(mPrefillQueue[i].tokenCount, mConfig.maxPrefillChunkTokens)
-            : mPrefillQueue[i].tokenCount;
-        result.prefillCandidateTokens += tokenCount;
+        int32_t const bucketTokens = dispatchedPrefillTokens(mPrefillQueue.front());
+        bool const bucketInitial = mPrefillQueue.front().tokenOffset == 0;
+        int32_t bucketRows{};
+        for (PhaseWorkItem const& item : mPrefillQueue)
+        {
+            if (bucketRows < mConfig.maxPrefillBatchSize && dispatchedPrefillTokens(item) == bucketTokens
+                && (item.tokenOffset == 0) == bucketInitial)
+            {
+                result.prefillCandidateTokens += bucketTokens;
+                ++bucketRows;
+            }
+        }
     }
+    int32_t const decodeCount = std::min<int32_t>(mConfig.maxDecodeBatchSize, mDecodeQueue.size());
     for (int32_t i = 0; i < decodeCount; ++i)
     {
         result.decodeCandidateTokens += mDecodeQueue[i].tokenCount;
@@ -140,20 +147,42 @@ PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const&
     return PhaseDispatchKind::kDecode;
 }
 
+int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept
+{
+    return mConfig.maxPrefillChunkTokens > 0 ? std::min(item.tokenCount, mConfig.maxPrefillChunkTokens)
+                                             : item.tokenCount;
+}
+
 std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
     std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill)
 {
     int32_t const count = std::min<int32_t>(maxBatchSize, queue.size());
     std::vector<PhaseWorkItem> batch;
     batch.reserve(count);
-    for (int32_t i = 0; i < count; ++i)
+    if (!chunkPrefill)
     {
-        PhaseWorkItem item = queue.front();
-        queue.pop_front();
-        if (chunkPrefill && mConfig.maxPrefillChunkTokens > 0)
+        for (int32_t i = 0; i < count; ++i)
         {
-            item.tokenCount = std::min(item.tokenCount, mConfig.maxPrefillChunkTokens);
+            PhaseWorkItem item = queue.front();
+            queue.pop_front();
+            check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
+            batch.push_back(item);
         }
+        return batch;
+    }
+
+    int32_t const bucketTokens = dispatchedPrefillTokens(queue.front());
+    bool const bucketInitial = queue.front().tokenOffset == 0;
+    for (auto it = queue.begin(); it != queue.end() && static_cast<int32_t>(batch.size()) < maxBatchSize;)
+    {
+        if (dispatchedPrefillTokens(*it) != bucketTokens || (it->tokenOffset == 0) != bucketInitial)
+        {
+            ++it;
+            continue;
+        }
+        PhaseWorkItem item = *it;
+        it = queue.erase(it);
+        item.tokenCount = bucketTokens;
         check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
         batch.push_back(item);
     }
