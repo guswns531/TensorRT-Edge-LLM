@@ -26,6 +26,7 @@
 #include "runtime/exec/tensorMap.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/phaseBatchState.h"
+#include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
@@ -41,9 +42,11 @@
 #include <fstream>
 #include <getopt.h>
 #include <iomanip>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -54,11 +57,13 @@ namespace
 
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
+constexpr uint64_t kLoadFirstRequestId{10000};
 
 struct Args
 {
     std::string engineDir;
     std::string outputCsv;
+    std::string loadCsv;
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t inputLen{512};
@@ -66,6 +71,13 @@ struct Args
     int32_t pastKVLen{512};
     int32_t warmup{20};
     int32_t iterations{100};
+    int32_t loadRequests{};
+    double arrivalRate{1000.0};
+    int32_t loadPromptMin{};
+    int32_t loadPromptMax{};
+    int32_t loadOutputMin{8};
+    int32_t loadOutputMax{8};
+    uint32_t loadSeed{};
     rt::PhaseTensorRTContextMode trtContextMode{rt::PhaseTensorRTContextMode::kIndependentConcurrent};
     bool contextAdapter{};
     bool adaptiveScheduler{};
@@ -81,13 +93,29 @@ struct Sample
     float contextScatterUs{};
 };
 
+struct LoadRequestSample
+{
+    uint64_t requestId{};
+    int64_t scheduledArrivalUs{};
+    int64_t submittedUs{-1};
+    int64_t admittedUs{-1};
+    int64_t firstTokenUs{-1};
+    int64_t terminalUs{-1};
+    int32_t promptTokens{};
+    int32_t maxOutputTokens{};
+    int32_t generatedTokens{};
+    bool initiallyPending{};
+};
+
 void printUsage(char const* program)
 {
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] "
         "[--trtContextMode shared|independent] "
-        "[--contextAdapter] [--adaptiveScheduler] [--outputCsv FILE]",
+        "[--contextAdapter] [--adaptiveScheduler] [--outputCsv FILE] "
+        "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
+        "--loadOutputMin N --loadOutputMax N --loadSeed N --loadCsv FILE]",
         program);
 }
 
@@ -108,6 +136,14 @@ bool parseArgs(Args& args, int argc, char** argv)
         kLegacySharedContext,
         kContextAdapter,
         kAdaptiveScheduler,
+        kLoadRequests,
+        kArrivalRate,
+        kLoadPromptMin,
+        kLoadPromptMax,
+        kLoadOutputMin,
+        kLoadOutputMax,
+        kLoadSeed,
+        kLoadCsv,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -119,7 +155,15 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"trtContextMode", required_argument, nullptr, kTensorRTContextMode},
         {"sharedContext", no_argument, nullptr, kLegacySharedContext},
         {"contextAdapter", no_argument, nullptr, kContextAdapter},
-        {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler}, {"help", no_argument, nullptr, kHelp}, {}};
+        {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler},
+        {"loadRequests", required_argument, nullptr, kLoadRequests},
+        {"arrivalRate", required_argument, nullptr, kArrivalRate},
+        {"loadPromptMin", required_argument, nullptr, kLoadPromptMin},
+        {"loadPromptMax", required_argument, nullptr, kLoadPromptMax},
+        {"loadOutputMin", required_argument, nullptr, kLoadOutputMin},
+        {"loadOutputMax", required_argument, nullptr, kLoadOutputMax},
+        {"loadSeed", required_argument, nullptr, kLoadSeed},
+        {"loadCsv", required_argument, nullptr, kLoadCsv}, {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -155,13 +199,23 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kLegacySharedContext: args.trtContextMode = rt::PhaseTensorRTContextMode::kSharedSerialized; break;
         case kContextAdapter: args.contextAdapter = true; break;
         case kAdaptiveScheduler: args.adaptiveScheduler = true; break;
+        case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
+        case kArrivalRate: args.arrivalRate = std::stod(optarg); break;
+        case kLoadPromptMin: args.loadPromptMin = std::stoi(optarg); break;
+        case kLoadPromptMax: args.loadPromptMax = std::stoi(optarg); break;
+        case kLoadOutputMin: args.loadOutputMin = std::stoi(optarg); break;
+        case kLoadOutputMax: args.loadOutputMax = std::stoi(optarg); break;
+        case kLoadSeed: args.loadSeed = static_cast<uint32_t>(std::stoul(optarg)); break;
+        case kLoadCsv: args.loadCsv = optarg; break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
     }
     return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.inputLen > 0
         && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
-        && args.warmup >= 0 && args.iterations > 0;
+        && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
+        && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
+        && args.loadOutputMin <= args.loadOutputMax;
 }
 
 bool usesSharedTensorRTContext(Args const& args) noexcept
@@ -229,6 +283,47 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
     }
 }
 
+void writeLoadMetrics(std::filesystem::path const& path, std::vector<LoadRequestSample> const& metrics)
+{
+    std::ofstream output(path);
+    ELLM_CHECK(output.good(), "Failed to open request load metrics CSV: " + path.string());
+    output << "request_id,scheduled_arrival_us,submitted_us,admitted_us,first_token_us,terminal_us,"
+              "prompt_tokens,max_output_tokens,generated_tokens,initial_admission,ttft_us,e2e_us,tpot_us\n";
+    output << std::fixed << std::setprecision(6);
+    for (LoadRequestSample const& sample : metrics)
+    {
+        int64_t const ttft = sample.firstTokenUs - sample.scheduledArrivalUs;
+        int64_t const e2e = sample.terminalUs - sample.scheduledArrivalUs;
+        double const tpot = sample.generatedTokens > 1
+            ? static_cast<double>(sample.terminalUs - sample.firstTokenUs) / (sample.generatedTokens - 1)
+            : 0.0;
+        output << sample.requestId << ',' << sample.scheduledArrivalUs << ',' << sample.submittedUs << ','
+               << sample.admittedUs << ',' << sample.firstTokenUs << ',' << sample.terminalUs << ','
+               << sample.promptTokens << ',' << sample.maxOutputTokens << ',' << sample.generatedTokens << ','
+               << (sample.initiallyPending ? "pending" : "admitted") << ',' << ttft << ',' << e2e << ',' << tpot
+               << '\n';
+    }
+}
+
+void logDispatchHistogram(std::vector<rt::PhaseDispatchMetrics> const& metrics)
+{
+    std::map<std::pair<int32_t, int32_t>, size_t> histogram;
+    for (rt::PhaseDispatchMetrics const& sample : metrics)
+    {
+        ++histogram[{sample.prefillBatchSize, sample.decodeBatchSize}];
+    }
+    for (auto const& [batchSizes, count] : histogram)
+    {
+        LOG_INFO("Continuous-load batch histogram: prefill=%d decode=%d count=%zu", batchSizes.first,
+            batchSizes.second, count);
+    }
+}
+
+int64_t elapsedMicroseconds(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
 void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samples, std::string const& scheduledMode)
 {
     std::ofstream output(path);
@@ -270,6 +365,17 @@ int main(int argc, char** argv)
     ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize,
         "Prefill and decode physical slots exceed maxSupportedBatchSize");
     ELLM_CHECK(args.inputLen <= config.maxSupportedInputLength, "inputLen exceeds maxSupportedInputLength");
+    int32_t const loadPromptMin = args.loadPromptMin > 0 ? args.loadPromptMin : args.inputLen;
+    int32_t const loadPromptMax = args.loadPromptMax > 0 ? args.loadPromptMax : args.inputLen;
+    if (args.loadRequests > 0)
+    {
+        ELLM_CHECK(!args.loadCsv.empty(), "Continuous-load mode requires --loadCsv");
+        ELLM_CHECK(loadPromptMin <= loadPromptMax, "Continuous-load prompt range is invalid");
+        ELLM_CHECK(loadPromptMax <= args.inputLen,
+            "Continuous-load prompt maximum exceeds the benchmark prefill buffer capacity");
+        ELLM_CHECK(loadPromptMax + args.loadOutputMax <= config.maxKVCacheCapacity,
+            "Continuous-load prompt plus output maximum exceeds KV capacity");
+    }
     int32_t const configuredChunkSize = args.prefillChunkSize > 0 ? args.prefillChunkSize : args.inputLen;
     int32_t const phaseRounds = (args.inputLen + configuredChunkSize - 1) / configuredChunkSize;
     ELLM_CHECK(args.pastKVLen + phaseRounds <= config.maxKVCacheCapacity, "pastKVLen exceeds KV capacity");
@@ -515,28 +621,62 @@ int main(int argc, char** argv)
         return executeDecode(*activeBatchState, phaseRounds, stream);
     };
 
-    // Exercise continuous source-context admission outside the timed samples.
-    if (args.prefillBatch == args.decodeBatch)
+    // Exercise actual source-context admission outside the fixed-shape timed samples.
+    bool const continuousLoad = args.loadRequests > 0;
+    if (continuousLoad || args.prefillBatch == args.decodeBatch)
     {
+        std::optional<rt::PhaseContinuousLoadGenerator> loadGenerator;
+        std::vector<rt::PhaseLoadRequest> servingRequests;
+        if (continuousLoad)
+        {
+            loadGenerator.emplace(rt::PhaseContinuousLoadConfig{args.loadRequests, args.arrivalRate, loadPromptMin,
+                loadPromptMax, args.loadOutputMin, args.loadOutputMax, args.loadSeed, kLoadFirstRequestId});
+            servingRequests = loadGenerator->schedule();
+        }
+        else
+        {
+            servingRequests.reserve(args.prefillBatch);
+            for (int32_t row = 0; row < args.prefillBatch; ++row)
+            {
+                servingRequests.push_back(
+                    {static_cast<uint64_t>(1000 + row), 0, args.inputLen, phaseRounds + 1});
+            }
+        }
+
         std::vector<std::unique_ptr<rt::DecodingInferenceContext>> facadeContexts;
-        facadeContexts.reserve(args.prefillBatch);
-        for (int32_t row = 0; row < args.prefillBatch; ++row)
+        facadeContexts.reserve(servingRequests.size());
+        for (rt::PhaseLoadRequest const& request : servingRequests)
         {
             auto source = std::make_unique<rt::DecodingInferenceContext>();
-            source->initialize(1, phaseRounds + 1, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
-            source->rawBatchedInputIds = {std::vector<int32_t>(args.inputLen, 0)};
+            source->initialize(
+                1, request.maxOutputTokens, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+            source->rawBatchedInputIds = {std::vector<int32_t>(request.promptTokenCount, 0)};
             source->tokenIds = source->rawBatchedInputIds;
-            source->effectivePrefillLengths = {args.inputLen};
+            source->effectivePrefillLengths = {request.promptTokenCount};
             source->currentGenerateLengths = {0};
             facadeContexts.push_back(std::move(source));
         }
 
-        rt::PhaseGreedySampler prefillSampler(
-            args.prefillBatch, config.outputVocabSize, config.eosTokenIds, "phase_serving_prefill_sampler");
+        std::vector<int32_t> const servingEosTokenIds = continuousLoad ? std::vector<int32_t>{} : config.eosTokenIds;
+        rt::PhaseGreedySampler prefillSampler(args.prefillBatch, config.outputVocabSize, servingEosTokenIds,
+            "phase_serving_prefill_sampler");
         rt::PhaseGreedySampler decodeSampler(
-            args.decodeBatch, config.outputVocabSize, config.eosTokenIds, "phase_serving_decode_sampler");
+            args.decodeBatch, config.outputVocabSize, servingEosTokenIds, "phase_serving_decode_sampler");
 
         std::vector<rt::PhaseDispatchMetrics> facadeDispatchMetrics;
+        std::vector<LoadRequestSample> loadMetrics;
+        std::unordered_map<uint64_t, size_t> loadMetricIndices;
+        if (continuousLoad)
+        {
+            loadMetrics.reserve(servingRequests.size());
+            for (rt::PhaseLoadRequest const& request : servingRequests)
+            {
+                loadMetricIndices.emplace(request.requestId, loadMetrics.size());
+                loadMetrics.push_back({request.requestId, request.arrivalOffsetUs, -1, -1, -1, -1,
+                    request.promptTokenCount, request.maxOutputTokens, 0, false});
+            }
+        }
+        std::chrono::steady_clock::time_point loadStart;
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
@@ -589,6 +729,21 @@ int main(int argc, char** argv)
             if (prefillSampler.pending())
             {
                 prefillSampler.completePrefill(packed);
+                if (continuousLoad)
+                {
+                    int64_t const completionUs = elapsedMicroseconds(loadStart);
+                    for (rt::PhasePrefillContextRow const& row : packed.rows())
+                    {
+                        if (row.tokenOffset + row.tokenCount == row.promptTokenCount)
+                        {
+                            LoadRequestSample& sample = loadMetrics.at(loadMetricIndices.at(row.requestId));
+                            if (sample.firstTokenUs < 0)
+                            {
+                                sample.firstTokenUs = completionUs;
+                            }
+                        }
+                    }
+                }
             }
         };
         facadeCallbacks.completePrefill
@@ -607,12 +762,37 @@ int main(int argc, char** argv)
             decodeSampler.enqueue(decodeIO.outputLogits, packed.activeBatchSize, packed.stream);
         };
         facadeCallbacks.completePackedDecode
-            = [&](rt::PhaseContextBatchAdapter& adapter) { decodeSampler.completeDecode(adapter.packedContext()); };
+            = [&](rt::PhaseContextBatchAdapter& adapter) { decodeSampler.completeDecode(adapter); };
         facadeCallbacks.isDecodeFinished = [](uint64_t, rt::DecodingInferenceContext const& context, int32_t row) {
             return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
         facadeCallbacks.onDispatchMetrics
             = [&](rt::PhaseDispatchMetrics const& sample) { facadeDispatchMetrics.push_back(sample); };
+        facadeCallbacks.onAdmission = [&](rt::PhaseAdmissionResult const& admission) {
+            if (!continuousLoad)
+            {
+                return;
+            }
+            LoadRequestSample& sample = loadMetrics.at(loadMetricIndices.at(admission.requestId));
+            if (admission.status == rt::PhaseAdmissionStatus::kPending)
+            {
+                sample.initiallyPending = true;
+            }
+            else if (sample.admittedUs < 0)
+            {
+                sample.admittedUs = elapsedMicroseconds(loadStart);
+            }
+        };
+        facadeCallbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) {
+            if (!continuousLoad)
+            {
+                return;
+            }
+            LoadRequestSample& sample = loadMetrics.at(loadMetricIndices.at(snapshot.requestId));
+            size_t const index = loadMetricIndices.at(snapshot.requestId);
+            sample.terminalUs = elapsedMicroseconds(loadStart);
+            sample.generatedTokens = facadeContexts.at(index)->currentGenerateLengths[0];
+        };
         auto const facadeMode = usesSharedTensorRTContext(args)
             ? rt::PhaseTensorRTContextMode::kSharedSerialized
             : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
@@ -622,32 +802,125 @@ int main(int argc, char** argv)
                   {prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
                   {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO});
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
-            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize, 0,
-            facadeSafety);
-        for (int32_t row = 0; row < args.prefillBatch; ++row)
+            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize,
+            continuousLoad ? servingRequests.size() : 0, facadeSafety);
+        if (continuousLoad)
         {
-            uint64_t const requestId = static_cast<uint64_t>(1000 + row);
-            int32_t const slot = facade.submit(requestId, *facadeContexts[static_cast<size_t>(row)], 0, args.inputLen);
-            ELLM_CHECK(slot == row, "Serving facade did not preserve deterministic stable slot allocation");
+            ELLM_CHECK(enqueuePrefill(prefillBatch, prefillStream), "Continuous-load prefill warmup failed");
+            CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+            ELLM_CHECK(enqueueDecode(decodeBatch, decodeStream, false), "Continuous-load decode warmup failed");
+            CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+
+            rt::Tensor hostZeroLengths(
+                {phaseSlotCount}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "load_zero_slot_lengths");
+            std::fill_n(hostZeroLengths.dataPointer<int32_t>(), phaseSlotCount, 0);
+            cacheManager.resetForNewSequences(hostZeroLengths, setupStream);
+            CUDA_CHECK(cudaStreamSynchronize(setupStream));
+
+            loadStart = std::chrono::steady_clock::now();
+            size_t submittedRequests{};
+            constexpr int64_t kLoadTimeoutUs = 300000000;
+            while (!loadGenerator->done() || !facade.empty())
+            {
+                int64_t const elapsedUs = elapsedMicroseconds(loadStart);
+                ELLM_CHECK(elapsedUs < kLoadTimeoutUs, "Continuous-load run exceeded its timeout");
+                std::vector<rt::PhaseLoadRequest> const ready = loadGenerator->popReady(elapsedUs);
+                bool madeProgress = !ready.empty();
+                for (rt::PhaseLoadRequest const& request : ready)
+                {
+                    size_t const index = loadMetricIndices.at(request.requestId);
+                    loadMetrics[index].submittedUs = elapsedMicroseconds(loadStart);
+                    static_cast<void>(facade.submitOrQueue(
+                        request.requestId, *facadeContexts[index], 0, request.promptTokenCount));
+                    ++submittedRequests;
+                }
+                if (facade.busy())
+                {
+                    madeProgress = facade.poll() || madeProgress;
+                }
+                if (!facade.busy() && !facade.empty())
+                {
+                    ELLM_CHECK(facade.dispatchNext(), "Continuous-load facade failed to dispatch queued work");
+                    madeProgress = true;
+                }
+                if (!madeProgress)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            ELLM_CHECK(submittedRequests == servingRequests.size(),
+                "Continuous-load generator did not submit every scheduled request");
+            for (LoadRequestSample const& sample : loadMetrics)
+            {
+                ELLM_CHECK(sample.submittedUs >= sample.scheduledArrivalUs && sample.admittedUs >= sample.submittedUs,
+                    "Continuous-load admission timestamps are invalid");
+                ELLM_CHECK(sample.firstTokenUs >= sample.admittedUs && sample.terminalUs >= sample.firstTokenUs,
+                    "Continuous-load completion timestamps are invalid");
+                ELLM_CHECK(sample.generatedTokens == sample.maxOutputTokens,
+                    "Continuous-load request did not generate its configured token count");
+            }
         }
-        facade.runUntilIdle(static_cast<size_t>(2 * phaseRounds + 2));
+        else
+        {
+            for (int32_t row = 0; row < args.prefillBatch; ++row)
+            {
+                rt::PhaseLoadRequest const& request = servingRequests[static_cast<size_t>(row)];
+                int32_t const slot = facade.submit(
+                    request.requestId, *facadeContexts[static_cast<size_t>(row)], 0, request.promptTokenCount);
+                ELLM_CHECK(slot == row, "Serving facade did not preserve deterministic stable slot allocation");
+            }
+            facade.runUntilIdle(static_cast<size_t>(2 * phaseRounds + 2));
+        }
         ELLM_CHECK(facade.empty(), "Serving facade engine smoke did not drain all phase queues");
         ELLM_CHECK(facade.availableSlotCount() == phaseSlotCount,
             "Serving facade engine smoke did not release all stable slots");
         ELLM_CHECK(facade.registeredRequestCount() == 0, "Serving facade retained source registrations");
         ELLM_CHECK(!facadeDispatchMetrics.empty(), "Serving facade emitted no dispatch metrics");
-        if (!args.outputCsv.empty())
+        std::filesystem::path dispatchCsv;
+        if (continuousLoad)
         {
-            std::filesystem::path dispatchCsv = args.outputCsv;
+            writeLoadMetrics(args.loadCsv, loadMetrics);
+            dispatchCsv = args.loadCsv;
             dispatchCsv.replace_filename(dispatchCsv.stem().string() + "-dispatch.csv");
+            logDispatchHistogram(facadeDispatchMetrics);
+            std::vector<float> ttftUs;
+            std::vector<float> e2eUs;
+            int64_t terminalUs{};
+            int32_t generatedTokens{};
+            for (LoadRequestSample const& sample : loadMetrics)
+            {
+                ttftUs.push_back(static_cast<float>(sample.firstTokenUs - sample.scheduledArrivalUs));
+                e2eUs.push_back(static_cast<float>(sample.terminalUs - sample.scheduledArrivalUs));
+                terminalUs = std::max(terminalUs, sample.terminalUs);
+                generatedTokens += sample.generatedTokens;
+            }
+            LOG_INFO(
+                "Continuous-load completed: requests=%zu rate=%.3f req/s pending_initial=%zu "
+                "achieved=%.3f req/s %.3f token/s TTFT median/p95=%.3f/%.3f ms "
+                "E2E median/p95=%.3f/%.3f ms",
+                loadMetrics.size(), args.arrivalRate,
+                static_cast<size_t>(std::count_if(loadMetrics.begin(), loadMetrics.end(),
+                    [](LoadRequestSample const& sample) { return sample.initiallyPending; })),
+                static_cast<double>(loadMetrics.size()) * 1000000.0 / terminalUs,
+                static_cast<double>(generatedTokens) * 1000000.0 / terminalUs,
+                percentile(ttftUs, 0.5F) / 1000.0F, percentile(ttftUs, 0.95F) / 1000.0F,
+                percentile(e2eUs, 0.5F) / 1000.0F, percentile(e2eUs, 0.95F) / 1000.0F);
+            LOG_INFO("Continuous-load request metrics written to %s", args.loadCsv.c_str());
+        }
+        else if (!args.outputCsv.empty())
+        {
+            dispatchCsv = args.outputCsv;
+            dispatchCsv.replace_filename(dispatchCsv.stem().string() + "-dispatch.csv");
+        }
+        if (!dispatchCsv.empty())
+        {
             writeDispatchMetrics(dispatchCsv, facadeDispatchMetrics);
             LOG_INFO("Serving dispatch metrics written to %s", dispatchCsv.c_str());
         }
         LOG_INFO("Serving facade scheduler policy: %s", args.adaptiveScheduler ? "adaptive_metrics" : "queue_default");
-        LOG_INFO(
-            "Serving facade engine smoke passed: %d request context(s), stable admission -> actual greedy sampling -> "
-            "repeated packed decode -> scatter -> slot release",
-            args.prefillBatch);
+        LOG_INFO("Serving facade engine run passed: %zu request context(s), stable admission -> actual greedy "
+                 "sampling -> repeated packed decode -> scatter -> slot release",
+            servingRequests.size());
     }
 
     cudaEvent_t start{};

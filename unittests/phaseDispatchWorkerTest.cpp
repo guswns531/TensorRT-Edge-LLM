@@ -543,7 +543,7 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     first.currentGenerateLengths = {1, 1};
 
     rt::DecodingInferenceContext second;
-    second.initialize(1, 8, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    second.initialize(1, 2, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
     second.rawBatchedInputIds = {{6, 7}};
     second.tokenIds = {{6, 7, 13}};
     second.effectivePrefillLengths = {2};
@@ -560,6 +560,7 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     EXPECT_EQ(adapter.workItems()[1].kvSlotId, 0);
     rt::DecodingInferenceContext& packed = adapter.packedContext();
     ASSERT_NE(packed.phaseBatchState, nullptr);
+    EXPECT_EQ(packed.maxGenerateLength, 8);
     EXPECT_EQ(packed.tokenIds[0], (std::vector<int32_t>{12}));
     EXPECT_EQ(packed.tokenIds[1], (std::vector<int32_t>{13}));
     EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.tokenIds()), (std::vector<int32_t>{12, 13}));
@@ -569,10 +570,17 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &packed.phaseBatchState->slotIds());
     EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &packed.phaseBatchState->lengths());
 
-    packed.tokenIds[0].push_back(91);
-    packed.tokenIds[1].push_back(92);
-    ++packed.currentGenerateLengths[0];
-    ++packed.currentGenerateLengths[1];
+    constexpr int32_t vocabSize = 128;
+    rt::Tensor logits({2, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "phase_adapter_sampler_logits");
+    std::vector<float> hostLogits(2 * vocabSize, -10.0F);
+    hostLogits[91] = 7.0F;
+    hostLogits[vocabSize + 92] = 8.0F;
+    CUDA_CHECK(
+        cudaMemcpy(logits.rawPointer(), hostLogits.data(), hostLogits.size() * sizeof(float), cudaMemcpyHostToDevice));
+    rt::PhaseGreedySampler sampler(2, vocabSize, {}, "phase_adapter_sampler");
+    sampler.enqueue(logits, 2, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    sampler.completeDecode(adapter);
     adapter.scatterDecode();
 
     EXPECT_FALSE(adapter.packed());
@@ -581,6 +589,8 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     EXPECT_EQ(second.tokenIds[0], (std::vector<int32_t>{6, 7, 13, 92}));
     EXPECT_EQ(first.currentGenerateLengths, (std::vector<int32_t>{1, 2}));
     EXPECT_EQ(second.currentGenerateLengths, (std::vector<int32_t>{2}));
+    EXPECT_EQ(first.finishedStates, (std::vector<int8_t>{0, 0}));
+    EXPECT_EQ(second.finishedStates, (std::vector<int8_t>{1}));
     EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &previousBindings.slotIds());
     EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &previousBindings.lengths());
 }

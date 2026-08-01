@@ -108,17 +108,17 @@ void PhaseContextBatchAdapter::packDecode(std::vector<PhaseContextRow> const& ro
     }
 
     DecodingInferenceContext const& first = *rows.front().context;
+    int32_t packedMaxGenerateLength{};
     for (PhaseContextRow const& row : rows)
     {
         DecodingInferenceContext const& source = *row.context;
         check::check(source.temperature == first.temperature && source.topP == first.topP && source.topK == first.topK,
             "Phase context decode rows have incompatible sampling parameters.");
-        check::check(source.maxGenerateLength == first.maxGenerateLength,
-            "Phase context decode rows have incompatible maximum generation lengths.");
+        packedMaxGenerateLength = std::max(packedMaxGenerateLength, source.maxGenerateLength);
     }
 
     mPackedContext = DecodingInferenceContext{};
-    mPackedContext.initialize(static_cast<int32_t>(rows.size()), first.maxGenerateLength, std::nullopt,
+    mPackedContext.initialize(static_cast<int32_t>(rows.size()), packedMaxGenerateLength, std::nullopt,
         OptionalInputTensors{}, first.loraWeightsName, stream);
     mPackedContext.temperature = first.temperature;
     mPackedContext.topP = first.topP;
@@ -211,6 +211,11 @@ DecodingInferenceContext& PhaseContextBatchAdapter::packedContext()
 Tensor& PhaseContextBatchAdapter::tokenIds() noexcept
 {
     return mDeviceTokenIds;
+}
+
+std::vector<PhaseContextRow> const& PhaseContextBatchAdapter::rows() const noexcept
+{
+    return mRows;
 }
 
 std::vector<PhaseWorkItem> const& PhaseContextBatchAdapter::workItems() const noexcept

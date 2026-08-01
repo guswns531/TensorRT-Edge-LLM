@@ -64,6 +64,8 @@ public:
     DecodingInferenceContext& packedContext();
     //! Device INT32 [batch] containing each source row's current decode token.
     Tensor& tokenIds() noexcept;
+    //! Source rows corresponding to packed row order.
+    std::vector<PhaseContextRow> const& rows() const noexcept;
     std::vector<PhaseWorkItem> const& workItems() const noexcept;
     bool packed() const noexcept;
 

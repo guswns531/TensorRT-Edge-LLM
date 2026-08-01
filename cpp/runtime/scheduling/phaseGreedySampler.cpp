@@ -63,16 +63,17 @@ void PhaseGreedySampler::enqueue(Tensor const& logits, int32_t batchSize, cudaSt
     mPendingBatchSize = batchSize;
 }
 
-void PhaseGreedySampler::completeRow(DecodingInferenceContext& context, int32_t row, int32_t tokenId) const
+void PhaseGreedySampler::completeRow(
+    DecodingInferenceContext& context, int32_t row, int32_t tokenId, int32_t maxGenerateLength) const
 {
     check::check(row >= 0 && row < context.activeBatchSize, "Phase sampled row is outside the active batch.");
     size_t const index = static_cast<size_t>(row);
     check::check(!context.finishedStates[index], "Cannot append a token to a finished phase row.");
-    check::check(context.maxGenerateLength > 0, "Phase sampled context has no generation budget.");
+    check::check(maxGenerateLength > 0, "Phase sampled context has no generation budget.");
     context.tokenIds[index].push_back(tokenId);
     ++context.currentGenerateLengths[index];
     bool const reachedEos = std::find(mEosTokenIds.begin(), mEosTokenIds.end(), tokenId) != mEosTokenIds.end();
-    bool const reachedLength = context.currentGenerateLengths[index] >= context.maxGenerateLength;
+    bool const reachedLength = context.currentGenerateLengths[index] >= maxGenerateLength;
     context.finishedStates[index] = reachedEos || reachedLength;
 }
 
@@ -91,7 +92,7 @@ void PhaseGreedySampler::completePrefill(PhasePrefillContextBatchAdapter const& 
         PhasePrefillContextRow const& row = adapter.rows()[static_cast<size_t>(packedRow)];
         if (row.tokenOffset + row.tokenCount == row.promptTokenCount)
         {
-            completeRow(*row.context, row.contextRow, selected[packedRow]);
+            completeRow(*row.context, row.contextRow, selected[packedRow], row.context->maxGenerateLength);
         }
     }
     finishCompletion(adapter.batchSize());
@@ -103,9 +104,24 @@ void PhaseGreedySampler::completeDecode(DecodingInferenceContext& context)
     int32_t const* selected = mHostSelectedTokenIds.dataPointer<int32_t>();
     for (int32_t row = 0; row < context.activeBatchSize; ++row)
     {
-        completeRow(context, row, selected[row]);
+        completeRow(context, row, selected[row], context.maxGenerateLength);
     }
     finishCompletion(context.activeBatchSize);
+}
+
+void PhaseGreedySampler::completeDecode(PhaseContextBatchAdapter& adapter)
+{
+    DecodingInferenceContext& packed = adapter.packedContext();
+    check::check(packed.activeBatchSize == mPendingBatchSize, "Phase decode sampling batch mismatch.");
+    check::check(static_cast<int32_t>(adapter.rows().size()) == mPendingBatchSize,
+        "Phase decode sampling source-row mismatch.");
+    int32_t const* selected = mHostSelectedTokenIds.dataPointer<int32_t>();
+    for (int32_t row = 0; row < packed.activeBatchSize; ++row)
+    {
+        PhaseContextRow const& source = adapter.rows()[static_cast<size_t>(row)];
+        completeRow(packed, row, selected[row], source.context->maxGenerateLength);
+    }
+    finishCompletion(packed.activeBatchSize);
 }
 
 bool PhaseGreedySampler::pending() const noexcept

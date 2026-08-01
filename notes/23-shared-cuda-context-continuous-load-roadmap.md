@@ -93,3 +93,18 @@ batch-size distribution, overlap, peak VRAM, slot utilization과 sanitizer 결�
 
 이번 작업은 1번과 2번까지다. 2번 결과가 실제로 prefill/decode queue를 동시에 채우고 서로 다른 batch를 만드는
 것을 확인하기 전에는 three-phase coordinator나 SM 제어를 붙이지 않는다.
+
+## 진행 상태
+
+- [x] 1. 하나의 CUDA primary context와 phase별 TensorRT context/resource 격리
+- [x] 2. deterministic continuous-load generator와 실제 Gemma queue batching
+- [ ] 3. Three-phase coordinator
+- [ ] 4. Adaptive chunked prefill
+- [ ] 5. SLO 기반 customizable scheduler
+- [ ] 6. 실제 encoder engine 연결
+- [ ] 7. SM resource backend
+- [ ] 8. Kernel-group 계측과 engine segmentation
+- [ ] 9. 최종 load/performance gate
+
+1단계 결과는 [24번 노트](24-shared-cuda-independent-trt-contexts.md), 2단계 결과는
+[25번 노트](25-deterministic-continuous-load.md)에 기록했다.

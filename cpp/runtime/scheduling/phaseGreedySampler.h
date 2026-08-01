@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phasePrefillContextBatchAdapter.h"
 #include "runtime/state/decodingInferenceContext.h"
 
@@ -42,11 +43,14 @@ public:
     void completePrefill(PhasePrefillContextBatchAdapter const& adapter);
     //! Append one sampled token to every packed decode row.
     void completeDecode(DecodingInferenceContext& context);
+    //! Append one token while applying each source row's own generation budget.
+    void completeDecode(PhaseContextBatchAdapter& adapter);
 
     bool pending() const noexcept;
 
 private:
-    void completeRow(DecodingInferenceContext& context, int32_t row, int32_t tokenId) const;
+    void completeRow(
+        DecodingInferenceContext& context, int32_t row, int32_t tokenId, int32_t maxGenerateLength) const;
     void finishCompletion(int32_t batchSize);
 
     int32_t mMaxBatchSize{};
