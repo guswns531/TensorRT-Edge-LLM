@@ -4,10 +4,11 @@
 
 현재 성능 효과는 두 종류로 구분해야 한다.
 
-1. indexed-linear KV는 정상 prefill/decode를 빠르게 만들지 않는다. stable physical slot으로 eviction 때 KV
-   compaction을 제거하며, 정상 kernel 비용은 median `+0.14~+2.57%`다.
-2. 실제 makespan 개선은 같은 CUDA primary context 안의 독립 TensorRT context와 stream으로 prefill/decode를
-   겹칠 때 나온다. 기존 6개 workload에서 median latency가 `2.32~12.53%` 감소했다.
+1. actual text BS4 request 100 batch에서 indexed-only의 총 GPU time은 legacy보다 `1.14%` 늘었다. indexed KV는
+   정상 prefill/decode를 빠르게 만드는 기능이 아니라 eviction의 KV compaction을 제거하는 기반이다.
+2. 실제 request lifecycle과 arrival queue를 포함한 6개 workload에서 independent TensorRT context는 shared
+   serialized context보다 throughput을 `1.20~24.45%` 높이고, 5개 부하의 TTFT p95를 `6.71~85.85%` 낮췄다.
+   비포화 20 rps에서는 TTFT가 7.23% 늘었지만 E2E p95와 TPOT p95는 각각 33.74%, 42.91% 줄었다.
 
 즉 indexed KV가 안전한 ownership과 compaction-free eviction을 만들고, 그 위의 phase scheduler가 indexed
 lookup 비용보다 큰 overlap 이득을 만드는 구조다.
@@ -16,37 +17,59 @@ lookup 비용보다 큰 overlap 이득을 만드는 구조다.
 
 | Tier | 구성 | 효과 | 비교 방법 |
 |---|---|---|---|
-| L0 완전 legacy | active row = physical row, 기존 실행 | 기준점 | L1과 같은 `llm_bench` shape |
-| L1 indexed only | stable `kv_slot_ids`, 기존 실행 순서 | eviction KV copy 제거 | L0와 직접 비교 |
-| L2 indexed + shared TRT | queue/stream 2개, TRT context 1개, event 직렬화 | 안전 fallback | 자체 sequential과 비교 |
-| L3 indexed + independent TRT | CUDA context 1개, TRT context/workspace/I/O/stream 2개 | kernel overlap | 자체 sequential과 비교 |
+| L0 완전 legacy | active row = physical row, 기존 실행 | 기준점 | L1과 actual text BS4 100 batch 비교 |
+| L1 indexed only | stable `kv_slot_ids`, 기존 실행 순서 | eviction KV copy 제거 | L0와 actual text request 직접 비교 |
+| L2 indexed + shared TRT | queue/stream 2개, TRT context 1개, event 직렬화 | 안전 fallback | L3와 동일 continuous trace 비교 |
+| L3 indexed + independent TRT | CUDA context 1개, TRT context/workspace/I/O/stream 2개 | kernel overlap | L2와 동일 continuous trace 비교 |
 | L4 production adapter | L3 + request context pack/scatter | 실제 batch 연결 | adapter on/off 비교 |
 | L5 continuous scheduler | L4 + admission/batching/backpressure | 부하 제어 | 현재 legacy 동등 경로 없음 |
 
-L0/L1의 `llm_bench`는 한 phase의 CUDA-event 시간이고, L2~L4의 `llm_phase_bench`는 prefill과 decode를 함께
-넣은 makespan이다. 두 벤치의 absolute millisecond를 직접 빼면 안 된다.
+주 비교는 actual text request를 처리하는 `llm_inference`와 actual request context, admission, 실제 greedy
+sampling, 반복 decode, terminal release를 수행하는 continuous `llm_phase_bench`다. fixed-shape phase 측정은
+kernel overlap의 보조자료로만 사용한다.
 
-## L0 대 L1: indexed KV만 켠 비용
+## L0 대 L1: actual text request의 indexed-only 비용
 
-RTX 3080, CUDA graph 비활성, warmup 20회, 측정 100회, 전체 3회 결과다. greedy 출력 SHA256은 두 engine이
-`1918f649c96695ea807985d3e7a98c4257d3d429f3b9557277f4957472dfcb2a`로 같다.
+실제 chat-template text 요청 4개에 서로 다른 stop 조건을 주어 active batch가 4→3→2→1로 줄어드는 입력을
+100 batch 반복했다. 각 engine은 warmup 20 batch 뒤 prefill 100회와 generation/eviction 500회를 profiler로
+집계했다. 두 출력 파일의 SHA256은
+`500efce553448fcbec39d622720df374dc6f88c332e689070785395e82eb8578`로 같다.
 
-| Phase | Shape | Median 변화 | p95 변화 |
-|---|---|---:|---:|
-| Prefill | BS1/BS4 × input 128/512/1024 | `+0.14~+0.90%` | `+0.06~+0.48%` |
-| Decode | BS1/BS4 × past KV 128/512/1536 | `+0.80~+2.57%` | `-1.25~+2.97%` |
-
-모두 3% gate를 통과했다. engine 크기는 1,001,923,868 byte에서 1,002,044,972 byte로 121,104 byte,
-약 `0.0121%` 증가했다. BS1 component median 합은 다음과 같다. request E2E latency가 아니라 overlap 전 component
-cost를 보기 위한 값이다.
-
-| Prompt / past KV | Legacy | Indexed | 변화 |
+| Stage | Legacy | Indexed only | 변화 |
 |---|---:|---:|---:|
-| 128 / 128 | 25.1235 ms | 25.4594 ms | +1.337% |
-| 512 / 512 | 55.9956 ms | 56.2683 ms | +0.487% |
-| 1024 / 1536 | 112.5921 ms | 112.9126 ms | +0.285% |
+| Prefill median / p95 | 17.6551 / 17.8228 ms | 17.6067 / 17.8129 ms | -0.27% / -0.06% |
+| Generation-step median / p95 | 5.9976 / 6.8363 ms | 6.1302 / 6.9324 ms | +2.21% / +1.41% |
+| 전체 GPU time | 4,844.62 ms | 4,899.61 ms | +1.14% |
+| Peak VRAM | 8,480 MiB | 8,486 MiB | +6 MiB |
 
-## L2 대 L3: context 분리와 overlap
+이 workload의 prompt는 batch 전체 76 token이고 생성은 batch당 15 token이라 eviction 때 이동하는 KV가 작다.
+따라서 compaction 제거 이득보다 indexed lookup 비용이 더 크게 보인다. 긴 survivor KV의 eviction은 별도 direct
+benchmark가 필요하다. engine 크기는 121,104 byte, 약 `0.0121%` 증가했다.
+
+## L1/L2 대 L3: 동일 continuous request trace
+
+두 topology에 seed 0의 같은 request ID, arrival offset, prompt length, output budget을 replay했다. shared mode도
+indexed KV, admission과 queue batching을 사용하지만 TensorRT context 하나를 event로 직렬화한다. independent
+mode는 같은 CUDA primary context에서 prefill/decode TensorRT context와 stream을 분리한다.
+
+| Workload | Throughput | TTFT p95 | E2E p95 | TPOT p95 | Pending |
+|---|---:|---:|---:|---:|---:|
+| steady 20 rps | 19.23→19.46, +1.20% | 25.03→26.84, +7.23% | 135.52→89.79, -33.74% | 15.86→9.06, -42.91% | 0→0 |
+| steady 25 rps | 20.05→24.12, +20.29% | 194.44→27.52, -85.85% | 340.92→104.49, -69.35% | 25.36→11.03, -56.52% | 19→0 |
+| burst 1000 rps | 25.74→27.74, +7.79% | 831.47→774.28, -6.88% | 901.30→833.82, -7.49% | 13.15→9.85, -25.06% | 20→20 |
+| long output 24~32 | 8.88→9.47, +6.56% | 1328.91→1239.74, -6.71% | 1650.98→1540.08, -6.72% | 17.42→16.13, -7.44% | 12→12 |
+| chunked 512/128 | 10.74→12.61, +17.39% | 922.43→766.55, -16.90% | 1011.63→846.15, -16.36% | 32.44→24.89, -23.29% | 8→8 |
+| mixed lengths | 10.86→13.52, +24.45% | 1136.68→884.89, -22.15% | 1339.80→1050.35, -21.60% | 38.98→25.54, -34.47% | 12→12 |
+
+steady 25 rps의 큰 tail 개선은 독립 mode가 포화 knee를 20 rps 부근에서 24 rps 이상으로 옮긴 결과라서 단순
+kernel speedup으로 해석하면 안 된다. 반대로 비포화 20 rps에서는 prefill TTFT가 1.81 ms 나빠졌지만 이후 decode
+service가 빨라 E2E와 TPOT은 크게 개선됐다. scheduler는 TTFT만이 아니라 TTFT/TPOT/E2E SLO를 함께 봐야 한다.
+
+이 결과는 한 번 생성한 deterministic trace의 topology별 1회 replay다. batch histogram과 overlap dispatch 수는
+두 mode에서 같아서 workload 선택 차이는 없지만, 최종 gate에는 process-level 3회 반복을 추가해야 한다. 전체
+원자료 요약은 `gemma4-e2b-real-request-context-comparison.csv`에 있다.
+
+## Fixed-shape kernel 보조 측정
 
 기존 6개 workload의 100-sample 결과에서 shared TRT context는 event 직렬화 때문에 median
 `+0.29~+1.38%`, p95 `+0.17~+1.35%`의 scheduler 비용만 있었다. independent TRT context는 모든 workload의
@@ -73,21 +96,6 @@ independent의 sequential 절대값 차이는 context/profile topology가 다르
 짧은 workload는 두 phase가 겹칠 면적이 커 이득이 크고, 장문 prefill은 한 phase가 makespan 대부분을 차지해
 상대 개선 상한이 작다. 동시 실행 중 개별 phase는 contention으로 느려질 수 있으므로 makespan, TTFT, TPOT을
 함께 최적화해야 한다.
-
-## L0부터 L3까지 정규화 추정
-
-L0→L1 component ratio와 기존 L1-sequential→L3-overlap ratio만 곱했다. 동일 request E2E 직접 측정이 아니라
-단계별 효과를 보여 주는 `normalized estimate`다.
-
-| BS1 workload | Indexed 비용 | Overlap 효과 | Legacy 대비 추정 순효과 |
-|---|---:|---:|---:|
-| prompt 128 / KV 128 | +1.337% | -12.53% | -11.36%, 약 1.128x |
-| prompt 512 / KV 512 | +0.487% | -6.90% | -6.45%, 약 1.069x |
-| prompt 1024 / KV 1536 | +0.285% | -4.14% | -3.87%, 약 1.040x |
-
-보수적인 기존 matrix를 써도 indexed 비용을 상쇄하고 이득이 남는다. 다만 production 결론에는 같은 arrival trace의
-end-to-end A/B가 필요하다. legacy runtime은 stable ownership 없이 continuous admission을 안전하게 수행할 수 없어
-L5와 완전히 같은 실험은 현재 불가능하다.
 
 ## L4와 L5
 
@@ -128,5 +136,6 @@ indexed-linear는 allocation을 줄이지 않는다. 네 slot을 미리 고정 �
 3. production adapter phase matrix를 3회 반복하며 GPU clock/temperature와 VRAM peak를 저장한다.
 4. throughput, TTFT/TPOT/E2E p95, pending depth, batch histogram을 공동 gate로 사용한다.
 
-원자료는 `gemma4-e2b-perf-gate-confirmed.csv`, `gemma4-e2b-phase-context-comparison.csv`,
-`/tmp/gemma4-e2b/perf/phase/tier-current-*.csv`, `/tmp/gemma4-e2b/perf/phase/load-suite-v1/summary.csv`에 있다.
+원자료는 `gemma4-e2b-real-request-context-comparison.csv`, `gemma4-e2b-perf-gate-confirmed.csv`,
+`gemma4-e2b-phase-context-comparison.csv`, `/tmp/gemma4-e2b/perf/real-request-*-repeat100-profile.json`,
+`/tmp/gemma4-e2b/perf/phase/real-request-tier-{shared,independent}/summary.csv`에 있다.
