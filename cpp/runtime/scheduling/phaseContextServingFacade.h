@@ -96,7 +96,7 @@ public:
     PhaseContextServingFacade(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
         PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
-        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
+        PhaseTensorRTContextMode executionMode = PhaseTensorRTContextMode::kSharedSerialized,
         TensorMap* prefillTensorMap = nullptr, int32_t maxPrefillChunkTokens = 0, size_t maxPendingAdmissions = 0,
         PhaseExecutionSafetyContract safetyContract = {});
 

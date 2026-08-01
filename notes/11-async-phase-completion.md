@@ -30,7 +30,7 @@ sequenceDiagram
 ## 같은 TensorRT context에서 두 stream을 쓰는 의미
 
 CUDA stream이 두 개여도 같은 TensorRT `IExecutionContext`에 prefill과 decode를 동시에 `enqueueV3()`하는 것은
-지원되는 실행 모델이 아니다. 기본 `kSharedContextSerialized`는 queue, batch, stream, event를 분리하되 enqueue를 정렬한다.
+지원되는 실행 모델이 아니다. 기본 `kSharedSerialized`는 queue, batch, stream, event를 분리하되 enqueue를 정렬한다.
 
 ```text
 prefill stream: [prefill enqueue] -------- [prefill-done]
@@ -45,7 +45,7 @@ decode stream :                         wait ^ [decode enqueue] --- [decode-done
 - phase별 event latency와 queue wait를 분리 계측
 
 실제 kernel overlap은 별도 `IExecutionContext`, USER_MANAGED workspace, phase별 I/O buffer를 가질 때만
-`kIndependentContextsConcurrent`로 opt-in한다. 기존 dual-context benchmark 수치는 이 모드의 결과다.
+`kIndependentConcurrent`로 opt-in한다. 기존 dual-context benchmark 수치는 이 모드의 결과다.
 
 ## In-flight 안전 조건
 

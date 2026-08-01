@@ -27,11 +27,40 @@ namespace trt_edgellm
 namespace rt
 {
 
-PhaseExecutionSafetyContract PhaseExecutionSafetyContract::shared(void const* executionContext) noexcept
+namespace
+{
+
+CUcontext getStreamCudaContext(cudaStream_t stream)
+{
+    check::check(stream != nullptr, "Phase execution requires explicit non-default CUDA streams.");
+    CUcontext context{};
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(stream, &context));
+    check::check(context != nullptr, "Phase CUDA stream has no owning CUDA context.");
+    return context;
+}
+
+void validatePrimaryCudaContext(CUcontext context)
+{
+    CUcontext current{};
+    CUDA_DRIVER_CHECK(cuCtxGetCurrent(&current));
+    check::check(current == context, "Phase streams must belong to the thread's current CUDA context.");
+
+    CUdevice device{};
+    CUDA_DRIVER_CHECK(cuCtxGetDevice(&device));
+    CUcontext primary{};
+    CUDA_DRIVER_CHECK(cuDevicePrimaryCtxRetain(&primary, device));
+    bool const isPrimary = primary == context;
+    CUDA_DRIVER_CHECK(cuDevicePrimaryCtxRelease(device));
+    check::check(isPrimary, "Phase execution must use the device CUDA primary context.");
+}
+
+} // namespace
+
+PhaseExecutionSafetyContract PhaseExecutionSafetyContract::shared(void const* tensorRTExecutionContext) noexcept
 {
     PhaseExecutionSafetyContract result;
-    result.prefill.executionContext = executionContext;
-    result.decode.executionContext = executionContext;
+    result.prefill.tensorRTExecutionContext = tensorRTExecutionContext;
+    result.decode.tensorRTExecutionContext = tensorRTExecutionContext;
     return result;
 }
 
@@ -43,29 +72,31 @@ PhaseExecutionSafetyContract PhaseExecutionSafetyContract::independent(
 
 bool PhaseExecutionSafetyContract::provesIndependentResources() const noexcept
 {
-    return prefill.executionContext != nullptr && decode.executionContext != nullptr && prefill.workspace != nullptr
-        && decode.workspace != nullptr && prefill.ioBuffers != nullptr && decode.ioBuffers != nullptr
-        && prefill.executionContext != decode.executionContext && prefill.workspace != decode.workspace
+    return prefill.tensorRTExecutionContext != nullptr && decode.tensorRTExecutionContext != nullptr
+        && prefill.workspace != nullptr && decode.workspace != nullptr && prefill.ioBuffers != nullptr
+        && decode.ioBuffers != nullptr && prefill.tensorRTExecutionContext != decode.tensorRTExecutionContext
+        && prefill.workspace != decode.workspace
         && prefill.ioBuffers != decode.ioBuffers;
 }
 
-void PhaseExecutionSafetyContract::validate(PhaseStreamExecutionMode mode) const
+void PhaseExecutionSafetyContract::validate(PhaseTensorRTContextMode mode) const
 {
-    if (mode == PhaseStreamExecutionMode::kIndependentContextsConcurrent)
+    if (mode == PhaseTensorRTContextMode::kIndependentConcurrent)
     {
         check::check(provesIndependentResources(),
-            "Concurrent phase execution requires distinct non-null context, workspace, and I/O identities.");
+            "Concurrent phase execution requires distinct non-null TensorRT context, workspace, and I/O identities.");
         return;
     }
-    if (prefill.executionContext != nullptr || decode.executionContext != nullptr)
+    if (prefill.tensorRTExecutionContext != nullptr || decode.tensorRTExecutionContext != nullptr)
     {
-        check::check(prefill.executionContext != nullptr && prefill.executionContext == decode.executionContext,
-            "Shared-context phase execution requires one identical execution-context identity.");
+        check::check(prefill.tensorRTExecutionContext != nullptr
+                && prefill.tensorRTExecutionContext == decode.tensorRTExecutionContext,
+            "Shared TensorRT context mode requires one identical IExecutionContext identity.");
     }
 }
 
 PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
-    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode,
+    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseTensorRTContextMode executionMode,
     PhaseExecutionSafetyContract safetyContract)
     : mScheduler(scheduler)
     , mCallbacks(std::move(callbacks))
@@ -75,6 +106,17 @@ PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDi
     , mSafetyContract(safetyContract)
 {
     mSafetyContract.validate(mExecutionMode);
+    CUcontext const prefillCudaContext = getStreamCudaContext(mPrefillStream);
+    CUcontext const decodeCudaContext = getStreamCudaContext(mDecodeStream);
+    check::check(prefillCudaContext == decodeCudaContext,
+        "Prefill and decode streams must share one CUDA context.");
+    if (mExecutionMode == PhaseTensorRTContextMode::kIndependentConcurrent)
+    {
+        check::check(mPrefillStream != mDecodeStream,
+            "Independent TensorRT contexts require distinct CUDA streams.");
+    }
+    validatePrimaryCudaContext(prefillCudaContext);
+    mCudaContext = prefillCudaContext;
     check::check(static_cast<bool>(mCallbacks.enqueuePrefill), "Prefill enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.enqueueDecode), "Decode enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.completePrefill), "Prefill completion callback is required.");
@@ -132,7 +174,7 @@ bool PhaseDispatchWorker::dispatchNext()
     if (mHasDecode)
     {
         bool const serializeSharedContext
-            = mHasPrefill && mExecutionMode == PhaseStreamExecutionMode::kSharedContextSerialized;
+            = mHasPrefill && mExecutionMode == PhaseTensorRTContextMode::kSharedSerialized;
         if (serializeSharedContext)
         {
             // A stream wait does not protect host-side TensorRT context state.
@@ -331,6 +373,11 @@ std::optional<PhaseDispatchMetrics> const& PhaseDispatchWorker::lastMetrics() co
 PhaseExecutionSafetyContract const& PhaseDispatchWorker::safetyContract() const noexcept
 {
     return mSafetyContract;
+}
+
+CUcontext PhaseDispatchWorker::cudaContext() const noexcept
+{
+    return mCudaContext;
 }
 
 } // namespace rt

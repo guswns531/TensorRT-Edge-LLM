@@ -61,9 +61,9 @@ sequenceDiagram
     H->>H: unfinished request requeue
 ```
 
-v1은 plan 하나만 in-flight로 둔다. `kSharedContextSerialized` 기본 모드는 stream은 분리하지만 같은 TensorRT
+v1은 plan 하나만 in-flight로 둔다. `kSharedSerialized` 기본 모드는 stream은 분리하지만 같은 TensorRT
 execution context의 동시 enqueue를 막기 위해 decode stream이 `prefill-done`을 기다린다.
-`kIndependentContextsConcurrent`는 prefill/decode가 독립 execution context와 workspace를 가진 benchmark 경로에서만
+`kIndependentConcurrent`는 prefill/decode가 독립 execution context와 workspace를 가진 benchmark 경로에서만
 명시적으로 선택한다. 다음 plan은 두 완료 event를 확인한 후 dispatch한다.
 
 ## RTX 3080 Gemma 4 E2B 결과

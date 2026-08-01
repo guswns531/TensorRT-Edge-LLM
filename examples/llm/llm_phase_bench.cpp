@@ -66,7 +66,7 @@ struct Args
     int32_t pastKVLen{512};
     int32_t warmup{20};
     int32_t iterations{100};
-    bool sharedContext{};
+    rt::PhaseTensorRTContextMode trtContextMode{rt::PhaseTensorRTContextMode::kIndependentConcurrent};
     bool contextAdapter{};
     bool adaptiveScheduler{};
 };
@@ -85,7 +85,8 @@ void printUsage(char const* program)
 {
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
-        "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] [--sharedContext] "
+        "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] "
+        "[--trtContextMode shared|independent] "
         "[--contextAdapter] [--adaptiveScheduler] [--outputCsv FILE]",
         program);
 }
@@ -103,7 +104,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         kWarmup,
         kIterations,
         kOutputCsv,
-        kSharedContext,
+        kTensorRTContextMode,
+        kLegacySharedContext,
         kContextAdapter,
         kAdaptiveScheduler,
         kHelp,
@@ -114,7 +116,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
-        {"sharedContext", no_argument, nullptr, kSharedContext},
+        {"trtContextMode", required_argument, nullptr, kTensorRTContextMode},
+        {"sharedContext", no_argument, nullptr, kLegacySharedContext},
         {"contextAdapter", no_argument, nullptr, kContextAdapter},
         {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler}, {"help", no_argument, nullptr, kHelp}, {}};
 
@@ -132,7 +135,24 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kWarmup: args.warmup = std::stoi(optarg); break;
         case kIterations: args.iterations = std::stoi(optarg); break;
         case kOutputCsv: args.outputCsv = optarg; break;
-        case kSharedContext: args.sharedContext = true; break;
+        case kTensorRTContextMode:
+        {
+            std::string const mode{optarg};
+            if (mode == "shared")
+            {
+                args.trtContextMode = rt::PhaseTensorRTContextMode::kSharedSerialized;
+            }
+            else if (mode == "independent")
+            {
+                args.trtContextMode = rt::PhaseTensorRTContextMode::kIndependentConcurrent;
+            }
+            else
+            {
+                return false;
+            }
+            break;
+        }
+        case kLegacySharedContext: args.trtContextMode = rt::PhaseTensorRTContextMode::kSharedSerialized; break;
         case kContextAdapter: args.contextAdapter = true; break;
         case kAdaptiveScheduler: args.adaptiveScheduler = true; break;
         case kHelp: printUsage(argv[0]); return false;
@@ -142,6 +162,11 @@ bool parseArgs(Args& args, int argc, char** argv)
     return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.inputLen > 0
         && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
         && args.warmup >= 0 && args.iterations > 0;
+}
+
+bool usesSharedTensorRTContext(Args const& args) noexcept
+{
+    return args.trtContextMode == rt::PhaseTensorRTContextMode::kSharedSerialized;
 }
 
 void uploadInt32(rt::Tensor& tensor, std::vector<int32_t> const& values, cudaStream_t stream)
@@ -261,11 +286,26 @@ int main(int argc, char** argv)
     auto prefillExecutor = rt::EngineExecutor::createForLLM(enginePath, config);
     std::unique_ptr<rt::EngineExecutor> decodeExecutor;
     rt::EngineExecutor* decodeRunner = prefillExecutor.get();
-    if (!args.sharedContext)
+    if (!usesSharedTensorRTContext(args))
     {
         decodeExecutor = prefillExecutor->createSibling();
         decodeRunner = decodeExecutor.get();
     }
+    bool const sharedTensorRTContext
+        = prefillExecutor->getExecutionContextIdentity() == decodeRunner->getExecutionContextIdentity();
+    ELLM_CHECK(sharedTensorRTContext == usesSharedTensorRTContext(args),
+        "TensorRT execution-context identity does not match --trtContextMode");
+    CUcontext prefillCudaContext{};
+    CUcontext decodeCudaContext{};
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(prefillStream, &prefillCudaContext));
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(decodeStream, &decodeCudaContext));
+    ELLM_CHECK(prefillCudaContext != nullptr && prefillCudaContext == decodeCudaContext,
+        "Phase streams must share one CUDA primary context");
+    LOG_INFO("Phase execution topology: CUDA context=%p (shared), TensorRT prefill=%p, decode=%p (%s)",
+        static_cast<void*>(prefillCudaContext),
+        static_cast<void const*>(prefillExecutor->getExecutionContextIdentity()),
+        static_cast<void const*>(decodeRunner->getExecutionContextIdentity()),
+        sharedTensorRTContext ? "shared_serialized" : "independent_concurrent");
     rt::validateAgainstEngine(config, *prefillExecutor, "phase-prefill");
 
     std::unordered_map<std::string, std::string> const emptyLoraMap;
@@ -352,17 +392,40 @@ int main(int argc, char** argv)
     fillRandomData(prefillIO.inputsEmbeds, -1.0F, 1.0F, nvinfer1::DataType::kHALF, 0);
     fillRandomData(decodeIO.inputsEmbeds, -1.0F, 1.0F, nvinfer1::DataType::kHALF, 1);
 
-    std::unique_ptr<rt::Gemma4EmbeddingPreprocessor> gemma4Ple;
+    std::unique_ptr<rt::Gemma4EmbeddingPreprocessor> prefillGemma4Ple;
+    std::unique_ptr<rt::Gemma4EmbeddingPreprocessor> decodeGemma4PleOwner;
+    rt::Gemma4EmbeddingPreprocessor* decodeGemma4Ple{};
     if (config.pleEnabled)
     {
         int32_t const maxPleSeqLen = std::max(args.inputLen, 1);
-        gemma4Ple = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
+        prefillGemma4Ple = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
             engineDir, config, config.maxSupportedBatchSize, maxPleSeqLen, prefillMap, setupStream);
-        gemma4Ple->bindOutputs(decodeMap);
-        rt::Tensor pleTokenIds({config.maxSupportedBatchSize, maxPleSeqLen}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "phase_ple_token_ids");
-        CUDA_CHECK(cudaMemsetAsync(pleTokenIds.rawPointer(), 0, pleTokenIds.getMemoryCapacity(), setupStream));
-        gemma4Ple->embed(pleTokenIds, setupStream);
+        if (usesSharedTensorRTContext(args))
+        {
+            prefillGemma4Ple->bindOutputs(decodeMap);
+            decodeGemma4Ple = prefillGemma4Ple.get();
+        }
+        else
+        {
+            decodeGemma4PleOwner
+                = prefillGemma4Ple->createSibling(config.maxSupportedBatchSize, 1, decodeMap);
+            decodeGemma4Ple = decodeGemma4PleOwner.get();
+            ELLM_CHECK(prefillGemma4Ple->tableDataIdentity() == decodeGemma4Ple->tableDataIdentity(),
+                "Independent phase PLE preprocessors did not share the immutable table");
+            ELLM_CHECK(prefillGemma4Ple->outputDataIdentity() != decodeGemma4Ple->outputDataIdentity(),
+                "Independent phase PLE preprocessors aliased mutable outputs");
+        }
+        rt::Tensor prefillPleTokenIds({config.maxSupportedBatchSize, maxPleSeqLen}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "phase_prefill_ple_token_ids");
+        rt::Tensor decodePleTokenIds(
+            {config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "phase_decode_ple_token_ids");
+        CUDA_CHECK(cudaMemsetAsync(
+            prefillPleTokenIds.rawPointer(), 0, prefillPleTokenIds.getMemoryCapacity(), setupStream));
+        CUDA_CHECK(
+            cudaMemsetAsync(decodePleTokenIds.rawPointer(), 0, decodePleTokenIds.getMemoryCapacity(), setupStream));
+        prefillGemma4Ple->embed(prefillPleTokenIds, setupStream);
+        decodeGemma4Ple->embed(decodePleTokenIds, setupStream);
     }
     CUDA_CHECK(cudaStreamSynchronize(setupStream));
 
@@ -381,9 +444,9 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaMemsetAsync(
                 prefillIO.contextLengths.rawPointer(), 0, prefillIO.contextLengths.getMemoryCapacity(), stream));
             kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, stream);
-            if (gemma4Ple)
+            if (prefillGemma4Ple)
             {
-                gemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
+                prefillGemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
             }
             bool const initialChunk = chunkOffset == 0;
             auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
@@ -404,9 +467,9 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaMemcpyAsync(decodeIO.contextLengths.rawPointer(), activeBatchState.lengths().rawPointer(),
             batchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
         kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
-        if (gemma4Ple)
+        if (decodeGemma4Ple)
         {
-            gemma4Ple->reshapeOutputs(batchSize, 1);
+            decodeGemma4Ple->reshapeOutputs(batchSize, 1);
         }
         auto const decodeDims = config.decodeDims(batchSize);
         for (int32_t round = 0; round < rounds; ++round)
@@ -501,10 +564,10 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
                 prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t), cudaMemcpyHostToDevice,
                 packed.stream()));
-            if (gemma4Ple)
+            if (prefillGemma4Ple)
             {
-                gemma4Ple->embed(packed.tokenIds(), packed.stream());
-                gemma4Ple->reshapeOutputs(batchSize, chunkLength);
+                prefillGemma4Ple->embed(packed.tokenIds(), packed.stream());
+                prefillGemma4Ple->reshapeOutputs(batchSize, chunkLength);
             }
             check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
                 "Serving prefill logits reshape failed");
@@ -536,9 +599,9 @@ int main(int argc, char** argv)
         facadeCallbacks.enqueuePackedDecode = [&](rt::PhaseContextBatchAdapter& adapter) {
             rt::DecodingInferenceContext& packed = adapter.packedContext();
             ELLM_CHECK(packed.phaseBatchState != nullptr, "Serving facade decode has no phase batch state");
-            ELLM_CHECK(gemma4Ple != nullptr, "Serving facade actual token decode requires Gemma 4 PLE");
-            gemma4Ple->embed(adapter.tokenIds(), packed.stream);
-            gemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
+            ELLM_CHECK(decodeGemma4Ple != nullptr, "Serving facade actual token decode requires Gemma 4 PLE");
+            decodeGemma4Ple->embed(adapter.tokenIds(), packed.stream);
+            decodeGemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
             ELLM_CHECK(
                 executeDecode(*packed.phaseBatchState, 1, packed.stream), "Serving facade decode enqueue failed");
             decodeSampler.enqueue(decodeIO.outputLogits, packed.activeBatchSize, packed.stream);
@@ -550,13 +613,14 @@ int main(int argc, char** argv)
         };
         facadeCallbacks.onDispatchMetrics
             = [&](rt::PhaseDispatchMetrics const& sample) { facadeDispatchMetrics.push_back(sample); };
-        auto const facadeMode = args.sharedContext ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
-                                                   : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
-        auto const facadeSafety = args.sharedContext
-            ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor.get())
+        auto const facadeMode = usesSharedTensorRTContext(args)
+            ? rt::PhaseTensorRTContextMode::kSharedSerialized
+            : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
+        auto const facadeSafety = usesSharedTensorRTContext(args)
+            ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor->getExecutionContextIdentity())
             : rt::PhaseExecutionSafetyContract::independent(
-                  {prefillExecutor.get(), &prefillContext, &prefillIO},
-                  {decodeRunner, decodeContext.get(), &decodeIO});
+                  {prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
+                  {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO});
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
             cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize, 0,
             facadeSafety);
@@ -636,14 +700,14 @@ int main(int argc, char** argv)
             callbacks.completeDecode = [phaseRounds](rt::PhaseWorkItem const& item) {
                 return rt::PhaseDecodeCompletion{item.tokenCount + phaseRounds, true};
             };
-            auto const executionMode = args.sharedContext
-                ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
-                : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
-            auto const safetyContract = args.sharedContext
-                ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor.get())
+            auto const executionMode = usesSharedTensorRTContext(args)
+                ? rt::PhaseTensorRTContextMode::kSharedSerialized
+                : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
+            auto const safetyContract = usesSharedTensorRTContext(args)
+                ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor->getExecutionContextIdentity())
                 : rt::PhaseExecutionSafetyContract::independent(
-                      {prefillExecutor.get(), &prefillContext, &prefillIO},
-                      {decodeRunner, decodeContext.get(), &decodeIO});
+                      {prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
+                      {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO});
             rt::PhaseDispatchWorker worker(
                 scheduler, std::move(callbacks), prefillStream, decodeStream, executionMode, safetyContract);
             ELLM_CHECK(worker.dispatchNext(), "Phase worker failed to dispatch overlap plan");
@@ -656,7 +720,7 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaEventRecord(prefillBegin, setupStream));
             ELLM_CHECK(enqueuePrefill(prefillBatch, setupStream), "Sequential prefill enqueue failed");
             CUDA_CHECK(cudaEventRecord(prefillEnd, setupStream));
-            if (args.sharedContext)
+            if (usesSharedTensorRTContext(args))
             {
                 CUDA_CHECK(cudaEventSynchronize(prefillEnd));
             }
@@ -697,7 +761,8 @@ int main(int argc, char** argv)
 
     logSummary("Sequential", samples, false);
     char const* const scheduledName
-        = args.sharedContext ? "Shared-context scheduled" : "Independent-context concurrent";
+        = usesSharedTensorRTContext(args) ? "Shared-TensorRT-context scheduled"
+                                         : "Independent-TensorRT-context concurrent";
     logSummary(scheduledName, samples, true);
     std::vector<float> sequentialMakespans;
     std::vector<float> concurrentMakespans;
@@ -709,7 +774,9 @@ int main(int argc, char** argv)
     LOG_INFO("%s makespan speedup: %.4fx", scheduledName, speedup);
     if (!args.outputCsv.empty())
     {
-        writeCsv(args.outputCsv, samples, args.sharedContext ? "scheduled_shared" : "concurrent_independent");
+        char const* const csvMode
+            = usesSharedTensorRTContext(args) ? "shared_trt_serialized" : "independent_trt_concurrent";
+        writeCsv(args.outputCsv, samples, csvMode);
         LOG_INFO("Raw CUDA-event samples written to %s", args.outputCsv.c_str());
     }
 

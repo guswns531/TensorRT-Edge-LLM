@@ -33,7 +33,8 @@ namespace
 
 bool completeIdentity(PhaseExecutionResourceIdentity const& identity) noexcept
 {
-    return identity.executionContext != nullptr && identity.workspace != nullptr && identity.ioBuffers != nullptr;
+    return identity.tensorRTExecutionContext != nullptr && identity.workspace != nullptr
+        && identity.ioBuffers != nullptr;
 }
 
 } // namespace
@@ -41,15 +42,15 @@ bool completeIdentity(PhaseExecutionResourceIdentity const& identity) noexcept
 void PhaseEncoderExecutionSafetyContract::validate() const
 {
     check::check(completeIdentity(encoder),
-        "Concurrent encoder execution requires non-null context, workspace, and I/O identities.");
+        "Concurrent encoder execution requires non-null TensorRT context, workspace, and I/O identities.");
     check::check(!llmResources.empty(), "Concurrent encoder execution requires at least one LLM resource identity.");
     for (PhaseExecutionResourceIdentity const& llm : llmResources)
     {
         check::check(completeIdentity(llm),
             "Concurrent encoder execution requires complete LLM context, workspace, and I/O identities.");
-        check::check(encoder.executionContext != llm.executionContext && encoder.workspace != llm.workspace
-                && encoder.ioBuffers != llm.ioBuffers,
-            "Encoder context, workspace, and I/O must not alias an overlapping LLM phase.");
+        check::check(encoder.tensorRTExecutionContext != llm.tensorRTExecutionContext
+                && encoder.workspace != llm.workspace && encoder.ioBuffers != llm.ioBuffers,
+            "Encoder TensorRT context, workspace, and I/O must not alias an overlapping LLM phase.");
     }
 }
 
@@ -101,8 +102,8 @@ bool PhaseEncoderDispatchWorker::cancel(uint64_t requestId)
     {
         return false;
     }
-    auto const it = std::find_if(
-        mQueue.begin(), mQueue.end(), [requestId](PhaseEncoderWorkItem const& item) { return item.requestId == requestId; });
+    auto const it = std::find_if(mQueue.begin(), mQueue.end(),
+        [requestId](PhaseEncoderWorkItem const& item) { return item.requestId == requestId; });
     if (it == mQueue.end())
     {
         return false;

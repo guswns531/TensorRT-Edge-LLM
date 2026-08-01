@@ -154,6 +154,9 @@ public:
     //! @brief Access the underlying TRT engine for generic introspection.
     nvinfer1::ICudaEngine const& getEngine() const noexcept;
 
+    //! @brief Return the owned TensorRT execution context identity.
+    nvinfer1::IExecutionContext const* getExecutionContextIdentity() const noexcept;
+
     //! @brief Snapshot of all binding addresses and shapes — used for graph-cache verification.
     struct BindingSnapshot
     {

@@ -28,7 +28,7 @@ namespace rt
 
 PhaseRequestLifecycle::PhaseRequestLifecycle(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
     PhaseRequestLifecycleCallbacks callbacks, cudaStream_t prefillStream, cudaStream_t decodeStream,
-    PhaseStreamExecutionMode executionMode, PhaseExecutionSafetyContract safetyContract)
+    PhaseTensorRTContextMode executionMode, PhaseExecutionSafetyContract safetyContract)
     : mScheduler(std::move(schedulerConfig))
     , mSlotAllocator(maxSlots)
     , mCallbacks(std::move(callbacks))

@@ -69,11 +69,11 @@ kv_slot_ids:         [1, 3, 0]
 
 ## TensorRT context와 stream 선택
 
-기본 `kSharedContextSerialized`는 TensorRT execution context 하나를 유지하면서 prefill/decode queue와 CUDA stream을
+기본 `kSharedSerialized`는 TensorRT execution context 하나를 유지하면서 prefill/decode queue와 CUDA stream을
 분리한다. profile과 binding host state를 동시에 바꾸지 않도록 CUDA event 완료 뒤 다음 phase를 enqueue하므로
 kernel은 안전하게 직렬 실행된다. 사용자가 원한 “context 추가 없이 queue별 batching”에 해당하는 모드다.
 
-`kIndependentContextsConcurrent`는 같은 engine에서 sibling execution context와 phase별 workspace/I/O를 사용해 실제
+`kIndependentConcurrent`는 같은 engine에서 sibling execution context와 phase별 workspace/I/O를 사용해 실제
 kernel overlap을 허용하는 선택 모드다. queue, slot allocator와 facade 계약은 두 모드에서 동일하다.
 
 ## RTX 3080 검증과 성능

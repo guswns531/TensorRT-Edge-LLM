@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 namespace trt_edgellm
@@ -42,21 +43,32 @@ public:
     Gemma4EmbeddingPreprocessor(std::filesystem::path const& engineDir, LLMEngineConfig const& config,
         int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream);
 
+    //! Create phase-local mutable outputs while sharing the immutable PLE table.
+    std::unique_ptr<Gemma4EmbeddingPreprocessor> createSibling(
+        int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap) const;
+
     //! Gather PLE tensors for the current token-id tensor shape.
     void embed(Tensor const& tokenIds, cudaStream_t stream);
 
     //! Reshape already-bound output tensors for a CUDA-graph capture shape.
     void reshapeOutputs(int64_t batchSize, int64_t seqLen);
 
-    //! Bind the owned PLE output views into an additional phase-local tensor map.
-    //!
-    //! This permits sibling TensorRT execution contexts to share the immutable PLE
-    //! table and a precomputed read-only output buffer without loading the table twice.
+    //! Bind the same owned PLE output views into an additional serialized tensor map.
     void bindOutputs(TensorMap& tensorMap);
 
+    //! Return the shared immutable PLE table allocation identity.
+    void const* tableDataIdentity() const noexcept;
+
+    //! Return this preprocessor's mutable phase-local output allocation identity.
+    void const* outputDataIdentity() const noexcept;
+
 private:
+    Gemma4EmbeddingPreprocessor(LLMEngineConfig const& config, std::shared_ptr<Tensor> pleTable,
+        int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap);
+    void initializeOutputs(int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap);
+
     LLMEngineConfig mConfig{};
-    Tensor mPleTable{};
+    std::shared_ptr<Tensor> mPleTable{};
     Tensor mPleOutputBuffer{}; //!< Unified owned backing buffer for all PLE layer outputs.
     //! Non-owned tensor views into mPleOutputBuffer. TensorMap stores pointers to these stable objects.
     std::vector<Tensor> mPleOutputViews{};

@@ -361,6 +361,11 @@ nvinfer1::ICudaEngine const& EngineExecutor::getEngine() const noexcept
     return *mEngineState->engine;
 }
 
+nvinfer1::IExecutionContext const* EngineExecutor::getExecutionContextIdentity() const noexcept
+{
+    return mContext.get();
+}
+
 // ---------------------------------------------------------------------------
 // BindingSnapshot
 // ---------------------------------------------------------------------------

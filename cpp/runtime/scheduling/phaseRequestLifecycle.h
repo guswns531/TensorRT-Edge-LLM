@@ -61,7 +61,7 @@ class PhaseRequestLifecycle
 public:
     PhaseRequestLifecycle(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
         PhaseRequestLifecycleCallbacks callbacks, cudaStream_t prefillStream, cudaStream_t decodeStream,
-        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
+        PhaseTensorRTContextMode executionMode = PhaseTensorRTContextMode::kSharedSerialized,
         PhaseExecutionSafetyContract safetyContract = {});
 
     int32_t submit(uint64_t requestId, int32_t promptTokenCount);

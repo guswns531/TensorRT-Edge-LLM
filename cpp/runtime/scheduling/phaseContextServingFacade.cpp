@@ -31,7 +31,7 @@ namespace rt
 
 PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
     PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
-    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode,
+    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseTensorRTContextMode executionMode,
     TensorMap* prefillTensorMap, int32_t maxPrefillChunkTokens, size_t maxPendingAdmissions,
     PhaseExecutionSafetyContract safetyContract)
     : mCallbacks(std::move(callbacks))

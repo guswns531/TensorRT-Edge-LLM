@@ -19,6 +19,7 @@
 
 #include "runtime/scheduling/phaseQueueScheduler.h"
 
+#include <cuda.h>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -62,17 +63,17 @@ struct PhaseDispatchWorkerCallbacks
 };
 
 //! Controls whether phase enqueues may overlap across streams.
-enum class PhaseStreamExecutionMode
+enum class PhaseTensorRTContextMode
 {
     //! One TensorRT execution context is shared, so engine enqueues are ordered.
-    kSharedContextSerialized,
+    kSharedSerialized,
     //! Prefill and decode own independent execution contexts and may overlap.
-    kIndependentContextsConcurrent,
+    kIndependentConcurrent,
 };
 
 struct PhaseExecutionResourceIdentity
 {
-    void const* executionContext{};
+    void const* tensorRTExecutionContext{};
     void const* workspace{};
     void const* ioBuffers{};
 };
@@ -83,25 +84,25 @@ struct PhaseExecutionSafetyContract
     PhaseExecutionResourceIdentity prefill;
     PhaseExecutionResourceIdentity decode;
 
-    static PhaseExecutionSafetyContract shared(void const* executionContext) noexcept;
+    static PhaseExecutionSafetyContract shared(void const* tensorRTExecutionContext) noexcept;
     static PhaseExecutionSafetyContract independent(PhaseExecutionResourceIdentity prefill,
         PhaseExecutionResourceIdentity decode) noexcept;
-    void validate(PhaseStreamExecutionMode mode) const;
+    void validate(PhaseTensorRTContextMode mode) const;
     bool provesIndependentResources() const noexcept;
 };
 
-//! CUDA-event handoff between PhaseQueueScheduler and two execution streams.
+//! CUDA-event handoff between PhaseQueueScheduler and two execution streams in one CUDA primary context.
 //!
-//! V1 permits one DispatchPlan in flight. The default shared-context mode uses
+//! V1 permits one DispatchPlan in flight. The default shared TensorRT context mode uses
 //! separate phase streams but orders decode after prefill because one TensorRT
-//! execution context cannot be enqueued concurrently. Independent contexts may
+//! execution context cannot be enqueued concurrently. Independent TensorRT contexts may
 //! opt into concurrent phase execution.
 class PhaseDispatchWorker
 {
 public:
     PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
-        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
+        PhaseTensorRTContextMode executionMode = PhaseTensorRTContextMode::kSharedSerialized,
         PhaseExecutionSafetyContract safetyContract = {});
     ~PhaseDispatchWorker() noexcept;
 
@@ -128,6 +129,9 @@ public:
     std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
     PhaseExecutionSafetyContract const& safetyContract() const noexcept;
 
+    //! CUDA primary context shared by the two phase streams.
+    CUcontext cudaContext() const noexcept;
+
 private:
     void enqueueDeferredDecode();
     void completePrefillInFlight();
@@ -140,7 +144,8 @@ private:
     PhaseDispatchWorkerCallbacks mCallbacks;
     cudaStream_t mPrefillStream{};
     cudaStream_t mDecodeStream{};
-    PhaseStreamExecutionMode mExecutionMode{PhaseStreamExecutionMode::kSharedContextSerialized};
+    CUcontext mCudaContext{};
+    PhaseTensorRTContextMode mExecutionMode{PhaseTensorRTContextMode::kSharedSerialized};
     PhaseExecutionSafetyContract mSafetyContract;
     cudaEvent_t mDispatchStart{};
     cudaEvent_t mPrefillStart{};

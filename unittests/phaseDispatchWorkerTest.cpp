@@ -146,6 +146,9 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     callbacks.onMetrics = [&](rt::PhaseDispatchMetrics const& sample) { metrics.push_back(sample); };
 
     rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream);
+    CUcontext expectedCudaContext{};
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(prefillStream, &expectedCudaContext));
+    EXPECT_EQ(worker.cudaContext(), expectedCudaContext);
     worker.runUntilIdle(8);
 
     EXPECT_EQ(prefillEnqueues, 3);
@@ -187,21 +190,21 @@ TEST(PhaseExecutionSafetyContractTest, ValidatesSharedAndIndependentResourceIden
     int identities[6]{};
     auto const independent = rt::PhaseExecutionSafetyContract::independent(
         {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[4], &identities[5]});
-    EXPECT_NO_THROW(independent.validate(rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent));
+    EXPECT_NO_THROW(independent.validate(rt::PhaseTensorRTContextMode::kIndependentConcurrent));
     EXPECT_TRUE(independent.provesIndependentResources());
 
     auto const aliasedWorkspace = rt::PhaseExecutionSafetyContract::independent(
         {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[1], &identities[5]});
     EXPECT_THROW(
-        aliasedWorkspace.validate(rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent), std::runtime_error);
+        aliasedWorkspace.validate(rt::PhaseTensorRTContextMode::kIndependentConcurrent), std::runtime_error);
     EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract{}.validate(
-        rt::PhaseStreamExecutionMode::kSharedContextSerialized));
+        rt::PhaseTensorRTContextMode::kSharedSerialized));
     EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract::shared(&identities[0])
-                        .validate(rt::PhaseStreamExecutionMode::kSharedContextSerialized));
+                        .validate(rt::PhaseTensorRTContextMode::kSharedSerialized));
     auto const mismatchedShared = rt::PhaseExecutionSafetyContract::independent(
         {&identities[0], nullptr, nullptr}, {&identities[1], nullptr, nullptr});
     EXPECT_THROW(
-        mismatchedShared.validate(rt::PhaseStreamExecutionMode::kSharedContextSerialized), std::runtime_error);
+        mismatchedShared.validate(rt::PhaseTensorRTContextMode::kSharedSerialized), std::runtime_error);
 }
 
 TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceProof)
@@ -228,10 +231,19 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceP
     int identities[6]{};
     auto const contract = rt::PhaseExecutionSafetyContract::independent(
         {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[4], &identities[5]});
+    EXPECT_THROW(
+        {
+            rt::PhaseDispatchWorker invalidWorker(scheduler, callbacks, prefillStream, prefillStream,
+                rt::PhaseTensorRTContextMode::kIndependentConcurrent, contract);
+        },
+        std::runtime_error);
     rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream,
-        rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent, contract);
+        rt::PhaseTensorRTContextMode::kIndependentConcurrent, contract);
 
     EXPECT_TRUE(worker.dispatchNext());
+    CUcontext currentCudaContext{};
+    CUDA_DRIVER_CHECK(cuCtxGetCurrent(&currentCudaContext));
+    EXPECT_EQ(worker.cudaContext(), currentCudaContext);
     EXPECT_EQ(prefillEnqueues, 1);
     EXPECT_EQ(decodeEnqueues, 1);
     worker.wait();
@@ -745,7 +757,7 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
         {&resourceIdentities[0], &resourceIdentities[1], &resourceIdentities[2]},
         {&resourceIdentities[3], &resourceIdentities[4], &resourceIdentities[5]});
     rt::PhaseContextServingFacade facade(2, schedulerConfig, std::move(callbacks), cacheManager, decodeTensorMap,
-        prefillStream, decodeStream, rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent, nullptr, 0, 1,
+        prefillStream, decodeStream, rt::PhaseTensorRTContextMode::kIndependentConcurrent, nullptr, 0, 1,
         safetyContract);
 
     EXPECT_EQ(facade.submit(101, first, 0, 2), 0);
