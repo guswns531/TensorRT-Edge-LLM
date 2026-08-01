@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace trt_edgellm
@@ -47,6 +48,22 @@ using PhaseBatchCompletionCallback = std::function<void(std::vector<PhaseWorkIte
 using PrefillCompletionCallback = std::function<PhasePrefillCompletion(PhaseWorkItem const&)>;
 using DecodeCompletionCallback = std::function<PhaseDecodeCompletion(PhaseWorkItem const&)>;
 
+struct PhaseDispatchMetrics
+{
+    size_t dispatchIndex{};
+    PhaseDispatchKind kind{PhaseDispatchKind::kNone};
+    int32_t prefillBatchSize{};
+    int32_t decodeBatchSize{};
+    int32_t prefillTokens{};
+    int32_t decodeTokens{};
+    double prefillQueueWaitUs{};
+    double decodeQueueWaitUs{};
+    float prefillGpuMs{};
+    float decodeGpuMs{};
+    float makespanGpuMs{};
+    float overlapRatio{};
+};
+
 struct PhaseDispatchWorkerCallbacks
 {
     PhaseEnqueueCallback enqueuePrefill;
@@ -56,6 +73,8 @@ struct PhaseDispatchWorkerCallbacks
     PhaseBatchCompletionCallback completeDecodeBatch;
     PrefillCompletionCallback completePrefill;
     DecodeCompletionCallback completeDecode;
+    //! Observe one immutable timing record after all phase completions.
+    std::function<void(PhaseDispatchMetrics const&)> onMetrics;
 };
 
 //! Controls whether phase enqueues may overlap across streams.
@@ -101,12 +120,14 @@ public:
 
     bool busy() const noexcept;
     size_t dispatchCount() const noexcept;
+    std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
 
 private:
     void enqueueDeferredDecode();
     void completePrefillInFlight();
     void completeDecodeInFlight();
     void completeInFlight();
+    void collectMetrics();
     bool eventReady(cudaEvent_t event) const;
 
     PhaseQueueScheduler& mScheduler;
@@ -115,9 +136,13 @@ private:
     cudaStream_t mDecodeStream{};
     PhaseStreamExecutionMode mExecutionMode{PhaseStreamExecutionMode::kSharedContextSerialized};
     cudaEvent_t mDispatchStart{};
+    cudaEvent_t mPrefillStart{};
     cudaEvent_t mPrefillDone{};
+    cudaEvent_t mDecodeStart{};
     cudaEvent_t mDecodeDone{};
     PhaseDispatchPlan mInFlight;
+    PhaseDispatchMetrics mCurrentMetrics;
+    std::optional<PhaseDispatchMetrics> mLastMetrics;
     bool mBusy{};
     bool mHasPrefill{};
     bool mHasDecode{};

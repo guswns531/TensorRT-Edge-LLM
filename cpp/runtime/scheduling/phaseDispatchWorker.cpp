@@ -39,15 +39,19 @@ PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDi
     check::check(static_cast<bool>(mCallbacks.enqueueDecode), "Decode enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.completePrefill), "Prefill completion callback is required.");
     check::check(static_cast<bool>(mCallbacks.completeDecode), "Decode completion callback is required.");
-    CUDA_CHECK(cudaEventCreateWithFlags(&mDispatchStart, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&mPrefillDone, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&mDecodeDone, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreate(&mDispatchStart));
+    CUDA_CHECK(cudaEventCreate(&mPrefillStart));
+    CUDA_CHECK(cudaEventCreate(&mPrefillDone));
+    CUDA_CHECK(cudaEventCreate(&mDecodeStart));
+    CUDA_CHECK(cudaEventCreate(&mDecodeDone));
 }
 
 PhaseDispatchWorker::~PhaseDispatchWorker() noexcept
 {
     static_cast<void>(cudaEventDestroy(mDispatchStart));
+    static_cast<void>(cudaEventDestroy(mPrefillStart));
     static_cast<void>(cudaEventDestroy(mPrefillDone));
+    static_cast<void>(cudaEventDestroy(mDecodeStart));
     static_cast<void>(cudaEventDestroy(mDecodeDone));
 }
 
@@ -62,9 +66,22 @@ bool PhaseDispatchWorker::dispatchNext()
 
     mHasPrefill = !mInFlight.prefillBatch.empty();
     mHasDecode = !mInFlight.decodeBatch.empty();
+    mCurrentMetrics = PhaseDispatchMetrics{};
+    mCurrentMetrics.dispatchIndex = mDispatchCount + 1;
+    mCurrentMetrics.kind = mInFlight.kind;
+    mCurrentMetrics.prefillBatchSize = static_cast<int32_t>(mInFlight.prefillBatch.size());
+    mCurrentMetrics.decodeBatchSize = static_cast<int32_t>(mInFlight.decodeBatch.size());
+    for (PhaseWorkItem const& item : mInFlight.prefillBatch)
+    {
+        mCurrentMetrics.prefillTokens += item.tokenCount;
+    }
+    mCurrentMetrics.decodeTokens = static_cast<int32_t>(mInFlight.decodeBatch.size());
+    mCurrentMetrics.prefillQueueWaitUs = mInFlight.prefillQueueWaitUs;
+    mCurrentMetrics.decodeQueueWaitUs = mInFlight.decodeQueueWaitUs;
     CUDA_CHECK(cudaEventRecord(mDispatchStart, mPrefillStream));
     if (mHasPrefill)
     {
+        CUDA_CHECK(cudaEventRecord(mPrefillStart, mPrefillStream));
         mCallbacks.enqueuePrefill(mInFlight.prefillBatch, mPrefillStream);
         CUDA_CHECK(cudaEventRecord(mPrefillDone, mPrefillStream));
     }
@@ -81,6 +98,7 @@ bool PhaseDispatchWorker::dispatchNext()
         else
         {
             CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, mDispatchStart));
+            CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
             mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
             CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
         }
@@ -151,6 +169,7 @@ void PhaseDispatchWorker::wait()
 void PhaseDispatchWorker::enqueueDeferredDecode()
 {
     check::check(mDecodeDeferred && mHasDecode, "No deferred decode batch is available.");
+    CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
     mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
     CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
     mDecodeDeferred = false;
@@ -198,11 +217,39 @@ void PhaseDispatchWorker::completeInFlight()
 {
     completePrefillInFlight();
     completeDecodeInFlight();
+    collectMetrics();
     mInFlight = PhaseDispatchPlan{};
     mBusy = false;
     mHasPrefill = false;
     mHasDecode = false;
     mDecodeDeferred = false;
+}
+
+void PhaseDispatchWorker::collectMetrics()
+{
+    float phaseEndMs{};
+    if (mCurrentMetrics.prefillBatchSize > 0)
+    {
+        CUDA_CHECK(cudaEventElapsedTime(&mCurrentMetrics.prefillGpuMs, mPrefillStart, mPrefillDone));
+        CUDA_CHECK(cudaEventElapsedTime(&phaseEndMs, mDispatchStart, mPrefillDone));
+        mCurrentMetrics.makespanGpuMs = std::max(mCurrentMetrics.makespanGpuMs, phaseEndMs);
+    }
+    if (mCurrentMetrics.decodeBatchSize > 0)
+    {
+        CUDA_CHECK(cudaEventElapsedTime(&mCurrentMetrics.decodeGpuMs, mDecodeStart, mDecodeDone));
+        CUDA_CHECK(cudaEventElapsedTime(&phaseEndMs, mDispatchStart, mDecodeDone));
+        mCurrentMetrics.makespanGpuMs = std::max(mCurrentMetrics.makespanGpuMs, phaseEndMs);
+    }
+    float const phaseSum = mCurrentMetrics.prefillGpuMs + mCurrentMetrics.decodeGpuMs;
+    if (phaseSum > 0.0F)
+    {
+        mCurrentMetrics.overlapRatio = std::clamp(1.0F - mCurrentMetrics.makespanGpuMs / phaseSum, 0.0F, 1.0F);
+    }
+    mLastMetrics = mCurrentMetrics;
+    if (mCallbacks.onMetrics)
+    {
+        mCallbacks.onMetrics(*mLastMetrics);
+    }
 }
 
 void PhaseDispatchWorker::runUntilIdle(size_t maxDispatches)
@@ -229,6 +276,11 @@ bool PhaseDispatchWorker::busy() const noexcept
 size_t PhaseDispatchWorker::dispatchCount() const noexcept
 {
     return mDispatchCount;
+}
+
+std::optional<PhaseDispatchMetrics> const& PhaseDispatchWorker::lastMetrics() const noexcept
+{
+    return mLastMetrics;
 }
 
 } // namespace rt

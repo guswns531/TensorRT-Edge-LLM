@@ -80,17 +80,20 @@ bool PhaseQueueScheduler::cancel(uint64_t requestId)
     if (erased)
     {
         check::check(mActiveRequestIds.erase(requestId) == 1, "Cancelled request is not active");
+        check::check(mQueuedSince.erase(requestId) == 1, "Cancelled request has no queue timestamp");
     }
     return erased;
 }
 void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
 {
     mPrefillQueue.push_back(item);
+    mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
 }
 
 void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
 {
     mDecodeQueue.push_back(item);
+    mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
 }
 
 PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
@@ -154,8 +157,15 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
 }
 
 std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
-    std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill)
+    std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill, double& queueWaitUs)
 {
+    auto const now = std::chrono::steady_clock::now();
+    auto recordQueueWait = [&](uint64_t requestId) {
+        auto const timestamp = mQueuedSince.find(requestId);
+        check::check(timestamp != mQueuedSince.end(), "Dispatched request has no queue timestamp");
+        queueWaitUs = std::max(queueWaitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
+        mQueuedSince.erase(timestamp);
+    };
     int32_t const count = std::min<int32_t>(maxBatchSize, queue.size());
     std::vector<PhaseWorkItem> batch;
     batch.reserve(count);
@@ -166,6 +176,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
             PhaseWorkItem item = queue.front();
             queue.pop_front();
             check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
+            recordQueueWait(item.requestId);
             batch.push_back(item);
         }
         return batch;
@@ -184,6 +195,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         it = queue.erase(it);
         item.tokenCount = bucketTokens;
         check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
+        recordQueueWait(item.requestId);
         batch.push_back(item);
     }
     return batch;
@@ -204,11 +216,11 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.kind = kind;
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true);
+        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true, plan.prefillQueueWaitUs);
     }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.decodeBatch = popBatch(mDecodeQueue, mConfig.maxDecodeBatchSize, false);
+        plan.decodeBatch = popBatch(mDecodeQueue, mConfig.maxDecodeBatchSize, false, plan.decodeQueueWaitUs);
     }
     if (kind == PhaseDispatchKind::kDecode)
     {

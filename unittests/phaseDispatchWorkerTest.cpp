@@ -112,6 +112,7 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     int32_t prefillBatchCompletions{};
     int32_t decodeBatchCompletions{};
     std::unordered_map<uint64_t, int32_t> decodeSteps;
+    std::vector<rt::PhaseDispatchMetrics> metrics;
     rt::PhaseDispatchWorkerCallbacks callbacks;
     callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
         ASSERT_EQ(batch.size(), 1U);
@@ -139,6 +140,7 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
         bool const finished = item.requestId == 1 || step == 3;
         return rt::PhaseDecodeCompletion{item.tokenCount + 1, finished};
     };
+    callbacks.onMetrics = [&](rt::PhaseDispatchMetrics const& sample) { metrics.push_back(sample); };
 
     rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream);
     worker.runUntilIdle(8);
@@ -148,6 +150,25 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     EXPECT_EQ(prefillBatchCompletions, prefillEnqueues);
     EXPECT_EQ(decodeBatchCompletions, decodeEnqueues);
     EXPECT_EQ(worker.dispatchCount(), 4U);
+    ASSERT_EQ(metrics.size(), worker.dispatchCount());
+    ASSERT_TRUE(worker.lastMetrics().has_value());
+    EXPECT_EQ(worker.lastMetrics()->dispatchIndex, metrics.back().dispatchIndex);
+    EXPECT_EQ(metrics.front().kind, rt::PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(metrics.front().prefillBatchSize, 1);
+    EXPECT_EQ(metrics.front().decodeBatchSize, 1);
+    EXPECT_EQ(metrics.front().prefillTokens, 128);
+    EXPECT_EQ(metrics.front().decodeTokens, 1);
+    for (size_t index = 0; index < metrics.size(); ++index)
+    {
+        EXPECT_EQ(metrics[index].dispatchIndex, index + 1);
+        EXPECT_GE(metrics[index].prefillQueueWaitUs, 0.0);
+        EXPECT_GE(metrics[index].decodeQueueWaitUs, 0.0);
+        EXPECT_GE(metrics[index].prefillGpuMs, 0.0F);
+        EXPECT_GE(metrics[index].decodeGpuMs, 0.0F);
+        EXPECT_GE(metrics[index].makespanGpuMs, 0.0F);
+        EXPECT_GE(metrics[index].overlapRatio, 0.0F);
+        EXPECT_LE(metrics[index].overlapRatio, 1.0F);
+    }
     EXPECT_FALSE(worker.busy());
     EXPECT_TRUE(scheduler.empty());
     EXPECT_FALSE(scheduler.hasRequest(1));

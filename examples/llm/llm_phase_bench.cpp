@@ -184,6 +184,22 @@ void logSummary(char const* name, std::vector<Sample> const& samples, bool concu
         percentile(decode, 0.5F), percentile(contextPack, 0.5F), percentile(contextScatter, 0.5F));
 }
 
+void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::PhaseDispatchMetrics> const& metrics)
+{
+    std::ofstream output(path);
+    ELLM_CHECK(output.good(), "Failed to open dispatch metrics CSV: " + path.string());
+    output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,decode_tokens,"
+              "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio\n";
+    output << std::fixed << std::setprecision(6);
+    for (rt::PhaseDispatchMetrics const& sample : metrics)
+    {
+        output << sample.dispatchIndex << ',' << static_cast<int32_t>(sample.kind) << ',' << sample.prefillBatchSize
+               << ',' << sample.decodeBatchSize << ',' << sample.prefillTokens << ',' << sample.decodeTokens << ','
+               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
+               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << '\n';
+    }
+}
+
 void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samples, std::string const& scheduledMode)
 {
     std::ofstream output(path);
@@ -453,6 +469,7 @@ int main(int argc, char** argv)
         rt::PhaseGreedySampler decodeSampler(
             args.decodeBatch, config.outputVocabSize, config.eosTokenIds, "phase_serving_decode_sampler");
 
+        std::vector<rt::PhaseDispatchMetrics> facadeDispatchMetrics;
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
@@ -526,6 +543,8 @@ int main(int argc, char** argv)
         facadeCallbacks.isDecodeFinished = [](uint64_t, rt::DecodingInferenceContext const& context, int32_t row) {
             return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
+        facadeCallbacks.onDispatchMetrics
+            = [&](rt::PhaseDispatchMetrics const& sample) { facadeDispatchMetrics.push_back(sample); };
         auto const facadeMode = args.sharedContext ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
                                                    : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
@@ -541,6 +560,14 @@ int main(int argc, char** argv)
         ELLM_CHECK(facade.availableSlotCount() == phaseSlotCount,
             "Serving facade engine smoke did not release all stable slots");
         ELLM_CHECK(facade.registeredRequestCount() == 0, "Serving facade retained source registrations");
+        ELLM_CHECK(!facadeDispatchMetrics.empty(), "Serving facade emitted no dispatch metrics");
+        if (!args.outputCsv.empty())
+        {
+            std::filesystem::path dispatchCsv = args.outputCsv;
+            dispatchCsv.replace_filename(dispatchCsv.stem().string() + "-dispatch.csv");
+            writeDispatchMetrics(dispatchCsv, facadeDispatchMetrics);
+            LOG_INFO("Serving dispatch metrics written to %s", dispatchCsv.c_str());
+        }
         LOG_INFO(
             "Serving facade engine smoke passed: %d request context(s), stable admission -> actual greedy sampling -> "
             "repeated packed decode -> scatter -> slot release",

@@ -17,10 +17,12 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -83,6 +85,9 @@ struct PhaseDispatchPlan
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
     std::vector<PhaseWorkItem> prefillBatch;
     std::vector<PhaseWorkItem> decodeBatch;
+    //! Oldest selected row's host queue residence before dispatch.
+    double prefillQueueWaitUs{};
+    double decodeQueueWaitUs{};
 };
 
 //! Host-side two-queue batch scheduler for phase-separated, dual-stream inference.
@@ -122,7 +127,8 @@ private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
-    std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill);
+    std::vector<PhaseWorkItem> popBatch(
+        std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill, double& queueWaitUs);
     void enqueueKnownPrefill(PhaseWorkItem item);
     void enqueueKnownDecode(PhaseWorkItem item);
 
@@ -131,6 +137,7 @@ private:
     std::deque<PhaseWorkItem> mDecodeQueue;
     std::unordered_set<uint64_t> mActiveRequestIds;
     std::unordered_set<uint64_t> mInFlightRequestIds;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     int32_t mConsecutiveDecodeBatches{};
 };
 

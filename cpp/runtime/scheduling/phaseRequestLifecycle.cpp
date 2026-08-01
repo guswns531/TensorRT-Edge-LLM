@@ -90,6 +90,7 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
         }
         return completion;
     };
+    result.onMetrics = mCallbacks.execution.onMetrics;
     result.completeDecode = [this](PhaseWorkItem const& item) {
         PhaseDecodeCompletion const completion = mCallbacks.execution.completeDecode(item);
         check::check(completion.resultingKVLength >= item.tokenCount, "Decode completion moved KV length backwards.");

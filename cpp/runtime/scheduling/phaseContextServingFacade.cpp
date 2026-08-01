@@ -70,6 +70,7 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()
 {
     PhaseRequestLifecycleCallbacks result;
+    result.execution.onMetrics = mCallbacks.onDispatchMetrics;
     result.execution.enqueuePrefill
         = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueuePrefillBatch(batch, stream); };
     result.execution.completePrefillBatch = [this](std::vector<PhaseWorkItem> const& batch) {
