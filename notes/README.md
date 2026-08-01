@@ -42,6 +42,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 20. [Metrics 기반 adaptive scheduler](20-metrics-adaptive-scheduler.md)
 21. [Single-context/two-stream 실행 안전 계약](21-single-context-two-stream-safety.md)
 22. [Encoder queue/stream/event와 prefill handoff](22-encoder-phase-handoff.md)
+23. [동일 CUDA context 기반 3-phase continuous-load 로드맵](23-shared-cuda-context-continuous-load-roadmap.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
