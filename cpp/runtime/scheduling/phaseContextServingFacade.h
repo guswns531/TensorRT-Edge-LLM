@@ -97,7 +97,8 @@ public:
         PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
         PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
-        TensorMap* prefillTensorMap = nullptr, int32_t maxPrefillChunkTokens = 0, size_t maxPendingAdmissions = 0);
+        TensorMap* prefillTensorMap = nullptr, int32_t maxPrefillChunkTokens = 0, size_t maxPendingAdmissions = 0,
+        PhaseExecutionSafetyContract safetyContract = {});
 
     PhaseContextServingFacade(PhaseContextServingFacade const&) = delete;
     PhaseContextServingFacade& operator=(PhaseContextServingFacade const&) = delete;

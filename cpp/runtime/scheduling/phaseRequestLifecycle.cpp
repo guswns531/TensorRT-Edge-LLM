@@ -28,7 +28,7 @@ namespace rt
 
 PhaseRequestLifecycle::PhaseRequestLifecycle(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
     PhaseRequestLifecycleCallbacks callbacks, cudaStream_t prefillStream, cudaStream_t decodeStream,
-    PhaseStreamExecutionMode executionMode)
+    PhaseStreamExecutionMode executionMode, PhaseExecutionSafetyContract safetyContract)
     : mScheduler(std::move(schedulerConfig))
     , mSlotAllocator(maxSlots)
     , mCallbacks(std::move(callbacks))
@@ -38,7 +38,7 @@ PhaseRequestLifecycle::PhaseRequestLifecycle(int32_t maxSlots, PhaseQueueSchedul
     check::check(static_cast<bool>(mCallbacks.execution.completePrefill), "Prefill completion callback is required.");
     check::check(static_cast<bool>(mCallbacks.execution.completeDecode), "Decode completion callback is required.");
     mWorker = std::make_unique<PhaseDispatchWorker>(
-        mScheduler, makeWorkerCallbacks(), prefillStream, decodeStream, executionMode);
+        mScheduler, makeWorkerCallbacks(), prefillStream, decodeStream, executionMode, safetyContract);
 }
 
 PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()

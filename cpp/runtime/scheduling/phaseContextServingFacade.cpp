@@ -32,7 +32,8 @@ namespace rt
 PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
     PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
     cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode,
-    TensorMap* prefillTensorMap, int32_t maxPrefillChunkTokens, size_t maxPendingAdmissions)
+    TensorMap* prefillTensorMap, int32_t maxPrefillChunkTokens, size_t maxPendingAdmissions,
+    PhaseExecutionSafetyContract safetyContract)
     : mCallbacks(std::move(callbacks))
     , mCacheManager(cacheManager)
     , mHostAdmissionSlotIds(
@@ -64,7 +65,8 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
     check::check(!usesPackedDecode || static_cast<bool>(mCallbacks.completePackedDecode),
         "Packed serving decode completion callback is required.");
     mLifecycle = std::make_unique<PhaseRequestLifecycle>(
-        maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(), prefillStream, decodeStream, executionMode);
+        maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(), prefillStream, decodeStream, executionMode,
+        safetyContract);
 }
 
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()

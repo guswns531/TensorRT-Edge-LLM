@@ -120,6 +120,8 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     };
     callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
         ASSERT_EQ(batch.size(), 1U);
+        EXPECT_EQ(prefillEnqueues, prefillBatchCompletions)
+            << "Shared-context decode enqueue ran before prefill host completion";
         ++decodeEnqueues;
     };
     callbacks.completePrefillBatch = [&](std::vector<rt::PhaseWorkItem> const& batch) {
@@ -173,6 +175,66 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     EXPECT_TRUE(scheduler.empty());
     EXPECT_FALSE(scheduler.hasRequest(1));
     EXPECT_FALSE(scheduler.hasRequest(2));
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+
+TEST(PhaseExecutionSafetyContractTest, ValidatesSharedAndIndependentResourceIdentity)
+{
+    int identities[6]{};
+    auto const independent = rt::PhaseExecutionSafetyContract::independent(
+        {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[4], &identities[5]});
+    EXPECT_NO_THROW(independent.validate(rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent));
+    EXPECT_TRUE(independent.provesIndependentResources());
+
+    auto const aliasedWorkspace = rt::PhaseExecutionSafetyContract::independent(
+        {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[1], &identities[5]});
+    EXPECT_THROW(
+        aliasedWorkspace.validate(rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent), std::runtime_error);
+    EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract{}.validate(
+        rt::PhaseStreamExecutionMode::kSharedContextSerialized));
+    EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract::shared(&identities[0])
+                        .validate(rt::PhaseStreamExecutionMode::kSharedContextSerialized));
+    auto const mismatchedShared = rt::PhaseExecutionSafetyContract::independent(
+        {&identities[0], nullptr, nullptr}, {&identities[1], nullptr, nullptr});
+    EXPECT_THROW(
+        mismatchedShared.validate(rt::PhaseStreamExecutionMode::kSharedContextSerialized), std::runtime_error);
+}
+
+TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceProof)
+{
+    rt::PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 64});
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    int prefillEnqueues{};
+    int decodeEnqueues{};
+    rt::PhaseDispatchWorkerCallbacks callbacks;
+    callbacks.enqueuePrefill
+        = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
+    callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++decodeEnqueues; };
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    callbacks.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    int identities[6]{};
+    auto const contract = rt::PhaseExecutionSafetyContract::independent(
+        {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[4], &identities[5]});
+    rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream,
+        rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent, contract);
+
+    EXPECT_TRUE(worker.dispatchNext());
+    EXPECT_EQ(prefillEnqueues, 1);
+    EXPECT_EQ(decodeEnqueues, 1);
+    worker.wait();
+    EXPECT_TRUE(scheduler.empty());
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
@@ -587,8 +649,13 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     schedulerConfig.maxPrefillBatchSize = 2;
     schedulerConfig.maxDecodeBatchSize = 2;
     schedulerConfig.maxPrefillChunkTokens = 1;
+    int resourceIdentities[6]{};
+    auto const safetyContract = rt::PhaseExecutionSafetyContract::independent(
+        {&resourceIdentities[0], &resourceIdentities[1], &resourceIdentities[2]},
+        {&resourceIdentities[3], &resourceIdentities[4], &resourceIdentities[5]});
     rt::PhaseContextServingFacade facade(2, schedulerConfig, std::move(callbacks), cacheManager, decodeTensorMap,
-        prefillStream, decodeStream, rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent, nullptr, 0, 1);
+        prefillStream, decodeStream, rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent, nullptr, 0, 1,
+        safetyContract);
 
     EXPECT_EQ(facade.submit(101, first, 0, 2), 0);
     EXPECT_EQ(facade.submit(202, second, 0, 2), 1);

@@ -70,6 +70,26 @@ enum class PhaseStreamExecutionMode
     kIndependentContextsConcurrent,
 };
 
+struct PhaseExecutionResourceIdentity
+{
+    void const* executionContext{};
+    void const* workspace{};
+    void const* ioBuffers{};
+};
+
+//! Declares the resource-aliasing facts required by a phase execution mode.
+struct PhaseExecutionSafetyContract
+{
+    PhaseExecutionResourceIdentity prefill;
+    PhaseExecutionResourceIdentity decode;
+
+    static PhaseExecutionSafetyContract shared(void const* executionContext) noexcept;
+    static PhaseExecutionSafetyContract independent(PhaseExecutionResourceIdentity prefill,
+        PhaseExecutionResourceIdentity decode) noexcept;
+    void validate(PhaseStreamExecutionMode mode) const;
+    bool provesIndependentResources() const noexcept;
+};
+
 //! CUDA-event handoff between PhaseQueueScheduler and two execution streams.
 //!
 //! V1 permits one DispatchPlan in flight. The default shared-context mode uses
@@ -81,7 +101,8 @@ class PhaseDispatchWorker
 public:
     PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
-        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized);
+        PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
+        PhaseExecutionSafetyContract safetyContract = {});
     ~PhaseDispatchWorker() noexcept;
 
     PhaseDispatchWorker(PhaseDispatchWorker const&) = delete;
@@ -105,6 +126,7 @@ public:
     bool busy() const noexcept;
     size_t dispatchCount() const noexcept;
     std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
+    PhaseExecutionSafetyContract const& safetyContract() const noexcept;
 
 private:
     void enqueueDeferredDecode();
@@ -119,6 +141,7 @@ private:
     cudaStream_t mPrefillStream{};
     cudaStream_t mDecodeStream{};
     PhaseStreamExecutionMode mExecutionMode{PhaseStreamExecutionMode::kSharedContextSerialized};
+    PhaseExecutionSafetyContract mSafetyContract;
     cudaEvent_t mDispatchStart{};
     cudaEvent_t mPrefillStart{};
     cudaEvent_t mPrefillDone{};

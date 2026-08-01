@@ -27,14 +27,54 @@ namespace trt_edgellm
 namespace rt
 {
 
+PhaseExecutionSafetyContract PhaseExecutionSafetyContract::shared(void const* executionContext) noexcept
+{
+    PhaseExecutionSafetyContract result;
+    result.prefill.executionContext = executionContext;
+    result.decode.executionContext = executionContext;
+    return result;
+}
+
+PhaseExecutionSafetyContract PhaseExecutionSafetyContract::independent(
+    PhaseExecutionResourceIdentity prefill, PhaseExecutionResourceIdentity decode) noexcept
+{
+    return PhaseExecutionSafetyContract{prefill, decode};
+}
+
+bool PhaseExecutionSafetyContract::provesIndependentResources() const noexcept
+{
+    return prefill.executionContext != nullptr && decode.executionContext != nullptr && prefill.workspace != nullptr
+        && decode.workspace != nullptr && prefill.ioBuffers != nullptr && decode.ioBuffers != nullptr
+        && prefill.executionContext != decode.executionContext && prefill.workspace != decode.workspace
+        && prefill.ioBuffers != decode.ioBuffers;
+}
+
+void PhaseExecutionSafetyContract::validate(PhaseStreamExecutionMode mode) const
+{
+    if (mode == PhaseStreamExecutionMode::kIndependentContextsConcurrent)
+    {
+        check::check(provesIndependentResources(),
+            "Concurrent phase execution requires distinct non-null context, workspace, and I/O identities.");
+        return;
+    }
+    if (prefill.executionContext != nullptr || decode.executionContext != nullptr)
+    {
+        check::check(prefill.executionContext != nullptr && prefill.executionContext == decode.executionContext,
+            "Shared-context phase execution requires one identical execution-context identity.");
+    }
+}
+
 PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
-    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode)
+    cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode,
+    PhaseExecutionSafetyContract safetyContract)
     : mScheduler(scheduler)
     , mCallbacks(std::move(callbacks))
     , mPrefillStream(prefillStream)
     , mDecodeStream(decodeStream)
     , mExecutionMode(executionMode)
+    , mSafetyContract(safetyContract)
 {
+    mSafetyContract.validate(mExecutionMode);
     check::check(static_cast<bool>(mCallbacks.enqueuePrefill), "Prefill enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.enqueueDecode), "Decode enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.completePrefill), "Prefill completion callback is required.");
@@ -286,6 +326,11 @@ size_t PhaseDispatchWorker::dispatchCount() const noexcept
 std::optional<PhaseDispatchMetrics> const& PhaseDispatchWorker::lastMetrics() const noexcept
 {
     return mLastMetrics;
+}
+
+PhaseExecutionSafetyContract const& PhaseDispatchWorker::safetyContract() const noexcept
+{
+    return mSafetyContract;
 }
 
 } // namespace rt

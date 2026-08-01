@@ -552,8 +552,14 @@ int main(int argc, char** argv)
             = [&](rt::PhaseDispatchMetrics const& sample) { facadeDispatchMetrics.push_back(sample); };
         auto const facadeMode = args.sharedContext ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
                                                    : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
+        auto const facadeSafety = args.sharedContext
+            ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor.get())
+            : rt::PhaseExecutionSafetyContract::independent(
+                  {prefillExecutor.get(), &prefillContext, &prefillIO},
+                  {decodeRunner, decodeContext.get(), &decodeIO});
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
-            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize);
+            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize, 0,
+            facadeSafety);
         for (int32_t row = 0; row < args.prefillBatch; ++row)
         {
             uint64_t const requestId = static_cast<uint64_t>(1000 + row);
@@ -633,7 +639,13 @@ int main(int argc, char** argv)
             auto const executionMode = args.sharedContext
                 ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
                 : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
-            rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream, executionMode);
+            auto const safetyContract = args.sharedContext
+                ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor.get())
+                : rt::PhaseExecutionSafetyContract::independent(
+                      {prefillExecutor.get(), &prefillContext, &prefillIO},
+                      {decodeRunner, decodeContext.get(), &decodeIO});
+            rt::PhaseDispatchWorker worker(
+                scheduler, std::move(callbacks), prefillStream, decodeStream, executionMode, safetyContract);
             ELLM_CHECK(worker.dispatchNext(), "Phase worker failed to dispatch overlap plan");
             worker.wait();
             CUDA_CHECK(cudaStreamWaitEvent(setupStream, prefillEnd));
