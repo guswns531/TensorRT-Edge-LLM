@@ -72,10 +72,18 @@ bool PhaseDispatchWorker::dispatchNext()
     {
         bool const serializeSharedContext
             = mHasPrefill && mExecutionMode == PhaseStreamExecutionMode::kSharedContextSerialized;
-        cudaEvent_t const decodeStart = serializeSharedContext ? mPrefillDone : mDispatchStart;
-        CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, decodeStart));
-        mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
-        CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
+        if (serializeSharedContext)
+        {
+            // A stream wait does not protect host-side TensorRT context state.
+            // Defer prepare/execute until the prefill event has completed.
+            mDecodeDeferred = true;
+        }
+        else
+        {
+            CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, mDispatchStart));
+            mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
+            CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
+        }
     }
     mBusy = true;
     ++mDispatchCount;
@@ -103,6 +111,16 @@ bool PhaseDispatchWorker::poll()
     {
         return false;
     }
+    if (mDecodeDeferred)
+    {
+        if (!eventReady(mPrefillDone))
+        {
+            return false;
+        }
+        completePrefillInFlight();
+        enqueueDeferredDecode();
+        return false;
+    }
     if ((mHasPrefill && !eventReady(mPrefillDone)) || (mHasDecode && !eventReady(mDecodeDone)))
     {
         return false;
@@ -118,6 +136,11 @@ void PhaseDispatchWorker::wait()
     {
         CUDA_CHECK(cudaEventSynchronize(mPrefillDone));
     }
+    if (mDecodeDeferred)
+    {
+        completePrefillInFlight();
+        enqueueDeferredDecode();
+    }
     if (mHasDecode)
     {
         CUDA_CHECK(cudaEventSynchronize(mDecodeDone));
@@ -125,29 +148,60 @@ void PhaseDispatchWorker::wait()
     completeInFlight();
 }
 
-void PhaseDispatchWorker::completeInFlight()
+void PhaseDispatchWorker::enqueueDeferredDecode()
 {
-    if (mHasPrefill && mCallbacks.completePrefillBatch)
+    check::check(mDecodeDeferred && mHasDecode, "No deferred decode batch is available.");
+    mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
+    CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
+    mDecodeDeferred = false;
+}
+
+void PhaseDispatchWorker::completePrefillInFlight()
+{
+    if (!mHasPrefill)
+    {
+        return;
+    }
+    if (mCallbacks.completePrefillBatch)
     {
         mCallbacks.completePrefillBatch(mInFlight.prefillBatch);
-    }
-    if (mHasDecode && mCallbacks.completeDecodeBatch)
-    {
-        mCallbacks.completeDecodeBatch(mInFlight.decodeBatch);
     }
     for (PhaseWorkItem const& item : mInFlight.prefillBatch)
     {
         mScheduler.completePrefill(item, mCallbacks.completePrefill(item));
+    }
+    mInFlight.prefillBatch.clear();
+    mHasPrefill = false;
+}
+
+void PhaseDispatchWorker::completeDecodeInFlight()
+{
+    if (!mHasDecode)
+    {
+        return;
+    }
+    if (mCallbacks.completeDecodeBatch)
+    {
+        mCallbacks.completeDecodeBatch(mInFlight.decodeBatch);
     }
     for (PhaseWorkItem const& item : mInFlight.decodeBatch)
     {
         PhaseDecodeCompletion const completion = mCallbacks.completeDecode(item);
         mScheduler.completeDecode(item, completion.resultingKVLength, completion.finished);
     }
+    mInFlight.decodeBatch.clear();
+    mHasDecode = false;
+}
+
+void PhaseDispatchWorker::completeInFlight()
+{
+    completePrefillInFlight();
+    completeDecodeInFlight();
     mInFlight = PhaseDispatchPlan{};
     mBusy = false;
     mHasPrefill = false;
     mHasDecode = false;
+    mDecodeDeferred = false;
 }
 
 void PhaseDispatchWorker::runUntilIdle(size_t maxDispatches)

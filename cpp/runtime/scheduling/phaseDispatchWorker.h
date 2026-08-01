@@ -97,6 +97,9 @@ public:
     size_t dispatchCount() const noexcept;
 
 private:
+    void enqueueDeferredDecode();
+    void completePrefillInFlight();
+    void completeDecodeInFlight();
     void completeInFlight();
     bool eventReady(cudaEvent_t event) const;
 
@@ -112,6 +115,7 @@ private:
     bool mBusy{};
     bool mHasPrefill{};
     bool mHasDecode{};
+    bool mDecodeDeferred{};
     size_t mDispatchCount{};
 };
 

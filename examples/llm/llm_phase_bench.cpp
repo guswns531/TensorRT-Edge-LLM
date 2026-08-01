@@ -27,6 +27,7 @@
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
+#include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
@@ -62,6 +63,7 @@ struct Args
     int32_t pastKVLen{512};
     int32_t warmup{20};
     int32_t iterations{100};
+    bool sharedContext{};
 };
 
 struct Sample
@@ -76,7 +78,8 @@ void printUsage(char const* program)
 {
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
-        "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] [--outputCsv FILE]",
+        "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] [--sharedContext] "
+        "[--outputCsv FILE]",
         program);
 }
 
@@ -93,6 +96,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kWarmup,
         kIterations,
         kOutputCsv,
+        kSharedContext,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -101,7 +105,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
-        {"help", no_argument, nullptr, kHelp}, {}};
+        {"sharedContext", no_argument, nullptr, kSharedContext}, {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -117,6 +121,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kWarmup: args.warmup = std::stoi(optarg); break;
         case kIterations: args.iterations = std::stoi(optarg); break;
         case kOutputCsv: args.outputCsv = optarg; break;
+        case kSharedContext: args.sharedContext = true; break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -163,7 +168,7 @@ void logSummary(char const* name, std::vector<Sample> const& samples, bool concu
         percentile(makespans, 0.5F), percentile(makespans, 0.95F), percentile(prefill, 0.5F), percentile(decode, 0.5F));
 }
 
-void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samples)
+void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samples, std::string const& scheduledMode)
 {
     std::ofstream output(path);
     ELLM_CHECK(output.is_open(), "Failed to open phase benchmark CSV: " + path.string());
@@ -176,7 +181,7 @@ void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samp
         int32_t const iteration = sample.concurrent ? concurrentIndex++ : sequentialIndex++;
         float const phaseSum = sample.prefillMs + sample.decodeMs;
         float const overlap = phaseSum > 0.0F ? std::max(0.0F, 1.0F - sample.makespanMs / phaseSum) : 0.0F;
-        output << iteration << ',' << (sample.concurrent ? "concurrent" : "sequential") << ',' << sample.makespanMs
+        output << iteration << ',' << (sample.concurrent ? scheduledMode : "sequential") << ',' << sample.makespanMs
                << ',' << sample.prefillMs << ',' << sample.decodeMs << ',' << overlap << '\n';
     }
 }
@@ -217,7 +222,13 @@ int main(int argc, char** argv)
 
     std::filesystem::path const enginePath = engineDir / "llm.engine";
     auto prefillExecutor = rt::EngineExecutor::createForLLM(enginePath, config);
-    auto decodeExecutor = prefillExecutor->createSibling();
+    std::unique_ptr<rt::EngineExecutor> decodeExecutor;
+    rt::EngineExecutor* decodeRunner = prefillExecutor.get();
+    if (!args.sharedContext)
+    {
+        decodeExecutor = prefillExecutor->createSibling();
+        decodeRunner = decodeExecutor.get();
+    }
     rt::validateAgainstEngine(config, *prefillExecutor, "phase-prefill");
 
     std::unordered_map<std::string, std::string> const emptyLoraMap;
@@ -237,10 +248,14 @@ int main(int argc, char** argv)
     int64_t const contextBytes = prefillExecutor->getRequiredContextMemorySize();
     rt::Tensor prefillContext(
         {contextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_prefill_context_memory");
-    rt::Tensor decodeContext(
-        {contextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_decode_context_memory");
     prefillExecutor->setContextMemory(prefillContext);
-    decodeExecutor->setContextMemory(decodeContext);
+    std::unique_ptr<rt::Tensor> decodeContext;
+    if (decodeExecutor)
+    {
+        decodeContext = std::make_unique<rt::Tensor>(
+            rt::Coords{contextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_decode_context_memory");
+        decodeExecutor->setContextMemory(*decodeContext);
+    }
 
     std::vector<int32_t> prefillSlots(args.prefillBatch);
     std::iota(prefillSlots.begin(), prefillSlots.end(), 0);
@@ -325,18 +340,22 @@ int main(int argc, char** argv)
     };
     auto enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
         ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.decodeBatch, "Unexpected decode batch size");
+        int32_t const currentKVLength = batch.front().tokenCount;
+        ELLM_CHECK(std::all_of(batch.begin(), batch.end(),
+                       [currentKVLength](rt::PhaseWorkItem const& item) { return item.tokenCount == currentKVLength; }),
+            "Phase benchmark decode batch must have uniform KV lengths");
+
         decodeBatchState.prepare(batch, cacheManager, stream);
         CUDA_CHECK(cudaMemsetAsync(
             decodeIO.contextLengths.rawPointer(), 0, decodeIO.contextLengths.getMemoryCapacity(), stream));
-        kernel::incrementLengthTensor(decodeIO.contextLengths, args.pastKVLen + 1, stream);
+        kernel::incrementLengthTensor(decodeIO.contextLengths, currentKVLength + 1, stream);
         if (gemma4Ple)
         {
             gemma4Ple->reshapeOutputs(args.decodeBatch, 1);
         }
         for (int32_t round = 0; round < phaseRounds; ++round)
         {
-            if (!decodeExecutor->prepare(kDecodeProfile, decodeDims, decodeMap, stream)
-                || !decodeExecutor->execute(stream))
+            if (!decodeRunner->prepare(kDecodeProfile, decodeDims, decodeMap, stream) || !decodeRunner->execute(stream))
             {
                 return false;
             }
@@ -345,6 +364,41 @@ int main(int argc, char** argv)
         }
         return true;
     };
+
+    if (args.prefillBatch == args.decodeBatch)
+    {
+        rt::PhaseQueueSchedulerConfig lifecycleSchedulerConfig;
+        lifecycleSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
+        lifecycleSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
+        rt::PhaseRequestLifecycleCallbacks lifecycleCallbacks;
+        lifecycleCallbacks.execution.enqueuePrefill
+            = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+                  ELLM_CHECK(enqueuePrefill(batch, stream), "Lifecycle prefill enqueue failed");
+              };
+        lifecycleCallbacks.execution.enqueueDecode
+            = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+                  ELLM_CHECK(enqueueDecode(batch, stream), "Lifecycle decode enqueue failed");
+              };
+        lifecycleCallbacks.execution.completePrefill
+            = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+        lifecycleCallbacks.execution.completeDecode = [phaseRounds](rt::PhaseWorkItem const& item) {
+            return rt::PhaseDecodeCompletion{item.tokenCount + phaseRounds, true};
+        };
+        auto const lifecycleMode = args.sharedContext ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
+                                                      : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
+        rt::PhaseRequestLifecycle lifecycle(phaseSlotCount, lifecycleSchedulerConfig, std::move(lifecycleCallbacks),
+            prefillStream, decodeStream, lifecycleMode);
+        for (int32_t row = 0; row < args.prefillBatch; ++row)
+        {
+            int32_t const slot = lifecycle.submit(static_cast<uint64_t>(1000 + row), args.inputLen);
+            ELLM_CHECK(slot == row, "Lifecycle did not preserve deterministic stable slot allocation");
+        }
+        lifecycle.runUntilIdle(4);
+        ELLM_CHECK(lifecycle.empty(), "Lifecycle engine smoke did not drain all phase queues");
+        ELLM_CHECK(lifecycle.availableSlotCount() == phaseSlotCount,
+            "Lifecycle engine smoke did not release all stable slots");
+        LOG_INFO("Lifecycle engine smoke passed: %d request(s), prefill -> decode -> slot release", args.prefillBatch);
+    }
 
     cudaEvent_t start{};
     cudaEvent_t prefillBegin{};
@@ -392,9 +446,13 @@ int main(int argc, char** argv)
             };
             callbacks.completePrefill
                 = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
-            callbacks.completeDecode
-                = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
-            rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream);
+            callbacks.completeDecode = [phaseRounds](rt::PhaseWorkItem const& item) {
+                return rt::PhaseDecodeCompletion{item.tokenCount + phaseRounds, true};
+            };
+            auto const executionMode = args.sharedContext
+                ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
+                : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
+            rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream, executionMode);
             ELLM_CHECK(worker.dispatchNext(), "Phase worker failed to dispatch overlap plan");
             worker.wait();
             CUDA_CHECK(cudaStreamWaitEvent(setupStream, prefillEnd));
@@ -405,6 +463,10 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaEventRecord(prefillBegin, setupStream));
             ELLM_CHECK(enqueuePrefill(prefillBatch, setupStream), "Sequential prefill enqueue failed");
             CUDA_CHECK(cudaEventRecord(prefillEnd, setupStream));
+            if (args.sharedContext)
+            {
+                CUDA_CHECK(cudaEventSynchronize(prefillEnd));
+            }
             CUDA_CHECK(cudaEventRecord(decodeBegin, setupStream));
             ELLM_CHECK(enqueueDecode(decodeBatch, setupStream), "Sequential decode enqueue failed");
             CUDA_CHECK(cudaEventRecord(decodeEnd, setupStream));
@@ -432,7 +494,9 @@ int main(int argc, char** argv)
     }
 
     logSummary("Sequential", samples, false);
-    logSummary("Concurrent", samples, true);
+    char const* const scheduledName
+        = args.sharedContext ? "Shared-context scheduled" : "Independent-context concurrent";
+    logSummary(scheduledName, samples, true);
     std::vector<float> sequentialMakespans;
     std::vector<float> concurrentMakespans;
     for (Sample const& sample : samples)
@@ -440,10 +504,10 @@ int main(int argc, char** argv)
         (sample.concurrent ? concurrentMakespans : sequentialMakespans).push_back(sample.makespanMs);
     }
     float const speedup = percentile(sequentialMakespans, 0.5F) / percentile(concurrentMakespans, 0.5F);
-    LOG_INFO("Concurrent makespan speedup: %.4fx", speedup);
+    LOG_INFO("%s makespan speedup: %.4fx", scheduledName, speedup);
     if (!args.outputCsv.empty())
     {
-        writeCsv(args.outputCsv, samples);
+        writeCsv(args.outputCsv, samples, args.sharedContext ? "scheduled_shared" : "concurrent_independent");
         LOG_INFO("Raw CUDA-event samples written to %s", args.outputCsv.c_str());
     }
 
