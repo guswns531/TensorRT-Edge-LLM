@@ -296,6 +296,12 @@ void HybridCacheManager::commitPhaseSequenceLength(
     mKVCacheAllEmpty = false;
 }
 
+void HybridCacheManager::clearPhaseKVCacheLengths(rt::Tensor const& phaseSlotIds, cudaStream_t stream)
+{
+    check::check(mConfig.indexedKVCache, "Phase KV length clear requires indexed KV cache mode.");
+    kernel::clearIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, stream);
+}
+
 void HybridCacheManager::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, cudaStream_t stream)
 {
     int32_t const batchSize = static_cast<int32_t>(reuseKVCacheLengths.getShape()[0]);

@@ -139,6 +139,10 @@ void PhaseContextBatchAdapter::packDecode(std::vector<PhaseContextRow> const& ro
     }
 
     mBatchState.prepare(mWorkItems, mCacheManager, stream);
+    mPreviousSlotIds = mTensorMap.get(binding_names::kKVSlotIds);
+    mPreviousLengths = mTensorMap.get(binding_names::kKVCacheStartIndex);
+    check::check(mPreviousSlotIds != nullptr && mPreviousLengths != nullptr,
+        "Phase context adapter requires existing KV slot and length bindings.");
     mBatchState.bind(mTensorMap);
     mPackedContext.phaseBatchState = &mBatchState;
     mPacked = true;
@@ -180,8 +184,10 @@ void PhaseContextBatchAdapter::restoreBindings() noexcept
     }
     try
     {
-        mTensorMap.set(binding_names::kKVSlotIds, mCacheManager.getKVSlotIds());
-        mTensorMap.set(binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths());
+        mTensorMap.set(binding_names::kKVSlotIds, *mPreviousSlotIds);
+        mTensorMap.set(binding_names::kKVCacheStartIndex, *mPreviousLengths);
+        mPreviousSlotIds = nullptr;
+        mPreviousLengths = nullptr;
     }
     catch (...)
     {

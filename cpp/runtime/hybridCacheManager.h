@@ -187,6 +187,9 @@ public:
     void commitPhaseSequenceLength(
         rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, rt::Tensor const& increments, cudaStream_t stream);
 
+    //! Clear physical-slot lengths before those slots are admitted for new requests.
+    void clearPhaseKVCacheLengths(rt::Tensor const& phaseSlotIds, cudaStream_t stream);
+
     //! Reset state for new sequences. Validates batch size, copies reuse lengths
     //! from host to device, and updates the "all empty" flag.
     //! @param reuseKVCacheLengths Host INT32 tensor with reuse lengths, shape [batchSize].

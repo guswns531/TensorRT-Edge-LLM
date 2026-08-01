@@ -29,10 +29,12 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 
 11. [Production prefill/decode async completion 경계](11-async-phase-completion.md)
 12. [Continuous request lifecycle과 stable slot lease](12-continuous-request-lifecycle.md)
+
 ## 지금 내린 핵심 결론
 
 13. [실제 phase engine 연결과 shared/independent context 성능](13-phase-engine-connection-and-performance.md)
 14. [Production decode context batching과 adapter 성능](14-production-decode-context-batching.md)
+15. [Continuous request context serving facade와 KV 파편화](15-continuous-context-serving-facade.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,

@@ -76,6 +76,8 @@ private:
     DecodingInferenceContext mPackedContext;
     std::vector<PhaseContextRow> mRows;
     std::vector<PhaseWorkItem> mWorkItems;
+    Tensor* mPreviousSlotIds{};
+    Tensor* mPreviousLengths{};
     bool mPacked{};
 };
 

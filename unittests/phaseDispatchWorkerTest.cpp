@@ -20,6 +20,7 @@
 #include "common/cudaUtils.h"
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
+#include "runtime/scheduling/phaseContextServingFacade.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "testUtils.h"
 
@@ -271,8 +272,8 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     cacheManager.resetForNewSequences(hostLengths, nullptr);
 
     rt::TensorMap tensorMap;
-    tensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
-    tensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+    rt::PhaseBatchState previousBindings(maxSlots, "phase_context_previous_bindings");
+    previousBindings.bind(tensorMap);
 
     rt::DecodingInferenceContext first;
     first.initialize(2, 8, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
@@ -319,8 +320,8 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     EXPECT_EQ(second.tokenIds[0], (std::vector<int32_t>{6, 7, 13, 92}));
     EXPECT_EQ(first.currentGenerateLengths, (std::vector<int32_t>{1, 2}));
     EXPECT_EQ(second.currentGenerateLengths, (std::vector<int32_t>{2}));
-    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &cacheManager.getKVSlotIds());
-    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &cacheManager.getKVCacheLengths());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &previousBindings.slotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &previousBindings.lengths());
 }
 
 TEST(PhaseContextBatchAdapterTest, RejectsIncompatibleOrDuplicateDecodeRows)
@@ -352,6 +353,128 @@ TEST(PhaseContextBatchAdapterTest, RejectsIncompatibleOrDuplicateDecodeRows)
 
     second.temperature = first.temperature;
     EXPECT_THROW(adapter.packDecode({{1, &first, 0, 0, 5}, {2, &second, 0, 0, 5}}, nullptr), std::runtime_error);
+}
+
+TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
+{
+    rt::HybridCacheManager cacheManager = makeIndexedManager(2);
+    // Seed stale lengths to prove first-chunk admission clears only newly leased slots.
+    std::vector<int32_t> initialLengths{9, 7};
+    rt::Tensor hostLengths({2}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(hostLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    cacheManager.resetForNewSequences(hostLengths, prefillStream);
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+
+    rt::TensorMap decodeTensorMap;
+    decodeTensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
+    decodeTensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+    rt::PhaseBatchState prefillState(2, "phase_serving_prefill_test");
+
+    rt::DecodingInferenceContext first;
+    first.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+    first.rawBatchedInputIds = {{1, 2}};
+    first.tokenIds = {{1, 2, 10}};
+    first.effectivePrefillLengths = {2};
+    first.currentGenerateLengths = {1};
+
+    rt::DecodingInferenceContext second;
+    second.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+    second.rawBatchedInputIds = {{3, 4}};
+    second.tokenIds = {{3, 4, 20}};
+    second.effectivePrefillLengths = {2};
+    second.currentGenerateLengths = {1};
+
+    rt::DecodingInferenceContext third;
+    third.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+    third.rawBatchedInputIds = {{5, 6}};
+    third.tokenIds = {{5, 6, 30}};
+    third.effectivePrefillLengths = {2};
+    third.currentGenerateLengths = {1};
+
+    std::unordered_map<uint64_t, int32_t> const finishLengths{{101, 2}, {202, 3}, {303, 2}, {404, 2}};
+    std::vector<std::vector<int32_t>> decodeSlotBatches;
+    std::vector<rt::PhaseRequestSnapshot> terminals;
+    int32_t generatedToken{100};
+
+    rt::PhaseContextServingCallbacks callbacks;
+    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+        ASSERT_FALSE(batch.empty());
+        int32_t const chunkLength = batch.front().tokenCount;
+        ASSERT_TRUE(std::all_of(batch.begin(), batch.end(),
+            [chunkLength](rt::PhaseWorkItem const& item) { return item.tokenCount == chunkLength; }));
+        prefillState.prepare(batch, cacheManager, stream);
+        prefillState.commit(cacheManager, chunkLength, stream);
+    };
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.enqueueDecode = [&](rt::DecodingInferenceContext& packed) {
+        ASSERT_NE(packed.phaseBatchState, nullptr);
+        packed.phaseBatchState->commit(cacheManager, 1, packed.stream);
+    };
+    callbacks.completeDecode = [&](rt::DecodingInferenceContext& packed) {
+        decodeSlotBatches.push_back(copyDeviceToHost<int32_t>(packed.phaseBatchState->slotIds()));
+        for (int32_t row = 0; row < packed.activeBatchSize; ++row)
+        {
+            packed.tokenIds[row].push_back(generatedToken++);
+            ++packed.currentGenerateLengths[row];
+        }
+    };
+    callbacks.isDecodeFinished = [&](uint64_t requestId, rt::DecodingInferenceContext const& context, int32_t row) {
+        return context.currentGenerateLengths[static_cast<size_t>(row)] >= finishLengths.at(requestId);
+    };
+    callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
+
+    rt::PhaseQueueSchedulerConfig schedulerConfig;
+    schedulerConfig.maxPrefillBatchSize = 2;
+    schedulerConfig.maxDecodeBatchSize = 2;
+    schedulerConfig.maxPrefillChunkTokens = 1;
+    rt::PhaseContextServingFacade facade(2, schedulerConfig, std::move(callbacks), cacheManager, decodeTensorMap,
+        prefillStream, decodeStream, rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent);
+
+    EXPECT_EQ(facade.submit(101, first, 0, 2), 0);
+    EXPECT_EQ(facade.submit(202, second, 0, 2), 1);
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+
+    ASSERT_EQ(terminals.size(), 1U);
+    EXPECT_EQ(terminals[0].requestId, 101U);
+    EXPECT_EQ(terminals[0].status, rt::PhaseRequestStatus::kFinished);
+    EXPECT_EQ(facade.availableSlotCount(), 1);
+    EXPECT_EQ(facade.registeredRequestCount(), 1U);
+    EXPECT_EQ(facade.submit(303, third, 0, 2), 0);
+
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+
+    EXPECT_TRUE(facade.empty());
+    EXPECT_EQ(facade.activeRequestCount(), 0U);
+    EXPECT_EQ(facade.registeredRequestCount(), 0U);
+    EXPECT_EQ(facade.availableSlotCount(), 2);
+    EXPECT_EQ(decodeSlotBatches, (std::vector<std::vector<int32_t>>{{0, 1}, {1}, {0}}));
+    EXPECT_EQ(first.tokenIds[0].size(), 4U);
+    EXPECT_EQ(second.tokenIds[0].size(), 5U);
+    EXPECT_EQ(third.tokenIds[0].size(), 4U);
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{3, 4}));
+
+    EXPECT_EQ(facade.submit(404, first, 0, 2), 0);
+    EXPECT_TRUE(facade.cancel(404));
+    EXPECT_EQ(facade.registeredRequestCount(), 0U);
+    EXPECT_EQ(terminals.back().status, rt::PhaseRequestStatus::kCancelled);
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
 } // namespace
