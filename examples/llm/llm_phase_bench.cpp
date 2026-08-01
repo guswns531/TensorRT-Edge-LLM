@@ -77,6 +77,7 @@ struct Args
     int32_t loadPromptMax{};
     int32_t loadOutputMin{8};
     int32_t loadOutputMax{8};
+    int32_t maxOverlapPrefillTokens{128};
     uint32_t loadSeed{};
     rt::PhaseTensorRTContextMode trtContextMode{rt::PhaseTensorRTContextMode::kIndependentConcurrent};
     bool contextAdapter{};
@@ -115,7 +116,7 @@ void printUsage(char const* program)
         "[--trtContextMode shared|independent] "
         "[--contextAdapter] [--adaptiveScheduler] [--outputCsv FILE] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
-        "--loadOutputMin N --loadOutputMax N --loadSeed N --loadCsv FILE]",
+        "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --loadSeed N --loadCsv FILE]",
         program);
 }
 
@@ -142,6 +143,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kLoadPromptMax,
         kLoadOutputMin,
         kLoadOutputMax,
+        kMaxOverlapPrefillTokens,
         kLoadSeed,
         kLoadCsv,
         kHelp,
@@ -162,6 +164,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"loadPromptMax", required_argument, nullptr, kLoadPromptMax},
         {"loadOutputMin", required_argument, nullptr, kLoadOutputMin},
         {"loadOutputMax", required_argument, nullptr, kLoadOutputMax},
+        {"maxOverlapPrefillTokens", required_argument, nullptr, kMaxOverlapPrefillTokens},
         {"loadSeed", required_argument, nullptr, kLoadSeed},
         {"loadCsv", required_argument, nullptr, kLoadCsv}, {"help", no_argument, nullptr, kHelp}, {}};
 
@@ -205,6 +208,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kLoadPromptMax: args.loadPromptMax = std::stoi(optarg); break;
         case kLoadOutputMin: args.loadOutputMin = std::stoi(optarg); break;
         case kLoadOutputMax: args.loadOutputMax = std::stoi(optarg); break;
+        case kMaxOverlapPrefillTokens: args.maxOverlapPrefillTokens = std::stoi(optarg); break;
         case kLoadSeed: args.loadSeed = static_cast<uint32_t>(std::stoul(optarg)); break;
         case kLoadCsv: args.loadCsv = optarg; break;
         case kHelp: printUsage(argv[0]); return false;
@@ -215,7 +219,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
         && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
         && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
-        && args.loadOutputMin <= args.loadOutputMax;
+        && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0;
 }
 
 bool usesSharedTensorRTContext(Args const& args) noexcept
@@ -680,6 +684,7 @@ int main(int argc, char** argv)
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
+        facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
         facadeSchedulerConfig.maxPrefillChunkTokens = configuredChunkSize;
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
         rt::PhaseContextServingCallbacks facadeCallbacks;

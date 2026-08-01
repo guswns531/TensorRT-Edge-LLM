@@ -45,6 +45,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 23. [동일 CUDA context 기반 3-phase continuous-load 로드맵](23-shared-cuda-context-continuous-load-roadmap.md)
 24. [공유 CUDA context와 분리 TensorRT context 구현 결과](24-shared-cuda-independent-trt-contexts.md)
 25. [Deterministic continuous-load 구현과 Gemma 실험](25-deterministic-continuous-load.md)
+26. [Phase continuous-load sweep 결과](26-phase-load-sweep.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
