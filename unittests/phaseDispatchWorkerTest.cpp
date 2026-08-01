@@ -21,6 +21,7 @@
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
+#include "runtime/scheduling/phaseEncoderDispatchWorker.h"
 #include "runtime/scheduling/phaseGreedySampler.h"
 #include "runtime/scheduling/phasePrefillContextBatchAdapter.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
@@ -238,6 +239,96 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceP
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseEncoderExecutionSafetyContractTest, RejectsAliasedLlmResources)
+{
+    int identities[9]{};
+    rt::PhaseEncoderExecutionSafetyContract const valid{
+        {&identities[0], &identities[1], &identities[2]},
+        {{&identities[3], &identities[4], &identities[5]},
+            {&identities[6], &identities[7], &identities[8]}}};
+    EXPECT_NO_THROW(valid.validate());
+
+    rt::PhaseEncoderExecutionSafetyContract const aliased{
+        {&identities[0], &identities[1], &identities[2]},
+        {{&identities[3], &identities[1], &identities[5]}}};
+    EXPECT_THROW(aliased.validate(), std::runtime_error);
+}
+
+TEST(PhaseEncoderDispatchWorkerTest, BatchesAndHandsOffToPrefillAfterCudaEvent)
+{
+    rt::PhaseQueueSchedulerConfig llmConfig;
+    llmConfig.maxPrefillBatchSize = 2;
+    rt::PhaseQueueScheduler scheduler(llmConfig);
+    cudaStream_t encoderStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    rt::Tensor marker({4}, rt::DeviceType::kGPU, DataType::kINT32, "encoder_event_marker");
+
+    int32_t enqueueCount{};
+    int32_t batchCompletionCount{};
+    std::vector<rt::PhaseEncoderDispatchMetrics> metrics;
+    rt::PhaseEncoderDispatchWorkerCallbacks callbacks;
+    callbacks.enqueueEncoder = [&](std::vector<rt::PhaseEncoderWorkItem> const& batch, cudaStream_t stream) {
+        EXPECT_EQ(batch.size(), 2U);
+        ++enqueueCount;
+        CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 0, marker.getMemoryCapacity(), stream));
+    };
+    callbacks.completeEncoderBatch = [&](std::vector<rt::PhaseEncoderWorkItem> const& batch) {
+        EXPECT_EQ(batch.size(), 2U);
+        EXPECT_EQ(enqueueCount, 1);
+        ++batchCompletionCount;
+    };
+    callbacks.completeEncoder = [](rt::PhaseEncoderWorkItem const& item) {
+        return rt::PhaseWorkItem{item.requestId, item.inputUnits, item.kvSlotId, 0, item.inputUnits};
+    };
+    callbacks.onMetrics = [&](rt::PhaseEncoderDispatchMetrics const& sample) { metrics.push_back(sample); };
+
+    int identities[9]{};
+    rt::PhaseEncoderExecutionSafetyContract contract{
+        {&identities[0], &identities[1], &identities[2]},
+        {{&identities[3], &identities[4], &identities[5]},
+            {&identities[6], &identities[7], &identities[8]}}};
+    rt::PhaseEncoderQueueConfig encoderConfig;
+    encoderConfig.maxBatchSize = 2;
+    encoderConfig.maxQueuedRequests = 2;
+    rt::PhaseEncoderDispatchWorker worker(
+        scheduler, encoderConfig, std::move(callbacks), encoderStream, std::move(contract));
+
+    worker.submit({10, 4, 0});
+    worker.submit({20, 5, 1});
+    EXPECT_THROW(worker.submit({30, 3, 2}), std::runtime_error);
+    EXPECT_TRUE(worker.cancel(20));
+    EXPECT_THROW(worker.submit({40, 2, 0}), std::runtime_error);
+    worker.submit({30, 3, 2});
+    EXPECT_EQ(worker.queueSize(), 2U);
+    EXPECT_TRUE(worker.dispatchNext());
+    EXPECT_TRUE(worker.busy());
+    EXPECT_FALSE(worker.cancel(10));
+    worker.wait();
+
+    EXPECT_TRUE(worker.empty());
+    EXPECT_EQ(worker.dispatchCount(), 1U);
+    EXPECT_EQ(batchCompletionCount, 1);
+    ASSERT_EQ(metrics.size(), 1U);
+    EXPECT_EQ(metrics.front().batchSize, 2);
+    EXPECT_EQ(metrics.front().inputUnits, 7);
+    EXPECT_GE(metrics.front().queueWaitUs, 0.0);
+    EXPECT_GE(metrics.front().gpuMs, 0.0F);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 2U);
+    EXPECT_TRUE(scheduler.hasRequest(10));
+    EXPECT_TRUE(scheduler.hasRequest(30));
+    EXPECT_FALSE(scheduler.hasRequest(20));
+
+    for (int32_t dispatch = 0; dispatch < 2; ++dispatch)
+    {
+        rt::PhaseDispatchPlan const plan = scheduler.next();
+        ASSERT_EQ(plan.prefillBatch.size(), 1U);
+        rt::PhaseWorkItem const& item = plan.prefillBatch.front();
+        scheduler.completePrefill(item, item.tokenCount, true);
+    }
+    EXPECT_TRUE(scheduler.empty());
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
 }
 
 TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
