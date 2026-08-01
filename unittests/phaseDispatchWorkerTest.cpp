@@ -447,8 +447,16 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     third.effectivePrefillLengths = {2};
     third.currentGenerateLengths = {1};
 
+    rt::DecodingInferenceContext fourth;
+    fourth.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+    fourth.rawBatchedInputIds = {{7, 8}};
+    fourth.tokenIds = {{7, 8, 40}};
+    fourth.effectivePrefillLengths = {2};
+    fourth.currentGenerateLengths = {1};
+
     std::unordered_map<uint64_t, int32_t> const finishLengths{{101, 2}, {202, 3}, {303, 2}, {404, 2}};
     std::vector<std::vector<int32_t>> decodeSlotBatches;
+    std::vector<rt::PhaseAdmissionResult> admissions;
     std::vector<rt::PhaseRequestSnapshot> terminals;
     int32_t generatedToken{100};
 
@@ -478,16 +486,25 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
         return context.currentGenerateLengths[static_cast<size_t>(row)] >= finishLengths.at(requestId);
     };
     callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
+    callbacks.onAdmission = [&](rt::PhaseAdmissionResult const& result) { admissions.push_back(result); };
 
     rt::PhaseQueueSchedulerConfig schedulerConfig;
     schedulerConfig.maxPrefillBatchSize = 2;
     schedulerConfig.maxDecodeBatchSize = 2;
     schedulerConfig.maxPrefillChunkTokens = 1;
     rt::PhaseContextServingFacade facade(2, schedulerConfig, std::move(callbacks), cacheManager, decodeTensorMap,
-        prefillStream, decodeStream, rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent);
+        prefillStream, decodeStream, rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent, nullptr, 0, 1);
 
     EXPECT_EQ(facade.submit(101, first, 0, 2), 0);
     EXPECT_EQ(facade.submit(202, second, 0, 2), 1);
+    rt::PhaseAdmissionResult const pending = facade.submitOrQueue(303, third, 0, 2);
+    EXPECT_EQ(pending.status, rt::PhaseAdmissionStatus::kPending);
+    EXPECT_EQ(pending.kvSlotId, -1);
+    EXPECT_EQ(facade.pendingRequestCount(), 1U);
+    ASSERT_TRUE(facade.request(303).has_value());
+    EXPECT_EQ(facade.request(303)->status, rt::PhaseRequestStatus::kPending);
+    EXPECT_THROW(facade.submitOrQueue(404, fourth, 0, 2), std::runtime_error);
+    EXPECT_EQ(facade.registeredRequestCount(), 3U);
     ASSERT_TRUE(facade.dispatchNext());
     facade.wait();
     ASSERT_TRUE(facade.dispatchNext());
@@ -498,9 +515,14 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     ASSERT_EQ(terminals.size(), 1U);
     EXPECT_EQ(terminals[0].requestId, 101U);
     EXPECT_EQ(terminals[0].status, rt::PhaseRequestStatus::kFinished);
-    EXPECT_EQ(facade.availableSlotCount(), 1);
-    EXPECT_EQ(facade.registeredRequestCount(), 1U);
-    EXPECT_EQ(facade.submit(303, third, 0, 2), 0);
+    EXPECT_EQ(facade.availableSlotCount(), 0);
+    EXPECT_EQ(facade.pendingRequestCount(), 0U);
+    EXPECT_EQ(facade.registeredRequestCount(), 2U);
+    ASSERT_EQ(admissions.size(), 2U);
+    EXPECT_EQ(admissions[0].status, rt::PhaseAdmissionStatus::kPending);
+    EXPECT_EQ(admissions[1].status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(admissions[1].requestId, 303U);
+    EXPECT_EQ(admissions[1].kvSlotId, 0);
 
     ASSERT_TRUE(facade.dispatchNext());
     facade.wait();
@@ -520,8 +542,19 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     EXPECT_EQ(copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{3, 4}));
 
     EXPECT_EQ(facade.submit(404, first, 0, 2), 0);
+    EXPECT_EQ(facade.submit(405, fourth, 0, 2), 1);
+    rt::PhaseAdmissionResult const cancelledPending = facade.submitOrQueue(505, second, 0, 2);
+    EXPECT_EQ(cancelledPending.status, rt::PhaseAdmissionStatus::kPending);
+    EXPECT_TRUE(facade.cancel(505));
+    EXPECT_EQ(facade.pendingRequestCount(), 0U);
+    EXPECT_EQ(facade.registeredRequestCount(), 2U);
+    EXPECT_EQ(terminals.back().requestId, 505U);
+    EXPECT_EQ(terminals.back().kvSlotId, -1);
+    EXPECT_EQ(terminals.back().status, rt::PhaseRequestStatus::kCancelled);
+    EXPECT_TRUE(facade.cancel(405));
     EXPECT_TRUE(facade.cancel(404));
     EXPECT_EQ(facade.registeredRequestCount(), 0U);
+    EXPECT_EQ(terminals.back().requestId, 404U);
     EXPECT_EQ(terminals.back().status, rt::PhaseRequestStatus::kCancelled);
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));

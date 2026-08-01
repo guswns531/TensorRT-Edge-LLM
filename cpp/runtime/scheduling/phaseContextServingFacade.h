@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -37,6 +38,19 @@ using PhasePackedContextCallback = std::function<void(DecodingInferenceContext&)
 using PhasePackedPrefillCallback = std::function<void(PhasePrefillContextBatchAdapter&)>;
 using PhaseContextFinishedCallback
     = std::function<bool(uint64_t requestId, DecodingInferenceContext const& context, int32_t contextRow)>;
+
+enum class PhaseAdmissionStatus
+{
+    kAdmitted,
+    kPending,
+};
+
+struct PhaseAdmissionResult
+{
+    uint64_t requestId{};
+    int32_t kvSlotId{-1};
+    PhaseAdmissionStatus status{PhaseAdmissionStatus::kPending};
+};
 
 struct PhaseContextServingCallbacks
 {
@@ -58,6 +72,8 @@ struct PhaseContextServingCallbacks
     PhaseContextFinishedCallback isDecodeFinished;
     //! Observe finished or cancelled requests after their stable slot is released.
     std::function<void(PhaseRequestSnapshot const&)> onTerminal;
+    //! Observe immediate or deferred stable-slot admission.
+    std::function<void(PhaseAdmissionResult const&)> onAdmission;
 };
 
 //! Connects continuous request admission to stable-slot packed decode execution.
@@ -72,7 +88,7 @@ public:
         PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
         PhaseStreamExecutionMode executionMode = PhaseStreamExecutionMode::kSharedContextSerialized,
-        TensorMap* prefillTensorMap = nullptr, int32_t maxPrefillChunkTokens = 0);
+        TensorMap* prefillTensorMap = nullptr, int32_t maxPrefillChunkTokens = 0, size_t maxPendingAdmissions = 0);
 
     PhaseContextServingFacade(PhaseContextServingFacade const&) = delete;
     PhaseContextServingFacade& operator=(PhaseContextServingFacade const&) = delete;
@@ -83,6 +99,9 @@ public:
     //! The source context must remain alive until terminal completion or cancellation.
     //! @return The leased physical KV slot ID.
     int32_t submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount);
+    //! Admit immediately when a slot is free, otherwise apply bounded queue backpressure.
+    PhaseAdmissionResult submitOrQueue(
+        uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount);
     //! Cancel queued work. In-flight work can be cancelled after its event completes.
     bool cancel(uint64_t requestId);
 
@@ -94,6 +113,7 @@ public:
     bool empty() const noexcept;
     bool busy() const noexcept;
     size_t activeRequestCount() const noexcept;
+    size_t pendingRequestCount() const noexcept;
     size_t registeredRequestCount() const noexcept;
     int32_t availableSlotCount() const noexcept;
     std::optional<PhaseRequestSnapshot> request(uint64_t requestId) const;
@@ -105,10 +125,18 @@ private:
         int32_t contextRow{-1};
     };
 
+    struct PendingAdmission
+    {
+        uint64_t requestId{};
+        int32_t promptTokenCount{};
+    };
+
     PhaseRequestLifecycleCallbacks makeLifecycleCallbacks();
     void enqueuePrefillBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
     void enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
     void completeDecodeBatch(std::vector<PhaseWorkItem> const& batch);
+    void registerSource(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow);
+    void admitPendingRequests();
     Registration& registration(uint64_t requestId);
     Registration const& registration(uint64_t requestId) const;
 
@@ -119,6 +147,9 @@ private:
     std::unique_ptr<PhasePrefillContextBatchAdapter> mPrefillAdapter;
     PhaseContextBatchAdapter mDecodeAdapter;
     std::unordered_map<uint64_t, Registration> mRegistrations;
+    std::deque<PendingAdmission> mPendingAdmissions;
+    size_t mMaxPendingAdmissions{};
+    bool mPendingAdmissionRequired{};
     std::unique_ptr<PhaseRequestLifecycle> mLifecycle;
 };
 

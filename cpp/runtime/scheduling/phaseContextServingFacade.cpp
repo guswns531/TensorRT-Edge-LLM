@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -31,13 +32,14 @@ namespace rt
 PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueueSchedulerConfig schedulerConfig,
     PhaseContextServingCallbacks callbacks, HybridCacheManager& cacheManager, TensorMap& decodeTensorMap,
     cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseStreamExecutionMode executionMode,
-    TensorMap* prefillTensorMap, int32_t maxPrefillChunkTokens)
+    TensorMap* prefillTensorMap, int32_t maxPrefillChunkTokens, size_t maxPendingAdmissions)
     : mCallbacks(std::move(callbacks))
     , mCacheManager(cacheManager)
     , mHostAdmissionSlotIds(
           {maxSlots}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_serving_host_admission_slots")
     , mDeviceAdmissionSlotIds({maxSlots}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_serving_admission_slots")
     , mDecodeAdapter(schedulerConfig.maxDecodeBatchSize, cacheManager, decodeTensorMap, "phase_serving_decode")
+    , mMaxPendingAdmissions(maxPendingAdmissions)
 {
     check::check(maxSlots <= cacheManager.getGlobalKVCacheLengths().getShape()[0],
         "Serving facade slot count exceeds the indexed KV cache capacity.");
@@ -99,12 +101,13 @@ PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks
         {
             mCallbacks.onTerminal(snapshot);
         }
+        mPendingAdmissionRequired = true;
     };
     return result;
 }
 
-int32_t PhaseContextServingFacade::submit(
-    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount)
+void PhaseContextServingFacade::registerSource(
+    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow)
 {
     check::check(contextRow >= 0 && contextRow < context.activeBatchSize,
         "Serving source row is outside the active request context.");
@@ -116,8 +119,13 @@ int32_t PhaseContextServingFacade::submit(
         check::check(source.context != &context || source.contextRow != contextRow,
             "Serving source context row is already registered.");
     }
-
     mRegistrations.emplace(requestId, Registration{&context, contextRow});
+}
+
+int32_t PhaseContextServingFacade::submit(
+    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount)
+{
+    registerSource(requestId, context, contextRow);
     try
     {
         return mLifecycle->submit(requestId, promptTokenCount);
@@ -129,9 +137,79 @@ int32_t PhaseContextServingFacade::submit(
     }
 }
 
+PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(
+    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount)
+{
+    check::check(promptTokenCount > 0, "Phase request prompt length must be positive.");
+    registerSource(requestId, context, contextRow);
+    PhaseAdmissionResult result{requestId, -1, PhaseAdmissionStatus::kPending};
+    try
+    {
+        if (mLifecycle->availableSlotCount() > 0)
+        {
+            result.kvSlotId = mLifecycle->submit(requestId, promptTokenCount);
+            result.status = PhaseAdmissionStatus::kAdmitted;
+        }
+        else
+        {
+            check::check(mPendingAdmissions.size() < mMaxPendingAdmissions, "Serving pending admission queue is full.");
+            mPendingAdmissions.push_back({requestId, promptTokenCount});
+        }
+    }
+    catch (...)
+    {
+        mRegistrations.erase(requestId);
+        throw;
+    }
+    if (mCallbacks.onAdmission)
+    {
+        mCallbacks.onAdmission(result);
+    }
+    return result;
+}
+
+void PhaseContextServingFacade::admitPendingRequests()
+{
+    if (mLifecycle->busy())
+    {
+        mPendingAdmissionRequired = !mPendingAdmissions.empty();
+        return;
+    }
+    mPendingAdmissionRequired = false;
+    while (!mPendingAdmissions.empty() && mLifecycle->availableSlotCount() > 0)
+    {
+        PendingAdmission const admission = mPendingAdmissions.front();
+        int32_t const slot = mLifecycle->submit(admission.requestId, admission.promptTokenCount);
+        mPendingAdmissions.pop_front();
+        if (mCallbacks.onAdmission)
+        {
+            mCallbacks.onAdmission({admission.requestId, slot, PhaseAdmissionStatus::kAdmitted});
+        }
+    }
+}
+
 bool PhaseContextServingFacade::cancel(uint64_t requestId)
 {
-    return mLifecycle->cancel(requestId);
+    auto const pending = std::find_if(mPendingAdmissions.begin(), mPendingAdmissions.end(),
+        [requestId](PendingAdmission const& admission) { return admission.requestId == requestId; });
+    if (pending != mPendingAdmissions.end())
+    {
+        int32_t const promptTokenCount = pending->promptTokenCount;
+        mPendingAdmissions.erase(pending);
+        check::check(mRegistrations.erase(requestId) == 1, "Pending phase request has no registered source context.");
+        if (mCallbacks.onTerminal)
+        {
+            mCallbacks.onTerminal({requestId, -1, promptTokenCount, 0, PhaseRequestStatus::kCancelled});
+        }
+        return true;
+    }
+
+    bool const cancelled = mLifecycle->cancel(requestId);
+    if (cancelled && mPendingAdmissionRequired)
+    {
+        admitPendingRequests();
+    }
+    return cancelled;
 }
 
 void PhaseContextServingFacade::enqueuePrefillBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
@@ -209,27 +287,48 @@ PhaseContextServingFacade::Registration const& PhaseContextServingFacade::regist
 
 bool PhaseContextServingFacade::dispatchNext()
 {
+    admitPendingRequests();
     return mLifecycle->dispatchNext();
 }
 
 bool PhaseContextServingFacade::poll()
 {
-    return mLifecycle->poll();
+    bool const completed = mLifecycle->poll();
+    if (completed && mPendingAdmissionRequired)
+    {
+        admitPendingRequests();
+    }
+    return completed;
 }
 
 void PhaseContextServingFacade::wait()
 {
     mLifecycle->wait();
+    if (mPendingAdmissionRequired)
+    {
+        admitPendingRequests();
+    }
 }
 
 void PhaseContextServingFacade::runUntilIdle(size_t maxDispatches)
 {
-    mLifecycle->runUntilIdle(maxDispatches);
+    check::check(maxDispatches > 0, "Serving facade maxDispatches must be positive.");
+    size_t dispatches{};
+    while (!empty())
+    {
+        if (!busy())
+        {
+            check::check(dispatches < maxDispatches, "Serving facade exceeded its dispatch limit.");
+            check::check(dispatchNext(), "Serving facade failed to dispatch queued work.");
+            ++dispatches;
+        }
+        wait();
+    }
 }
 
 bool PhaseContextServingFacade::empty() const noexcept
 {
-    return mLifecycle->empty();
+    return mPendingAdmissions.empty() && mLifecycle->empty();
 }
 
 bool PhaseContextServingFacade::busy() const noexcept
@@ -240,6 +339,11 @@ bool PhaseContextServingFacade::busy() const noexcept
 size_t PhaseContextServingFacade::activeRequestCount() const noexcept
 {
     return mLifecycle->activeRequestCount();
+}
+
+size_t PhaseContextServingFacade::pendingRequestCount() const noexcept
+{
+    return mPendingAdmissions.size();
 }
 
 size_t PhaseContextServingFacade::registeredRequestCount() const noexcept
@@ -254,6 +358,12 @@ int32_t PhaseContextServingFacade::availableSlotCount() const noexcept
 
 std::optional<PhaseRequestSnapshot> PhaseContextServingFacade::request(uint64_t requestId) const
 {
+    auto const pending = std::find_if(mPendingAdmissions.begin(), mPendingAdmissions.end(),
+        [requestId](PendingAdmission const& admission) { return admission.requestId == requestId; });
+    if (pending != mPendingAdmissions.end())
+    {
+        return PhaseRequestSnapshot{requestId, -1, pending->promptTokenCount, 0, PhaseRequestStatus::kPending};
+    }
     return mLifecycle->request(requestId);
 }
 

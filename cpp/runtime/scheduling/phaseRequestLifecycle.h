@@ -33,6 +33,7 @@ namespace rt
 
 enum class PhaseRequestStatus
 {
+    kPending,
     kPrefill,
     kDecode,
     kFinished,
