@@ -62,6 +62,8 @@ public:
     void scatterDecode();
 
     DecodingInferenceContext& packedContext();
+    //! Device INT32 [batch] containing each source row's current decode token.
+    Tensor& tokenIds() noexcept;
     std::vector<PhaseWorkItem> const& workItems() const noexcept;
     bool packed() const noexcept;
 
@@ -72,6 +74,8 @@ private:
     int32_t mMaxBatchSize{};
     HybridCacheManager& mCacheManager;
     TensorMap& mTensorMap;
+    Tensor mHostTokenIds;
+    Tensor mDeviceTokenIds;
     PhaseBatchState mBatchState;
     DecodingInferenceContext mPackedContext;
     std::vector<PhaseContextRow> mRows;

@@ -107,7 +107,7 @@ public:
 
     //! Complete one dispatched prefill chunk. An unfinished prompt is put back
     //! on the prefill queue; the final chunk transitions to decode.
-    void completePrefill(PhaseWorkItem item, int32_t resultingKVLength);
+    void completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished = false);
 
     //! Complete one decode turn. Unfinished requests are requeued for decode;
     //! finished requests leave the scheduler.

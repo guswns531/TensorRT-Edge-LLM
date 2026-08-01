@@ -29,6 +29,7 @@
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
+#include "runtime/scheduling/phaseGreedySampler.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
@@ -345,7 +346,6 @@ int main(int argc, char** argv)
     }
     CUDA_CHECK(cudaStreamSynchronize(setupStream));
 
-    auto const decodeDims = config.decodeDims(args.decodeBatch);
     auto enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
         ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.prefillBatch, "Unexpected prefill batch size");
         prefillBatchState.prepare(batch, cacheManager, stream);
@@ -377,14 +377,18 @@ int main(int argc, char** argv)
         return true;
     };
     auto executeDecode = [&](rt::PhaseBatchState& activeBatchState, int32_t rounds, cudaStream_t stream) {
-        check::check(decodeIO.contextLengths.reshape({args.decodeBatch}), "Decode context lengths reshape failed");
+        int32_t const batchSize = activeBatchState.lengths().getShape()[0];
+        check::check(decodeIO.contextLengths.reshape({batchSize}), "Decode context lengths reshape failed");
+        check::check(
+            decodeIO.outputLogits.reshape({batchSize, config.outputVocabSize}), "Decode logits reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(decodeIO.contextLengths.rawPointer(), activeBatchState.lengths().rawPointer(),
-            args.decodeBatch * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            batchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
         kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
         if (gemma4Ple)
         {
-            gemma4Ple->reshapeOutputs(args.decodeBatch, 1);
+            gemma4Ple->reshapeOutputs(batchSize, 1);
         }
+        auto const decodeDims = config.decodeDims(batchSize);
         for (int32_t round = 0; round < rounds; ++round)
         {
             if (!decodeRunner->prepare(kDecodeProfile, decodeDims, decodeMap, stream) || !decodeRunner->execute(stream))
@@ -436,13 +440,18 @@ int main(int argc, char** argv)
         for (int32_t row = 0; row < args.prefillBatch; ++row)
         {
             auto source = std::make_unique<rt::DecodingInferenceContext>();
-            source->initialize(1, 2, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+            source->initialize(1, phaseRounds + 1, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
             source->rawBatchedInputIds = {std::vector<int32_t>(args.inputLen, 0)};
             source->tokenIds = source->rawBatchedInputIds;
             source->effectivePrefillLengths = {args.inputLen};
             source->currentGenerateLengths = {0};
             facadeContexts.push_back(std::move(source));
         }
+
+        rt::PhaseGreedySampler prefillSampler(
+            args.prefillBatch, config.outputVocabSize, config.eosTokenIds, "phase_serving_prefill_sampler");
+        rt::PhaseGreedySampler decodeSampler(
+            args.decodeBatch, config.outputVocabSize, config.eosTokenIds, "phase_serving_decode_sampler");
 
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
@@ -475,27 +484,48 @@ int main(int argc, char** argv)
                 gemma4Ple->embed(packed.tokenIds(), packed.stream());
                 gemma4Ple->reshapeOutputs(batchSize, chunkLength);
             }
+            check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
+                "Serving prefill logits reshape failed");
             auto const dims = config.prefillDims(batchSize, chunkLength, packed.initialChunk());
             ELLM_CHECK(prefillExecutor->prepare(kPrefillProfile, dims, prefillMap, packed.stream())
                     && prefillExecutor->execute(packed.stream()),
                 "Serving facade packed prefill enqueue failed");
             packed.phaseBatchState().commit(cacheManager, chunkLength, packed.stream());
+            bool const hasFinalPromptRow
+                = std::any_of(packed.rows().begin(), packed.rows().end(), [](rt::PhasePrefillContextRow const& row) {
+                      return row.tokenOffset + row.tokenCount == row.promptTokenCount;
+                  });
+            if (hasFinalPromptRow)
+            {
+                prefillSampler.enqueue(prefillIO.outputLogits, batchSize, packed.stream());
+            }
+        };
+        facadeCallbacks.completePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
+            if (prefillSampler.pending())
+            {
+                prefillSampler.completePrefill(packed);
+            }
         };
         facadeCallbacks.completePrefill
             = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
-        facadeCallbacks.enqueueDecode = [&](rt::DecodingInferenceContext& packed) {
+        facadeCallbacks.isPrefillFinished = [](uint64_t, rt::DecodingInferenceContext const& context, int32_t row) {
+            return context.finishedStates[static_cast<size_t>(row)] != 0;
+        };
+        facadeCallbacks.enqueuePackedDecode = [&](rt::PhaseContextBatchAdapter& adapter) {
+            rt::DecodingInferenceContext& packed = adapter.packedContext();
             ELLM_CHECK(packed.phaseBatchState != nullptr, "Serving facade decode has no phase batch state");
+            ELLM_CHECK(gemma4Ple != nullptr, "Serving facade actual token decode requires Gemma 4 PLE");
+            gemma4Ple->embed(adapter.tokenIds(), packed.stream);
+            gemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
             ELLM_CHECK(
                 executeDecode(*packed.phaseBatchState, 1, packed.stream), "Serving facade decode enqueue failed");
+            decodeSampler.enqueue(decodeIO.outputLogits, packed.activeBatchSize, packed.stream);
         };
-        facadeCallbacks.completeDecode = [](rt::DecodingInferenceContext& packed) {
-            for (int32_t row = 0; row < packed.activeBatchSize; ++row)
-            {
-                packed.tokenIds[static_cast<size_t>(row)].push_back(0);
-                ++packed.currentGenerateLengths[static_cast<size_t>(row)];
-            }
+        facadeCallbacks.completePackedDecode
+            = [&](rt::PhaseContextBatchAdapter& adapter) { decodeSampler.completeDecode(adapter.packedContext()); };
+        facadeCallbacks.isDecodeFinished = [](uint64_t, rt::DecodingInferenceContext const& context, int32_t row) {
+            return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
-        facadeCallbacks.isDecodeFinished = [](uint64_t, rt::DecodingInferenceContext const&, int32_t) { return true; };
         auto const facadeMode = args.sharedContext ? rt::PhaseStreamExecutionMode::kSharedContextSerialized
                                                    : rt::PhaseStreamExecutionMode::kIndependentContextsConcurrent;
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
@@ -506,14 +536,14 @@ int main(int argc, char** argv)
             int32_t const slot = facade.submit(requestId, *facadeContexts[static_cast<size_t>(row)], 0, args.inputLen);
             ELLM_CHECK(slot == row, "Serving facade did not preserve deterministic stable slot allocation");
         }
-        facade.runUntilIdle(static_cast<size_t>(phaseRounds + 2));
+        facade.runUntilIdle(static_cast<size_t>(2 * phaseRounds + 2));
         ELLM_CHECK(facade.empty(), "Serving facade engine smoke did not drain all phase queues");
         ELLM_CHECK(facade.availableSlotCount() == phaseSlotCount,
             "Serving facade engine smoke did not release all stable slots");
         ELLM_CHECK(facade.registeredRequestCount() == 0, "Serving facade retained source registrations");
         LOG_INFO(
-            "Serving facade engine smoke passed: %d request context(s), stable admission -> packed decode -> "
-            "scatter -> slot release",
+            "Serving facade engine smoke passed: %d request context(s), stable admission -> actual greedy sampling -> "
+            "repeated packed decode -> scatter -> slot release",
             args.prefillBatch);
     }
 
@@ -561,8 +591,9 @@ int main(int argc, char** argv)
                 ELLM_CHECK(enqueueDecode(batch, stream, args.contextAdapter), "Decode enqueue failed");
                 CUDA_CHECK(cudaEventRecord(decodeEnd, stream));
             };
-            callbacks.completePrefill
-                = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+            callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
+                return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, false};
+            };
             callbacks.completeDecode = [phaseRounds](rt::PhaseWorkItem const& item) {
                 return rt::PhaseDecodeCompletion{item.tokenCount + phaseRounds, true};
             };

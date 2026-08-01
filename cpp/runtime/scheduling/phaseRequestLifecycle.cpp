@@ -63,18 +63,32 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
         }
     };
     result.completePrefill = [this](PhaseWorkItem const& item) {
-        int32_t const resultingKVLength = mCallbacks.execution.completePrefill(item);
+        PhasePrefillCompletion const completion = mCallbacks.execution.completePrefill(item);
+        int32_t const resultingKVLength = completion.resultingKVLength;
         int32_t const completedPromptLength = item.tokenOffset + item.tokenCount;
         check::check(resultingKVLength >= completedPromptLength, "Prefill completion moved KV length backwards.");
         auto const it = mRequests.find(item.requestId);
         check::check(it != mRequests.end(), "Prefill completed for an unknown request.");
         PhaseRequestSnapshot& snapshot = it->second.snapshot;
         snapshot.kvLength = resultingKVLength;
-        if (completedPromptLength == item.promptTokenCount)
+        if (completion.finished)
+        {
+            check::check(completedPromptLength == item.promptTokenCount,
+                "Phase request cannot finish before its final prefill chunk.");
+            int32_t const slot = snapshot.kvSlotId;
+            mSlotAllocator.release(slot);
+            snapshot.kvSlotId = -1;
+            snapshot.status = PhaseRequestStatus::kFinished;
+            if (mCallbacks.onTerminal)
+            {
+                mCallbacks.onTerminal(snapshot);
+            }
+        }
+        else if (completedPromptLength == item.promptTokenCount)
         {
             snapshot.status = PhaseRequestStatus::kDecode;
         }
-        return resultingKVLength;
+        return completion;
     };
     result.completeDecode = [this](PhaseWorkItem const& item) {
         PhaseDecodeCompletion const completion = mCallbacks.execution.completeDecode(item);

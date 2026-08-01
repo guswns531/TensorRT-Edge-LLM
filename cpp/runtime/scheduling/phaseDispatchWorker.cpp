@@ -168,7 +168,8 @@ void PhaseDispatchWorker::completePrefillInFlight()
     }
     for (PhaseWorkItem const& item : mInFlight.prefillBatch)
     {
-        mScheduler.completePrefill(item, mCallbacks.completePrefill(item));
+        PhasePrefillCompletion const completion = mCallbacks.completePrefill(item);
+        mScheduler.completePrefill(item, completion.resultingKVLength, completion.finished);
     }
     mInFlight.prefillBatch.clear();
     mHasPrefill = false;

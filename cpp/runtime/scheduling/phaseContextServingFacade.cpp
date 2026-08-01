@@ -55,8 +55,14 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
             maxPrefillChunkTokens, cacheManager, *prefillTensorMap, "phase_serving_prefill");
     }
     check::check(static_cast<bool>(mCallbacks.completePrefill), "Serving prefill completion callback is required.");
-    check::check(static_cast<bool>(mCallbacks.enqueueDecode), "Serving decode enqueue callback is required.");
-    check::check(static_cast<bool>(mCallbacks.completeDecode), "Serving decode completion callback is required.");
+    bool const usesLegacyDecode = static_cast<bool>(mCallbacks.enqueueDecode);
+    bool const usesPackedDecode = static_cast<bool>(mCallbacks.enqueuePackedDecode);
+    check::check(usesLegacyDecode != usesPackedDecode,
+        "Serving facade requires exactly one legacy or packed decode enqueue callback.");
+    check::check(!usesLegacyDecode || static_cast<bool>(mCallbacks.completeDecode),
+        "Legacy serving decode completion callback is required.");
+    check::check(!usesPackedDecode || static_cast<bool>(mCallbacks.completePackedDecode),
+        "Packed serving decode completion callback is required.");
     mLifecycle = std::make_unique<PhaseRequestLifecycle>(
         maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(), prefillStream, decodeStream, executionMode);
 }
@@ -81,7 +87,18 @@ PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks
             mCallbacks.completePrefillBatch(batch);
         }
     };
-    result.execution.completePrefill = [this](PhaseWorkItem const& item) { return mCallbacks.completePrefill(item); };
+    result.execution.completePrefill = [this](PhaseWorkItem const& item) {
+        int32_t const resultingKVLength = mCallbacks.completePrefill(item);
+        bool finished{};
+        if (item.tokenOffset + item.tokenCount == item.promptTokenCount)
+        {
+            Registration const& source = registration(item.requestId);
+            finished = mCallbacks.isPrefillFinished
+                ? mCallbacks.isPrefillFinished(item.requestId, *source.context, source.contextRow)
+                : source.context->finishedStates[static_cast<size_t>(source.contextRow)] != 0;
+        }
+        return PhasePrefillCompletion{resultingKVLength, finished};
+    };
     result.execution.enqueueDecode
         = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueueDecodeBatch(batch, stream); };
     result.execution.completeDecodeBatch
@@ -259,7 +276,14 @@ void PhaseContextServingFacade::enqueueDecodeBatch(std::vector<PhaseWorkItem> co
         rows.push_back({item.requestId, source.context, source.contextRow, item.kvSlotId, item.tokenCount});
     }
     mDecodeAdapter.packDecode(rows, stream);
-    mCallbacks.enqueueDecode(mDecodeAdapter.packedContext());
+    if (mCallbacks.enqueuePackedDecode)
+    {
+        mCallbacks.enqueuePackedDecode(mDecodeAdapter);
+    }
+    else
+    {
+        mCallbacks.enqueueDecode(mDecodeAdapter.packedContext());
+    }
 }
 
 void PhaseContextServingFacade::completeDecodeBatch(std::vector<PhaseWorkItem> const& batch)
@@ -267,7 +291,14 @@ void PhaseContextServingFacade::completeDecodeBatch(std::vector<PhaseWorkItem> c
     check::check(mDecodeAdapter.packed(), "Serving decode completion has no packed context.");
     check::check(mDecodeAdapter.workItems().size() == batch.size(),
         "Serving decode completion batch size does not match its packed context.");
-    mCallbacks.completeDecode(mDecodeAdapter.packedContext());
+    if (mCallbacks.completePackedDecode)
+    {
+        mCallbacks.completePackedDecode(mDecodeAdapter);
+    }
+    else
+    {
+        mCallbacks.completeDecode(mDecodeAdapter.packedContext());
+    }
     mDecodeAdapter.scatterDecode();
 }
 

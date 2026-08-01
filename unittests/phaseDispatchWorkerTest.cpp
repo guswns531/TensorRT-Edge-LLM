@@ -21,6 +21,7 @@
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
+#include "runtime/scheduling/phaseGreedySampler.h"
 #include "runtime/scheduling/phasePrefillContextBatchAdapter.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "testUtils.h"
@@ -130,7 +131,9 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
         EXPECT_GT(decodeEnqueues, decodeBatchCompletions);
         ++decodeBatchCompletions;
     };
-    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, false};
+    };
     callbacks.completeDecode = [&](rt::PhaseWorkItem const& item) {
         int32_t const step = ++decodeSteps[item.requestId];
         bool const finished = item.requestId == 1 || step == 3;
@@ -180,8 +183,9 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
         }
     };
     callbacks.execution.enqueueDecode = callbacks.execution.enqueuePrefill;
-    callbacks.execution.completePrefill
-        = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.execution.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, false};
+    };
     callbacks.execution.completeDecode = [&](rt::PhaseWorkItem const& item) {
         int32_t const step = ++decodeSteps[item.requestId];
         return rt::PhaseDecodeCompletion{item.tokenCount + 1, step == 2};
@@ -233,8 +237,9 @@ TEST(PhaseRequestLifecycleTest, DefersInFlightCancellationUntilEventCompletion)
     rt::PhaseRequestLifecycleCallbacks callbacks;
     callbacks.execution.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
     callbacks.execution.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
-    callbacks.execution.completePrefill
-        = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.execution.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, false};
+    };
     callbacks.execution.completeDecode
         = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
     callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
@@ -259,6 +264,74 @@ TEST(PhaseRequestLifecycleTest, DefersInFlightCancellationUntilEventCompletion)
     }
 
     EXPECT_EQ(terminals.size(), 1U);
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseGreedySamplerTest, SamplesActualLogitsAndAppliesEosAndLengthState)
+{
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t vocabSize = 8;
+    rt::Tensor logits({batchSize, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "phase_sampler_logits");
+    std::vector<float> hostLogits(static_cast<size_t>(batchSize * vocabSize), -10.0F);
+    hostLogits[3] = 7.0F;
+    hostLogits[vocabSize + 5] = 9.0F;
+    CUDA_CHECK(
+        cudaMemcpy(logits.rawPointer(), hostLogits.data(), hostLogits.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    rt::DecodingInferenceContext context;
+    context.initialize(batchSize, 2, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    context.rawBatchedInputIds = {{1}, {2}};
+    context.tokenIds = context.rawBatchedInputIds;
+    context.effectivePrefillLengths = {1, 1};
+
+    rt::PhaseGreedySampler sampler(batchSize, vocabSize, {3}, "phase_sampler_test");
+    sampler.enqueue(logits, batchSize, nullptr);
+    ASSERT_TRUE(sampler.pending());
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    sampler.completeDecode(context);
+
+    EXPECT_FALSE(sampler.pending());
+    EXPECT_EQ(context.tokenIds[0], (std::vector<int32_t>{1, 3}));
+    EXPECT_EQ(context.tokenIds[1], (std::vector<int32_t>{2, 5}));
+    EXPECT_EQ(context.currentGenerateLengths, (std::vector<int32_t>{1, 1}));
+    EXPECT_EQ(context.finishedStates, (std::vector<int8_t>{1, 0}));
+}
+
+TEST(PhaseRequestLifecycleTest, ReleasesSlotWhenFinalPrefillSampleFinishes)
+{
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    int32_t decodeEnqueues{};
+    std::vector<rt::PhaseRequestSnapshot> terminals;
+    rt::PhaseRequestLifecycleCallbacks callbacks;
+    callbacks.execution.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.execution.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++decodeEnqueues; };
+    callbacks.execution.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    callbacks.execution.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
+
+    {
+        rt::PhaseRequestLifecycle lifecycle(
+            1, rt::PhaseQueueSchedulerConfig{}, std::move(callbacks), prefillStream, decodeStream);
+        EXPECT_EQ(lifecycle.submit(77, 2), 0);
+        lifecycle.runUntilIdle(2);
+        EXPECT_TRUE(lifecycle.empty());
+        EXPECT_EQ(lifecycle.availableSlotCount(), 1);
+        EXPECT_EQ(decodeEnqueues, 0);
+        ASSERT_EQ(terminals.size(), 1U);
+        EXPECT_EQ(terminals[0].requestId, 77U);
+        EXPECT_EQ(terminals[0].kvSlotId, -1);
+        EXPECT_EQ(terminals[0].kvLength, 2);
+        EXPECT_EQ(terminals[0].status, rt::PhaseRequestStatus::kFinished);
+    }
+
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
@@ -303,6 +376,7 @@ TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
     ASSERT_NE(packed.phaseBatchState, nullptr);
     EXPECT_EQ(packed.tokenIds[0], (std::vector<int32_t>{12}));
     EXPECT_EQ(packed.tokenIds[1], (std::vector<int32_t>{13}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.tokenIds()), (std::vector<int32_t>{12, 13}));
     EXPECT_EQ(packed.batchIndexMapping, (std::vector<int32_t>{0, 1}));
     EXPECT_EQ(copyDeviceToHost<int32_t>(packed.phaseBatchState->slotIds()), (std::vector<int32_t>{3, 0}));
     EXPECT_EQ(copyDeviceToHost<int32_t>(packed.phaseBatchState->lengths()), (std::vector<int32_t>{40, 10}));

@@ -30,6 +30,12 @@ namespace trt_edgellm
 namespace rt
 {
 
+struct PhasePrefillCompletion
+{
+    int32_t resultingKVLength{};
+    bool finished{};
+};
+
 struct PhaseDecodeCompletion
 {
     int32_t resultingKVLength{};
@@ -38,7 +44,7 @@ struct PhaseDecodeCompletion
 
 using PhaseEnqueueCallback = std::function<void(std::vector<PhaseWorkItem> const&, cudaStream_t)>;
 using PhaseBatchCompletionCallback = std::function<void(std::vector<PhaseWorkItem> const&)>;
-using PrefillCompletionCallback = std::function<int32_t(PhaseWorkItem const&)>;
+using PrefillCompletionCallback = std::function<PhasePrefillCompletion(PhaseWorkItem const&)>;
 using DecodeCompletionCallback = std::function<PhaseDecodeCompletion(PhaseWorkItem const&)>;
 
 struct PhaseDispatchWorkerCallbacks

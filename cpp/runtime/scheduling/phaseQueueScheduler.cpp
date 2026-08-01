@@ -221,7 +221,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     return plan;
 }
 
-void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength)
+void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
 {
     check::check(
         mInFlightRequestIds.erase(item.requestId) == 1, "Completed prefill request is not currently in flight");
@@ -230,6 +230,13 @@ void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingK
     int32_t const nextOffset = item.tokenOffset + item.tokenCount;
     check::check(nextOffset <= item.promptTokenCount, "Completed prefill chunk exceeds the prompt length");
     check::check(resultingKVLength >= nextOffset, "Resulting KV length is behind completed prompt progress");
+
+    if (finished)
+    {
+        check::check(nextOffset == item.promptTokenCount, "A request cannot finish before its final prefill chunk");
+        check::check(mActiveRequestIds.erase(item.requestId) == 1, "Finished prefill request is not active");
+        return;
+    }
 
     item.tokenOffset = nextOffset;
     if (nextOffset < item.promptTokenCount)

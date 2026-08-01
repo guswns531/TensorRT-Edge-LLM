@@ -36,6 +36,7 @@ namespace rt
 
 using PhasePackedContextCallback = std::function<void(DecodingInferenceContext&)>;
 using PhasePackedPrefillCallback = std::function<void(PhasePrefillContextBatchAdapter&)>;
+using PhasePackedDecodeCallback = std::function<void(PhaseContextBatchAdapter&)>;
 using PhaseContextFinishedCallback
     = std::function<bool(uint64_t requestId, DecodingInferenceContext const& context, int32_t contextRow)>;
 
@@ -63,11 +64,17 @@ struct PhaseContextServingCallbacks
     //! Run batch-level host completion after the prefill CUDA event.
     PhaseBatchCompletionCallback completePrefillBatch;
     //! Return the KV length after an individual prefill chunk completes.
-    PrefillCompletionCallback completePrefill;
-    //! Enqueue exactly one vanilla decode token for the packed context.
+    std::function<int32_t(PhaseWorkItem const&)> completePrefill;
+    //! Decide whether final-prefill sampling reached EOS or the generation limit.
+    PhaseContextFinishedCallback isPrefillFinished;
+    //! Legacy packed-context decode enqueue callback.
     PhasePackedContextCallback enqueueDecode;
-    //! Update packed token state after the decode CUDA event.
+    //! Production decode callback with device current-token staging and stable KV bindings.
+    PhasePackedDecodeCallback enqueuePackedDecode;
+    //! Legacy packed-context host completion after the decode CUDA event.
     PhasePackedContextCallback completeDecode;
+    //! Production decode completion before source-row scatter.
+    PhasePackedDecodeCallback completePackedDecode;
     //! Decide whether a scattered source row has reached its terminal state.
     PhaseContextFinishedCallback isDecodeFinished;
     //! Observe finished or cancelled requests after their stable slot is released.

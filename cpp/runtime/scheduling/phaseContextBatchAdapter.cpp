@@ -19,6 +19,7 @@
 
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
+#include "common/cudaMacros.h"
 
 #include <set>
 #include <unordered_set>
@@ -34,6 +35,8 @@ PhaseContextBatchAdapter::PhaseContextBatchAdapter(
     : mMaxBatchSize(maxBatchSize)
     , mCacheManager(cacheManager)
     , mTensorMap(tensorMap)
+    , mHostTokenIds({maxBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_token_ids")
+    , mDeviceTokenIds({maxBatchSize, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_token_ids")
     , mBatchState(maxBatchSize, name)
 {
     check::check(mMaxBatchSize > 0, "Phase context adapter max batch size must be positive.");
@@ -135,8 +138,13 @@ void PhaseContextBatchAdapter::packDecode(std::vector<PhaseContextRow> const& ro
         mPackedContext.currentGenerateLengths[packedRow] = source.currentGenerateLengths[sourceRow];
         mPackedContext.effectivePrefillLengths[packedRow] = source.effectivePrefillLengths[sourceRow];
         mPackedContext.finishedStates[packedRow] = source.finishedStates[sourceRow];
+        mHostTokenIds.dataPointer<int32_t>()[packedRow] = source.tokenIds[sourceRow].back();
         mWorkItems.push_back({row.requestId, row.kvLength, row.kvSlotId});
     }
+    check::check(mHostTokenIds.reshape({static_cast<int32_t>(rows.size())}), "Host decode token reshape failed.");
+    check::check(mDeviceTokenIds.reshape({static_cast<int32_t>(rows.size()), 1}), "Decode token reshape failed.");
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceTokenIds.rawPointer(), mHostTokenIds.rawPointer(), rows.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
 
     mBatchState.prepare(mWorkItems, mCacheManager, stream);
     mPreviousSlotIds = mTensorMap.get(binding_names::kKVSlotIds);
@@ -198,6 +206,11 @@ DecodingInferenceContext& PhaseContextBatchAdapter::packedContext()
 {
     check::check(mPacked, "No phase context decode batch is packed.");
     return mPackedContext;
+}
+
+Tensor& PhaseContextBatchAdapter::tokenIds() noexcept
+{
+    return mDeviceTokenIds;
 }
 
 std::vector<PhaseWorkItem> const& PhaseContextBatchAdapter::workItems() const noexcept
