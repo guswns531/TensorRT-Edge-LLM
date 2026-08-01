@@ -58,6 +58,31 @@ void PhaseQueueScheduler::enqueueDecode(PhaseWorkItem item)
     enqueueKnownDecode(item);
 }
 
+bool PhaseQueueScheduler::cancel(uint64_t requestId)
+{
+    if (mInFlightRequestIds.find(requestId) != mInFlightRequestIds.end())
+    {
+        return false;
+    }
+
+    auto eraseRequest = [requestId](std::deque<PhaseWorkItem>& queue) {
+        auto const it = std::find_if(
+            queue.begin(), queue.end(), [requestId](PhaseWorkItem const& item) { return item.requestId == requestId; });
+        if (it == queue.end())
+        {
+            return false;
+        }
+        queue.erase(it);
+        return true;
+    };
+
+    bool const erased = eraseRequest(mPrefillQueue) || eraseRequest(mDecodeQueue);
+    if (erased)
+    {
+        check::check(mActiveRequestIds.erase(requestId) == 1, "Cancelled request is not active");
+    }
+    return erased;
+}
 void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
 {
     mPrefillQueue.push_back(item);

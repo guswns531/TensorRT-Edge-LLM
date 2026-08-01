@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/cudaUtils.h"
 #include "runtime/scheduling/phaseBatchState.h"
+#include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "testUtils.h"
 
 #include <cstring>
@@ -146,6 +147,115 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     EXPECT_FALSE(scheduler.hasRequest(1));
     EXPECT_FALSE(scheduler.hasRequest(2));
 
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 2;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 2;
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    std::unordered_map<uint64_t, int32_t> observedSlots;
+    std::unordered_map<uint64_t, int32_t> decodeSteps;
+    std::vector<rt::PhaseRequestSnapshot> terminals;
+    rt::PhaseRequestLifecycleCallbacks callbacks;
+    callbacks.execution.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
+        for (rt::PhaseWorkItem const& item : batch)
+        {
+            auto const [it, inserted] = observedSlots.emplace(item.requestId, item.kvSlotId);
+            if (!inserted)
+            {
+                EXPECT_EQ(it->second, item.kvSlotId);
+            }
+        }
+    };
+    callbacks.execution.enqueueDecode = callbacks.execution.enqueuePrefill;
+    callbacks.execution.completePrefill
+        = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.execution.completeDecode = [&](rt::PhaseWorkItem const& item) {
+        int32_t const step = ++decodeSteps[item.requestId];
+        return rt::PhaseDecodeCompletion{item.tokenCount + 1, step == 2};
+    };
+    callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
+
+    {
+        rt::PhaseRequestLifecycle lifecycle(2, config, std::move(callbacks), prefillStream, decodeStream);
+        EXPECT_EQ(lifecycle.submit(10, 5), 0);
+        EXPECT_EQ(lifecycle.submit(20, 4), 1);
+        EXPECT_EQ(lifecycle.availableSlotCount(), 0);
+        EXPECT_THROW(lifecycle.submit(30, 3), std::runtime_error);
+        EXPECT_TRUE(lifecycle.cancel(20));
+        EXPECT_EQ(lifecycle.availableSlotCount(), 1);
+        EXPECT_EQ(lifecycle.submit(30, 3), 1);
+        EXPECT_EQ(lifecycle.activeRequestCount(), 2U);
+        lifecycle.runUntilIdle(16);
+        EXPECT_TRUE(lifecycle.empty());
+        EXPECT_EQ(lifecycle.activeRequestCount(), 0U);
+        EXPECT_EQ(lifecycle.availableSlotCount(), 2);
+        auto const request10 = lifecycle.request(10);
+        auto const request20 = lifecycle.request(20);
+        auto const request30 = lifecycle.request(30);
+        ASSERT_TRUE(request10.has_value());
+        ASSERT_TRUE(request20.has_value());
+        ASSERT_TRUE(request30.has_value());
+        EXPECT_EQ(request10->status, rt::PhaseRequestStatus::kFinished);
+        EXPECT_EQ(request20->status, rt::PhaseRequestStatus::kCancelled);
+        EXPECT_EQ(request30->status, rt::PhaseRequestStatus::kFinished);
+        EXPECT_EQ(request10->kvLength, 7);
+        EXPECT_EQ(request30->kvLength, 5);
+        EXPECT_EQ(observedSlots.at(10), 0);
+        EXPECT_EQ(observedSlots.at(30), 1);
+        EXPECT_EQ(terminals.size(), 3U);
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseRequestLifecycleTest, DefersInFlightCancellationUntilEventCompletion)
+{
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    std::vector<rt::PhaseRequestSnapshot> terminals;
+    rt::PhaseRequestLifecycleCallbacks callbacks;
+    callbacks.execution.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.execution.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.execution.completePrefill
+        = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.execution.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
+
+    {
+        rt::PhaseRequestLifecycle lifecycle(
+            1, rt::PhaseQueueSchedulerConfig{}, std::move(callbacks), prefillStream, decodeStream);
+        EXPECT_EQ(lifecycle.submit(7, 2), 0);
+        EXPECT_TRUE(lifecycle.dispatchNext());
+        EXPECT_TRUE(lifecycle.busy());
+        EXPECT_FALSE(lifecycle.cancel(7));
+        EXPECT_EQ(lifecycle.availableSlotCount(), 0);
+        lifecycle.wait();
+        auto const afterPrefill = lifecycle.request(7);
+        ASSERT_TRUE(afterPrefill.has_value());
+        EXPECT_EQ(afterPrefill->status, rt::PhaseRequestStatus::kDecode);
+        EXPECT_TRUE(lifecycle.cancel(7));
+        EXPECT_EQ(lifecycle.availableSlotCount(), 1);
+        auto const cancelled = lifecycle.request(7);
+        ASSERT_TRUE(cancelled.has_value());
+        EXPECT_EQ(cancelled->status, rt::PhaseRequestStatus::kCancelled);
+    }
+
+    EXPECT_EQ(terminals.size(), 1U);
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }

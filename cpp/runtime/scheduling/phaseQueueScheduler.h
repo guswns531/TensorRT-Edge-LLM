@@ -100,6 +100,9 @@ public:
     void enqueuePrefill(PhaseWorkItem item);
     void enqueueDecode(PhaseWorkItem item);
 
+    //! Cancel queued work. In-flight requests cannot be cancelled until their event completes.
+    bool cancel(uint64_t requestId);
+
     PhaseDispatchPlan next();
 
     //! Complete one dispatched prefill chunk. An unfinished prompt is put back
