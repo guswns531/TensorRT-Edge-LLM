@@ -83,6 +83,69 @@ TEST(PhaseQueueSchedulerTest, SupportsCustomPolicy)
     EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
 }
 
+TEST(PhaseQueueSchedulerTest, UsesEwmaCostToAvoidExpensiveOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.minMetricsSamples = 1;
+    config.metricsEwmaAlpha = 1.0F;
+    config.maxPredictedOverlapPrefillMs = 5.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kPrefill;
+    sample.prefillTokens = 100;
+    sample.prefillGpuMs = 10.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 512});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(scheduler.telemetry().sampleCount, 1U);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().prefillGpuMsPerToken, 0.1F);
+}
+
+TEST(PhaseQueueSchedulerTest, SupportsCustomMetricsPolicyAndEwmaTelemetry)
+{
+    bool called{};
+    PhaseQueueSchedulerConfig config;
+    config.metricsEwmaAlpha = 0.5F;
+    config.metricsPolicy = [&](PhaseQueueSnapshot const& state, PhaseSchedulerTelemetry const& telemetry) {
+        called = true;
+        EXPECT_EQ(state.prefillQueued, 1U);
+        EXPECT_EQ(state.decodeQueued, 1U);
+        EXPECT_EQ(telemetry.sampleCount, 2U);
+        EXPECT_NEAR(telemetry.prefillGpuMsPerToken, 0.15F, 1.0e-6F);
+        EXPECT_NEAR(telemetry.decodeGpuMsPerContextToken, 0.15F, 1.0e-6F);
+        EXPECT_NEAR(telemetry.overlapRatio, 0.3F, 1.0e-6F);
+        return PhaseDispatchKind::kPrefill;
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics first;
+    first.kind = PhaseDispatchKind::kOverlap;
+    first.prefillBatchSize = 1;
+    first.decodeBatchSize = 1;
+    first.prefillTokens = 100;
+    first.decodeContextTokens = 100;
+    first.prefillGpuMs = 10.0F;
+    first.decodeGpuMs = 10.0F;
+    first.overlapRatio = 0.4F;
+    scheduler.observeMetrics(first);
+    PhaseDispatchMetrics second = first;
+    second.prefillGpuMs = 20.0F;
+    second.decodeGpuMs = 20.0F;
+    second.overlapRatio = 0.2F;
+    scheduler.observeMetrics(second);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 512});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+    EXPECT_TRUE(called);
+    ASSERT_TRUE(scheduler.telemetry().lastDispatch.has_value());
+    EXPECT_FLOAT_EQ(scheduler.telemetry().lastDispatch->overlapRatio, 0.2F);
+}
+
 TEST(PhaseQueueSchedulerTest, RejectsDuplicateQueuedRequest)
 {
     PhaseQueueScheduler scheduler;

@@ -48,22 +48,6 @@ using PhaseBatchCompletionCallback = std::function<void(std::vector<PhaseWorkIte
 using PrefillCompletionCallback = std::function<PhasePrefillCompletion(PhaseWorkItem const&)>;
 using DecodeCompletionCallback = std::function<PhaseDecodeCompletion(PhaseWorkItem const&)>;
 
-struct PhaseDispatchMetrics
-{
-    size_t dispatchIndex{};
-    PhaseDispatchKind kind{PhaseDispatchKind::kNone};
-    int32_t prefillBatchSize{};
-    int32_t decodeBatchSize{};
-    int32_t prefillTokens{};
-    int32_t decodeTokens{};
-    double prefillQueueWaitUs{};
-    double decodeQueueWaitUs{};
-    float prefillGpuMs{};
-    float decodeGpuMs{};
-    float makespanGpuMs{};
-    float overlapRatio{};
-};
-
 struct PhaseDispatchWorkerCallbacks
 {
     PhaseEnqueueCallback enqueuePrefill;

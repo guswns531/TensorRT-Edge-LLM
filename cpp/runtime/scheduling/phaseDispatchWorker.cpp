@@ -76,6 +76,10 @@ bool PhaseDispatchWorker::dispatchNext()
         mCurrentMetrics.prefillTokens += item.tokenCount;
     }
     mCurrentMetrics.decodeTokens = static_cast<int32_t>(mInFlight.decodeBatch.size());
+    for (PhaseWorkItem const& item : mInFlight.decodeBatch)
+    {
+        mCurrentMetrics.decodeContextTokens += item.tokenCount;
+    }
     mCurrentMetrics.prefillQueueWaitUs = mInFlight.prefillQueueWaitUs;
     mCurrentMetrics.decodeQueueWaitUs = mInFlight.decodeQueueWaitUs;
     CUDA_CHECK(cudaEventRecord(mDispatchStart, mPrefillStream));
@@ -246,6 +250,7 @@ void PhaseDispatchWorker::collectMetrics()
         mCurrentMetrics.overlapRatio = std::clamp(1.0F - mCurrentMetrics.makespanGpuMs / phaseSum, 0.0F, 1.0F);
     }
     mLastMetrics = mCurrentMetrics;
+    mScheduler.observeMetrics(*mLastMetrics);
     if (mCallbacks.onMetrics)
     {
         mCallbacks.onMetrics(*mLastMetrics);

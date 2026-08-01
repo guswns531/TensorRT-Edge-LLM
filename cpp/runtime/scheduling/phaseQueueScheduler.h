@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -52,6 +53,33 @@ enum class PhaseDispatchKind
     kOverlap,
 };
 
+struct PhaseDispatchMetrics
+{
+    size_t dispatchIndex{};
+    PhaseDispatchKind kind{PhaseDispatchKind::kNone};
+    int32_t prefillBatchSize{};
+    int32_t decodeBatchSize{};
+    int32_t prefillTokens{};
+    int32_t decodeTokens{};
+    int32_t decodeContextTokens{};
+    double prefillQueueWaitUs{};
+    double decodeQueueWaitUs{};
+    float prefillGpuMs{};
+    float decodeGpuMs{};
+    float makespanGpuMs{};
+    float overlapRatio{};
+};
+
+struct PhaseSchedulerTelemetry
+{
+    size_t sampleCount{};
+    size_t overlapSampleCount{};
+    float prefillGpuMsPerToken{};
+    float decodeGpuMsPerContextToken{};
+    float overlapRatio{};
+    std::optional<PhaseDispatchMetrics> lastDispatch;
+};
+
 //! Read-only queue summary passed to a custom scheduling policy.
 struct PhaseQueueSnapshot
 {
@@ -60,9 +88,13 @@ struct PhaseQueueSnapshot
     int32_t prefillCandidateTokens{};
     int32_t decodeCandidateTokens{};
     int32_t consecutiveDecodeBatches{};
+    double prefillOldestWaitUs{};
+    double decodeOldestWaitUs{};
 };
 
 using PhaseSchedulingPolicy = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&)>;
+using PhaseMetricsSchedulingPolicy
+    = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&, PhaseSchedulerTelemetry const&)>;
 
 struct PhaseQueueSchedulerConfig
 {
@@ -77,6 +109,17 @@ struct PhaseQueueSchedulerConfig
     //! Admit one prefill batch after this many decode-only decisions so a
     //! continuous decode queue cannot starve new requests forever.
     int32_t decodeBurstLimit{8};
+    //! Opt in to the provided queue-deadline + EWMA GPU-cost policy.
+    bool enableMetricsPolicy{};
+    double prefillQueueWaitTargetUs{5000.0};
+    double decodeQueueWaitTargetUs{2000.0};
+    float maxPredictedOverlapPrefillMs{30.0F};
+    float minObservedOverlapRatio{0.05F};
+    size_t minMetricsSamples{2};
+    float metricsEwmaAlpha{0.2F};
+    //! Optional complete replacement for the provided metrics policy.
+    PhaseMetricsSchedulingPolicy metricsPolicy{};
+    //! Legacy queue-only policy, used when metrics policy is disabled.
     PhaseSchedulingPolicy policy{};
 };
 
@@ -123,8 +166,14 @@ public:
     bool empty() const noexcept;
     bool hasRequest(uint64_t requestId) const noexcept;
 
+    //! Update scheduling telemetry after one CUDA-complete dispatch.
+    void observeMetrics(PhaseDispatchMetrics const& metrics);
+    PhaseSchedulerTelemetry const& telemetry() const noexcept;
+
 private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
+    PhaseDispatchKind metricsDecision(
+        PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     std::vector<PhaseWorkItem> popBatch(
@@ -138,6 +187,7 @@ private:
     std::unordered_set<uint64_t> mActiveRequestIds;
     std::unordered_set<uint64_t> mInFlightRequestIds;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
+    PhaseSchedulerTelemetry mTelemetry;
     int32_t mConsecutiveDecodeBatches{};
 };
 

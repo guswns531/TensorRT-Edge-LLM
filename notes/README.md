@@ -39,6 +39,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 17. [Pending admission과 backpressure](17-pending-admission-backpressure.md)
 18. [실제 sampling과 반복 decode](18-actual-sampling-and-repeated-decode.md)
 19. [CUDA event와 queue metrics](19-cuda-event-and-queue-metrics.md)
+20. [Metrics 기반 adaptive scheduler](20-metrics-adaptive-scheduler.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,

@@ -35,6 +35,13 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
     check::check(mConfig.decodeBurstLimit > 0, "decodeBurstLimit must be positive");
+    check::check(mConfig.prefillQueueWaitTargetUs > 0.0, "prefillQueueWaitTargetUs must be positive");
+    check::check(mConfig.decodeQueueWaitTargetUs > 0.0, "decodeQueueWaitTargetUs must be positive");
+    check::check(mConfig.maxPredictedOverlapPrefillMs >= 0.0F, "maxPredictedOverlapPrefillMs must be non-negative");
+    check::check(mConfig.minObservedOverlapRatio >= 0.0F && mConfig.minObservedOverlapRatio <= 1.0F,
+        "minObservedOverlapRatio must be in [0, 1]");
+    check::check(
+        mConfig.metricsEwmaAlpha > 0.0F && mConfig.metricsEwmaAlpha <= 1.0F, "metricsEwmaAlpha must be in (0, 1]");
 }
 
 void PhaseQueueScheduler::enqueuePrefill(PhaseWorkItem item)
@@ -122,6 +129,19 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     {
         result.decodeCandidateTokens += mDecodeQueue[i].tokenCount;
     }
+    auto const now = std::chrono::steady_clock::now();
+    auto oldestWait = [&](std::deque<PhaseWorkItem> const& queue) {
+        double waitUs{};
+        for (PhaseWorkItem const& item : queue)
+        {
+            auto const timestamp = mQueuedSince.find(item.requestId);
+            check::check(timestamp != mQueuedSince.end(), "Queued request has no residence timestamp");
+            waitUs = std::max(waitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
+        }
+        return waitUs;
+    };
+    result.prefillOldestWaitUs = oldestWait(mPrefillQueue);
+    result.decodeOldestWaitUs = oldestWait(mDecodeQueue);
     return result;
 }
 
@@ -144,6 +164,39 @@ PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const&
         return PhaseDispatchKind::kPrefill;
     }
     if (state.prefillCandidateTokens <= mConfig.maxOverlapPrefillTokens)
+    {
+        return PhaseDispatchKind::kOverlap;
+    }
+    return PhaseDispatchKind::kDecode;
+}
+
+PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
+    PhaseQueueSnapshot const& state, PhaseSchedulerTelemetry const& telemetry) const noexcept
+{
+    if (state.prefillQueued == 0 || state.decodeQueued == 0)
+    {
+        return defaultDecision(state);
+    }
+
+    double const prefillPressure = state.prefillOldestWaitUs / mConfig.prefillQueueWaitTargetUs;
+    double const decodePressure = state.decodeOldestWaitUs / mConfig.decodeQueueWaitTargetUs;
+    if (prefillPressure >= 1.0 || decodePressure >= 1.0)
+    {
+        return prefillPressure > decodePressure ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
+    }
+    if (state.consecutiveDecodeBatches >= mConfig.decodeBurstLimit)
+    {
+        return PhaseDispatchKind::kPrefill;
+    }
+    if (telemetry.sampleCount < mConfig.minMetricsSamples || telemetry.prefillGpuMsPerToken <= 0.0F)
+    {
+        return defaultDecision(state);
+    }
+
+    float const predictedPrefillMs = telemetry.prefillGpuMsPerToken * static_cast<float>(state.prefillCandidateTokens);
+    bool const overlapEfficient
+        = telemetry.overlapSampleCount == 0 || telemetry.overlapRatio >= mConfig.minObservedOverlapRatio;
+    if (predictedPrefillMs <= mConfig.maxPredictedOverlapPrefillMs && overlapEfficient)
     {
         return PhaseDispatchKind::kOverlap;
     }
@@ -204,7 +257,10 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
 PhaseDispatchPlan PhaseQueueScheduler::next()
 {
     PhaseQueueSnapshot const state = snapshot();
-    PhaseDispatchKind const kind = mConfig.policy ? mConfig.policy(state) : defaultDecision(state);
+    PhaseDispatchKind const kind = mConfig.metricsPolicy
+        ? mConfig.metricsPolicy(state, mTelemetry)
+        : (mConfig.enableMetricsPolicy ? metricsDecision(state, mTelemetry)
+                                       : (mConfig.policy ? mConfig.policy(state) : defaultDecision(state)));
     check::check(kind != PhaseDispatchKind::kPrefill || state.prefillQueued > 0,
         "Scheduling policy selected an empty prefill queue");
     check::check(kind != PhaseDispatchKind::kDecode || state.decodeQueued > 0,
@@ -293,6 +349,34 @@ bool PhaseQueueScheduler::empty() const noexcept
 bool PhaseQueueScheduler::hasRequest(uint64_t requestId) const noexcept
 {
     return mActiveRequestIds.find(requestId) != mActiveRequestIds.end();
+}
+
+void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
+{
+    auto updateEwma = [alpha = mConfig.metricsEwmaAlpha](float& average, float sample) {
+        average = average > 0.0F ? alpha * sample + (1.0F - alpha) * average : sample;
+    };
+    if (metrics.prefillTokens > 0 && metrics.prefillGpuMs > 0.0F)
+    {
+        updateEwma(mTelemetry.prefillGpuMsPerToken, metrics.prefillGpuMs / static_cast<float>(metrics.prefillTokens));
+    }
+    if (metrics.decodeContextTokens > 0 && metrics.decodeGpuMs > 0.0F)
+    {
+        updateEwma(mTelemetry.decodeGpuMsPerContextToken,
+            metrics.decodeGpuMs / static_cast<float>(metrics.decodeContextTokens));
+    }
+    if (metrics.kind == PhaseDispatchKind::kOverlap && metrics.prefillBatchSize > 0 && metrics.decodeBatchSize > 0)
+    {
+        updateEwma(mTelemetry.overlapRatio, metrics.overlapRatio);
+        ++mTelemetry.overlapSampleCount;
+    }
+    ++mTelemetry.sampleCount;
+    mTelemetry.lastDispatch = metrics;
+}
+
+PhaseSchedulerTelemetry const& PhaseQueueScheduler::telemetry() const noexcept
+{
+    return mTelemetry;
 }
 
 } // namespace rt

@@ -68,6 +68,7 @@ struct Args
     int32_t iterations{100};
     bool sharedContext{};
     bool contextAdapter{};
+    bool adaptiveScheduler{};
 };
 
 struct Sample
@@ -85,7 +86,7 @@ void printUsage(char const* program)
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] [--sharedContext] "
-        "[--contextAdapter] [--outputCsv FILE]",
+        "[--contextAdapter] [--adaptiveScheduler] [--outputCsv FILE]",
         program);
 }
 
@@ -104,6 +105,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kOutputCsv,
         kSharedContext,
         kContextAdapter,
+        kAdaptiveScheduler,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -113,7 +115,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
         {"sharedContext", no_argument, nullptr, kSharedContext},
-        {"contextAdapter", no_argument, nullptr, kContextAdapter}, {"help", no_argument, nullptr, kHelp}, {}};
+        {"contextAdapter", no_argument, nullptr, kContextAdapter},
+        {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler}, {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -131,6 +134,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kOutputCsv: args.outputCsv = optarg; break;
         case kSharedContext: args.sharedContext = true; break;
         case kContextAdapter: args.contextAdapter = true; break;
+        case kAdaptiveScheduler: args.adaptiveScheduler = true; break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -474,6 +478,7 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
         facadeSchedulerConfig.maxPrefillChunkTokens = configuredChunkSize;
+        facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
         rt::PhaseContextServingCallbacks facadeCallbacks;
         facadeCallbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
             int32_t const batchSize = packed.batchSize();
@@ -568,6 +573,7 @@ int main(int argc, char** argv)
             writeDispatchMetrics(dispatchCsv, facadeDispatchMetrics);
             LOG_INFO("Serving dispatch metrics written to %s", dispatchCsv.c_str());
         }
+        LOG_INFO("Serving facade scheduler policy: %s", args.adaptiveScheduler ? "adaptive_metrics" : "queue_default");
         LOG_INFO(
             "Serving facade engine smoke passed: %d request context(s), stable admission -> actual greedy sampling -> "
             "repeated packed decode -> scatter -> slot release",
