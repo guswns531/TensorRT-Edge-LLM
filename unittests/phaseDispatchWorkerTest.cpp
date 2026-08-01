@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/cudaUtils.h"
 #include "runtime/scheduling/phaseBatchState.h"
+#include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "testUtils.h"
 
@@ -258,6 +259,99 @@ TEST(PhaseRequestLifecycleTest, DefersInFlightCancellationUntilEventCompletion)
     EXPECT_EQ(terminals.size(), 1U);
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseContextBatchAdapterTest, PacksScattersAndRestoresStableSlotBindings)
+{
+    int32_t const maxSlots = 4;
+    rt::HybridCacheManager cacheManager = makeIndexedManager(maxSlots);
+    std::vector<int32_t> initialLengths{10, 20, 30, 40};
+    rt::Tensor hostLengths({maxSlots}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(hostLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+    cacheManager.resetForNewSequences(hostLengths, nullptr);
+
+    rt::TensorMap tensorMap;
+    tensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
+    tensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+
+    rt::DecodingInferenceContext first;
+    first.initialize(2, 8, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    first.rawBatchedInputIds = {{1, 2}, {3, 4, 5}};
+    first.tokenIds = {{1, 2, 11}, {3, 4, 5, 12}};
+    first.effectivePrefillLengths = {2, 3};
+    first.currentGenerateLengths = {1, 1};
+
+    rt::DecodingInferenceContext second;
+    second.initialize(1, 8, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    second.rawBatchedInputIds = {{6, 7}};
+    second.tokenIds = {{6, 7, 13}};
+    second.effectivePrefillLengths = {2};
+    second.currentGenerateLengths = {1};
+
+    rt::PhaseContextBatchAdapter adapter(2, cacheManager, tensorMap, "phase_context_adapter_test");
+    std::vector<rt::PhaseContextRow> const rows{{101, &first, 1, 3, 40}, {202, &second, 0, 0, 10}};
+    adapter.packDecode(rows, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    ASSERT_TRUE(adapter.packed());
+    ASSERT_EQ(adapter.workItems().size(), 2U);
+    EXPECT_EQ(adapter.workItems()[0].kvSlotId, 3);
+    EXPECT_EQ(adapter.workItems()[1].kvSlotId, 0);
+    rt::DecodingInferenceContext& packed = adapter.packedContext();
+    ASSERT_NE(packed.phaseBatchState, nullptr);
+    EXPECT_EQ(packed.tokenIds[0], (std::vector<int32_t>{12}));
+    EXPECT_EQ(packed.tokenIds[1], (std::vector<int32_t>{13}));
+    EXPECT_EQ(packed.batchIndexMapping, (std::vector<int32_t>{0, 1}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(packed.phaseBatchState->slotIds()), (std::vector<int32_t>{3, 0}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(packed.phaseBatchState->lengths()), (std::vector<int32_t>{40, 10}));
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &packed.phaseBatchState->slotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &packed.phaseBatchState->lengths());
+
+    packed.tokenIds[0].push_back(91);
+    packed.tokenIds[1].push_back(92);
+    ++packed.currentGenerateLengths[0];
+    ++packed.currentGenerateLengths[1];
+    adapter.scatterDecode();
+
+    EXPECT_FALSE(adapter.packed());
+    EXPECT_EQ(first.tokenIds[0], (std::vector<int32_t>{1, 2, 11}));
+    EXPECT_EQ(first.tokenIds[1], (std::vector<int32_t>{3, 4, 5, 12, 91}));
+    EXPECT_EQ(second.tokenIds[0], (std::vector<int32_t>{6, 7, 13, 92}));
+    EXPECT_EQ(first.currentGenerateLengths, (std::vector<int32_t>{1, 2}));
+    EXPECT_EQ(second.currentGenerateLengths, (std::vector<int32_t>{2}));
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &cacheManager.getKVSlotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &cacheManager.getKVCacheLengths());
+}
+
+TEST(PhaseContextBatchAdapterTest, RejectsIncompatibleOrDuplicateDecodeRows)
+{
+    rt::HybridCacheManager cacheManager = makeIndexedManager(2);
+    std::vector<int32_t> initialLengths{5, 7};
+    rt::Tensor hostLengths({2}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(hostLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+    cacheManager.resetForNewSequences(hostLengths, nullptr);
+    rt::TensorMap tensorMap;
+    tensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
+    tensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+
+    rt::DecodingInferenceContext first;
+    first.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    first.rawBatchedInputIds = {{1}};
+    first.tokenIds = {{1, 10}};
+    first.effectivePrefillLengths = {1};
+
+    rt::DecodingInferenceContext second;
+    second.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    second.rawBatchedInputIds = {{2}};
+    second.tokenIds = {{2, 20}};
+    second.effectivePrefillLengths = {1};
+    second.temperature = 0.5F;
+
+    rt::PhaseContextBatchAdapter adapter(2, cacheManager, tensorMap, "phase_context_adapter_reject_test");
+    EXPECT_THROW(adapter.packDecode({{1, &first, 0, 0, 5}, {2, &second, 0, 1, 7}}, nullptr), std::runtime_error);
+
+    second.temperature = first.temperature;
+    EXPECT_THROW(adapter.packDecode({{1, &first, 0, 0, 5}, {2, &second, 0, 0, 5}}, nullptr), std::runtime_error);
 }
 
 } // namespace

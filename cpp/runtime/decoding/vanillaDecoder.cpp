@@ -26,6 +26,7 @@
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/scheduling/phaseBatchState.h"
 #include "sampler/sampling.h"
 
 #include <optional>
@@ -90,8 +91,16 @@ bool VanillaDecoder::enqueueDecodeStep(DecodingInferenceContext& context)
         mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize, mRuntime.deployment.base.outputVocabSize}),
         "Tensor reshape failed");
 
-    mRuntime.preprocess.stepPreparer.prepare(
-        InferencePhase::kDecode, activeBatchSize, mRuntime.base.cacheManager, mRuntime.base.pipelineIO, context.stream);
+    if (context.phaseBatchState != nullptr)
+    {
+        mRuntime.preprocess.stepPreparer.prepareDecodeForPhase(
+            activeBatchSize, context.phaseBatchState->lengths(), mRuntime.base.pipelineIO, context.stream);
+    }
+    else
+    {
+        mRuntime.preprocess.stepPreparer.prepare(InferencePhase::kDecode, activeBatchSize, mRuntime.base.cacheManager,
+            mRuntime.base.pipelineIO, context.stream);
+    }
     if (mRuntime.preprocess.deepstack)
     {
         mRuntime.preprocess.deepstack->useZeroTarget(mRuntime.base.tensorMap);
@@ -106,7 +115,15 @@ bool VanillaDecoder::enqueueDecodeStep(DecodingInferenceContext& context)
     }
     if (decodingStatus)
     {
-        mRuntime.base.cacheManager.commitSequenceLength(/*increment=*/1, context.stream);
+        constexpr int32_t kDecodeIncrement{1};
+        if (context.phaseBatchState != nullptr)
+        {
+            context.phaseBatchState->commit(mRuntime.base.cacheManager, kDecodeIncrement, context.stream);
+        }
+        else
+        {
+            mRuntime.base.cacheManager.commitSequenceLength(kDecodeIncrement, context.stream);
+        }
     }
     if (!decodingStatus)
     {

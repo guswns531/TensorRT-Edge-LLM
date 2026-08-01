@@ -73,6 +73,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     activeBatchSize = batchSize;
     loraWeightsName = loraName;
     stream = cudaStream;
+    phaseBatchState = nullptr;
 }
 
 } // namespace rt

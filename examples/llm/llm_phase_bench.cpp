@@ -26,12 +26,14 @@
 #include "runtime/exec/tensorMap.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/phaseBatchState.h"
+#include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -64,6 +66,7 @@ struct Args
     int32_t warmup{20};
     int32_t iterations{100};
     bool sharedContext{};
+    bool contextAdapter{};
 };
 
 struct Sample
@@ -72,6 +75,8 @@ struct Sample
     float makespanMs{};
     float prefillMs{};
     float decodeMs{};
+    float contextPackUs{};
+    float contextScatterUs{};
 };
 
 void printUsage(char const* program)
@@ -79,7 +84,7 @@ void printUsage(char const* program)
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] [--sharedContext] "
-        "[--outputCsv FILE]",
+        "[--contextAdapter] [--outputCsv FILE]",
         program);
 }
 
@@ -97,6 +102,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kIterations,
         kOutputCsv,
         kSharedContext,
+        kContextAdapter,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -105,7 +111,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
-        {"sharedContext", no_argument, nullptr, kSharedContext}, {"help", no_argument, nullptr, kHelp}, {}};
+        {"sharedContext", no_argument, nullptr, kSharedContext},
+        {"contextAdapter", no_argument, nullptr, kContextAdapter}, {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -122,6 +129,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kIterations: args.iterations = std::stoi(optarg); break;
         case kOutputCsv: args.outputCsv = optarg; break;
         case kSharedContext: args.sharedContext = true; break;
+        case kContextAdapter: args.contextAdapter = true; break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -155,6 +163,8 @@ void logSummary(char const* name, std::vector<Sample> const& samples, bool concu
     std::vector<float> makespans;
     std::vector<float> prefill;
     std::vector<float> decode;
+    std::vector<float> contextPack;
+    std::vector<float> contextScatter;
     for (Sample const& sample : samples)
     {
         if (sample.concurrent == concurrent)
@@ -162,17 +172,22 @@ void logSummary(char const* name, std::vector<Sample> const& samples, bool concu
             makespans.push_back(sample.makespanMs);
             prefill.push_back(sample.prefillMs);
             decode.push_back(sample.decodeMs);
+            contextPack.push_back(sample.contextPackUs);
+            contextScatter.push_back(sample.contextScatterUs);
         }
     }
-    LOG_INFO("%s: makespan median=%.4f ms p95=%.4f ms, prefill median=%.4f ms, decode median=%.4f ms", name,
-        percentile(makespans, 0.5F), percentile(makespans, 0.95F), percentile(prefill, 0.5F), percentile(decode, 0.5F));
+    LOG_INFO(
+        "%s: makespan median=%.4f ms p95=%.4f ms, prefill median=%.4f ms, decode median=%.4f ms, "
+        "context pack/scatter median=%.3f/%.3f us",
+        name, percentile(makespans, 0.5F), percentile(makespans, 0.95F), percentile(prefill, 0.5F),
+        percentile(decode, 0.5F), percentile(contextPack, 0.5F), percentile(contextScatter, 0.5F));
 }
 
 void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samples, std::string const& scheduledMode)
 {
     std::ofstream output(path);
     ELLM_CHECK(output.is_open(), "Failed to open phase benchmark CSV: " + path.string());
-    output << "iteration,mode,makespan_ms,prefill_ms,decode_ms,overlap_fraction\n";
+    output << "iteration,mode,makespan_ms,prefill_ms,decode_ms,overlap_fraction,context_pack_us,context_scatter_us\n";
     int32_t sequentialIndex{};
     int32_t concurrentIndex{};
     output << std::fixed << std::setprecision(6);
@@ -182,7 +197,8 @@ void writeCsv(std::filesystem::path const& path, std::vector<Sample> const& samp
         float const phaseSum = sample.prefillMs + sample.decodeMs;
         float const overlap = phaseSum > 0.0F ? std::max(0.0F, 1.0F - sample.makespanMs / phaseSum) : 0.0F;
         output << iteration << ',' << (sample.concurrent ? scheduledMode : "sequential") << ',' << sample.makespanMs
-               << ',' << sample.prefillMs << ',' << sample.decodeMs << ',' << overlap << '\n';
+               << ',' << sample.prefillMs << ',' << sample.decodeMs << ',' << overlap << ',' << sample.contextPackUs
+               << ',' << sample.contextScatterUs << '\n';
     }
 }
 
@@ -286,6 +302,28 @@ int main(int argc, char** argv)
     auto& cacheManager = *resources->cacheManagers[0];
     cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
 
+    std::vector<std::unique_ptr<rt::DecodingInferenceContext>> decodeSourceContexts;
+    std::vector<rt::PhaseContextRow> decodeContextRows;
+    std::unique_ptr<rt::PhaseContextBatchAdapter> decodeContextAdapter;
+    if (args.contextAdapter)
+    {
+        decodeSourceContexts.reserve(args.decodeBatch);
+        decodeContextRows.reserve(args.decodeBatch);
+        for (int32_t row = 0; row < args.decodeBatch; ++row)
+        {
+            auto source = std::make_unique<rt::DecodingInferenceContext>();
+            source->initialize(1, phaseRounds + 1, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+            source->rawBatchedInputIds = {{0}};
+            source->tokenIds = {{0}};
+            source->effectivePrefillLengths = {args.pastKVLen};
+            decodeContextRows.push_back(
+                {decodeBatch[row].requestId, source.get(), 0, decodeBatch[row].kvSlotId, args.pastKVLen});
+            decodeSourceContexts.push_back(std::move(source));
+        }
+        decodeContextAdapter = std::make_unique<rt::PhaseContextBatchAdapter>(
+            args.decodeBatch, cacheManager, decodeMap, "phase_decode_context_adapter");
+    }
+
     uploadInt32(prefillIO.contextLengths, std::vector<int32_t>(args.prefillBatch, args.inputLen), setupStream);
     uploadInt32(decodeIO.contextLengths, std::vector<int32_t>(args.decodeBatch, args.pastKVLen + 1), setupStream);
     uploadInt64(prefillIO.selectTokenIndices, std::vector<int64_t>(args.prefillBatch, args.inputLen - 1), setupStream);
@@ -338,17 +376,39 @@ int main(int argc, char** argv)
         }
         return true;
     };
-    auto enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+    float contextPackUs{};
+    auto enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream, bool useContextAdapter) {
         ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.decodeBatch, "Unexpected decode batch size");
         int32_t const currentKVLength = batch.front().tokenCount;
         ELLM_CHECK(std::all_of(batch.begin(), batch.end(),
                        [currentKVLength](rt::PhaseWorkItem const& item) { return item.tokenCount == currentKVLength; }),
             "Phase benchmark decode batch must have uniform KV lengths");
 
-        decodeBatchState.prepare(batch, cacheManager, stream);
-        CUDA_CHECK(cudaMemsetAsync(
-            decodeIO.contextLengths.rawPointer(), 0, decodeIO.contextLengths.getMemoryCapacity(), stream));
-        kernel::incrementLengthTensor(decodeIO.contextLengths, currentKVLength + 1, stream);
+        rt::PhaseBatchState* activeBatchState = &decodeBatchState;
+        if (useContextAdapter)
+        {
+            ELLM_CHECK(decodeContextAdapter != nullptr, "Context adapter was not initialized");
+            for (int32_t row = 0; row < args.decodeBatch; ++row)
+            {
+                decodeContextRows[row].requestId = batch[row].requestId;
+                decodeContextRows[row].kvSlotId = batch[row].kvSlotId;
+                decodeContextRows[row].kvLength = batch[row].tokenCount;
+            }
+            auto const packStart = std::chrono::steady_clock::now();
+            decodeContextAdapter->packDecode(decodeContextRows, stream);
+            auto const packEnd = std::chrono::steady_clock::now();
+            contextPackUs = std::chrono::duration<float, std::micro>(packEnd - packStart).count();
+            activeBatchState = decodeContextAdapter->packedContext().phaseBatchState;
+        }
+        else
+        {
+            contextPackUs = 0.0F;
+            decodeBatchState.prepare(batch, cacheManager, stream);
+        }
+        check::check(decodeIO.contextLengths.reshape({args.decodeBatch}), "Decode context lengths reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(decodeIO.contextLengths.rawPointer(), activeBatchState->lengths().rawPointer(),
+            args.decodeBatch * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+        kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
         if (gemma4Ple)
         {
             gemma4Ple->reshapeOutputs(args.decodeBatch, 1);
@@ -359,7 +419,7 @@ int main(int argc, char** argv)
             {
                 return false;
             }
-            decodeBatchState.commit(cacheManager, 1, stream);
+            activeBatchState->commit(cacheManager, 1, stream);
             kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
         }
         return true;
@@ -377,7 +437,7 @@ int main(int argc, char** argv)
               };
         lifecycleCallbacks.execution.enqueueDecode
             = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
-                  ELLM_CHECK(enqueueDecode(batch, stream), "Lifecycle decode enqueue failed");
+                  ELLM_CHECK(enqueueDecode(batch, stream, false), "Lifecycle decode enqueue failed");
               };
         lifecycleCallbacks.execution.completePrefill
             = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
@@ -441,7 +501,7 @@ int main(int argc, char** argv)
             };
             callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
                 CUDA_CHECK(cudaEventRecord(decodeBegin, stream));
-                ELLM_CHECK(enqueueDecode(batch, stream), "Decode enqueue failed");
+                ELLM_CHECK(enqueueDecode(batch, stream, args.contextAdapter), "Decode enqueue failed");
                 CUDA_CHECK(cudaEventRecord(decodeEnd, stream));
             };
             callbacks.completePrefill
@@ -468,12 +528,21 @@ int main(int argc, char** argv)
                 CUDA_CHECK(cudaEventSynchronize(prefillEnd));
             }
             CUDA_CHECK(cudaEventRecord(decodeBegin, setupStream));
-            ELLM_CHECK(enqueueDecode(decodeBatch, setupStream), "Sequential decode enqueue failed");
+            ELLM_CHECK(
+                enqueueDecode(decodeBatch, setupStream, args.contextAdapter), "Sequential decode enqueue failed");
             CUDA_CHECK(cudaEventRecord(decodeEnd, setupStream));
         }
         CUDA_CHECK(cudaEventRecord(stop, setupStream));
         CUDA_CHECK(cudaEventSynchronize(stop));
         Sample sample{concurrent};
+        sample.contextPackUs = contextPackUs;
+        if (args.contextAdapter)
+        {
+            auto const scatterStart = std::chrono::steady_clock::now();
+            decodeContextAdapter->scatterDecode();
+            auto const scatterEnd = std::chrono::steady_clock::now();
+            sample.contextScatterUs = std::chrono::duration<float, std::micro>(scatterEnd - scatterStart).count();
+        }
         CUDA_CHECK(cudaEventElapsedTime(&sample.makespanMs, start, stop));
         CUDA_CHECK(cudaEventElapsedTime(&sample.prefillMs, prefillBegin, prefillEnd));
         CUDA_CHECK(cudaEventElapsedTime(&sample.decodeMs, decodeBegin, decodeEnd));

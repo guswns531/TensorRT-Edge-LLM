@@ -65,6 +65,12 @@ public:
     void prepare(
         InferencePhase phase, int32_t batchSize, HybridCacheManager& kvCache, PipelineIO& io, cudaStream_t stream);
 
+    //! Prepare decode metadata from an independently owned phase-local KV length view.
+    //!
+    //! This is used when active rows are packed from multiple request contexts and
+    //! therefore do not match HybridCacheManager's legacy active-row ordering.
+    void prepareDecodeForPhase(int32_t batchSize, Tensor const& phaseKVLengths, PipelineIO& io, cudaStream_t stream);
+
 private:
     LLMEngineConfig mConfig;
 

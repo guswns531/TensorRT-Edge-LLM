@@ -60,16 +60,27 @@ void StepPreparer::prepare(
     }
     else
     {
-        // -- selectTokenIndices: always zero for decode (single token) --
-        CUDA_CHECK(cudaMemsetAsync(io.selectTokenIndices.rawPointer(), 0, batchSize * sizeof(int64_t), stream));
-
-        // -- contextLengths: KV cache lengths + 1 --
-        Tensor& kvLengths = kvCache.getKVCacheLengths();
-        CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), kvLengths.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToDevice, stream));
-        constexpr int32_t kDecodeIncrement{1};
-        kernel::incrementLengthTensor(io.contextLengths, kDecodeIncrement, stream);
+        prepareDecodeForPhase(batchSize, kvCache.getKVCacheLengths(), io, stream);
     }
+}
+
+void StepPreparer::prepareDecodeForPhase(
+    int32_t batchSize, Tensor const& phaseKVLengths, PipelineIO& io, cudaStream_t stream)
+{
+    check::check(batchSize > 0, "Phase decode batch size must be positive.");
+    check::check(phaseKVLengths.getDeviceType() == DeviceType::kGPU, "Phase KV lengths must reside on the GPU.");
+    check::check(
+        phaseKVLengths.getDataType() == nvinfer1::DataType::kINT32, "Phase KV lengths must have INT32 data type.");
+    check::check(phaseKVLengths.getShape().getNumDims() == 1 && phaseKVLengths.getShape()[0] >= batchSize,
+        "Phase KV lengths must contain the active decode batch.");
+
+    check::check(io.selectTokenIndices.reshape({batchSize, 1}), "selectTokenIndices reshape failed");
+    check::check(io.contextLengths.reshape({batchSize}), "contextLengths reshape failed");
+    CUDA_CHECK(cudaMemsetAsync(io.selectTokenIndices.rawPointer(), 0, batchSize * sizeof(int64_t), stream));
+    CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), phaseKVLengths.rawPointer(), batchSize * sizeof(int32_t),
+        cudaMemcpyDeviceToDevice, stream));
+    constexpr int32_t kDecodeIncrement{1};
+    kernel::incrementLengthTensor(io.contextLengths, kDecodeIncrement, stream);
 }
 
 } // namespace rt

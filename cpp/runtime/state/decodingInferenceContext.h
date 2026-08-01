@@ -32,6 +32,7 @@ namespace trt_edgellm
 {
 namespace rt
 {
+class PhaseBatchState;
 
 class LayerDebugger; // Few-layer-validation debug: per-layer logits/KV dump (runtime/debug/layerDebugger.h)
 
@@ -99,6 +100,9 @@ struct DecodingInferenceContext
     float topP{1.0f};        //!< Top-P sampling parameter
     int64_t topK{0};         //!< Top-K sampling parameter
     int32_t numLogprobs{0};  //!< Number of top log-probs to collect per generated token
+    //! Optional phase-local stable-slot view used by a dynamically packed decode batch.
+    //! The adapter owns this object and keeps it alive through async completion.
+    PhaseBatchState* phaseBatchState{};
     //! Per-batch flat logprobs accumulator.  slot.data is pre-allocated
     //! [(maxGenerateLength + draftingStep) * numLogprobs] in spec-decode mode (vanilla: maxGenerateLength)
     //! to accommodate the up-to-(draftingStep+1) tokens accepted per verify step.
