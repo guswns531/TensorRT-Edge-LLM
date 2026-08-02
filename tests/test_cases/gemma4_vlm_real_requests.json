@@ -1,0 +1,99 @@
+{
+    "batch_size": 2,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 96,
+    "requests": [
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/woman_and_dog.jpeg"},
+                {"type": "text", "text": "Describe the scene, the subjects, and their interaction in three concise bullet points. Do not invent details that are not visible."}
+            ]}],
+            "reference": "A woman and a dog interact on a beach."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/woman_and_dog.jpeg"},
+                {"type": "text", "text": "Write one-sentence accessibility alt text for this image, under 30 words."}
+            ]}],
+            "reference": "A woman interacts with a dog on a beach."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/database_er.jpeg"},
+                {"type": "text", "text": "Analyze this database diagram. List the visible entities and summarize the relationships. Mention uncertainty for text that is too small to read."}
+            ]}],
+            "reference": "The response identifies visible database entities and relationships."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/database_er.jpeg"},
+                {"type": "text", "text": "Act as a database reviewer. Give two concrete schema observations and one practical improvement based only on the diagram."}
+            ]}],
+            "reference": "The response gives diagram-grounded schema observations and an improvement."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "text", "text": "Compare image 1 with image 2. Identify each animal and explain two visible differences in a compact table."}
+            ]}],
+            "reference": "Image 1 is a red panda and image 2 is a giant panda."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "text", "text": "For the first and second images respectively, name the animal and cite one visible feature supporting each identification."}
+            ]}],
+            "reference": "The first is a giant panda and the second is a red panda."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/woman_and_dog.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "text", "text": "Explain how the subjects and settings differ between the first and second images. Use no more than four sentences."}
+            ]}],
+            "reference": "The first image shows a woman and dog on a beach; the second shows a red panda."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/database_er.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/woman_and_dog.jpeg"},
+                {"type": "text", "text": "Classify each image as a diagram or a photograph, then summarize its primary content in one sentence each."}
+            ]}],
+            "reference": "The first is a database diagram and the second is a photograph of a woman and dog."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "text", "text": "A wildlife catalog needs a short record. Provide the common animal name, dominant colors, and what it is resting on."}
+            ]}],
+            "reference": "A red panda with reddish-brown, white, and dark fur rests on a branch or wooden structure."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "text", "text": "Provide a concise factual caption describing the animal, its posture, and the immediate environment."}
+            ]}],
+            "reference": "A giant panda is in a naturalistic environment."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "text", "text": "A user asks whether these are the same animal species. Answer directly, identify both in image order, and give one visual reason."}
+            ]}],
+            "reference": "They are different species: red panda first and giant panda second."
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/woman_and_dog.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "text", "text": "Create two retrieval tags for each image. Preserve image order and avoid tags for objects that are not visible."}
+            ]}],
+            "reference": "The first image is tagged for a woman, dog, or beach; the second for a giant panda."
+        }
+    ]
+}

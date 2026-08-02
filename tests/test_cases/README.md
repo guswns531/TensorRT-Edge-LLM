@@ -26,6 +26,9 @@ Small JSON request sets for `llm_inference` smoke and runtime-sanity runs.
   VLM runtime sanity coverage for text-only-on-VLM, single-image, multi-image, system-prompt KV cache, `disable_spec_decode`, and request-mode switching.
   Recommended engine: VLM vanilla or EAGLE, `maxBatchSize >= 1`, `maxInputLen >= 8192`, `maxKVCacheCapacity >= 8192`, visual token capacity sized for all referenced images.
   **Requires a visual engine built with a larger image-token shape range than the defaults** — the fixture contains multi-image requests whose combined ViT `cuSeqlens` exceeds the default `--maxImageTokens`. Rebuild the visual engine with a larger `--maxImageTokens` / `--maxImageTokensPerImage` before running this fixture.
+- `gemma4_vlm_real_requests.json`
+  Deterministic BS2 service-style Gemma 4 workload covering descriptions, accessibility text, diagram review, and ordered multi-image comparisons.
+  Recommended engine: `maxBatchSize >= 2`, `maxInputLen >= 1024`, `maxKVCacheCapacity >= 2048`, visual `maxImageTokens >= 1120`, and `maxImageTokensPerImage >= 280`.
 
 ### Notes
 
