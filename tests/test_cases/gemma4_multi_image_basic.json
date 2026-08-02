@@ -1,0 +1,39 @@
+{
+    "batch_size": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 64,
+    "requests": [
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "text", "text": "Identify the animal in this image. Answer with only its common name."}
+            ]}],
+            "reference": "Red panda"
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "text", "text": "Identify the animal in this image. Answer with only its common name."}
+            ]}],
+            "reference": "Giant panda"
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "text", "text": "Name the animal in the first image and then the animal in the second image. Keep the same image order."}
+            ]}],
+            "reference": "Red panda; giant panda"
+        },
+        {
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "examples/multimodal/pics/giant_panda.jpeg"},
+                {"type": "image", "image": "examples/multimodal/pics/red_panda.jpeg"},
+                {"type": "text", "text": "Name the animal in the first image and then the animal in the second image. Keep the same image order."}
+            ]}],
+            "reference": "Giant panda; red panda"
+        }
+    ]
+}

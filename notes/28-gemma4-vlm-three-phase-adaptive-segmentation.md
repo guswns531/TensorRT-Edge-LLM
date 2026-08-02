@@ -39,7 +39,7 @@ WORK_DIR=/tmp/gemma4-e2b scripts/gemma4_e2b_indexed/run_vlm_pipeline.sh infer
 
 - export: PyTorch 25.12 container, 원본 HF checkpoint의 FP16 visual ONNX만 export
 - build/runtime: TensorRT 26.06, CUDA 13.3, visual profile `min=4`, `max total=1120`, `max/image=280`
-- inference: indexed INT4 LLM + FP16 vision engine + `vlm_basic.json`, generation 16 tokens
+- inference: indexed INT4 LLM + FP16 vision engine + deterministic `gemma4_multi_image_basic.json`, generation 64 tokens
 
 `maxImageTokens=280`으로 만든 최초 engine은 두 장짜리 request를 거부했다. 총 image-token profile과 이미지당
 profile은 별도이므로 총 profile을 1120으로 늘렸다.
@@ -57,9 +57,23 @@ profile은 별도이므로 총 profile을 1120으로 늘렸다.
 | peak GPU memory | 8,894 MiB |
 | 9,874 MiB 기준 headroom | 약 980 MiB |
 
-첫 request는 해변의 여성과 개를 올바르게 기술했다. 두 이미지 비교 request는 runtime과 encoder 처리는
-성공했지만 출력이 이미지를 다시 요구했다. 따라서 이 결과는 engine 연결/shape/memory 성공 증거이지 두 이미지
-semantic accuracy 통과 증거는 아니다. multi-image prompt의 embedding placement는 별도 accuracy 이슈로 남긴다.
+최초 `vlm_basic.json` 실행은 해변의 여성과 개를 올바르게 기술했지만 두 이미지 비교 request에서 이미지를 다시
+요구했다. 이 workload는 `temperature=1`, `top_k=50`이므로 그 한 번의 출력만으로 placement 오류를 판정할 수
+없었다. 이후 greedy(`temperature=0`, `top_k=1`) 진단에서 다음을 확인했다.
+
+- red panda와 giant panda를 각각 단일 이미지로 정확히 식별했다.
+- `red panda -> giant panda` 두 이미지와 역순 `giant panda -> red panda` 모두 입력 순서를 정확히 유지했다.
+- indexed engine과 legacy engine의 5개 진단 request 출력은 byte-for-byte 동일했다.
+- tokenizer가 만든 image placeholder 수와 visual embedding row 수가 정확히 일치했다.
+
+따라서 관측된 "이미지를 제공해 달라"는 응답은 indexed KV 또는 multi-image embedding placement 오류가 아니라
+확률적 decoding과 모호한 비교 prompt에서 나온 false negative였다. 재현 스크립트는 이제 단일 이미지 두 건과
+정방향/역방향 두 이미지 두 건을 포함한 deterministic 회귀 workload를 사용한다. Runtime도 explicit image token을
+다른 out-of-vocabulary special token과 혼동하지 않으며, placeholder 수와 embedding row 수가 다르면 즉시 실패한다.
+
+최종 indexed 회귀 실행은 4/4 request, 6 images, 1,566 image tokens를 처리했다. Vision encoder GPU time은
+100.21ms, LLM prefill은 1,692 computed tokens와 189.49ms, generation은 168.2 token/s였고 peak GPU memory는
+8,894MiB였다. 동일 workload의 legacy와 indexed 생성 문자열은 모두 byte-for-byte 일치했다.
 
 ## Adaptive chunked prefill 실측과 수정
 
@@ -97,5 +111,5 @@ fixed workload에서 median은 prefill engine 30.537ms, decode engine 7.107ms였
 
 - 관련 GPU unit tests: 19/19 통과 후 adaptive regression 추가, scheduler 14/14 통과
 - actual indexed LLM continuous-load: fixed와 수정 adaptive 모두 12/12 terminal 완료
-- actual indexed LLM + actual vision engine: VLM request 2/2 runtime 완료
+- actual indexed LLM + actual vision engine: deterministic single/multi-image 순서 진단 완료
 - phase microbenchmark: independent TensorRT contexts, shared CUDA context에서 median makespan 1.1096x 개선

@@ -582,7 +582,8 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
 }
 
 rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize)
+    std::optional<int32_t> imageTokenId, int32_t vocabSize, std::optional<int64_t> expectedAudioTokens,
+    std::optional<int64_t> expectedImageTokens)
 {
     auto const shape = inputIds.getShape();
     check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
@@ -608,7 +609,7 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
             {
                 indicesPtr[pos] = audioIndex++;
             }
-            else if ((imageTokenId.has_value() && tokenId == *imageTokenId) || tokenId >= vocabSize)
+            else if (imageTokenId.has_value() ? tokenId == *imageTokenId : tokenId >= vocabSize)
             {
                 indicesPtr[pos] = imageIndex++;
             }
@@ -617,6 +618,17 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
                 indicesPtr[pos] = 0;
             }
         }
+    }
+
+    if (expectedAudioTokens.has_value())
+    {
+        check::check(audioIndex == *expectedAudioTokens,
+            "Audio placeholder count does not match the number of audio embedding rows");
+    }
+    if (expectedImageTokens.has_value())
+    {
+        check::check(imageIndex == *expectedImageTokens,
+            "Image placeholder count does not match the number of visual embedding rows");
     }
 
     return multimodalIndices;

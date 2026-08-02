@@ -360,11 +360,14 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
  * @param inputIds Input token IDs on CPU [batchSize, seqLen]
  * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
  * @param imageTokenId Special token ID for image, or std::nullopt if no image
- * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
+ * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens only without an explicit ID)
+ * @param expectedAudioTokens Optional exact number of audio embedding rows
+ * @param expectedImageTokens Optional exact number of image embedding rows
  * @return multimodalIndices tensor on CPU [batchSize, seqLen]
  */
 rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize);
+    std::optional<int32_t> imageTokenId, int32_t vocabSize, std::optional<int64_t> expectedAudioTokens = std::nullopt,
+    std::optional<int64_t> expectedImageTokens = std::nullopt);
 
 /*! \brief Build Gemma4 block IDs from host token IDs.
  *

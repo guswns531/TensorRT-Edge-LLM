@@ -56,8 +56,8 @@ run_inference()
         "${trt_image}" ./build/examples/llm/llm_inference \
         --engineDir "${container_work}/engine-indexed" \
         --multimodalEngineDir "${container_work}/engine-multimodal" \
-        --inputFile "${container_repo}/tests/test_cases/vlm_basic.json" \
-        --maxGenerateLength 16 \
+        --inputFile "${container_repo}/tests/test_cases/gemma4_multi_image_basic.json" \
+        --maxGenerateLength 64 \
         --outputFile "${container_work}/vlm-indexed-output.json" \
         --dumpProfile \
         --profileOutputFile "${container_work}/vlm-indexed-profile.json"

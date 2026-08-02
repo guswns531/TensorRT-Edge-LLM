@@ -80,6 +80,27 @@ TEST(GenerateMultimodalIndices, ImageOnlyExplicitId)
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 2}));
 }
 
+TEST(GenerateMultimodalIndices, ExplicitImageIdIgnoresOtherOutOfVocabularyTokens)
+{
+    int32_t constexpr kImageTok = 50;
+    int32_t constexpr kVocab = 100;
+    auto ids = makeCpuIds({kImageTok, 101, kImageTok}, 1, 3);
+    auto result
+        = rt::generateMultimodalIndices(ids, std::nullopt, kImageTok, kVocab, std::nullopt, std::optional<int64_t>{2});
+    auto v = toVec(result);
+    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 1}));
+}
+
+TEST(GenerateMultimodalIndices, RejectsVisualEmbeddingCountMismatch)
+{
+    int32_t constexpr kImageTok = 50;
+    int32_t constexpr kVocab = 100;
+    auto ids = makeCpuIds({10, kImageTok, kImageTok, 20}, 1, 4);
+    EXPECT_THROW(static_cast<void>(rt::generateMultimodalIndices(
+                     ids, std::nullopt, kImageTok, kVocab, std::nullopt, std::optional<int64_t>{1})),
+        std::runtime_error);
+}
+
 // Mixed audio + image tokens
 TEST(GenerateMultimodalIndices, MixedAudioImage)
 {

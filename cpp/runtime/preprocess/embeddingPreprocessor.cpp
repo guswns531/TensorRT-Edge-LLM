@@ -57,8 +57,14 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
             = (mConfig.audioTokenId >= 0) ? std::optional{mConfig.audioTokenId} : std::nullopt;
         std::optional<int32_t> imageTokenOpt
             = (mConfig.imageTokenId >= 0) ? std::optional{mConfig.imageTokenId} : std::nullopt;
-        Tensor multimodalIndicesCPU
-            = generateMultimodalIndices(inputIdsCPU, audioTokenOpt, imageTokenOpt, mConfig.vocabSize);
+        std::optional<int64_t> const expectedAudioTokens = audioTokenOpt.has_value()
+            ? std::optional<int64_t>{audioEmbeds.has_value() ? audioEmbeds->get().getShape()[0] : 0}
+            : std::nullopt;
+        std::optional<int64_t> const expectedImageTokens = imageTokenOpt.has_value()
+            ? std::optional<int64_t>{visionEmbeds.has_value() ? visionEmbeds->get().getShape()[0] : 0}
+            : std::nullopt;
+        Tensor multimodalIndicesCPU = generateMultimodalIndices(
+            inputIdsCPU, audioTokenOpt, imageTokenOpt, mConfig.vocabSize, expectedAudioTokens, expectedImageTokens);
 
         auto const indicesShape = multimodalIndicesCPU.getShape();
         size_t const indicesSizeBytes = indicesShape.volume() * sizeof(int32_t);
