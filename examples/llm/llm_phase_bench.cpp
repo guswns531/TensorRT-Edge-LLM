@@ -26,11 +26,12 @@
 #include "runtime/exec/tensorMap.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/phaseBatchState.h"
-#include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
+#include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseGreedySampler.h"
+#include "runtime/scheduling/phaseKernelGroupRecorder.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
@@ -64,6 +65,7 @@ struct Args
     std::string engineDir;
     std::string outputCsv;
     std::string loadCsv;
+    std::string kernelGroupCsv;
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t inputLen{512};
@@ -82,6 +84,7 @@ struct Args
     rt::PhaseTensorRTContextMode trtContextMode{rt::PhaseTensorRTContextMode::kIndependentConcurrent};
     bool contextAdapter{};
     bool adaptiveScheduler{};
+    bool adaptiveChunking{};
 };
 
 struct Sample
@@ -114,7 +117,8 @@ void printUsage(char const* program)
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] "
         "[--trtContextMode shared|independent] "
-        "[--contextAdapter] [--adaptiveScheduler] [--outputCsv FILE] "
+        "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--outputCsv FILE] "
+        "[--kernelGroupCsv FILE] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
         "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --loadSeed N --loadCsv FILE]",
         program);
@@ -137,6 +141,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kLegacySharedContext,
         kContextAdapter,
         kAdaptiveScheduler,
+        kAdaptiveChunking,
         kLoadRequests,
         kArrivalRate,
         kLoadPromptMin,
@@ -146,6 +151,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kMaxOverlapPrefillTokens,
         kLoadSeed,
         kLoadCsv,
+        kKernelGroupCsv,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -158,6 +164,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"sharedContext", no_argument, nullptr, kLegacySharedContext},
         {"contextAdapter", no_argument, nullptr, kContextAdapter},
         {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler},
+        {"adaptiveChunking", no_argument, nullptr, kAdaptiveChunking},
         {"loadRequests", required_argument, nullptr, kLoadRequests},
         {"arrivalRate", required_argument, nullptr, kArrivalRate},
         {"loadPromptMin", required_argument, nullptr, kLoadPromptMin},
@@ -165,8 +172,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"loadOutputMin", required_argument, nullptr, kLoadOutputMin},
         {"loadOutputMax", required_argument, nullptr, kLoadOutputMax},
         {"maxOverlapPrefillTokens", required_argument, nullptr, kMaxOverlapPrefillTokens},
-        {"loadSeed", required_argument, nullptr, kLoadSeed},
-        {"loadCsv", required_argument, nullptr, kLoadCsv}, {"help", no_argument, nullptr, kHelp}, {}};
+        {"loadSeed", required_argument, nullptr, kLoadSeed}, {"loadCsv", required_argument, nullptr, kLoadCsv},
+        {"kernelGroupCsv", required_argument, nullptr, kKernelGroupCsv}, {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -202,6 +209,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kLegacySharedContext: args.trtContextMode = rt::PhaseTensorRTContextMode::kSharedSerialized; break;
         case kContextAdapter: args.contextAdapter = true; break;
         case kAdaptiveScheduler: args.adaptiveScheduler = true; break;
+        case kAdaptiveChunking: args.adaptiveChunking = true; break;
         case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
         case kArrivalRate: args.arrivalRate = std::stod(optarg); break;
         case kLoadPromptMin: args.loadPromptMin = std::stoi(optarg); break;
@@ -211,6 +219,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kMaxOverlapPrefillTokens: args.maxOverlapPrefillTokens = std::stoi(optarg); break;
         case kLoadSeed: args.loadSeed = static_cast<uint32_t>(std::stoul(optarg)); break;
         case kLoadCsv: args.loadCsv = optarg; break;
+        case kKernelGroupCsv: args.kernelGroupCsv = optarg; break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -318,8 +327,8 @@ void logDispatchHistogram(std::vector<rt::PhaseDispatchMetrics> const& metrics)
     }
     for (auto const& [batchSizes, count] : histogram)
     {
-        LOG_INFO("Continuous-load batch histogram: prefill=%d decode=%d count=%zu", batchSizes.first,
-            batchSizes.second, count);
+        LOG_INFO("Continuous-load batch histogram: prefill=%d decode=%d count=%zu", batchSizes.first, batchSizes.second,
+            count);
     }
 }
 
@@ -517,8 +526,7 @@ int main(int argc, char** argv)
         }
         else
         {
-            decodeGemma4PleOwner
-                = prefillGemma4Ple->createSibling(config.maxSupportedBatchSize, 1, decodeMap);
+            decodeGemma4PleOwner = prefillGemma4Ple->createSibling(config.maxSupportedBatchSize, 1, decodeMap);
             decodeGemma4Ple = decodeGemma4PleOwner.get();
             ELLM_CHECK(prefillGemma4Ple->tableDataIdentity() == decodeGemma4Ple->tableDataIdentity(),
                 "Independent phase PLE preprocessors did not share the immutable table");
@@ -527,11 +535,10 @@ int main(int argc, char** argv)
         }
         rt::Tensor prefillPleTokenIds({config.maxSupportedBatchSize, maxPleSeqLen}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "phase_prefill_ple_token_ids");
-        rt::Tensor decodePleTokenIds(
-            {config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
-            "phase_decode_ple_token_ids");
-        CUDA_CHECK(cudaMemsetAsync(
-            prefillPleTokenIds.rawPointer(), 0, prefillPleTokenIds.getMemoryCapacity(), setupStream));
+        rt::Tensor decodePleTokenIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "phase_decode_ple_token_ids");
+        CUDA_CHECK(
+            cudaMemsetAsync(prefillPleTokenIds.rawPointer(), 0, prefillPleTokenIds.getMemoryCapacity(), setupStream));
         CUDA_CHECK(
             cudaMemsetAsync(decodePleTokenIds.rawPointer(), 0, decodePleTokenIds.getMemoryCapacity(), setupStream));
         prefillGemma4Ple->embed(prefillPleTokenIds, setupStream);
@@ -642,8 +649,7 @@ int main(int argc, char** argv)
             servingRequests.reserve(args.prefillBatch);
             for (int32_t row = 0; row < args.prefillBatch; ++row)
             {
-                servingRequests.push_back(
-                    {static_cast<uint64_t>(1000 + row), 0, args.inputLen, phaseRounds + 1});
+                servingRequests.push_back({static_cast<uint64_t>(1000 + row), 0, args.inputLen, phaseRounds + 1});
             }
         }
 
@@ -652,8 +658,7 @@ int main(int argc, char** argv)
         for (rt::PhaseLoadRequest const& request : servingRequests)
         {
             auto source = std::make_unique<rt::DecodingInferenceContext>();
-            source->initialize(
-                1, request.maxOutputTokens, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+            source->initialize(1, request.maxOutputTokens, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
             source->rawBatchedInputIds = {std::vector<int32_t>(request.promptTokenCount, 0)};
             source->tokenIds = source->rawBatchedInputIds;
             source->effectivePrefillLengths = {request.promptTokenCount};
@@ -662,8 +667,8 @@ int main(int argc, char** argv)
         }
 
         std::vector<int32_t> const servingEosTokenIds = continuousLoad ? std::vector<int32_t>{} : config.eosTokenIds;
-        rt::PhaseGreedySampler prefillSampler(args.prefillBatch, config.outputVocabSize, servingEosTokenIds,
-            "phase_serving_prefill_sampler");
+        rt::PhaseGreedySampler prefillSampler(
+            args.prefillBatch, config.outputVocabSize, servingEosTokenIds, "phase_serving_prefill_sampler");
         rt::PhaseGreedySampler decodeSampler(
             args.decodeBatch, config.outputVocabSize, servingEosTokenIds, "phase_serving_decode_sampler");
 
@@ -687,48 +692,75 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
         facadeSchedulerConfig.maxPrefillChunkTokens = configuredChunkSize;
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
+        facadeSchedulerConfig.enableAdaptivePrefillChunking = args.adaptiveChunking && configuredChunkSize > 0;
+        facadeSchedulerConfig.minPrefillChunkTokens = std::min(32, std::max(1, configuredChunkSize));
+        rt::PhaseKernelGroupRecorder kernelGroupRecorder;
+        size_t kernelGroupDispatchIndex{};
+        auto executeKernelSegments = [&](std::vector<rt::PhaseKernelSegment> const& segments) {
+            if (args.kernelGroupCsv.empty())
+            {
+                for (rt::PhaseKernelSegment const& segment : segments)
+                {
+                    segment.enqueue(segment.stream);
+                }
+            }
+            else
+            {
+                kernelGroupRecorder.execute(kernelGroupDispatchIndex++, segments);
+            }
+        };
         rt::PhaseContextServingCallbacks facadeCallbacks;
         facadeCallbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
             int32_t const batchSize = packed.batchSize();
             int32_t const chunkLength = packed.chunkLength();
-            check::check(prefillIO.inputsEmbeds.reshape({batchSize, chunkLength, config.hiddenSize}),
-                "Serving prefill input reshape failed");
-            check::check(
-                prefillIO.contextLengths.reshape({batchSize}), "Serving prefill context lengths reshape failed");
-            check::check(
-                prefillIO.selectTokenIndices.reshape({batchSize, 1}), "Serving prefill select indices reshape failed");
-            check::check(
-                prefillIO.hostContextLengths.reshape({batchSize}), "Serving host prefill lengths reshape failed");
-            check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
-                "Serving host prefill indices reshape failed");
-            std::fill_n(prefillIO.hostContextLengths.dataPointer<int32_t>(), batchSize, chunkLength);
-            std::fill_n(prefillIO.hostSelectTokenIndices.dataPointer<int64_t>(), batchSize,
-                static_cast<int64_t>(chunkLength - 1));
-            CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(), prefillIO.hostContextLengths.rawPointer(),
-                batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, packed.stream()));
-            CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
-                prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t), cudaMemcpyHostToDevice,
-                packed.stream()));
-            if (prefillGemma4Ple)
-            {
-                prefillGemma4Ple->embed(packed.tokenIds(), packed.stream());
-                prefillGemma4Ple->reshapeOutputs(batchSize, chunkLength);
-            }
-            check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
-                "Serving prefill logits reshape failed");
-            auto const dims = config.prefillDims(batchSize, chunkLength, packed.initialChunk());
-            ELLM_CHECK(prefillExecutor->prepare(kPrefillProfile, dims, prefillMap, packed.stream())
-                    && prefillExecutor->execute(packed.stream()),
-                "Serving facade packed prefill enqueue failed");
-            packed.phaseBatchState().commit(cacheManager, chunkLength, packed.stream());
             bool const hasFinalPromptRow
                 = std::any_of(packed.rows().begin(), packed.rows().end(), [](rt::PhasePrefillContextRow const& row) {
                       return row.tokenOffset + row.tokenCount == row.promptTokenCount;
                   });
+            std::vector<rt::PhaseKernelSegment> segments;
+            segments.push_back(
+                {rt::PhaseKernelGroup::kPrefillPrepare, {}, packed.stream(), [&](cudaStream_t stream) {
+                     check::check(prefillIO.inputsEmbeds.reshape({batchSize, chunkLength, config.hiddenSize}),
+                         "Serving prefill input reshape failed");
+                     check::check(prefillIO.contextLengths.reshape({batchSize}),
+                         "Serving prefill context lengths reshape failed");
+                     check::check(prefillIO.selectTokenIndices.reshape({batchSize, 1}),
+                         "Serving prefill select indices reshape failed");
+                     check::check(prefillIO.hostContextLengths.reshape({batchSize}),
+                         "Serving host prefill lengths reshape failed");
+                     check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
+                         "Serving host prefill indices reshape failed");
+                     std::fill_n(prefillIO.hostContextLengths.dataPointer<int32_t>(), batchSize, chunkLength);
+                     std::fill_n(prefillIO.hostSelectTokenIndices.dataPointer<int64_t>(), batchSize,
+                         static_cast<int64_t>(chunkLength - 1));
+                     CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(),
+                         prefillIO.hostContextLengths.rawPointer(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice,
+                         stream));
+                     CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
+                         prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t),
+                         cudaMemcpyHostToDevice, stream));
+                     if (prefillGemma4Ple)
+                     {
+                         prefillGemma4Ple->embed(packed.tokenIds(), stream);
+                         prefillGemma4Ple->reshapeOutputs(batchSize, chunkLength);
+                     }
+                     check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
+                         "Serving prefill logits reshape failed");
+                 }});
+            segments.push_back({rt::PhaseKernelGroup::kPrefillEngine, {}, packed.stream(), [&](cudaStream_t stream) {
+                                    auto const dims = config.prefillDims(batchSize, chunkLength, packed.initialChunk());
+                                    ELLM_CHECK(prefillExecutor->prepare(kPrefillProfile, dims, prefillMap, stream)
+                                            && prefillExecutor->execute(stream),
+                                        "Serving facade packed prefill enqueue failed");
+                                }});
+            segments.push_back({rt::PhaseKernelGroup::kPrefillCacheCommit, {}, packed.stream(),
+                [&](cudaStream_t stream) { packed.phaseBatchState().commit(cacheManager, chunkLength, stream); }});
             if (hasFinalPromptRow)
             {
-                prefillSampler.enqueue(prefillIO.outputLogits, batchSize, packed.stream());
+                segments.push_back({rt::PhaseKernelGroup::kPrefillSample, {}, packed.stream(),
+                    [&](cudaStream_t stream) { prefillSampler.enqueue(prefillIO.outputLogits, batchSize, stream); }});
             }
+            executeKernelSegments(segments);
         };
         facadeCallbacks.completePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
             if (prefillSampler.pending())
@@ -750,6 +782,7 @@ int main(int argc, char** argv)
                     }
                 }
             }
+            kernelGroupRecorder.poll();
         };
         facadeCallbacks.completePrefill
             = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
@@ -760,14 +793,27 @@ int main(int argc, char** argv)
             rt::DecodingInferenceContext& packed = adapter.packedContext();
             ELLM_CHECK(packed.phaseBatchState != nullptr, "Serving facade decode has no phase batch state");
             ELLM_CHECK(decodeGemma4Ple != nullptr, "Serving facade actual token decode requires Gemma 4 PLE");
-            decodeGemma4Ple->embed(adapter.tokenIds(), packed.stream);
-            decodeGemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
-            ELLM_CHECK(
-                executeDecode(*packed.phaseBatchState, 1, packed.stream), "Serving facade decode enqueue failed");
-            decodeSampler.enqueue(decodeIO.outputLogits, packed.activeBatchSize, packed.stream);
+            executeKernelSegments({
+                {rt::PhaseKernelGroup::kDecodePrepare, {}, packed.stream,
+                    [&](cudaStream_t stream) {
+                        decodeGemma4Ple->embed(adapter.tokenIds(), stream);
+                        decodeGemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
+                    }},
+                {rt::PhaseKernelGroup::kDecodeEngine, {}, packed.stream,
+                    [&](cudaStream_t stream) {
+                        ELLM_CHECK(
+                            executeDecode(*packed.phaseBatchState, 1, stream), "Serving facade decode enqueue failed");
+                    }},
+                {rt::PhaseKernelGroup::kDecodeSample, {}, packed.stream,
+                    [&](cudaStream_t stream) {
+                        decodeSampler.enqueue(decodeIO.outputLogits, packed.activeBatchSize, stream);
+                    }},
+            });
         };
-        facadeCallbacks.completePackedDecode
-            = [&](rt::PhaseContextBatchAdapter& adapter) { decodeSampler.completeDecode(adapter); };
+        facadeCallbacks.completePackedDecode = [&](rt::PhaseContextBatchAdapter& adapter) {
+            decodeSampler.completeDecode(adapter);
+            kernelGroupRecorder.poll();
+        };
         facadeCallbacks.isDecodeFinished = [](uint64_t, rt::DecodingInferenceContext const& context, int32_t row) {
             return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
@@ -798,9 +844,8 @@ int main(int argc, char** argv)
             sample.terminalUs = elapsedMicroseconds(loadStart);
             sample.generatedTokens = facadeContexts.at(index)->currentGenerateLengths[0];
         };
-        auto const facadeMode = usesSharedTensorRTContext(args)
-            ? rt::PhaseTensorRTContextMode::kSharedSerialized
-            : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
+        auto const facadeMode = usesSharedTensorRTContext(args) ? rt::PhaseTensorRTContextMode::kSharedSerialized
+                                                                : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
         auto const facadeSafety = usesSharedTensorRTContext(args)
             ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor->getExecutionContextIdentity())
             : rt::PhaseExecutionSafetyContract::independent(
@@ -835,8 +880,8 @@ int main(int argc, char** argv)
                 {
                     size_t const index = loadMetricIndices.at(request.requestId);
                     loadMetrics[index].submittedUs = elapsedMicroseconds(loadStart);
-                    static_cast<void>(facade.submitOrQueue(
-                        request.requestId, *facadeContexts[index], 0, request.promptTokenCount));
+                    static_cast<void>(
+                        facade.submitOrQueue(request.requestId, *facadeContexts[index], 0, request.promptTokenCount));
                     ++submittedRequests;
                 }
                 if (facade.busy())
@@ -907,9 +952,9 @@ int main(int argc, char** argv)
                 static_cast<size_t>(std::count_if(loadMetrics.begin(), loadMetrics.end(),
                     [](LoadRequestSample const& sample) { return sample.initiallyPending; })),
                 static_cast<double>(loadMetrics.size()) * 1000000.0 / terminalUs,
-                static_cast<double>(generatedTokens) * 1000000.0 / terminalUs,
-                percentile(ttftUs, 0.5F) / 1000.0F, percentile(ttftUs, 0.95F) / 1000.0F,
-                percentile(e2eUs, 0.5F) / 1000.0F, percentile(e2eUs, 0.95F) / 1000.0F);
+                static_cast<double>(generatedTokens) * 1000000.0 / terminalUs, percentile(ttftUs, 0.5F) / 1000.0F,
+                percentile(ttftUs, 0.95F) / 1000.0F, percentile(e2eUs, 0.5F) / 1000.0F,
+                percentile(e2eUs, 0.95F) / 1000.0F);
             LOG_INFO("Continuous-load request metrics written to %s", args.loadCsv.c_str());
         }
         else if (!args.outputCsv.empty())
@@ -923,9 +968,17 @@ int main(int argc, char** argv)
             LOG_INFO("Serving dispatch metrics written to %s", dispatchCsv.c_str());
         }
         LOG_INFO("Serving facade scheduler policy: %s", args.adaptiveScheduler ? "adaptive_metrics" : "queue_default");
-        LOG_INFO("Serving facade engine run passed: %zu request context(s), stable admission -> actual greedy "
-                 "sampling -> repeated packed decode -> scatter -> slot release",
+        LOG_INFO("Serving facade prefill chunk policy: %s", args.adaptiveChunking ? "adaptive_cuda_cost" : "fixed");
+        LOG_INFO(
+            "Serving facade engine run passed: %zu request context(s), stable admission -> actual greedy "
+            "sampling -> repeated packed decode -> scatter -> slot release",
             servingRequests.size());
+        if (!args.kernelGroupCsv.empty())
+        {
+            kernelGroupRecorder.drain();
+            kernelGroupRecorder.writeCsv(args.kernelGroupCsv);
+            LOG_INFO("Kernel-group CUDA-event samples written to %s", args.kernelGroupCsv.c_str());
+        }
     }
 
     cudaEvent_t start{};
@@ -1038,9 +1091,8 @@ int main(int argc, char** argv)
     }
 
     logSummary("Sequential", samples, false);
-    char const* const scheduledName
-        = usesSharedTensorRTContext(args) ? "Shared-TensorRT-context scheduled"
-                                         : "Independent-TensorRT-context concurrent";
+    char const* const scheduledName = usesSharedTensorRTContext(args) ? "Shared-TensorRT-context scheduled"
+                                                                      : "Independent-TensorRT-context concurrent";
     logSummary(scheduledName, samples, true);
     std::vector<float> sequentialMakespans;
     std::vector<float> concurrentMakespans;

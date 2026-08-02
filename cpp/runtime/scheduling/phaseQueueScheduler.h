@@ -43,6 +43,8 @@ struct PhaseWorkItem
     int32_t kvSlotId{-1};
     int32_t tokenOffset{};
     int32_t promptTokenCount{};
+    //! Gemma4 vision-block attention currently requires one atomic prefill.
+    bool allowChunkedPrefill{true};
 };
 
 enum class PhaseDispatchKind
@@ -106,6 +108,13 @@ struct PhaseQueueSchedulerConfig
     //! Maximum tokens dispatched per request in one prefill turn. Zero keeps
     //! the legacy whole-prompt behavior.
     int32_t maxPrefillChunkTokens{};
+    //! Adapt each text-prefill turn between minPrefillChunkTokens and
+    //! maxPrefillChunkTokens using observed CUDA cost and overlap efficiency.
+    //! Queue deadlines belong to phase selection so they cannot fragment an
+    //! otherwise efficient prefill batch into extra TensorRT executions.
+    bool enableAdaptivePrefillChunking{};
+    int32_t minPrefillChunkTokens{32};
+    int32_t prefillChunkAlignment{8};
     //! Admit one prefill batch after this many decode-only decisions so a
     //! continuous decode queue cannot starve new requests forever.
     int32_t decodeBurstLimit{8};

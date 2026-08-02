@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <deque>
 #include <functional>
@@ -68,10 +69,8 @@ struct PhaseEncoderExecutionSafetyContract
     void validate() const;
 };
 
-using PhaseEncoderEnqueueCallback
-    = std::function<void(std::vector<PhaseEncoderWorkItem> const&, cudaStream_t)>;
-using PhaseEncoderBatchCompletionCallback
-    = std::function<void(std::vector<PhaseEncoderWorkItem> const&)>;
+using PhaseEncoderEnqueueCallback = std::function<void(std::vector<PhaseEncoderWorkItem> const&, cudaStream_t)>;
+using PhaseEncoderBatchCompletionCallback = std::function<void(std::vector<PhaseEncoderWorkItem> const&)>;
 //! Performs host-side encoder output finalization and returns ready prefill work.
 using PhaseEncoderCompletionCallback = std::function<PhaseWorkItem(PhaseEncoderWorkItem const&)>;
 
@@ -115,6 +114,7 @@ public:
     size_t dispatchCount() const noexcept;
     std::optional<PhaseEncoderDispatchMetrics> const& lastMetrics() const noexcept;
     PhaseEncoderExecutionSafetyContract const& safetyContract() const noexcept;
+    CUcontext cudaContext() const noexcept;
 
 private:
     void completeInFlight();
@@ -124,6 +124,7 @@ private:
     PhaseEncoderQueueConfig mConfig;
     PhaseEncoderDispatchWorkerCallbacks mCallbacks;
     cudaStream_t mEncoderStream{};
+    CUcontext mCudaContext{};
     PhaseEncoderExecutionSafetyContract mSafetyContract;
     cudaEvent_t mEncoderStart{};
     cudaEvent_t mEncoderDone{};

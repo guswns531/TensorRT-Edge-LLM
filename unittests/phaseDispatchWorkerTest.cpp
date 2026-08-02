@@ -18,13 +18,16 @@
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "common/bindingNames.h"
 #include "common/cudaUtils.h"
+#include "runtime/scheduling/gemma4PhaseVisionAdapter.h"
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
 #include "runtime/scheduling/phaseEncoderDispatchWorker.h"
 #include "runtime/scheduling/phaseGreedySampler.h"
+#include "runtime/scheduling/phaseKernelGroupRecorder.h"
 #include "runtime/scheduling/phasePrefillContextBatchAdapter.h"
 #include "runtime/scheduling/phaseRequestLifecycle.h"
+#include "runtime/scheduling/phaseThreeCoordinator.h"
 #include "testUtils.h"
 
 #include <cstring>
@@ -37,6 +40,39 @@ using namespace nvinfer1;
 
 namespace
 {
+
+class FakeGemma4VisionRunner : public rt::MultimodalRunner
+{
+public:
+    FakeGemma4VisionRunner()
+    {
+        mModelType = multimodal::ModelType::GEMMA4_VISION;
+        mOutputEmbedding = rt::Tensor({3, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "fake_visual_embedding");
+    }
+
+    bool preprocess(rt::LLMGenerationRequest const&, std::vector<std::vector<int32_t>>& batchedInputIds,
+        tokenizer::Tokenizer const*, rt::OptionalOutputTensor, cudaStream_t, bool) override
+    {
+        batchedInputIds = {{1, 2, 3, 4}};
+        return true;
+    }
+
+    bool infer(cudaStream_t stream) override
+    {
+        CUDA_CHECK(cudaMemsetAsync(mOutputEmbedding.rawPointer(), 0, mOutputEmbedding.getMemoryCapacity(), stream));
+        return true;
+    }
+
+    bool validateAndFillConfig(std::string const&) override
+    {
+        return true;
+    }
+
+    bool allocateBuffer(cudaStream_t) override
+    {
+        return true;
+    }
+};
 
 rt::HybridCacheManager makeIndexedManager(int32_t maxBatchSize)
 {
@@ -184,7 +220,6 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
-
 TEST(PhaseExecutionSafetyContractTest, ValidatesSharedAndIndependentResourceIdentity)
 {
     int identities[6]{};
@@ -195,16 +230,13 @@ TEST(PhaseExecutionSafetyContractTest, ValidatesSharedAndIndependentResourceIden
 
     auto const aliasedWorkspace = rt::PhaseExecutionSafetyContract::independent(
         {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[1], &identities[5]});
-    EXPECT_THROW(
-        aliasedWorkspace.validate(rt::PhaseTensorRTContextMode::kIndependentConcurrent), std::runtime_error);
-    EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract{}.validate(
-        rt::PhaseTensorRTContextMode::kSharedSerialized));
+    EXPECT_THROW(aliasedWorkspace.validate(rt::PhaseTensorRTContextMode::kIndependentConcurrent), std::runtime_error);
+    EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract{}.validate(rt::PhaseTensorRTContextMode::kSharedSerialized));
     EXPECT_NO_THROW(rt::PhaseExecutionSafetyContract::shared(&identities[0])
-                        .validate(rt::PhaseTensorRTContextMode::kSharedSerialized));
+            .validate(rt::PhaseTensorRTContextMode::kSharedSerialized));
     auto const mismatchedShared = rt::PhaseExecutionSafetyContract::independent(
         {&identities[0], nullptr, nullptr}, {&identities[1], nullptr, nullptr});
-    EXPECT_THROW(
-        mismatchedShared.validate(rt::PhaseTensorRTContextMode::kSharedSerialized), std::runtime_error);
+    EXPECT_THROW(mismatchedShared.validate(rt::PhaseTensorRTContextMode::kSharedSerialized), std::runtime_error);
 }
 
 TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceProof)
@@ -220,8 +252,7 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceP
     int prefillEnqueues{};
     int decodeEnqueues{};
     rt::PhaseDispatchWorkerCallbacks callbacks;
-    callbacks.enqueuePrefill
-        = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
+    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
     callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++decodeEnqueues; };
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
         return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
@@ -256,15 +287,12 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeEnqueuesOnlyWithIndependentResourceP
 TEST(PhaseEncoderExecutionSafetyContractTest, RejectsAliasedLlmResources)
 {
     int identities[9]{};
-    rt::PhaseEncoderExecutionSafetyContract const valid{
-        {&identities[0], &identities[1], &identities[2]},
-        {{&identities[3], &identities[4], &identities[5]},
-            {&identities[6], &identities[7], &identities[8]}}};
+    rt::PhaseEncoderExecutionSafetyContract const valid{{&identities[0], &identities[1], &identities[2]},
+        {{&identities[3], &identities[4], &identities[5]}, {&identities[6], &identities[7], &identities[8]}}};
     EXPECT_NO_THROW(valid.validate());
 
     rt::PhaseEncoderExecutionSafetyContract const aliased{
-        {&identities[0], &identities[1], &identities[2]},
-        {{&identities[3], &identities[1], &identities[5]}}};
+        {&identities[0], &identities[1], &identities[2]}, {{&identities[3], &identities[1], &identities[5]}}};
     EXPECT_THROW(aliased.validate(), std::runtime_error);
 }
 
@@ -297,10 +325,8 @@ TEST(PhaseEncoderDispatchWorkerTest, BatchesAndHandsOffToPrefillAfterCudaEvent)
     callbacks.onMetrics = [&](rt::PhaseEncoderDispatchMetrics const& sample) { metrics.push_back(sample); };
 
     int identities[9]{};
-    rt::PhaseEncoderExecutionSafetyContract contract{
-        {&identities[0], &identities[1], &identities[2]},
-        {{&identities[3], &identities[4], &identities[5]},
-            {&identities[6], &identities[7], &identities[8]}}};
+    rt::PhaseEncoderExecutionSafetyContract contract{{&identities[0], &identities[1], &identities[2]},
+        {{&identities[3], &identities[4], &identities[5]}, {&identities[6], &identities[7], &identities[8]}}};
     rt::PhaseEncoderQueueConfig encoderConfig;
     encoderConfig.maxBatchSize = 2;
     encoderConfig.maxQueuedRequests = 2;
@@ -341,6 +367,129 @@ TEST(PhaseEncoderDispatchWorkerTest, BatchesAndHandsOffToPrefillAfterCudaEvent)
     }
     EXPECT_TRUE(scheduler.empty());
     CUDA_CHECK(cudaStreamDestroy(encoderStream));
+}
+
+TEST(Gemma4PhaseVisionAdapterTest, CopiesActualRunnerOutputBeforePrefillHandoff)
+{
+    cudaStream_t encoderStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    FakeGemma4VisionRunner runner;
+    tokenizer::Tokenizer tokenizer;
+    rt::PhaseKernelGroupRecorder kernelGroups;
+    rt::Gemma4PhaseVisionAdapter adapter(runner, tokenizer, &kernelGroups);
+    rt::LLMGenerationRequest request;
+    request.requests.resize(1);
+    rt::DecodingInferenceContext context;
+    context.initialize(1, 1, std::nullopt, {}, "", encoderStream);
+    adapter.registerRequest(10, request, context);
+
+    rt::PhaseQueueScheduler scheduler;
+    int identities[6]{};
+    rt::PhaseEncoderExecutionSafetyContract safety{
+        {&identities[0], &identities[1], &identities[2]}, {{&identities[3], &identities[4], &identities[5]}}};
+    rt::PhaseEncoderDispatchWorker worker(scheduler, {}, adapter.makeCallbacks(), encoderStream, std::move(safety));
+    worker.submit({10, 1, 0});
+    ASSERT_TRUE(worker.dispatchNext());
+    worker.wait();
+    kernelGroups.drain();
+    ASSERT_EQ(kernelGroups.samples().size(), 2U);
+    EXPECT_EQ(kernelGroups.samples()[0].group, rt::PhaseKernelGroup::kEncoderPreprocess);
+    EXPECT_EQ(kernelGroups.samples()[1].group, rt::PhaseKernelGroup::kEncoderEngine);
+
+    rt::PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 4);
+    EXPECT_FALSE(plan.prefillBatch.front().allowChunkedPrefill);
+    ASSERT_TRUE(context.visualEmbeddings.has_value());
+    EXPECT_EQ(context.visualEmbeddings->get().getShape(), rt::Coords({3, 4}));
+    scheduler.completePrefill(plan.prefillBatch.front(), 4, true);
+    adapter.release(10);
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
+}
+
+TEST(PhaseThreeCoordinatorTest, ConnectsEncoderPrefillAndDecodeOnOneCudaContext)
+{
+    rt::PhaseQueueScheduler scheduler;
+    cudaStream_t encoderStream{};
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    rt::Tensor marker({3}, rt::DeviceType::kGPU, DataType::kINT32, "three_phase_marker");
+
+    int identities[9]{};
+    rt::PhaseEncoderDispatchWorkerCallbacks encoderCallbacks;
+    encoderCallbacks.enqueueEncoder = [&](std::vector<rt::PhaseEncoderWorkItem> const&, cudaStream_t stream) {
+        CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 1, marker.getMemoryCapacity(), stream));
+    };
+    encoderCallbacks.completeEncoder = [](rt::PhaseEncoderWorkItem const& item) {
+        return rt::PhaseWorkItem{item.requestId, 2, item.kvSlotId, 0, 2};
+    };
+    rt::PhaseEncoderExecutionSafetyContract encoderSafety{{&identities[0], &identities[1], &identities[2]},
+        {{&identities[3], &identities[4], &identities[5]}, {&identities[6], &identities[7], &identities[8]}}};
+    rt::PhaseEncoderDispatchWorker encoderWorker(
+        scheduler, {}, std::move(encoderCallbacks), encoderStream, std::move(encoderSafety));
+
+    rt::PhaseDispatchWorkerCallbacks llmCallbacks;
+    llmCallbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t stream) {
+        CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 2, marker.getMemoryCapacity(), stream));
+    };
+    llmCallbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t stream) {
+        CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 3, marker.getMemoryCapacity(), stream));
+    };
+    llmCallbacks.completePrefill
+        = [](rt::PhaseWorkItem const& item) { return rt::PhasePrefillCompletion{item.promptTokenCount, false}; };
+    llmCallbacks.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    rt::PhaseExecutionSafetyContract llmSafety = rt::PhaseExecutionSafetyContract::independent(
+        {&identities[3], &identities[4], &identities[5]}, {&identities[6], &identities[7], &identities[8]});
+    rt::PhaseDispatchWorker llmWorker(scheduler, std::move(llmCallbacks), prefillStream, decodeStream,
+        rt::PhaseTensorRTContextMode::kIndependentConcurrent, llmSafety);
+    rt::PhaseThreeCoordinator coordinator(encoderWorker, llmWorker);
+
+    encoderWorker.submit({10, 1, 0});
+    coordinator.runUntilIdle(3);
+    EXPECT_TRUE(coordinator.empty());
+    EXPECT_EQ(coordinator.encoderDispatchCount(), 1U);
+    EXPECT_EQ(coordinator.llmDispatchCount(), 2U);
+    EXPECT_FALSE(scheduler.hasRequest(10));
+
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseKernelGroupRecorderTest, SegmentsAndMeasuresCrossStreamHandoffs)
+{
+    cudaStream_t firstStream{};
+    cudaStream_t secondStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&firstStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&secondStream, cudaStreamNonBlocking));
+    rt::Tensor marker({4}, rt::DeviceType::kGPU, DataType::kINT32, "kernel_group_marker");
+    rt::PhaseKernelGroupRecorder recorder;
+    recorder.execute(7,
+        {{rt::PhaseKernelGroup::kEncoderEngine, "vit", firstStream,
+             [&](cudaStream_t stream) {
+                 CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 1, marker.getMemoryCapacity(), stream));
+             }},
+            {rt::PhaseKernelGroup::kPrefillEngine, "llm_prefill", secondStream,
+                [&](cudaStream_t stream) {
+                    CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 2, marker.getMemoryCapacity(), stream));
+                }},
+            {rt::PhaseKernelGroup::kPrefillSample, "sample", secondStream, [&](cudaStream_t stream) {
+                 CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 3, marker.getMemoryCapacity(), stream));
+             }}});
+    EXPECT_EQ(recorder.pendingCount(), 3U);
+    recorder.drain();
+    ASSERT_EQ(recorder.samples().size(), 3U);
+    EXPECT_EQ(recorder.samples()[0].dispatchIndex, 7U);
+    EXPECT_EQ(recorder.samples()[0].name, "vit");
+    EXPECT_EQ(recorder.samples()[1].group, rt::PhaseKernelGroup::kPrefillEngine);
+    EXPECT_GE(recorder.samples()[2].gpuMs, 0.0F);
+
+    CUDA_CHECK(cudaStreamDestroy(firstStream));
+    CUDA_CHECK(cudaStreamDestroy(secondStream));
 }
 
 TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)

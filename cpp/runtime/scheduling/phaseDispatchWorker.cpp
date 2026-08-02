@@ -75,8 +75,7 @@ bool PhaseExecutionSafetyContract::provesIndependentResources() const noexcept
     return prefill.tensorRTExecutionContext != nullptr && decode.tensorRTExecutionContext != nullptr
         && prefill.workspace != nullptr && decode.workspace != nullptr && prefill.ioBuffers != nullptr
         && decode.ioBuffers != nullptr && prefill.tensorRTExecutionContext != decode.tensorRTExecutionContext
-        && prefill.workspace != decode.workspace
-        && prefill.ioBuffers != decode.ioBuffers;
+        && prefill.workspace != decode.workspace && prefill.ioBuffers != decode.ioBuffers;
 }
 
 void PhaseExecutionSafetyContract::validate(PhaseTensorRTContextMode mode) const
@@ -108,12 +107,10 @@ PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDi
     mSafetyContract.validate(mExecutionMode);
     CUcontext const prefillCudaContext = getStreamCudaContext(mPrefillStream);
     CUcontext const decodeCudaContext = getStreamCudaContext(mDecodeStream);
-    check::check(prefillCudaContext == decodeCudaContext,
-        "Prefill and decode streams must share one CUDA context.");
+    check::check(prefillCudaContext == decodeCudaContext, "Prefill and decode streams must share one CUDA context.");
     if (mExecutionMode == PhaseTensorRTContextMode::kIndependentConcurrent)
     {
-        check::check(mPrefillStream != mDecodeStream,
-            "Independent TensorRT contexts require distinct CUDA streams.");
+        check::check(mPrefillStream != mDecodeStream, "Independent TensorRT contexts require distinct CUDA streams.");
     }
     validatePrimaryCudaContext(prefillCudaContext);
     mCudaContext = prefillCudaContext;
@@ -358,6 +355,11 @@ void PhaseDispatchWorker::runUntilIdle(size_t maxDispatches)
 bool PhaseDispatchWorker::busy() const noexcept
 {
     return mBusy;
+}
+
+bool PhaseDispatchWorker::empty() const noexcept
+{
+    return !mBusy && mScheduler.empty();
 }
 
 size_t PhaseDispatchWorker::dispatchCount() const noexcept

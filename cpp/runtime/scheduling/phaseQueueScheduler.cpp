@@ -34,6 +34,13 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
+    check::check(mConfig.minPrefillChunkTokens > 0, "minPrefillChunkTokens must be positive");
+    check::check(mConfig.prefillChunkAlignment > 0, "prefillChunkAlignment must be positive");
+    check::check(!mConfig.enableAdaptivePrefillChunking || mConfig.maxPrefillChunkTokens > 0,
+        "Adaptive prefill chunking requires maxPrefillChunkTokens");
+    check::check(
+        !mConfig.enableAdaptivePrefillChunking || mConfig.minPrefillChunkTokens <= mConfig.maxPrefillChunkTokens,
+        "Adaptive minimum prefill chunk exceeds the maximum");
     check::check(mConfig.decodeBurstLimit > 0, "decodeBurstLimit must be positive");
     check::check(mConfig.prefillQueueWaitTargetUs > 0.0, "prefillQueueWaitTargetUs must be positive");
     check::check(mConfig.decodeQueueWaitTargetUs > 0.0, "decodeQueueWaitTargetUs must be positive");
@@ -205,8 +212,40 @@ PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
 
 int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept
 {
-    return mConfig.maxPrefillChunkTokens > 0 ? std::min(item.tokenCount, mConfig.maxPrefillChunkTokens)
-                                             : item.tokenCount;
+    if (!item.allowChunkedPrefill || mConfig.maxPrefillChunkTokens == 0)
+    {
+        return item.tokenCount;
+    }
+
+    int32_t const maximum = std::min(item.tokenCount, mConfig.maxPrefillChunkTokens);
+    if (!mConfig.enableAdaptivePrefillChunking || mDecodeQueue.empty())
+    {
+        return maximum;
+    }
+
+    int32_t const minimum = std::min(maximum, mConfig.minPrefillChunkTokens);
+    int32_t selected = maximum;
+    if (mTelemetry.prefillGpuMsPerToken > 0.0F)
+    {
+        float const budgetTokens = mConfig.maxPredictedOverlapPrefillMs / mTelemetry.prefillGpuMsPerToken;
+        if (budgetTokens <= static_cast<float>(minimum))
+        {
+            selected = minimum;
+        }
+        else if (budgetTokens < static_cast<float>(maximum))
+        {
+            selected = static_cast<int32_t>(budgetTokens);
+        }
+    }
+
+    if (mTelemetry.overlapSampleCount > 0 && mTelemetry.overlapRatio < mConfig.minObservedOverlapRatio)
+    {
+        selected = minimum;
+    }
+
+    selected = std::clamp(selected, minimum, maximum);
+    int32_t const aligned = selected / mConfig.prefillChunkAlignment * mConfig.prefillChunkAlignment;
+    return std::max(minimum, aligned);
 }
 
 std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(

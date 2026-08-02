@@ -19,9 +19,9 @@
 
 #include "runtime/scheduling/phaseQueueScheduler.h"
 
-#include <cuda.h>
 #include <cstddef>
 #include <cstdint>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <functional>
 #include <optional>
@@ -85,8 +85,8 @@ struct PhaseExecutionSafetyContract
     PhaseExecutionResourceIdentity decode;
 
     static PhaseExecutionSafetyContract shared(void const* tensorRTExecutionContext) noexcept;
-    static PhaseExecutionSafetyContract independent(PhaseExecutionResourceIdentity prefill,
-        PhaseExecutionResourceIdentity decode) noexcept;
+    static PhaseExecutionSafetyContract independent(
+        PhaseExecutionResourceIdentity prefill, PhaseExecutionResourceIdentity decode) noexcept;
     void validate(PhaseTensorRTContextMode mode) const;
     bool provesIndependentResources() const noexcept;
 };
@@ -125,6 +125,7 @@ public:
     void runUntilIdle(size_t maxDispatches);
 
     bool busy() const noexcept;
+    bool empty() const noexcept;
     size_t dispatchCount() const noexcept;
     std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
     PhaseExecutionSafetyContract const& safetyContract() const noexcept;

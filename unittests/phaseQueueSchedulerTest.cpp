@@ -230,6 +230,70 @@ TEST(PhaseQueueSchedulerTest, UsesChunkCostForOverlapDecision)
     EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kOverlap);
 }
 
+TEST(PhaseQueueSchedulerTest, AdaptsChunkSizeFromObservedGpuCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.minPrefillChunkTokens = 16;
+    config.prefillChunkAlignment = 16;
+    config.maxPredictedOverlapPrefillMs = 5.0F;
+    config.metricsEwmaAlpha = 1.0F;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.prefillTokens = 100;
+    sample.prefillGpuMs = 10.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 48);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsNonChunkableMultimodalPrefillAtomic)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem multimodal{1, 300, 0, 0, 300};
+    multimodal.allowChunkedPrefill = false;
+    scheduler.enqueuePrefill(multimodal);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 300);
+}
+
+TEST(PhaseQueueSchedulerTest, DoesNotFragmentEfficientChunkForDecodeQueueWait)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.minPrefillChunkTokens = 32;
+    config.prefillChunkAlignment = 16;
+    config.enableAdaptivePrefillChunking = true;
+    config.decodeQueueWaitTargetUs = 0.001;
+    config.maxPredictedOverlapPrefillMs = 30.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueueDecode({2, 128, 1});
+    PhaseDispatchMetrics observed;
+    observed.prefillTokens = 128;
+    observed.prefillGpuMs = 12.8F;
+    observed.decodeContextTokens = 128;
+    observed.decodeGpuMs = 4.0F;
+    scheduler.observeMetrics(observed);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+}
+
 TEST(PhaseQueueSchedulerTest, KeepsInFlightRequestUnique)
 {
     PhaseQueueScheduler scheduler;

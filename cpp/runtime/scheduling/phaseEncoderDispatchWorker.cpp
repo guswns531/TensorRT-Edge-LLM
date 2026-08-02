@@ -67,6 +67,12 @@ PhaseEncoderDispatchWorker::PhaseEncoderDispatchWorker(PhaseQueueScheduler& pref
     check::check(static_cast<bool>(mCallbacks.enqueueEncoder), "Encoder enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.completeEncoder), "Encoder completion callback is required.");
     mSafetyContract.validate();
+    check::check(mEncoderStream != nullptr, "Encoder execution requires an explicit non-default CUDA stream.");
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(mEncoderStream, &mCudaContext));
+    check::check(mCudaContext != nullptr, "Encoder CUDA stream has no owning CUDA context.");
+    CUcontext current{};
+    CUDA_DRIVER_CHECK(cuCtxGetCurrent(&current));
+    check::check(current == mCudaContext, "Encoder stream must belong to the thread's current CUDA context.");
     CUDA_CHECK(cudaEventCreate(&mEncoderStart));
     CUDA_CHECK(cudaEventCreate(&mEncoderDone));
 }
@@ -96,9 +102,9 @@ void PhaseEncoderDispatchWorker::submit(PhaseEncoderWorkItem item)
 
 bool PhaseEncoderDispatchWorker::cancel(uint64_t requestId)
 {
-    if (mBusy
-        && std::any_of(mInFlight.begin(), mInFlight.end(),
-            [requestId](PhaseEncoderWorkItem const& item) { return item.requestId == requestId; }))
+    if (mBusy && std::any_of(mInFlight.begin(), mInFlight.end(), [requestId](PhaseEncoderWorkItem const& item) {
+            return item.requestId == requestId;
+        }))
     {
         return false;
     }
@@ -136,8 +142,8 @@ bool PhaseEncoderDispatchWorker::dispatchNext()
         mQueue.pop_front();
         auto const timestamp = mQueuedSince.find(item.requestId);
         check::check(timestamp != mQueuedSince.end(), "Dispatched encoder request has no queue timestamp.");
-        mCurrentMetrics.queueWaitUs = std::max(mCurrentMetrics.queueWaitUs,
-            std::chrono::duration<double, std::micro>(now - timestamp->second).count());
+        mCurrentMetrics.queueWaitUs = std::max(
+            mCurrentMetrics.queueWaitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
         mQueuedSince.erase(timestamp);
         mCurrentMetrics.inputUnits += item.inputUnits;
         mInFlight.push_back(item);
@@ -212,10 +218,8 @@ void PhaseEncoderDispatchWorker::completeInFlight()
     for (PhaseWorkItem const& item : prefillWork)
     {
         mPrefillScheduler.enqueuePrefill(item);
-        check::check(mActiveRequestIds.erase(item.requestId) == 1,
-            "Completed encoder request is not active.");
-        check::check(mActiveKVSlotIds.erase(item.kvSlotId) == 1,
-            "Completed encoder KV slot is not active.");
+        check::check(mActiveRequestIds.erase(item.requestId) == 1, "Completed encoder request is not active.");
+        check::check(mActiveKVSlotIds.erase(item.kvSlotId) == 1, "Completed encoder KV slot is not active.");
     }
 
     CUDA_CHECK(cudaEventElapsedTime(&mCurrentMetrics.gpuMs, mEncoderStart, mEncoderDone));
@@ -276,6 +280,11 @@ std::optional<PhaseEncoderDispatchMetrics> const& PhaseEncoderDispatchWorker::la
 PhaseEncoderExecutionSafetyContract const& PhaseEncoderDispatchWorker::safetyContract() const noexcept
 {
     return mSafetyContract;
+}
+
+CUcontext PhaseEncoderDispatchWorker::cudaContext() const noexcept
+{
+    return mCudaContext;
 }
 
 } // namespace rt
