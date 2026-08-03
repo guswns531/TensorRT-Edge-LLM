@@ -115,21 +115,57 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
     return result;
 }
 
-int32_t PhaseRequestLifecycle::submit(uint64_t requestId, int32_t promptTokenCount)
+int32_t PhaseRequestLifecycle::reserveForEncoder(uint64_t requestId, int32_t promptTokenCountEstimate)
 {
-    check::check(promptTokenCount > 0, "Phase request prompt length must be positive.");
+    check::check(promptTokenCountEstimate > 0, "Phase request prompt length estimate must be positive.");
     check::check(mRequests.find(requestId) == mRequests.end(), "Phase request ID has already been used.");
     int32_t const slot = mSlotAllocator.reserve();
-    PhaseRequestSnapshot snapshot{requestId, slot, promptTokenCount, 0, PhaseRequestStatus::kPrefill};
+    PhaseRequestSnapshot snapshot{requestId, slot, promptTokenCountEstimate, 0, PhaseRequestStatus::kEncoder};
     try
     {
         mRequests.emplace(requestId, RequestState{snapshot});
-        mScheduler.enqueuePrefill({requestId, promptTokenCount, slot, 0, promptTokenCount});
     }
     catch (...)
     {
         mRequests.erase(requestId);
         mSlotAllocator.release(slot);
+        throw;
+    }
+    return slot;
+}
+
+void PhaseRequestLifecycle::beginPrefill(uint64_t requestId, int32_t promptTokenCount, bool allowChunkedPrefill)
+{
+    check::check(promptTokenCount > 0, "Phase request prompt length must be positive.");
+    auto const it = mRequests.find(requestId);
+    check::check(it != mRequests.end(), "Encoder completed for an unknown phase request.");
+    PhaseRequestSnapshot& snapshot = it->second.snapshot;
+    check::check(snapshot.status == PhaseRequestStatus::kEncoder, "Phase request is not waiting for encoder handoff.");
+    snapshot.promptTokenCount = promptTokenCount;
+    snapshot.status = PhaseRequestStatus::kPrefill;
+    try
+    {
+        mScheduler.enqueuePrefill(
+            {requestId, promptTokenCount, snapshot.kvSlotId, 0, promptTokenCount, allowChunkedPrefill});
+    }
+    catch (...)
+    {
+        snapshot.status = PhaseRequestStatus::kEncoder;
+        throw;
+    }
+}
+
+int32_t PhaseRequestLifecycle::submit(uint64_t requestId, int32_t promptTokenCount)
+{
+    int32_t const slot = reserveForEncoder(requestId, promptTokenCount);
+    try
+    {
+        beginPrefill(requestId, promptTokenCount);
+    }
+    catch (...)
+    {
+        mSlotAllocator.release(slot);
+        mRequests.erase(requestId);
         throw;
     }
     return slot;
@@ -147,7 +183,7 @@ bool PhaseRequestLifecycle::cancel(uint64_t requestId)
     {
         return false;
     }
-    if (!mScheduler.cancel(requestId))
+    if (snapshot.status != PhaseRequestStatus::kEncoder && !mScheduler.cancel(requestId))
     {
         return false;
     }
@@ -184,7 +220,12 @@ void PhaseRequestLifecycle::runUntilIdle(size_t maxDispatches)
 
 bool PhaseRequestLifecycle::empty() const noexcept
 {
-    return mScheduler.empty() && !mWorker->busy();
+    return mScheduler.empty() && !mWorker->busy() && activeRequestCount() == 0;
+}
+
+bool PhaseRequestLifecycle::hasQueuedWork() const noexcept
+{
+    return !mScheduler.empty();
 }
 
 bool PhaseRequestLifecycle::busy() const noexcept
@@ -199,7 +240,8 @@ size_t PhaseRequestLifecycle::activeRequestCount() const noexcept
     {
         static_cast<void>(requestId);
         PhaseRequestStatus const status = state.snapshot.status;
-        if (status == PhaseRequestStatus::kPrefill || status == PhaseRequestStatus::kDecode)
+        if (status == PhaseRequestStatus::kEncoder || status == PhaseRequestStatus::kPrefill
+            || status == PhaseRequestStatus::kDecode)
         {
             ++count;
         }
@@ -220,6 +262,11 @@ std::optional<PhaseRequestSnapshot> PhaseRequestLifecycle::request(uint64_t requ
         return std::nullopt;
     }
     return it->second.snapshot;
+}
+
+CUcontext PhaseRequestLifecycle::cudaContext() const noexcept
+{
+    return mWorker->cudaContext();
 }
 
 } // namespace rt

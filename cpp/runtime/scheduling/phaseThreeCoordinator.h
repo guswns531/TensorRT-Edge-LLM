@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/scheduling/phaseContextServingFacade.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseEncoderDispatchWorker.h"
 
@@ -48,6 +49,29 @@ public:
 private:
     PhaseEncoderDispatchWorker& mEncoderWorker;
     PhaseDispatchWorker& mLlmWorker;
+};
+
+//! Drives encoder work and the continuous-context serving facade together.
+//!
+//! Requests may hold a stable slot in kEncoder state while visual work is in
+//! flight. Encoder completion uses PhaseContextServingFacade::beginPrefillAfterEncoder
+//! to make the request runnable by the LLM phase queues.
+class PhaseOnlineCoordinator
+{
+public:
+    PhaseOnlineCoordinator(PhaseEncoderDispatchWorker& encoderWorker, PhaseContextServingFacade& servingFacade);
+
+    bool step();
+    void runUntilIdle(size_t maxDispatches);
+
+    bool empty() const noexcept;
+    size_t encoderDispatchCount() const noexcept;
+    size_t llmDispatchCount() const noexcept;
+
+private:
+    PhaseEncoderDispatchWorker& mEncoderWorker;
+    PhaseContextServingFacade& mServingFacade;
+    size_t mLlmDispatchCount{};
 };
 
 } // namespace rt

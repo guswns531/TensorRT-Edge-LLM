@@ -64,9 +64,8 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
         "Legacy serving decode completion callback is required.");
     check::check(!usesPackedDecode || static_cast<bool>(mCallbacks.completePackedDecode),
         "Packed serving decode completion callback is required.");
-    mLifecycle = std::make_unique<PhaseRequestLifecycle>(
-        maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(), prefillStream, decodeStream, executionMode,
-        safetyContract);
+    mLifecycle = std::make_unique<PhaseRequestLifecycle>(maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(),
+        prefillStream, decodeStream, executionMode, safetyContract);
 }
 
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()
@@ -155,6 +154,34 @@ int32_t PhaseContextServingFacade::submit(
         mRegistrations.erase(requestId);
         throw;
     }
+}
+
+int32_t PhaseContextServingFacade::reserveForEncoder(
+    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCountEstimate)
+{
+    registerSource(requestId, context, contextRow);
+    try
+    {
+        return mLifecycle->reserveForEncoder(requestId, promptTokenCountEstimate);
+    }
+    catch (...)
+    {
+        mRegistrations.erase(requestId);
+        throw;
+    }
+}
+
+void PhaseContextServingFacade::beginPrefillAfterEncoder(PhaseWorkItem const& item)
+{
+    auto const snapshot = mLifecycle->request(item.requestId);
+    check::check(snapshot.has_value(), "Encoder handoff has no phase request reservation.");
+    check::check(snapshot->status == PhaseRequestStatus::kEncoder, "Encoder handoff request is not encoder-pending.");
+    check::check(snapshot->kvSlotId == item.kvSlotId, "Encoder handoff changed the stable KV slot.");
+    check::check(item.tokenOffset == 0 && item.tokenCount > 0,
+        "Encoder handoff must provide a non-empty prompt at token offset zero.");
+    int32_t const promptTokenCount = item.promptTokenCount > 0 ? item.promptTokenCount : item.tokenCount;
+    check::check(promptTokenCount == item.tokenCount, "Encoder handoff must provide the complete prompt in V1.");
+    mLifecycle->beginPrefill(item.requestId, promptTokenCount, item.allowChunkedPrefill);
 }
 
 PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(
@@ -365,6 +392,11 @@ bool PhaseContextServingFacade::empty() const noexcept
     return mPendingAdmissions.empty() && mLifecycle->empty();
 }
 
+bool PhaseContextServingFacade::hasQueuedPhaseWork() const noexcept
+{
+    return mLifecycle->hasQueuedWork();
+}
+
 bool PhaseContextServingFacade::busy() const noexcept
 {
     return mLifecycle->busy();
@@ -399,6 +431,11 @@ std::optional<PhaseRequestSnapshot> PhaseContextServingFacade::request(uint64_t 
         return PhaseRequestSnapshot{requestId, -1, pending->promptTokenCount, 0, PhaseRequestStatus::kPending};
     }
     return mLifecycle->request(requestId);
+}
+
+CUcontext PhaseContextServingFacade::cudaContext() const noexcept
+{
+    return mLifecycle->cudaContext();
 }
 
 } // namespace rt

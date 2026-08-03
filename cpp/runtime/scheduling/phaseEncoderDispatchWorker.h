@@ -73,6 +73,7 @@ using PhaseEncoderEnqueueCallback = std::function<void(std::vector<PhaseEncoderW
 using PhaseEncoderBatchCompletionCallback = std::function<void(std::vector<PhaseEncoderWorkItem> const&)>;
 //! Performs host-side encoder output finalization and returns ready prefill work.
 using PhaseEncoderCompletionCallback = std::function<PhaseWorkItem(PhaseEncoderWorkItem const&)>;
+using PhaseEncoderPrefillHandoffCallback = std::function<void(PhaseWorkItem const&)>;
 
 struct PhaseEncoderDispatchWorkerCallbacks
 {
@@ -91,6 +92,9 @@ class PhaseEncoderDispatchWorker
 public:
     PhaseEncoderDispatchWorker(PhaseQueueScheduler& prefillScheduler, PhaseEncoderQueueConfig config,
         PhaseEncoderDispatchWorkerCallbacks callbacks, cudaStream_t encoderStream,
+        PhaseEncoderExecutionSafetyContract safetyContract);
+    PhaseEncoderDispatchWorker(PhaseEncoderQueueConfig config, PhaseEncoderDispatchWorkerCallbacks callbacks,
+        PhaseEncoderPrefillHandoffCallback prefillHandoff, cudaStream_t encoderStream,
         PhaseEncoderExecutionSafetyContract safetyContract);
     ~PhaseEncoderDispatchWorker() noexcept;
 
@@ -120,7 +124,8 @@ private:
     void completeInFlight();
     bool eventReady() const;
 
-    PhaseQueueScheduler& mPrefillScheduler;
+    PhaseQueueScheduler* mPrefillScheduler{};
+    PhaseEncoderPrefillHandoffCallback mPrefillHandoff;
     PhaseEncoderQueueConfig mConfig;
     PhaseEncoderDispatchWorkerCallbacks mCallbacks;
     cudaStream_t mEncoderStream{};

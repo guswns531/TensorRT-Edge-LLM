@@ -57,7 +57,8 @@ void PhaseEncoderExecutionSafetyContract::validate() const
 PhaseEncoderDispatchWorker::PhaseEncoderDispatchWorker(PhaseQueueScheduler& prefillScheduler,
     PhaseEncoderQueueConfig config, PhaseEncoderDispatchWorkerCallbacks callbacks, cudaStream_t encoderStream,
     PhaseEncoderExecutionSafetyContract safetyContract)
-    : mPrefillScheduler(prefillScheduler)
+    : mPrefillScheduler(&prefillScheduler)
+    , mPrefillHandoff([&prefillScheduler](PhaseWorkItem const& item) { prefillScheduler.enqueuePrefill(item); })
     , mConfig(config)
     , mCallbacks(std::move(callbacks))
     , mEncoderStream(encoderStream)
@@ -66,6 +67,30 @@ PhaseEncoderDispatchWorker::PhaseEncoderDispatchWorker(PhaseQueueScheduler& pref
     check::check(mConfig.maxBatchSize > 0, "Encoder maxBatchSize must be positive.");
     check::check(static_cast<bool>(mCallbacks.enqueueEncoder), "Encoder enqueue callback is required.");
     check::check(static_cast<bool>(mCallbacks.completeEncoder), "Encoder completion callback is required.");
+    mSafetyContract.validate();
+    check::check(mEncoderStream != nullptr, "Encoder execution requires an explicit non-default CUDA stream.");
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(mEncoderStream, &mCudaContext));
+    check::check(mCudaContext != nullptr, "Encoder CUDA stream has no owning CUDA context.");
+    CUcontext current{};
+    CUDA_DRIVER_CHECK(cuCtxGetCurrent(&current));
+    check::check(current == mCudaContext, "Encoder stream must belong to the thread's current CUDA context.");
+    CUDA_CHECK(cudaEventCreate(&mEncoderStart));
+    CUDA_CHECK(cudaEventCreate(&mEncoderDone));
+}
+
+PhaseEncoderDispatchWorker::PhaseEncoderDispatchWorker(PhaseEncoderQueueConfig config,
+    PhaseEncoderDispatchWorkerCallbacks callbacks, PhaseEncoderPrefillHandoffCallback prefillHandoff,
+    cudaStream_t encoderStream, PhaseEncoderExecutionSafetyContract safetyContract)
+    : mPrefillHandoff(std::move(prefillHandoff))
+    , mConfig(config)
+    , mCallbacks(std::move(callbacks))
+    , mEncoderStream(encoderStream)
+    , mSafetyContract(std::move(safetyContract))
+{
+    check::check(mConfig.maxBatchSize > 0, "Encoder maxBatchSize must be positive.");
+    check::check(static_cast<bool>(mCallbacks.enqueueEncoder), "Encoder enqueue callback is required.");
+    check::check(static_cast<bool>(mCallbacks.completeEncoder), "Encoder completion callback is required.");
+    check::check(static_cast<bool>(mPrefillHandoff), "Encoder prefill handoff callback is required.");
     mSafetyContract.validate();
     check::check(mEncoderStream != nullptr, "Encoder execution requires an explicit non-default CUDA stream.");
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mEncoderStream, &mCudaContext));
@@ -87,7 +112,8 @@ void PhaseEncoderDispatchWorker::submit(PhaseEncoderWorkItem item)
 {
     check::check(item.inputUnits > 0, "Encoder inputUnits must be positive.");
     check::check(item.kvSlotId >= 0, "Encoder handoff requires a stable non-negative KV slot.");
-    check::check(!mPrefillScheduler.hasRequest(item.requestId), "Request is already active in the LLM scheduler.");
+    check::check(mPrefillScheduler == nullptr || !mPrefillScheduler->hasRequest(item.requestId),
+        "Request is already active in the LLM scheduler.");
     check::check(mActiveRequestIds.find(item.requestId) == mActiveRequestIds.end(),
         "Request is already active in the encoder queue.");
     check::check(mActiveKVSlotIds.find(item.kvSlotId) == mActiveKVSlotIds.end(),
@@ -211,13 +237,13 @@ void PhaseEncoderDispatchWorker::completeInFlight()
         }
         check::check(item.promptTokenCount >= item.tokenCount,
             "Encoder handoff prompt length is smaller than its initial prefill work.");
-        check::check(!mPrefillScheduler.hasRequest(item.requestId),
+        check::check(mPrefillScheduler == nullptr || !mPrefillScheduler->hasRequest(item.requestId),
             "Encoder handoff request is already active in the LLM scheduler.");
         prefillWork.push_back(item);
     }
     for (PhaseWorkItem const& item : prefillWork)
     {
-        mPrefillScheduler.enqueuePrefill(item);
+        mPrefillHandoff(item);
         check::check(mActiveRequestIds.erase(item.requestId) == 1, "Completed encoder request is not active.");
         check::check(mActiveKVSlotIds.erase(item.kvSlotId) == 1, "Completed encoder KV slot is not active.");
     }

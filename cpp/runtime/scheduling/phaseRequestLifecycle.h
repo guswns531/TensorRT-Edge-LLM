@@ -34,6 +34,7 @@ namespace rt
 enum class PhaseRequestStatus
 {
     kPending,
+    kEncoder,
     kPrefill,
     kDecode,
     kFinished,
@@ -64,6 +65,10 @@ public:
         PhaseTensorRTContextMode executionMode = PhaseTensorRTContextMode::kSharedSerialized,
         PhaseExecutionSafetyContract safetyContract = {});
 
+    //! Reserve stable KV ownership without making prefill runnable yet.
+    int32_t reserveForEncoder(uint64_t requestId, int32_t promptTokenCountEstimate);
+    //! Transition a reserved encoder request to the prefill queue.
+    void beginPrefill(uint64_t requestId, int32_t promptTokenCount, bool allowChunkedPrefill = true);
     int32_t submit(uint64_t requestId, int32_t promptTokenCount);
     bool cancel(uint64_t requestId);
 
@@ -73,10 +78,12 @@ public:
     void runUntilIdle(size_t maxDispatches);
 
     bool empty() const noexcept;
+    bool hasQueuedWork() const noexcept;
     bool busy() const noexcept;
     size_t activeRequestCount() const noexcept;
     int32_t availableSlotCount() const noexcept;
     std::optional<PhaseRequestSnapshot> request(uint64_t requestId) const;
+    CUcontext cudaContext() const noexcept;
 
 private:
     PhaseDispatchWorkerCallbacks makeWorkerCallbacks();

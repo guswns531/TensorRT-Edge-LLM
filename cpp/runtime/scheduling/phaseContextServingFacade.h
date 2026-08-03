@@ -109,6 +109,11 @@ public:
     //! The source context must remain alive until terminal completion or cancellation.
     //! @return The leased physical KV slot ID.
     int32_t submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount);
+    //! Register source state and lease a slot before asynchronous encoder execution.
+    int32_t reserveForEncoder(
+        uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCountEstimate);
+    //! Make encoder-produced tokens and embeddings runnable by the prefill scheduler.
+    void beginPrefillAfterEncoder(PhaseWorkItem const& item);
     //! Admit immediately when a slot is free, otherwise apply bounded queue backpressure.
     PhaseAdmissionResult submitOrQueue(
         uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount);
@@ -121,12 +126,14 @@ public:
     void runUntilIdle(size_t maxDispatches);
 
     bool empty() const noexcept;
+    bool hasQueuedPhaseWork() const noexcept;
     bool busy() const noexcept;
     size_t activeRequestCount() const noexcept;
     size_t pendingRequestCount() const noexcept;
     size_t registeredRequestCount() const noexcept;
     int32_t availableSlotCount() const noexcept;
     std::optional<PhaseRequestSnapshot> request(uint64_t requestId) const;
+    CUcontext cudaContext() const noexcept;
 
 private:
     struct Registration

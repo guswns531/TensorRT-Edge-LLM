@@ -86,5 +86,71 @@ size_t PhaseThreeCoordinator::llmDispatchCount() const noexcept
     return mLlmWorker.dispatchCount();
 }
 
+PhaseOnlineCoordinator::PhaseOnlineCoordinator(
+    PhaseEncoderDispatchWorker& encoderWorker, PhaseContextServingFacade& servingFacade)
+    : mEncoderWorker(encoderWorker)
+    , mServingFacade(servingFacade)
+{
+    check::check(mEncoderWorker.cudaContext() == mServingFacade.cudaContext(),
+        "Encoder and LLM phase workers must share one CUDA context.");
+}
+
+bool PhaseOnlineCoordinator::step()
+{
+    bool progressed{};
+    if (mEncoderWorker.busy())
+    {
+        progressed = mEncoderWorker.poll() || progressed;
+    }
+    if (mServingFacade.busy())
+    {
+        progressed = mServingFacade.poll() || progressed;
+    }
+    if (!mEncoderWorker.busy() && mEncoderWorker.queueSize() > 0)
+    {
+        progressed = mEncoderWorker.dispatchNext() || progressed;
+    }
+    if (!mServingFacade.busy() && mServingFacade.hasQueuedPhaseWork())
+    {
+        bool const dispatched = mServingFacade.dispatchNext();
+        progressed = dispatched || progressed;
+        if (dispatched)
+        {
+            ++mLlmDispatchCount;
+        }
+    }
+    return progressed;
+}
+
+void PhaseOnlineCoordinator::runUntilIdle(size_t maxDispatches)
+{
+    check::check(maxDispatches > 0, "Online phase coordinator maxDispatches must be positive.");
+    size_t const initialDispatches = encoderDispatchCount() + llmDispatchCount();
+    while (!empty())
+    {
+        if (!step())
+        {
+            std::this_thread::yield();
+        }
+        check::check(encoderDispatchCount() + llmDispatchCount() - initialDispatches <= maxDispatches,
+            "Online phase coordinator exceeded its dispatch limit.");
+    }
+}
+
+bool PhaseOnlineCoordinator::empty() const noexcept
+{
+    return mEncoderWorker.empty() && mServingFacade.empty();
+}
+
+size_t PhaseOnlineCoordinator::encoderDispatchCount() const noexcept
+{
+    return mEncoderWorker.dispatchCount();
+}
+
+size_t PhaseOnlineCoordinator::llmDispatchCount() const noexcept
+{
+    return mLlmDispatchCount;
+}
+
 } // namespace rt
 } // namespace trt_edgellm

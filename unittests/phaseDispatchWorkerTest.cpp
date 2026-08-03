@@ -603,6 +603,71 @@ TEST(PhaseRequestLifecycleTest, DefersInFlightCancellationUntilEventCompletion)
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
+TEST(PhaseRequestLifecycleTest, DefersPrefillUntilEncoderHandoff)
+{
+    cudaStream_t encoderStream{};
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    int32_t prefillEnqueues{};
+    rt::PhaseRequestLifecycleCallbacks lifecycleCallbacks;
+    lifecycleCallbacks.execution.enqueuePrefill
+        = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
+    lifecycleCallbacks.execution.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    lifecycleCallbacks.execution.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    lifecycleCallbacks.execution.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+
+    rt::PhaseRequestLifecycle lifecycle(
+        1, rt::PhaseQueueSchedulerConfig{}, std::move(lifecycleCallbacks), prefillStream, decodeStream);
+    int32_t const slot = lifecycle.reserveForEncoder(55, 1);
+    EXPECT_EQ(slot, 0);
+    EXPECT_FALSE(lifecycle.empty());
+    EXPECT_FALSE(lifecycle.hasQueuedWork());
+    ASSERT_TRUE(lifecycle.request(55).has_value());
+    EXPECT_EQ(lifecycle.request(55)->status, rt::PhaseRequestStatus::kEncoder);
+
+    rt::Tensor marker({1}, rt::DeviceType::kGPU, DataType::kINT32, "deferred_encoder_marker");
+    rt::PhaseEncoderDispatchWorkerCallbacks encoderCallbacks;
+    encoderCallbacks.enqueueEncoder = [&](std::vector<rt::PhaseEncoderWorkItem> const&, cudaStream_t stream) {
+        CUDA_CHECK(cudaMemsetAsync(marker.rawPointer(), 0, marker.getMemoryCapacity(), stream));
+    };
+    encoderCallbacks.completeEncoder = [](rt::PhaseEncoderWorkItem const& item) {
+        rt::PhaseWorkItem work{item.requestId, 4, item.kvSlotId, 0, 4};
+        work.allowChunkedPrefill = false;
+        return work;
+    };
+    int identities[6]{};
+    rt::PhaseEncoderExecutionSafetyContract safety{
+        {&identities[0], &identities[1], &identities[2]}, {{&identities[3], &identities[4], &identities[5]}}};
+    rt::PhaseEncoderDispatchWorker encoderWorker(
+        {}, std::move(encoderCallbacks),
+        [&](rt::PhaseWorkItem const& item) {
+            EXPECT_EQ(item.kvSlotId, slot);
+            lifecycle.beginPrefill(item.requestId, item.promptTokenCount, item.allowChunkedPrefill);
+        },
+        encoderStream, std::move(safety));
+    encoderWorker.submit({55, 1, slot});
+    ASSERT_TRUE(encoderWorker.dispatchNext());
+    encoderWorker.wait();
+
+    EXPECT_TRUE(lifecycle.hasQueuedWork());
+    EXPECT_EQ(lifecycle.request(55)->status, rt::PhaseRequestStatus::kPrefill);
+    lifecycle.runUntilIdle(1);
+    EXPECT_EQ(prefillEnqueues, 1);
+    EXPECT_TRUE(lifecycle.empty());
+    EXPECT_EQ(lifecycle.availableSlotCount(), 1);
+
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
 TEST(PhaseGreedySamplerTest, SamplesActualLogitsAndAppliesEosAndLengthState)
 {
     constexpr int32_t batchSize = 2;
