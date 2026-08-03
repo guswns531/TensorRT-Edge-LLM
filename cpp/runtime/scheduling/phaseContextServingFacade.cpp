@@ -141,13 +141,13 @@ void PhaseContextServingFacade::registerSource(
     mRegistrations.emplace(requestId, Registration{&context, contextRow});
 }
 
-int32_t PhaseContextServingFacade::submit(
-    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount)
+int32_t PhaseContextServingFacade::submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
+    int32_t promptTokenCount, PhaseSchedulingHints scheduling)
 {
     registerSource(requestId, context, contextRow);
     try
     {
-        return mLifecycle->submit(requestId, promptTokenCount);
+        return mLifecycle->submit(requestId, promptTokenCount, scheduling);
     }
     catch (...)
     {
@@ -156,13 +156,13 @@ int32_t PhaseContextServingFacade::submit(
     }
 }
 
-int32_t PhaseContextServingFacade::reserveForEncoder(
-    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCountEstimate)
+int32_t PhaseContextServingFacade::reserveForEncoder(uint64_t requestId, DecodingInferenceContext& context,
+    int32_t contextRow, int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling)
 {
     registerSource(requestId, context, contextRow);
     try
     {
-        return mLifecycle->reserveForEncoder(requestId, promptTokenCountEstimate);
+        return mLifecycle->reserveForEncoder(requestId, promptTokenCountEstimate, scheduling);
     }
     catch (...)
     {
@@ -184,8 +184,8 @@ void PhaseContextServingFacade::beginPrefillAfterEncoder(PhaseWorkItem const& it
     mLifecycle->beginPrefill(item.requestId, promptTokenCount, item.allowChunkedPrefill);
 }
 
-PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(
-    uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount)
+PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(uint64_t requestId, DecodingInferenceContext& context,
+    int32_t contextRow, int32_t promptTokenCount, PhaseSchedulingHints scheduling)
 {
     check::check(promptTokenCount > 0, "Phase request prompt length must be positive.");
     registerSource(requestId, context, contextRow);
@@ -194,13 +194,13 @@ PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(
     {
         if (mLifecycle->availableSlotCount() > 0)
         {
-            result.kvSlotId = mLifecycle->submit(requestId, promptTokenCount);
+            result.kvSlotId = mLifecycle->submit(requestId, promptTokenCount, scheduling);
             result.status = PhaseAdmissionStatus::kAdmitted;
         }
         else
         {
             check::check(mPendingAdmissions.size() < mMaxPendingAdmissions, "Serving pending admission queue is full.");
-            mPendingAdmissions.push_back({requestId, promptTokenCount});
+            mPendingAdmissions.push_back({requestId, promptTokenCount, scheduling});
         }
     }
     catch (...)
@@ -226,7 +226,7 @@ void PhaseContextServingFacade::admitPendingRequests()
     while (!mPendingAdmissions.empty() && mLifecycle->availableSlotCount() > 0)
     {
         PendingAdmission const admission = mPendingAdmissions.front();
-        int32_t const slot = mLifecycle->submit(admission.requestId, admission.promptTokenCount);
+        int32_t const slot = mLifecycle->submit(admission.requestId, admission.promptTokenCount, admission.scheduling);
         mPendingAdmissions.pop_front();
         if (mCallbacks.onAdmission)
         {
@@ -428,7 +428,8 @@ std::optional<PhaseRequestSnapshot> PhaseContextServingFacade::request(uint64_t 
         [requestId](PendingAdmission const& admission) { return admission.requestId == requestId; });
     if (pending != mPendingAdmissions.end())
     {
-        return PhaseRequestSnapshot{requestId, -1, pending->promptTokenCount, 0, PhaseRequestStatus::kPending};
+        return PhaseRequestSnapshot{
+            requestId, -1, pending->promptTokenCount, 0, PhaseRequestStatus::kPending, pending->scheduling};
     }
     return mLifecycle->request(requestId);
 }

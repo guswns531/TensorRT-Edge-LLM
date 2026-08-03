@@ -108,15 +108,16 @@ public:
     //! Register a borrowed source row and reserve its stable physical KV slot.
     //! The source context must remain alive until terminal completion or cancellation.
     //! @return The leased physical KV slot ID.
-    int32_t submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount);
+    int32_t submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount,
+        PhaseSchedulingHints scheduling = {});
     //! Register source state and lease a slot before asynchronous encoder execution.
-    int32_t reserveForEncoder(
-        uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCountEstimate);
+    int32_t reserveForEncoder(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
+        int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling = {});
     //! Make encoder-produced tokens and embeddings runnable by the prefill scheduler.
     void beginPrefillAfterEncoder(PhaseWorkItem const& item);
     //! Admit immediately when a slot is free, otherwise apply bounded queue backpressure.
-    PhaseAdmissionResult submitOrQueue(
-        uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount);
+    PhaseAdmissionResult submitOrQueue(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
+        int32_t promptTokenCount, PhaseSchedulingHints scheduling = {});
     //! Cancel queued work. In-flight work can be cancelled after its event completes.
     bool cancel(uint64_t requestId);
 
@@ -146,6 +147,7 @@ private:
     {
         uint64_t requestId{};
         int32_t promptTokenCount{};
+        PhaseSchedulingHints scheduling;
     };
 
     PhaseRequestLifecycleCallbacks makeLifecycleCallbacks();

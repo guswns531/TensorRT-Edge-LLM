@@ -80,6 +80,9 @@ struct Args
     int32_t loadOutputMin{8};
     int32_t loadOutputMax{8};
     int32_t maxOverlapPrefillTokens{128};
+    double ttftTargetMs{500.0};
+    double tpotTargetMs{50.0};
+    int32_t loadPriorityClasses{1};
     uint32_t loadSeed{};
     rt::PhaseTensorRTContextMode trtContextMode{rt::PhaseTensorRTContextMode::kIndependentConcurrent};
     bool contextAdapter{};
@@ -108,6 +111,7 @@ struct LoadRequestSample
     int32_t promptTokens{};
     int32_t maxOutputTokens{};
     int32_t generatedTokens{};
+    int32_t priority{};
     bool initiallyPending{};
 };
 
@@ -120,7 +124,8 @@ void printUsage(char const* program)
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
-        "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --loadSeed N --loadCsv FILE]",
+        "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --ttftTargetMs F --tpotTargetMs F "
+        "--loadPriorityClasses N --loadSeed N --loadCsv FILE]",
         program);
 }
 
@@ -149,6 +154,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         kLoadOutputMin,
         kLoadOutputMax,
         kMaxOverlapPrefillTokens,
+        kTtftTargetMs,
+        kTpotTargetMs,
+        kLoadPriorityClasses,
         kLoadSeed,
         kLoadCsv,
         kKernelGroupCsv,
@@ -172,6 +180,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"loadOutputMin", required_argument, nullptr, kLoadOutputMin},
         {"loadOutputMax", required_argument, nullptr, kLoadOutputMax},
         {"maxOverlapPrefillTokens", required_argument, nullptr, kMaxOverlapPrefillTokens},
+        {"ttftTargetMs", required_argument, nullptr, kTtftTargetMs},
+        {"tpotTargetMs", required_argument, nullptr, kTpotTargetMs},
+        {"loadPriorityClasses", required_argument, nullptr, kLoadPriorityClasses},
         {"loadSeed", required_argument, nullptr, kLoadSeed}, {"loadCsv", required_argument, nullptr, kLoadCsv},
         {"kernelGroupCsv", required_argument, nullptr, kKernelGroupCsv}, {"help", no_argument, nullptr, kHelp}, {}};
 
@@ -217,6 +228,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kLoadOutputMin: args.loadOutputMin = std::stoi(optarg); break;
         case kLoadOutputMax: args.loadOutputMax = std::stoi(optarg); break;
         case kMaxOverlapPrefillTokens: args.maxOverlapPrefillTokens = std::stoi(optarg); break;
+        case kTtftTargetMs: args.ttftTargetMs = std::stod(optarg); break;
+        case kTpotTargetMs: args.tpotTargetMs = std::stod(optarg); break;
+        case kLoadPriorityClasses: args.loadPriorityClasses = std::stoi(optarg); break;
         case kLoadSeed: args.loadSeed = static_cast<uint32_t>(std::stoul(optarg)); break;
         case kLoadCsv: args.loadCsv = optarg; break;
         case kKernelGroupCsv: args.kernelGroupCsv = optarg; break;
@@ -228,7 +242,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
         && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
         && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
-        && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0;
+        && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
+        && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4;
 }
 
 bool usesSharedTensorRTContext(Args const& args) noexcept
@@ -301,7 +316,7 @@ void writeLoadMetrics(std::filesystem::path const& path, std::vector<LoadRequest
     std::ofstream output(path);
     ELLM_CHECK(output.good(), "Failed to open request load metrics CSV: " + path.string());
     output << "request_id,scheduled_arrival_us,submitted_us,admitted_us,first_token_us,terminal_us,"
-              "prompt_tokens,max_output_tokens,generated_tokens,initial_admission,ttft_us,e2e_us,tpot_us\n";
+              "prompt_tokens,max_output_tokens,generated_tokens,priority,initial_admission,ttft_us,e2e_us,tpot_us\n";
     output << std::fixed << std::setprecision(6);
     for (LoadRequestSample const& sample : metrics)
     {
@@ -313,8 +328,8 @@ void writeLoadMetrics(std::filesystem::path const& path, std::vector<LoadRequest
         output << sample.requestId << ',' << sample.scheduledArrivalUs << ',' << sample.submittedUs << ','
                << sample.admittedUs << ',' << sample.firstTokenUs << ',' << sample.terminalUs << ','
                << sample.promptTokens << ',' << sample.maxOutputTokens << ',' << sample.generatedTokens << ','
-               << (sample.initiallyPending ? "pending" : "admitted") << ',' << ttft << ',' << e2e << ',' << tpot
-               << '\n';
+               << sample.priority << ',' << (sample.initiallyPending ? "pending" : "admitted") << ',' << ttft << ','
+               << e2e << ',' << tpot << '\n';
     }
 }
 
@@ -678,11 +693,13 @@ int main(int argc, char** argv)
         if (continuousLoad)
         {
             loadMetrics.reserve(servingRequests.size());
-            for (rt::PhaseLoadRequest const& request : servingRequests)
+            for (size_t index = 0; index < servingRequests.size(); ++index)
             {
+                rt::PhaseLoadRequest const& request = servingRequests[index];
                 loadMetricIndices.emplace(request.requestId, loadMetrics.size());
                 loadMetrics.push_back({request.requestId, request.arrivalOffsetUs, -1, -1, -1, -1,
-                    request.promptTokenCount, request.maxOutputTokens, 0, false});
+                    request.promptTokenCount, request.maxOutputTokens, 0,
+                    static_cast<int32_t>(index % static_cast<size_t>(args.loadPriorityClasses)), false});
             }
         }
         std::chrono::steady_clock::time_point loadStart;
@@ -692,6 +709,8 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
         facadeSchedulerConfig.maxPrefillChunkTokens = configuredChunkSize;
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
+        facadeSchedulerConfig.prefillQueueWaitTargetUs = args.ttftTargetMs * 1000.0;
+        facadeSchedulerConfig.decodeQueueWaitTargetUs = args.tpotTargetMs * 1000.0;
         facadeSchedulerConfig.enableAdaptivePrefillChunking = args.adaptiveChunking && configuredChunkSize > 0;
         facadeSchedulerConfig.minPrefillChunkTokens = std::min(32, std::max(1, configuredChunkSize));
         rt::PhaseKernelGroupRecorder kernelGroupRecorder;
@@ -880,8 +899,12 @@ int main(int argc, char** argv)
                 {
                     size_t const index = loadMetricIndices.at(request.requestId);
                     loadMetrics[index].submittedUs = elapsedMicroseconds(loadStart);
-                    static_cast<void>(
-                        facade.submitOrQueue(request.requestId, *facadeContexts[index], 0, request.promptTokenCount));
+                    rt::PhaseSchedulingHints scheduling;
+                    scheduling.priority = loadMetrics[index].priority;
+                    scheduling.ttftTargetUs = args.ttftTargetMs * 1000.0;
+                    scheduling.tpotTargetUs = args.tpotTargetMs * 1000.0;
+                    static_cast<void>(facade.submitOrQueue(
+                        request.requestId, *facadeContexts[index], 0, request.promptTokenCount, scheduling));
                     ++submittedRequests;
                 }
                 if (facade.busy())

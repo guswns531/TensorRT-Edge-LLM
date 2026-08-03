@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace trt_edgellm
@@ -49,12 +50,31 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
         "minObservedOverlapRatio must be in [0, 1]");
     check::check(
         mConfig.metricsEwmaAlpha > 0.0F && mConfig.metricsEwmaAlpha <= 1.0F, "metricsEwmaAlpha must be in (0, 1]");
+    check::check(mConfig.maxPriority > 0, "maxPriority must be positive");
+    check::check(std::isfinite(mConfig.priorityPressureWeight) && mConfig.priorityPressureWeight >= 0.0,
+        "priorityPressureWeight must be finite and non-negative");
 }
+
+namespace
+{
+
+void validateSchedulingHints(PhaseSchedulingHints const& hints, int32_t maxPriority)
+{
+    check::check(
+        hints.priority >= 0 && hints.priority <= maxPriority, "Request priority is outside the configured range");
+    check::check(std::isfinite(hints.ttftTargetUs) && hints.ttftTargetUs >= 0.0,
+        "Request TTFT target must be finite and non-negative");
+    check::check(std::isfinite(hints.tpotTargetUs) && hints.tpotTargetUs >= 0.0,
+        "Request TPOT target must be finite and non-negative");
+}
+
+} // namespace
 
 void PhaseQueueScheduler::enqueuePrefill(PhaseWorkItem item)
 {
     check::check(item.tokenCount > 0, "Prefill tokenCount must be positive");
     check::check(item.tokenOffset >= 0, "Prefill tokenOffset must be non-negative");
+    validateSchedulingHints(item.scheduling, mConfig.maxPriority);
     check::check(mActiveRequestIds.insert(item.requestId).second, "Request is already active");
     if (item.promptTokenCount == 0)
     {
@@ -68,6 +88,7 @@ void PhaseQueueScheduler::enqueuePrefill(PhaseWorkItem item)
 void PhaseQueueScheduler::enqueueDecode(PhaseWorkItem item)
 {
     check::check(item.tokenCount >= 0, "Decode tokenCount must be non-negative");
+    validateSchedulingHints(item.scheduling, mConfig.maxPriority);
     check::check(mActiveRequestIds.insert(item.requestId).second, "Request is already active");
     enqueueKnownDecode(item);
 }
@@ -137,18 +158,28 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         result.decodeCandidateTokens += mDecodeQueue[i].tokenCount;
     }
     auto const now = std::chrono::steady_clock::now();
-    auto oldestWait = [&](std::deque<PhaseWorkItem> const& queue) {
+    auto summarizeQueue = [&](std::deque<PhaseWorkItem> const& queue, bool prefill, double& oldestWaitUs,
+                              double& maxSloPressure, int32_t& highestPriority) {
         double waitUs{};
         for (PhaseWorkItem const& item : queue)
         {
             auto const timestamp = mQueuedSince.find(item.requestId);
             check::check(timestamp != mQueuedSince.end(), "Queued request has no residence timestamp");
-            waitUs = std::max(waitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
+            double const itemWaitUs = std::chrono::duration<double, std::micro>(now - timestamp->second).count();
+            waitUs = std::max(waitUs, itemWaitUs);
+            double const requestTarget = prefill ? item.scheduling.ttftTargetUs : item.scheduling.tpotTargetUs;
+            double const target = requestTarget > 0.0
+                ? requestTarget
+                : (prefill ? mConfig.prefillQueueWaitTargetUs : mConfig.decodeQueueWaitTargetUs);
+            maxSloPressure = std::max(maxSloPressure, itemWaitUs / target);
+            highestPriority = std::max(highestPriority, item.scheduling.priority);
         }
-        return waitUs;
+        oldestWaitUs = waitUs;
     };
-    result.prefillOldestWaitUs = oldestWait(mPrefillQueue);
-    result.decodeOldestWaitUs = oldestWait(mDecodeQueue);
+    summarizeQueue(
+        mPrefillQueue, true, result.prefillOldestWaitUs, result.prefillMaxSloPressure, result.prefillHighestPriority);
+    summarizeQueue(
+        mDecodeQueue, false, result.decodeOldestWaitUs, result.decodeMaxSloPressure, result.decodeHighestPriority);
     return result;
 }
 
@@ -185,11 +216,18 @@ PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
         return defaultDecision(state);
     }
 
-    double const prefillPressure = state.prefillOldestWaitUs / mConfig.prefillQueueWaitTargetUs;
-    double const decodePressure = state.decodeOldestWaitUs / mConfig.decodeQueueWaitTargetUs;
+    double const prefillPressure = state.prefillMaxSloPressure;
+    double const decodePressure = state.decodeMaxSloPressure;
     if (prefillPressure >= 1.0 || decodePressure >= 1.0)
     {
-        return prefillPressure > decodePressure ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
+        auto score = [this](double pressure, int32_t priority) {
+            return pressure
+                + mConfig.priorityPressureWeight * static_cast<double>(priority)
+                / static_cast<double>(mConfig.maxPriority);
+        };
+        return score(prefillPressure, state.prefillHighestPriority) > score(decodePressure, state.decodeHighestPriority)
+            ? PhaseDispatchKind::kPrefill
+            : PhaseDispatchKind::kDecode;
     }
     if (state.consecutiveDecodeBatches >= mConfig.decodeBurstLimit)
     {

@@ -986,12 +986,15 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
 
     EXPECT_EQ(facade.submit(101, first, 0, 2), 0);
     EXPECT_EQ(facade.submit(202, second, 0, 2), 1);
-    rt::PhaseAdmissionResult const pending = facade.submitOrQueue(303, third, 0, 2);
+    rt::PhaseSchedulingHints const pendingScheduling{2, 7000.0, 900.0};
+    rt::PhaseAdmissionResult const pending = facade.submitOrQueue(303, third, 0, 2, pendingScheduling);
     EXPECT_EQ(pending.status, rt::PhaseAdmissionStatus::kPending);
     EXPECT_EQ(pending.kvSlotId, -1);
     EXPECT_EQ(facade.pendingRequestCount(), 1U);
     ASSERT_TRUE(facade.request(303).has_value());
     EXPECT_EQ(facade.request(303)->status, rt::PhaseRequestStatus::kPending);
+    EXPECT_EQ(facade.request(303)->scheduling.priority, 2);
+    EXPECT_DOUBLE_EQ(facade.request(303)->scheduling.ttftTargetUs, 7000.0);
     EXPECT_THROW(facade.submitOrQueue(404, fourth, 0, 2), std::runtime_error);
     EXPECT_EQ(facade.registeredRequestCount(), 3U);
     ASSERT_TRUE(facade.dispatchNext());
@@ -1012,6 +1015,9 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     EXPECT_EQ(admissions[1].status, rt::PhaseAdmissionStatus::kAdmitted);
     EXPECT_EQ(admissions[1].requestId, 303U);
     EXPECT_EQ(admissions[1].kvSlotId, 0);
+    ASSERT_TRUE(facade.request(303).has_value());
+    EXPECT_EQ(facade.request(303)->scheduling.priority, 2);
+    EXPECT_DOUBLE_EQ(facade.request(303)->scheduling.tpotTargetUs, 900.0);
 
     ASSERT_TRUE(facade.dispatchNext());
     facade.wait();

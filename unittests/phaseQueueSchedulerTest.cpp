@@ -146,6 +146,49 @@ TEST(PhaseQueueSchedulerTest, SupportsCustomMetricsPolicyAndEwmaTelemetry)
     EXPECT_FLOAT_EQ(scheduler.telemetry().lastDispatch->overlapRatio, 0.2F);
 }
 
+TEST(PhaseQueueSchedulerTest, UsesPerRequestSloAndBoundedPriorityForUrgentQueues)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.priorityPressureWeight = 0.25;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem prefill{1, 512};
+    prefill.scheduling = {3, 0.001, 0.0};
+    PhaseWorkItem decode{2, 128};
+    decode.scheduling = {0, 0.0, 0.001};
+    scheduler.enqueuePrefill(prefill);
+    scheduler.enqueueDecode(decode);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, ExposesSloAndPriorityToCustomPolicy)
+{
+    bool called{};
+    PhaseQueueSchedulerConfig config;
+    config.metricsPolicy = [&](PhaseQueueSnapshot const& state, PhaseSchedulerTelemetry const&) {
+        called = true;
+        EXPECT_EQ(state.prefillHighestPriority, 1);
+        EXPECT_EQ(state.decodeHighestPriority, 2);
+        EXPECT_GT(state.prefillMaxSloPressure, 0.0);
+        EXPECT_GT(state.decodeMaxSloPressure, 0.0);
+        return PhaseDispatchKind::kDecode;
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem prefill{1, 32};
+    prefill.scheduling = {1, 1000000.0, 0.0};
+    PhaseWorkItem decode{2, 128};
+    decode.scheduling = {2, 0.0, 1000000.0};
+    scheduler.enqueuePrefill(prefill);
+    scheduler.enqueueDecode(decode);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(called);
+}
+
 TEST(PhaseQueueSchedulerTest, RejectsDuplicateQueuedRequest)
 {
     PhaseQueueScheduler scheduler;

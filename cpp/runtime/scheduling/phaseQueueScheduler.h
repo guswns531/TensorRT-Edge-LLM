@@ -32,12 +32,33 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Per-request policy hints. Zero SLO targets inherit the scheduler defaults.
+struct PhaseSchedulingHints
+{
+    int32_t priority{};
+    double ttftTargetUs{};
+    double tpotTargetUs{};
+};
+
 //! A unit of phase work. For prefill, tokenCount is the remaining prompt
 //! length while queued and the dispatched chunk length while in flight.
 //! For decode it is the current KV length. kvSlotId identifies stable physical
 //! cache ownership; tokenOffset and promptTokenCount describe chunk progress.
 struct PhaseWorkItem
 {
+    PhaseWorkItem() = default;
+    PhaseWorkItem(uint64_t requestId, int32_t tokenCount, int32_t kvSlotId = -1, int32_t tokenOffset = 0,
+        int32_t promptTokenCount = 0, bool allowChunkedPrefill = true, PhaseSchedulingHints scheduling = {})
+        : requestId(requestId)
+        , tokenCount(tokenCount)
+        , kvSlotId(kvSlotId)
+        , tokenOffset(tokenOffset)
+        , promptTokenCount(promptTokenCount)
+        , allowChunkedPrefill(allowChunkedPrefill)
+        , scheduling(scheduling)
+    {
+    }
+
     uint64_t requestId{};
     int32_t tokenCount{};
     int32_t kvSlotId{-1};
@@ -45,6 +66,7 @@ struct PhaseWorkItem
     int32_t promptTokenCount{};
     //! Gemma4 vision-block attention currently requires one atomic prefill.
     bool allowChunkedPrefill{true};
+    PhaseSchedulingHints scheduling;
 };
 
 enum class PhaseDispatchKind
@@ -92,6 +114,10 @@ struct PhaseQueueSnapshot
     int32_t consecutiveDecodeBatches{};
     double prefillOldestWaitUs{};
     double decodeOldestWaitUs{};
+    double prefillMaxSloPressure{};
+    double decodeMaxSloPressure{};
+    int32_t prefillHighestPriority{};
+    int32_t decodeHighestPriority{};
 };
 
 using PhaseSchedulingPolicy = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&)>;
@@ -126,6 +152,10 @@ struct PhaseQueueSchedulerConfig
     float minObservedOverlapRatio{0.05F};
     size_t minMetricsSamples{2};
     float metricsEwmaAlpha{0.2F};
+    //! Priority is constrained to [0, maxPriority]. Its contribution is bounded
+    //! so an overdue lower-priority phase cannot be starved indefinitely.
+    int32_t maxPriority{3};
+    double priorityPressureWeight{0.25};
     //! Optional complete replacement for the provided metrics policy.
     PhaseMetricsSchedulingPolicy metricsPolicy{};
     //! Legacy queue-only policy, used when metrics policy is disabled.

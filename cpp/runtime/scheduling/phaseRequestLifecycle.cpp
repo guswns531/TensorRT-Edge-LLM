@@ -115,12 +115,14 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
     return result;
 }
 
-int32_t PhaseRequestLifecycle::reserveForEncoder(uint64_t requestId, int32_t promptTokenCountEstimate)
+int32_t PhaseRequestLifecycle::reserveForEncoder(
+    uint64_t requestId, int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling)
 {
     check::check(promptTokenCountEstimate > 0, "Phase request prompt length estimate must be positive.");
     check::check(mRequests.find(requestId) == mRequests.end(), "Phase request ID has already been used.");
     int32_t const slot = mSlotAllocator.reserve();
-    PhaseRequestSnapshot snapshot{requestId, slot, promptTokenCountEstimate, 0, PhaseRequestStatus::kEncoder};
+    PhaseRequestSnapshot snapshot{
+        requestId, slot, promptTokenCountEstimate, 0, PhaseRequestStatus::kEncoder, scheduling};
     try
     {
         mRequests.emplace(requestId, RequestState{snapshot});
@@ -145,8 +147,9 @@ void PhaseRequestLifecycle::beginPrefill(uint64_t requestId, int32_t promptToken
     snapshot.status = PhaseRequestStatus::kPrefill;
     try
     {
-        mScheduler.enqueuePrefill(
-            {requestId, promptTokenCount, snapshot.kvSlotId, 0, promptTokenCount, allowChunkedPrefill});
+        PhaseWorkItem item{requestId, promptTokenCount, snapshot.kvSlotId, 0, promptTokenCount, allowChunkedPrefill};
+        item.scheduling = snapshot.scheduling;
+        mScheduler.enqueuePrefill(std::move(item));
     }
     catch (...)
     {
@@ -155,9 +158,9 @@ void PhaseRequestLifecycle::beginPrefill(uint64_t requestId, int32_t promptToken
     }
 }
 
-int32_t PhaseRequestLifecycle::submit(uint64_t requestId, int32_t promptTokenCount)
+int32_t PhaseRequestLifecycle::submit(uint64_t requestId, int32_t promptTokenCount, PhaseSchedulingHints scheduling)
 {
-    int32_t const slot = reserveForEncoder(requestId, promptTokenCount);
+    int32_t const slot = reserveForEncoder(requestId, promptTokenCount, scheduling);
     try
     {
         beginPrefill(requestId, promptTokenCount);

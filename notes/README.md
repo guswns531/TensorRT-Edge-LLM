@@ -49,6 +49,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 27. [Legacy/indexed/phase/continuous 단계별 성능 분석](27-performance-tier-analysis.md)
 28. [Gemma 4 VLM three-phase, adaptive prefill, kernel-group 결과](28-gemma4-vlm-three-phase-adaptive-segmentation.md)
 29. [Gemma 4 VLM real-request 정확성 및 성능 비교](29-gemma4-vlm-real-request-performance.md)
+30. [SLO 기반 customizable scheduler](30-slo-customizable-scheduler.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
