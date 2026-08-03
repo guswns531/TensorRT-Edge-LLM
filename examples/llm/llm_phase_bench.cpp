@@ -711,6 +711,7 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
         facadeSchedulerConfig.prefillQueueWaitTargetUs = args.ttftTargetMs * 1000.0;
         facadeSchedulerConfig.decodeQueueWaitTargetUs = args.tpotTargetMs * 1000.0;
+        facadeSchedulerConfig.enablePriorityBatching = args.loadPriorityClasses > 1;
         facadeSchedulerConfig.enableAdaptivePrefillChunking = args.adaptiveChunking && configuredChunkSize > 0;
         facadeSchedulerConfig.minPrefillChunkTokens = std::min(32, std::max(1, configuredChunkSize));
         rt::PhaseKernelGroupRecorder kernelGroupRecorder;

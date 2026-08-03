@@ -53,6 +53,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxPriority > 0, "maxPriority must be positive");
     check::check(std::isfinite(mConfig.priorityPressureWeight) && mConfig.priorityPressureWeight >= 0.0,
         "priorityPressureWeight must be finite and non-negative");
+    check::check(std::isfinite(mConfig.priorityAgingUs) && mConfig.priorityAgingUs > 0.0,
+        "priorityAgingUs must be finite and positive");
 }
 
 namespace
@@ -290,6 +292,21 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
     std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill, double& queueWaitUs)
 {
     auto const now = std::chrono::steady_clock::now();
+    auto priorityRank = [&](PhaseWorkItem const& item) {
+        auto const timestamp = mQueuedSince.find(item.requestId);
+        check::check(timestamp != mQueuedSince.end(), "Prioritized request has no queue timestamp");
+        double const waitUs = std::chrono::duration<double, std::micro>(now - timestamp->second).count();
+        return static_cast<double>(item.scheduling.priority) + waitUs / mConfig.priorityAgingUs;
+    };
+    auto higherPriority = [&](PhaseWorkItem const& lhs, PhaseWorkItem const& rhs) {
+        double const lhsRank = priorityRank(lhs);
+        double const rhsRank = priorityRank(rhs);
+        if (lhsRank != rhsRank)
+        {
+            return lhsRank < rhsRank;
+        }
+        return mQueuedSince.at(lhs.requestId) > mQueuedSince.at(rhs.requestId);
+    };
     auto recordQueueWait = [&](uint64_t requestId) {
         auto const timestamp = mQueuedSince.find(requestId);
         check::check(timestamp != mQueuedSince.end(), "Dispatched request has no queue timestamp");
@@ -303,8 +320,13 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
     {
         for (int32_t i = 0; i < count; ++i)
         {
-            PhaseWorkItem item = queue.front();
-            queue.pop_front();
+            auto selected = queue.begin();
+            if (mConfig.enablePriorityBatching)
+            {
+                selected = std::max_element(queue.begin(), queue.end(), higherPriority);
+            }
+            PhaseWorkItem item = *selected;
+            queue.erase(selected);
             check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
             recordQueueWait(item.requestId);
             batch.push_back(item);
@@ -312,17 +334,30 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         return batch;
     }
 
-    int32_t const bucketTokens = dispatchedPrefillTokens(queue.front());
-    bool const bucketInitial = queue.front().tokenOffset == 0;
-    for (auto it = queue.begin(); it != queue.end() && static_cast<int32_t>(batch.size()) < maxBatchSize;)
+    auto bucketSeed = queue.begin();
+    if (mConfig.enablePriorityBatching)
     {
-        if (dispatchedPrefillTokens(*it) != bucketTokens || (it->tokenOffset == 0) != bucketInitial)
+        bucketSeed = std::max_element(queue.begin(), queue.end(), higherPriority);
+    }
+    int32_t const bucketTokens = dispatchedPrefillTokens(*bucketSeed);
+    bool const bucketInitial = bucketSeed->tokenOffset == 0;
+    while (static_cast<int32_t>(batch.size()) < maxBatchSize)
+    {
+        auto selected = queue.end();
+        for (auto it = queue.begin(); it != queue.end(); ++it)
         {
-            ++it;
-            continue;
+            if (dispatchedPrefillTokens(*it) == bucketTokens && (it->tokenOffset == 0) == bucketInitial
+                && (selected == queue.end() || (mConfig.enablePriorityBatching && higherPriority(*selected, *it))))
+            {
+                selected = it;
+            }
         }
-        PhaseWorkItem item = *it;
-        it = queue.erase(it);
+        if (selected == queue.end())
+        {
+            break;
+        }
+        PhaseWorkItem item = *selected;
+        queue.erase(selected);
         item.tokenCount = bucketTokens;
         check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
         recordQueueWait(item.requestId);

@@ -26,6 +26,11 @@ priority 항은 기본 0.25로 제한되어, 낮은 priority의 심하게 overdu
 queue depth, candidate token cost, wait, SLO pressure, priority, EWMA와 마지막 CUDA-event metric을 받아 이 기본
 결정을 완전히 교체할 수 있다.
 
+`enablePriorityBatching=true`이면 phase를 고른 뒤 같은 phase queue 안에서도 effective priority가 높은 요청부터
+batch를 만든다. effective priority는 `priority + wait_us / priorityAgingUs`이며 기본 aging window는 1초다. 따라서
+높은 priority 요청이 먼저 실행되지만 오래 기다린 낮은 priority 요청은 매초 한 class씩 승급되어 starvation을
+피한다. Prefill은 priority가 가장 높은 요청의 chunk/profile bucket을 먼저 고른 뒤 같은 bucket에서 batch를 채운다.
+
 `ttftTargetUs`는 scheduler에 admission된 뒤 prefill queue residence budget이다. 실제 arrival부터 admission까지의
 pending 시간까지 포함한 end-to-end TTFT SLO를 적용하려면 admission 시 남은 budget을 계산해 요청별 힌트로 넣는다.
 `tpotTargetUs`도 token 간 전체 지연의 근사치로 decode queue residence를 사용하며, host/network 시간을 포함한 최종
@@ -56,4 +61,3 @@ priority class는 고정 seed schedule의 request 순서에 0부터 round-robin�
 - 두 phase가 모두 overdue일 때 bounded priority가 decision에 반영되는지 확인했다.
 - pending admission을 거친 요청의 TTFT/TPOT/priority가 보존되는지 확인했다.
 - 관련 scheduler/lifecycle/facade GPU unit test 21개와 `llm_phase_bench` 빌드가 통과했다.
-

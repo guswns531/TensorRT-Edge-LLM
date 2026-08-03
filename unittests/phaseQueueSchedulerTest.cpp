@@ -189,6 +189,31 @@ TEST(PhaseQueueSchedulerTest, ExposesSloAndPriorityToCustomPolicy)
     EXPECT_TRUE(called);
 }
 
+TEST(PhaseQueueSchedulerTest, BatchesHigherPriorityWithinEachPhase)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.enablePriorityBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem low{1, 32};
+    low.scheduling.priority = 0;
+    PhaseWorkItem high{2, 64};
+    high.scheduling.priority = 3;
+    PhaseWorkItem medium{3, 64};
+    medium.scheduling.priority = 2;
+    scheduler.enqueuePrefill(low);
+    scheduler.enqueuePrefill(high);
+    scheduler.enqueuePrefill(medium);
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 2U);
+    EXPECT_EQ(first.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(first.prefillBatch[1].requestId, 3U);
+    PhaseDispatchPlan const second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch[0].requestId, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, RejectsDuplicateQueuedRequest)
 {
     PhaseQueueScheduler scheduler;

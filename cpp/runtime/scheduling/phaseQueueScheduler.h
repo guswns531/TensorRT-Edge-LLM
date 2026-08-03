@@ -156,6 +156,10 @@ struct PhaseQueueSchedulerConfig
     //! so an overdue lower-priority phase cannot be starved indefinitely.
     int32_t maxPriority{3};
     double priorityPressureWeight{0.25};
+    //! Select higher-priority requests first within each phase batch. Waiting
+    //! requests gain one effective priority class per priorityAgingUs.
+    bool enablePriorityBatching{};
+    double priorityAgingUs{1000000.0};
     //! Optional complete replacement for the provided metrics policy.
     PhaseMetricsSchedulingPolicy metricsPolicy{};
     //! Legacy queue-only policy, used when metrics policy is disabled.
