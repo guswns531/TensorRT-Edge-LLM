@@ -21,10 +21,15 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
+#include "multimodal/multimodalRunner.h"
+#include "requestFileParser.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
+#include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/scheduling/gemma4PhaseVisionAdapter.h"
+#include "runtime/scheduling/phaseAsyncServer.h"
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
 #include "runtime/scheduling/phaseContextServingFacade.h"
@@ -32,8 +37,10 @@
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseGreedySampler.h"
 #include "runtime/scheduling/phaseKernelGroupRecorder.h"
+#include "runtime/scheduling/phaseThreeCoordinator.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
+#include "tokenizer/tokenizer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -44,6 +51,7 @@
 #include <getopt.h>
 #include <iomanip>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -66,6 +74,9 @@ struct Args
     std::string outputCsv;
     std::string loadCsv;
     std::string kernelGroupCsv;
+    std::string inputFile;
+    std::string multimodalEngineDir;
+    std::string traceCsv;
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t inputLen{512};
@@ -75,6 +86,7 @@ struct Args
     int32_t iterations{100};
     int32_t loadRequests{};
     double arrivalRate{1000.0};
+    double traceArrivalRate{10.0};
     int32_t loadPromptMin{};
     int32_t loadPromptMax{};
     int32_t loadOutputMin{8};
@@ -115,6 +127,73 @@ struct LoadRequestSample
     bool initiallyPending{};
 };
 
+struct TraceRequestSample
+{
+    uint64_t requestId{};
+    int64_t scheduledArrivalUs{};
+    int64_t submittedUs{-1};
+    int64_t completedUs{-1};
+    size_t imageCount{};
+    rt::PhaseRequestStatus admissionStatus{rt::PhaseRequestStatus::kPending};
+    rt::PhaseAsyncCompletion completion;
+};
+
+std::vector<int64_t> readTraceArrivalOffsets(
+    std::filesystem::path const& inputFile, size_t requestCount, double defaultArrivalRate)
+{
+    std::ifstream input(inputFile);
+    ELLM_CHECK(input.is_open(), "Failed to open trace JSON: " + inputFile.string());
+    nlohmann::json const root = nlohmann::json::parse(input);
+    auto const& requests = root.at("requests");
+    ELLM_CHECK(requests.size() == requestCount, "Trace parser and arrival metadata request counts differ");
+    bool const hasExplicitOffsets = std::all_of(requests.begin(), requests.end(), [](nlohmann::json const& request) {
+        return request.contains("arrival_offset_us");
+    });
+    std::vector<int64_t> result(requestCount);
+    int64_t const defaultIntervalUs = static_cast<int64_t>(1000000.0 / defaultArrivalRate);
+    for (size_t index = 0; index < requestCount; ++index)
+    {
+        result[index] = hasExplicitOffsets ? requests[index].at("arrival_offset_us").get<int64_t>()
+                                           : static_cast<int64_t>(index) * defaultIntervalUs;
+        ELLM_CHECK(result[index] >= 0 && (index == 0 || result[index] >= result[index - 1]),
+            "Trace arrival offsets must be non-negative and nondecreasing");
+    }
+    return result;
+}
+
+std::string csvQuote(std::string value)
+{
+    size_t offset{};
+    while ((offset = value.find('"', offset)) != std::string::npos)
+    {
+        value.insert(offset, 1, '"');
+        offset += 2;
+    }
+    return '"' + value + '"';
+}
+
+void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceRequestSample> const& samples)
+{
+    if (path.has_parent_path())
+    {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream output(path);
+    ELLM_CHECK(output.is_open(), "Failed to open phase trace CSV: " + path.string());
+    output << "request_id,scheduled_arrival_us,submitted_us,completed_us,queue_delay_us,e2e_ms,image_count,"
+              "admission_status,finish_reason,output_tokens,output_text\n";
+    output << std::fixed << std::setprecision(6);
+    for (TraceRequestSample const& sample : samples)
+    {
+        rt::LLMGenerationResponse const& response = sample.completion.response;
+        output << sample.requestId << ',' << sample.scheduledArrivalUs << ',' << sample.submittedUs << ','
+               << sample.completedUs << ',' << sample.submittedUs - sample.scheduledArrivalUs << ','
+               << sample.completion.latencyMs << ',' << sample.imageCount << ','
+               << static_cast<int>(sample.admissionStatus) << ',' << rt::finishReasonName(response.finishReasons[0])
+               << ',' << response.outputIds[0].size() << ',' << csvQuote(response.outputTexts[0]) << '\n';
+    }
+}
+
 void printUsage(char const* program)
 {
     LOG_INFO(
@@ -123,6 +202,7 @@ void printUsage(char const* program)
         "[--trtContextMode shared|independent] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
+        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
         "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --ttftTargetMs F --tpotTargetMs F "
         "--loadPriorityClasses N --loadSeed N --loadCsv FILE]",
@@ -160,6 +240,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         kLoadSeed,
         kLoadCsv,
         kKernelGroupCsv,
+        kInputFile,
+        kMultimodalEngineDir,
+        kTraceCsv,
+        kTraceArrivalRate,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -184,7 +268,12 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"tpotTargetMs", required_argument, nullptr, kTpotTargetMs},
         {"loadPriorityClasses", required_argument, nullptr, kLoadPriorityClasses},
         {"loadSeed", required_argument, nullptr, kLoadSeed}, {"loadCsv", required_argument, nullptr, kLoadCsv},
-        {"kernelGroupCsv", required_argument, nullptr, kKernelGroupCsv}, {"help", no_argument, nullptr, kHelp}, {}};
+        {"kernelGroupCsv", required_argument, nullptr, kKernelGroupCsv},
+        {"inputFile", required_argument, nullptr, kInputFile},
+        {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
+        {"traceCsv", required_argument, nullptr, kTraceCsv},
+        {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
+        {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -234,6 +323,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kLoadSeed: args.loadSeed = static_cast<uint32_t>(std::stoul(optarg)); break;
         case kLoadCsv: args.loadCsv = optarg; break;
         case kKernelGroupCsv: args.kernelGroupCsv = optarg; break;
+        case kInputFile: args.inputFile = optarg; break;
+        case kMultimodalEngineDir: args.multimodalEngineDir = optarg; break;
+        case kTraceCsv: args.traceCsv = optarg; break;
+        case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -243,7 +336,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
         && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
         && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
-        && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4;
+        && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4
+        && args.traceArrivalRate > 0.0 && (args.inputFile.empty() || !args.traceCsv.empty());
 }
 
 bool usesSharedTensorRTContext(Args const& args) noexcept
@@ -392,6 +486,8 @@ int main(int argc, char** argv)
     ELLM_CHECK(config.numDeepstackFeatures == 0, "llm_phase_bench v1 does not support deepstack inputs");
     ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize,
         "Prefill and decode physical slots exceed maxSupportedBatchSize");
+    int32_t const phaseSlotCount = args.prefillBatch + args.decodeBatch;
+    rt::LLMEngineConfig resourceConfig = config;
     ELLM_CHECK(args.inputLen <= config.maxSupportedInputLength, "inputLen exceeds maxSupportedInputLength");
     int32_t const loadPromptMin = args.loadPromptMin > 0 ? args.loadPromptMin : args.inputLen;
     int32_t const loadPromptMax = args.loadPromptMax > 0 ? args.loadPromptMax : args.inputLen;
@@ -443,29 +539,41 @@ int main(int argc, char** argv)
     rt::validateAgainstEngine(config, *prefillExecutor, "phase-prefill");
 
     std::unordered_map<std::string, std::string> const emptyLoraMap;
-    auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
-    auto prefillIO = rt::PipelineIO::createForLLM(config, setupStream);
-    auto decodeIO = rt::PipelineIO::createForLLM(config, setupStream);
+    auto resources = rt::SharedResources::createForLLM(resourceConfig, emptyLoraMap, setupStream);
+    auto prefillIO = rt::PipelineIO::createForLLM(config, args.prefillBatch, args.inputLen, setupStream);
+    auto decodeIO = rt::PipelineIO::createForLLM(config, args.decodeBatch, 1, setupStream);
     rt::TensorMap prefillMap;
     rt::TensorMap decodeMap;
-    rt::buildTensorMap(prefillMap, prefillIO, *resources, config, 0);
-    rt::buildTensorMap(decodeMap, decodeIO, *resources, config, 0);
+    rt::buildTensorMap(prefillMap, prefillIO, *resources, resourceConfig, 0);
+    rt::buildTensorMap(decodeMap, decodeIO, *resources, resourceConfig, 0);
 
     resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream);
     resources->externalWeightManager->validateAgainstEngine(*prefillExecutor, "phase-shared");
     resources->externalWeightManager->registerTensorMapEntries(prefillMap);
     resources->externalWeightManager->registerAdditionalTensorMapEntries(decodeMap);
 
-    int64_t const contextBytes = prefillExecutor->getRequiredContextMemorySize();
+    rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
+    rt::EmbeddingPreprocessor prefillEmbedding(embedding, config);
+    rt::EmbeddingPreprocessor decodeEmbedding(embedding, config);
+
+    int64_t const prefillContextBytes = prefillExecutor->getRequiredContextMemorySizeForProfile(kPrefillProfile);
+    int64_t const decodeContextBytes = decodeRunner->getRequiredContextMemorySizeForProfile(kDecodeProfile);
+    LOG_INFO("Phase context workspaces: prefill=%.1f MiB decode=%.1f MiB all-profiles=%.1f MiB",
+        static_cast<double>(prefillContextBytes) / (1024.0 * 1024.0),
+        static_cast<double>(decodeContextBytes) / (1024.0 * 1024.0),
+        static_cast<double>(prefillExecutor->getRequiredContextMemorySize()) / (1024.0 * 1024.0));
     rt::Tensor prefillContext(
-        {contextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_prefill_context_memory");
-    prefillExecutor->setContextMemory(prefillContext);
+        {prefillContextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_prefill_context_memory");
+    ELLM_CHECK(prefillExecutor->setContextMemoryForProfile(kPrefillProfile, prefillContext, setupStream),
+        "Failed to assign prefill profile context memory");
     std::unique_ptr<rt::Tensor> decodeContext;
     if (decodeExecutor)
     {
         decodeContext = std::make_unique<rt::Tensor>(
-            rt::Coords{contextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_decode_context_memory");
-        decodeExecutor->setContextMemory(*decodeContext);
+            rt::Coords{decodeContextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+            "phase_decode_context_memory");
+        ELLM_CHECK(decodeExecutor->setContextMemoryForProfile(kDecodeProfile, *decodeContext, setupStream),
+            "Failed to assign decode profile context memory");
     }
 
     std::vector<int32_t> prefillSlots(args.prefillBatch);
@@ -488,7 +596,6 @@ int main(int argc, char** argv)
     prefillBatchState.bind(prefillMap);
     decodeBatchState.bind(decodeMap);
 
-    int32_t const phaseSlotCount = args.prefillBatch + args.decodeBatch;
     std::vector<int32_t> initialSlotLengths(phaseSlotCount, 0);
     std::fill(initialSlotLengths.begin() + args.prefillBatch, initialSlotLengths.end(), args.pastKVLen);
     rt::Tensor hostInitialSlotLengths(
@@ -523,6 +630,13 @@ int main(int argc, char** argv)
     uploadInt32(decodeIO.contextLengths, std::vector<int32_t>(args.decodeBatch, args.pastKVLen + 1), setupStream);
     uploadInt64(prefillIO.selectTokenIndices, std::vector<int64_t>(args.prefillBatch, args.inputLen - 1), setupStream);
     uploadInt64(decodeIO.selectTokenIndices, std::vector<int64_t>(args.decodeBatch, 0), setupStream);
+    if (config.useVisionBidirectionalAttention)
+    {
+        CUDA_CHECK(cudaMemsetAsync(
+            prefillIO.visionBlockIds.rawPointer(), 0xFF, prefillIO.visionBlockIds.getMemoryCapacity(), setupStream));
+        CUDA_CHECK(cudaMemsetAsync(
+            decodeIO.visionBlockIds.rawPointer(), 0xFF, decodeIO.visionBlockIds.getMemoryCapacity(), setupStream));
+    }
     fillRandomData(prefillIO.inputsEmbeds, -1.0F, 1.0F, nvinfer1::DataType::kHALF, 0);
     fillRandomData(decodeIO.inputsEmbeds, -1.0F, 1.0F, nvinfer1::DataType::kHALF, 1);
 
@@ -533,7 +647,7 @@ int main(int argc, char** argv)
     {
         int32_t const maxPleSeqLen = std::max(args.inputLen, 1);
         prefillGemma4Ple = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
-            engineDir, config, config.maxSupportedBatchSize, maxPleSeqLen, prefillMap, setupStream);
+            engineDir, config, args.prefillBatch, maxPleSeqLen, prefillMap, setupStream);
         if (usesSharedTensorRTContext(args))
         {
             prefillGemma4Ple->bindOutputs(decodeMap);
@@ -541,16 +655,16 @@ int main(int argc, char** argv)
         }
         else
         {
-            decodeGemma4PleOwner = prefillGemma4Ple->createSibling(config.maxSupportedBatchSize, 1, decodeMap);
+            decodeGemma4PleOwner = prefillGemma4Ple->createSibling(args.decodeBatch, 1, decodeMap);
             decodeGemma4Ple = decodeGemma4PleOwner.get();
             ELLM_CHECK(prefillGemma4Ple->tableDataIdentity() == decodeGemma4Ple->tableDataIdentity(),
                 "Independent phase PLE preprocessors did not share the immutable table");
             ELLM_CHECK(prefillGemma4Ple->outputDataIdentity() != decodeGemma4Ple->outputDataIdentity(),
                 "Independent phase PLE preprocessors aliased mutable outputs");
         }
-        rt::Tensor prefillPleTokenIds({config.maxSupportedBatchSize, maxPleSeqLen}, rt::DeviceType::kGPU,
+        rt::Tensor prefillPleTokenIds({args.prefillBatch, maxPleSeqLen}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "phase_prefill_ple_token_ids");
-        rt::Tensor decodePleTokenIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+        rt::Tensor decodePleTokenIds({args.decodeBatch, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "phase_decode_ple_token_ids");
         CUDA_CHECK(
             cudaMemsetAsync(prefillPleTokenIds.rawPointer(), 0, prefillPleTokenIds.getMemoryCapacity(), setupStream));
@@ -649,7 +763,22 @@ int main(int argc, char** argv)
 
     // Exercise actual source-context admission outside the fixed-shape timed samples.
     bool const continuousLoad = args.loadRequests > 0;
-    if (continuousLoad || args.prefillBatch == args.decodeBatch)
+    bool const realRequestTrace = !args.inputFile.empty();
+    std::vector<rt::LLMGenerationRequest> traceRequests;
+    std::vector<int64_t> traceArrivalOffsets;
+    if (realRequestTrace)
+    {
+        ELLM_CHECK(!usesSharedTensorRTContext(args),
+            "Real three-phase trace requires independent TensorRT contexts");
+        ELLM_CHECK(!args.multimodalEngineDir.empty(),
+            "Real three-phase trace requires --multimodalEngineDir");
+        auto parsed = exampleUtils::parseRequestFile(args.inputFile, 1, -1, 0);
+        ELLM_CHECK(parsed.first.empty(), "Real phase trace v1 does not support LoRA weights");
+        traceRequests = std::move(parsed.second);
+        ELLM_CHECK(!traceRequests.empty(), "Real phase trace contains no requests");
+        traceArrivalOffsets = readTraceArrivalOffsets(args.inputFile, traceRequests.size(), args.traceArrivalRate);
+    }
+    if (continuousLoad || realRequestTrace || args.prefillBatch == args.decodeBatch)
     {
         std::optional<rt::PhaseContinuousLoadGenerator> loadGenerator;
         std::vector<rt::PhaseLoadRequest> servingRequests;
@@ -759,6 +888,18 @@ int main(int argc, char** argv)
                      CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
                          prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t),
                          cudaMemcpyHostToDevice, stream));
+                     prefillEmbedding.embed(
+                         packed.tokenIds(), packed.visualEmbeddings(), std::nullopt, prefillIO, stream);
+                     if (config.useVisionBidirectionalAttention)
+                     {
+                         check::check(prefillIO.visionBlockIds.reshape({batchSize, chunkLength}),
+                             "Serving prefill vision block IDs reshape failed");
+                         rt::Tensor hostVisionBlockIds
+                             = rt::generateVisionBlockIds(packed.hostTokenIds(), config.imageTokenId);
+                         CUDA_CHECK(cudaMemcpy(prefillIO.visionBlockIds.rawPointer(),
+                             hostVisionBlockIds.rawPointer(), batchSize * chunkLength * sizeof(int32_t),
+                             cudaMemcpyHostToDevice));
+                     }
                      if (prefillGemma4Ple)
                      {
                          prefillGemma4Ple->embed(packed.tokenIds(), stream);
@@ -816,6 +957,7 @@ int main(int argc, char** argv)
             executeKernelSegments({
                 {rt::PhaseKernelGroup::kDecodePrepare, {}, packed.stream,
                     [&](cudaStream_t stream) {
+                        decodeEmbedding.embed(adapter.tokenIds(), std::nullopt, std::nullopt, decodeIO, stream);
                         decodeGemma4Ple->embed(adapter.tokenIds(), stream);
                         decodeGemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
                     }},
@@ -873,8 +1015,131 @@ int main(int argc, char** argv)
                   {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO});
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
             cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize,
-            continuousLoad ? servingRequests.size() : 0, facadeSafety);
-        if (continuousLoad)
+            continuousLoad ? servingRequests.size() : traceRequests.size(), facadeSafety);
+        if (realRequestTrace)
+        {
+            cudaStream_t encoderStream{};
+            CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+            {
+                tokenizer::Tokenizer tokenizer;
+                ELLM_CHECK(tokenizer.loadFromHF(engineDir), "Failed to load phase trace tokenizer");
+                tokenizer.setAdditionalEosIds(config.eosTokenIds);
+
+                std::filesystem::path visionDir{args.multimodalEngineDir};
+                if (std::filesystem::exists(visionDir / "visual" / "visual.engine"))
+                {
+                    visionDir /= "visual";
+                }
+                auto visionRunner = rt::MultimodalRunner::create(visionDir.string(), config.maxSupportedBatchSize,
+                    config.maxKVCacheCapacity, encoderStream);
+                int64_t const encoderContextBytes = visionRunner->getRequiredContextMemorySize();
+                size_t freeGpuBytes{};
+                size_t totalGpuBytes{};
+                CUDA_CHECK(cudaMemGetInfo(&freeGpuBytes, &totalGpuBytes));
+                LOG_INFO("Encoder context workspace: required=%.1f MiB free=%.1f MiB total=%.1f MiB",
+                    static_cast<double>(encoderContextBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(freeGpuBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(totalGpuBytes) / (1024.0 * 1024.0));
+                rt::Tensor encoderContext({encoderContextBytes}, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kUINT8, "phase_encoder_context_memory");
+                ELLM_CHECK(visionRunner->setContextMemory(encoderContext),
+                    "Failed to assign independent encoder context memory");
+
+                ELLM_CHECK(visionRunner->getExecutionContextIdentity()
+                        != prefillExecutor->getExecutionContextIdentity()
+                        && visionRunner->getExecutionContextIdentity() != decodeRunner->getExecutionContextIdentity()
+                        && prefillExecutor->getExecutionContextIdentity()
+                            != decodeRunner->getExecutionContextIdentity(),
+                    "Encoder, prefill, and decode must use three independent TensorRT contexts");
+                LOG_INFO("Three-phase TensorRT topology: CUDA=%p encoder=%p prefill=%p decode=%p",
+                    static_cast<void*>(prefillCudaContext), visionRunner->getExecutionContextIdentity(),
+                    prefillExecutor->getExecutionContextIdentity(), decodeRunner->getExecutionContextIdentity());
+
+                rt::Gemma4PhaseVisionAdapter visionAdapter(*visionRunner, tokenizer, &kernelGroupRecorder);
+                rt::PhaseEncoderExecutionSafetyContract encoderSafety{
+                    {visionRunner->getExecutionContextIdentity(), &encoderContext, visionRunner.get()},
+                    {{prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
+                        {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO}}};
+                rt::PhaseEncoderQueueConfig encoderQueueConfig;
+                encoderQueueConfig.maxBatchSize = 1;
+                encoderQueueConfig.maxQueuedRequests = traceRequests.size();
+                rt::PhaseEncoderDispatchWorker encoderWorker(encoderQueueConfig, visionAdapter.makeCallbacks(),
+                    [&](rt::PhaseWorkItem const& item) { facade.beginPrefillAfterEncoder(item); }, encoderStream,
+                    std::move(encoderSafety));
+                rt::PhaseOnlineCoordinator coordinator(encoderWorker, facade);
+                rt::PhaseAsyncServer server({traceRequests.size()}, coordinator, encoderWorker, facade, tokenizer,
+                    prefillStream, &visionAdapter);
+
+                ELLM_CHECK(enqueuePrefill(prefillBatch, prefillStream), "Real trace prefill context warmup failed");
+                CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+                ELLM_CHECK(enqueueDecode(decodeBatch, decodeStream, false), "Real trace decode context warmup failed");
+                CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+
+                rt::Tensor hostZeroLengths(
+                    {phaseSlotCount}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "trace_zero_slot_lengths");
+                std::fill_n(hostZeroLengths.dataPointer<int32_t>(), phaseSlotCount, 0);
+                cacheManager.resetForNewSequences(hostZeroLengths, setupStream);
+                CUDA_CHECK(cudaStreamSynchronize(setupStream));
+
+                std::vector<TraceRequestSample> traceSamples(traceRequests.size());
+                std::unordered_map<uint64_t, size_t> traceIndices;
+                auto const traceStart = std::chrono::steady_clock::now();
+                size_t nextSubmission{};
+                size_t completionCount{};
+                constexpr int64_t kTraceTimeoutUs = 300000000;
+                while (completionCount < traceRequests.size())
+                {
+                    int64_t const elapsedUs = elapsedMicroseconds(traceStart);
+                    ELLM_CHECK(elapsedUs < kTraceTimeoutUs, "Real phase trace exceeded its timeout");
+                    bool madeProgress{};
+                    while (nextSubmission < traceRequests.size()
+                        && traceArrivalOffsets[nextSubmission] <= elapsedUs)
+                    {
+                        rt::LLMGenerationRequest& request = traceRequests[nextSubmission];
+                        request.disableSpecDecode = true;
+                        request.topK = 1;
+                        request.numLogprobs = 0;
+                        size_t const imageCount = request.requests.front().imageBuffers.size();
+                        rt::PhaseSchedulingHints scheduling;
+                        scheduling.ttftTargetUs = args.ttftTargetMs * 1000.0;
+                        scheduling.tpotTargetUs = args.tpotTargetMs * 1000.0;
+                        rt::PhaseAsyncSubmission const submission
+                            = server.submit(std::move(request), scheduling);
+                        TraceRequestSample& sample = traceSamples[nextSubmission];
+                        sample.requestId = submission.requestId;
+                        sample.scheduledArrivalUs = traceArrivalOffsets[nextSubmission];
+                        sample.submittedUs = elapsedMicroseconds(traceStart);
+                        sample.imageCount = imageCount;
+                        sample.admissionStatus = submission.status;
+                        traceIndices.emplace(submission.requestId, nextSubmission);
+                        ++nextSubmission;
+                        madeProgress = true;
+                    }
+                    madeProgress = server.poll() || madeProgress;
+                    while (auto completion = server.tryPopCompletion())
+                    {
+                        TraceRequestSample& sample = traceSamples.at(traceIndices.at(completion->requestId));
+                        sample.completedUs = elapsedMicroseconds(traceStart);
+                        sample.completion = std::move(*completion);
+                        LOG_INFO("Trace request %lu completed in %.3f ms: %s",
+                            static_cast<unsigned long>(sample.requestId), sample.completion.latencyMs,
+                            sample.completion.response.outputTexts.front().c_str());
+                        ++completionCount;
+                        madeProgress = true;
+                    }
+                    if (!madeProgress)
+                    {
+                        std::this_thread::yield();
+                    }
+                }
+                ELLM_CHECK(server.empty() && facade.empty() && encoderWorker.empty(),
+                    "Real phase trace did not drain all three phase queues");
+                writeTraceMetrics(args.traceCsv, traceSamples);
+                LOG_INFO("Real JSON/image phase trace metrics written to %s", args.traceCsv.c_str());
+            }
+            CUDA_CHECK(cudaStreamDestroy(encoderStream));
+        }
+        else if (continuousLoad)
         {
             ELLM_CHECK(enqueuePrefill(prefillBatch, prefillStream), "Continuous-load prefill warmup failed");
             CUDA_CHECK(cudaStreamSynchronize(prefillStream));
@@ -1003,6 +1268,14 @@ int main(int argc, char** argv)
             kernelGroupRecorder.writeCsv(args.kernelGroupCsv);
             LOG_INFO("Kernel-group CUDA-event samples written to %s", args.kernelGroupCsv.c_str());
         }
+    }
+
+    if (realRequestTrace)
+    {
+        CUDA_CHECK(cudaStreamDestroy(prefillStream));
+        CUDA_CHECK(cudaStreamDestroy(decodeStream));
+        CUDA_CHECK(cudaStreamDestroy(setupStream));
+        return EXIT_SUCCESS;
     }
 
     cudaEvent_t start{};

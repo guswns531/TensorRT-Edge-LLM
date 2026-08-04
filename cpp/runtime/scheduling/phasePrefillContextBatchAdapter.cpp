@@ -175,6 +175,11 @@ Tensor& PhasePrefillContextBatchAdapter::tokenIds() noexcept
     return mDeviceTokenIds;
 }
 
+Tensor const& PhasePrefillContextBatchAdapter::hostTokenIds() const noexcept
+{
+    return mHostTokenIds;
+}
+
 OptionalInputTensor PhasePrefillContextBatchAdapter::visualEmbeddings() const noexcept
 {
     if (!mPacked || mRows.empty())

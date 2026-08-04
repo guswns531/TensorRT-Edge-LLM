@@ -51,11 +51,13 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 29. [Gemma 4 VLM real-request 정확성 및 성능 비교](29-gemma4-vlm-real-request-performance.md)
 30. [SLO 기반 customizable scheduler](30-slo-customizable-scheduler.md)
 31. [SLO scheduler 100-request 성능 결과](31-slo-scheduler-performance.md)
+32. [Production async server와 실제 three-context trace](32-production-async-three-context-server.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
   batch slot과 sequence position으로 관리한다.
-- 현재 `LLMInferenceRuntime::handleRequest()`는 encoder, prefill, 반복 decode를 한 호출 안에서 직렬로 수행한다.
+- 호환 경로인 `LLMInferenceRuntime::handleRequest()`는 encoder, prefill, 반복 decode를 한 호출 안에서 직렬로
+  수행한다. 새 online 경로는 `PhaseAsyncServer::submit()/poll()/tryPopCompletion()`만 사용한다.
 - LLM prefill과 decode는 optimization profile만 0/1로 나뉘며 같은 `EngineExecutor`, 같은 TensorRT
   `IExecutionContext`, 같은 I/O buffer를 사용한다.
 - base, draft, vision, audio, action engine은 “서로 직렬 실행한다”는 전제로 하나의 TensorRT context workspace를

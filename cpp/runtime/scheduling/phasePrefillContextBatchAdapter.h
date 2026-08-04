@@ -63,6 +63,7 @@ public:
     void complete();
 
     Tensor& tokenIds() noexcept;
+    Tensor const& hostTokenIds() const noexcept;
     //! Visual embeddings for a single-request atomic multimodal prefill.
     OptionalInputTensor visualEmbeddings() const noexcept;
     PhaseBatchState& phaseBatchState() noexcept;

@@ -1,0 +1,17 @@
+{
+    "batch_size": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 4,
+    "requests": [
+        {
+            "arrival_offset_us": 0,
+            "messages": [{"role": "user", "content": "Say hello in one short sentence."}]
+        },
+        {
+            "arrival_offset_us": 1000,
+            "messages": [{"role": "user", "content": "What is two plus two? Answer briefly."}]
+        }
+    ]
+}
