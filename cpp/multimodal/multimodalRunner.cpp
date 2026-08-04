@@ -101,6 +101,12 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
     return true;
 }
 
+void const* MultimodalRunner::getExecutionContextIdentity() const noexcept
+{
+    return mAudioContext ? static_cast<void const*>(mAudioContext.get())
+                         : static_cast<void const*>(mVisualContext.get());
+}
+
 namespace
 {
 //! \brief Construct a QwenViTRunner-family runner, then run its two-phase initialize().

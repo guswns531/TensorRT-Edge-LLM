@@ -114,6 +114,9 @@ struct PipelineIO
     //! Build PipelineIO for the vanilla single-engine LLM runtime
     //! (basic I/O tensors, deepstack embeds, MRope cos/sin cache).
     static PipelineIO createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream);
+    //! Build phase-local vanilla I/O without allocating the engine profile's full batch/sequence maxima.
+    static PipelineIO createForLLM(
+        LLMEngineConfig const& cfg, int32_t maxBatchSize, int32_t maxInputLength, cudaStream_t stream);
 
     //! Build PipelineIO for a two-engine speculative-decoding runtime
     //! (basic I/O, hidden states, deepstack embeds, MRope cos/sin cache).

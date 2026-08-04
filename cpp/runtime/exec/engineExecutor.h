@@ -121,6 +121,9 @@ public:
      */
     int64_t getRequiredContextMemorySize() const;
 
+    //! @brief Query the upper-bound context memory for one optimization profile.
+    int64_t getRequiredContextMemorySizeForProfile(int32_t profileIndex) const;
+
     /*!
      * @brief Provide shared device memory for the execution context.
      *
@@ -128,6 +131,9 @@ public:
      * @return True on success
      */
     bool setContextMemory(Tensor& sharedMem);
+
+    //! @brief Select one fixed profile before assigning profile-sized context memory.
+    bool setContextMemoryForProfile(int32_t profileIndex, Tensor& sharedMem, cudaStream_t stream);
 
     //! @brief Return the number of I/O tensors in the engine.
     int32_t getNumIOTensors() const;

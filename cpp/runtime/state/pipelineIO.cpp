@@ -307,38 +307,48 @@ void buildTensorMapForGemma4MTPDraft(
 
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
 {
+    return createForLLM(cfg, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, stream);
+}
+
+PipelineIO PipelineIO::createForLLM(
+    LLMEngineConfig const& cfg, int32_t maxBatchSize, int32_t maxInputLength, cudaStream_t stream)
+{
+    check::check(maxBatchSize > 0 && maxBatchSize <= cfg.maxSupportedBatchSize,
+        "PipelineIO phase batch size exceeds the engine profile.");
+    check::check(maxInputLength > 0 && maxInputLength <= cfg.maxSupportedInputLength,
+        "PipelineIO phase input length exceeds the engine profile.");
     PipelineIO io;
 
-    allocateBasicIO(io, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize, cfg.outputVocabSize,
+    allocateBasicIO(io, maxBatchSize, maxInputLength, cfg.hiddenSize, cfg.outputVocabSize,
         nvinfer1::DataType::kHALF);
 
     if (cfg.useVisionBidirectionalAttention)
     {
-        io.visionBlockIds = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength}, DeviceType::kGPU,
+        io.visionBlockIds = Tensor({maxBatchSize, maxInputLength}, DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
     }
 
     if (cfg.numDeepstackFeatures > 0)
     {
-        allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength,
-            cfg.hiddenSize, nvinfer1::DataType::kHALF);
+        allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, maxBatchSize, maxInputLength, cfg.hiddenSize,
+            nvinfer1::DataType::kHALF);
         LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]", cfg.numDeepstackFeatures,
-            cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize);
+            maxBatchSize, maxInputLength, cfg.hiddenSize);
     }
 
     // Engine-output hidden states for the vanilla LLM path. Always allocated:
     // streaming consumers (Qwen3-Omni Talker) read it; if the engine emits
     // hidden_states but no consumer is set, the buffer is harmless write-target;
     // if the engine has no hidden_states output the binding is silently skipped.
-    io.outputHiddenStates = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize},
+    io.outputHiddenStates = Tensor({maxBatchSize, maxInputLength, cfg.hiddenSize},
         DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
 
     if (cfg.ropeConfig.type == RopeType::kMRope)
     {
-        allocateMRope(io, cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity, cfg.rotaryDim);
+        allocateMRope(io, maxBatchSize, cfg.maxKVCacheCapacity, cfg.rotaryDim);
         // Initialize MRoPE cache for all batch slots using text-only sequential positions.
         kernel::initializeTextOnlyMRopeCosSin(io.mropeCosSin.dataPointer<float>(), cfg.ropeConfig.rotaryTheta,
-            cfg.rotaryDim, cfg.maxKVCacheCapacity, cfg.maxSupportedBatchSize, stream);
+            cfg.rotaryDim, cfg.maxKVCacheCapacity, maxBatchSize, stream);
     }
 
     return io;

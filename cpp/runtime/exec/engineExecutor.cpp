@@ -319,8 +319,32 @@ int64_t EngineExecutor::getRequiredContextMemorySize() const
     return mEngineState->engine->getDeviceMemorySizeV2();
 }
 
+int64_t EngineExecutor::getRequiredContextMemorySizeForProfile(int32_t profileIndex) const
+{
+    ELLM_CHECK(profileIndex >= 0 && profileIndex < mEngineState->engine->getNbOptimizationProfiles(),
+        "TensorRT optimization profile index is out of range");
+    return mEngineState->engine->getDeviceMemorySizeForProfileV2(profileIndex);
+}
+
 bool EngineExecutor::setContextMemory(Tensor& sharedMem)
 {
+    mContext->setDeviceMemoryV2(sharedMem.rawPointer(), sharedMem.getMemoryCapacity());
+    return true;
+}
+
+bool EngineExecutor::setContextMemoryForProfile(int32_t profileIndex, Tensor& sharedMem, cudaStream_t stream)
+{
+    ELLM_CHECK(profileIndex >= 0 && profileIndex < mEngineState->engine->getNbOptimizationProfiles(),
+        "TensorRT optimization profile index is out of range");
+    if (!mContext->setOptimizationProfileAsync(profileIndex, stream))
+    {
+        LOG_ERROR("failed to select fixed optimization profile %d for context memory", profileIndex);
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int64_t const requiredBytes = getRequiredContextMemorySizeForProfile(profileIndex);
+    ELLM_CHECK(sharedMem.getMemoryCapacity() >= requiredBytes,
+        "Profile-specific TensorRT context memory is too small");
     mContext->setDeviceMemoryV2(sharedMem.rawPointer(), sharedMem.getMemoryCapacity());
     return true;
 }

@@ -78,6 +78,9 @@ public:
      */
     bool setContextMemory(rt::Tensor& sharedContextMemory);
 
+    //! Stable identity of the TensorRT execution context used by infer().
+    void const* getExecutionContextIdentity() const noexcept;
+
     /*!
      * @brief Create appropriate multimodal runner instance
      *
