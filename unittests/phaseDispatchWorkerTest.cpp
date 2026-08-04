@@ -506,6 +506,7 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
     std::unordered_map<uint64_t, int32_t> observedSlots;
     std::unordered_map<uint64_t, int32_t> decodeSteps;
     std::vector<rt::PhaseRequestSnapshot> terminals;
+    std::vector<rt::PhaseDispatchMetrics> dispatches;
     rt::PhaseRequestLifecycleCallbacks callbacks;
     callbacks.execution.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
         for (rt::PhaseWorkItem const& item : batch)
@@ -525,6 +526,8 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
         int32_t const step = ++decodeSteps[item.requestId];
         return rt::PhaseDecodeCompletion{item.tokenCount + 1, step == 2};
     };
+    callbacks.execution.onDispatch
+        = [&](rt::PhaseDispatchMetrics const& metrics) { dispatches.push_back(metrics); };
     callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
 
     {
@@ -555,6 +558,10 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
         EXPECT_EQ(observedSlots.at(10), 0);
         EXPECT_EQ(observedSlots.at(30), 1);
         EXPECT_EQ(terminals.size(), 3U);
+        ASSERT_FALSE(dispatches.empty());
+        EXPECT_TRUE(std::any_of(dispatches.begin(), dispatches.end(), [](rt::PhaseDispatchMetrics const& metrics) {
+            return metrics.prefillBatchSize > 0 || metrics.decodeBatchSize > 0;
+        }));
     }
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));

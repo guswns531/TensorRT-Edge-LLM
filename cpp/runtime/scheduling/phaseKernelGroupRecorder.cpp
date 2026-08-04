@@ -56,7 +56,8 @@ PhaseKernelGroupRecorder::~PhaseKernelGroupRecorder() noexcept
     }
 }
 
-void PhaseKernelGroupRecorder::execute(size_t dispatchIndex, std::vector<PhaseKernelSegment> const& segments)
+void PhaseKernelGroupRecorder::execute(size_t dispatchIndex, std::vector<PhaseKernelSegment> const& segments,
+    PhaseKernelDispatchMetadata dispatch)
 {
     check::check(!segments.empty(), "Kernel-group execution requires at least one segment.");
     cudaEvent_t previous{};
@@ -74,6 +75,7 @@ void PhaseKernelGroupRecorder::execute(size_t dispatchIndex, std::vector<PhaseKe
         pending.sample.segmentIndex = segmentIndex++;
         pending.sample.group = segment.group;
         pending.sample.name = segment.name.empty() ? phaseKernelGroupName(segment.group) : segment.name;
+        pending.sample.dispatch = dispatch;
         CUDA_CHECK(cudaEventCreate(&pending.start));
         CUDA_CHECK(cudaEventCreate(&pending.done));
         CUDA_CHECK(cudaEventRecord(pending.start, segment.stream));
@@ -137,11 +139,15 @@ void PhaseKernelGroupRecorder::writeCsv(std::filesystem::path const& path) const
     check::check(mPending.empty(), "Kernel-group samples must be drained before CSV export.");
     std::ofstream output(path);
     check::check(output.good(), "Failed to open kernel-group CSV output.");
-    output << "dispatch_index,segment_index,group,name,gpu_ms\n";
+    output << "dispatch_index,segment_index,scheduler_dispatch_index,scheduler_kind,prefill_batch,decode_batch,"
+              "prefill_tokens,decode_context_tokens,group,name,gpu_ms\n";
     output << std::fixed << std::setprecision(6);
     for (PhaseKernelGroupSample const& sample : mSamples)
     {
-        output << sample.dispatchIndex << ',' << sample.segmentIndex << ',' << phaseKernelGroupName(sample.group) << ','
+        output << sample.dispatchIndex << ',' << sample.segmentIndex << ',' << sample.dispatch.schedulerDispatchIndex
+               << ',' << sample.dispatch.schedulerKind << ',' << sample.dispatch.prefillBatchSize << ','
+               << sample.dispatch.decodeBatchSize << ',' << sample.dispatch.prefillTokens << ','
+               << sample.dispatch.decodeContextTokens << ',' << phaseKernelGroupName(sample.group) << ','
                << sample.name << ',' << sample.gpuMs << '\n';
     }
 }

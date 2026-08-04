@@ -161,6 +161,10 @@ bool PhaseDispatchWorker::dispatchNext()
     }
     mCurrentMetrics.prefillQueueWaitUs = mInFlight.prefillQueueWaitUs;
     mCurrentMetrics.decodeQueueWaitUs = mInFlight.decodeQueueWaitUs;
+    if (mCallbacks.onDispatch)
+    {
+        mCallbacks.onDispatch(mCurrentMetrics);
+    }
     CUDA_CHECK(cudaEventRecord(mDispatchStart, mPrefillStream));
     if (mHasPrefill)
     {

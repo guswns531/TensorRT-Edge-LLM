@@ -72,6 +72,7 @@ PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks
 {
     PhaseRequestLifecycleCallbacks result;
     result.execution.onMetrics = mCallbacks.onDispatchMetrics;
+    result.execution.onDispatch = mCallbacks.onDispatch;
     result.execution.enqueuePrefill
         = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueuePrefillBatch(batch, stream); };
     result.execution.completePrefillBatch = [this](std::vector<PhaseWorkItem> const& batch) {

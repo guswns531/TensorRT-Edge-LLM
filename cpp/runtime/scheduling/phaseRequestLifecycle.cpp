@@ -90,6 +90,7 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
         }
         return completion;
     };
+    result.onDispatch = mCallbacks.execution.onDispatch;
     result.onMetrics = mCallbacks.execution.onMetrics;
     result.completeDecode = [this](PhaseWorkItem const& item) {
         PhaseDecodeCompletion const completion = mCallbacks.execution.completeDecode(item);

@@ -79,6 +79,7 @@ struct Args
     std::string traceCsv;
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
+    int32_t slotCount{};
     int32_t inputLen{512};
     int32_t prefillChunkSize{};
     int32_t pastKVLen{512};
@@ -230,6 +231,7 @@ void printUsage(char const* program)
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] "
         "[--trtContextMode shared|independent] "
+        "[--slotCount N] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
@@ -246,6 +248,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kEngineDir = 801,
         kPrefillBatch,
         kDecodeBatch,
+        kSlotCount,
         kInputLen,
         kPrefillChunkSize,
         kPastKVLen,
@@ -279,6 +282,7 @@ bool parseArgs(Args& args, int argc, char** argv)
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
         {"prefillBatch", required_argument, nullptr, kPrefillBatch},
         {"decodeBatch", required_argument, nullptr, kDecodeBatch}, {"inputLen", required_argument, nullptr, kInputLen},
+        {"slotCount", required_argument, nullptr, kSlotCount},
         {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
@@ -313,6 +317,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kEngineDir: args.engineDir = optarg; break;
         case kPrefillBatch: args.prefillBatch = std::stoi(optarg); break;
         case kDecodeBatch: args.decodeBatch = std::stoi(optarg); break;
+        case kSlotCount: args.slotCount = std::stoi(optarg); break;
         case kInputLen: args.inputLen = std::stoi(optarg); break;
         case kPrefillChunkSize: args.prefillChunkSize = std::stoi(optarg); break;
         case kPastKVLen: args.pastKVLen = std::stoi(optarg); break;
@@ -361,7 +366,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         default: return false;
         }
     }
-    return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.inputLen > 0
+    return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.slotCount >= 0
+        && args.inputLen > 0
         && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
         && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
         && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
@@ -514,9 +520,17 @@ int main(int argc, char** argv)
     ELLM_CHECK(config.indexedKVCache, "llm_phase_bench requires an indexed_kv_cache engine");
     ELLM_CHECK(!deployment.draft.has_value(), "llm_phase_bench v1 supports vanilla inference only");
     ELLM_CHECK(config.numDeepstackFeatures == 0, "llm_phase_bench v1 does not support deepstack inputs");
-    ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize,
-        "Prefill and decode physical slots exceed maxSupportedBatchSize");
-    int32_t const phaseSlotCount = args.prefillBatch + args.decodeBatch;
+    if (args.loadRequests == 0 && args.inputFile.empty())
+    {
+        ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize,
+            "Fixed microbenchmark prefill and decode slots exceed maxSupportedBatchSize");
+    }
+    int32_t const phaseSlotCount
+        = args.slotCount > 0 ? args.slotCount : args.prefillBatch + args.decodeBatch;
+    ELLM_CHECK(phaseSlotCount <= config.maxSupportedBatchSize,
+        "Physical slot count exceeds maxSupportedBatchSize");
+    ELLM_CHECK(phaseSlotCount >= std::max(args.prefillBatch, args.decodeBatch),
+        "Physical slot count is smaller than a phase batch limit");
     rt::LLMEngineConfig resourceConfig = config;
     ELLM_CHECK(args.inputLen <= config.maxSupportedInputLength, "inputLen exceeds maxSupportedInputLength");
     int32_t const loadPromptMin = args.loadPromptMin > 0 ? args.loadPromptMin : args.inputLen;
@@ -525,8 +539,9 @@ int main(int argc, char** argv)
     {
         ELLM_CHECK(!args.loadCsv.empty(), "Continuous-load mode requires --loadCsv");
         ELLM_CHECK(loadPromptMin <= loadPromptMax, "Continuous-load prompt range is invalid");
-        ELLM_CHECK(loadPromptMax <= args.inputLen,
-            "Continuous-load prompt maximum exceeds the benchmark prefill buffer capacity");
+        ELLM_CHECK(loadPromptMax <= args.inputLen
+                || (args.prefillChunkSize > 0 && args.prefillChunkSize <= args.inputLen),
+            "Continuous-load prompt maximum requires chunking within the prefill buffer capacity");
         ELLM_CHECK(loadPromptMax + args.loadOutputMax <= config.maxKVCacheCapacity,
             "Continuous-load prompt plus output maximum exceeds KV capacity");
     }
@@ -609,7 +624,8 @@ int main(int argc, char** argv)
     std::vector<int32_t> prefillSlots(args.prefillBatch);
     std::iota(prefillSlots.begin(), prefillSlots.end(), 0);
     std::vector<int32_t> decodeSlots(args.decodeBatch);
-    std::iota(decodeSlots.begin(), decodeSlots.end(), args.prefillBatch);
+    bool const reuseWarmupSlots = args.prefillBatch + args.decodeBatch > phaseSlotCount;
+    std::iota(decodeSlots.begin(), decodeSlots.end(), reuseWarmupSlots ? 0 : args.prefillBatch);
     std::vector<rt::PhaseWorkItem> prefillBatch;
     std::vector<rt::PhaseWorkItem> decodeBatch;
     for (int32_t row = 0; row < args.prefillBatch; ++row)
@@ -627,12 +643,33 @@ int main(int argc, char** argv)
     decodeBatchState.bind(decodeMap);
 
     std::vector<int32_t> initialSlotLengths(phaseSlotCount, 0);
-    std::fill(initialSlotLengths.begin() + args.prefillBatch, initialSlotLengths.end(), args.pastKVLen);
+    if (!reuseWarmupSlots)
+    {
+        for (int32_t const slot : decodeSlots)
+        {
+            initialSlotLengths[slot] = args.pastKVLen;
+        }
+    }
     rt::Tensor hostInitialSlotLengths(
         {phaseSlotCount}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_initial_slot_lengths");
     std::copy(initialSlotLengths.begin(), initialSlotLengths.end(), hostInitialSlotLengths.dataPointer<int32_t>());
     auto& cacheManager = *resources->cacheManagers[0];
     cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
+    auto resetForDecodeWarmup = [&](cudaStream_t stream) {
+        if (!reuseWarmupSlots)
+        {
+            return;
+        }
+        rt::Tensor hostDecodeLengths(
+            {phaseSlotCount}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "warmup_decode_slot_lengths");
+        std::fill_n(hostDecodeLengths.dataPointer<int32_t>(), phaseSlotCount, 0);
+        for (int32_t const slot : decodeSlots)
+        {
+            hostDecodeLengths.dataPointer<int32_t>()[slot] = args.pastKVLen;
+        }
+        cacheManager.resetForNewSequences(hostDecodeLengths, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    };
 
     std::vector<std::unique_ptr<rt::DecodingInferenceContext>> decodeSourceContexts;
     std::vector<rt::PhaseContextRow> decodeContextRows;
@@ -885,6 +922,7 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.minPrefillChunkTokens = std::min(32, std::max(1, configuredChunkSize));
         rt::PhaseKernelGroupRecorder kernelGroupRecorder;
         size_t kernelGroupDispatchIndex{};
+        rt::PhaseKernelDispatchMetadata kernelDispatchMetadata;
         auto executeKernelSegments = [&](std::vector<rt::PhaseKernelSegment> const& segments) {
             if (args.kernelGroupCsv.empty())
             {
@@ -895,7 +933,7 @@ int main(int argc, char** argv)
             }
             else
             {
-                kernelGroupRecorder.execute(kernelGroupDispatchIndex++, segments);
+                kernelGroupRecorder.execute(kernelGroupDispatchIndex++, segments, kernelDispatchMetadata);
             }
         };
         rt::PhaseContextServingCallbacks facadeCallbacks;
@@ -1035,6 +1073,14 @@ int main(int argc, char** argv)
         };
         facadeCallbacks.onDispatchMetrics
             = [&](rt::PhaseDispatchMetrics const& sample) { facadeDispatchMetrics.push_back(sample); };
+        facadeCallbacks.onDispatch = [&](rt::PhaseDispatchMetrics const& sample) {
+            kernelDispatchMetadata.schedulerDispatchIndex = sample.dispatchIndex;
+            kernelDispatchMetadata.schedulerKind = static_cast<int32_t>(sample.kind);
+            kernelDispatchMetadata.prefillBatchSize = sample.prefillBatchSize;
+            kernelDispatchMetadata.decodeBatchSize = sample.decodeBatchSize;
+            kernelDispatchMetadata.prefillTokens = sample.prefillTokens;
+            kernelDispatchMetadata.decodeContextTokens = sample.decodeContextTokens;
+        };
         facadeCallbacks.onAdmission = [&](rt::PhaseAdmissionResult const& admission) {
             if (continuousLoad)
             {
@@ -1088,6 +1134,7 @@ int main(int argc, char** argv)
 
             ELLM_CHECK(enqueuePrefill(prefillBatch, prefillStream), "Real trace prefill context warmup failed");
             CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+            resetForDecodeWarmup(decodeStream);
             ELLM_CHECK(enqueueDecode(decodeBatch, decodeStream, false), "Real trace decode context warmup failed");
             CUDA_CHECK(cudaStreamSynchronize(decodeStream));
 
@@ -1217,6 +1264,7 @@ int main(int argc, char** argv)
         {
             ELLM_CHECK(enqueuePrefill(prefillBatch, prefillStream), "Continuous-load prefill warmup failed");
             CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+            resetForDecodeWarmup(decodeStream);
             ELLM_CHECK(enqueueDecode(decodeBatch, decodeStream, false), "Continuous-load decode warmup failed");
             CUDA_CHECK(cudaStreamSynchronize(decodeStream));
 

@@ -83,6 +83,8 @@ struct PhaseContextServingCallbacks
     std::function<void(PhaseAdmissionResult const&)> onAdmission;
     //! Observe queue residence and CUDA-event timing for each dispatch.
     std::function<void(PhaseDispatchMetrics const&)> onDispatchMetrics;
+    //! Observe selected P/D batch composition immediately before enqueue.
+    std::function<void(PhaseDispatchMetrics const&)> onDispatch;
 };
 
 //! Connects continuous request admission to stable-slot packed decode execution.

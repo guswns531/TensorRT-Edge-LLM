@@ -53,12 +53,23 @@ struct PhaseKernelSegment
     std::function<void(cudaStream_t)> enqueue;
 };
 
+struct PhaseKernelDispatchMetadata
+{
+    size_t schedulerDispatchIndex{};
+    int32_t schedulerKind{};
+    int32_t prefillBatchSize{};
+    int32_t decodeBatchSize{};
+    int32_t prefillTokens{};
+    int32_t decodeContextTokens{};
+};
+
 struct PhaseKernelGroupSample
 {
     size_t dispatchIndex{};
     size_t segmentIndex{};
     PhaseKernelGroup group{PhaseKernelGroup::kEncoderPreprocess};
     std::string name;
+    PhaseKernelDispatchMetadata dispatch;
     float gpuMs{};
 };
 
@@ -76,7 +87,8 @@ public:
     PhaseKernelGroupRecorder(PhaseKernelGroupRecorder const&) = delete;
     PhaseKernelGroupRecorder& operator=(PhaseKernelGroupRecorder const&) = delete;
 
-    void execute(size_t dispatchIndex, std::vector<PhaseKernelSegment> const& segments);
+    void execute(size_t dispatchIndex, std::vector<PhaseKernelSegment> const& segments,
+        PhaseKernelDispatchMetadata dispatch = {});
     //! Collect every currently complete segment without blocking.
     size_t poll();
     //! Synchronize and collect every pending segment.

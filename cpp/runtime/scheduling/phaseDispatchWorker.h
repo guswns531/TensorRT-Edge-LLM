@@ -58,6 +58,8 @@ struct PhaseDispatchWorkerCallbacks
     PhaseBatchCompletionCallback completeDecodeBatch;
     PrefillCompletionCallback completePrefill;
     DecodeCompletionCallback completeDecode;
+    //! Observe the selected batch composition immediately before phase enqueue.
+    std::function<void(PhaseDispatchMetrics const&)> onDispatch;
     //! Observe one immutable timing record after all phase completions.
     std::function<void(PhaseDispatchMetrics const&)> onMetrics;
 };
