@@ -30,12 +30,29 @@ namespace trt_edgellm
 namespace rt
 {
 
+PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseContextServingFacade& servingFacade,
+    tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream)
+    : mConfig(config)
+    , mServingFacade(servingFacade)
+    , mTokenizer(tokenizer)
+    , mRequestStream(requestStream)
+{
+    check::check(mConfig.maxInFlightRequests > 0, "Async server maxInFlightRequests must be positive.");
+    check::check(mRequestStream != nullptr, "Async server requires an explicit request CUDA stream.");
+    CUcontext requestContext{};
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(mRequestStream, &requestContext));
+    check::check(requestContext != nullptr && requestContext == mServingFacade.cudaContext(),
+        "Async text server and both LLM phase streams must share one CUDA context.");
+    mTerminalObserverId = mServingFacade.addTerminalObserver(
+        [this](PhaseRequestSnapshot const& snapshot) { mTerminalSnapshots.push_back(snapshot); });
+}
+
 PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseOnlineCoordinator& coordinator,
     PhaseEncoderDispatchWorker& encoderWorker, PhaseContextServingFacade& servingFacade,
     tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream, Gemma4PhaseVisionAdapter* visionAdapter)
     : mConfig(config)
-    , mCoordinator(coordinator)
-    , mEncoderWorker(encoderWorker)
+    , mCoordinator(&coordinator)
+    , mEncoderWorker(&encoderWorker)
     , mServingFacade(servingFacade)
     , mTokenizer(tokenizer)
     , mRequestStream(requestStream)
@@ -46,7 +63,7 @@ PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseOnlineCoo
     CUcontext requestContext{};
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mRequestStream, &requestContext));
     check::check(requestContext != nullptr && requestContext == mServingFacade.cudaContext()
-            && requestContext == mEncoderWorker.cudaContext(),
+            && requestContext == mEncoderWorker->cudaContext(),
         "Async server and all phase workers must share one CUDA context.");
     mTerminalObserverId = mServingFacade.addTerminalObserver(
         [this](PhaseRequestSnapshot const& snapshot) { mTerminalSnapshots.push_back(snapshot); });
@@ -67,9 +84,9 @@ PhaseAsyncServer::~PhaseAsyncServer() noexcept
         {
             processCancellations();
             processTerminals();
-            if (mEncoderWorker.busy())
+            if (mEncoderWorker != nullptr && mEncoderWorker->busy())
             {
-                mEncoderWorker.wait();
+                mEncoderWorker->wait();
             }
             else if (mServingFacade.busy())
             {
@@ -77,7 +94,14 @@ PhaseAsyncServer::~PhaseAsyncServer() noexcept
             }
             else
             {
-                static_cast<void>(mCoordinator.step());
+                if (mCoordinator != nullptr)
+                {
+                    static_cast<void>(mCoordinator->step());
+                }
+                else if (mServingFacade.hasQueuedPhaseWork())
+                {
+                    static_cast<void>(mServingFacade.dispatchNext());
+                }
             }
             processTerminals();
         }
@@ -169,7 +193,8 @@ PhaseRequestStatus PhaseAsyncServer::admit(uint64_t requestId, RequestState& sta
     {
         mVisionAdapter->registerRequest(requestId, state.request, state.context);
         int32_t const imageCount = static_cast<int32_t>(state.request.requests.front().imageBuffers.size());
-        mEncoderWorker.submit({requestId, std::max(1, imageCount), kvSlot});
+        check::check(mEncoderWorker != nullptr, "Async phase request contains images but no encoder worker exists.");
+        mEncoderWorker->submit({requestId, std::max(1, imageCount), kvSlot});
     }
     catch (...)
     {
@@ -255,7 +280,7 @@ bool PhaseAsyncServer::processCancellations()
             cancelWithoutLease.push_back(requestId);
             continue;
         }
-        if (mEncoderWorker.hasRequest(requestId) && !mEncoderWorker.cancel(requestId))
+        if (mEncoderWorker != nullptr && mEncoderWorker->hasRequest(requestId) && !mEncoderWorker->cancel(requestId))
         {
             continue;
         }
@@ -322,7 +347,21 @@ bool PhaseAsyncServer::poll()
 {
     bool progressed = admitWaitingVisionRequests();
     progressed = processCancellations() || progressed;
-    progressed = mCoordinator.step() || progressed;
+    if (mCoordinator != nullptr)
+    {
+        progressed = mCoordinator->step() || progressed;
+    }
+    else
+    {
+        if (mServingFacade.busy())
+        {
+            progressed = mServingFacade.poll() || progressed;
+        }
+        if (!mServingFacade.busy() && mServingFacade.hasQueuedPhaseWork())
+        {
+            progressed = mServingFacade.dispatchNext() || progressed;
+        }
+    }
     processTerminals();
     progressed = processCancellations() || progressed;
     progressed = admitWaitingVisionRequests() || progressed;

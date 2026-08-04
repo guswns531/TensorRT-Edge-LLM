@@ -1,0 +1,7 @@
+policy,arrival_rate_rps,prefill_batch_limit,decode_batch_limit,run_seeds,achieved_rps_median,ttft_p95_ms_median,tpot_p95_ms_median,prefill_batch_mean_median,decode_batch_mean_median,prefill_chunk_median
+whole,30,2,2,3,11.54,440.5,18.23,1.00,1.92,105.0
+fixed64,30,2,2,3,11.32,527.0,20.71,1.00,1.94,64.0
+fixed128,30,2,2,3,12.32,433.2,19.73,1.00,1.96,93.5
+fixed256,30,2,2,3,11.24,444.6,18.87,1.00,1.84,105.0
+adaptive256_current,30,2,2,3,9.26,739.5,18.21,1.11,1.66,32.0
+fixed128_shared_context,30,2,2,3,10.96,510.58,22.51,1.00,1.94,93.5

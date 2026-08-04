@@ -64,6 +64,10 @@ struct PhaseAsyncCompletion
 class PhaseAsyncServer
 {
 public:
+    //! Construct a text-only server over independent prefill/decode queues.
+    PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseContextServingFacade& servingFacade,
+        tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream);
+    //! Construct an encoder + prefill + decode server for multimodal requests.
     PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseOnlineCoordinator& coordinator,
         PhaseEncoderDispatchWorker& encoderWorker, PhaseContextServingFacade& servingFacade,
         tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream,
@@ -109,8 +113,8 @@ private:
     void complete(uint64_t requestId, PhaseRequestStatus status);
 
     PhaseAsyncServerConfig mConfig;
-    PhaseOnlineCoordinator& mCoordinator;
-    PhaseEncoderDispatchWorker& mEncoderWorker;
+    PhaseOnlineCoordinator* mCoordinator{};
+    PhaseEncoderDispatchWorker* mEncoderWorker{};
     PhaseContextServingFacade& mServingFacade;
     tokenizer::Tokenizer const& mTokenizer;
     cudaStream_t mRequestStream{};

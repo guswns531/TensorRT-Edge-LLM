@@ -52,6 +52,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 30. [SLO 기반 customizable scheduler](30-slo-customizable-scheduler.md)
 31. [SLO scheduler 100-request 성능 결과](31-slo-scheduler-performance.md)
 32. [Production async server와 실제 three-context trace](32-production-async-three-context-server.md)
+33. [LLM real-request scheduler 실험](33-llm-real-request-scheduler-experiments.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
