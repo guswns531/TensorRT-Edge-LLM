@@ -65,9 +65,13 @@ void PhasePrefillContextBatchAdapter::validateRow(PhasePrefillContextRow const& 
     std::vector<int32_t> const& prompt = row.context->rawBatchedInputIds[sourceRow];
     check::check(static_cast<int32_t>(prompt.size()) == row.promptTokenCount,
         "Phase prefill v1 requires the full text prompt without prefix-cache reuse.");
-    check::check(!row.context->visualEmbeddings.has_value() && !row.context->audioEmbeddings.has_value()
-            && row.context->deepstackFeatures.empty(),
-        "Phase prefill adapter v1 supports text-only requests.");
+    check::check(!row.context->audioEmbeddings.has_value() && row.context->deepstackFeatures.empty(),
+        "Phase prefill adapter v1 does not support audio or deepstack features.");
+    if (row.context->visualEmbeddings.has_value())
+    {
+        check::check(row.tokenOffset == 0 && row.tokenCount == row.promptTokenCount,
+            "Multimodal phase prefill must process the complete prompt atomically.");
+    }
     check::check(row.context->loraWeightsName.empty(), "Phase prefill adapter v1 does not support LoRA.");
 }
 
@@ -92,6 +96,12 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
         check::check(sourceRows.insert({row.context, row.contextRow}).second,
             "Phase prefill batch contains a duplicate source row.");
     }
+    bool const hasVisualEmbeddings = rows.front().context->visualEmbeddings.has_value();
+    check::check(std::all_of(rows.begin(), rows.end(), [hasVisualEmbeddings](PhasePrefillContextRow const& row) {
+        return row.context->visualEmbeddings.has_value() == hasVisualEmbeddings;
+    }), "Phase prefill batch cannot mix text-only and multimodal rows.");
+    check::check(!hasVisualEmbeddings || rows.size() == 1,
+        "Phase prefill adapter v1 supports one multimodal request per batch.");
 
     bool const initialChunk = rows.front().tokenOffset == 0;
     check::check(
@@ -163,6 +173,15 @@ void PhasePrefillContextBatchAdapter::restoreBindings() noexcept
 Tensor& PhasePrefillContextBatchAdapter::tokenIds() noexcept
 {
     return mDeviceTokenIds;
+}
+
+OptionalInputTensor PhasePrefillContextBatchAdapter::visualEmbeddings() const noexcept
+{
+    if (!mPacked || mRows.empty())
+    {
+        return std::nullopt;
+    }
+    return mRows.front().context->visualEmbeddings;
 }
 
 PhaseBatchState& PhasePrefillContextBatchAdapter::phaseBatchState() noexcept

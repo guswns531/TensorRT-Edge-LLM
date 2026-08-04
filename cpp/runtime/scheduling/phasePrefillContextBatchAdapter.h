@@ -63,6 +63,8 @@ public:
     void complete();
 
     Tensor& tokenIds() noexcept;
+    //! Visual embeddings for a single-request atomic multimodal prefill.
+    OptionalInputTensor visualEmbeddings() const noexcept;
     PhaseBatchState& phaseBatchState() noexcept;
     std::vector<PhasePrefillContextRow> const& rows() const noexcept;
     std::vector<PhaseWorkItem> const& workItems() const noexcept;

@@ -890,6 +890,55 @@ TEST(PhasePrefillContextBatchAdapterTest, PacksPromptSlicesAndRestoresStableSlot
     EXPECT_THROW(adapter.pack({{1, &first, 0, 0, 0, 2, 5}, {2, &second, 0, 1, 2, 2, 5}}, nullptr), std::runtime_error);
 }
 
+TEST(PhasePrefillContextBatchAdapterTest, PacksSingleAtomicMultimodalPrompt)
+{
+    rt::HybridCacheManager cacheManager = makeIndexedManager(2);
+    rt::TensorMap tensorMap;
+    rt::PhaseBatchState previousBindings(2, "phase_multimodal_prefill_previous_bindings");
+    previousBindings.bind(tensorMap);
+    rt::Tensor visualEmbeddings({4, 8}, rt::DeviceType::kGPU, DataType::kHALF, "phase_visual_embeddings");
+
+    rt::DecodingInferenceContext context;
+    context.initialize(1, 4, std::cref(visualEmbeddings), rt::OptionalInputTensors{}, "", nullptr);
+    context.rawBatchedInputIds = {{10, 11, 12, 13}};
+    context.tokenIds = context.rawBatchedInputIds;
+
+    rt::PhasePrefillContextBatchAdapter adapter(2, 4, cacheManager, tensorMap, "phase_multimodal_prefill_test");
+    adapter.pack({{101, &context, 0, 1, 0, 4, 4}}, nullptr);
+    ASSERT_TRUE(adapter.visualEmbeddings().has_value());
+    EXPECT_EQ(&adapter.visualEmbeddings()->get(), &visualEmbeddings);
+    adapter.complete();
+
+    EXPECT_THROW(adapter.pack({{101, &context, 0, 1, 0, 2, 4}}, nullptr), std::runtime_error);
+
+    rt::DecodingInferenceContext textContext;
+    textContext.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    textContext.rawBatchedInputIds = {{20, 21, 22, 23}};
+    textContext.tokenIds = textContext.rawBatchedInputIds;
+    EXPECT_THROW(adapter.pack({{101, &context, 0, 1, 0, 4, 4}, {202, &textContext, 0, 0, 0, 4, 4}}, nullptr),
+        std::runtime_error);
+}
+
+TEST(PhaseContextBatchAdapterTest, AllowsVisualContextDuringDecode)
+{
+    rt::HybridCacheManager cacheManager = makeIndexedManager(1);
+    rt::TensorMap tensorMap;
+    rt::PhaseBatchState previousBindings(1, "phase_visual_decode_previous_bindings");
+    previousBindings.bind(tensorMap);
+    rt::Tensor visualEmbeddings({4, 8}, rt::DeviceType::kGPU, DataType::kHALF, "phase_decode_visual_embeddings");
+
+    rt::DecodingInferenceContext context;
+    context.initialize(1, 4, std::cref(visualEmbeddings), rt::OptionalInputTensors{}, "", nullptr);
+    context.rawBatchedInputIds = {{1, 2}};
+    context.tokenIds = {{1, 2, 3}};
+    context.effectivePrefillLengths = {2};
+    context.currentGenerateLengths = {1};
+
+    rt::PhaseContextBatchAdapter adapter(1, cacheManager, tensorMap, "phase_visual_decode_test");
+    EXPECT_NO_THROW(adapter.packDecode({{101, &context, 0, 0, 2}}, nullptr));
+    adapter.scatterDecode();
+}
+
 TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
 {
     rt::HybridCacheManager cacheManager = makeIndexedManager(2);

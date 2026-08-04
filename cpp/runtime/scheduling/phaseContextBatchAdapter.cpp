@@ -70,9 +70,8 @@ void PhaseContextBatchAdapter::validateSourceRow(PhaseContextRow const& row) con
 
     check::check(!row.context->finishedStates[sourceRow], "Finished source rows cannot be packed for decode.");
     check::check(!row.context->tokenIds[sourceRow].empty(), "Decode source row has no input token.");
-    check::check(!row.context->visualEmbeddings.has_value() && !row.context->audioEmbeddings.has_value()
-            && row.context->deepstackFeatures.empty(),
-        "Phase context adapter v1 supports text-only decode.");
+    check::check(!row.context->audioEmbeddings.has_value() && row.context->deepstackFeatures.empty(),
+        "Phase context adapter v1 does not support audio or deepstack decode.");
     check::check(row.context->loraWeightsName.empty(), "Phase context adapter v1 does not support LoRA.");
     check::check(row.context->numLogprobs == 0, "Phase context adapter v1 does not support logprobs.");
     check::check(!row.context->hasLogitBias && row.context->logitBiasPerSlot[sourceRow].empty(),
