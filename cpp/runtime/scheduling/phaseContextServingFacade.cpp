@@ -120,6 +120,11 @@ PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks
         {
             mCallbacks.onTerminal(snapshot);
         }
+        for (auto const& [observerId, observer] : mTerminalObservers)
+        {
+            static_cast<void>(observerId);
+            observer(snapshot);
+        }
         mPendingAdmissionRequired = true;
     };
     return result;
@@ -437,6 +442,19 @@ std::optional<PhaseRequestSnapshot> PhaseContextServingFacade::request(uint64_t 
 CUcontext PhaseContextServingFacade::cudaContext() const noexcept
 {
     return mLifecycle->cudaContext();
+}
+
+size_t PhaseContextServingFacade::addTerminalObserver(std::function<void(PhaseRequestSnapshot const&)> observer)
+{
+    check::check(static_cast<bool>(observer), "Serving terminal observer must be callable.");
+    size_t const observerId = mNextTerminalObserverId++;
+    mTerminalObservers.emplace(observerId, std::move(observer));
+    return observerId;
+}
+
+void PhaseContextServingFacade::removeTerminalObserver(size_t observerId) noexcept
+{
+    mTerminalObservers.erase(observerId);
 }
 
 } // namespace rt

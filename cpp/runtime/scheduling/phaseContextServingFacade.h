@@ -135,6 +135,9 @@ public:
     int32_t availableSlotCount() const noexcept;
     std::optional<PhaseRequestSnapshot> request(uint64_t requestId) const;
     CUcontext cudaContext() const noexcept;
+    //! Add a terminal observer without replacing the callbacks installed by the executor owner.
+    size_t addTerminalObserver(std::function<void(PhaseRequestSnapshot const&)> observer);
+    void removeTerminalObserver(size_t observerId) noexcept;
 
 private:
     struct Registration
@@ -169,6 +172,8 @@ private:
     std::deque<PendingAdmission> mPendingAdmissions;
     size_t mMaxPendingAdmissions{};
     bool mPendingAdmissionRequired{};
+    size_t mNextTerminalObserverId{1};
+    std::unordered_map<size_t, std::function<void(PhaseRequestSnapshot const&)>> mTerminalObservers;
     std::unique_ptr<PhaseRequestLifecycle> mLifecycle;
 };
 

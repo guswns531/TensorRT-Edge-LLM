@@ -1032,6 +1032,9 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     rt::PhaseContextServingFacade facade(2, schedulerConfig, std::move(callbacks), cacheManager, decodeTensorMap,
         prefillStream, decodeStream, rt::PhaseTensorRTContextMode::kIndependentConcurrent, nullptr, 0, 1,
         safetyContract);
+    std::vector<rt::PhaseRequestSnapshot> observedTerminals;
+    size_t const observerId = facade.addTerminalObserver(
+        [&](rt::PhaseRequestSnapshot const& snapshot) { observedTerminals.push_back(snapshot); });
 
     EXPECT_EQ(facade.submit(101, first, 0, 2), 0);
     EXPECT_EQ(facade.submit(202, second, 0, 2), 1);
@@ -1054,7 +1057,9 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     facade.wait();
 
     ASSERT_EQ(terminals.size(), 1U);
+    ASSERT_EQ(observedTerminals.size(), 1U);
     EXPECT_EQ(terminals[0].requestId, 101U);
+    EXPECT_EQ(observedTerminals[0].requestId, 101U);
     EXPECT_EQ(terminals[0].status, rt::PhaseRequestStatus::kFinished);
     EXPECT_EQ(facade.availableSlotCount(), 0);
     EXPECT_EQ(facade.pendingRequestCount(), 0U);
@@ -1085,6 +1090,7 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     EXPECT_EQ(third.tokenIds[0].size(), 4U);
     EXPECT_EQ(copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{3, 4}));
 
+    facade.removeTerminalObserver(observerId);
     EXPECT_EQ(facade.submit(404, first, 0, 2), 0);
     EXPECT_EQ(facade.submit(405, fourth, 0, 2), 1);
     rt::PhaseAdmissionResult const cancelledPending = facade.submitOrQueue(505, second, 0, 2);
@@ -1100,6 +1106,7 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     EXPECT_EQ(facade.registeredRequestCount(), 0U);
     EXPECT_EQ(terminals.back().requestId, 404U);
     EXPECT_EQ(terminals.back().status, rt::PhaseRequestStatus::kCancelled);
+    EXPECT_EQ(observedTerminals.size(), 3U);
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
