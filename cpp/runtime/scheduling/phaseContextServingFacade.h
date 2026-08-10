@@ -51,6 +51,9 @@ struct PhaseAdmissionResult
     uint64_t requestId{};
     int32_t kvSlotId{-1};
     PhaseAdmissionStatus status{PhaseAdmissionStatus::kPending};
+    int32_t availableSlots{};
+    size_t pendingQueueDepth{};
+    KVPagePoolStats pagePool;
 };
 
 struct PhaseContextServingCallbacks

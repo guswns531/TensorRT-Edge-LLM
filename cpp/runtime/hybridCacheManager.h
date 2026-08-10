@@ -34,6 +34,17 @@ namespace rt
 
 struct PhaseWorkItem;
 
+//! Snapshot of the host-side physical KV page-bundle pool.
+//!
+//! Non-paged caches return zeros. The snapshot is intended for scheduler and
+//! benchmark telemetry; ownership changes remain serialized by the manager.
+struct KVPagePoolStats
+{
+    int32_t totalBundles{};
+    int32_t allocatedBundles{};
+    int32_t availableBundles{};
+};
+
 //! Top-level cache manager for hybrid Attention + Mamba architectures.
 //!
 //! Routes cache access by absolute decoder-layer index to the appropriate
@@ -187,6 +198,9 @@ public:
         return mConfig.kvConfig.pagedKVCache;
     }
 
+    //! Return the current host page-pool ownership counters.
+    KVPagePoolStats getPagedKVPoolStats() const noexcept;
+
     //! Stable-slot physical page table [maxSlots, 2, maxPagesPerSequence].
     rt::Tensor& getKVPageIds();
 
@@ -327,7 +341,7 @@ private:
     rt::Tensor mDeviceKVPageIds{};            //!< Stable-slot physical page table
     std::optional<KVSlotAllocator> mSlotAllocator;
     std::optional<KVPageBundleAllocator> mPageAllocator;
-    std::mutex mPageAllocatorMutex;              //!< Serializes host page ownership updates
+    mutable std::mutex mPageAllocatorMutex;      //!< Serializes host page ownership updates
     std::vector<int32_t> mHostGlobalKVCacheLengths; //!< Host mirror used by ordinary decode page reservation
     std::vector<int32_t> mHostKVPageIds;         //!< Stable host staging for asynchronous page-table row uploads
     int32_t mActiveBatchSize{};               //!< Number of active sequences

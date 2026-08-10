@@ -301,6 +301,16 @@ rt::Tensor& HybridCacheManager::getKVPageIds()
     return mDeviceKVPageIds;
 }
 
+KVPagePoolStats HybridCacheManager::getPagedKVPoolStats() const noexcept
+{
+    if (!mConfig.kvConfig.pagedKVCache || !mPageAllocator.has_value())
+    {
+        return {};
+    }
+    std::lock_guard<std::mutex> const lock(mPageAllocatorMutex);
+    return {mConfig.kvConfig.numPageBundles, mPageAllocator->allocatedBundles(), mPageAllocator->availableBundles()};
+}
+
 void HybridCacheManager::preparePagedKVCapacity(
     std::vector<PhaseWorkItem> const& batch, bool decode, cudaStream_t stream)
 {

@@ -92,6 +92,10 @@ struct PhaseDispatchMetrics
     float decodeGpuMs{};
     float makespanGpuMs{};
     float overlapRatio{};
+    //! Host page-pool snapshot after the dispatch completion; zero for linear caches.
+    int32_t pagePoolTotalBundles{};
+    int32_t pagePoolAllocatedBundles{};
+    int32_t pagePoolAvailableBundles{};
 };
 
 struct PhaseSchedulerTelemetry

@@ -62,6 +62,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 40. [Cosmos Reason2-2B indexed KV 구현과 image trace 결과](47-cosmos-indexed-kv-20260810.md)
 41. [Stable indexed-paged KV cache 설계와 구현 계획](48-stable-indexed-paged-kv-plan.md)
 42. [Cosmos indexed-paged KV 구현과 10GB GPU 검증](49-cosmos-paged-kv-implementation.md)
+43. [Real-request indexed-linear/indexed-paged cost matrix](50-real-request-indexed-paged-cost-matrix.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.

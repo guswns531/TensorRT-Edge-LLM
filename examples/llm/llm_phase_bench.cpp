@@ -145,6 +145,9 @@ struct TraceRequestSample
     int32_t maxOutputTokens{};
     size_t imageCount{};
     rt::PhaseRequestStatus admissionStatus{rt::PhaseRequestStatus::kPending};
+    int32_t admissionAvailableSlots{};
+    size_t admissionPendingQueueDepth{};
+    rt::KVPagePoolStats admissionPagePool;
     rt::PhaseAsyncCompletion completion;
 };
 
@@ -207,7 +210,9 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
     ELLM_CHECK(output.is_open(), "Failed to open phase trace CSV: " + path.string());
     output << "request_id,scheduled_arrival_us,submitted_us,admitted_us,first_token_us,completed_us,queue_delay_us,"
               "admission_delay_us,prompt_tokens,max_output_tokens,output_tokens,ttft_us,tpot_us,e2e_ms,image_count,"
-              "admission_status,"
+              "admission_status,admission_available_slots,admission_pending_queue_depth,"
+              "admission_page_pool_total_bundles,admission_page_pool_allocated_bundles,"
+              "admission_page_pool_available_bundles,admission_page_pool_pressure,"
               "finish_reason,output_text\n";
     output << std::fixed << std::setprecision(6);
     for (TraceRequestSample const& sample : samples)
@@ -223,8 +228,15 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
                << sample.submittedUs - sample.scheduledArrivalUs << ',' << sample.admittedUs - sample.submittedUs << ','
                << sample.promptTokens << ',' << sample.maxOutputTokens << ',' << outputTokens << ',' << ttftUs << ','
                << tpotUs << ',' << sample.completion.latencyMs << ',' << sample.imageCount << ','
-               << static_cast<int>(sample.admissionStatus) << ',' << rt::finishReasonName(response.finishReasons[0])
-               << ',' << csvQuote(response.outputTexts[0]) << '\n';
+               << static_cast<int>(sample.admissionStatus) << ',' << sample.admissionAvailableSlots << ','
+               << sample.admissionPendingQueueDepth << ',' << sample.admissionPagePool.totalBundles << ','
+               << sample.admissionPagePool.allocatedBundles << ',' << sample.admissionPagePool.availableBundles << ','
+               << (sample.admissionPagePool.totalBundles > 0
+                       ? static_cast<double>(sample.admissionPagePool.allocatedBundles)
+                           / static_cast<double>(sample.admissionPagePool.totalBundles)
+                       : 0.0)
+               << ',' << rt::finishReasonName(response.finishReasons[0]) << ','
+               << csvQuote(response.outputTexts[0]) << '\n';
     }
 }
 
@@ -431,14 +443,17 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
     std::ofstream output(path);
     ELLM_CHECK(output.good(), "Failed to open dispatch metrics CSV: " + path.string());
     output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,decode_tokens,"
-              "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio\n";
+              "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
+              "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles\n";
     output << std::fixed << std::setprecision(6);
     for (rt::PhaseDispatchMetrics const& sample : metrics)
     {
         output << sample.dispatchIndex << ',' << static_cast<int32_t>(sample.kind) << ',' << sample.prefillBatchSize
                << ',' << sample.decodeBatchSize << ',' << sample.prefillTokens << ',' << sample.decodeTokens << ','
                << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
-               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << '\n';
+               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
+               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
+               << sample.pagePoolAvailableBundles << '\n';
     }
 }
 
@@ -1267,7 +1282,14 @@ int main(int argc, char** argv)
             return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
         facadeCallbacks.onDispatchMetrics
-            = [&](rt::PhaseDispatchMetrics const& sample) { facadeDispatchMetrics.push_back(sample); };
+            = [&](rt::PhaseDispatchMetrics const& sample) {
+                  rt::PhaseDispatchMetrics telemetry = sample;
+                  rt::KVPagePoolStats const pool = cacheManager.getPagedKVPoolStats();
+                  telemetry.pagePoolTotalBundles = pool.totalBundles;
+                  telemetry.pagePoolAllocatedBundles = pool.allocatedBundles;
+                  telemetry.pagePoolAvailableBundles = pool.availableBundles;
+                  facadeDispatchMetrics.push_back(telemetry);
+              };
         facadeCallbacks.onDispatch = [&](rt::PhaseDispatchMetrics const& sample) {
             kernelDispatchMetadata.schedulerDispatchIndex = sample.dispatchIndex;
             kernelDispatchMetadata.schedulerKind = static_cast<int32_t>(sample.kind);
@@ -1291,11 +1313,13 @@ int main(int argc, char** argv)
                 return;
             }
             auto const found = traceIndices.find(admission.requestId);
-            if (realRequestTrace && found != traceIndices.end()
-                && admission.status == rt::PhaseAdmissionStatus::kAdmitted)
+            if (realRequestTrace && found != traceIndices.end())
             {
                 TraceRequestSample& sample = traceSamples.at(found->second);
-                if (sample.admittedUs < 0)
+                sample.admissionAvailableSlots = admission.availableSlots;
+                sample.admissionPendingQueueDepth = admission.pendingQueueDepth;
+                sample.admissionPagePool = admission.pagePool;
+                if (admission.status == rt::PhaseAdmissionStatus::kAdmitted && sample.admittedUs < 0)
                 {
                     sample.admittedUs = elapsedMicroseconds(traceStart);
                 }

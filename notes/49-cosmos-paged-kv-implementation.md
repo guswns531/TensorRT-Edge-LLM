@@ -126,6 +126,7 @@ TensorRT enqueue보다 같은 stream에서 먼저 실행된다. ordinary `handle
 | phase enqueue reservation | `cpp/runtime/scheduling/phaseBatchState.cpp` |
 | terminal page release | `cpp/runtime/scheduling/phaseRequestLifecycle.cpp`, `phaseContextServingFacade.cpp` |
 | logits tolerance와 argmax margin 비교 | `scripts/cosmos_reason2/compare_indexed_logits.py` |
+| page-pool snapshot과 admission telemetry | `cpp/runtime/hybridCacheManager.{h,cpp}`, `phaseContextServingFacade.{h,cpp}`, `examples/llm/llm_phase_bench.cpp` |
 
 모델별 변경은 없다. Cosmos가 사용하는 default decoder attention graph가 공통 paged op를 생성하고,
 Cosmos 특유 deepstack/M-RoPE input은 기존 model adapter 경로를 유지한다. 현재 실험은 vanilla text-only
@@ -209,8 +210,8 @@ byte-exact였다. aux stream 또는 page-table update race로 인한 run-to-run 
 ## 아직 통과하지 않은 gate
 
 1. prefill median/p95는 workload를 100회씩 3세트 실행해야 한다. 현재 표의 prefill count는 1이다.
-2. pool exhaustion은 allocator 수준에서 transactional error로 안전하게 멈추지만, online scheduler가 이를
-   queue backpressure metric으로 바꾸는 정책은 아직 없다.
+2. dispatch/admission CSV에 page-pool available/allocated와 stable-slot pending depth를 기록하기 시작했다.
+   다만 pool exhaustion을 scheduler가 자동으로 작은 batch 또는 pending admission으로 바꾸는 정책은 아직 없다.
 3. deferred free의 event ordering은 phase server completion event 경계에 연결했지만 sanitizer/Nsight로
    use-after-release와 eviction D2D 0 bytes를 다시 확인해야 한다.
 4. v1은 FP16 vanilla text attention만 지원한다. prefix sharing/COW, speculative decode, host offload,
