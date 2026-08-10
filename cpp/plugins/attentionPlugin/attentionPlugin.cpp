@@ -1558,10 +1558,10 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         // requirement): newly generated tokens are text, so decode is pure
         // causal/sliding — identical masking to the non-vision path.
         // Cache-state parity: the vision prefill paths write the cache with
-        // launchApplyRopeWriteKV (roped K + original V in the canonical
-        // [B, 2, Hkv, cap, D] layout) and the decode RoPE above appended the
-        // new token the same way as the non-vision path, so XQA reads exactly
-        // the cache state it would see without vision.
+        // launchApplyRopeWriteKV (roped K + original V). Legacy engines use
+        // physical [B, 2, Hkv, cap, D]; indexed engines use the paged-XQA
+        // physical pool behind the same logical binding shape. Decode appends
+        // with the matching layout, so XQA sees the same logical cache state.
 
         // XQA decode kernel dispatch.
         auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,

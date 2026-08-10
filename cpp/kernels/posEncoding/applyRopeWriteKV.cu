@@ -72,7 +72,7 @@ __device__ __forceinline__ DVec<T> vecApplyRopeNonInterleave(
 }
 
 template <typename TCache>
-__device__ __forceinline__ void storeVec(TCache* dst, int base, DVec<half> const& vec, float scaleQuantOrig)
+__device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> const& vec, float scaleQuantOrig)
 {
     if constexpr (std::is_same_v<TCache, half>)
     {
@@ -93,6 +93,26 @@ __device__ __forceinline__ void storeVec(TCache* dst, int base, DVec<half> const
         out.store(dst + base);
     }
 #endif
+}
+
+__device__ __forceinline__ int64_t getKVCacheOffset(int32_t cacheSlot, int32_t kvIndex, int32_t kvHeadIdx,
+    int32_t tokenIdx, int32_t kvCacheCapacity, uint32_t numKVHeads, uint32_t headDim, bool indexedKVCache)
+{
+    if (!indexedKVCache)
+    {
+        return (((static_cast<int64_t>(cacheSlot) * 2 + kvIndex) * numKVHeads + kvHeadIdx) * kvCacheCapacity + tokenIdx)
+            * headDim;
+    }
+
+    // Indexed caches expose the legacy [slots, 2, H, capacity, D] binding shape,
+    // but use the paged-XQA physical layout [page, token, H, D]. The page list
+    // maps each logical K/V page to this pool without moving cache contents.
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    int32_t const pagesPerSequence = kvCacheCapacity / kTOKENS_PER_PAGE;
+    int32_t const logicalPage = tokenIdx / kTOKENS_PER_PAGE;
+    int32_t const tokenInPage = tokenIdx % kTOKENS_PER_PAGE;
+    int64_t const physicalPage = (static_cast<int64_t>(cacheSlot) * 2 + kvIndex) * pagesPerSequence + logicalPage;
+    return (((physicalPage * kTOKENS_PER_PAGE + tokenInPage) * numKVHeads + kvHeadIdx) * headDim);
 }
 
 template <typename T, typename TCache>
@@ -203,8 +223,8 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
 
         int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
         int32_t const tokenIdxInCache = kvCacheStartIdx + tokenIdx % qSeqLen;
-        int32_t const cacheSlot = kvSlotIds != nullptr ? kvSlotIds[batchIdx] : batchIdx;
-        int64_t const cacheOffsetSequence = static_cast<int64_t>(cacheSlot) * 2 * numKVHead * kvCacheCapacity * headDim;
+        bool const indexedKVCache = kvSlotIds != nullptr;
+        int32_t const cacheSlot = indexedKVCache ? kvSlotIds[batchIdx] : batchIdx;
 
         // Load V before writing roped K in-place: when K and V share the same
         // buffer (e.g. Gemma4 global layers where K=V projection), the in-place
@@ -224,11 +244,13 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
         // This ensures padding tokens don't corrupt valid cache entries
         if (!isPaddingToken)
         {
-            // Save to KVCache which assume to have layout of [B, Hk + Hv, S, D]
-            int32_t cacheOffsetK = cacheOffsetSequence + kvHeadIdx * kvCacheCapacity * headDim
-                + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
-            int32_t cacheOffsetV = cacheOffsetSequence + (numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
-                + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
+            int64_t const vecOffset = DVec<T>::vec_size * tIdx;
+            int64_t const cacheOffsetK = getKVCacheOffset(cacheSlot, 0, kvHeadIdx, tokenIdxInCache, kvCacheCapacity,
+                                             numKVHead, headDim, indexedKVCache)
+                + vecOffset;
+            int64_t const cacheOffsetV = getKVCacheOffset(cacheSlot, 1, kvHeadIdx, tokenIdxInCache, kvCacheCapacity,
+                                             numKVHead, headDim, indexedKVCache)
+                + vecOffset;
             storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
             storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
         }
@@ -430,17 +452,16 @@ __global__ void applyRopeWriteKVSplitQKVKernel(T* __restrict__ q, T const* __res
         DVec<T> vSrc;
         vSrc.load(vPtr + DVec<T>::vec_size * tIdx);
 
-        // KV cache layout: [B, 2, H_kv, S, D]
-        //   K at [b, 0, h, s, :] = b*2*H*S*D + 0*H*S*D + h*S*D + s*D
-        //   V at [b, 1, h, s, :] = b*2*H*S*D + 1*H*S*D + h*S*D + s*D
         int32_t const tokenIdxInCache = kvCacheEndLens[batchIdx] - qSeqLen + tokenIdx % qSeqLen;
-        int32_t const cacheSlot = kvSlotIds != nullptr ? kvSlotIds[batchIdx] : batchIdx;
-        int64_t const cacheBase = static_cast<int64_t>(cacheSlot) * 2 * numKVHead * kvCacheCapacity * headDim;
-        int32_t const vecBase = DVec<T>::vec_size * tIdx;
-        int64_t const cacheOffsetK = cacheBase + static_cast<int64_t>(kvHeadIdx) * kvCacheCapacity * headDim
-            + tokenIdxInCache * headDim + vecBase;
-        int64_t const cacheOffsetV = cacheBase + static_cast<int64_t>(numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
-            + tokenIdxInCache * headDim + vecBase;
+        bool const indexedKVCache = kvSlotIds != nullptr;
+        int32_t const cacheSlot = indexedKVCache ? kvSlotIds[batchIdx] : batchIdx;
+        int64_t const vecOffset = DVec<T>::vec_size * tIdx;
+        int64_t const cacheOffsetK = getKVCacheOffset(cacheSlot, 0, kvHeadIdx, tokenIdxInCache, kvCacheCapacity,
+                                         numKVHead, headDim, indexedKVCache)
+            + vecOffset;
+        int64_t const cacheOffsetV = getKVCacheOffset(cacheSlot, 1, kvHeadIdx, tokenIdxInCache, kvCacheCapacity,
+                                         numKVHead, headDim, indexedKVCache)
+            + vecOffset;
 
         storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
         storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);

@@ -45,7 +45,7 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..linear import FP16Linear, TPMode, make_linear
-from ..ops import attention_plugin
+from ..ops import attention_plugin, indexed_attention_plugin
 
 __all__ = [
     "OnnxSpec",
@@ -85,7 +85,8 @@ def _make_flat_wrapper(model: nn.Module,
                        Na: int,
                        Nd: int,
                        eagle_base: bool = False,
-                       emit_hidden_states: bool = False) -> nn.Module:
+                       emit_hidden_states: bool = False,
+                       indexed_kv_cache: bool = False) -> nn.Module:
     """Build a wrapper with an explicit flat forward signature (no ``*args``).
 
     Using ``*flat_args`` in ``forward`` triggers a PyTorch 2.10 bug where the
@@ -109,11 +110,13 @@ def _make_flat_wrapper(model: nn.Module,
     """
     has_hidden_output = eagle_base or emit_hidden_states
 
-    param_names: List[str] = (["inputs_embeds"] +
-                              [f"past_key_values_{i}" for i in range(Na)] + [
-                                  "rope_rotary_cos_sin", "context_lengths",
-                                  "kvcache_start_index", "last_token_ids"
-                              ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+    param_names: List[str] = (
+        ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] +
+        ["rope_rotary_cos_sin", "context_lengths", "kvcache_start_index"])
+    if indexed_kv_cache:
+        param_names += ["kv_slot_ids"]
+    param_names += (["last_token_ids"] +
+                    [f"deepstack_embeds_{i}" for i in range(Nd)])
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
 
@@ -125,13 +128,14 @@ def _make_flat_wrapper(model: nn.Module,
     eagle_kwargs = (", attention_mask=attention_mask"
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
+    indexed_kwargs = ", kv_slot_ids=kv_slot_ids" if indexed_kv_cache else ""
 
     if has_hidden_output:
         body = (
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{ds_kwarg}{eagle_kwargs})\n"
+            f"{indexed_kwargs}{ds_kwarg}{eagle_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
@@ -139,7 +143,7 @@ def _make_flat_wrapper(model: nn.Module,
             f"    logits, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{ds_kwarg})\n"
+            f"{indexed_kwargs}{ds_kwarg})\n"
             f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -264,6 +268,7 @@ class Attention(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_slot_ids: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -305,16 +310,35 @@ class Attention(nn.Module):
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
-        attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
-            past_key_value,
-            context_lengths,
-            rope_rotary_cos_sin,
-            kvcache_start_index,
-            **kwargs,
-        )
+        if kv_slot_ids is not None:
+            attn_output, present_key_value = indexed_attention_plugin(
+                query_states,
+                key_states,
+                value_states,
+                past_key_value,
+                context_lengths,
+                rope_rotary_cos_sin,
+                kvcache_start_index,
+                kv_slot_ids,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                sliding_window_size=self.sliding_window_size,
+                enable_fp8_kv_cache=self.enable_fp8_kv_cache,
+                attention_scale=self.attention_scale,
+                qkv_scales=kwargs["qkv_scales"],
+            )
+        else:
+            attn_output, present_key_value = attention_plugin(
+                query_states,
+                key_states,
+                value_states,
+                past_key_value,
+                context_lengths,
+                rope_rotary_cos_sin,
+                kvcache_start_index,
+                **kwargs,
+            )
         # AttentionPlugin returns [batch, seq_len, num_heads, head_dim]; reshape for o_proj.
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
@@ -386,6 +410,7 @@ class DecoderLayer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_slot_ids: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -396,6 +421,7 @@ class DecoderLayer(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_slot_ids=kv_slot_ids,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
@@ -444,6 +470,7 @@ class Transformer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_slot_ids: "torch.Tensor | None" = None,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
@@ -466,6 +493,7 @@ class Transformer(nn.Module):
                 rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
+                kv_slot_ids=kv_slot_ids,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
             )
@@ -612,6 +640,9 @@ class CausalLM(nn.Module):
         kvcache_start_index = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
+        kv_slot_ids = torch.arange(batch_size,
+                                   dtype=torch.int32,
+                                   device=device)
         last_token_ids = torch.zeros(batch_size,
                                      1,
                                      dtype=torch.int64,
@@ -626,14 +657,18 @@ class CausalLM(nn.Module):
         ]
 
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, last_token_ids,
-                *deepstack_embeds_list)
+                context_lengths, kvcache_start_index)
+        if config.indexed_kv_cache:
+            args = args + (kv_slot_ids, )
+        args = args + (last_token_ids, *deepstack_embeds_list)
 
-        input_names = (["inputs_embeds"] +
-                       [f"past_key_values_{i}" for i in range(Na)] + [
-                           "rope_rotary_cos_sin", "context_lengths",
-                           "kvcache_start_index", "last_token_ids"
-                       ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+        input_names = (
+            ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] +
+            ["rope_rotary_cos_sin", "context_lengths", "kvcache_start_index"])
+        if config.indexed_kv_cache:
+            input_names = input_names + ["kv_slot_ids"]
+        input_names = (input_names + ["last_token_ids"] +
+                       [f"deepstack_embeds_{i}" for i in range(Nd)])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states and not eagle_base:
@@ -646,15 +681,19 @@ class CausalLM(nn.Module):
         past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        kv_slots = torch.export.Dim("kv_slots", min=1, max=256)
+        cache_batch = kv_slots if config.indexed_kv_cache else batch
 
         num_selected = torch.export.Dim("num_selected", min=1,
                                         max=256) if eagle_base else None
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
-            all_shapes.append({0: batch, 3: past})  # past_key_values_i
+            all_shapes.append({0: cache_batch, 3: past})  # past_key_values_i
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
+        if config.indexed_kv_cache:
+            all_shapes.append({0: batch})  # kv_slot_ids
         if eagle_base:
             all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         else:
@@ -697,7 +736,8 @@ class CausalLM(nn.Module):
             Na,
             Nd,
             eagle_base=eagle_base,
-            emit_hidden_states=self.emit_hidden_states)
+            emit_hidden_states=self.emit_hidden_states,
+            indexed_kv_cache=config.indexed_kv_cache)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -714,6 +754,7 @@ class CausalLM(nn.Module):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         last_token_ids: torch.Tensor,
+        kv_slot_ids: "torch.Tensor | None" = None,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
@@ -729,7 +770,8 @@ class CausalLM(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
-            deepstack_embeds,
+            kv_slot_ids=kv_slot_ids,
+            deepstack_embeds=deepstack_embeds,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             output_hidden_states=eagle_base and not dflash_base,

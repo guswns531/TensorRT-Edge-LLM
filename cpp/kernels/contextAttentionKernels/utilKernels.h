@@ -140,11 +140,13 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
     rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
 
-//! \brief Converts KV cache layout from [B, 2, H, S, D] into separate K and V tensors of shape [B, S, H, D].
+//! \brief Converts a combined KV cache into separate K and V tensors of shape [B, S, H, D].
 //!
 //! Splits the interleaved KV source into two independent FP16 output tensors, applying FP8 dequantization when
 //! the source is FP8. Used in the chunked-prefill path so that the SEPARATE_Q_K_V FMHA kernels receive
 //! separate K and V pointers.
+//! Without kvSlotIds, the source uses the legacy [B, 2, H, S, D] physical layout. With kvSlotIds, the binding
+//! retains that logical shape while storage uses the paged-XQA [page, tokenInPage, H, D] layout.
 //!
 //! \param[in]  src             Source tensor with shape [B, 2, H, S, D].
 //! \param[out] kDst            Destination K tensor with shape [B, S, H, D] (FP16).

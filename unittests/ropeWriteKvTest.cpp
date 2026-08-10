@@ -19,6 +19,7 @@
 
 #include "common/cudaUtils.h"
 #include "common/tensor.h"
+#include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "references.h"
@@ -678,6 +679,62 @@ TEST(RopeWriteKvPrefill, Accuracy)
     // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512,
     // cosSinCacheBatchSize = 2, cosSinCacheSeqLen = 8192
     TestRopeWriteKvPrefill(2, {24, 8, 128, 96}, 4096, 512, 10000.0f, 2, 8192);
+}
+
+TEST(RopeWriteKvPrefill, IndexedMultiHeadPagedLayoutRoundTrip)
+{
+    constexpr int32_t kACTIVE_BATCH = 2;
+    constexpr int32_t kPHYSICAL_SLOTS = 4;
+    constexpr int32_t kSEQ_LEN = 128;
+    constexpr int32_t kCAPACITY = 256;
+    constexpr int32_t kNUM_Q_HEADS = 16;
+    constexpr int32_t kNUM_KV_HEADS = 8;
+    constexpr int32_t kHEAD_DIM = 128;
+    std::vector<int32_t> const slotIds{3, 0};
+
+    rt::Tensor qTensor(
+        {kACTIVE_BATCH, kSEQ_LEN, kNUM_Q_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kTensor(
+        {kACTIVE_BATCH, kSEQ_LEN, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vTensor(
+        {kACTIVE_BATCH, kSEQ_LEN, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    std::vector<half> qInput(qTensor.getShape().volume());
+    std::vector<half> kInput(kTensor.getShape().volume());
+    std::vector<half> vInput(vTensor.getShape().volume());
+    uniformFloatInitialization(qInput);
+    uniformFloatInitialization(kInput);
+    uniformFloatInitialization(vInput);
+    copyHostToDevice(qTensor, qInput);
+    copyHostToDevice(kTensor, kInput);
+    copyHostToDevice(vTensor, vInput);
+
+    rt::Tensor backing(
+        {kPHYSICAL_SLOTS, 2, kNUM_KV_HEADS, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor activeView(backing.rawPointer(), rt::Coords{kACTIVE_BATCH, 2, kNUM_KV_HEADS, kCAPACITY, kHEAD_DIM},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor slotTensor({kACTIVE_BATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(slotTensor, slotIds);
+
+    rt::Tensor cosSinCache({1, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(cosSinCache.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, kHEAD_DIM, kCAPACITY, nullptr);
+
+    launchApplyRopeWriteKV(cosSinCache, std::nullopt, qTensor, kTensor, vTensor, activeView, 1.0F, 1.0F, nullptr, true,
+        slotTensor.dataPointer<int32_t>());
+
+    rt::Tensor kRoundTrip(
+        {kACTIVE_BATCH, kSEQ_LEN, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vRoundTrip(
+        {kACTIVE_BATCH, kSEQ_LEN, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    kernel::cvtKVLayoutBHSDToSplitKV(
+        activeView, kRoundTrip, vRoundTrip, rt::Tensor{}, kSEQ_LEN, nullptr, slotTensor.dataPointer<int32_t>());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const kExpected = copyDeviceToHost<half>(kTensor);
+    auto const vExpected = copyDeviceToHost<half>(vTensor);
+    auto const kActual = copyDeviceToHost<half>(kRoundTrip);
+    auto const vActual = copyDeviceToHost<half>(vRoundTrip);
+    ASSERT_EQ(kActual, kExpected);
+    ASSERT_EQ(vActual, vExpected);
 }
 
 TEST(RopeWriteKvPrefill, AccuracyFp8)

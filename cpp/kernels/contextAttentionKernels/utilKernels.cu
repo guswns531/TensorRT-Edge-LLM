@@ -281,8 +281,22 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
     uint32_t const h = headPair % H;
     uint32_t const physicalBatch = kvSlotIds != nullptr ? static_cast<uint32_t>(kvSlotIds[batch]) : batch;
 
-    // src layout: [B, 2, H, srcS, D]
-    size_t const srcIdx = (((((size_t) physicalBatch * 2 + kv) * H + h) * srcS + token) * D + d);
+    size_t srcIdx{};
+    if (kvSlotIds == nullptr)
+    {
+        // Legacy contiguous layout: [B, 2, H, srcS, D].
+        srcIdx = (((((size_t) physicalBatch * 2 + kv) * H + h) * srcS + token) * D + d);
+    }
+    else
+    {
+        // Indexed physical layout: [page, tokenInPage, H, D].
+        constexpr uint32_t kTOKENS_PER_PAGE = 128;
+        uint32_t const pagesPerSequence = srcS / kTOKENS_PER_PAGE;
+        uint32_t const logicalPage = token / kTOKENS_PER_PAGE;
+        uint32_t const tokenInPage = token % kTOKENS_PER_PAGE;
+        size_t const physicalPage = ((static_cast<size_t>(physicalBatch) * 2 + kv) * pagesPerSequence + logicalPage);
+        srcIdx = (((physicalPage * kTOKENS_PER_PAGE + tokenInPage) * H + h) * D + d);
+    }
     // dst layout: [B, dstS, H, D]
     size_t const dstIdx = ((((size_t) batch * dstS + token) * H + h) * D + d);
 
@@ -314,6 +328,9 @@ void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tenso
 
     check::check(srcShape[1] == 2, "Source tensor must have shape [B, 2, H, S, D].");
     check::check(dstS <= srcS, "seqLen must be <= source capacity.");
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    check::check(
+        kvSlotIds == nullptr || srcS % kTOKENS_PER_PAGE == 0, "Indexed KV cache capacity must be divisible by 128.");
     check::check(kDst.getDataType() == nvinfer1::DataType::kHALF, "kDst must be FP16.");
     check::check(vDst.getDataType() == nvinfer1::DataType::kHALF, "vDst must be FP16.");
 

@@ -35,7 +35,8 @@ namespace kernel
 //! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]
 //! @param[in,out] k FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
 //! @param[in] v FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
-//! @param[out] kvCache FP16/FP8 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim]
+//! @param[out] kvCache FP16/FP8 type tensor. Without kvSlotIds it uses [batchSize, 2, Hkv, capacity, headDim].
+//!     With kvSlotIds the binding keeps that logical shape while storage uses paged-XQA [page, token, Hkv, headDim].
 //! @param[in] kScale K dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in] vScale V dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in] stream CUDA stream to launch the kernel
@@ -45,6 +46,7 @@ namespace kernel
 //!     as separate contiguous tensors rather than from the KV cache. In this case K must contain the roped result.
 //!     Set to false (default) for chunked prefill with KV cache reuse, where FMHA reads KV from the transposed
 //!     KV cache, and for all decoding paths (vanilla / tree), where the XQA kernel reads KV from the cache.
+//! @param[in] kvSlotIds Optional active-row to stable physical-slot mapping. Enables the paged-XQA physical layout.
 //! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
     rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
@@ -86,7 +88,7 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
 //!     RoPE applied in-place when fp8QOut is null.
 //! @param[in] k FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
 //! @param[in] v FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
-//! @param[out] kvCache FP16/FP8 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim]
+//! @param[out] kvCache FP16/FP8 type tensor. With kvSlotIds its storage uses paged-XQA layout.
 //! @param[in] kScale K dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in] vScale V dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in] stream CUDA stream to launch the kernel

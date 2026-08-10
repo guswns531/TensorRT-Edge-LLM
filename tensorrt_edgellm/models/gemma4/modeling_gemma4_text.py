@@ -1279,6 +1279,8 @@ class Gemma4ForCausalLM(CausalLM):
         past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        kv_slots = torch.export.Dim("kv_slots", min=1, max=256)
+        cache_batch = kv_slots if config.indexed_kv_cache else batch
 
         num_selected = torch.export.Dim(
             "num_selected", min=1, max=256) if tree_attention_base else None
@@ -1286,7 +1288,7 @@ class Gemma4ForCausalLM(CausalLM):
         for _ in range(num_ple_inputs):
             all_shapes.append({0: batch, 1: seq})
         for _ in range(Na):
-            all_shapes.append({0: batch, 3: past})
+            all_shapes.append({0: cache_batch, 3: past})
         all_shapes.append({0: rope_batch, 1: pos})
         if config.use_dual_rope:
             all_shapes.append({0: rope_batch, 1: pos})

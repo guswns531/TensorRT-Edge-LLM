@@ -47,6 +47,15 @@ size_t srcIdx(int32_t b, int32_t kv, int32_t h, int32_t s, int32_t d, int32_t H,
     return (((((size_t) b * 2 + kv) * H + h) * S + s) * D + d);
 }
 
+size_t indexedSrcIdx(int32_t slot, int32_t kv, int32_t h, int32_t s, int32_t d, int32_t H, int32_t S, int32_t D)
+{
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    int32_t const pagesPerSequence = S / kTOKENS_PER_PAGE;
+    int32_t const page = (slot * 2 + kv) * pagesPerSequence + s / kTOKENS_PER_PAGE;
+    int32_t const tokenInPage = s % kTOKENS_PER_PAGE;
+    return (((static_cast<size_t>(page) * kTOKENS_PER_PAGE + tokenInPage) * H + h) * D + d);
+}
+
 // Returns the flat index into a [B, S, H, D] dst tensor.
 size_t dstIdx(int32_t b, int32_t s, int32_t h, int32_t d, int32_t S, int32_t H, int32_t D)
 {
@@ -126,8 +135,8 @@ TEST(SplitKVIndexedTest, GathersStablePhysicalSlots)
 {
     int32_t const physicalB = 4;
     int32_t const activeB = 3;
-    int32_t const H = 1;
-    int32_t const S = 4;
+    int32_t const H = 8;
+    int32_t const S = 256;
     int32_t const D = 8;
     std::vector<int32_t> const slotIds{3, 0, 2};
 
@@ -137,12 +146,16 @@ TEST(SplitKVIndexedTest, GathersStablePhysicalSlots)
     {
         for (int32_t kv = 0; kv < 2; ++kv)
         {
-            for (int32_t s = 0; s < S; ++s)
+            for (int32_t h = 0; h < H; ++h)
             {
-                for (int32_t d = 0; d < D; ++d)
+                for (int32_t s = 0; s < S; ++s)
                 {
-                    srcHost[srcIdx(b, kv, 0, s, d, H, S, D)]
-                        = __float2half(static_cast<float>(1000 * b + 100 * kv + 10 * s + d));
+                    for (int32_t d = 0; d < D; ++d)
+                    {
+                        float const value
+                            = static_cast<float>(1000 * b + 100 * kv + 10 * h + s % 10) + static_cast<float>(d) / 16.0F;
+                        srcHost[indexedSrcIdx(b, kv, h, s, d, H, S, D)] = __float2half(value);
+                    }
                 }
             }
         }
@@ -167,11 +180,14 @@ TEST(SplitKVIndexedTest, GathersStablePhysicalSlots)
     {
         for (int32_t s = 0; s < S; ++s)
         {
-            for (int32_t d = 0; d < D; ++d)
+            for (int32_t h = 0; h < H; ++h)
             {
-                size_t const out = dstIdx(b, s, 0, d, S, H, D);
-                EXPECT_EQ(kHost[out], srcHost[srcIdx(slotIds[b], 0, 0, s, d, H, S, D)]);
-                EXPECT_EQ(vHost[out], srcHost[srcIdx(slotIds[b], 1, 0, s, d, H, S, D)]);
+                for (int32_t d = 0; d < D; ++d)
+                {
+                    size_t const out = dstIdx(b, s, h, d, S, H, D);
+                    EXPECT_EQ(kHost[out], srcHost[indexedSrcIdx(slotIds[b], 0, h, s, d, H, S, D)]);
+                    EXPECT_EQ(vHost[out], srcHost[indexedSrcIdx(slotIds[b], 1, h, s, d, H, S, D)]);
+                }
             }
         }
     }

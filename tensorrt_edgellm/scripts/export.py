@@ -96,6 +96,12 @@ _GEMMA4_MODEL_TYPES = frozenset([
     "gemma4_unified_text",
 ])
 
+_INDEXED_KV_MODEL_TYPES = frozenset([
+    *_GEMMA4_MODEL_TYPES,
+    "qwen3_vl",
+    "qwen3_vl_text",
+])
+
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
@@ -2587,6 +2593,7 @@ def main() -> None:
     dtype = _dtype_from_str(args.dtype)
     has_mtp_draft = _has_mtp(config)
     is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+    is_indexed_kv_target = model_type in _INDEXED_KV_MODEL_TYPES
     mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir
     gemma4_mtp_requested = args.mtp and is_gemma4_target
     gemma4_mtp_assistant_dir = ""
@@ -2600,8 +2607,10 @@ def main() -> None:
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
-    if args.indexed_kv_cache and not is_gemma4_target:
-        p.error("--indexed-kv-cache v1 currently supports Gemma4 text only")
+    if args.indexed_kv_cache and not is_indexed_kv_target:
+        p.error(
+            "--indexed-kv-cache currently supports Gemma4 and Qwen3-VL text decoders"
+        )
     if args.indexed_kv_cache and (args.eagle_base or args.mtp
                                   or args.dflash_base or args.dflash_draft):
         p.error("--indexed-kv-cache v1 supports vanilla decoding only")
