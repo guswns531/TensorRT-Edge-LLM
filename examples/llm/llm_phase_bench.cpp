@@ -26,9 +26,12 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
-#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
+#include "runtime/features/deepstackBinding.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/gemma4PhaseVisionAdapter.h"
+#include "runtime/scheduling/independentEngineExecutorPair.h"
+#include "runtime/scheduling/modelPhaseContract.h"
 #include "runtime/scheduling/phaseAsyncServer.h"
 #include "runtime/scheduling/phaseBatchState.h"
 #include "runtime/scheduling/phaseContextBatchAdapter.h"
@@ -38,6 +41,7 @@
 #include "runtime/scheduling/phaseGreedySampler.h"
 #include "runtime/scheduling/phaseKernelGroupRecorder.h"
 #include "runtime/scheduling/phaseThreeCoordinator.h"
+#include "runtime/scheduling/qwen3VLPhaseVisionAdapter.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "tokenizer/tokenizer.h"
@@ -51,6 +55,7 @@
 #include <getopt.h>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
@@ -158,9 +163,8 @@ std::vector<TraceRequestMetadata> readTraceMetadata(
     nlohmann::json const root = nlohmann::json::parse(input);
     auto const& requests = root.at("requests");
     ELLM_CHECK(requests.size() == requestCount, "Trace parser and arrival metadata request counts differ");
-    bool const hasExplicitOffsets = std::all_of(requests.begin(), requests.end(), [](nlohmann::json const& request) {
-        return request.contains("arrival_offset_us");
-    });
+    bool const hasExplicitOffsets = std::all_of(requests.begin(), requests.end(),
+        [](nlohmann::json const& request) { return request.contains("arrival_offset_us"); });
     std::vector<TraceRequestMetadata> result(requestCount);
     int64_t const defaultIntervalUs = static_cast<int64_t>(1000000.0 / defaultArrivalRate);
     for (size_t index = 0; index < requestCount; ++index)
@@ -216,10 +220,9 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
             : 0.0;
         output << sample.requestId << ',' << sample.scheduledArrivalUs << ',' << sample.submittedUs << ','
                << sample.admittedUs << ',' << sample.firstTokenUs << ',' << sample.completedUs << ','
-               << sample.submittedUs - sample.scheduledArrivalUs << ',' << sample.admittedUs - sample.submittedUs
-               << ',' << sample.promptTokens << ',' << sample.maxOutputTokens << ',' << outputTokens << ',' << ttftUs
-               << ',' << tpotUs << ','
-               << sample.completion.latencyMs << ',' << sample.imageCount << ','
+               << sample.submittedUs - sample.scheduledArrivalUs << ',' << sample.admittedUs - sample.submittedUs << ','
+               << sample.promptTokens << ',' << sample.maxOutputTokens << ',' << outputTokens << ',' << ttftUs << ','
+               << tpotUs << ',' << sample.completion.latencyMs << ',' << sample.imageCount << ','
                << static_cast<int>(sample.admissionStatus) << ',' << rt::finishReasonName(response.finishReasons[0])
                << ',' << csvQuote(response.outputTexts[0]) << '\n';
     }
@@ -306,8 +309,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"inputFile", required_argument, nullptr, kInputFile},
         {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
         {"traceCsv", required_argument, nullptr, kTraceCsv},
-        {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
-        {"help", no_argument, nullptr, kHelp}, {}};
+        {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate}, {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -367,10 +369,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         }
     }
     return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.slotCount >= 0
-        && args.inputLen > 0
-        && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen && args.pastKVLen >= 0
-        && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
-        && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
+        && args.inputLen > 0 && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen
+        && args.pastKVLen >= 0 && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0
+        && args.arrivalRate > 0.0 && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
         && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
         && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4
         && args.traceArrivalRate > 0.0 && (args.inputFile.empty() || !args.traceCsv.empty());
@@ -517,21 +518,37 @@ int main(int argc, char** argv)
     std::filesystem::path const engineDir{args.engineDir};
     rt::DeploymentConfig deployment = rt::createDeploymentConfig(engineDir / "config.json", std::nullopt, std::nullopt);
     rt::LLMEngineConfig const& config = deployment.base;
-    ELLM_CHECK(config.indexedKVCache, "llm_phase_bench requires an indexed_kv_cache engine");
+    rt::ModelPhaseContract const phaseContract = rt::makeModelPhaseContract(config);
     ELLM_CHECK(!deployment.draft.has_value(), "llm_phase_bench v1 supports vanilla inference only");
-    ELLM_CHECK(config.numDeepstackFeatures == 0, "llm_phase_bench v1 does not support deepstack inputs");
+    if (!phaseContract.supportsDynamicAdmission)
+    {
+        // A legacy fixed-linear cache has no stable-slot allocator. It is
+        // useful for Cosmos text smoke tests, but admission/eviction would
+        // require copying KV rows and is intentionally not enabled here.
+        ELLM_CHECK(args.loadRequests == 0 && args.inputFile.empty() && !args.contextAdapter,
+            "Non-indexed phase execution supports only the fixed microbenchmark path");
+    }
+    ELLM_CHECK(args.prefillBatch <= config.maxSupportedPrefillBatchSize,
+        "prefillBatch exceeds the engine prefill profile limit");
+    ELLM_CHECK(
+        args.decodeBatch <= config.maxSupportedDecodeBatchSize, "decodeBatch exceeds the engine decode profile limit");
     if (args.loadRequests == 0 && args.inputFile.empty())
     {
-        ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize,
+        // A shared TensorRT context serializes the two phases.  It is safe to
+        // reuse the same physical slots there, which lets the capacity sweep
+        // measure a phase at BS16 on a BS16 fixed-linear engine.  Independent
+        // overlap still requires disjoint slots and retains the strict sum
+        // check below.
+        bool const serializedSlotReuse = usesSharedTensorRTContext(args) && args.slotCount > 0;
+        ELLM_CHECK(args.prefillBatch + args.decodeBatch <= config.maxSupportedBatchSize || serializedSlotReuse,
             "Fixed microbenchmark prefill and decode slots exceed maxSupportedBatchSize");
     }
-    int32_t const phaseSlotCount
-        = args.slotCount > 0 ? args.slotCount : args.prefillBatch + args.decodeBatch;
-    ELLM_CHECK(phaseSlotCount <= config.maxSupportedBatchSize,
-        "Physical slot count exceeds maxSupportedBatchSize");
+    int32_t const phaseSlotCount = args.slotCount > 0 ? args.slotCount : args.prefillBatch + args.decodeBatch;
+    ELLM_CHECK(phaseSlotCount <= config.maxSupportedBatchSize, "Physical slot count exceeds maxSupportedBatchSize");
     ELLM_CHECK(phaseSlotCount >= std::max(args.prefillBatch, args.decodeBatch),
         "Physical slot count is smaller than a phase batch limit");
     rt::LLMEngineConfig resourceConfig = config;
+    resourceConfig.maxSupportedBatchSize = phaseSlotCount;
     ELLM_CHECK(args.inputLen <= config.maxSupportedInputLength, "inputLen exceeds maxSupportedInputLength");
     int32_t const loadPromptMin = args.loadPromptMin > 0 ? args.loadPromptMin : args.inputLen;
     int32_t const loadPromptMax = args.loadPromptMax > 0 ? args.loadPromptMax : args.inputLen;
@@ -539,8 +556,8 @@ int main(int argc, char** argv)
     {
         ELLM_CHECK(!args.loadCsv.empty(), "Continuous-load mode requires --loadCsv");
         ELLM_CHECK(loadPromptMin <= loadPromptMax, "Continuous-load prompt range is invalid");
-        ELLM_CHECK(loadPromptMax <= args.inputLen
-                || (args.prefillChunkSize > 0 && args.prefillChunkSize <= args.inputLen),
+        ELLM_CHECK(
+            loadPromptMax <= args.inputLen || (args.prefillChunkSize > 0 && args.prefillChunkSize <= args.inputLen),
             "Continuous-load prompt maximum requires chunking within the prefill buffer capacity");
         ELLM_CHECK(loadPromptMax + args.loadOutputMax <= config.maxKVCacheCapacity,
             "Continuous-load prompt plus output maximum exceeds KV capacity");
@@ -558,16 +575,27 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
 
     std::filesystem::path const enginePath = engineDir / "llm.engine";
-    auto prefillExecutor = rt::EngineExecutor::createForLLM(enginePath, config);
-    std::unique_ptr<rt::EngineExecutor> decodeExecutor;
-    rt::EngineExecutor* decodeRunner = prefillExecutor.get();
-    if (!usesSharedTensorRTContext(args))
+    std::unique_ptr<rt::EngineExecutor> sharedExecutor;
+    std::unique_ptr<rt::IndependentEngineExecutorPair> independentExecutors;
+    rt::EngineExecutor* prefillRunner{};
+    rt::EngineExecutor* decodeRunner{};
+    if (usesSharedTensorRTContext(args))
     {
-        decodeExecutor = prefillExecutor->createSibling();
-        decodeRunner = decodeExecutor.get();
+        sharedExecutor = rt::EngineExecutor::createForLLM(enginePath, config);
+        prefillRunner = sharedExecutor.get();
+        decodeRunner = prefillRunner;
+    }
+    else
+    {
+        auto executor = rt::EngineExecutor::createForLLM(enginePath, config);
+        rt::IndependentEngineExecutorPairConfig const pairConfig{
+            kPrefillProfile, kDecodeProfile, setupStream, prefillStream, decodeStream};
+        independentExecutors = rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
+        prefillRunner = &independentExecutors->prefillExecutor();
+        decodeRunner = &independentExecutors->decodeExecutor();
     }
     bool const sharedTensorRTContext
-        = prefillExecutor->getExecutionContextIdentity() == decodeRunner->getExecutionContextIdentity();
+        = prefillRunner->getExecutionContextIdentity() == decodeRunner->getExecutionContextIdentity();
     ELLM_CHECK(sharedTensorRTContext == usesSharedTensorRTContext(args),
         "TensorRT execution-context identity does not match --trtContextMode");
     CUcontext prefillCudaContext{};
@@ -577,11 +605,10 @@ int main(int argc, char** argv)
     ELLM_CHECK(prefillCudaContext != nullptr && prefillCudaContext == decodeCudaContext,
         "Phase streams must share one CUDA primary context");
     LOG_INFO("Phase execution topology: CUDA context=%p (shared), TensorRT prefill=%p, decode=%p (%s)",
-        static_cast<void*>(prefillCudaContext),
-        static_cast<void const*>(prefillExecutor->getExecutionContextIdentity()),
+        static_cast<void*>(prefillCudaContext), static_cast<void const*>(prefillRunner->getExecutionContextIdentity()),
         static_cast<void const*>(decodeRunner->getExecutionContextIdentity()),
         sharedTensorRTContext ? "shared_serialized" : "independent_concurrent");
-    rt::validateAgainstEngine(config, *prefillExecutor, "phase-prefill");
+    rt::validateAgainstEngine(config, *prefillRunner, "phase-prefill");
 
     std::unordered_map<std::string, std::string> const emptyLoraMap;
     auto resources = rt::SharedResources::createForLLM(resourceConfig, emptyLoraMap, setupStream);
@@ -592,8 +619,22 @@ int main(int argc, char** argv)
     rt::buildTensorMap(prefillMap, prefillIO, *resources, resourceConfig, 0);
     rt::buildTensorMap(decodeMap, decodeIO, *resources, resourceConfig, 0);
 
+    // Cosmos/Qwen-VL decoder layers always consume deepstack inputs. A
+    // text-only phase run binds the per-phase tensors and clears them, which
+    // is equivalent to the runtime's zero-feature path without relying on a
+    // one-token shared dummy buffer for a long prefill sequence.
+    std::unique_ptr<rt::DeepstackBinding> prefillDeepstack;
+    std::unique_ptr<rt::DeepstackBinding> decodeDeepstack;
+    if (phaseContract.hasDeepstack())
+    {
+        prefillDeepstack = std::make_unique<rt::DeepstackBinding>(prefillIO.deepstackEmbeds, resources->zeroBuffer);
+        decodeDeepstack = std::make_unique<rt::DeepstackBinding>(decodeIO.deepstackEmbeds, resources->zeroBuffer);
+        prefillDeepstack->useRealFeatures(prefillMap);
+        decodeDeepstack->useRealFeatures(decodeMap);
+    }
+
     resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream);
-    resources->externalWeightManager->validateAgainstEngine(*prefillExecutor, "phase-shared");
+    resources->externalWeightManager->validateAgainstEngine(*prefillRunner, "phase-shared");
     resources->externalWeightManager->registerTensorMapEntries(prefillMap);
     resources->externalWeightManager->registerAdditionalTensorMapEntries(decodeMap);
 
@@ -601,24 +642,27 @@ int main(int argc, char** argv)
     rt::EmbeddingPreprocessor prefillEmbedding(embedding, config);
     rt::EmbeddingPreprocessor decodeEmbedding(embedding, config);
 
-    int64_t const prefillContextBytes = prefillExecutor->getRequiredContextMemorySizeForProfile(kPrefillProfile);
+    int64_t const prefillContextBytes = prefillRunner->getRequiredContextMemorySizeForProfile(kPrefillProfile);
     int64_t const decodeContextBytes = decodeRunner->getRequiredContextMemorySizeForProfile(kDecodeProfile);
     LOG_INFO("Phase context workspaces: prefill=%.1f MiB decode=%.1f MiB all-profiles=%.1f MiB",
         static_cast<double>(prefillContextBytes) / (1024.0 * 1024.0),
         static_cast<double>(decodeContextBytes) / (1024.0 * 1024.0),
-        static_cast<double>(prefillExecutor->getRequiredContextMemorySize()) / (1024.0 * 1024.0));
-    rt::Tensor prefillContext(
-        {prefillContextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "phase_prefill_context_memory");
-    ELLM_CHECK(prefillExecutor->setContextMemoryForProfile(kPrefillProfile, prefillContext, setupStream),
-        "Failed to assign prefill profile context memory");
-    std::unique_ptr<rt::Tensor> decodeContext;
-    if (decodeExecutor)
+        static_cast<double>(prefillRunner->getRequiredContextMemorySize()) / (1024.0 * 1024.0));
+    std::unique_ptr<rt::Tensor> ownedPrefillContext;
+    rt::Tensor* prefillContext{};
+    rt::Tensor* decodeContext{};
+    if (independentExecutors)
     {
-        decodeContext = std::make_unique<rt::Tensor>(
-            rt::Coords{decodeContextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
-            "phase_decode_context_memory");
-        ELLM_CHECK(decodeExecutor->setContextMemoryForProfile(kDecodeProfile, *decodeContext, setupStream),
-            "Failed to assign decode profile context memory");
+        prefillContext = &independentExecutors->prefillContextMemory();
+        decodeContext = &independentExecutors->decodeContextMemory();
+    }
+    else
+    {
+        ownedPrefillContext = std::make_unique<rt::Tensor>(rt::Coords{prefillContextBytes}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kUINT8, "phase_prefill_context_memory");
+        ELLM_CHECK(prefillRunner->setContextMemoryForProfile(kPrefillProfile, *ownedPrefillContext, setupStream),
+            "Failed to assign prefill profile context memory");
+        prefillContext = ownedPrefillContext.get();
     }
 
     std::vector<int32_t> prefillSlots(args.prefillBatch);
@@ -637,8 +681,8 @@ int main(int argc, char** argv)
         decodeBatch.push_back({static_cast<uint64_t>(args.prefillBatch + row), args.pastKVLen, decodeSlots[row]});
     }
 
-    rt::PhaseBatchState prefillBatchState(args.prefillBatch, "phase_prefill");
-    rt::PhaseBatchState decodeBatchState(args.decodeBatch, "phase_decode");
+    rt::PhaseBatchState prefillBatchState(args.prefillBatch, "phase_prefill", phaseContract.indexedKVCache);
+    rt::PhaseBatchState decodeBatchState(args.decodeBatch, "phase_decode", phaseContract.indexedKVCache);
     prefillBatchState.bind(prefillMap);
     decodeBatchState.bind(decodeMap);
 
@@ -693,6 +737,15 @@ int main(int argc, char** argv)
             args.decodeBatch, cacheManager, decodeMap, "phase_decode_context_adapter");
     }
 
+    // The fixed-shape benchmark normally records only phase-level CUDA events.
+    // Keep a separate recorder for this path so Cosmos (which does not expose
+    // the indexed serving facade) can produce the same kernel-group cost data
+    // as the dynamic serving path without changing the untimed fast path.
+    rt::PhaseKernelGroupRecorder fixedKernelGroupRecorder;
+    size_t fixedKernelGroupDispatchIndex{};
+    rt::PhaseKernelDispatchMetadata fixedKernelDispatchMetadata;
+    bool const recordFixedKernelGroups = !args.kernelGroupCsv.empty();
+
     uploadInt32(prefillIO.contextLengths, std::vector<int32_t>(args.prefillBatch, args.inputLen), setupStream);
     uploadInt32(decodeIO.contextLengths, std::vector<int32_t>(args.decodeBatch, args.pastKVLen + 1), setupStream);
     uploadInt64(prefillIO.selectTokenIndices, std::vector<int64_t>(args.prefillBatch, args.inputLen - 1), setupStream);
@@ -715,24 +768,19 @@ int main(int argc, char** argv)
         int32_t const maxPleSeqLen = std::max(args.inputLen, 1);
         prefillGemma4Ple = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
             engineDir, config, args.prefillBatch, maxPleSeqLen, prefillMap, setupStream);
-        if (usesSharedTensorRTContext(args))
-        {
-            prefillGemma4Ple->bindOutputs(decodeMap);
-            decodeGemma4Ple = prefillGemma4Ple.get();
-        }
-        else
-        {
-            decodeGemma4PleOwner = prefillGemma4Ple->createSibling(args.decodeBatch, 1, decodeMap);
-            decodeGemma4Ple = decodeGemma4PleOwner.get();
-            ELLM_CHECK(prefillGemma4Ple->tableDataIdentity() == decodeGemma4Ple->tableDataIdentity(),
-                "Independent phase PLE preprocessors did not share the immutable table");
-            ELLM_CHECK(prefillGemma4Ple->outputDataIdentity() != decodeGemma4Ple->outputDataIdentity(),
-                "Independent phase PLE preprocessors aliased mutable outputs");
-        }
+        // PLE output buffers are mutable phase-local state. Keep a sibling for
+        // decode even when TensorRT itself is serialized; otherwise an
+        // asymmetric prefill/decode batch would exceed the prefill-sized view.
+        decodeGemma4PleOwner = prefillGemma4Ple->createSibling(args.decodeBatch, 1, decodeMap);
+        decodeGemma4Ple = decodeGemma4PleOwner.get();
+        ELLM_CHECK(prefillGemma4Ple->tableDataIdentity() == decodeGemma4Ple->tableDataIdentity(),
+            "Phase PLE preprocessors did not share the immutable table");
+        ELLM_CHECK(prefillGemma4Ple->outputDataIdentity() != decodeGemma4Ple->outputDataIdentity(),
+            "Phase PLE preprocessors aliased mutable outputs");
         rt::Tensor prefillPleTokenIds({args.prefillBatch, maxPleSeqLen}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "phase_prefill_ple_token_ids");
-        rt::Tensor decodePleTokenIds({args.decodeBatch, 1}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "phase_decode_ple_token_ids");
+        rt::Tensor decodePleTokenIds(
+            {args.decodeBatch, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_decode_ple_token_ids");
         CUDA_CHECK(
             cudaMemsetAsync(prefillPleTokenIds.rawPointer(), 0, prefillPleTokenIds.getMemoryCapacity(), setupStream));
         CUDA_CHECK(
@@ -744,57 +792,177 @@ int main(int argc, char** argv)
 
     auto enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
         ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.prefillBatch, "Unexpected prefill batch size");
-        prefillBatchState.prepare(batch, cacheManager, stream);
-        CUDA_CHECK(cudaMemsetAsync(
-            prefillIO.selectTokenIndices.rawPointer(), 0, prefillIO.selectTokenIndices.getMemoryCapacity(), stream));
+        if (!recordFixedKernelGroups)
+        {
+            prefillBatchState.prepare(batch, cacheManager, stream);
+            CUDA_CHECK(cudaMemsetAsync(prefillIO.selectTokenIndices.rawPointer(), 0,
+                prefillIO.selectTokenIndices.getMemoryCapacity(), stream));
+            for (int32_t chunkOffset = 0; chunkOffset < args.inputLen; chunkOffset += configuredChunkSize)
+            {
+                int32_t const chunkLength = std::min(configuredChunkSize, args.inputLen - chunkOffset);
+                check::check(prefillIO.inputsEmbeds.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                    "Prefill input reshape failed");
+                check::check(
+                    prefillIO.contextLengths.reshape({args.prefillBatch}), "Prefill context lengths reshape failed");
+                CUDA_CHECK(cudaMemsetAsync(
+                    prefillIO.contextLengths.rawPointer(), 0, prefillIO.contextLengths.getMemoryCapacity(), stream));
+                kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, stream);
+                if (prefillGemma4Ple)
+                {
+                    prefillGemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
+                }
+                for (rt::Tensor& deepstack : prefillIO.deepstackEmbeds)
+                {
+                    check::check(deepstack.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                        "Prefill deepstack reshape failed");
+                    CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), stream));
+                }
+                bool const initialChunk = chunkOffset == 0;
+                auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
+                if (!prefillRunner->prepare(kPrefillProfile, prefillDims, prefillMap, stream)
+                    || !prefillRunner->execute(stream))
+                {
+                    return false;
+                }
+                prefillBatchState.commit(cacheManager, chunkLength, stream);
+            }
+            return true;
+        }
+
+        std::vector<rt::PhaseKernelSegment> segments;
+        segments.reserve(static_cast<size_t>(args.inputLen / configuredChunkSize) * 3U + 3U);
+        bool prefillOk{true};
         for (int32_t chunkOffset = 0; chunkOffset < args.inputLen; chunkOffset += configuredChunkSize)
         {
             int32_t const chunkLength = std::min(configuredChunkSize, args.inputLen - chunkOffset);
-            check::check(prefillIO.inputsEmbeds.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
-                "Prefill input reshape failed");
-            check::check(
-                prefillIO.contextLengths.reshape({args.prefillBatch}), "Prefill context lengths reshape failed");
-            CUDA_CHECK(cudaMemsetAsync(
-                prefillIO.contextLengths.rawPointer(), 0, prefillIO.contextLengths.getMemoryCapacity(), stream));
-            kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, stream);
-            if (prefillGemma4Ple)
-            {
-                prefillGemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
-            }
             bool const initialChunk = chunkOffset == 0;
-            auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
-            if (!prefillExecutor->prepare(kPrefillProfile, prefillDims, prefillMap, stream)
-                || !prefillExecutor->execute(stream))
-            {
-                return false;
-            }
-            prefillBatchState.commit(cacheManager, chunkLength, stream);
+            segments.push_back({rt::PhaseKernelGroup::kPrefillPrepare, {}, stream,
+                [&, chunkLength, initialChunk](cudaStream_t segmentStream) {
+                    if (initialChunk)
+                    {
+                        prefillBatchState.prepare(batch, cacheManager, segmentStream);
+                        CUDA_CHECK(cudaMemsetAsync(prefillIO.selectTokenIndices.rawPointer(), 0,
+                            prefillIO.selectTokenIndices.getMemoryCapacity(), segmentStream));
+                    }
+                    check::check(prefillIO.inputsEmbeds.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                        "Prefill input reshape failed");
+                    check::check(prefillIO.contextLengths.reshape({args.prefillBatch}),
+                        "Prefill context lengths reshape failed");
+                    CUDA_CHECK(cudaMemsetAsync(prefillIO.contextLengths.rawPointer(), 0,
+                        prefillIO.contextLengths.getMemoryCapacity(), segmentStream));
+                    kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, segmentStream);
+                    if (prefillGemma4Ple)
+                    {
+                        prefillGemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
+                    }
+                    for (rt::Tensor& deepstack : prefillIO.deepstackEmbeds)
+                    {
+                        check::check(deepstack.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                            "Prefill deepstack reshape failed");
+                        CUDA_CHECK(
+                            cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), segmentStream));
+                    }
+                }});
+            segments.push_back({rt::PhaseKernelGroup::kPrefillEngine, {}, stream,
+                [&, chunkLength, initialChunk](cudaStream_t segmentStream) {
+                    auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
+                    if (!prefillRunner->prepare(kPrefillProfile, prefillDims, prefillMap, segmentStream)
+                        || !prefillRunner->execute(segmentStream))
+                    {
+                        prefillOk = false;
+                    }
+                }});
+            segments.push_back(
+                {rt::PhaseKernelGroup::kPrefillCacheCommit, {}, stream, [&, chunkLength](cudaStream_t segmentStream) {
+                     if (prefillOk)
+                     {
+                         prefillBatchState.commit(cacheManager, chunkLength, segmentStream);
+                     }
+                 }});
         }
-        return true;
+        fixedKernelGroupRecorder.execute(fixedKernelGroupDispatchIndex++, segments, fixedKernelDispatchMetadata);
+        fixedKernelGroupRecorder.poll();
+        return prefillOk;
     };
     auto executeDecode = [&](rt::PhaseBatchState& activeBatchState, int32_t rounds, cudaStream_t stream) {
         int32_t const batchSize = activeBatchState.lengths().getShape()[0];
-        check::check(decodeIO.contextLengths.reshape({batchSize}), "Decode context lengths reshape failed");
-        check::check(
-            decodeIO.outputLogits.reshape({batchSize, config.outputVocabSize}), "Decode logits reshape failed");
-        CUDA_CHECK(cudaMemcpyAsync(decodeIO.contextLengths.rawPointer(), activeBatchState.lengths().rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-        kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
-        if (decodeGemma4Ple)
+        if (!recordFixedKernelGroups)
         {
-            decodeGemma4Ple->reshapeOutputs(batchSize, 1);
+            check::check(decodeIO.contextLengths.reshape({batchSize}), "Decode context lengths reshape failed");
+            check::check(
+                decodeIO.outputLogits.reshape({batchSize, config.outputVocabSize}), "Decode logits reshape failed");
+            CUDA_CHECK(cudaMemcpyAsync(decodeIO.contextLengths.rawPointer(), activeBatchState.lengths().rawPointer(),
+                batchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
+            if (decodeGemma4Ple)
+            {
+                decodeGemma4Ple->reshapeOutputs(batchSize, 1);
+            }
+            for (rt::Tensor& deepstack : decodeIO.deepstackEmbeds)
+            {
+                check::check(deepstack.reshape({batchSize, 1, config.hiddenSize}), "Decode deepstack reshape failed");
+                CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), stream));
+            }
+            auto const decodeDims = config.decodeDims(batchSize);
+            for (int32_t round = 0; round < rounds; ++round)
+            {
+                if (!decodeRunner->prepare(kDecodeProfile, decodeDims, decodeMap, stream)
+                    || !decodeRunner->execute(stream))
+                {
+                    return false;
+                }
+                activeBatchState.commit(cacheManager, 1, stream);
+                kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
+            }
+            return true;
         }
+
+        std::vector<rt::PhaseKernelSegment> segments;
+        segments.reserve(static_cast<size_t>(rounds) * 3U + 1U);
+        bool decodeOk{true};
+        segments.push_back(
+            {rt::PhaseKernelGroup::kDecodePrepare, {}, stream, [&, batchSize](cudaStream_t segmentStream) {
+                 check::check(decodeIO.contextLengths.reshape({batchSize}), "Decode context lengths reshape failed");
+                 check::check(decodeIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
+                     "Decode logits reshape failed");
+                 CUDA_CHECK(
+                     cudaMemcpyAsync(decodeIO.contextLengths.rawPointer(), activeBatchState.lengths().rawPointer(),
+                         batchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, segmentStream));
+                 kernel::incrementLengthTensor(decodeIO.contextLengths, 1, segmentStream);
+                 if (decodeGemma4Ple)
+                 {
+                     decodeGemma4Ple->reshapeOutputs(batchSize, 1);
+                 }
+                 for (rt::Tensor& deepstack : decodeIO.deepstackEmbeds)
+                 {
+                     check::check(
+                         deepstack.reshape({batchSize, 1, config.hiddenSize}), "Decode deepstack reshape failed");
+                     CUDA_CHECK(
+                         cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), segmentStream));
+                 }
+             }});
         auto const decodeDims = config.decodeDims(batchSize);
         for (int32_t round = 0; round < rounds; ++round)
         {
-            if (!decodeRunner->prepare(kDecodeProfile, decodeDims, decodeMap, stream) || !decodeRunner->execute(stream))
-            {
-                return false;
-            }
-            activeBatchState.commit(cacheManager, 1, stream);
-            kernel::incrementLengthTensor(decodeIO.contextLengths, 1, stream);
+            segments.push_back(
+                {rt::PhaseKernelGroup::kDecodeEngine, {}, stream, [&, decodeDims](cudaStream_t segmentStream) {
+                     if (!decodeRunner->prepare(kDecodeProfile, decodeDims, decodeMap, segmentStream)
+                         || !decodeRunner->execute(segmentStream))
+                     {
+                         decodeOk = false;
+                     }
+                 }});
+            segments.push_back({rt::PhaseKernelGroup::kDecodeCacheCommit, {}, stream, [&](cudaStream_t segmentStream) {
+                                    if (decodeOk)
+                                    {
+                                        activeBatchState.commit(cacheManager, 1, segmentStream);
+                                        kernel::incrementLengthTensor(decodeIO.contextLengths, 1, segmentStream);
+                                    }
+                                }});
         }
-        return true;
+        fixedKernelGroupRecorder.execute(fixedKernelGroupDispatchIndex++, segments, fixedKernelDispatchMetadata);
+        fixedKernelGroupRecorder.poll();
+        return decodeOk;
     };
     float contextPackUs{};
     auto enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream, bool useContextAdapter) {
@@ -841,9 +1009,8 @@ int main(int argc, char** argv)
         ELLM_CHECK(parsed.first.empty(), "Real phase trace v1 does not support LoRA weights");
         traceRequests = std::move(parsed.second);
         ELLM_CHECK(!traceRequests.empty(), "Real phase trace contains no requests");
-        traceHasVision = std::any_of(traceRequests.begin(), traceRequests.end(), [](auto const& request) {
-            return !request.requests.front().imageBuffers.empty();
-        });
+        traceHasVision = std::any_of(traceRequests.begin(), traceRequests.end(),
+            [](auto const& request) { return !request.requests.front().imageBuffers.empty(); });
         ELLM_CHECK(!traceHasVision || !usesSharedTensorRTContext(args),
             "Real multimodal trace requires independent TensorRT contexts");
         ELLM_CHECK(!traceHasVision || !args.multimodalEngineDir.empty(),
@@ -852,7 +1019,8 @@ int main(int argc, char** argv)
         traceHasPriority = std::any_of(
             traceMetadata.begin(), traceMetadata.end(), [](auto const& metadata) { return metadata.priority > 0; });
     }
-    if (continuousLoad || realRequestTrace || args.prefillBatch == args.decodeBatch)
+    if (continuousLoad || realRequestTrace
+        || (args.prefillBatch == args.decodeBatch && phaseContract.supportsDynamicBatching()))
     {
         std::optional<rt::PhaseContinuousLoadGenerator> loadGenerator;
         std::vector<rt::PhaseLoadRequest> servingRequests;
@@ -913,7 +1081,9 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
         facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
-        facadeSchedulerConfig.maxPrefillChunkTokens = configuredChunkSize;
+        facadeSchedulerConfig.maxPrefillChunkTokens
+            = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
+        facadeSchedulerConfig.supportsChunkedPrefill = phaseContract.supportsChunkedPrefill;
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
         facadeSchedulerConfig.prefillQueueWaitTargetUs = args.ttftTargetMs * 1000.0;
         facadeSchedulerConfig.decodeQueueWaitTargetUs = args.tpotTargetMs * 1000.0;
@@ -945,51 +1115,63 @@ int main(int argc, char** argv)
                       return row.tokenOffset + row.tokenCount == row.promptTokenCount;
                   });
             std::vector<rt::PhaseKernelSegment> segments;
-            segments.push_back(
-                {rt::PhaseKernelGroup::kPrefillPrepare, {}, packed.stream(), [&](cudaStream_t stream) {
-                     check::check(prefillIO.inputsEmbeds.reshape({batchSize, chunkLength, config.hiddenSize}),
-                         "Serving prefill input reshape failed");
-                     check::check(prefillIO.contextLengths.reshape({batchSize}),
-                         "Serving prefill context lengths reshape failed");
-                     check::check(prefillIO.selectTokenIndices.reshape({batchSize, 1}),
-                         "Serving prefill select indices reshape failed");
-                     check::check(prefillIO.hostContextLengths.reshape({batchSize}),
-                         "Serving host prefill lengths reshape failed");
-                     check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
-                         "Serving host prefill indices reshape failed");
-                     std::fill_n(prefillIO.hostContextLengths.dataPointer<int32_t>(), batchSize, chunkLength);
-                     std::fill_n(prefillIO.hostSelectTokenIndices.dataPointer<int64_t>(), batchSize,
-                         static_cast<int64_t>(chunkLength - 1));
-                     CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(),
-                         prefillIO.hostContextLengths.rawPointer(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice,
-                         stream));
-                     CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
-                         prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t),
-                         cudaMemcpyHostToDevice, stream));
-                     prefillEmbedding.embed(
-                         packed.tokenIds(), packed.visualEmbeddings(), std::nullopt, prefillIO, stream);
-                     if (config.useVisionBidirectionalAttention)
-                     {
-                         check::check(prefillIO.visionBlockIds.reshape({batchSize, chunkLength}),
-                             "Serving prefill vision block IDs reshape failed");
-                         rt::Tensor hostVisionBlockIds
-                             = rt::generateVisionBlockIds(packed.hostTokenIds(), config.imageTokenId);
-                         CUDA_CHECK(cudaMemcpy(prefillIO.visionBlockIds.rawPointer(),
-                             hostVisionBlockIds.rawPointer(), batchSize * chunkLength * sizeof(int32_t),
-                             cudaMemcpyHostToDevice));
-                     }
-                     if (prefillGemma4Ple)
-                     {
-                         prefillGemma4Ple->reshapeOutputs(batchSize, chunkLength);
-                         prefillGemma4Ple->embed(packed.tokenIds(), stream);
-                     }
-                     check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
-                         "Serving prefill logits reshape failed");
-                 }});
+            segments.push_back({rt::PhaseKernelGroup::kPrefillPrepare, {}, packed.stream(),
+                [&](cudaStream_t stream) {
+                    check::check(prefillIO.inputsEmbeds.reshape({batchSize, chunkLength, config.hiddenSize}),
+                        "Serving prefill input reshape failed");
+                    check::check(prefillIO.contextLengths.reshape({batchSize}),
+                        "Serving prefill context lengths reshape failed");
+                    check::check(prefillIO.selectTokenIndices.reshape({batchSize, 1}),
+                        "Serving prefill select indices reshape failed");
+                    check::check(prefillIO.hostContextLengths.reshape({batchSize}),
+                        "Serving host prefill lengths reshape failed");
+                    check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
+                        "Serving host prefill indices reshape failed");
+                    std::fill_n(prefillIO.hostContextLengths.dataPointer<int32_t>(), batchSize, chunkLength);
+                    std::fill_n(prefillIO.hostSelectTokenIndices.dataPointer<int64_t>(), batchSize,
+                        static_cast<int64_t>(chunkLength - 1));
+                    CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(),
+                        prefillIO.hostContextLengths.rawPointer(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice,
+                        stream));
+                    CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
+                        prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t),
+                        cudaMemcpyHostToDevice, stream));
+                    prefillEmbedding.embed(
+                        packed.tokenIds(), packed.visualEmbeddings(), std::nullopt, prefillIO, stream);
+                    prefillEmbedding.prepareDeepstack(packed.tokenIds(), packed.deepstackFeatures(), prefillIO, stream);
+                    if (phaseContract.hasMRope && packed.mropeCosSin().has_value())
+                    {
+                        rt::OptionalInputTensor const mropeCosSin = packed.mropeCosSin();
+                        ELLM_CHECK(mropeCosSin.has_value(), "Packed M-RoPE cache disappeared before copy");
+                        rt::Tensor const& source = mropeCosSin->get();
+                        ELLM_CHECK(source.getDataType() == nvinfer1::DataType::kFLOAT,
+                            "Multimodal M-RoPE cache must use FLOAT");
+                        CUDA_CHECK(cudaMemsetAsync(
+                            prefillIO.mropeCosSin.rawPointer(), 0, prefillIO.mropeCosSin.getMemoryCapacity(), stream));
+                        CUDA_CHECK(cudaMemcpyAsync(prefillIO.mropeCosSin.rawPointer(), source.rawPointer(),
+                            source.getShape().volume() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                    }
+                    if (config.useVisionBidirectionalAttention)
+                    {
+                        check::check(prefillIO.visionBlockIds.reshape({batchSize, chunkLength}),
+                            "Serving prefill vision block IDs reshape failed");
+                        rt::Tensor hostVisionBlockIds
+                            = rt::generateVisionBlockIds(packed.hostTokenIds(), config.imageTokenId);
+                        CUDA_CHECK(cudaMemcpy(prefillIO.visionBlockIds.rawPointer(), hostVisionBlockIds.rawPointer(),
+                            batchSize * chunkLength * sizeof(int32_t), cudaMemcpyHostToDevice));
+                    }
+                    if (prefillGemma4Ple)
+                    {
+                        prefillGemma4Ple->reshapeOutputs(batchSize, chunkLength);
+                        prefillGemma4Ple->embed(packed.tokenIds(), stream);
+                    }
+                    check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
+                        "Serving prefill logits reshape failed");
+                }});
             segments.push_back({rt::PhaseKernelGroup::kPrefillEngine, {}, packed.stream(), [&](cudaStream_t stream) {
                                     auto const dims = config.prefillDims(batchSize, chunkLength, packed.initialChunk());
-                                    ELLM_CHECK(prefillExecutor->prepare(kPrefillProfile, dims, prefillMap, stream)
-                                            && prefillExecutor->execute(stream),
+                                    ELLM_CHECK(prefillRunner->prepare(kPrefillProfile, dims, prefillMap, stream)
+                                            && prefillRunner->execute(stream),
                                         "Serving facade packed prefill enqueue failed");
                                 }});
             segments.push_back({rt::PhaseKernelGroup::kPrefillCacheCommit, {}, packed.stream(),
@@ -1007,8 +1189,7 @@ int main(int argc, char** argv)
                 prefillSampler.completePrefill(packed);
                 if (continuousLoad || realRequestTrace)
                 {
-                    int64_t const completionUs
-                        = elapsedMicroseconds(continuousLoad ? loadStart : traceStart);
+                    int64_t const completionUs = elapsedMicroseconds(continuousLoad ? loadStart : traceStart);
                     for (rt::PhasePrefillContextRow const& row : packed.rows())
                     {
                         if (row.tokenOffset + row.tokenCount == row.promptTokenCount)
@@ -1043,15 +1224,29 @@ int main(int argc, char** argv)
         facadeCallbacks.enqueuePackedDecode = [&](rt::PhaseContextBatchAdapter& adapter) {
             rt::DecodingInferenceContext& packed = adapter.packedContext();
             ELLM_CHECK(packed.phaseBatchState != nullptr, "Serving facade decode has no phase batch state");
-            ELLM_CHECK(decodeGemma4Ple != nullptr, "Serving facade actual token decode requires Gemma 4 PLE");
             executeKernelSegments({
                 {rt::PhaseKernelGroup::kDecodePrepare, {}, packed.stream,
                     [&](cudaStream_t stream) {
                         check::check(decodeIO.inputsEmbeds.reshape({packed.activeBatchSize, 1, config.hiddenSize}),
                             "Serving decode input reshape failed");
                         decodeEmbedding.embed(adapter.tokenIds(), std::nullopt, std::nullopt, decodeIO, stream);
-                        decodeGemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
-                        decodeGemma4Ple->embed(adapter.tokenIds(), stream);
+                        if (decodeGemma4Ple)
+                        {
+                            decodeGemma4Ple->reshapeOutputs(packed.activeBatchSize, 1);
+                            decodeGemma4Ple->embed(adapter.tokenIds(), stream);
+                        }
+                        if (phaseContract.hasMRope && adapter.mropeCosSin().has_value())
+                        {
+                            rt::OptionalInputTensor const mropeCosSin = adapter.mropeCosSin();
+                            ELLM_CHECK(mropeCosSin.has_value(), "Packed M-RoPE cache disappeared before decode copy");
+                            rt::Tensor const& source = mropeCosSin->get();
+                            ELLM_CHECK(source.getDataType() == nvinfer1::DataType::kFLOAT,
+                                "Multimodal M-RoPE cache must use FLOAT");
+                            CUDA_CHECK(cudaMemsetAsync(decodeIO.mropeCosSin.rawPointer(), 0,
+                                decodeIO.mropeCosSin.getMemoryCapacity(), stream));
+                            CUDA_CHECK(cudaMemcpyAsync(decodeIO.mropeCosSin.rawPointer(), source.rawPointer(),
+                                source.getShape().volume() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                        }
                     }},
                 {rt::PhaseKernelGroup::kDecodeEngine, {}, packed.stream,
                     [&](cudaStream_t stream) {
@@ -1119,13 +1314,14 @@ int main(int argc, char** argv)
         auto const facadeMode = usesSharedTensorRTContext(args) ? rt::PhaseTensorRTContextMode::kSharedSerialized
                                                                 : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
         auto const facadeSafety = usesSharedTensorRTContext(args)
-            ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor->getExecutionContextIdentity())
+            ? rt::PhaseExecutionSafetyContract::shared(prefillRunner->getExecutionContextIdentity())
             : rt::PhaseExecutionSafetyContract::independent(
-                  {prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
-                  {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO});
+                  {prefillRunner->getExecutionContextIdentity(), prefillContext, &prefillIO},
+                  {decodeRunner->getExecutionContextIdentity(), decodeContext, &decodeIO});
         rt::PhaseContextServingFacade facade(phaseSlotCount, facadeSchedulerConfig, std::move(facadeCallbacks),
-            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap, configuredChunkSize,
-            continuousLoad ? servingRequests.size() : traceRequests.size(), facadeSafety);
+            cacheManager, decodeMap, prefillStream, decodeStream, facadeMode, &prefillMap,
+            facadeSchedulerConfig.maxPrefillChunkTokens, continuousLoad ? servingRequests.size() : traceRequests.size(),
+            facadeSafety);
         if (realRequestTrace)
         {
             tokenizer::Tokenizer tokenizer;
@@ -1172,8 +1368,7 @@ int main(int argc, char** argv)
                         scheduling.priority = metadata.priority;
                         scheduling.ttftTargetUs = args.ttftTargetMs * 1000.0;
                         scheduling.tpotTargetUs = args.tpotTargetMs * 1000.0;
-                        rt::PhaseAsyncSubmission const submission
-                            = server.submit(std::move(request), scheduling);
+                        rt::PhaseAsyncSubmission const submission = server.submit(std::move(request), scheduling);
                         TraceRequestSample& sample = traceSamples[nextSubmission];
                         sample.requestId = submission.requestId;
                         sample.scheduledArrivalUs = metadata.arrivalOffsetUs;
@@ -1186,8 +1381,7 @@ int main(int argc, char** argv)
                         sample.maxOutputTokens = maxOutputTokens;
                         sample.admissionStatus = submission.status;
                         traceIndices.emplace(submission.requestId, nextSubmission);
-                        std::optional<rt::PhaseRequestSnapshot> const snapshot
-                            = facade.request(submission.requestId);
+                        std::optional<rt::PhaseRequestSnapshot> const snapshot = facade.request(submission.requestId);
                         ELLM_CHECK(snapshot.has_value(), "Submitted trace request is missing from the facade");
                         sample.promptTokens = snapshot->promptTokenCount;
                         ++nextSubmission;
@@ -1216,7 +1410,7 @@ int main(int argc, char** argv)
             if (!traceHasVision)
             {
                 LOG_INFO("Text-only phase topology: CUDA=%p prefill=%p decode=%p",
-                    static_cast<void*>(prefillCudaContext), prefillExecutor->getExecutionContextIdentity(),
+                    static_cast<void*>(prefillCudaContext), prefillRunner->getExecutionContextIdentity(),
                     decodeRunner->getExecutionContextIdentity());
                 rt::PhaseAsyncServer server({traceRequests.size()}, facade, tokenizer, prefillStream);
                 runTrace(server);
@@ -1231,27 +1425,41 @@ int main(int argc, char** argv)
                     {
                         visionDir /= "visual";
                     }
-                    auto visionRunner = rt::MultimodalRunner::create(visionDir.string(), config.maxSupportedBatchSize,
-                        config.maxKVCacheCapacity, encoderStream);
+                    auto visionRunner = rt::MultimodalRunner::create(
+                        visionDir.string(), config.maxSupportedBatchSize, config.maxKVCacheCapacity, encoderStream);
                     int64_t const encoderContextBytes = visionRunner->getRequiredContextMemorySize();
-                    rt::Tensor encoderContext({encoderContextBytes}, rt::DeviceType::kGPU,
-                        nvinfer1::DataType::kUINT8, "phase_encoder_context_memory");
+                    rt::Tensor encoderContext({encoderContextBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+                        "phase_encoder_context_memory");
                     ELLM_CHECK(visionRunner->setContextMemory(encoderContext),
                         "Failed to assign independent encoder context memory");
-                    rt::Gemma4PhaseVisionAdapter visionAdapter(*visionRunner, tokenizer, &kernelGroupRecorder);
+                    std::unique_ptr<rt::PhaseVisionAdapter> visionAdapter;
+                    switch (visionRunner->getModelType())
+                    {
+                    case multimodal::ModelType::GEMMA4_VISION:
+                        visionAdapter = std::make_unique<rt::Gemma4PhaseVisionAdapter>(
+                            *visionRunner, tokenizer, &kernelGroupRecorder);
+                        break;
+                    case multimodal::ModelType::QWEN3_VL:
+                    case multimodal::ModelType::QWEN3_5:
+                        visionAdapter = std::make_unique<rt::Qwen3VLPhaseVisionAdapter>(
+                            *visionRunner, tokenizer, config, &kernelGroupRecorder);
+                        break;
+                    default: ELLM_CHECK(false, "No phase vision adapter is registered for this multimodal model");
+                    }
                     rt::PhaseEncoderExecutionSafetyContract encoderSafety{
                         {visionRunner->getExecutionContextIdentity(), &encoderContext, visionRunner.get()},
-                        {{prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
-                            {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO}}};
+                        {{prefillRunner->getExecutionContextIdentity(), prefillContext, &prefillIO},
+                            {decodeRunner->getExecutionContextIdentity(), decodeContext, &decodeIO}}};
                     rt::PhaseEncoderQueueConfig encoderQueueConfig;
                     encoderQueueConfig.maxBatchSize = 1;
                     encoderQueueConfig.maxQueuedRequests = traceRequests.size();
-                    rt::PhaseEncoderDispatchWorker encoderWorker(encoderQueueConfig, visionAdapter.makeCallbacks(),
+                    rt::PhaseEncoderDispatchWorker encoderWorker(
+                        encoderQueueConfig, visionAdapter->makeCallbacks(),
                         [&](rt::PhaseWorkItem const& item) { facade.beginPrefillAfterEncoder(item); }, encoderStream,
                         std::move(encoderSafety));
                     rt::PhaseOnlineCoordinator coordinator(encoderWorker, facade);
                     rt::PhaseAsyncServer server({traceRequests.size()}, coordinator, encoderWorker, facade, tokenizer,
-                        prefillStream, &visionAdapter);
+                        prefillStream, visionAdapter.get());
                     runTrace(server);
                     ELLM_CHECK(encoderWorker.empty(), "Real phase trace did not drain the encoder queue");
                 }
@@ -1391,9 +1599,9 @@ int main(int argc, char** argv)
                 "TTFT median/p95=%.3f/%.3f ms E2E median/p95=%.3f/%.3f ms",
                 traceSamples.size(), args.traceArrivalRate,
                 static_cast<double>(traceSamples.size()) * 1000000.0 / terminalUs,
-                static_cast<double>(generatedTokens) * 1000000.0 / terminalUs,
-                percentile(ttftUs, 0.5F) / 1000.0F, percentile(ttftUs, 0.95F) / 1000.0F,
-                percentile(e2eUs, 0.5F) / 1000.0F, percentile(e2eUs, 0.95F) / 1000.0F);
+                static_cast<double>(generatedTokens) * 1000000.0 / terminalUs, percentile(ttftUs, 0.5F) / 1000.0F,
+                percentile(ttftUs, 0.95F) / 1000.0F, percentile(e2eUs, 0.5F) / 1000.0F,
+                percentile(e2eUs, 0.95F) / 1000.0F);
         }
         else if (!args.outputCsv.empty())
         {
@@ -1440,8 +1648,16 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaEventCreate(&decodeEnd));
     CUDA_CHECK(cudaEventCreate(&stop));
 
+    size_t fixedSchedulerDispatchIndex{};
     auto runOnce = [&](bool concurrent) {
         cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
+        fixedKernelDispatchMetadata.schedulerDispatchIndex = fixedSchedulerDispatchIndex++;
+        fixedKernelDispatchMetadata.schedulerKind
+            = static_cast<int32_t>(concurrent ? rt::PhaseDispatchKind::kOverlap : rt::PhaseDispatchKind::kNone);
+        fixedKernelDispatchMetadata.prefillBatchSize = args.prefillBatch;
+        fixedKernelDispatchMetadata.decodeBatchSize = args.decodeBatch;
+        fixedKernelDispatchMetadata.prefillTokens = args.inputLen;
+        fixedKernelDispatchMetadata.decodeContextTokens = args.pastKVLen;
         CUDA_CHECK(cudaEventRecord(start, setupStream));
         if (concurrent)
         {
@@ -1481,10 +1697,10 @@ int main(int argc, char** argv)
                 ? rt::PhaseTensorRTContextMode::kSharedSerialized
                 : rt::PhaseTensorRTContextMode::kIndependentConcurrent;
             auto const safetyContract = usesSharedTensorRTContext(args)
-                ? rt::PhaseExecutionSafetyContract::shared(prefillExecutor->getExecutionContextIdentity())
+                ? rt::PhaseExecutionSafetyContract::shared(prefillRunner->getExecutionContextIdentity())
                 : rt::PhaseExecutionSafetyContract::independent(
-                      {prefillExecutor->getExecutionContextIdentity(), &prefillContext, &prefillIO},
-                      {decodeRunner->getExecutionContextIdentity(), decodeContext.get(), &decodeIO});
+                      {prefillRunner->getExecutionContextIdentity(), prefillContext, &prefillIO},
+                      {decodeRunner->getExecutionContextIdentity(), decodeContext, &decodeIO});
             rt::PhaseDispatchWorker worker(
                 scheduler, std::move(callbacks), prefillStream, decodeStream, executionMode, safetyContract);
             ELLM_CHECK(worker.dispatchNext(), "Phase worker failed to dispatch overlap plan");
@@ -1523,6 +1739,12 @@ int main(int argc, char** argv)
         return sample;
     };
 
+    // TensorRT lazily initializes tactics and auxiliary-stream state on the
+    // first enqueue. Prime both modes before collecting user-visible samples;
+    // otherwise the fixed loop order (sequential first, concurrent second)
+    // makes a zero-warmup run report a false multi-x speedup for concurrent mode.
+    static_cast<void>(runOnce(false));
+    static_cast<void>(runOnce(true));
     for (int32_t i = 0; i < args.warmup; ++i)
     {
         static_cast<void>(runOnce(false));
@@ -1554,6 +1776,12 @@ int main(int argc, char** argv)
             = usesSharedTensorRTContext(args) ? "shared_trt_serialized" : "independent_trt_concurrent";
         writeCsv(args.outputCsv, samples, csvMode);
         LOG_INFO("Raw CUDA-event samples written to %s", args.outputCsv.c_str());
+    }
+    if (recordFixedKernelGroups)
+    {
+        fixedKernelGroupRecorder.drain();
+        fixedKernelGroupRecorder.writeCsv(args.kernelGroupCsv);
+        LOG_INFO("Fixed-path kernel-group CUDA-event samples written to %s", args.kernelGroupCsv.c_str());
     }
 
     CUDA_CHECK(cudaEventDestroy(start));

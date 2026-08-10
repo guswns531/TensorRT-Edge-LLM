@@ -276,23 +276,27 @@ rt::Tensor& HybridCacheManager::getKVSlotIds()
 void HybridCacheManager::preparePhaseKVCacheLengths(
     rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, cudaStream_t stream) const
 {
-    check::check(mConfig.indexedKVCache, "Phase KV lengths require indexed KV cache mode.");
-    kernel::gatherIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, phaseLengths, stream);
+    // The same gather kernel also provides a fixed-row compatibility view for
+    // legacy (non-indexed) engines. In that mode the cache-length tensor is
+    // itself indexed by the caller-assigned physical row; no compaction or
+    // asynchronous admission is permitted by the phase benchmark.
+    rt::Tensor const& physicalLengths = mConfig.indexedKVCache ? mDeviceGlobalKVCacheLengths : mDeviceKVCacheLengths;
+    kernel::gatherIndexedLengthTensor(physicalLengths, phaseSlotIds, phaseLengths, stream);
 }
 
 void HybridCacheManager::commitPhaseSequenceLength(
     rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, int32_t increment, cudaStream_t stream)
 {
-    check::check(mConfig.indexedKVCache, "Phase KV length commit requires indexed KV cache mode.");
-    kernel::incrementIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, phaseLengths, increment, stream);
+    rt::Tensor& physicalLengths = mConfig.indexedKVCache ? mDeviceGlobalKVCacheLengths : mDeviceKVCacheLengths;
+    kernel::incrementIndexedLengthTensor(physicalLengths, phaseSlotIds, phaseLengths, increment, stream);
     mKVCacheAllEmpty = false;
 }
 
 void HybridCacheManager::commitPhaseSequenceLength(
     rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, rt::Tensor const& increments, cudaStream_t stream)
 {
-    check::check(mConfig.indexedKVCache, "Phase KV length commit requires indexed KV cache mode.");
-    kernel::incrementIndexedLengthTensor(mDeviceGlobalKVCacheLengths, phaseSlotIds, phaseLengths, increments, stream);
+    rt::Tensor& physicalLengths = mConfig.indexedKVCache ? mDeviceGlobalKVCacheLengths : mDeviceKVCacheLengths;
+    kernel::incrementIndexedLengthTensor(physicalLengths, phaseSlotIds, phaseLengths, increments, stream);
     mKVCacheAllEmpty = false;
 }
 

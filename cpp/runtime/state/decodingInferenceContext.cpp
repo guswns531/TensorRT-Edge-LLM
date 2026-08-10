@@ -68,6 +68,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
 
     visualEmbeddings = visual;
     deepstackFeatures = deepstack;
+    mropeCosSin = std::nullopt;
     generationRound = 0;
     maxGenerateLength = maxGenLength;
     activeBatchSize = batchSize;

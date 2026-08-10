@@ -252,7 +252,7 @@ PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
 
 int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept
 {
-    if (!item.allowChunkedPrefill || mConfig.maxPrefillChunkTokens == 0)
+    if (!item.allowChunkedPrefill || !mConfig.supportsChunkedPrefill || mConfig.maxPrefillChunkTokens == 0)
     {
         return item.tokenCount;
     }

@@ -327,6 +327,8 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(configJson.contains("builder_config"), "parseEngineConfig: missing required 'builder_config' section");
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedBatchSize = getRequired<int32_t>(bc, "max_batch_size");
+    cfg.maxSupportedPrefillBatchSize = bc.value("max_prefill_batch_size", cfg.maxSupportedBatchSize);
+    cfg.maxSupportedDecodeBatchSize = bc.value("max_decode_batch_size", cfg.maxSupportedBatchSize);
     cfg.maxSupportedInputLength = getRequired<int32_t>(bc, "max_input_len");
     cfg.maxKVCacheCapacity = getRequired<int32_t>(bc, "max_kv_cache_capacity");
 
@@ -339,6 +341,12 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     requirePositive(cfg.headDim, "head_dim");
     requirePositive(cfg.hiddenSize, "hidden_size");
     requirePositive(cfg.maxSupportedBatchSize, "max_batch_size");
+    requirePositive(cfg.maxSupportedPrefillBatchSize, "max_prefill_batch_size");
+    requirePositive(cfg.maxSupportedDecodeBatchSize, "max_decode_batch_size");
+    ELLM_CHECK(cfg.maxSupportedPrefillBatchSize <= cfg.maxSupportedBatchSize,
+        "parseEngineConfig: max_prefill_batch_size cannot exceed max_batch_size");
+    ELLM_CHECK(cfg.maxSupportedDecodeBatchSize <= cfg.maxSupportedBatchSize,
+        "parseEngineConfig: max_decode_batch_size cannot exceed max_batch_size");
     requirePositive(cfg.maxSupportedInputLength, "max_input_len");
     requirePositive(cfg.maxKVCacheCapacity, "max_kv_cache_capacity");
     ELLM_CHECK(cfg.maxSupportedInputLength <= cfg.maxKVCacheCapacity,
@@ -524,9 +532,8 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         ELLM_CHECK(
             cfg.specDecodeType == SpecDecodeMode::kNONE, "indexed_kv_cache v1 does not support speculative decoding.");
         ELLM_CHECK(cfg.numLinearAttnLayers == 0, "indexed_kv_cache v1 does not support recurrent/Mamba state.");
-        ELLM_CHECK(cfg.numKVHeads == 1, "indexed_kv_cache v1 paged-XQA view currently requires one KV head.");
         ELLM_CHECK(!cfg.useVisionBidirectionalAttention,
-            "indexed_kv_cache v1 supports text-only inference; multimodal attention is not supported.");
+            "indexed_kv_cache v1 does not support bidirectional vision-block attention in the decoder.");
     }
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     cfg.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
@@ -741,10 +748,12 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " outputVocabSize=" << cfg.outputVocabSize << " numDecoderLayers=" << cfg.numDecoderLayers
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
-       << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
-       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " maxPrefillBatch=" << cfg.maxSupportedPrefillBatchSize
+       << " maxDecodeBatch=" << cfg.maxSupportedDecodeBatchSize << " maxInputLen=" << cfg.maxSupportedInputLength
+       << " maxKVCapacity=" << cfg.maxKVCacheCapacity << " pleEnabled=" << cfg.pleEnabled
+       << " numPleInputs=" << cfg.numPleInputs << " pleHiddenSize=" << cfg.pleHiddenSize
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim

@@ -134,6 +134,10 @@ struct PhaseQueueSchedulerConfig
     //! Maximum tokens dispatched per request in one prefill turn. Zero keeps
     //! the legacy whole-prompt behavior.
     int32_t maxPrefillChunkTokens{};
+    //! Model contract gate. A model with atomic multimodal prefill can disable
+    //! chunking for every work item; per-request allowChunkedPrefill remains
+    //! the narrower override.
+    bool supportsChunkedPrefill{true};
     //! Adapt each text-prefill turn between minPrefillChunkTokens and
     //! maxPrefillChunkTokens using observed CUDA cost and overlap efficiency.
     //! Queue deadlines belong to phase selection so they cannot fragment an

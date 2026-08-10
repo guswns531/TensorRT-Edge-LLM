@@ -18,10 +18,9 @@
 #pragma once
 
 #include "multimodal/multimodalRunner.h"
-#include "runtime/scheduling/phaseEncoderDispatchWorker.h"
+#include "runtime/config/llmEngineConfig.h"
 #include "runtime/scheduling/phaseKernelGroupRecorder.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
-#include "runtime/state/decodingInferenceContext.h"
 
 #include <cstdint>
 #include <unordered_map>
@@ -32,24 +31,22 @@ namespace trt_edgellm
 namespace rt
 {
 
-//! Connects the real Gemma4 visual TensorRT runner to encoder phase dispatch.
+//! Qwen3-VL/Cosmos encoder adapter for phase execution.
 //!
-//! V1 accepts one logical sequence per encoder dispatch. The visual embedding
-//! is copied to request-owned GPU storage on the encoder stream before the
-//! worker records its completion event, so a later encoder batch cannot
-//! overwrite embeddings still consumed by prefill.
-class Gemma4PhaseVisionAdapter : public PhaseVisionAdapter
+//! Unlike the Gemma adapter, this owns request-scoped copies of the main
+//! visual embedding, every raw deepstack feature, and the M-RoPE cache until
+//! packed prefill has consumed them.
+class Qwen3VLPhaseVisionAdapter : public PhaseVisionAdapter
 {
 public:
-    ~Gemma4PhaseVisionAdapter() noexcept override = default;
-    Gemma4PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
-        PhaseKernelGroupRecorder* kernelGroupRecorder = nullptr);
+    Qwen3VLPhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
+        LLMEngineConfig const& config, PhaseKernelGroupRecorder* kernelGroupRecorder = nullptr);
+    ~Qwen3VLPhaseVisionAdapter() noexcept override = default;
 
     void registerRequest(
         uint64_t requestId, LLMGenerationRequest const& request, DecodingInferenceContext& context) override;
     void release(uint64_t requestId) override;
     bool hasRequest(uint64_t requestId) const noexcept override;
-
     PhaseEncoderDispatchWorkerCallbacks makeCallbacks() override;
 
 private:
@@ -59,14 +56,18 @@ private:
         DecodingInferenceContext* context{};
         std::vector<int32_t> tokenIds;
         Tensor visualEmbedding;
+        std::vector<Tensor> deepstackFeatures;
+        Tensor mropeCosSin;
     };
 
     void enqueue(std::vector<PhaseEncoderWorkItem> const& batch, cudaStream_t stream);
     PhaseWorkItem complete(PhaseEncoderWorkItem const& item);
     Registration& registration(uint64_t requestId);
+    static void copyTensor(Tensor const& source, Tensor& target, char const* name, cudaStream_t stream);
 
     MultimodalRunner& mRunner;
     tokenizer::Tokenizer const& mTokenizer;
+    LLMEngineConfig mConfig;
     PhaseKernelGroupRecorder* mKernelGroupRecorder{};
     size_t mKernelGroupDispatchIndex{};
     std::unordered_map<uint64_t, Registration> mRegistrations;

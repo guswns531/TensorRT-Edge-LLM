@@ -93,7 +93,7 @@ file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE ACTION_CPP_SRCS "action/*.cpp")
-file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
+file(GLOB_RECURSE RUNTIME_CPP_SRCS CONFIGURE_DEPENDS "runtime/*.cpp")
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
 
 # Enable relocatable device code for MoE Marlin kernels

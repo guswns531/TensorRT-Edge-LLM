@@ -169,21 +169,31 @@ public:
     //! @return Reference to the device tensor of shape [activeBatchSize].
     rt::Tensor& getKVCacheLengths() noexcept;
 
+    //! Whether this manager preserves physical slots across logical rows.
+    //! Non-indexed engines use their fixed batch rows as physical slots; the
+    //! phase microbenchmark can still address those rows explicitly, but
+    //! continuous admission/eviction requires indexed mode.
+    bool isIndexedKVCache() const noexcept
+    {
+        return mConfig.indexedKVCache;
+    }
+
     //! Physical-slot length store. Indexed mode only; shape remains [maxSlots].
     rt::Tensor& getGlobalKVCacheLengths();
 
     //! Device INT32 [activeBatchSize] logical-row to stable physical-slot mapping.
     rt::Tensor& getKVSlotIds();
 
-    //! Gather stable physical-slot lengths into an independently owned phase view.
+    //! Gather physical-slot lengths into an independently owned phase view.
+    //! Non-indexed managers use their fixed batch rows as physical slots.
     void preparePhaseKVCacheLengths(
         rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, cudaStream_t stream) const;
 
-    //! Commit a scalar phase increment to stable physical slots and refresh the phase view.
+    //! Commit a scalar phase increment to physical slots and refresh the phase view.
     void commitPhaseSequenceLength(
         rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, int32_t increment, cudaStream_t stream);
 
-    //! Commit per-row phase increments to stable physical slots and refresh the phase view.
+    //! Commit per-row phase increments to physical slots and refresh the phase view.
     void commitPhaseSequenceLength(
         rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, rt::Tensor const& increments, cudaStream_t stream);
 

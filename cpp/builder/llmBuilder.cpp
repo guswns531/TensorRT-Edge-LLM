@@ -579,27 +579,29 @@ bool LLMBuilder::setupCommonProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
 
     // Context lengths
     result &= setOptimizationProfile(&contextProfile, binding_names::kContextLengths, createDims({1}),
-        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        createDims({maxPrefillBatchSize}), createDims({maxPrefillBatchSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kContextLengths, createDims({1}),
-        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        createDims({maxDecodeBatchSize}), createDims({maxDecodeBatchSize}));
 
     if (mModelConfig.value("indexed_kv_cache", false))
     {
         result &= setOptimizationProfile(&contextProfile, binding_names::kKVSlotIds, createDims({1}),
-            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+            createDims({maxPrefillBatchSize}), createDims({maxPrefillBatchSize}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kKVSlotIds, createDims({1}),
-            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+            createDims({maxDecodeBatchSize}), createDims({maxDecodeBatchSize}));
     }
 
     // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
     // This can help distinguish the normal prefill and chunked prefill execution.
     result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),
-        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        createDims({maxPrefillBatchSize}), createDims({maxPrefillBatchSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
-        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        createDims({maxDecodeBatchSize}), createDims({maxDecodeBatchSize}));
 
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
@@ -621,15 +623,17 @@ bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfil
     nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     auto setRopeProfile = [&](char const* bindingName, int64_t rotaryDim) {
         result &= setOptimizationProfile(&contextProfile, bindingName,
             createDims({1, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
         result &= setOptimizationProfile(&generationProfile, bindingName,
             createDims({1, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
+            createDims({maxDecodeBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({maxDecodeBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
     };
 
     // RoPE rotary cos/sin inputs: single binding for single-RoPE engines, or
@@ -654,30 +658,31 @@ bool LLMBuilder::setupVanillaProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
 
     // Input embeddings - always dynamic
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+        createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+        createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
+        createDims({maxDecodeBatchSize, 1, mHiddenSize}), createDims({maxDecodeBatchSize, 1, mHiddenSize}));
 
     if (mModelConfig.value("use_vision_bidirectional_attention", false))
     {
         result &= setOptimizationProfile(&contextProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2)}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+            createDims({maxPrefillBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2)}),
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen}));
         // Decode ignores block IDs, but the static engine binding remains present.
         result &= setOptimizationProfile(&generationProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+            createDims({maxDecodeBatchSize, 1}), createDims({maxDecodeBatchSize, 1}));
     }
 
     // Last token IDs
     result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+        createDims({maxPrefillBatchSize, 1}), createDims({maxPrefillBatchSize, 1}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+        createDims({maxDecodeBatchSize, 1}), createDims({maxDecodeBatchSize, 1}));
 
     return result;
 }
@@ -887,6 +892,8 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
 {
     bool result = true;
     bool foundPleInput = false;
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     std::string_view const prefix = binding_names::kPleTokenEmbedsTemplate;
 
     for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
@@ -911,9 +918,8 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
 
         int64_t const pleHiddenSize = inputDims.d[2];
         result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
-            createDims(
-                {mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
+            createDims({maxPrefillBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
 
         if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
         {
@@ -926,8 +932,7 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         else
         {
             result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
-                createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}),
-                createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}));
+                createDims({maxDecodeBatchSize, 1, pleHiddenSize}), createDims({maxDecodeBatchSize, 1, pleHiddenSize}));
         }
     }
 
@@ -946,6 +951,8 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
     nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
 
     // Dynamically detect all deepstack_embeds inputs in the network
     std::vector<std::string> deepstackInputs;
@@ -974,22 +981,22 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
 
         // Same profile as inputs_embeds
         result &= setOptimizationProfile(&contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
 
         if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
         {
             int const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
             result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
-                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
-                createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
+                createDims({1, 1, mHiddenSize}), createDims({maxDecodeBatchSize, maxTokens / 2, mHiddenSize}),
+                createDims({maxDecodeBatchSize, maxTokens, mHiddenSize}));
         }
         else
         {
             result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
-                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
-                createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
+                createDims({1, 1, mHiddenSize}), createDims({maxDecodeBatchSize, 1, mHiddenSize}),
+                createDims({maxDecodeBatchSize, 1, mHiddenSize}));
         }
     }
 
@@ -1126,21 +1133,27 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
         int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
         int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
         nvinfer1::Dims minKVCacheShape = createDims({1, 2, layerNumKVHeads, 0, layerHeadSize});
-        nvinfer1::Dims optKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-        nvinfer1::Dims maxKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims optPrefillKVCacheShape
+            = createDims({maxPrefillBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims maxPrefillKVCacheShape
+            = createDims({maxPrefillBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims optDecodeKVCacheShape
+            = createDims({maxDecodeBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims maxDecodeKVCacheShape
+            = createDims({maxDecodeBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
 
         result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            minKVCacheShape, optPrefillKVCacheShape, maxPrefillKVCacheShape);
         result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            minKVCacheShape, optDecodeKVCacheShape, maxDecodeKVCacheShape);
     }
 
     return result;

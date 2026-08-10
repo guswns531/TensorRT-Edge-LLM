@@ -66,6 +66,10 @@ public:
     Tensor const& hostTokenIds() const noexcept;
     //! Visual embeddings for a single-request atomic multimodal prefill.
     OptionalInputTensor visualEmbeddings() const noexcept;
+    //! Raw deepstack features for a single-request atomic multimodal prefill.
+    OptionalInputTensors const& deepstackFeatures() const noexcept;
+    //! Request-owned M-RoPE cache for a single-request atomic multimodal prefill.
+    OptionalInputTensor mropeCosSin() const noexcept;
     PhaseBatchState& phaseBatchState() noexcept;
     std::vector<PhasePrefillContextRow> const& rows() const noexcept;
     std::vector<PhaseWorkItem> const& workItems() const noexcept;

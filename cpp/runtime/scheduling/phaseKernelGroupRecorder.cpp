@@ -42,6 +42,7 @@ char const* phaseKernelGroupName(PhaseKernelGroup group) noexcept
     case PhaseKernelGroup::kPrefillSample: result = "prefill_sample"; break;
     case PhaseKernelGroup::kDecodePrepare: result = "decode_prepare"; break;
     case PhaseKernelGroup::kDecodeEngine: result = "decode_engine"; break;
+    case PhaseKernelGroup::kDecodeCacheCommit: result = "decode_cache_commit"; break;
     case PhaseKernelGroup::kDecodeSample: result = "decode_sample"; break;
     }
     return result;
@@ -56,8 +57,8 @@ PhaseKernelGroupRecorder::~PhaseKernelGroupRecorder() noexcept
     }
 }
 
-void PhaseKernelGroupRecorder::execute(size_t dispatchIndex, std::vector<PhaseKernelSegment> const& segments,
-    PhaseKernelDispatchMetadata dispatch)
+void PhaseKernelGroupRecorder::execute(
+    size_t dispatchIndex, std::vector<PhaseKernelSegment> const& segments, PhaseKernelDispatchMetadata dispatch)
 {
     check::check(!segments.empty(), "Kernel-group execution requires at least one segment.");
     cudaEvent_t previous{};
@@ -147,8 +148,8 @@ void PhaseKernelGroupRecorder::writeCsv(std::filesystem::path const& path) const
         output << sample.dispatchIndex << ',' << sample.segmentIndex << ',' << sample.dispatch.schedulerDispatchIndex
                << ',' << sample.dispatch.schedulerKind << ',' << sample.dispatch.prefillBatchSize << ','
                << sample.dispatch.decodeBatchSize << ',' << sample.dispatch.prefillTokens << ','
-               << sample.dispatch.decodeContextTokens << ',' << phaseKernelGroupName(sample.group) << ','
-               << sample.name << ',' << sample.gpuMs << '\n';
+               << sample.dispatch.decodeContextTokens << ',' << phaseKernelGroupName(sample.group) << ',' << sample.name
+               << ',' << sample.gpuMs << '\n';
     }
 }
 

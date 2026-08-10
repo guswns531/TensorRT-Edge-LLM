@@ -18,8 +18,8 @@
 #pragma once
 
 #include "runtime/llmRuntimeUtils.h"
-#include "runtime/scheduling/gemma4PhaseVisionAdapter.h"
 #include "runtime/scheduling/phaseThreeCoordinator.h"
+#include "runtime/scheduling/phaseVisionAdapter.h"
 #include "runtime/streaming.h"
 
 #include <chrono>
@@ -70,8 +70,7 @@ public:
     //! Construct an encoder + prefill + decode server for multimodal requests.
     PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseOnlineCoordinator& coordinator,
         PhaseEncoderDispatchWorker& encoderWorker, PhaseContextServingFacade& servingFacade,
-        tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream,
-        Gemma4PhaseVisionAdapter* visionAdapter = nullptr);
+        tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream, PhaseVisionAdapter* visionAdapter = nullptr);
     ~PhaseAsyncServer() noexcept;
 
     PhaseAsyncServer(PhaseAsyncServer const&) = delete;
@@ -118,7 +117,7 @@ private:
     PhaseContextServingFacade& mServingFacade;
     tokenizer::Tokenizer const& mTokenizer;
     cudaStream_t mRequestStream{};
-    Gemma4PhaseVisionAdapter* mVisionAdapter{};
+    PhaseVisionAdapter* mVisionAdapter{};
     uint64_t mNextRequestId{1};
     size_t mTerminalObserverId{};
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> mRequests;

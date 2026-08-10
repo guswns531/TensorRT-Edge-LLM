@@ -90,6 +90,7 @@ struct DecodingInferenceContext
     rt::OptionalInputTensor visualEmbeddings;                  //!< Optional visual embeddings
     rt::OptionalInputTensor audioEmbeddings;                   //!< Optional audio embeddings
     rt::OptionalInputTensors deepstackFeatures;                //!< Optional Deepstack features
+    rt::OptionalInputTensor mropeCosSin;                       //!< Optional request-owned M-RoPE cache
     int32_t generationRound{};                                 //!< Current generation round
     int32_t maxGenerateLength{};                               //!< Maximum generation length
     int32_t activeBatchSize{};                                 //!< Current active batch size

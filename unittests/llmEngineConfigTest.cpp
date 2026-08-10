@@ -117,6 +117,8 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.outputVocabSize, 32000);
     EXPECT_EQ(cfg.reducedVocabSize, 0);
     EXPECT_EQ(cfg.maxSupportedBatchSize, 2);
+    EXPECT_EQ(cfg.maxSupportedPrefillBatchSize, 2);
+    EXPECT_EQ(cfg.maxSupportedDecodeBatchSize, 2);
     EXPECT_EQ(cfg.maxSupportedInputLength, 128);
     EXPECT_EQ(cfg.maxKVCacheCapacity, 256);
     EXPECT_EQ(cfg.maxSupportedLoraRank, 0);
@@ -124,6 +126,32 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
+}
+
+TEST_F(LLMEngineConfigTest, ParseAsymmetricPhaseBatchLimits)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_batch_size"] = 32;
+    json["builder_config"]["max_prefill_batch_size"] = 8;
+    json["builder_config"]["max_decode_batch_size"] = 32;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path);
+    EXPECT_EQ(cfg.maxSupportedBatchSize, 32);
+    EXPECT_EQ(cfg.maxSupportedPrefillBatchSize, 8);
+    EXPECT_EQ(cfg.maxSupportedDecodeBatchSize, 32);
+}
+
+TEST_F(LLMEngineConfigTest, ParseIndexedKVCacheWithGroupedQueryAttention)
+{
+    Json json = makeMinimalConfig();
+    json["indexed_kv_cache"] = true;
+    json["num_key_value_heads"] = 8;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path);
+    EXPECT_TRUE(cfg.indexedKVCache);
+    EXPECT_EQ(cfg.numKVHeads, 8);
 }
 
 TEST_F(LLMEngineConfigTest, ReducedVocabSize)

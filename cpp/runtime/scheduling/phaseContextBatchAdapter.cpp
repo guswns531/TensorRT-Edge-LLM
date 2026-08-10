@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <algorithm>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -37,10 +38,9 @@ PhaseContextBatchAdapter::PhaseContextBatchAdapter(
     , mTensorMap(tensorMap)
     , mHostTokenIds({maxBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_token_ids")
     , mDeviceTokenIds({maxBatchSize, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_token_ids")
-    , mBatchState(maxBatchSize, name)
+    , mBatchState(maxBatchSize, name, cacheManager.isIndexedKVCache())
 {
     check::check(mMaxBatchSize > 0, "Phase context adapter max batch size must be positive.");
-    static_cast<void>(mCacheManager.getGlobalKVCacheLengths());
 }
 
 PhaseContextBatchAdapter::~PhaseContextBatchAdapter() noexcept
@@ -70,8 +70,10 @@ void PhaseContextBatchAdapter::validateSourceRow(PhaseContextRow const& row) con
 
     check::check(!row.context->finishedStates[sourceRow], "Finished source rows cannot be packed for decode.");
     check::check(!row.context->tokenIds[sourceRow].empty(), "Decode source row has no input token.");
-    check::check(!row.context->audioEmbeddings.has_value() && row.context->deepstackFeatures.empty(),
-        "Phase context adapter v1 does not support audio or deepstack decode.");
+    check::check(!row.context->audioEmbeddings.has_value(), "Phase context adapter v1 does not support audio decode.");
+    bool const hasMRope = row.context->mropeCosSin.has_value();
+    check::check(!hasMRope || row.context->activeBatchSize == 1,
+        "Phase context adapter M-RoPE requests must have one source sequence.");
     check::check(row.context->loraWeightsName.empty(), "Phase context adapter v1 does not support LoRA.");
     check::check(row.context->numLogprobs == 0, "Phase context adapter v1 does not support logprobs.");
     check::check(!row.context->hasLogitBias && row.context->logitBiasPerSlot[sourceRow].empty(),
@@ -107,6 +109,13 @@ void PhaseContextBatchAdapter::packDecode(std::vector<PhaseContextRow> const& ro
     }
 
     DecodingInferenceContext const& first = *rows.front().context;
+    bool const hasMRope = first.mropeCosSin.has_value();
+    check::check(
+        !hasMRope || rows.size() == 1, "Phase context adapter v1 supports one M-RoPE request per decode batch.");
+    check::check(
+        std::all_of(rows.begin(), rows.end(),
+            [hasMRope](PhaseContextRow const& row) { return row.context->mropeCosSin.has_value() == hasMRope; }),
+        "Phase context decode batch cannot mix M-RoPE and standard-RoPE rows.");
     int32_t packedMaxGenerateLength{};
     for (PhaseContextRow const& row : rows)
     {
@@ -210,6 +219,15 @@ DecodingInferenceContext& PhaseContextBatchAdapter::packedContext()
 Tensor& PhaseContextBatchAdapter::tokenIds() noexcept
 {
     return mDeviceTokenIds;
+}
+
+OptionalInputTensor PhaseContextBatchAdapter::mropeCosSin() const noexcept
+{
+    if (!mPacked || mRows.empty())
+    {
+        return std::nullopt;
+    }
+    return mRows.front().context->mropeCosSin;
 }
 
 std::vector<PhaseContextRow> const& PhaseContextBatchAdapter::rows() const noexcept

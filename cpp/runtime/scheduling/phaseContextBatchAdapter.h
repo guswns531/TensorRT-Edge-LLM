@@ -64,6 +64,8 @@ public:
     DecodingInferenceContext& packedContext();
     //! Device INT32 [batch] containing each source row's current decode token.
     Tensor& tokenIds() noexcept;
+    //! Request-owned M-RoPE cache for a packed multimodal decode batch.
+    OptionalInputTensor mropeCosSin() const noexcept;
     //! Source rows corresponding to packed row order.
     std::vector<PhaseContextRow> const& rows() const noexcept;
     std::vector<PhaseWorkItem> const& workItems() const noexcept;

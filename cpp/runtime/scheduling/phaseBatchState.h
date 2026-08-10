@@ -31,15 +31,17 @@ namespace trt_edgellm
 namespace rt
 {
 
-//! Stable phase-local bindings for indexed KV cache execution.
+//! Stable phase-local bindings for indexed and fixed-row KV cache execution.
 //!
 //! Each TensorRT execution context owns one instance. The device tensors stay
 //! at stable addresses after bind() while prepare() reshapes and fills the
-//! active prefix for each dispatched batch.
+//! active prefix for each dispatched batch. Legacy non-indexed engines use
+//! explicit fixed rows but do not support admission/eviction through this
+//! state object.
 class PhaseBatchState
 {
 public:
-    PhaseBatchState(int32_t maxBatchSize, std::string const& name);
+    PhaseBatchState(int32_t maxBatchSize, std::string const& name, bool indexedKVCache = true);
 
     PhaseBatchState(PhaseBatchState const&) = delete;
     PhaseBatchState& operator=(PhaseBatchState const&) = delete;
@@ -68,6 +70,7 @@ private:
     Tensor mHostSlotIds;
     Tensor mDeviceSlotIds;
     Tensor mDeviceLengths;
+    bool mIndexedKVCache{true};
 };
 
 } // namespace rt

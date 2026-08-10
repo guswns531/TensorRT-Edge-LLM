@@ -62,18 +62,20 @@ struct Gemma4MTPKVSharingEntry
 struct LLMEngineConfig
 {
     // --- Core model dimensions ---
-    int32_t hiddenSize{};              //!< Model hidden dimension
-    int32_t outputVocabSize{};         //!< Actual output vocab (reduced if vocab reduction active)
-    int32_t numAttentionLayers{};      //!< Number of attention layers needing KV cache
-    int32_t numKVHeads{};              //!< Number of key-value heads
-    int32_t headDim{};                 //!< Dimension of each attention head
-    int32_t maxSupportedBatchSize{};   //!< Maximum supported batch size
-    int32_t maxSupportedInputLength{}; //!< Maximum supported input length
-    int32_t maxKVCacheCapacity{};      //!< Maximum KV cache capacity (sequence length)
-    int32_t rotaryDim{};               //!< Rotary embedding dimension
-    int32_t numDecoderLayers{};        //!< Total decoder layers (attention + linear)
-    int32_t vocabSize{};               //!< Full vocabulary size
-    int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
+    int32_t hiddenSize{};                   //!< Model hidden dimension
+    int32_t outputVocabSize{};              //!< Actual output vocab (reduced if vocab reduction active)
+    int32_t numAttentionLayers{};           //!< Number of attention layers needing KV cache
+    int32_t numKVHeads{};                   //!< Number of key-value heads
+    int32_t headDim{};                      //!< Dimension of each attention head
+    int32_t maxSupportedBatchSize{};        //!< Maximum supported batch size
+    int32_t maxSupportedPrefillBatchSize{}; //!< Maximum batch accepted by the prefill profile
+    int32_t maxSupportedDecodeBatchSize{};  //!< Maximum batch accepted by the decode profile
+    int32_t maxSupportedInputLength{};      //!< Maximum supported input length
+    int32_t maxKVCacheCapacity{};           //!< Maximum KV cache capacity (sequence length)
+    int32_t rotaryDim{};                    //!< Rotary embedding dimension
+    int32_t numDecoderLayers{};             //!< Total decoder layers (attention + linear)
+    int32_t vocabSize{};                    //!< Full vocabulary size
+    int32_t reducedVocabSize{0};            //!< 0 = no vocab reduction
 
     // --- Feature flags ---
     bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings

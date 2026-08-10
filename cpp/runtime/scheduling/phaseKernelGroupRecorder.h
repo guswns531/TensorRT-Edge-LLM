@@ -40,6 +40,7 @@ enum class PhaseKernelGroup
     kPrefillSample,
     kDecodePrepare,
     kDecodeEngine,
+    kDecodeCacheCommit,
     kDecodeSample,
 };
 

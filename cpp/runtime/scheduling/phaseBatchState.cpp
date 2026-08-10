@@ -39,17 +39,21 @@ namespace trt_edgellm
 namespace rt
 {
 
-PhaseBatchState::PhaseBatchState(int32_t maxBatchSize, std::string const& name)
+PhaseBatchState::PhaseBatchState(int32_t maxBatchSize, std::string const& name, bool indexedKVCache)
     : mMaxBatchSize(validateMaxBatchSize(maxBatchSize))
     , mHostSlotIds({mMaxBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_slot_ids")
     , mDeviceSlotIds({mMaxBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_slot_ids")
     , mDeviceLengths({mMaxBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_lengths")
+    , mIndexedKVCache(indexedKVCache)
 {
 }
 
 void PhaseBatchState::bind(TensorMap& tensorMap)
 {
-    tensorMap.set(binding_names::kKVSlotIds, mDeviceSlotIds);
+    if (mIndexedKVCache)
+    {
+        tensorMap.set(binding_names::kKVSlotIds, mDeviceSlotIds);
+    }
     tensorMap.set(binding_names::kKVCacheStartIndex, mDeviceLengths);
 }
 
@@ -57,6 +61,8 @@ void PhaseBatchState::prepare(
     std::vector<PhaseWorkItem> const& batch, HybridCacheManager& cacheManager, cudaStream_t stream)
 {
     check::check(!batch.empty(), "PhaseBatchState cannot prepare an empty batch.");
+    check::check(mIndexedKVCache == cacheManager.isIndexedKVCache(),
+        "PhaseBatchState cache mode does not match the cache manager.");
     check::check(
         static_cast<int32_t>(batch.size()) <= mMaxBatchSize, "PhaseBatchState batch exceeds its configured maximum.");
     mBatchSize = static_cast<int32_t>(batch.size());
@@ -65,7 +71,9 @@ void PhaseBatchState::prepare(
     check::check(mDeviceLengths.reshape({mBatchSize}), "Device phase lengths reshape failed.");
 
     int32_t* hostSlotIds = mHostSlotIds.dataPointer<int32_t>();
-    int32_t const maxSlots = static_cast<int32_t>(cacheManager.getGlobalKVCacheLengths().getShape()[0]);
+    rt::Tensor const& physicalLengths
+        = mIndexedKVCache ? cacheManager.getGlobalKVCacheLengths() : cacheManager.getKVCacheLengths();
+    int32_t const maxSlots = static_cast<int32_t>(physicalLengths.getShape()[0]);
     std::unordered_set<int32_t> uniqueSlots;
     for (int32_t row = 0; row < mBatchSize; ++row)
     {

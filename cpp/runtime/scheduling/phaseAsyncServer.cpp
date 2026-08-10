@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "sampler/sampling.h"
+#include "tokenizer/tokenizer.h"
 
 #include <algorithm>
 #include <limits>
@@ -49,7 +50,7 @@ PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseContextSe
 
 PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseOnlineCoordinator& coordinator,
     PhaseEncoderDispatchWorker& encoderWorker, PhaseContextServingFacade& servingFacade,
-    tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream, Gemma4PhaseVisionAdapter* visionAdapter)
+    tokenizer::Tokenizer const& tokenizer, cudaStream_t requestStream, PhaseVisionAdapter* visionAdapter)
     : mConfig(config)
     , mCoordinator(&coordinator)
     , mEncoderWorker(&encoderWorker)
@@ -116,8 +117,7 @@ PhaseAsyncServer::~PhaseAsyncServer() noexcept
 void PhaseAsyncServer::validateRequest(LLMGenerationRequest const& request) const
 {
     check::check(request.requests.size() == 1, "Async phase server accepts one logical request per submission.");
-    check::check(request.maxGenerateLength > 0
-            && request.maxGenerateLength <= std::numeric_limits<int32_t>::max(),
+    check::check(request.maxGenerateLength > 0 && request.maxGenerateLength <= std::numeric_limits<int32_t>::max(),
         "Async phase request maxGenerateLength is invalid.");
     check::check(request.loraWeightsName.empty(), "Async phase server v1 does not support LoRA.");
     check::check(!request.saveSystemPromptKVCache, "Async phase server v1 does not support system-prompt caching.");
@@ -129,10 +129,8 @@ void PhaseAsyncServer::validateRequest(LLMGenerationRequest const& request) cons
         "Async phase server owns completion delivery and does not accept legacy streaming callbacks.");
     check::check(!request.generateAudio && request.requests.front().audioBuffers.empty(),
         "Async phase server v1 does not support audio.");
-    check::check(request.requests.front().stopStrings.empty(),
-        "Async phase server v1 does not support stop strings.");
-    check::check(request.requests.front().logitBias.empty(),
-        "Async phase server v1 does not support logit bias.");
+    check::check(request.requests.front().stopStrings.empty(), "Async phase server v1 does not support stop strings.");
+    check::check(request.requests.front().logitBias.empty(), "Async phase server v1 does not support logit bias.");
     check::check(!request.requests.front().pastTrajectory.has_value(),
         "Async phase server v1 does not support trajectory inputs.");
 }
@@ -145,8 +143,8 @@ void PhaseAsyncServer::prepareRequest(RequestState& state)
                      request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
         "Failed to apply the chat template for an async phase request.");
 
-    state.context.initialize(1, static_cast<int32_t>(request.maxGenerateLength), std::nullopt,
-        OptionalInputTensors{}, request.loraWeightsName, mRequestStream);
+    state.context.initialize(1, static_cast<int32_t>(request.maxGenerateLength), std::nullopt, OptionalInputTensors{},
+        request.loraWeightsName, mRequestStream);
     state.context.temperature = request.temperature;
     state.context.topP = request.topP;
     state.context.topK = request.topK;

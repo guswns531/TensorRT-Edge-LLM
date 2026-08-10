@@ -43,7 +43,9 @@ enum LLMBuildOptionId : int
     SPEC_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
     MAX_DRAFT_TREE_SIZE = 712,
-    PROFILING_DETAILED = 713
+    PROFILING_DETAILED = 713,
+    MAX_PREFILL_BATCH_SIZE = 714,
+    MAX_DECODE_BATCH_SIZE = 715
 };
 
 struct LLMBuildArgs
@@ -55,6 +57,8 @@ struct LLMBuildArgs
     int64_t maxKVCacheCapacity{4096};
     bool debug{false};
     int64_t maxBatchSize{4};
+    int64_t maxPrefillBatchSize{};
+    int64_t maxDecodeBatchSize{};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
     bool specDraft{false};
     bool specBase{false};
@@ -67,7 +71,8 @@ void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
-                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
+                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--maxPrefillBatchSize <int>] "
+                 "[--maxDecodeBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  "[--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed]"
               << std::endl;
@@ -82,6 +87,8 @@ void printUsage(char const* programName)
                  "Default = 4096"
               << std::endl;
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
+    std::cerr << "  --maxPrefillBatchSize     Maximum prefill profile batch size. Default = maxBatchSize" << std::endl;
+    std::cerr << "  --maxDecodeBatchSize      Maximum decode profile batch size. Default = maxBatchSize" << std::endl;
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
               << std::endl;
@@ -107,6 +114,8 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"maxKVCacheCapacity", required_argument, 0, LLMBuildOptionId::MAX_KV_CACHE_CAPACITY},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
+        {"maxPrefillBatchSize", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE},
+        {"maxDecodeBatchSize", required_argument, 0, LLMBuildOptionId::MAX_DECODE_BATCH_SIZE},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
         {"specDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT},
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT}, // deprecated alias
@@ -163,6 +172,18 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxBatchSize = std::stoi(optarg);
             }
             break;
+        case LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxPrefillBatchSize = std::stoi(optarg);
+            }
+            break;
+        case LLMBuildOptionId::MAX_DECODE_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxDecodeBatchSize = std::stoi(optarg);
+            }
+            break;
         case LLMBuildOptionId::MAX_LORA_RANK:
             if (optarg)
             {
@@ -204,6 +225,19 @@ int main(int argc, char** argv)
         printUsage(argv[0]);
         return EXIT_SUCCESS;
     }
+    int64_t const maxPrefillBatchSize = args.maxPrefillBatchSize > 0 ? args.maxPrefillBatchSize : args.maxBatchSize;
+    int64_t const maxDecodeBatchSize = args.maxDecodeBatchSize > 0 ? args.maxDecodeBatchSize : args.maxBatchSize;
+    if (args.maxBatchSize <= 0 || maxPrefillBatchSize <= 0 || maxDecodeBatchSize <= 0
+        || maxPrefillBatchSize > args.maxBatchSize || maxDecodeBatchSize > args.maxBatchSize)
+    {
+        LOG_ERROR("Phase batch limits must be positive and no greater than --maxBatchSize.");
+        return EXIT_FAILURE;
+    }
+    if ((args.specBase || args.specDraft) && (args.maxPrefillBatchSize > 0 || args.maxDecodeBatchSize > 0))
+    {
+        LOG_ERROR("Asymmetric phase batch limits currently support vanilla engines only.");
+        return EXIT_FAILURE;
+    }
 
     if (args.debug)
     {
@@ -229,6 +263,8 @@ int main(int argc, char** argv)
     config.maxInputLen = args.maxInputLen;
     config.maxKVCacheCapacity = args.maxKVCacheCapacity;
     config.maxBatchSize = args.maxBatchSize;
+    config.maxPrefillBatchSize = args.maxPrefillBatchSize;
+    config.maxDecodeBatchSize = args.maxDecodeBatchSize;
     config.maxLoraRank = args.maxLoraRank;
     config.specDraft = args.specDraft;
     config.specBase = args.specBase;

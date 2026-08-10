@@ -39,7 +39,7 @@ PhasePrefillContextBatchAdapter::PhasePrefillContextBatchAdapter(int32_t maxBatc
     , mHostTokenIds(
           {maxBatchSize, maxChunkTokens}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_token_ids")
     , mDeviceTokenIds({maxBatchSize, maxChunkTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_token_ids")
-    , mBatchState(maxBatchSize, name + "_batch")
+    , mBatchState(maxBatchSize, name + "_batch", cacheManager.isIndexedKVCache())
 {
     check::check(mMaxBatchSize > 0, "Phase prefill adapter max batch size must be positive.");
     check::check(mMaxChunkTokens > 0, "Phase prefill adapter max chunk length must be positive.");
@@ -65,8 +65,8 @@ void PhasePrefillContextBatchAdapter::validateRow(PhasePrefillContextRow const& 
     std::vector<int32_t> const& prompt = row.context->rawBatchedInputIds[sourceRow];
     check::check(static_cast<int32_t>(prompt.size()) == row.promptTokenCount,
         "Phase prefill v1 requires the full text prompt without prefix-cache reuse.");
-    check::check(!row.context->audioEmbeddings.has_value() && row.context->deepstackFeatures.empty(),
-        "Phase prefill adapter v1 does not support audio or deepstack features.");
+    check::check(
+        !row.context->audioEmbeddings.has_value(), "Phase prefill adapter v1 does not support audio features.");
     if (row.context->visualEmbeddings.has_value())
     {
         check::check(row.tokenOffset == 0 && row.tokenCount == row.promptTokenCount,
@@ -97,11 +97,21 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
             "Phase prefill batch contains a duplicate source row.");
     }
     bool const hasVisualEmbeddings = rows.front().context->visualEmbeddings.has_value();
-    check::check(std::all_of(rows.begin(), rows.end(), [hasVisualEmbeddings](PhasePrefillContextRow const& row) {
-        return row.context->visualEmbeddings.has_value() == hasVisualEmbeddings;
-    }), "Phase prefill batch cannot mix text-only and multimodal rows.");
+    check::check(std::all_of(rows.begin(), rows.end(),
+                     [hasVisualEmbeddings](PhasePrefillContextRow const& row) {
+                         return row.context->visualEmbeddings.has_value() == hasVisualEmbeddings;
+                     }),
+        "Phase prefill batch cannot mix text-only and multimodal rows.");
     check::check(!hasVisualEmbeddings || rows.size() == 1,
         "Phase prefill adapter v1 supports one multimodal request per batch.");
+    bool const hasDeepstack = !rows.front().context->deepstackFeatures.empty();
+    check::check(std::all_of(rows.begin(), rows.end(),
+                     [hasDeepstack](PhasePrefillContextRow const& row) {
+                         return (!row.context->deepstackFeatures.empty()) == hasDeepstack;
+                     }),
+        "Phase prefill batch cannot mix deepstack and non-deepstack rows.");
+    check::check(
+        !hasDeepstack || rows.size() == 1, "Phase prefill adapter v1 supports one deepstack request per batch.");
 
     bool const initialChunk = rows.front().tokenOffset == 0;
     check::check(
@@ -187,6 +197,25 @@ OptionalInputTensor PhasePrefillContextBatchAdapter::visualEmbeddings() const no
         return std::nullopt;
     }
     return mRows.front().context->visualEmbeddings;
+}
+
+OptionalInputTensors const& PhasePrefillContextBatchAdapter::deepstackFeatures() const noexcept
+{
+    static OptionalInputTensors const empty;
+    if (!mPacked || mRows.empty())
+    {
+        return empty;
+    }
+    return mRows.front().context->deepstackFeatures;
+}
+
+OptionalInputTensor PhasePrefillContextBatchAdapter::mropeCosSin() const noexcept
+{
+    if (!mPacked || mRows.empty())
+    {
+        return std::nullopt;
+    }
+    return mRows.front().context->mropeCosSin;
 }
 
 PhaseBatchState& PhasePrefillContextBatchAdapter::phaseBatchState() noexcept
