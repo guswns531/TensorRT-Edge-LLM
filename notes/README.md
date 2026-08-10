@@ -60,6 +60,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 38. [공통 phase runtime과 모델별 adapter 분리 설계](45-common-phase-runtime-model-adapters.md)
 39. [Cosmos 공정 재측정과 BS16 kernel-group cost table](46-cosmos-fair-phase-cost-20260806.md)
 40. [Cosmos Reason2-2B indexed KV 구현과 image trace 결과](47-cosmos-indexed-kv-20260810.md)
+41. [Stable indexed-paged KV cache 설계와 구현 계획](48-stable-indexed-paged-kv-plan.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
