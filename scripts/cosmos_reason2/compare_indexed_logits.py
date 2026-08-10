@@ -13,9 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Extract teacher-forcing tokens and compare legacy/indexed logits dumps."""
+"""Extract teacher-forcing tokens and compare EdgeLLM logits dumps."""
 
 import argparse
+import json
 import math
 import re
 from pathlib import Path
@@ -73,12 +74,20 @@ def extract_tokens(args: argparse.Namespace) -> int:
 def cosine(reference: torch.Tensor, candidate: torch.Tensor) -> float:
     reference = reference.double().flatten()
     candidate = candidate.double().flatten()
+    if torch.equal(reference, candidate):
+        return 1.0
     denominator = float(
         torch.linalg.vector_norm(reference) *
         torch.linalg.vector_norm(candidate))
     if denominator == 0.0:
         return 1.0 if torch.equal(reference, candidate) else 0.0
     return float(torch.dot(reference, candidate)) / denominator
+
+
+def top_two(logits: torch.Tensor) -> tuple[int, float, int, float]:
+    values, indices = torch.topk(logits.float().flatten(), k=2)
+    return (int(indices[0]), float(values[0]), int(indices[1]),
+            float(values[1]))
 
 
 def compare(args: argparse.Namespace) -> int:
@@ -94,8 +103,11 @@ def compare(args: argparse.Namespace) -> int:
     passed = True
     worst_cosine = math.inf
     largest_absolute_error = 0.0
+    largest_mean_absolute_error = 0.0
+    minimum_close_fraction = 1.0
     greedy_matches = 0
     greedy_total = 0
+    report_rows = []
     for round_index in reference_rounds:
         prefix = f"round_{round_index}"
         reference_lengths = reference[f"{prefix}.context_lengths"]
@@ -118,17 +130,60 @@ def compare(args: argparse.Namespace) -> int:
 
         round_cosines = []
         round_max_abs = 0.0
+        round_mean_abs = 0.0
+        round_min_close_fraction = 1.0
+        round_argmax_matches = 0
+        round_rows = []
         for row in range(reference_logits.shape[0]):
             row_reference = reference_logits[row].float()
             row_candidate = candidate_logits[row].float()
             row_cosine = cosine(row_reference, row_candidate)
-            row_max_abs = float(
-                torch.max(torch.abs(row_reference - row_candidate)))
+            absolute_error = torch.abs(row_reference - row_candidate)
+            row_max_abs = float(torch.max(absolute_error))
+            row_mean_abs = float(torch.mean(absolute_error))
+            row_close_fraction = float(
+                torch.mean(
+                    torch.isclose(row_reference,
+                                  row_candidate,
+                                  atol=args.atol,
+                                  rtol=args.rtol).float()))
+            reference_top1, reference_top1_value, reference_top2, reference_top2_value = top_two(
+                row_reference)
+            candidate_top1, candidate_top1_value, candidate_top2, candidate_top2_value = top_two(
+                row_candidate)
+            argmax_match = reference_top1 == candidate_top1
             round_cosines.append(row_cosine)
             round_max_abs = max(round_max_abs, row_max_abs)
-            passed = passed and row_cosine >= args.min_cosine
+            round_mean_abs = max(round_mean_abs, row_mean_abs)
+            round_min_close_fraction = min(round_min_close_fraction,
+                                           row_close_fraction)
+            round_argmax_matches += int(argmax_match)
+            row_passed = (row_cosine >= args.min_cosine
+                          and row_close_fraction >= args.min_close_fraction)
+            passed = passed and row_passed
+            round_rows.append({
+                "row": row,
+                "cosine": row_cosine,
+                "max_abs": row_max_abs,
+                "mean_abs": row_mean_abs,
+                "close_fraction": row_close_fraction,
+                "reference_top1": reference_top1,
+                "reference_top2": reference_top2,
+                "reference_margin":
+                reference_top1_value - reference_top2_value,
+                "candidate_top1": candidate_top1,
+                "candidate_top2": candidate_top2,
+                "candidate_margin":
+                candidate_top1_value - candidate_top2_value,
+                "argmax_match": argmax_match,
+                "passed": row_passed,
+            })
         worst_cosine = min(worst_cosine, min(round_cosines))
         largest_absolute_error = max(largest_absolute_error, round_max_abs)
+        largest_mean_absolute_error = max(largest_mean_absolute_error,
+                                          round_mean_abs)
+        minimum_close_fraction = min(minimum_close_fraction,
+                                     round_min_close_fraction)
 
         reference_tokens = reference[f"{prefix}.generated_token_ids"].reshape(
             -1)
@@ -137,17 +192,65 @@ def compare(args: argparse.Namespace) -> int:
         matches = int(torch.sum(reference_tokens == candidate_tokens))
         greedy_matches += matches
         greedy_total += reference_tokens.numel()
-        status = "PASS" if min(round_cosines) >= args.min_cosine else "FAIL"
+        round_passed = (min(round_cosines) >= args.min_cosine and
+                        round_min_close_fraction >= args.min_close_fraction)
+        status = "PASS" if round_passed else "FAIL"
         print(f"{status} round {round_index}: "
               f"min_cosine={min(round_cosines):.8f}, "
               f"max_abs={round_max_abs:.6g}, "
-              f"greedy={matches}/{reference_tokens.numel()}")
+              f"max_mean_abs={round_mean_abs:.6g}, "
+              f"min_close={round_min_close_fraction:.6f}, "
+              f"argmax={round_argmax_matches}/{len(round_rows)}, "
+              f"sampled={matches}/{reference_tokens.numel()}")
+        for row_report in round_rows:
+            if not row_report["argmax_match"]:
+                print(f"  argmax mismatch row {row_report['row']}: "
+                      f"reference={row_report['reference_top1']} "
+                      f"margin={row_report['reference_margin']:.6g}, "
+                      f"candidate={row_report['candidate_top1']} "
+                      f"margin={row_report['candidate_margin']:.6g}")
+        report_rows.append({
+            "round": round_index,
+            "min_cosine": min(round_cosines),
+            "max_abs": round_max_abs,
+            "max_mean_abs": round_mean_abs,
+            "min_close_fraction": round_min_close_fraction,
+            "argmax_matches": round_argmax_matches,
+            "sampled_token_matches": matches,
+            "rows": round_rows,
+        })
 
     print(f"{'PASS' if passed else 'FAIL'}: "
           f"worst_cosine={worst_cosine:.8f} "
           f"(threshold={args.min_cosine}), "
           f"max_abs={largest_absolute_error:.6g}, "
-          f"greedy={greedy_matches}/{greedy_total}")
+          f"max_mean_abs={largest_mean_absolute_error:.6g}, "
+          f"min_close={minimum_close_fraction:.6f} "
+          f"(atol={args.atol}, rtol={args.rtol}, "
+          f"threshold={args.min_close_fraction}), "
+          f"sampled={greedy_matches}/{greedy_total}")
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(
+            {
+                "passed": passed,
+                "reference": str(args.reference),
+                "candidate": str(args.candidate),
+                "min_cosine_threshold": args.min_cosine,
+                "atol": args.atol,
+                "rtol": args.rtol,
+                "min_close_fraction_threshold": args.min_close_fraction,
+                "worst_cosine": worst_cosine,
+                "max_abs": largest_absolute_error,
+                "max_mean_abs": largest_mean_absolute_error,
+                "min_close_fraction": minimum_close_fraction,
+                "sampled_token_matches": greedy_matches,
+                "sampled_token_total": greedy_total,
+                "rounds": report_rows,
+            },
+            indent=2) + "\n",
+                                    encoding="utf-8")
+        print(f"wrote comparison report to {args.output_json}")
     return 0 if passed else 1
 
 
@@ -164,6 +267,12 @@ def main() -> int:
     compare_parser.add_argument("--reference", type=Path, required=True)
     compare_parser.add_argument("--candidate", type=Path, required=True)
     compare_parser.add_argument("--min-cosine", type=float, default=0.999)
+    compare_parser.add_argument("--atol", type=float, default=1e-2)
+    compare_parser.add_argument("--rtol", type=float, default=1e-2)
+    compare_parser.add_argument("--min-close-fraction",
+                                type=float,
+                                default=0.0)
+    compare_parser.add_argument("--output-json", type=Path)
     compare_parser.set_defaults(function=compare)
     args = parser.parse_args()
     return args.function(args)

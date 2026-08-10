@@ -152,5 +152,5 @@ indexed-paged 6,828MiB로 감소했다. 구현 파일, 성능 수치, 파편화 
 [Cosmos indexed-paged KV 구현과 10GB GPU 검증](49-cosmos-paged-kv-implementation.md)에 정리한다.
 
 단계 D의 terminal page 반환은 연결했지만 pool 부족을 scheduler backpressure로 바꾸는 정책은 남아 있다.
-단계 E도 unit/CUDA accuracy와 page-boundary E2E는 통과했으나 logits tolerance 비교, 반복 성능 측정,
-sanitizer/Nsight 검증이 남아 있다.
+단계 E의 unit/CUDA accuracy, page-boundary E2E와 teacher-forced BS2/BS4 logits cosine gate는 통과했다.
+반복 성능 측정과 sanitizer/Nsight 검증은 남아 있다.

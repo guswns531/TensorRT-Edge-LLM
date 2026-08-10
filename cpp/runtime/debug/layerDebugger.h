@@ -60,6 +60,8 @@ namespace rt
 //!
 //! Scope (POC): base model + vanilla decoding only. Hooked from
 //! ``runBaseModelPrefill`` (round 0) and ``VanillaDecoder::decodeStep``.
+//! Paged KV engines support logits-only mode (`k=0`) because their logical
+//! cache binding is not a contiguous physical allocation.
 //!
 //! Optionally also drives teacher-forcing: when ``EDGELLM_FORCE_TOKENS_FILE`` is set the
 //! dumper overrides each step's sampled token with the golden's (see applyForcedTokens()),

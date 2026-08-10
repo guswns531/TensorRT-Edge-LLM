@@ -131,6 +131,9 @@ void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, Tensor const& lo
     std::vector<int32_t> const& validLengths, int32_t const* generatedTokenIds, int32_t activeBatchSize,
     cudaStream_t stream)
 {
+    check::check(!cacheManager.isPagedKVCache() || mLayers.empty(),
+        "Paged KV debug currently supports logits-only dumps; set EDGELLM_DUMP_LOGITS_KVCACHE_LAYERS=0.");
+
     // The KV cache / logits are produced asynchronously on this stream; synchronise
     // so the device-side data is final before we copy it out.
     CUDA_CHECK(cudaStreamSynchronize(stream));

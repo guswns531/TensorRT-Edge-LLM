@@ -14,8 +14,10 @@ VRAM도 9,294MiB에서 6,828MiB로 2,466MiB 감소했다. BS1 decode median은
 6.2368ms에서 6.2555ms로 0.30%, p95는 6.2543ms에서 6.2948ms로 0.65% 증가했다.
 따라서 현재 단일 real-request decode 결과는 3% 회귀 제한 안이다.
 
-다만 prefill은 측정 sample이 한 번뿐이고, 별도로 빌드한 engine 사이의 greedy output이 긴 출력에서
-갈라진다. 그러므로 전체 correctness/performance gate를 통과했다고 선언하지 않는다.
+동일 token trajectory의 BS2/BS4 전체-vocabulary logits는 cosine `0.999` gate를 통과했고 paged engine
+반복 실행은 byte-exact였다. 별도로 빌드한 engine 사이의 greedy output은 near-tie에서 갈릴 수 있지만
+cache 주소 오류의 징후는 없었다. 다만 prefill은 측정 sample이 한 번뿐이므로 전체 performance gate는
+아직 통과로 선언하지 않는다.
 
 ## 실행 구조
 
@@ -123,6 +125,7 @@ TensorRT enqueue보다 같은 stream에서 먼저 실행된다. ordinary `handle
 | paged XQA decode 연결 | `cpp/plugins/attentionPlugin/attentionPlugin.cpp` |
 | phase enqueue reservation | `cpp/runtime/scheduling/phaseBatchState.cpp` |
 | terminal page release | `cpp/runtime/scheduling/phaseRequestLifecycle.cpp`, `phaseContextServingFacade.cpp` |
+| logits tolerance와 argmax margin 비교 | `scripts/cosmos_reason2/compare_indexed_logits.py` |
 
 모델별 변경은 없다. Cosmos가 사용하는 default decoder attention graph가 공통 paged op를 생성하고,
 Cosmos 특유 deepstack/M-RoPE input은 기존 model adapter 경로를 유지한다. 현재 실험은 vanilla text-only
@@ -178,25 +181,45 @@ allocation이 추가되지 않는다.
 p95 0.65% 느렸다. 한 번의 prefill 측정으로 속도 개선을 주장할 수는 없지만 paged indirection 비용이
 현재 sample에서 3% 이내임은 확인했다.
 
+### teacher-forced logits correctness
+
+indexed-linear reference가 생성한 token trajectory를 `EDGELLM_FORCE_TOKENS_FILE`로 paged engine에
+입력하고 prefill 1회와 decode 7회를 비교했다. 매 round/row마다 151,936 vocabulary logits 전체를
+비교했으며 context length와 tensor shape는 exact match를 요구했다.
+
+| 비교 | workload | worst cosine | max abs | 최대 row mean abs | sampled argmax |
+| --- | --- | ---: | ---: | ---: | ---: |
+| legacy → indexed-linear | BS2 × 8 rounds | 0.99997274 | 0.203125 | 0.0244433 | 14/16 |
+| indexed-linear → indexed-paged | BS2 × 8 rounds | 0.99992612 | 0.234375 | 0.0323054 | 15/16 |
+| indexed-linear → indexed-paged | BS4 × 8 rounds | 0.99994773 | 0.234375 | 0.0323054 | 31/32 |
+| indexed-paged repeat | BS4 × 8 rounds | 1.0 | 0 | 0 | 32/32 |
+
+두 paged 비교 모두 prefill round 0은 byte-exact였다. 공통 argmax mismatch는 decode round 2의 첫
+request이며 indexed-linear reference의 top-1/top-2 margin이 0.03125인 near-tie였다. forced token 이후
+round도 cosine이 계속 `0.9999` 이상이므로 잘못된 page를 읽어 trajectory가 분리된 형태가 아니다.
+
+`atol=1e-2`, `rtol=1e-2` element-wise close 비율도 함께 기록한다. 전체 vocabulary에는 0 근처의 작은
+logit이 많아 worst row close 비율은 BS2 53.36%, BS4 65.19%였고, 기존 legacy→indexed도 79.30%다.
+따라서 이 비율을 full-engine correctness gate로 사용하지 않고 paged XQA/KV write unit에서는 기존
+`1e-3` accuracy gate를, end-to-end에서는 calibrated cosine `0.999`를 사용한다.
+
+같은 paged engine을 동일 입력/forced token/CUDA graph off로 반복한 결과 모든 32 row-round logits가
+byte-exact였다. aux stream 또는 page-table update race로 인한 run-to-run 비결정성도 관측되지 않았다.
+
 ## 아직 통과하지 않은 gate
 
-1. 별도 tactic으로 빌드한 legacy/indexed/paged engine의 긴 greedy output은 일부 token에서 갈린다.
-   paged output은 request에 따라 legacy 또는 indexed output과 일치하는 구간이 달랐다. paged XQA와 KV write의
-   numerical unit test는 통과했지만, production gate에는 같은 logits의 단계별 tolerance 비교가 필요하다.
-2. prefill median/p95는 workload를 100회씩 3세트 실행해야 한다. 현재 표의 prefill count는 1이다.
-3. pool exhaustion은 allocator 수준에서 transactional error로 안전하게 멈추지만, online scheduler가 이를
+1. prefill median/p95는 workload를 100회씩 3세트 실행해야 한다. 현재 표의 prefill count는 1이다.
+2. pool exhaustion은 allocator 수준에서 transactional error로 안전하게 멈추지만, online scheduler가 이를
    queue backpressure metric으로 바꾸는 정책은 아직 없다.
-4. deferred free의 event ordering은 phase server completion event 경계에 연결했지만 sanitizer/Nsight로
+3. deferred free의 event ordering은 phase server completion event 경계에 연결했지만 sanitizer/Nsight로
    use-after-release와 eviction D2D 0 bytes를 다시 확인해야 한다.
-5. v1은 FP16 vanilla text attention만 지원한다. prefix sharing/COW, speculative decode, host offload,
+4. v1은 FP16 vanilla text attention만 지원한다. prefix sharing/COW, speculative decode, host offload,
    Mamba state paging, image prefill page 분할은 지원하지 않는다.
 
 ## 다음 작업 순서
 
-1. engine output logits를 선택한 decode step에서 dump해 indexed-linear와 indexed-paged를
-   `atol=1e-2`, `rtol=1e-2`로 직접 비교한다.
-2. real-request trace를 반복해 BS1/2/4/8 prefill과 BS1/2/4/8/16 decode의 median/p95 cost table을 만든다.
-3. scheduler에 `availableBundles`, dispatch 예상 bundle 수, pool-pressure metric을 노출하고 부족하면
+1. real-request trace를 반복해 BS1/2/4/8 prefill과 BS1/2/4/8/16 decode의 median/p95 cost table을 만든다.
+2. scheduler에 `availableBundles`, dispatch 예상 bundle 수, pool-pressure metric을 노출하고 부족하면
    prefill chunk 또는 admission을 지연한다.
-4. compute-sanitizer와 Nsight Systems로 page boundary, terminal reuse, eviction copy 0을 검증한다.
-5. 위 gate 통과 후에만 prefix page refcount/COW 또는 adaptive page budget을 설계한다.
+3. compute-sanitizer와 Nsight Systems로 page boundary, terminal reuse, eviction copy 0을 검증한다.
+4. 위 gate 통과 후에만 prefix page refcount/COW 또는 adaptive page budget을 설계한다.
