@@ -141,6 +141,38 @@ def _indexed_attention_plugin_translation(
     return attn_4d, present_kv
 
 
+@script()
+def _paged_attention_plugin_translation(
+    query_states: onnxscript.FLOAT16,
+    key_states: onnxscript.FLOAT16,
+    value_states: onnxscript.FLOAT16,
+    past_key_value: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    rope_rotary_cos_sin: onnxscript.FLOAT,
+    kvcache_start_index: onnxscript.INT32,
+    kv_slot_ids: onnxscript.INT32,
+    kv_page_ids: onnxscript.INT32,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    sliding_window_size: int,
+    enable_fp8_kv_cache: int,
+    attention_scale: float,
+    qkv_scales: Sequence[float],
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
+    attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
+        query_states, key_states, value_states, past_key_value,
+        context_lengths, rope_rotary_cos_sin, kvcache_start_index,
+        kv_slot_ids, kv_page_ids,
+        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+        head_size=head_size, enable_tree_attention=0,
+        enable_fp8_kv_cache=enable_fp8_kv_cache,
+        enable_vision_block_attention=0, enable_indexed_kv_cache=1,
+        enable_paged_kv_cache=1, sliding_window_size=sliding_window_size,
+        qkv_scales=qkv_scales, attention_scale=attention_scale, _outputs=2)
+    return attn_4d, present_kv
+
+
 # ---------------------------------------------------------------------------
 # FP8 ops
 # ---------------------------------------------------------------------------
@@ -1106,6 +1138,8 @@ def build_custom_translation_table() -> dict:
         _attention_plugin_translation,
         torch.ops.trt.indexed_attention_plugin.default:
         _indexed_attention_plugin_translation,
+        torch.ops.trt.paged_attention_plugin.default:
+        _paged_attention_plugin_translation,
         torch.ops.trt.fp8_quantize.default:
         _fp8_quantize_translation,
         torch.ops.trt.fp8_dequantize.default:

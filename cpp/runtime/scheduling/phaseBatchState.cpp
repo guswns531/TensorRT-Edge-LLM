@@ -58,7 +58,7 @@ void PhaseBatchState::bind(TensorMap& tensorMap)
 }
 
 void PhaseBatchState::prepare(
-    std::vector<PhaseWorkItem> const& batch, HybridCacheManager& cacheManager, cudaStream_t stream)
+    std::vector<PhaseWorkItem> const& batch, HybridCacheManager& cacheManager, cudaStream_t stream, bool decode)
 {
     check::check(!batch.empty(), "PhaseBatchState cannot prepare an empty batch.");
     check::check(mIndexedKVCache == cacheManager.isIndexedKVCache(),
@@ -86,6 +86,7 @@ void PhaseBatchState::prepare(
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceSlotIds.rawPointer(), mHostSlotIds.rawPointer(), mBatchSize * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
+    cacheManager.preparePagedKVCapacity(batch, decode, stream);
     cacheManager.preparePhaseKVCacheLengths(mDeviceSlotIds, mDeviceLengths, stream);
 }
 

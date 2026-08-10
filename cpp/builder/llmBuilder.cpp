@@ -184,6 +184,17 @@ bool LLMBuilder::build()
     {
         return false;
     }
+    if (mModelConfig.value("paged_kv_cache", false))
+    {
+        constexpr int64_t tokensPerPage = 128;
+        int64_t const minBundles = mBuilderConfig.maxKVCacheCapacity / tokensPerPage;
+        if (mBuilderConfig.maxKVCacheCapacity % tokensPerPage != 0
+            || mBuilderConfig.kvCachePageBundles < minBundles)
+        {
+            LOG_ERROR("Paged KV requires capacity divisible by 128 and --kvCachePageBundles >= %ld.", minBundles);
+            return false;
+        }
+    }
 
     // Create builder and network
     auto [builder, network] = createBuilderAndNetwork();
@@ -594,6 +605,17 @@ bool LLMBuilder::setupCommonProfiles(
             createDims({maxPrefillBatchSize}), createDims({maxPrefillBatchSize}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kKVSlotIds, createDims({1}),
             createDims({maxDecodeBatchSize}), createDims({maxDecodeBatchSize}));
+    }
+    if (mModelConfig.value("paged_kv_cache", false))
+    {
+        constexpr int64_t tokensPerPage = 128;
+        int64_t const maxPagesPerSequence = mBuilderConfig.maxKVCacheCapacity / tokensPerPage;
+        nvinfer1::Dims const pageTableShape
+            = createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSequence});
+        result &= setOptimizationProfile(
+            &contextProfile, binding_names::kKVPageIds, pageTableShape, pageTableShape, pageTableShape);
+        result &= setOptimizationProfile(
+            &generationProfile, binding_names::kKVPageIds, pageTableShape, pageTableShape, pageTableShape);
     }
 
     // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
@@ -1135,20 +1157,25 @@ bool LLMBuilder::setupKVCacheProfiles(
     bool result = true;
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
+    bool const fixedSlotCache = mModelConfig.value("paged_kv_cache", false);
+    int64_t const minCacheBatchSize = fixedSlotCache ? mBuilderConfig.maxBatchSize : 1;
+    int64_t const prefillCacheBatchSize = fixedSlotCache ? mBuilderConfig.maxBatchSize : maxPrefillBatchSize;
+    int64_t const decodeCacheBatchSize = fixedSlotCache ? mBuilderConfig.maxBatchSize : maxDecodeBatchSize;
     // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
         int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
         int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-        nvinfer1::Dims minKVCacheShape = createDims({1, 2, layerNumKVHeads, 0, layerHeadSize});
+        nvinfer1::Dims minKVCacheShape
+            = createDims({minCacheBatchSize, 2, layerNumKVHeads, 0, layerHeadSize});
         nvinfer1::Dims optPrefillKVCacheShape
-            = createDims({maxPrefillBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            = createDims({prefillCacheBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
         nvinfer1::Dims maxPrefillKVCacheShape
-            = createDims({maxPrefillBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            = createDims({prefillCacheBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
         nvinfer1::Dims optDecodeKVCacheShape
-            = createDims({maxDecodeBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            = createDims({decodeCacheBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
         nvinfer1::Dims maxDecodeKVCacheShape
-            = createDims({maxDecodeBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            = createDims({decodeCacheBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
 
         result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
             minKVCacheShape, optPrefillKVCacheShape, maxPrefillKVCacheShape);

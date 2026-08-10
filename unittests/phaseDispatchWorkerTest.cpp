@@ -79,7 +79,8 @@ rt::HybridCacheManager makeIndexedManager(int32_t maxBatchSize)
 {
     rt::HybridCacheManager::Config config{};
     config.layerTypes = {rt::HybridCacheManager::LayerType::kAttention};
-    config.kvConfig = rt::KVCacheManager::Config{1, maxBatchSize, 64, {rt::KVLayerConfig{1, 64}}, DataType::kHALF};
+    config.kvConfig
+        = rt::KVCacheManager::Config{1, maxBatchSize, 64, {rt::KVLayerConfig{1, 64}}, DataType::kHALF, false, 0, 128};
     config.mambaConfig.maxBatchSize = maxBatchSize;
     config.indexedKVCache = true;
     config.maxBatchSize = maxBatchSize;
@@ -508,6 +509,7 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
     std::unordered_map<uint64_t, int32_t> decodeSteps;
     std::vector<rt::PhaseRequestSnapshot> terminals;
     std::vector<rt::PhaseDispatchMetrics> dispatches;
+    std::vector<int32_t> releasedSlots;
     rt::PhaseRequestLifecycleCallbacks callbacks;
     callbacks.execution.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
         for (rt::PhaseWorkItem const& item : batch)
@@ -528,6 +530,7 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
         return rt::PhaseDecodeCompletion{item.tokenCount + 1, step == 2};
     };
     callbacks.execution.onDispatch = [&](rt::PhaseDispatchMetrics const& metrics) { dispatches.push_back(metrics); };
+    callbacks.onSlotRelease = [&](int32_t slot) { releasedSlots.push_back(slot); };
     callbacks.onTerminal = [&](rt::PhaseRequestSnapshot const& snapshot) { terminals.push_back(snapshot); };
 
     {
@@ -558,6 +561,9 @@ TEST(PhaseRequestLifecycleTest, OwnsStableSlotsAcrossContinuousQueueTransitions)
         EXPECT_EQ(observedSlots.at(10), 0);
         EXPECT_EQ(observedSlots.at(30), 1);
         EXPECT_EQ(terminals.size(), 3U);
+        EXPECT_EQ(releasedSlots.size(), 3U);
+        EXPECT_EQ(std::count(releasedSlots.begin(), releasedSlots.end(), 0), 1);
+        EXPECT_EQ(std::count(releasedSlots.begin(), releasedSlots.end(), 1), 2);
         ASSERT_FALSE(dispatches.empty());
         EXPECT_TRUE(std::any_of(dispatches.begin(), dispatches.end(), [](rt::PhaseDispatchMetrics const& metrics) {
             return metrics.prefillBatchSize > 0 || metrics.decodeBatchSize > 0;

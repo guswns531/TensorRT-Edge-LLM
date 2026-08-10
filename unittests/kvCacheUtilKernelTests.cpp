@@ -42,7 +42,7 @@ void TestKVCacheCopyWithTensor(KVCacheParameters const& cacheParams, int32_t cop
         cacheParams.numDecoderLayers, rt::KVLayerConfig{cacheParams.numKVHead, cacheParams.headDim});
 
     rt::KVCacheManager kvManager(rt::KVCacheManager::Config{cacheParams.numDecoderLayers, cacheParams.maxBatchSize,
-                                     cacheParams.maxSequenceLength, layerConfigs, DataType::kHALF},
+                                     cacheParams.maxSequenceLength, layerConfigs, DataType::kHALF, false, 0, 128},
         stream);
 
     // Per-layer saved tensor shape: [2, numKVHead, copySequenceLen, headDim]

@@ -1407,6 +1407,8 @@ bool LLMInferenceRuntime::enqueueBaseModelPrefill(DecodingInferenceContext& cont
     }
 
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
+    mSharedResources->cacheManagers[0]->preparePagedKVCapacityForActiveLengths(
+        context.effectivePrefillLengths, /*extraTokens=*/0, context.stream);
     mStepPreparer->prepare(
         InferencePhase::kPrefill, activeBatchSize, *mSharedResources->cacheManagers[0], *mPipelineIO, context.stream);
     // Bind real deepstack features for this prefill (no-op when feature absent).

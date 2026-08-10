@@ -61,10 +61,12 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 39. [Cosmos 공정 재측정과 BS16 kernel-group cost table](46-cosmos-fair-phase-cost-20260806.md)
 40. [Cosmos Reason2-2B indexed KV 구현과 image trace 결과](47-cosmos-indexed-kv-20260810.md)
 41. [Stable indexed-paged KV cache 설계와 구현 계획](48-stable-indexed-paged-kv-plan.md)
+42. [Cosmos indexed-paged KV 구현과 10GB GPU 검증](49-cosmos-paged-kv-implementation.md)
 
-- 현재 KV cache는 paged cache가 아니다. attention layer별로
-  `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
-  batch slot과 sequence position으로 관리한다.
+- 기본 KV cache와 indexed-linear는 attention layer별로
+  `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.
+  새 opt-in indexed-paged 경로는 stable slot을 유지하면서 128-token 전역 page-bundle pool에서 실제 KV를
+  할당하며 Cosmos text decoder에서 export/build/inference까지 검증되었다.
 - 호환 경로인 `LLMInferenceRuntime::handleRequest()`는 encoder, prefill, 반복 decode를 한 호출 안에서 직렬로
   수행한다. 새 online 경로는 `PhaseAsyncServer::submit()/poll()/tryPopCompletion()`만 사용한다.
 - LLM prefill과 decode는 optimization profile만 0/1로 나뉘며 같은 `EngineExecutor`, 같은 TensorRT
@@ -90,4 +92,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
   거부한다. multimodal phase 실행은 독립 context와 model adapter가 있는 경우에만 opt-in이다. Qwen3-VL/Cosmos
   indexed decoder의 image trace까지 검증했으며, deepstack/M-RoPE image prefill은 현재 원자적 BS1로 제한한다.
   CUDA graph는 smoke만 검증했다.
+- indexed-paged v1은 FP16 vanilla text attention, 128-token page, stable slot release를 지원한다. pool 부족의
+  online backpressure, prefix refcount/COW, speculative decoding, host offload와 image prefill paging은 아직
+  지원하지 않는다.
 - 성능 개선보다 정확성, 메모리 소유권, 의존성 검증을 먼저 완료한다.

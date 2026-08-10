@@ -66,6 +66,14 @@ inline constexpr char const* kContextLengths = "context_lengths";
 inline constexpr char const* kKVSlotIds = "kv_slot_ids";
 
 /*!
+ * @brief Physical KV page IDs owned by every stable request slot.
+ *
+ * Shape: [max_slots, 2, max_pages_per_sequence] (INT32). Present only in
+ * paged KV-cache engines. K/V entries refer to a shared page-major pool.
+ */
+inline constexpr char const* kKVPageIds = "kv_page_ids";
+
+/*!
  * @brief Last token IDs tensor - indices of the last tokens to extract from hidden states
  *
  * Shape: [batch_size] for Eagle models, [batch_size, 1] for vanilla models (INT64)

@@ -53,6 +53,9 @@ public:
         int32_t maxSequenceLength{};             //!< Maximum sequence length
         std::vector<KVLayerConfig> layerConfigs; //!< Per-layer head config (size == numAttentionLayers)
         nvinfer1::DataType kvCacheType{};        //!< Storage dtype for KV cache (kHALF or kFP8)
+        bool pagedKVCache{false};                //!< Use shared page-major physical storage
+        int32_t numPageBundles{};                //!< Shared physical K/V bundle count
+        int32_t tokensPerPage{128};              //!< Page granularity for paged KV v1
     };
     //! \endcond
 
@@ -112,6 +115,7 @@ public:
 
 private:
     Config mConfig{};                     //!< Cache configuration
+    std::vector<rt::Tensor> mLayerStorage; //!< Owned page-major storage in paged mode
     std::vector<rt::Tensor> mLayerCaches; //!< Per-layer KV cache tensors on device
     bool mIsUniform{true};                //!< True if all layers share the same numKVHeads and headDim
 };

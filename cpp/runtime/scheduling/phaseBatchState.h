@@ -52,7 +52,8 @@ public:
     void bind(TensorMap& tensorMap);
 
     //! Upload batch slot IDs and gather physical lengths into the local view.
-    void prepare(std::vector<PhaseWorkItem> const& batch, HybridCacheManager& cacheManager, cudaStream_t stream);
+    void prepare(std::vector<PhaseWorkItem> const& batch, HybridCacheManager& cacheManager, cudaStream_t stream,
+        bool decode = false);
 
     //! Commit a scalar increment for every row in the current phase batch.
     void commit(HybridCacheManager& cacheManager, int32_t increment, cudaStream_t stream);

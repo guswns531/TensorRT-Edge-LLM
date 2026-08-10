@@ -19,9 +19,11 @@
 
 #include "kernels/speculative/batchEvictKernels.h" // KVLayerInfo
 #include "runtime/kvCacheManager.h"
+#include "runtime/kvPageBundleAllocator.h"
 #include "runtime/kvSlotAllocator.h"
 #include "runtime/mambaCacheManager.h"
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -29,6 +31,8 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+struct PhaseWorkItem;
 
 //! Top-level cache manager for hybrid Attention + Mamba architectures.
 //!
@@ -178,6 +182,30 @@ public:
         return mConfig.indexedKVCache;
     }
 
+    bool isPagedKVCache() const noexcept
+    {
+        return mConfig.kvConfig.pagedKVCache;
+    }
+
+    //! Stable-slot physical page table [maxSlots, 2, maxPagesPerSequence].
+    rt::Tensor& getKVPageIds();
+
+    //! Reserve pages needed by a phase batch before its TensorRT enqueue.
+    void preparePagedKVCapacity(std::vector<PhaseWorkItem> const& batch, bool decode, cudaStream_t stream);
+
+    //! Reserve pages for the ordinary handleRequest() active batch.
+    void preparePagedKVCapacityForActiveLengths(
+        std::vector<int32_t> const& lengths, int32_t extraTokens, cudaStream_t stream);
+
+    //! Reserve the next token for every active handleRequest() sequence.
+    void preparePagedKVCapacityForDecode(cudaStream_t stream);
+
+    //! Release every physical page owned by a stable phase-server slot.
+    //!
+    //! The caller must invoke this only after the slot's final GPU event has
+    //! completed and before making the logical slot available for admission.
+    void releasePagedKVSlot(int32_t slot);
+
     //! Physical-slot length store. Indexed mode only; shape remains [maxSlots].
     rt::Tensor& getGlobalKVCacheLengths();
 
@@ -296,7 +324,12 @@ private:
     rt::Tensor mDeviceGlobalKVCacheLengths{}; //!< Indexed physical-slot lengths [maxBatchSize]
     rt::Tensor mDeviceKVSlotIds{};            //!< Active logical-row to physical-slot mapping on device
     rt::Tensor mDeviceReleasedSlotIds{};      //!< Indexed eviction scratch [maxBatchSize]
+    rt::Tensor mDeviceKVPageIds{};            //!< Stable-slot physical page table
     std::optional<KVSlotAllocator> mSlotAllocator;
+    std::optional<KVPageBundleAllocator> mPageAllocator;
+    std::mutex mPageAllocatorMutex;              //!< Serializes host page ownership updates
+    std::vector<int32_t> mHostGlobalKVCacheLengths; //!< Host mirror used by ordinary decode page reservation
+    std::vector<int32_t> mHostKVPageIds;         //!< Stable host staging for asynchronous page-table row uploads
     int32_t mActiveBatchSize{};               //!< Number of active sequences
     bool mKVCacheAllEmpty{true};              //!< True until the first commitSequenceLength call
     std::vector<HeadDimGroup> mHeadDimGroups; //!< Pre-computed per-headDim groups for batched kernels

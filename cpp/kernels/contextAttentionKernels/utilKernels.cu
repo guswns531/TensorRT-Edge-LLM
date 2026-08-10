@@ -264,7 +264,8 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
     half* __restrict__ kDst,                                              // [B, dstS, H, D]
     half* __restrict__ vDst,                                              // [B, dstS, H, D]
     float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t srcS,
-    int32_t dstS, int32_t H, int32_t D, int32_t const* __restrict__ kvSlotIds)
+    int32_t dstS, int32_t H, int32_t D, int32_t const* __restrict__ kvSlotIds,
+    int32_t const* __restrict__ kvPageIds)
 {
     uint32_t const token = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. dstS-1
     uint32_t const d = blockIdx.x * blockDim.x + threadIdx.x;     // 0 .. D-1
@@ -280,6 +281,8 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
     uint32_t const kv = headPair / H; // 0 = K, 1 = V
     uint32_t const h = headPair % H;
     uint32_t const physicalBatch = kvSlotIds != nullptr ? static_cast<uint32_t>(kvSlotIds[batch]) : batch;
+    size_t const dstIdx = ((((size_t) batch * dstS + token) * H + h) * D + d);
+    half* dst = (kv == 0) ? kDst : vDst;
 
     size_t srcIdx{};
     if (kvSlotIds == nullptr)
@@ -294,13 +297,16 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
         uint32_t const pagesPerSequence = srcS / kTOKENS_PER_PAGE;
         uint32_t const logicalPage = token / kTOKENS_PER_PAGE;
         uint32_t const tokenInPage = token % kTOKENS_PER_PAGE;
-        size_t const physicalPage = ((static_cast<size_t>(physicalBatch) * 2 + kv) * pagesPerSequence + logicalPage);
+        size_t const pageTableIndex
+            = (static_cast<size_t>(physicalBatch) * 2 + kv) * pagesPerSequence + logicalPage;
+        int64_t const physicalPage = kvPageIds != nullptr ? kvPageIds[pageTableIndex] : pageTableIndex;
+        if (physicalPage < 0)
+        {
+            dst[dstIdx] = half(0);
+            return;
+        }
         srcIdx = (((physicalPage * kTOKENS_PER_PAGE + tokenInPage) * H + h) * D + d);
     }
-    // dst layout: [B, dstS, H, D]
-    size_t const dstIdx = ((((size_t) batch * dstS + token) * H + h) * D + d);
-
-    half* dst = (kv == 0) ? kDst : vDst;
 
 #if SUPPORTS_FP8
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
@@ -316,7 +322,8 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
 }
 
 void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
-    rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds)
+    rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds,
+    int32_t const* kvPageIds)
 {
     rt::Coords const srcShape = src.getShape();
     int32_t const B = static_cast<int32_t>(srcShape[0]);
@@ -356,7 +363,8 @@ void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tenso
     if (src.getDataType() == nvinfer1::DataType::kHALF)
     {
         cvtKVLayoutBHSDToSplitKVKernel<half><<<grid, block, 0, stream>>>(src.dataPointer<half>(),
-            kDst.dataPointer<half>(), vDst.dataPointer<half>(), nullptr, nullptr, B, srcS, dstS, H, D, kvSlotIds);
+            kDst.dataPointer<half>(), vDst.dataPointer<half>(), nullptr, nullptr, B, srcS, dstS, H, D, kvSlotIds,
+            kvPageIds);
     }
 #if SUPPORTS_FP8
     else if (src.getDataType() == nvinfer1::DataType::kFP8)
@@ -370,7 +378,7 @@ void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tenso
         float const* const vScaleQuantOrigPtr = scales + 1;
         cvtKVLayoutBHSDToSplitKVKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
             kDst.dataPointer<half>(), vDst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, srcS, dstS,
-            H, D, kvSlotIds);
+            H, D, kvSlotIds, kvPageIds);
     }
 #endif
     else

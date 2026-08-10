@@ -154,7 +154,7 @@ void PhaseContextBatchAdapter::packDecode(std::vector<PhaseContextRow> const& ro
     CUDA_CHECK(cudaMemcpyAsync(mDeviceTokenIds.rawPointer(), mHostTokenIds.rawPointer(), rows.size() * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
 
-    mBatchState.prepare(mWorkItems, mCacheManager, stream);
+    mBatchState.prepare(mWorkItems, mCacheManager, stream, /*decode=*/true);
     mPreviousSlotIds = mTensorMap.get(binding_names::kKVSlotIds);
     mPreviousLengths = mTensorMap.get(binding_names::kKVCacheStartIndex);
     check::check(mPreviousSlotIds != nullptr && mPreviousLengths != nullptr,

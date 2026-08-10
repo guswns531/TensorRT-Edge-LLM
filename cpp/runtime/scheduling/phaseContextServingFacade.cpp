@@ -71,6 +71,7 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()
 {
     PhaseRequestLifecycleCallbacks result;
+    result.onSlotRelease = [this](int32_t slot) { mCacheManager.releasePagedKVSlot(slot); };
     result.execution.onMetrics = mCallbacks.onDispatchMetrics;
     result.execution.onDispatch = mCallbacks.onDispatch;
     result.execution.enqueuePrefill

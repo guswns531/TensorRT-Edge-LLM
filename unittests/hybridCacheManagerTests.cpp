@@ -83,7 +83,7 @@ rt::KVCacheManager::Config makeUniformKVConfig(
     int32_t numLayers, int32_t maxBatch, int32_t maxSeq, int32_t numKVHeads, int32_t headDim)
 {
     std::vector<rt::KVLayerConfig> layers(numLayers, rt::KVLayerConfig{numKVHeads, headDim});
-    return rt::KVCacheManager::Config{numLayers, maxBatch, maxSeq, layers, DataType::kHALF};
+    return rt::KVCacheManager::Config{numLayers, maxBatch, maxSeq, layers, DataType::kHALF, false, 0, 128};
 }
 
 // Build a heterogeneous KV config where the first half uses (h0, d0) and the second half uses (h1, d1).
@@ -103,7 +103,7 @@ rt::KVCacheManager::Config makeHeteroKVConfig(
             layers.push_back({h1, d1});
         }
     }
-    return rt::KVCacheManager::Config{numLayers, maxBatch, maxSeq, layers, DataType::kHALF};
+    return rt::KVCacheManager::Config{numLayers, maxBatch, maxSeq, layers, DataType::kHALF, false, 0, 128};
 }
 
 rt::MambaCacheManager::Config makeMambaConfig(int32_t numLayers, int32_t maxBatch)
@@ -342,6 +342,41 @@ TEST(HybridCacheManagerTests, IndependentPhaseViewsShareGlobalIndexedLengths)
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(HybridCacheManagerTests, PagedCapacityCrossesBoundaryAndEvictionClearsOnlyReleasedSlot)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const maxBatch = 4;
+
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(1, maxBatch, 256, 1, 64);
+    cfg.kvConfig.pagedKVCache = true;
+    cfg.kvConfig.numPageBundles = 6;
+    cfg.mambaConfig = makeMambaConfig(0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+    cfg.indexedKVCache = true;
+    rt::HybridCacheManager mgr(cfg, stream);
+
+    rt::Tensor reuseLengths({2}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memset(reuseLengths.rawPointer(), 0, reuseLengths.getMemoryCapacity());
+    mgr.resetForNewSequences(reuseLengths, stream);
+    mgr.preparePagedKVCapacityForActiveLengths({129, 1}, /*extraTokens=*/0, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getKVPageIds()),
+        (std::vector<int32_t>{0, 2, 1, 3, 4, -1, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1}));
+
+    std::vector<int32_t> const hostMapping{-1, 0};
+    rt::Tensor mapping = uploadMapping(hostMapping);
+    mgr.compactBatch(mapping, /*oldBatch=*/2, /*newBatch=*/1, stream, &hostMapping);
+    mgr.setActiveBatchSize(1);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getKVSlotIds()), (std::vector<int32_t>{1}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getKVPageIds()),
+        (std::vector<int32_t>{-1, -1, -1, -1, 4, -1, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1}));
 }
 
 // --- Compaction: attention-only, oldBatch < maxBatch ------------------------
@@ -807,7 +842,7 @@ TEST(HybridCacheManagerTests, ConstructPureMambaNoAttentionLayers)
     rt::HybridCacheManager::Config cfg{};
     cfg.layerTypes.assign(numMamba, rt::HybridCacheManager::LayerType::kMamba);
     // Zero-attention KV config: empty layerConfigs, numAttentionLayers == 0.
-    cfg.kvConfig = rt::KVCacheManager::Config{0, maxBatch, 32, {}, DataType::kHALF};
+    cfg.kvConfig = rt::KVCacheManager::Config{0, maxBatch, 32, {}, DataType::kHALF, false, 0, 128};
     cfg.mambaConfig = makeMambaConfig(numMamba, maxBatch);
     cfg.maxBatchSize = maxBatch;
 
@@ -830,7 +865,8 @@ TEST(HybridCacheManagerTests, CaptureKVCacheRejectsFp8)
 
     rt::HybridCacheManager::Config cfg{};
     cfg.layerTypes.assign(numLayers, rt::HybridCacheManager::LayerType::kAttention);
-    cfg.kvConfig = rt::KVCacheManager::Config{numLayers, maxBatch, 32, {rt::KVLayerConfig{2, 64}}, DataType::kFP8};
+    cfg.kvConfig = rt::KVCacheManager::Config{
+        numLayers, maxBatch, 32, {rt::KVLayerConfig{2, 64}}, DataType::kFP8, false, 0, 128};
     cfg.mambaConfig = makeMambaConfig(0, maxBatch);
     cfg.maxBatchSize = maxBatch;
 

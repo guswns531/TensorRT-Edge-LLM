@@ -75,9 +75,7 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
         {
             check::check(completedPromptLength == item.promptTokenCount,
                 "Phase request cannot finish before its final prefill chunk.");
-            int32_t const slot = snapshot.kvSlotId;
-            mSlotAllocator.release(slot);
-            snapshot.kvSlotId = -1;
+            releaseSlot(snapshot);
             snapshot.status = PhaseRequestStatus::kFinished;
             if (mCallbacks.onTerminal)
             {
@@ -102,9 +100,7 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
         snapshot.status = PhaseRequestStatus::kDecode;
         if (completion.finished)
         {
-            int32_t const slot = snapshot.kvSlotId;
-            mSlotAllocator.release(slot);
-            snapshot.kvSlotId = -1;
+            releaseSlot(snapshot);
             snapshot.status = PhaseRequestStatus::kFinished;
             if (mCallbacks.onTerminal)
             {
@@ -114,6 +110,18 @@ PhaseDispatchWorkerCallbacks PhaseRequestLifecycle::makeWorkerCallbacks()
         return completion;
     };
     return result;
+}
+
+void PhaseRequestLifecycle::releaseSlot(PhaseRequestSnapshot& snapshot)
+{
+    int32_t const slot = snapshot.kvSlotId;
+    check::check(slot >= 0, "Phase request has no stable slot to release.");
+    if (mCallbacks.onSlotRelease)
+    {
+        mCallbacks.onSlotRelease(slot);
+    }
+    mSlotAllocator.release(slot);
+    snapshot.kvSlotId = -1;
 }
 
 int32_t PhaseRequestLifecycle::reserveForEncoder(
@@ -191,9 +199,7 @@ bool PhaseRequestLifecycle::cancel(uint64_t requestId)
     {
         return false;
     }
-    int32_t const slot = snapshot.kvSlotId;
-    mSlotAllocator.release(slot);
-    snapshot.kvSlotId = -1;
+    releaseSlot(snapshot);
     snapshot.status = PhaseRequestStatus::kCancelled;
     if (mCallbacks.onTerminal)
     {

@@ -146,6 +146,11 @@ table update와 kernel read 사이의 lifetime을 보장한다.
 
 ## 현재 구현 상태
 
-단계 A가 구현되었다. 이 단계는 allocator와 page-table ownership만 제공하며 아직 실제 KV
-tensor allocation을 줄이지 않는다. VRAM 감소를 주장하려면 B와 C가 모두 연결된 engine을
-`export -> build -> inference` 순서로 검증해야 한다.
+단계 A-C와 ordinary runtime/phase lifecycle 연결이 구현되었다. Cosmos Reason2-2B에서
+`export -> build -> inference`를 통과했고 실제 peak VRAM은 indexed-linear 9,294MiB에서
+indexed-paged 6,828MiB로 감소했다. 구현 파일, 성능 수치, 파편화 분석과 아직 통과하지 않은 gate는
+[Cosmos indexed-paged KV 구현과 10GB GPU 검증](49-cosmos-paged-kv-implementation.md)에 정리한다.
+
+단계 D의 terminal page 반환은 연결했지만 pool 부족을 scheduler backpressure로 바꾸는 정책은 남아 있다.
+단계 E도 unit/CUDA accuracy와 page-boundary E2E는 통과했으나 logits tolerance 비교, 반복 성능 측정,
+sanitizer/Nsight 검증이 남아 있다.

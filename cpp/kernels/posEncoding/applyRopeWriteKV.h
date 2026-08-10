@@ -50,7 +50,7 @@ namespace kernel
 //! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
     rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    bool writeKInPlace, int32_t const* kvSlotIds = nullptr);
+    bool writeKInPlace, int32_t const* kvSlotIds = nullptr, int32_t const* kvPageIds = nullptr);
 
 //! @brief Launch the kernel when we are performing tree attention for speculative decoding.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
@@ -97,7 +97,8 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
 //! @param[in] qScale Q dequant scale (quant→orig). Only used when fp8QOut is non-null.
 void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q,
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    void* fp8QOut = nullptr, float qScale = 1.0f, int32_t const* kvSlotIds = nullptr);
+    void* fp8QOut = nullptr, float qScale = 1.0f, int32_t const* kvSlotIds = nullptr,
+    int32_t const* kvPageIds = nullptr);
 
 //! @brief Launch kernel to apply RoPE to Q only (no KV write).
 //!
@@ -111,6 +112,10 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 //! Build [B, 2, capacity/tokensPerPage] page IDs for a fixed linear slot pool.
 void launchBuildLinearKVPageList(int32_t const* kvSlotIds, int32_t* pageList, int32_t batchSize, int32_t capacity,
     int32_t tokensPerPage, cudaStream_t stream);
+
+//! Gather active XQA rows from [maxSlots, 2, maxPages] using kvSlotIds.
+void launchGatherPagedKVPageList(int32_t const* kvSlotIds, int32_t const* globalPageList, int32_t* activePageList,
+    int32_t batchSize, int32_t pagesPerSequence, cudaStream_t stream);
 
 void launchApplyRopeQOnly(
     rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream);

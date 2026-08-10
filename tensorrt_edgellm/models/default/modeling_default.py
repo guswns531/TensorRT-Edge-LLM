@@ -45,7 +45,8 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..linear import FP16Linear, TPMode, make_linear
-from ..ops import attention_plugin, indexed_attention_plugin
+from ..ops import (attention_plugin, indexed_attention_plugin,
+                   paged_attention_plugin)
 
 __all__ = [
     "OnnxSpec",
@@ -86,7 +87,8 @@ def _make_flat_wrapper(model: nn.Module,
                        Nd: int,
                        eagle_base: bool = False,
                        emit_hidden_states: bool = False,
-                       indexed_kv_cache: bool = False) -> nn.Module:
+                       indexed_kv_cache: bool = False,
+                       paged_kv_cache: bool = False) -> nn.Module:
     """Build a wrapper with an explicit flat forward signature (no ``*args``).
 
     Using ``*flat_args`` in ``forward`` triggers a PyTorch 2.10 bug where the
@@ -115,6 +117,8 @@ def _make_flat_wrapper(model: nn.Module,
         ["rope_rotary_cos_sin", "context_lengths", "kvcache_start_index"])
     if indexed_kv_cache:
         param_names += ["kv_slot_ids"]
+    if paged_kv_cache:
+        param_names += ["kv_page_ids"]
     param_names += (["last_token_ids"] +
                     [f"deepstack_embeds_{i}" for i in range(Nd)])
     if eagle_base:
@@ -129,13 +133,14 @@ def _make_flat_wrapper(model: nn.Module,
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
     indexed_kwargs = ", kv_slot_ids=kv_slot_ids" if indexed_kv_cache else ""
+    paged_kwargs = ", kv_page_ids=kv_page_ids" if paged_kv_cache else ""
 
     if has_hidden_output:
         body = (
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{indexed_kwargs}{ds_kwarg}{eagle_kwargs})\n"
+            f"{indexed_kwargs}{paged_kwargs}{ds_kwarg}{eagle_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
@@ -143,7 +148,7 @@ def _make_flat_wrapper(model: nn.Module,
             f"    logits, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{indexed_kwargs}{ds_kwarg})\n"
+            f"{indexed_kwargs}{paged_kwargs}{ds_kwarg})\n"
             f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -269,6 +274,7 @@ class Attention(nn.Module):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         kv_slot_ids: "torch.Tensor | None" = None,
+        kv_page_ids: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -310,7 +316,27 @@ class Attention(nn.Module):
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
-        if kv_slot_ids is not None:
+        if kv_page_ids is not None:
+            assert kv_slot_ids is not None
+            attn_output, present_key_value = paged_attention_plugin(
+                query_states,
+                key_states,
+                value_states,
+                past_key_value,
+                context_lengths,
+                rope_rotary_cos_sin,
+                kvcache_start_index,
+                kv_slot_ids,
+                kv_page_ids,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                sliding_window_size=self.sliding_window_size,
+                enable_fp8_kv_cache=self.enable_fp8_kv_cache,
+                attention_scale=self.attention_scale,
+                qkv_scales=kwargs["qkv_scales"],
+            )
+        elif kv_slot_ids is not None:
             attn_output, present_key_value = indexed_attention_plugin(
                 query_states,
                 key_states,
@@ -411,6 +437,7 @@ class DecoderLayer(nn.Module):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         kv_slot_ids: "torch.Tensor | None" = None,
+        kv_page_ids: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -422,6 +449,7 @@ class DecoderLayer(nn.Module):
             context_lengths,
             kvcache_start_index,
             kv_slot_ids=kv_slot_ids,
+            kv_page_ids=kv_page_ids,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
@@ -471,6 +499,7 @@ class Transformer(nn.Module):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         kv_slot_ids: "torch.Tensor | None" = None,
+        kv_page_ids: "torch.Tensor | None" = None,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
@@ -494,6 +523,7 @@ class Transformer(nn.Module):
                 context_lengths,
                 kvcache_start_index,
                 kv_slot_ids=kv_slot_ids,
+                kv_page_ids=kv_page_ids,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
             )
@@ -643,6 +673,11 @@ class CausalLM(nn.Module):
         kv_slot_ids = torch.arange(batch_size,
                                    dtype=torch.int32,
                                    device=device)
+        kv_page_ids = torch.zeros(batch_size,
+                                  2,
+                                  32,
+                                  dtype=torch.int32,
+                                  device=device)
         last_token_ids = torch.zeros(batch_size,
                                      1,
                                      dtype=torch.int64,
@@ -660,6 +695,8 @@ class CausalLM(nn.Module):
                 context_lengths, kvcache_start_index)
         if config.indexed_kv_cache:
             args = args + (kv_slot_ids, )
+        if config.paged_kv_cache:
+            args = args + (kv_page_ids, )
         args = args + (last_token_ids, *deepstack_embeds_list)
 
         input_names = (
@@ -667,6 +704,8 @@ class CausalLM(nn.Module):
             ["rope_rotary_cos_sin", "context_lengths", "kvcache_start_index"])
         if config.indexed_kv_cache:
             input_names = input_names + ["kv_slot_ids"]
+        if config.paged_kv_cache:
+            input_names = input_names + ["kv_page_ids"]
         input_names = (input_names + ["last_token_ids"] +
                        [f"deepstack_embeds_{i}" for i in range(Nd)])
         output_names = (["logits"] +
@@ -682,6 +721,7 @@ class CausalLM(nn.Module):
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
         kv_slots = torch.export.Dim("kv_slots", min=1, max=256)
+        kv_pages = torch.export.Dim("kv_pages", min=1, max=256)
         cache_batch = kv_slots if config.indexed_kv_cache else batch
 
         num_selected = torch.export.Dim("num_selected", min=1,
@@ -694,6 +734,8 @@ class CausalLM(nn.Module):
         all_shapes.append({0: kv_batch})  # kvcache_start_index
         if config.indexed_kv_cache:
             all_shapes.append({0: batch})  # kv_slot_ids
+        if config.paged_kv_cache:
+            all_shapes.append({0: kv_slots, 2: kv_pages})  # kv_page_ids
         if eagle_base:
             all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         else:
@@ -737,7 +779,8 @@ class CausalLM(nn.Module):
             Nd,
             eagle_base=eagle_base,
             emit_hidden_states=self.emit_hidden_states,
-            indexed_kv_cache=config.indexed_kv_cache)
+            indexed_kv_cache=config.indexed_kv_cache,
+            paged_kv_cache=config.paged_kv_cache)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -755,6 +798,7 @@ class CausalLM(nn.Module):
         kvcache_start_index: torch.Tensor,
         last_token_ids: torch.Tensor,
         kv_slot_ids: "torch.Tensor | None" = None,
+        kv_page_ids: "torch.Tensor | None" = None,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
@@ -771,6 +815,7 @@ class CausalLM(nn.Module):
             context_lengths,
             kvcache_start_index,
             kv_slot_ids=kv_slot_ids,
+            kv_page_ids=kv_page_ids,
             deepstack_embeds=deepstack_embeds,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,

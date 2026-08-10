@@ -36,6 +36,12 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     check::check(mConfig.maxSequenceLength > 0, "maxSequenceLength must be positive.");
     check::check(static_cast<int32_t>(mConfig.layerConfigs.size()) == mConfig.numAttentionLayers,
         "layerConfigs size must equal numAttentionLayers.");
+    if (mConfig.pagedKVCache)
+    {
+        check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF, "Paged KV v1 requires FP16 cache storage.");
+        check::check(mConfig.tokensPerPage == 128, "Paged KV v1 requires exactly 128 tokens per page.");
+        check::check(mConfig.numPageBundles > 0, "Paged KV page-bundle count must be positive.");
+    }
 
     // Pure-Mamba / pure-recurrent models legitimately have zero attention layers.
     // Leave mLayerCaches empty and skip uniformity detection.
@@ -62,6 +68,7 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
 
     // Allocate one tensor per attention layer.
     size_t totalBytes = 0;
+    mLayerStorage.reserve(mConfig.numAttentionLayers);
     mLayerCaches.reserve(mConfig.numAttentionLayers);
     for (int32_t i = 0; i < mConfig.numAttentionLayers; ++i)
     {
@@ -69,18 +76,32 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         check::check(lc.numKVHeads > 0, "numKVHeads must be positive for layer " + std::to_string(i) + ".");
         check::check(lc.headDim > 0, "headDim must be positive for layer " + std::to_string(i) + ".");
 
-        int64_t const layerVolume
-            = static_cast<int64_t>(mConfig.maxBatchSize) * 2 * lc.numKVHeads * mConfig.maxSequenceLength * lc.headDim;
+        int64_t const layerVolume = mConfig.pagedKVCache
+            ? static_cast<int64_t>(mConfig.numPageBundles) * 2 * mConfig.tokensPerPage * lc.numKVHeads * lc.headDim
+            : static_cast<int64_t>(mConfig.maxBatchSize) * 2 * lc.numKVHeads * mConfig.maxSequenceLength * lc.headDim;
         size_t const layerBytes = static_cast<size_t>(layerVolume) * elemSize;
         totalBytes += layerBytes;
 
-        mLayerCaches.emplace_back(
-            rt::Tensor({mConfig.maxBatchSize, 2, lc.numKVHeads, mConfig.maxSequenceLength, lc.headDim},
-                DeviceType::kGPU, mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
+        if (mConfig.pagedKVCache)
+        {
+            mLayerStorage.emplace_back(rt::Tensor(
+                {mConfig.numPageBundles * 2, mConfig.tokensPerPage, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
+                mConfig.kvCacheType, "KVCacheManager::paged_layer_" + std::to_string(i)));
+            mLayerCaches.emplace_back(rt::Tensor(mLayerStorage.back().rawPointer(),
+                {mConfig.maxBatchSize, 2, lc.numKVHeads, mConfig.maxSequenceLength, lc.headDim}, DeviceType::kGPU,
+                mConfig.kvCacheType, "KVCacheManager::logical_layer_" + std::to_string(i)));
+        }
+        else
+        {
+            mLayerCaches.emplace_back(
+                rt::Tensor({mConfig.maxBatchSize, 2, lc.numKVHeads, mConfig.maxSequenceLength, lc.headDim},
+                    DeviceType::kGPU, mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
+        }
     }
 
-    LOG_DEBUG("KVCacheManager(dtype=%s, layers=%d, uniform=%s) allocated %.2f MB total GPU memory", kvCacheTypeStr,
-        mConfig.numAttentionLayers, mIsUniform ? "true" : "false",
+    LOG_DEBUG("KVCacheManager(dtype=%s, layers=%d, uniform=%s, paged=%s) allocated %.2f MB total GPU memory",
+        kvCacheTypeStr, mConfig.numAttentionLayers, mIsUniform ? "true" : "false",
+        mConfig.pagedKVCache ? "true" : "false",
         static_cast<float>(totalBytes) / (1024.0f * 1024.0f));
 }
 
@@ -89,6 +110,7 @@ KVCacheManager::~KVCacheManager() noexcept {}
 KVCacheManager::KVCacheManager(KVCacheManager&& other) noexcept
 {
     mConfig = std::move(other.mConfig);
+    mLayerStorage = std::move(other.mLayerStorage);
     mLayerCaches = std::move(other.mLayerCaches);
     mIsUniform = other.mIsUniform;
 
@@ -101,6 +123,7 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
     if (this != &other)
     {
         mConfig = std::move(other.mConfig);
+        mLayerStorage = std::move(other.mLayerStorage);
         mLayerCaches = std::move(other.mLayerCaches);
         mIsUniform = other.mIsUniform;
 

@@ -21,6 +21,8 @@
 #include "common/logger.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/batchEvictKernels.h"
+#include "runtime/scheduling/phaseQueueScheduler.h"
+#include <algorithm>
 #include <unordered_map>
 
 using namespace nvinfer1;
@@ -85,6 +87,18 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
             {mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32, "HybridCacheManager::mDeviceReleasedSlotIds");
         CUDA_CHECK(cudaMemsetAsync(
             mDeviceGlobalKVCacheLengths.rawPointer(), 0, mDeviceGlobalKVCacheLengths.getMemoryCapacity(), stream));
+        if (mConfig.kvConfig.pagedKVCache)
+        {
+            mPageAllocator.emplace(KVPageBundleAllocator::Config{mConfig.maxBatchSize,
+                mConfig.kvConfig.numPageBundles, mConfig.kvConfig.maxSequenceLength,
+                mConfig.kvConfig.tokensPerPage});
+            int32_t const maxPages = mPageAllocator->maxPagesPerSequence();
+            mDeviceKVPageIds = rt::Tensor({mConfig.maxBatchSize, 2, maxPages}, DeviceType::kGPU, DataType::kINT32,
+                "HybridCacheManager::mDeviceKVPageIds");
+            CUDA_CHECK(cudaMemsetAsync(mDeviceKVPageIds.rawPointer(), 0xFF, mDeviceKVPageIds.getMemoryCapacity(), stream));
+            mHostGlobalKVCacheLengths.assign(mConfig.maxBatchSize, 0);
+            mHostKVPageIds.assign(static_cast<size_t>(mConfig.maxBatchSize) * 2 * maxPages, -1);
+        }
     }
 
     // Pre-build per-headDim groups for batched kernel launches.
@@ -148,7 +162,11 @@ HybridCacheManager::HybridCacheManager(HybridCacheManager&& other) noexcept
     mDeviceGlobalKVCacheLengths = std::move(other.mDeviceGlobalKVCacheLengths);
     mDeviceKVSlotIds = std::move(other.mDeviceKVSlotIds);
     mDeviceReleasedSlotIds = std::move(other.mDeviceReleasedSlotIds);
+    mDeviceKVPageIds = std::move(other.mDeviceKVPageIds);
     mSlotAllocator = std::move(other.mSlotAllocator);
+    mPageAllocator = std::move(other.mPageAllocator);
+    mHostGlobalKVCacheLengths = std::move(other.mHostGlobalKVCacheLengths);
+    mHostKVPageIds = std::move(other.mHostKVPageIds);
     mActiveBatchSize = other.mActiveBatchSize;
     mKVCacheAllEmpty = other.mKVCacheAllEmpty;
     mHeadDimGroups = std::move(other.mHeadDimGroups);
@@ -171,7 +189,11 @@ HybridCacheManager& HybridCacheManager::operator=(HybridCacheManager&& other) no
         mDeviceGlobalKVCacheLengths = std::move(other.mDeviceGlobalKVCacheLengths);
         mDeviceKVSlotIds = std::move(other.mDeviceKVSlotIds);
         mDeviceReleasedSlotIds = std::move(other.mDeviceReleasedSlotIds);
+        mDeviceKVPageIds = std::move(other.mDeviceKVPageIds);
         mSlotAllocator = std::move(other.mSlotAllocator);
+        mPageAllocator = std::move(other.mPageAllocator);
+        mHostGlobalKVCacheLengths = std::move(other.mHostGlobalKVCacheLengths);
+        mHostKVPageIds = std::move(other.mHostKVPageIds);
         mActiveBatchSize = other.mActiveBatchSize;
         mKVCacheAllEmpty = other.mKVCacheAllEmpty;
         mHeadDimGroups = std::move(other.mHeadDimGroups);
@@ -273,6 +295,99 @@ rt::Tensor& HybridCacheManager::getKVSlotIds()
     return mDeviceKVSlotIds;
 }
 
+rt::Tensor& HybridCacheManager::getKVPageIds()
+{
+    check::check(mConfig.kvConfig.pagedKVCache, "KV page IDs requested for a non-paged cache manager.");
+    return mDeviceKVPageIds;
+}
+
+void HybridCacheManager::preparePagedKVCapacity(
+    std::vector<PhaseWorkItem> const& batch, bool decode, cudaStream_t stream)
+{
+    if (!mConfig.kvConfig.pagedKVCache)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> const lock(mPageAllocatorMutex);
+    for (PhaseWorkItem const& item : batch)
+    {
+        int32_t const targetLength = decode ? item.tokenCount + 1 : item.tokenOffset + item.tokenCount;
+        size_t const previousPages = mPageAllocator->bundles(item.kvSlotId).size();
+        mPageAllocator->ensureCapacity(item.kvSlotId, targetLength);
+        mHostGlobalKVCacheLengths[item.kvSlotId] = targetLength;
+        if (mPageAllocator->bundles(item.kvSlotId).size() != previousPages)
+        {
+            std::vector<int32_t> const row = mPageAllocator->makePhysicalPageTableRow(item.kvSlotId);
+            size_t const offset = static_cast<size_t>(item.kvSlotId) * row.size();
+            std::copy(row.begin(), row.end(), mHostKVPageIds.begin() + offset);
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset,
+                mHostKVPageIds.data() + offset, row.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+    }
+}
+
+void HybridCacheManager::preparePagedKVCapacityForActiveLengths(
+    std::vector<int32_t> const& lengths, int32_t extraTokens, cudaStream_t stream)
+{
+    if (!mConfig.kvConfig.pagedKVCache)
+    {
+        return;
+    }
+    check::check(static_cast<int32_t>(lengths.size()) == mActiveBatchSize,
+        "Paged KV active-length count must match the active batch size.");
+    check::check(extraTokens >= 0, "Paged KV reservation increment must be non-negative.");
+    std::lock_guard<std::mutex> const lock(mPageAllocatorMutex);
+    auto const& slots = mSlotAllocator->activeSlots();
+    for (int32_t rowIdx = 0; rowIdx < mActiveBatchSize; ++rowIdx)
+    {
+        int32_t const slot = slots[rowIdx];
+        size_t const previousPages = mPageAllocator->bundles(slot).size();
+        mPageAllocator->ensureCapacity(slot, lengths[rowIdx] + extraTokens);
+        mHostGlobalKVCacheLengths[slot] = lengths[rowIdx];
+        if (mPageAllocator->bundles(slot).size() != previousPages)
+        {
+            std::vector<int32_t> const pageRow = mPageAllocator->makePhysicalPageTableRow(slot);
+            size_t const offset = static_cast<size_t>(slot) * pageRow.size();
+            std::copy(pageRow.begin(), pageRow.end(), mHostKVPageIds.begin() + offset);
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset,
+                mHostKVPageIds.data() + offset, pageRow.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+    }
+}
+
+void HybridCacheManager::preparePagedKVCapacityForDecode(cudaStream_t stream)
+{
+    if (!mConfig.kvConfig.pagedKVCache)
+    {
+        return;
+    }
+    std::vector<int32_t> lengths;
+    lengths.reserve(mActiveBatchSize);
+    for (int32_t const slot : mSlotAllocator->activeSlots())
+    {
+        lengths.push_back(mHostGlobalKVCacheLengths[slot]);
+    }
+    preparePagedKVCapacityForActiveLengths(lengths, /*extraTokens=*/1, stream);
+}
+
+void HybridCacheManager::releasePagedKVSlot(int32_t slot)
+{
+    if (!mConfig.kvConfig.pagedKVCache)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> const lock(mPageAllocatorMutex);
+    auto const& bundles = mPageAllocator->bundles(slot);
+    if (!bundles.empty())
+    {
+        mPageAllocator->release(slot);
+    }
+    mHostGlobalKVCacheLengths[slot] = 0;
+    std::vector<int32_t> const row = mPageAllocator->makePhysicalPageTableRow(slot);
+    size_t const offset = static_cast<size_t>(slot) * row.size();
+    std::copy(row.begin(), row.end(), mHostKVPageIds.begin() + offset);
+}
+
 void HybridCacheManager::preparePhaseKVCacheLengths(
     rt::Tensor const& phaseSlotIds, rt::Tensor& phaseLengths, cudaStream_t stream) const
 {
@@ -321,6 +436,19 @@ void HybridCacheManager::resetForNewSequences(rt::Tensor const& reuseKVCacheLeng
     if (mConfig.indexedKVCache)
     {
         mSlotAllocator->reset(batchSize);
+        if (mConfig.kvConfig.pagedKVCache)
+        {
+            mPageAllocator->reset();
+            CUDA_CHECK(cudaMemsetAsync(
+                mDeviceKVPageIds.rawPointer(), 0xFF, mDeviceKVPageIds.getMemoryCapacity(), stream));
+            std::fill(mHostKVPageIds.begin(), mHostKVPageIds.end(), -1);
+            int32_t const* reuseData = reuseKVCacheLengths.dataPointer<int32_t>();
+            for (int32_t row = 0; row < batchSize; ++row)
+            {
+                check::check(reuseData[row] == 0, "Paged KV v1 does not support system-prompt cache reuse.");
+                mHostGlobalKVCacheLengths[row] = 0;
+            }
+        }
         check::check(mDeviceKVSlotIds.reshape({mActiveBatchSize}), "KV slot IDs reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(mDeviceKVSlotIds.rawPointer(), mSlotAllocator->activeSlots().data(),
             batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -373,6 +501,13 @@ void HybridCacheManager::commitSequenceLength(int32_t increment, cudaStream_t st
     if (mConfig.indexedKVCache)
     {
         commitPhaseSequenceLength(mDeviceKVSlotIds, mDeviceKVCacheLengths, increment, stream);
+        if (mConfig.kvConfig.pagedKVCache)
+        {
+            for (int32_t const slot : mSlotAllocator->activeSlots())
+            {
+                mHostGlobalKVCacheLengths[slot] += increment;
+            }
+        }
     }
     else
     {
@@ -420,6 +555,11 @@ void HybridCacheManager::compactBatch(rt::Tensor const& batchMapping, int32_t ol
     {
         check::check(hostBatchMapping != nullptr,
             "Indexed KV cache compaction requires the host batch mapping and must not move KV storage.");
+        std::unique_lock<std::mutex> pageAllocatorLock(mPageAllocatorMutex, std::defer_lock);
+        if (mConfig.kvConfig.pagedKVCache)
+        {
+            pageAllocatorLock.lock();
+        }
         std::vector<int32_t> releasedSlots;
         std::vector<int32_t> const oldActiveSlots = mSlotAllocator->activeSlots();
         for (int32_t oldRow = 0; oldRow < oldBatch; ++oldRow)
@@ -427,6 +567,11 @@ void HybridCacheManager::compactBatch(rt::Tensor const& batchMapping, int32_t ol
             if ((*hostBatchMapping)[oldRow] < 0)
             {
                 releasedSlots.push_back(oldActiveSlots[oldRow]);
+                if (mConfig.kvConfig.pagedKVCache && !mPageAllocator->bundles(oldActiveSlots[oldRow]).empty())
+                {
+                    mPageAllocator->release(oldActiveSlots[oldRow]);
+                    mHostGlobalKVCacheLengths[oldActiveSlots[oldRow]] = 0;
+                }
             }
         }
         mSlotAllocator->compact(*hostBatchMapping, newBatch);
@@ -441,6 +586,17 @@ void HybridCacheManager::compactBatch(rt::Tensor const& batchMapping, int32_t ol
             CUDA_CHECK(cudaMemcpyAsync(mDeviceReleasedSlotIds.rawPointer(), releasedSlots.data(),
                 releasedSlots.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
             kernel::clearIndexedLengthTensor(mDeviceGlobalKVCacheLengths, mDeviceReleasedSlotIds, stream);
+            if (mConfig.kvConfig.pagedKVCache)
+            {
+                for (int32_t const slot : releasedSlots)
+                {
+                    std::vector<int32_t> const row = mPageAllocator->makePhysicalPageTableRow(slot);
+                    size_t const offset = static_cast<size_t>(slot) * row.size();
+                    std::copy(row.begin(), row.end(), mHostKVPageIds.begin() + offset);
+                    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset,
+                        mHostKVPageIds.data() + offset, row.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                }
+            }
         }
         kernel::gatherIndexedLengthTensor(mDeviceGlobalKVCacheLengths, mDeviceKVSlotIds, mDeviceKVCacheLengths, stream);
         return;

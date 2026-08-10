@@ -635,6 +635,7 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     out["kv_cache_dtype"] = ("fp8" if config.quant.kv_cache_quant == "fp8" else
                              "fp16")
     out["indexed_kv_cache"] = bool(config.indexed_kv_cache)
+    out["paged_kv_cache"] = bool(config.paged_kv_cache)
 
     # Hybrid models (Mamba / GDN / Nemotron-H) bake in recurrent-state and
     # conv-state dtypes at export time. The authoritative source is the

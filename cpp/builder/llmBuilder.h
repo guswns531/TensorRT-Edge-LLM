@@ -44,6 +44,7 @@ struct LLMBuilderConfig
     int64_t maxDecodeBatchSize{};     //!< Maximum decode batch size (0 inherits maxBatchSize)
     int64_t maxLoraRank{0};           //!< Maximum LoRA rank (0 = no LoRA support)
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
+    int64_t kvCachePageBundles{};     //!< Shared paged-KV bundle count (0 disables true paging)
     int64_t maxVerifyTreeSize{60};    //!< Maximum length of input_ids passed into spec base model for verification
     int64_t maxDraftTreeSize{60};     //!< Maximum length of input_ids passed into spec draft model for draft generation
     bool profilingDetailed{false};    //!< Enable detailed profiling verbosity for layer info extraction
@@ -67,6 +68,10 @@ struct LLMBuilderConfig
         }
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        if (kvCachePageBundles > 0)
+        {
+            json["kv_cache_page_bundles"] = kvCachePageBundles;
+        }
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -126,6 +131,10 @@ struct LLMBuilderConfig
         {
             config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
+        if (json.contains("kv_cache_page_bundles"))
+        {
+            config.kvCachePageBundles = json["kv_cache_page_bundles"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -151,6 +160,7 @@ struct LLMBuilderConfig
         oss << "  maxDecodeBatchSize: " << getMaxDecodeBatchSize() << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
+        oss << "  kvCachePageBundles: " << kvCachePageBundles << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {

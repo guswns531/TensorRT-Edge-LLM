@@ -260,7 +260,11 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
              for a in node.attribute if a.name == "enable_indexed_kv_cache"),
             0,
         )
-        optional_count = (1 if indexed_kv else
+        paged_kv = next(
+            (a.i for a in node.attribute if a.name == "enable_paged_kv_cache"),
+            0,
+        )
+        optional_count = (2 if paged_kv else 1 if indexed_kv else
                           (2 if tree_attn else
                            (1 if vision_block_attn else 0)))
         keep = _REQUIRED + optional_count

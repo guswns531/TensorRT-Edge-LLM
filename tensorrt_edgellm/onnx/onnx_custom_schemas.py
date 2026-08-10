@@ -171,6 +171,12 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="enable_paged_kv_cache",
+            type=OpSchema.AttrType.INT,
+            description="Use input slot 8 as the stable-slot physical page table.",
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="sliding_window_size",
             type=OpSchema.AttrType.INT,
             description=

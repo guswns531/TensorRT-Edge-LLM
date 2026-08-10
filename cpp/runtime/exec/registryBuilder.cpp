@@ -73,6 +73,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         reg.addTensor(
             {binding_names::kKVSlotIds, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
     }
+    if (cfg.pagedKVCache)
+    {
+        reg.addTensor({binding_names::kKVPageIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {fixed(cfg.maxSupportedBatchSize), fixed(2), fixed(cfg.maxKVCacheCapacity / cfg.kvCacheTokensPerPage)}});
+    }
 
     // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
     reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
@@ -119,8 +124,10 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
             // Plugin: combined KV, 5D [batch, 2, numKVHeads, kv_len, headDim]
-            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
-                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+            ShapeDim const cacheBatch
+                = cfg.pagedKVCache ? fixed(cfg.maxSupportedBatchSize) : sym(&InferenceDims::batch);
+            std::vector<ShapeDim> const shape{
+                cacheBatch, fixed(2), fixed(lc.numKVHeads), sym(&InferenceDims::kvLen), fixed(lc.headDim)};
             addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
             addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput, shape);
             ++localAttnIdx;

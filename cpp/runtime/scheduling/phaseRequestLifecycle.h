@@ -66,6 +66,8 @@ struct PhaseRequestSnapshot
 struct PhaseRequestLifecycleCallbacks
 {
     PhaseDispatchWorkerCallbacks execution;
+    //! Release cache ownership after final GPU completion and before stable-slot reuse.
+    std::function<void(int32_t)> onSlotRelease;
     std::function<void(PhaseRequestSnapshot const&)> onTerminal;
 };
 
@@ -101,6 +103,7 @@ public:
 
 private:
     PhaseDispatchWorkerCallbacks makeWorkerCallbacks();
+    void releaseSlot(PhaseRequestSnapshot& snapshot);
 
     struct RequestState
     {

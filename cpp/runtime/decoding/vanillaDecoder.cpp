@@ -106,6 +106,11 @@ bool VanillaDecoder::enqueueDecodeStep(DecodingInferenceContext& context)
         mRuntime.preprocess.deepstack->useZeroTarget(mRuntime.base.tensorMap);
     }
 
+    if (context.phaseBatchState == nullptr)
+    {
+        mRuntime.base.cacheManager.preparePagedKVCapacityForDecode(context.stream);
+    }
+
     auto const decodeDims = mRuntime.deployment.base.decodeDims(activeBatchSize);
     bool decodingStatus
         = mRuntime.base.executor.prepare(kDecodeProfile, decodeDims, mRuntime.base.tensorMap, context.stream);

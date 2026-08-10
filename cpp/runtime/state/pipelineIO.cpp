@@ -146,6 +146,10 @@ void buildTensorMap(
     {
         map.set(binding_names::kKVSlotIds, cacheMgr.getKVSlotIds());
     }
+    if (cfg.pagedKVCache)
+    {
+        map.set(binding_names::kKVPageIds, cacheMgr.getKVPageIds());
+    }
     auto& kvMgr = cacheMgr.getKVCacheManager();
     auto& mambaMgr = cacheMgr.getMambaCacheManager();
 

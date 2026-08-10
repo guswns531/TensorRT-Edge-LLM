@@ -491,6 +491,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     cfg.specDecodeType = parseSpecDecodeMode(configJson);
     cfg.indexedKVCache = configJson.value("indexed_kv_cache", false);
+    cfg.pagedKVCache = configJson.value("paged_kv_cache", false);
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole != "draft", "parseEngineConfig: use parseDraftEngineConfig for engine_role=draft.");
     cfg.isSpecDecodeBase = (engineRole == "base");
@@ -545,6 +546,16 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
+    cfg.kvCachePageBundles = bc.value("kv_cache_page_bundles", 0);
+    if (cfg.pagedKVCache)
+    {
+        ELLM_CHECK(cfg.indexedKVCache, "paged_kv_cache requires indexed_kv_cache.");
+        ELLM_CHECK(cfg.kvCacheDtype == nvinfer1::DataType::kHALF, "paged_kv_cache v1 requires FP16 KV cache.");
+        ELLM_CHECK(cfg.maxKVCacheCapacity % cfg.kvCacheTokensPerPage == 0,
+            "paged_kv_cache v1 requires max_kv_cache_capacity divisible by 128.");
+        ELLM_CHECK(cfg.kvCachePageBundles >= cfg.maxKVCacheCapacity / cfg.kvCacheTokensPerPage,
+            "kv_cache_page_bundles must hold at least one maximum-length sequence.");
+    }
 
     // Recurrent / conv state dtypes are only meaningful for hybrid engines
     // (Mamba / Nemotron-H / GDN). Mirror the Python export gating exactly:
@@ -1043,6 +1054,11 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         std::string("Indexed KV binding mismatch (") + engineLabel
             + "): config indexed_kv_cache=" + (config.indexedKVCache ? "true" : "false") + ", engine kv_slot_ids="
             + (engineHasKVSlotIds ? "present" : "absent") + ". Re-export and rebuild the engine.");
+    bool const engineHasKVPageIds = executor.hasIOTensor(binding_names::kKVPageIds);
+    ELLM_CHECK(engineHasKVPageIds == config.pagedKVCache,
+        std::string("Paged KV binding mismatch (") + engineLabel
+            + "): config paged_kv_cache=" + (config.pagedKVCache ? "true" : "false") + ", engine kv_page_ids="
+            + (engineHasKVPageIds ? "present" : "absent") + ". Re-export and rebuild the engine.");
 
     // KV cache binding: validated on layer 0; all layers share the same dtype.
     // Plugin-path engines use a combined `past_key_values_%d` binding.
