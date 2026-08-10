@@ -73,7 +73,8 @@ enum LLMInferenceOptionId : int
     OUTPUT_AUDIO_DIR = 919,
     ENABLE_THINKER_TALKER_STREAMING = 920,
     DFLASH_BLOCK_SIZE = 921,
-    NUM_LOGPROBS = 922
+    NUM_LOGPROBS = 922,
+    NO_CUDA_GRAPH = 923
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -109,6 +110,7 @@ struct LLMInferenceArgs
     bool dumpProfile{false};
     int32_t warmup{0};
     bool dumpOutput{false};
+    bool noCudaGraph{false};
     // Override parameters (only batchSize, maxGenerateLength, and numLogprobs can be overridden via CLI)
     // For other sampling parameters (temperature, top_p, top_k), please specify them in the input JSON file
     int32_t batchSize{-1};         // -1 means use value from input file
@@ -144,7 +146,7 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
+                 "[--dumpOutput] [--noCudaGraph] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
                  "[--specVerifySize=<number>] [--dflashBlockSize=<number>]"
               << std::endl;
@@ -159,6 +161,7 @@ void printUsage(char const* programName)
     std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
+    std::cerr << "  --noCudaGraph             Disable decode CUDA graph capture" << std::endl;
     std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
@@ -196,6 +199,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
         {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
         {"dumpOutput", no_argument, 0, LLMInferenceOptionId::DUMP_OUTPUT},
+        {"noCudaGraph", no_argument, 0, LLMInferenceOptionId::NO_CUDA_GRAPH},
         {"specDecode", no_argument, 0, LLMInferenceOptionId::SPEC_DECODE},
         {"eagle", no_argument, 0, LLMInferenceOptionId::SPEC_DECODE}, // deprecated alias
         {"specDraftTopK", required_argument, 0, LLMInferenceOptionId::SPEC_DRAFT_TOP_K},
@@ -246,6 +250,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case LLMInferenceOptionId::DUMP_OUTPUT: args.dumpOutput = true; break;
+        case LLMInferenceOptionId::NO_CUDA_GRAPH: args.noCudaGraph = true; break;
         case LLMInferenceOptionId::SPEC_DECODE: args.specDecodeArgs.enabled = true; break;
         case LLMInferenceOptionId::SPEC_DRAFT_TOP_K:
             try
@@ -594,7 +599,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (!runtime->captureDecodingCUDAGraph(stream))
+    if (!args.noCudaGraph && !runtime->captureDecodingCUDAGraph(stream))
     {
         LOG_WARNING("Failed to capture CUDA graph for decoding, proceeding with normal engine execution.");
     }
@@ -635,7 +640,7 @@ int main(int argc, char* argv[])
             }
         }
 
-        if (!ttsRuntime->captureDecodingCUDAGraph(stream))
+        if (!args.noCudaGraph && !ttsRuntime->captureDecodingCUDAGraph(stream))
         {
             LOG_WARNING("CUDA graph capture failed for TTS decoding, proceeding without.");
         }

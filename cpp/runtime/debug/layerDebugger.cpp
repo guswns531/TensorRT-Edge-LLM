@@ -51,16 +51,17 @@ std::string trim(std::string const& s)
     return s.substr(b, e - b + 1);
 }
 
-//! Parse the layer count "k" (a single positive integer) into the leading-layer set {0..k-1}.
+//! Parse the layer count "k" (a single non-negative integer) into the leading-layer set {0..k-1}.
 //! The only producer (few-layer-validation.sh) dumps the first N decoder layers; selecting
 //! arbitrary / non-leading layers is intentionally unsupported -- dump the prefix and pick the
-//! layers of interest at analysis time (disk is cheap; a simpler parser is worth more).
+//! layers of interest at analysis time. Zero enables a compact logits-only dump.
 std::set<int32_t> parseLeadingLayers(std::string const& spec)
 {
     int32_t const k = std::stoi(trim(spec));
-    if (k < 1)
+    if (k < 0)
     {
-        throw std::runtime_error(std::string(kLayersEnv) + ": expected a positive layer count, got '" + spec + "'.");
+        throw std::runtime_error(
+            std::string(kLayersEnv) + ": expected a non-negative layer count, got '" + spec + "'.");
     }
     std::set<int32_t> out;
     for (int32_t i = 0; i < k; ++i)
