@@ -37,17 +37,23 @@ class Scenario:
 
 PREFILL_BATCHES = (1, 2, 4, 8, 16)
 DECODE_BATCHES = (1, 2, 4, 8, 16)
-OVERLAP_SPLITS = ((1, 15), (2, 14), (4, 12), (6, 10), (8, 8),
-                  (10, 6), (12, 4), (14, 2), (15, 1))
+DECODE_SCALE_BATCHES = (8, 16, 24, 32)
+OVERLAP_SPLITS = ((1, 15), (2, 14), (4, 12), (6, 10), (8, 8), (10, 6), (12, 4),
+                  (14, 2), (15, 1))
 
-SCENARIOS = tuple(
-    [Scenario(f"prefill_bs{batch}", "prefill", batch, 1, 48, 128, 1)
-     for batch in PREFILL_BATCHES] +
-    [Scenario(f"decode_bs{batch}", "decode", 1, batch, 24, 128, 24)
-     for batch in DECODE_BATCHES] +
-    [Scenario(f"overlap_p{prefill}_d{decode}", "overlap", prefill, decode,
-              48, 512, 16)
-     for prefill, decode in OVERLAP_SPLITS])
+SCENARIOS = tuple([
+    Scenario(f"prefill_bs{batch}", "prefill", batch, 1, 48, 128, 1)
+    for batch in PREFILL_BATCHES
+] + [
+    Scenario(f"decode_bs{batch}", "decode", 1, batch, 24, 128, 24)
+    for batch in DECODE_BATCHES
+] + [
+    Scenario(f"decode_scale_bs{batch}", "decode_scale", 1, batch, 64, 128, 32)
+    for batch in DECODE_SCALE_BATCHES
+] + [
+    Scenario(f"overlap_p{prefill}_d{decode}", "overlap", prefill, decode, 48,
+             512, 16) for prefill, decode in OVERLAP_SPLITS
+])
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -70,8 +76,8 @@ def read_csv(path: Path) -> list[dict[str, str]]:
 
 def command_for(args: argparse.Namespace, scenario: Scenario,
                 scenario_dir: Path) -> list[str]:
-    overlap_prefill_tokens = (scenario.prefill_batch * 128
-                              if scenario.profile == "overlap" else 128)
+    overlap_prefill_tokens = (scenario.prefill_batch *
+                              128 if scenario.profile == "overlap" else 128)
     return [
         str(args.bench),
         "--engineDir",
@@ -158,10 +164,10 @@ def kernel_cost_rows(scenario: Scenario, path: Path,
         decode_batch = int(row["decode_batch"])
         prefill_tokens = int(row["prefill_tokens"])
         decode_context_tokens = int(row["decode_context_tokens"])
-        chunk_tokens = (prefill_tokens // prefill_batch
-                        if prefill_batch else 0)
-        mean_decode_context = (decode_context_tokens // decode_batch
-                               if decode_batch else 0)
+        chunk_tokens = (prefill_tokens //
+                        prefill_batch if prefill_batch else 0)
+        mean_decode_context = (decode_context_tokens //
+                               decode_batch if decode_batch else 0)
         key = (group, prefill_batch, decode_batch, chunk_tokens,
                mean_decode_context)
         grouped.setdefault(key, []).append(float(row["gpu_ms"]))
@@ -195,7 +201,8 @@ def kernel_group_summary_rows(scenario: Scenario, path: Path,
                int(row["decode_batch"]))
         grouped.setdefault(key, []).append(float(row["gpu_ms"]))
     result = []
-    for (group, prefill_batch, decode_batch), values in sorted(grouped.items()):
+    for (group, prefill_batch,
+         decode_batch), values in sorted(grouped.items()):
         result.append({
             "scenario": scenario.name,
             "profile": scenario.profile,
@@ -231,8 +238,8 @@ def dispatch_summary_rows(scenario: Scenario, path: Path,
             "samples": len(rows),
         }
         for column in ("prefill_queue_wait_us", "decode_queue_wait_us",
-                       "prefill_gpu_ms", "decode_gpu_ms",
-                       "makespan_gpu_ms", "overlap_ratio"):
+                       "prefill_gpu_ms", "decode_gpu_ms", "makespan_gpu_ms",
+                       "overlap_ratio"):
             values = [float(row[column]) for row in rows]
             result_row[f"{column}_mean"] = statistics.mean(values)
             result_row[f"{column}_p95"] = percentile(values, 0.95)
@@ -258,13 +265,23 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--slot-count", type=int, default=16)
-    parser.add_argument("--scenario", action="append",
+    parser.add_argument("--scenario",
+                        action="append",
                         choices=tuple(item.name for item in SCENARIOS))
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args()
 
-    selected = [scenario for scenario in SCENARIOS
-                if args.scenario is None or scenario.name in args.scenario]
+    selected = [
+        scenario for scenario in SCENARIOS
+        if (args.scenario is None or scenario.name in args.scenario) and max(
+            scenario.prefill_batch, scenario.decode_batch) <= args.slot_count
+    ]
+    unsupported = set(args.scenario or
+                      ()) - {scenario.name
+                             for scenario in selected}
+    if unsupported:
+        raise ValueError(f"scenarios exceed --slot-count {args.slot_count}: "
+                         f"{', '.join(sorted(unsupported))}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     request_summaries = []
     cost_rows = []
@@ -276,34 +293,40 @@ def main() -> None:
         request_csv = scenario_dir / "requests.csv"
         kernel_csv = scenario_dir / "kernel-groups.csv"
         log_path = scenario_dir / "run.log"
-        if not args.skip_existing or not (request_csv.exists() and
-                                          kernel_csv.exists()):
+        if not args.skip_existing or not (request_csv.exists()
+                                          and kernel_csv.exists()):
             print(f"[{index}/{len(selected)}] running {scenario.name}",
                   flush=True)
             with log_path.open("w", encoding="utf-8") as log:
-                result = subprocess.run(command_for(args, scenario, scenario_dir),
+                result = subprocess.run(command_for(args, scenario,
+                                                    scenario_dir),
                                         stdout=log,
                                         stderr=subprocess.STDOUT,
                                         check=False,
                                         text=True)
             if result.returncode != 0:
-                tail = "\n".join(log_path.read_text(
-                    encoding="utf-8", errors="replace").splitlines()[-40:])
+                tail = "\n".join(
+                    log_path.read_text(encoding="utf-8",
+                                       errors="replace").splitlines()[-40:])
                 raise RuntimeError(
-                    f"{scenario.name} failed with {result.returncode}:\n{tail}")
+                    f"{scenario.name} failed with {result.returncode}:\n{tail}"
+                )
         summary = summarize_requests(scenario, request_csv, args.slot_count)
         request_summaries.append(summary)
-        cost_rows.extend(kernel_cost_rows(scenario, kernel_csv,
-                                          args.slot_count))
-        group_summary_rows.extend(kernel_group_summary_rows(
-            scenario, kernel_csv, args.slot_count))
-        dispatch_rows.extend(dispatch_summary_rows(
-            scenario, scenario_dir / "requests-dispatch.csv",
-            args.slot_count))
-        print(f"[{index}/{len(selected)}] {scenario.name}: "
-              f"{summary['achieved_rps']:.2f} req/s, "
-              f"TTFT p95={summary['ttft_p95_ms']:.2f} ms, "
-              f"TPOT p95={summary['tpot_p95_ms']:.2f} ms", flush=True)
+        cost_rows.extend(
+            kernel_cost_rows(scenario, kernel_csv, args.slot_count))
+        group_summary_rows.extend(
+            kernel_group_summary_rows(scenario, kernel_csv, args.slot_count))
+        dispatch_rows.extend(
+            dispatch_summary_rows(scenario,
+                                  scenario_dir / "requests-dispatch.csv",
+                                  args.slot_count))
+        print(
+            f"[{index}/{len(selected)}] {scenario.name}: "
+            f"{summary['achieved_rps']:.2f} req/s, "
+            f"TTFT p95={summary['ttft_p95_ms']:.2f} ms, "
+            f"TPOT p95={summary['tpot_p95_ms']:.2f} ms",
+            flush=True)
 
     write_rows(args.output_dir / "request-summary.csv", request_summaries)
     write_rows(args.output_dir / "kernel-cost-table.csv", cost_rows)

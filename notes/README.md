@@ -53,6 +53,13 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 31. [SLO scheduler 100-request 성능 결과](31-slo-scheduler-performance.md)
 32. [Production async server와 실제 three-context trace](32-production-async-three-context-server.md)
 33. [LLM real-request scheduler 실험](33-llm-real-request-scheduler-experiments.md)
+34. [프로젝트 전체 회고·동작 방식·장단점·다음 단계](39-project-retrospective.md)
+35. [수정 전 legacy와 수정 후 indexed/phase 비교](40-before-after-legacy-indexed-comparison.md)
+36. [모델 중립 independent TensorRT context pair](43-model-agnostic-independent-contexts.md)
+37. [Cosmos non-indexed KV/deepstack phase 지원](44-cosmos-phase-support-20260806.md)
+38. [공통 phase runtime과 모델별 adapter 분리 설계](45-common-phase-runtime-model-adapters.md)
+39. [Cosmos 공정 재측정과 BS16 kernel-group cost table](46-cosmos-fair-phase-cost-20260806.md)
+40. [Cosmos Reason2-2B indexed KV 구현과 image trace 결과](47-cosmos-indexed-kv-20260810.md)
 
 - 현재 KV cache는 paged cache가 아니다. attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당하고,
@@ -77,7 +84,9 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 
 - 기존 `handleRequest()` 경로는 기본값으로 유지한다.
 - 새 기능은 opt-in configuration 아래에서만 활성화한다.
-- indexed-linear v1은 vanilla text prefill/decode와 batch eviction만 지원한다. speculative decoding,
-  system prompt cache, host offload, Mamba, multimodal 실행, 여러 `handleRequest()` 사이 continuous admission은
-  명시적으로 거부한다. CUDA graph는 smoke만 검증했다.
+- indexed-linear v1은 vanilla text prefill/decode와 batch eviction을 기본 지원한다. speculative decoding,
+  system prompt cache, host offload, Mamba, 여러 `handleRequest()` 사이 continuous admission은 명시적으로
+  거부한다. multimodal phase 실행은 독립 context와 model adapter가 있는 경우에만 opt-in이다. Qwen3-VL/Cosmos
+  indexed decoder의 image trace까지 검증했으며, deepstack/M-RoPE image prefill은 현재 원자적 BS1로 제한한다.
+  CUDA graph는 smoke만 검증했다.
 - 성능 개선보다 정확성, 메모리 소유권, 의존성 검증을 먼저 완료한다.

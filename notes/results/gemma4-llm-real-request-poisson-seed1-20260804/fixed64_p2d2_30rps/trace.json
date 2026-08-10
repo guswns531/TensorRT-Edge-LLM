@@ -1,0 +1,131 @@
+{
+    "batch_size": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 24,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Give one practical tip for reducing latency in an online inference service."
+                }
+            ],
+            "max_generate_length": 8,
+            "arrival_offset_us": 0
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "A customer reports that an API sometimes returns HTTP 429. Explain the likely cause and suggest two immediate checks."
+                }
+            ],
+            "max_generate_length": 12,
+            "arrival_offset_us": 8975
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write a concise Python function that returns the median of a non-empty list, then state its time complexity."
+                }
+            ],
+            "max_generate_length": 16,
+            "arrival_offset_us": 12604
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Summarize the difference between throughput and tail latency for a batch inference server. Keep the answer operational and under five sentences."
+                }
+            ],
+            "max_generate_length": 24,
+            "arrival_offset_us": 29414
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "You are reviewing an incident report. The service had stable CPU utilization, GPU utilization oscillated between 30 and 100 percent, request queues grew for six minutes, and p95 latency rose while median latency changed little. The deployment used one FIFO queue and formed a batch only after either eight requests arrived or a ten millisecond timeout expired. Explain the most plausible scheduling problem, identify the measurements that would confirm it, and recommend a safe first change."
+                }
+            ],
+            "max_generate_length": 32,
+            "arrival_offset_us": 35027
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "An inference runtime owns four fixed KV-cache slots. Requests A, B, C, and D occupy slots 0, 1, 2, and 3. B finishes first, then a new request E arrives while A, C, and D continue decoding. Describe a stable indexed allocation strategy that admits E without copying surviving KV tensors. Include how the logical decode batch maps to physical slots and what must happen when C later finishes."
+                }
+            ],
+            "max_generate_length": 16,
+            "arrival_offset_us": 37321
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Compare two designs for serving autoregressive language models on one GPU. Design one executes prefill and decode on a single CUDA stream. Design two uses separate TensorRT execution contexts and separate nonblocking CUDA streams while sharing one CUDA primary context and one stable KV-cache allocation. Discuss correctness requirements, possible overlap, memory cost, and when design two can make tail latency worse."
+                }
+            ],
+            "max_generate_length": 24,
+            "arrival_offset_us": 54437
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Design a small benchmark for a scheduler with separate prefill and decode queues. The benchmark should use timestamped request arrivals, variable prompt lengths, variable output lengths, and stable KV slots. Specify request-level metrics, dispatch-level metrics, CUDA-event measurements, warmup rules, and at least three workload regimes. Explain how to tell whether chunked prefill improves time to first token without damaging time per output token."
+                }
+            ],
+            "max_generate_length": 32,
+            "arrival_offset_us": 137787
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Read the following fictional production note and produce a short action list. During the morning peak, 48 requests arrived over two seconds. Prompt lengths ranged from 40 to 760 tokens and requested outputs ranged from 8 to 96 tokens. The scheduler always selected decode when both queues were non-empty, except after eight consecutive decode turns. Prefill was chunked into 256-token pieces. CUDA-event data showed decode engine batches of size one taking 7.8 ms, size two taking 9.1 ms, and size three taking 10.4 ms. Prefill engine chunks of 64, 128, and 256 tokens took 15, 27, and 51 ms respectively. When a 256-token prefill overlapped decode, decode rose to 18 ms and the overlap ratio was only 0.08. Queue logs showed new prompts waiting as long as 420 ms. Based only on this note, propose a revised chunk choice and fairness rule, and name one experiment needed before rollout."
+                }
+            ],
+            "max_generate_length": 16,
+            "priority": 1,
+            "arrival_offset_us": 191510
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "A team wants to predict phase cost online using exponential moving averages. Their telemetry records prefill batch size, chunk tokens, decode batch size, total decode context tokens, phase GPU milliseconds, queue wait, and overlap ratio. Explain how to construct separate prefill and decode cost estimates, how to avoid trusting cold-start samples, how to react to distribution shifts, and why a single milliseconds-per-token number can be misleading. Give a compact decision rule for choosing among prefill-only, decode-only, and overlap."
+                }
+            ],
+            "max_generate_length": 24,
+            "arrival_offset_us": 239805
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Consider an online LLM server with two queues and four KV slots. At time zero, two 500-token prompts arrive. At 20 milliseconds, three 80-token prompts arrive. Existing requests generate between 16 and 64 tokens. The prefill context supports batch size two and the decode context supports batch size two. Construct a plausible dispatch timeline using 128-token prefill chunks. Preserve stable slot ownership, do not compact KV memory, and prevent either queue from starving. Then explain which CUDA events are needed to measure queue-independent GPU service time and overlap makespan."
+                }
+            ],
+            "max_generate_length": 32,
+            "priority": 1,
+            "arrival_offset_us": 248170
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Prepare a technical recommendation for deploying an adaptive chunked-prefill scheduler. The implementation has independent prefill and decode TensorRT execution contexts, nonblocking streams, and a shared CUDA context. It can observe per-kernel-group CUDA event times but cannot yet partition SMs. Cover admission control, dynamic batching, chunk-size selection, decode deadlines, fairness, cancellation, KV-slot exhaustion, instrumentation, rollback criteria, and a staged experiment plan. Explicitly distinguish improvements in throughput from improvements in p95 TTFT and p95 TPOT."
+                }
+            ],
+            "max_generate_length": 24,
+            "arrival_offset_us": 273815
+        }
+    ]
+}

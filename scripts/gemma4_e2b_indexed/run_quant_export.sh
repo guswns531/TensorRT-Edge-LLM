@@ -5,7 +5,7 @@
 set -euo pipefail
 
 repo_dir=${REPO_DIR:-/workspace/TensorRT-Edge-LLM}
-work_dir=${WORK_DIR:-/workspace/artifacts/gemma4-e2b}
+work_dir=${WORK_DIR:-${repo_dir}/.local/gemma4-e2b}
 model_id=${MODEL_ID:-google/gemma-4-E2B-it}
 model_revision=${MODEL_REVISION:?MODEL_REVISION must be an immutable Hugging Face commit SHA}
 mode=${MODE:-legacy}
