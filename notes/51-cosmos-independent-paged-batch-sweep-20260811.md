@@ -169,6 +169,21 @@ exhaustion은 발생하지 않았다. 관측된 admission pending queue는 약 6
 더 컸다. Kernel-group median은 page128/page256에서 prefill engine `17.47/17.48ms`,
 decode engine `6.72/6.71ms`로 거의 동일했다.
 
+동일한 긴 trace를 page80에도 적용했다. p8 case는 d16과 d32에서 성공했지만 d24는 page pool
+exhaustion으로 종료됐다.
+
+| page80 / p8 | TTFT (ms) | TPOT (ms) | E2E (ms) | generated tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| d16 | 1,157 / 2,179 | 18.3 / 25.8 | 2,094 / 2,823 | 1,270 |
+| d24 | admission failure | admission failure | admission failure | - |
+| d32 | 1,157 / 1,872 | 13.5 / 17.3 | 1,802 / 2,368 | 1,460 |
+
+page80의 d24 실패와 d32 성공처럼 cap이 커질수록 항상 실패하는 단조 관계는 아직 관측되지
+않았다. request arrival과 phase admission 시점에 따라 page lifetime이 달라지기 때문이다.
+따라서 page exhaustion은 단순 pass/fail만 보지 않고 allocator snapshot, pending admission
+시간, retry 횟수를 함께 기록해야 하며, 동일 case를 반복해 deterministic backpressure인지
+확인해야 한다.
+
 원자료는 다음에 있다.
 
 ```text
@@ -184,5 +199,5 @@ decode engine `6.72/6.71ms`로 거의 동일했다.
    제외하되, 동일한 observed batch 조건을 맞춰 비교한다.
 3. peak VRAM headroom 512 MiB를 gate로 사용하고, page exhaustion은 failure가 아니라 admission
    backpressure latency로 기록한다.
-4. page80에서도 동일한 긴 trace를 실행해 page exhaustion이 발생하는 시점의 TTFT/E2E tail과
-   pending admission latency를 별도로 측정한다.
+4. page80의 d24 exhaustion을 동일 seed로 3회 이상 반복해 allocator lifetime과 pending admission
+   latency가 deterministic한지 확인한다.
