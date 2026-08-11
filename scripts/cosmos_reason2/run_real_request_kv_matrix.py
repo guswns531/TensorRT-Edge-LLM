@@ -82,7 +82,7 @@ def parse_engine(value: str) -> Engine:
 
 def materialize_trace(source: Path, destination: Path, seed: int,
                       arrival_rate: float, request_count: int,
-                      repeat_count: int) -> None:
+                      repeat_count: int, output_multiplier: float) -> None:
     root = json.loads(source.read_text(encoding="utf-8"))
     requests = list(root.get("requests", []))
     if not requests:
@@ -96,6 +96,9 @@ def materialize_trace(source: Path, destination: Path, seed: int,
         for _ in range(repeat_count)
         for request in requests
     ]
+    for request in requests:
+        original_length = int(request.get("max_generate_length", root.get("max_generate_length", 1)))
+        request["max_generate_length"] = max(1, math.ceil(original_length * output_multiplier))
     generator = random.Random(seed)
     elapsed_us = 0.0
     for index, request in enumerate(requests):
@@ -103,6 +106,9 @@ def materialize_trace(source: Path, destination: Path, seed: int,
             elapsed_us += generator.expovariate(arrival_rate) * 1_000_000.0
         request["arrival_offset_us"] = round(elapsed_us)
     root["requests"] = requests
+    root["max_generate_length"] = max(
+        int(request["max_generate_length"])
+        for request in requests)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(root, indent=2) + "\n", encoding="utf-8")
 
@@ -324,6 +330,8 @@ def main() -> None:
     parser.add_argument("--request-count", type=int, default=0)
     parser.add_argument("--repeat-count", type=int, default=1,
                         help="repeat the source request set to create a longer arrival trace")
+    parser.add_argument("--output-multiplier", type=float, default=1.0,
+                        help="multiply each request max_generate_length in the materialized trace")
     parser.add_argument("--slot-count", type=int, default=16)
     parser.add_argument("--page-bundles", type=int, default=80)
     parser.add_argument("--tokens-per-page", type=int, default=128)
@@ -338,11 +346,13 @@ def main() -> None:
 
     if args.slot_count <= 0 or args.page_bundles <= 0 or args.tokens_per_page <= 0:
         parser.error("slot-count, page-bundles, and tokens-per-page must be positive")
+    if args.output_multiplier <= 0.0:
+        parser.error("output-multiplier must be positive")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trace = args.output_dir / "materialized-trace.json"
     materialize_trace(args.source_trace, trace, args.seed, args.arrival_rate, args.request_count,
-                      args.repeat_count)
+                      args.repeat_count, args.output_multiplier)
     cases = scenarios(args.prefill_batches, args.decode_batches, args.context_modes)
     if args.case:
         cases = [case for case in cases if case.name in args.case]

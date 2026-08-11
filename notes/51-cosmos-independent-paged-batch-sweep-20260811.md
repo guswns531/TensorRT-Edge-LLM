@@ -129,6 +129,54 @@ python3 scripts/cosmos_reason2/run_real_request_kv_matrix.py \
 각 결과에는 `status.csv`, `request-summary.csv`, `dispatch-cost-table.csv`,
 `kernel-cost-table.csv`, `page-pressure-model.csv`가 있다.
 
+## 긴 output saturation과 latency
+
+실제 decode BS24/32를 만들기 위해 source trace를 8회 반복해 96 request로 만들고, request별
+`max_generate_length`를 2배로 늘렸다. arrival rate는 240 req/s로 설정했다.
+
+```bash
+--repeat-count 8 --output-multiplier 2.0 --arrival-rate 240
+```
+
+새 `--output-multiplier`는 원래 trace의 request별 길이 분포를 유지하면서 output 상한만 배율로
+늘린다. `page128/slot32`와 `page256/slot32` 모두 p1/p4/p8 × d16/d24/d32의 9/9 case가
+성공했고, p8 case에서 requested decode cap과 observed decode batch가 모두 일치했다.
+
+| page pool | p8/d16 observed | p8/d24 observed | p8/d32 observed |
+| ---: | ---: | ---: | ---: |
+| 128 | BS16 | BS24 | BS32 |
+| 256 | BS16 | BS24 | BS32 |
+
+request-level latency는 다음과 같다. 각 값은 `p8` case의 median/p95다.
+
+| page pool / decode | TTFT (ms) | TPOT (ms) | E2E (ms) | generated tok/s |
+| --- | ---: | ---: | ---: |
+| 128 / d16 | 1,113 / 2,052 | 17.4 / 24.1 | 1,999 / 2,680 | 1,328 |
+| 128 / d24 | 1,114 / 1,833 | 14.4 / 18.3 | 1,807 / 2,331 | 1,481 |
+| 128 / d32 | 1,113 / 1,768 | 12.8 / 16.2 | 1,724 / 2,253 | 1,523 |
+| 256 / d16 | 1,112 / 2,055 | 17.5 / 24.2 | 2,000 / 2,684 | 1,327 |
+| 256 / d24 | 1,109 / 1,829 | 14.4 / 18.3 | 1,802 / 2,327 | 1,484 |
+| 256 / d32 | 1,112 / 1,766 | 12.8 / 16.1 | 1,723 / 2,251 | 1,523 |
+
+decode batch를 16→24→32로 키우면 TPOT median은 약 17.5→14.4→12.8ms로 감소하고,
+TTFT/E2E tail도 이 workload에서는 함께 줄었다. 이는 decode queue가 충분히 포화되어 batch
+효율이 latency를 지배한 결과다. 다만 arrival rate가 낮은 workload에서는 큰 decode batch를
+기다리는 시간이 TTFT를 다시 악화시킬 수 있으므로 이 표를 고정 정책으로 사용하지 않는다.
+
+page128의 modelled peak pressure는 `0.453`, page256은 `0.227`이었고 두 경우 모두 page
+exhaustion은 발생하지 않았다. 관측된 admission pending queue는 약 61~62 request까지
+늘었으며, 이 긴 trace의 latency tail은 page pool보다 stable-slot/phase queue 대기 영향이
+더 컸다. Kernel-group median은 page128/page256에서 prefill engine `17.47/17.48ms`,
+decode engine `6.72/6.71ms`로 거의 동일했다.
+
+원자료는 다음에 있다.
+
+```text
+.local/cosmos-reason2-2b/sweep-results/
+  long-saturation-b128-s32/
+  long-saturation-b256-s32/
+```
+
 ## 다음 측정
 
 1. 위 성공 case를 warmup 20회와 측정 100회, process 3회로 반복한다.
@@ -136,5 +184,5 @@ python3 scripts/cosmos_reason2/run_real_request_kv_matrix.py \
    제외하되, 동일한 observed batch 조건을 맞춰 비교한다.
 3. peak VRAM headroom 512 MiB를 gate로 사용하고, page exhaustion은 failure가 아니라 admission
    backpressure latency로 기록한다.
-4. p8/d24와 p8/d32에서 실제 observed batch가 24/32에 도달하도록 request 수와 output length를
-   늘린 별도 saturation trace를 만든다.
+4. page80에서도 동일한 긴 trace를 실행해 page exhaustion이 발생하는 시점의 TTFT/E2E tail과
+   pending admission latency를 별도로 측정한다.
