@@ -201,3 +201,44 @@ page80의 d24 실패와 d32 성공처럼 cap이 커질수록 항상 실패하는
    backpressure latency로 기록한다.
 4. page80의 d24 exhaustion을 동일 seed로 3회 이상 반복해 allocator lifetime과 pending admission
    latency가 deterministic한지 확인한다.
+
+## Prefill 16 / Decode 64 후보 측정
+
+prefill과 decode 상한을 함께 확장한 별도 엔진도 build했다.
+
+```text
+maxBatchSize=64
+maxPrefillBatchSize=16
+maxDecodeBatchSize=64
+page pool=128 또는 256
+stable slots=64
+```
+
+P8/P12/P16 × D32/D48/D64를 96-request trace에서 실행했다. page128에서는 일부 P12/P16
+조합이 page exhaustion으로 중단됐고, page256에서는 9/9 case가 성공했다. 그러나 arrival
+240 req/s에서는 D64 cap도 실제 observed BS46까지밖에 형성되지 않았다.
+
+page256, 144-request trace에서 observed batch와 request latency는 다음과 같다.
+
+| prefill / decode cap | observed P/D | TTFT med/p95 (ms) | TPOT med/p95 (ms) | E2E med/p95 (ms) | tok/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| P8 / D32 | 7 / 32 | 1,252 / 2,131 | 11.0 / 14.5 | 1,695 / 2,553 | 2,040 |
+| P8 / D48 | 8 / 46 | 1,217 / 2,113 | 9.8 / 12.3 | 1,637 / 2,513 | 1,994 |
+| P8 / D64 | 8 / 46 | 1,216 / 2,110 | 9.7 / 12.3 | 1,636 / 2,509 | 1,996 |
+| P12 / D32 | 7 / 32 | 1,250 / 2,127 | 11.0 / 14.6 | 1,694 / 2,548 | 2,043 |
+| P12 / D48 | 8 / 46 | 1,213 / 2,113 | 9.8 / 12.2 | 1,634 / 2,513 | 1,993 |
+| P12 / D64 | 8 / 46 | 1,222 / 2,121 | 9.8 / 12.3 | 1,643 / 2,521 | 1,988 |
+| P16 / D32 | 7 / 32 | 1,245 / 2,129 | 11.0 / 14.2 | 1,692 / 2,552 | 2,041 |
+| P16 / D48 | 8 / 46 | 1,215 / 2,116 | 9.8 / 12.3 | 1,637 / 2,515 | 1,991 |
+| P16 / D64 | 8 / 46 | 1,214 / 2,116 | 9.8 / 12.3 | 1,636 / 2,515 | 1,992 |
+
+표의 첫 번째 행은 열 수가 밀리지 않도록 `TTFT`, `TPOT`, `E2E`가 각각 median/p95 순서다.
+실행 결과는 P8/P12/P16 간 차이가 0.2% 안팎으로 작았고, D48→D64도 throughput 개선이
+거의 없었다. 반면 D32→D48은 TPOT을 약 11% 줄였다. 따라서 RTX 3080 기준 기본 후보는
+`P8/D32`, TPOT 목표가 더 엄격한 경우 `P8/D48`로 두고, P16/D64는 page budget과 queue
+saturation을 더 확인한 뒤 선택한다.
+
+P16/D64 builder의 activation memory는 prefill 약 1.14 GiB, decode 약 0.54 GiB로 P8/D32의
+약 0.54/0.26 GiB보다 크다. page128 pressure는 `0.828~0.859`, page256은 `0.434`였으므로
+P16/D64에는 page256이 더 안전하다. 아직 실제 BS64를 형성한 측정은 아니므로 arrival rate를
+더 높이고 request 수를 늘린 전용 queue-saturation case가 남아 있다.
