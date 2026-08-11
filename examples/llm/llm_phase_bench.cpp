@@ -1006,7 +1006,7 @@ int main(int argc, char** argv)
         else
         {
             contextPackUs = 0.0F;
-            decodeBatchState.prepare(batch, cacheManager, stream);
+            decodeBatchState.prepare(batch, cacheManager, stream, /*decode=*/true);
         }
         return executeDecode(*activeBatchState, phaseRounds, stream);
     };

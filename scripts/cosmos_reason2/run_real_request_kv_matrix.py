@@ -329,7 +329,9 @@ def main() -> None:
     parser.add_argument("--tokens-per-page", type=int, default=128)
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--chunk-size", type=int, default=128)
-    parser.add_argument("--past-kv-len", type=int, default=128)
+    # Real-trace warmup must start from an empty cache. Paged KV v1 rejects
+    # the legacy system-prompt cache reuse path used by non-zero pastKVLen.
+    parser.add_argument("--past-kv-len", type=int, default=0)
     parser.add_argument("--case", action="append", help="run only CASE names, e.g. p4_d16_independent")
     parser.add_argument("--continue-on-error", action="store_true")
     args = parser.parse_args()

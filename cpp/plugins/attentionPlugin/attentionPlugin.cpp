@@ -1006,10 +1006,18 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     // present-KV output is not consumed in shared-KV mode and must remain
     // unwritten by every shared-KV path below.
     PluginTensorDesc const& kvCacheInputDesc = inputDesc[kIN_KV_CACHE_IDX];
-    rt::Tensor pastKVCacheTensor(const_cast<void*>(inputs[kIN_KV_CACHE_IDX]), rt::Coords{kvCacheInputDesc.dims},
-        rt::DeviceType::kGPU, kvCacheInputDesc.type);
+    // Paged engines keep the TensorRT binding descriptor at maxBatch so the
+    // physical page-table contract remains stable. Kernel helpers, however,
+    // operate on the active logical rows. Reinterpret the same pool pointer
+    // with runtimeBatchSize here; kvPageIds maps each active row to its stable
+    // physical pages and no cache data is copied.
+    rt::Coords const kvCacheViewShape = mEnablePagedKVCache
+        ? rt::Coords{runtimeBatchSize, 2, mNumKVHeads, kvCacheInputDesc.dims.d[3], mHeadSize}
+        : rt::Coords{kvCacheInputDesc.dims};
+    rt::Tensor pastKVCacheTensor(
+        const_cast<void*>(inputs[kIN_KV_CACHE_IDX]), kvCacheViewShape, rt::DeviceType::kGPU, kvCacheInputDesc.type);
     rt::Tensor presentKVCacheTensor(
-        outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+        outputs[kOUT_KV_CACHE_IDX], kvCacheViewShape, rt::DeviceType::kGPU, kvCacheInputDesc.type);
     rt::Tensor& kvCacheTensor = sharedKV ? pastKVCacheTensor : presentKVCacheTensor;
 
     // Extract KV cache capacity from the runtime tensor shape.

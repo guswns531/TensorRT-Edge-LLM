@@ -196,7 +196,10 @@ PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(uint64_t requestId
 {
     check::check(promptTokenCount > 0, "Phase request prompt length must be positive.");
     registerSource(requestId, context, contextRow);
-    PhaseAdmissionResult result{requestId, -1, PhaseAdmissionStatus::kPending};
+    PhaseAdmissionResult result{};
+    result.requestId = requestId;
+    result.kvSlotId = -1;
+    result.status = PhaseAdmissionStatus::kPending;
     result.availableSlots = mLifecycle->availableSlotCount();
     result.pendingQueueDepth = mPendingAdmissions.size();
     result.pagePool = mCacheManager.getPagedKVPoolStats();
@@ -240,7 +243,10 @@ void PhaseContextServingFacade::admitPendingRequests()
         mPendingAdmissions.pop_front();
         if (mCallbacks.onAdmission)
         {
-            PhaseAdmissionResult result{admission.requestId, slot, PhaseAdmissionStatus::kAdmitted};
+            PhaseAdmissionResult result{};
+            result.requestId = admission.requestId;
+            result.kvSlotId = slot;
+            result.status = PhaseAdmissionStatus::kAdmitted;
             result.availableSlots = mLifecycle->availableSlotCount();
             result.pendingQueueDepth = mPendingAdmissions.size();
             result.pagePool = mCacheManager.getPagedKVPoolStats();
