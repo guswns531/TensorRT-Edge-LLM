@@ -131,6 +131,37 @@ scenario median-of-medians가 TTFT 약 `-39~−40%`, TPOT 약 `-25%`, E2E 약 `-
 `prefill_prepare`, `prefill_cache_commit`, `decode_prepare`, `decode_sample`도 모든 mode에서
 sub-millisecond이며 두 cache 간 차이는 측정 노이즈 범위다.
 
+## Independent context를 주 경로로 볼 때의 해석
+
+실제 서비스 목표가 CUDA primary context 하나 + independent TensorRT execution context 두 개라면
+아래 20개 independent case를 주 성능표로 사용하고 `shared`는 회귀 확인용으로만 유지한다.
+
+| prefill cap | decode cap | linear TTFT med (ms) | paged TTFT med (ms) | linear TPOT med (ms) | paged TPOT med (ms) | paged tok/s / linear |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1210.5 | 1217.8 | 126.8 | 127.3 | 0.995 |
+| 1 | 2 | 303.8 | 310.2 | 64.8 | 65.1 | 0.996 |
+| 1 | 4 | 23.5 | 23.7 | 25.3 | 25.4 | 0.993 |
+| 1 | 8 | 23.6 | 23.1 | 10.0 | 10.0 | 1.000 |
+| 1 | 16 | 24.7 | 22.9 | 10.0 | 10.0 | 1.001 |
+
+prefill cap 2/4/8의 값은 위 cap 1과 거의 같지만, 이는 prefill cap이 실제로 포화되지 않았기
+때문이다. independent trace에서 관측된 prefill dispatch는 모든 cap에서 `BS=1` 56회였다.
+decode cap 16도 이 trace에서는 실제 최대 decode batch 9까지만 형성됐다. 따라서 이 실험으로
+`prefill BS=8` 또는 `decode BS=16`의 포화 비용을 결론 내릴 수는 없고, 더 높은 arrival rate와
+더 많은 동시 request/output length를 넣은 saturation trace가 필요하다.
+
+현재 trace에서 decode cap을 1→2→4→8로 키우는 효과는 크다(TPOT 약 127→65→25→10 ms).
+8→16은 이미 약 10 ms에서 plateau이므로 scheduler의 기본 decode cap은 8, reserve cap은
+16으로 두는 것이 합리적이다. prefill은 실제 BS1에서 약 23 ms 수준이며, prefill queue가
+쌓일 때만 cap 2/4/8을 사용하도록 admission window를 별도로 조정해야 한다.
+
+Independent 기준 indexed-paged의 평균 차이는 TTFT median `+0.10%`, TTFT p95 `+1.38%`,
+TPOT median `+0.54%`, TPOT p95 `+0.28%`, E2E median `+0.72%`, E2E p95 `+0.29%`,
+generated token/s `-0.27%`다. 따라서 independent 운영 기준에서는 paged KV의 실행 비용은
+사실상 동일하고, 선택 이유는 성능 향상보다 stable slot eviction과 page-pool memory 효율이다.
+TTFT p95의 최악 조합은 `p2_d4`에서 `+17.4%`였으나 median과 TPOT/E2E tail에는 재현되지 않아
+queue arrival noise로 분리해 기록한다.
+
 ### Page-pool pressure와 admission backpressure
 
 `page-pressure-model.csv`는 80-bundle pool, 128-token/page, 48-request trace에 대해
