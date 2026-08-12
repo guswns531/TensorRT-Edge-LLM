@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace trt_edgellm
 {
@@ -44,6 +45,24 @@ enum class PhaseAdmissionStatus
 {
     kAdmitted,
     kPending,
+};
+
+enum class PhasePageReservationMode
+{
+    //! Reserve the complete prompt plus maximum output at admission.
+    kFull,
+    //! Reserve the prompt plus a configurable output-token headroom.
+    kHeadroom,
+    //! Discount at most a configurable number of output page bundles.
+    kBoundedOvercommit,
+};
+
+struct PhasePageReservationConfig
+{
+    PhasePageReservationMode mode{PhasePageReservationMode::kFull};
+    int32_t outputHeadroomTokens{128};
+    int32_t maxOvercommitPageBundles{1};
+    int32_t maxConcurrentGrowthRequests{8};
 };
 
 struct PhaseAdmissionResult
@@ -112,6 +131,9 @@ public:
     PhaseContextServingFacade(PhaseContextServingFacade&&) = delete;
     PhaseContextServingFacade& operator=(PhaseContextServingFacade&&) = delete;
 
+    //! Configure admission reservation before the first request is registered.
+    void configurePageReservation(PhasePageReservationConfig config);
+
     //! Register a borrowed source row and reserve its stable physical KV slot.
     //! The source context must remain alive until terminal completion or cancellation.
     //! @return The leased physical KV slot ID.
@@ -148,6 +170,12 @@ public:
     void removeTerminalObserver(size_t observerId) noexcept;
 
 private:
+    struct PageBundleReservation
+    {
+        int32_t baseBundles{};
+        int32_t fullBundles{};
+    };
+
     struct Registration
     {
         DecodingInferenceContext* context{};
@@ -158,7 +186,7 @@ private:
     {
         uint64_t requestId{};
         int32_t promptTokenCount{};
-        int32_t requiredPageBundles{};
+        PageBundleReservation pageReservation;
         PhaseSchedulingHints scheduling;
     };
 
@@ -168,13 +196,17 @@ private:
     void completeDecodeBatch(std::vector<PhaseWorkItem> const& batch);
     void registerSource(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow);
     void admitPendingRequests();
-    int32_t requiredPageBundles(
+    PageBundleReservation makePageBundleReservation(
         DecodingInferenceContext const& context, int32_t contextRow, int32_t promptTokenCount) const;
-    bool hasPageReservationCapacity(int32_t requiredBundles) const noexcept;
-    void reservePageBundles(uint64_t requestId, int32_t requiredBundles);
-    void resizePageBundleReservation(uint64_t requestId, int32_t requiredBundles);
+    bool hasPageReservationCapacity(PageBundleReservation const& reservation) const;
+    int32_t guaranteedPageBundles() const;
+    int32_t guaranteedPageBundlesWithReplacement(uint64_t requestId, PageBundleReservation replacement) const;
+    void reservePageBundles(uint64_t requestId, PageBundleReservation reservation);
+    void resizePageBundleReservation(uint64_t requestId, PageBundleReservation reservation);
     void releasePageBundles(uint64_t requestId);
-    void updateAdmissionPageReservation(PhaseAdmissionResult& result) const noexcept;
+    void selectDrainOwners();
+    bool isPageWorkEligible(PhaseWorkItem const& item, bool prefill) const;
+    void updateAdmissionPageReservation(PhaseAdmissionResult& result) const;
     Registration& registration(uint64_t requestId);
     Registration const& registration(uint64_t requestId) const;
 
@@ -185,9 +217,11 @@ private:
     std::unique_ptr<PhasePrefillContextBatchAdapter> mPrefillAdapter;
     PhaseContextBatchAdapter mDecodeAdapter;
     std::unordered_map<uint64_t, Registration> mRegistrations;
-    std::unordered_map<uint64_t, int32_t> mPageBundleReservations;
+    std::unordered_map<uint64_t, PageBundleReservation> mPageBundleReservations;
     std::deque<PendingAdmission> mPendingAdmissions;
-    int32_t mReservedPageBundles{};
+    int32_t mBaseReservedPageBundles{};
+    std::unordered_set<uint64_t> mDrainRequestIds;
+    PhasePageReservationConfig mPageReservationConfig;
     size_t mMaxPendingAdmissions{};
     bool mPendingAdmissionRequired{};
     size_t mNextTerminalObserverId{1};

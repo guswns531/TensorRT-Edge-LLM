@@ -1203,6 +1203,78 @@ TEST(PhaseContextServingFacadeTest, AppliesWholeRequestPagedKVAdmissionBackpress
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
+TEST(PhaseContextServingFacadeTest, HeadroomPolicyAdmitsMoreRequestsWithOneDrainLease)
+{
+    constexpr int32_t kSLOT_COUNT = 3;
+    constexpr int32_t kPAGE_BUNDLES = 4;
+    constexpr int32_t kPROMPT_TOKENS = 64;
+    constexpr int32_t kOUTPUT_TOKENS = 192;
+    rt::HybridCacheManager cacheManager = makeIndexedPagedManager(kSLOT_COUNT, kPAGE_BUNDLES);
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    rt::TensorMap decodeTensorMap;
+    decodeTensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
+    decodeTensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+    std::array<rt::DecodingInferenceContext, kSLOT_COUNT> contexts;
+    for (rt::DecodingInferenceContext& context : contexts)
+    {
+        context.initialize(1, kOUTPUT_TOKENS, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+        context.rawBatchedInputIds = {{1}};
+        context.tokenIds = context.rawBatchedInputIds;
+    }
+
+    rt::PhaseContextServingCallbacks callbacks;
+    callbacks.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.promptTokenCount; };
+    callbacks.enqueueDecode = [](rt::DecodingInferenceContext&) {};
+    callbacks.completeDecode = [](rt::DecodingInferenceContext&) {};
+
+    rt::PhaseQueueSchedulerConfig schedulerConfig;
+    schedulerConfig.maxPrefillBatchSize = kSLOT_COUNT;
+    schedulerConfig.maxDecodeBatchSize = kSLOT_COUNT;
+    schedulerConfig.maxPrefillChunkTokens = kPROMPT_TOKENS;
+    rt::PhaseContextServingFacade facade(kSLOT_COUNT, schedulerConfig, std::move(callbacks), cacheManager,
+        decodeTensorMap, prefillStream, decodeStream, rt::PhaseTensorRTContextMode::kSharedSerialized, nullptr, 0,
+        kSLOT_COUNT);
+    facade.configurePageReservation({rt::PhasePageReservationMode::kHeadroom, 0, 0, 1});
+
+    EXPECT_EQ(facade.submitOrQueue(101, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(102, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    rt::PhaseAdmissionResult const third = facade.submitOrQueue(103, contexts[2], 0, kPROMPT_TOKENS);
+    EXPECT_EQ(third.status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(third.reservedPageBundles, kPAGE_BUNDLES);
+    EXPECT_EQ(third.reservationAvailableBundles, 0);
+    EXPECT_EQ(facade.pendingRequestCount(), 0U);
+
+    EXPECT_TRUE(facade.cancel(103));
+    EXPECT_TRUE(facade.cancel(102));
+    EXPECT_TRUE(facade.cancel(101));
+    EXPECT_TRUE(facade.empty());
+    EXPECT_EQ(cacheManager.getPagedKVPoolStats().allocatedBundles, 0);
+
+    facade.configurePageReservation({rt::PhasePageReservationMode::kBoundedOvercommit, 0, 1, 1});
+    EXPECT_EQ(facade.submitOrQueue(201, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(202, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(203, contexts[2], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_TRUE(facade.cancel(203));
+    EXPECT_TRUE(facade.cancel(202));
+    EXPECT_TRUE(facade.cancel(201));
+
+    facade.configurePageReservation({rt::PhasePageReservationMode::kHeadroom, 0, 0, 2});
+    EXPECT_EQ(facade.submitOrQueue(301, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(302, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(303, contexts[2], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kPending);
+    EXPECT_TRUE(facade.cancel(303));
+    EXPECT_TRUE(facade.cancel(302));
+    EXPECT_TRUE(facade.cancel(301));
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
 TEST(PhaseContextServingFacadeTest, KeepsStableSlotsWhileDecodeBatchShrinksFourToOne)
 {
     constexpr int32_t kSlotCount = 4;

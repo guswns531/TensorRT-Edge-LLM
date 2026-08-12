@@ -39,6 +39,7 @@ PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseContextSe
     , mRequestStream(requestStream)
 {
     check::check(mConfig.maxInFlightRequests > 0, "Async server maxInFlightRequests must be positive.");
+    mServingFacade.configurePageReservation(mConfig.pageReservation);
     check::check(mRequestStream != nullptr, "Async server requires an explicit request CUDA stream.");
     CUcontext requestContext{};
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mRequestStream, &requestContext));
@@ -60,6 +61,7 @@ PhaseAsyncServer::PhaseAsyncServer(PhaseAsyncServerConfig config, PhaseOnlineCoo
     , mVisionAdapter(visionAdapter)
 {
     check::check(mConfig.maxInFlightRequests > 0, "Async server maxInFlightRequests must be positive.");
+    mServingFacade.configurePageReservation(mConfig.pageReservation);
     check::check(mRequestStream != nullptr, "Async server requires an explicit request CUDA stream.");
     CUcontext requestContext{};
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mRequestStream, &requestContext));

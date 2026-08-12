@@ -18,10 +18,9 @@
 The runner deliberately invokes the existing ``llm_phase_bench`` executable so
 request admission, batching, CUDA-event timing, and TensorRT context ownership
 are measured by the production path.  A single materialized trace is reused for
-every engine/context/batch case.  Paged-pool pressure is reported by a
-conservative host model after each run: it reserves enough 128-token bundles for
-the complete requested output of each admitted request.  This is an admission
-policy model, not a claim that the current runtime already blocks on pages.
+every engine/context/batch case. Paged-pool pressure includes both the runtime's
+selected admission policy and a conservative host model that reserves the
+complete requested output.
 """
 
 import argparse
@@ -158,6 +157,14 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         str(args.arrival_rate),
         "--kernelGroupCsv",
         str(case_dir / "kernel-groups.csv"),
+        "--pageReservationMode",
+        args.page_reservation_mode,
+        "--pageReservationHeadroomTokens",
+        str(args.page_reservation_headroom_tokens),
+        "--pageReservationOvercommitBundles",
+        str(args.page_reservation_overcommit_bundles),
+        "--pageReservationGrowthRequests",
+        str(args.page_reservation_growth_requests),
     ]
     if args.cuda_graph:
         if case.context_mode != "independent":
@@ -513,6 +520,25 @@ def main() -> None:
         "--adaptive-scheduler",
         action="store_true",
         help="enable the CUDA-event/SLO/page-pressure phase selector")
+    parser.add_argument("--page-reservation-mode",
+                        choices=("full", "headroom", "bounded-overcommit"),
+                        default="full",
+                        help="runtime KV page admission reservation policy")
+    parser.add_argument(
+        "--page-reservation-headroom-tokens",
+        type=int,
+        default=128,
+        help="output tokens guaranteed per request in headroom mode")
+    parser.add_argument(
+        "--page-reservation-overcommit-bundles",
+        type=int,
+        default=1,
+        help="maximum page bundles discounted per request in bounded mode")
+    parser.add_argument(
+        "--page-reservation-growth-requests",
+        type=int,
+        default=8,
+        help="requests allowed to grow beyond their base reservation together")
     args = parser.parse_args()
 
     if args.slot_count <= 0 or args.page_bundles <= 0 or args.tokens_per_page <= 0:
@@ -534,6 +560,10 @@ def main() -> None:
     if args.cuda_graph_reserve_mib < 0 or args.prefill_token_budget < 0:
         parser.error(
             "CUDA graph reserve and prefill token budget must be non-negative")
+    if (args.page_reservation_headroom_tokens < 0
+            or args.page_reservation_overcommit_bundles < 0
+            or args.page_reservation_growth_requests <= 0):
+        parser.error("page reservation policy values must be non-negative")
     if args.dynamic_decode_batching and args.scheduler_cost_json is None:
         parser.error(
             "--dynamic-decode-batching requires --scheduler-cost-json")
@@ -617,6 +647,14 @@ def main() -> None:
                 str(args.scheduler_cost_json or ""),
                 "adaptive_scheduler":
                 args.adaptive_scheduler,
+                "page_reservation_mode":
+                args.page_reservation_mode,
+                "page_reservation_headroom_tokens":
+                args.page_reservation_headroom_tokens,
+                "page_reservation_overcommit_bundles":
+                args.page_reservation_overcommit_bundles,
+                "page_reservation_growth_requests":
+                args.page_reservation_growth_requests,
                 "log":
                 str(log_path),
             }

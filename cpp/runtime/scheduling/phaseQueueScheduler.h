@@ -127,6 +127,7 @@ struct PhaseQueueSnapshot
 using PhaseSchedulingPolicy = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&)>;
 using PhaseMetricsSchedulingPolicy
     = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&, PhaseSchedulerTelemetry const&)>;
+using PhaseWorkEligibilityPolicy = std::function<bool(PhaseWorkItem const&, bool prefill)>;
 
 //! Conservative decode cost point loaded from offline CUDA-event profiling.
 //! maxContextLength is the largest per-request KV length covered by the point.
@@ -190,6 +191,9 @@ struct PhaseQueueSchedulerConfig
     PhaseMetricsSchedulingPolicy metricsPolicy{};
     //! Legacy queue-only policy, used when metrics policy is disabled.
     PhaseSchedulingPolicy policy{};
+    //! Optional admission-growth gate. Ineligible work remains queued and keeps
+    //! its residence timestamp until the cache owner permits further growth.
+    PhaseWorkEligibilityPolicy eligibilityPolicy{};
 };
 
 struct PhaseDispatchPlan
@@ -246,6 +250,7 @@ private:
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
+    bool isEligible(PhaseWorkItem const& item, bool prefill) const;
     std::vector<PhaseWorkItem> popBatch(
         std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill, double& queueWaitUs);
     void enqueueKnownPrefill(PhaseWorkItem item);

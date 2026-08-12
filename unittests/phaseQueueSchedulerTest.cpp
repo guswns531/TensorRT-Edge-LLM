@@ -455,6 +455,32 @@ TEST(PhaseQueueSchedulerTest, KeepsInFlightRequestUnique)
     EXPECT_THROW(scheduler.enqueueDecode({7, 32}), std::runtime_error);
 }
 
+TEST(PhaseQueueSchedulerTest, KeepsIneligibleWorkQueuedUntilItsGrowthLeaseOpens)
+{
+    uint64_t eligibleRequest{2};
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.eligibilityPolicy = [&](PhaseWorkItem const& item, bool prefill) {
+        EXPECT_TRUE(prefill);
+        return item.requestId == eligibleRequest;
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueuePrefill({2, 32});
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    EXPECT_EQ(first.prefillBatch.front().requestId, 2U);
+    scheduler.completePrefill(first.prefillBatch.front(), 32, true);
+
+    eligibleRequest = 1;
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch.front().requestId, 1U);
+    scheduler.completePrefill(second.prefillBatch.front(), 32, true);
+    EXPECT_TRUE(scheduler.empty());
+}
+
 } // namespace
 } // namespace rt
 } // namespace trt_edgellm

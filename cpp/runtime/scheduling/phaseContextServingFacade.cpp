@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -65,8 +66,22 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
         "Legacy serving decode completion callback is required.");
     check::check(!usesPackedDecode || static_cast<bool>(mCallbacks.completePackedDecode),
         "Packed serving decode completion callback is required.");
+    PhaseWorkEligibilityPolicy const configuredEligibility = std::move(schedulerConfig.eligibilityPolicy);
+    schedulerConfig.eligibilityPolicy = [this, configuredEligibility](PhaseWorkItem const& item, bool prefill) {
+        return (!configuredEligibility || configuredEligibility(item, prefill)) && isPageWorkEligible(item, prefill);
+    };
     mLifecycle = std::make_unique<PhaseRequestLifecycle>(maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(),
         prefillStream, decodeStream, executionMode, safetyContract);
+}
+
+void PhaseContextServingFacade::configurePageReservation(PhasePageReservationConfig config)
+{
+    check::check(mRegistrations.empty() && mPendingAdmissions.empty() && mPageBundleReservations.empty(),
+        "Serving page reservation must be configured before request admission.");
+    check::check(config.outputHeadroomTokens >= 0, "Serving output page headroom cannot be negative.");
+    check::check(config.maxOvercommitPageBundles >= 0, "Serving page overcommit bound cannot be negative.");
+    check::check(config.maxConcurrentGrowthRequests > 0, "Serving concurrent page growth limit must be positive.");
+    mPageReservationConfig = config;
 }
 
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()
@@ -150,12 +165,12 @@ void PhaseContextServingFacade::registerSource(
     mRegistrations.emplace(requestId, Registration{&context, contextRow});
 }
 
-int32_t PhaseContextServingFacade::requiredPageBundles(
+PhaseContextServingFacade::PageBundleReservation PhaseContextServingFacade::makePageBundleReservation(
     DecodingInferenceContext const& context, int32_t contextRow, int32_t promptTokenCount) const
 {
     if (!mCacheManager.isPagedKVCache())
     {
-        return 0;
+        return {};
     }
     check::check(contextRow >= 0 && contextRow < context.activeBatchSize,
         "Serving page reservation row is outside the active request context.");
@@ -163,34 +178,106 @@ int32_t PhaseContextServingFacade::requiredPageBundles(
     int64_t const sequenceLength = static_cast<int64_t>(promptTokenCount) + context.maxGenerateLength;
     check::check(
         sequenceLength <= std::numeric_limits<int32_t>::max(), "Serving page reservation sequence length overflowed.");
-    return mCacheManager.getPagedKVRequiredBundles(static_cast<int32_t>(sequenceLength));
+    int32_t const fullBundles = mCacheManager.getPagedKVRequiredBundles(static_cast<int32_t>(sequenceLength));
+    int32_t const promptBundles = mCacheManager.getPagedKVRequiredBundles(promptTokenCount);
+    int32_t baseBundles = fullBundles;
+    switch (mPageReservationConfig.mode)
+    {
+    case PhasePageReservationMode::kFull: break;
+    case PhasePageReservationMode::kHeadroom:
+    {
+        int32_t const headroom = std::min(context.maxGenerateLength, mPageReservationConfig.outputHeadroomTokens);
+        baseBundles = mCacheManager.getPagedKVRequiredBundles(promptTokenCount + headroom);
+        break;
+    }
+    case PhasePageReservationMode::kBoundedOvercommit:
+        baseBundles = std::max(promptBundles, fullBundles - mPageReservationConfig.maxOvercommitPageBundles);
+        break;
+    }
+    return {baseBundles, fullBundles};
 }
 
-bool PhaseContextServingFacade::hasPageReservationCapacity(int32_t requiredBundles) const noexcept
+int32_t PhaseContextServingFacade::guaranteedPageBundles() const
+{
+    std::vector<int32_t> tails;
+    tails.reserve(mPageBundleReservations.size());
+    for (auto const& [requestId, reservation] : mPageBundleReservations)
+    {
+        static_cast<void>(requestId);
+        tails.push_back(reservation.fullBundles - reservation.baseBundles);
+    }
+    std::sort(tails.begin(), tails.end(), std::greater<int32_t>());
+    int32_t const growthCount = std::min<int32_t>(mPageReservationConfig.maxConcurrentGrowthRequests, tails.size());
+    return mBaseReservedPageBundles + std::accumulate(tails.begin(), tails.begin() + growthCount, 0);
+}
+
+int32_t PhaseContextServingFacade::guaranteedPageBundlesWithReplacement(
+    uint64_t replacedRequestId, PageBundleReservation replacement) const
+{
+    int32_t guaranteed = mBaseReservedPageBundles;
+    auto const previous = mPageBundleReservations.find(replacedRequestId);
+    check::check(previous != mPageBundleReservations.end(), "Replacement page reservation request is not active.");
+    guaranteed += replacement.baseBundles - previous->second.baseBundles;
+    std::vector<int32_t> tails;
+    tails.reserve(mPageBundleReservations.size());
+    for (auto const& [requestId, reservation] : mPageBundleReservations)
+    {
+        PageBundleReservation const& selected = requestId == replacedRequestId ? replacement : reservation;
+        tails.push_back(selected.fullBundles - selected.baseBundles);
+    }
+    std::sort(tails.begin(), tails.end(), std::greater<int32_t>());
+    int32_t const growthCount = std::min<int32_t>(mPageReservationConfig.maxConcurrentGrowthRequests, tails.size());
+    guaranteed += std::accumulate(tails.begin(), tails.begin() + growthCount, 0);
+    return guaranteed;
+}
+
+bool PhaseContextServingFacade::hasPageReservationCapacity(PageBundleReservation const& reservation) const
 {
     KVPagePoolStats const pagePool = mCacheManager.getPagedKVPoolStats();
-    return pagePool.totalBundles == 0 || mReservedPageBundles + requiredBundles <= pagePool.totalBundles;
+    std::vector<int32_t> tails;
+    tails.reserve(mPageBundleReservations.size() + 1);
+    tails.push_back(reservation.fullBundles - reservation.baseBundles);
+    for (auto const& [requestId, active] : mPageBundleReservations)
+    {
+        static_cast<void>(requestId);
+        tails.push_back(active.fullBundles - active.baseBundles);
+    }
+    std::sort(tails.begin(), tails.end(), std::greater<int32_t>());
+    int32_t const growthCount = std::min<int32_t>(mPageReservationConfig.maxConcurrentGrowthRequests, tails.size());
+    int32_t const guaranteed = mBaseReservedPageBundles + reservation.baseBundles
+        + std::accumulate(tails.begin(), tails.begin() + growthCount, 0);
+    return pagePool.totalBundles == 0 || guaranteed <= pagePool.totalBundles;
 }
 
-void PhaseContextServingFacade::reservePageBundles(uint64_t requestId, int32_t requiredBundles)
+void PhaseContextServingFacade::reservePageBundles(uint64_t requestId, PageBundleReservation reservation)
 {
-    check::check(requiredBundles >= 0, "Serving page reservation cannot be negative.");
-    check::check(hasPageReservationCapacity(requiredBundles), "Serving paged KV admission capacity is exhausted.");
-    check::check(mPageBundleReservations.emplace(requestId, requiredBundles).second,
+    check::check(reservation.baseBundles >= 0 && reservation.fullBundles >= reservation.baseBundles,
+        "Serving page reservation is invalid.");
+    check::check(hasPageReservationCapacity(reservation), "Serving paged KV admission capacity is exhausted.");
+    check::check(mPageBundleReservations.emplace(requestId, reservation).second,
         "Serving request already owns a paged KV admission reservation.");
-    mReservedPageBundles += requiredBundles;
+    mBaseReservedPageBundles += reservation.baseBundles;
+    selectDrainOwners();
 }
 
-void PhaseContextServingFacade::resizePageBundleReservation(uint64_t requestId, int32_t requiredBundles)
+void PhaseContextServingFacade::resizePageBundleReservation(uint64_t requestId, PageBundleReservation replacement)
 {
     auto const reservation = mPageBundleReservations.find(requestId);
     check::check(reservation != mPageBundleReservations.end(), "Serving request has no paged KV reservation.");
-    int32_t const difference = requiredBundles - reservation->second;
-    check::check(difference <= 0 || hasPageReservationCapacity(difference),
+    check::check(replacement.baseBundles >= 0 && replacement.fullBundles >= replacement.baseBundles,
+        "Serving replacement page reservation is invalid.");
+    KVPagePoolStats const pagePool = mCacheManager.getPagedKVPoolStats();
+    check::check(pagePool.totalBundles == 0
+            || guaranteedPageBundlesWithReplacement(requestId, replacement) <= pagePool.totalBundles,
         "Serving encoder handoff exceeds the available paged KV reservation capacity.");
-    check::check(mReservedPageBundles + difference >= 0, "Serving paged KV reservation accounting underflowed.");
-    reservation->second = requiredBundles;
-    mReservedPageBundles += difference;
+    mBaseReservedPageBundles += replacement.baseBundles - reservation->second.baseBundles;
+    check::check(mBaseReservedPageBundles >= 0, "Serving paged KV reservation accounting underflowed.");
+    reservation->second = replacement;
+    if (replacement.fullBundles == replacement.baseBundles)
+    {
+        mDrainRequestIds.erase(requestId);
+    }
+    selectDrainOwners();
 }
 
 void PhaseContextServingFacade::releasePageBundles(uint64_t requestId)
@@ -200,26 +287,83 @@ void PhaseContextServingFacade::releasePageBundles(uint64_t requestId)
     {
         return;
     }
-    check::check(mReservedPageBundles >= reservation->second, "Serving paged KV reservation accounting underflowed.");
-    mReservedPageBundles -= reservation->second;
+    check::check(mBaseReservedPageBundles >= reservation->second.baseBundles,
+        "Serving paged KV reservation accounting underflowed.");
+    mBaseReservedPageBundles -= reservation->second.baseBundles;
+    mDrainRequestIds.erase(requestId);
     mPageBundleReservations.erase(reservation);
+    selectDrainOwners();
 }
 
-void PhaseContextServingFacade::updateAdmissionPageReservation(PhaseAdmissionResult& result) const noexcept
+void PhaseContextServingFacade::selectDrainOwners()
+{
+    for (auto owner = mDrainRequestIds.begin(); owner != mDrainRequestIds.end();)
+    {
+        auto const reservation = mPageBundleReservations.find(*owner);
+        if (reservation == mPageBundleReservations.end()
+            || reservation->second.fullBundles == reservation->second.baseBundles)
+        {
+            owner = mDrainRequestIds.erase(owner);
+        }
+        else
+        {
+            ++owner;
+        }
+    }
+    std::vector<std::pair<int32_t, uint64_t>> candidates;
+    candidates.reserve(mPageBundleReservations.size() - mDrainRequestIds.size());
+    for (auto const& [requestId, reservation] : mPageBundleReservations)
+    {
+        int32_t const tail = reservation.fullBundles - reservation.baseBundles;
+        if (tail > 0 && mDrainRequestIds.find(requestId) == mDrainRequestIds.end())
+        {
+            candidates.emplace_back(tail, requestId);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](auto const& left, auto const& right) {
+        return left.first > right.first || (left.first == right.first && left.second < right.second);
+    });
+    int32_t const availableGrowthLeases
+        = mPageReservationConfig.maxConcurrentGrowthRequests - static_cast<int32_t>(mDrainRequestIds.size());
+    int32_t const growthCount = std::min<int32_t>(availableGrowthLeases, candidates.size());
+    for (int32_t index{}; index < growthCount; ++index)
+    {
+        mDrainRequestIds.insert(candidates[static_cast<size_t>(index)].second);
+    }
+}
+
+bool PhaseContextServingFacade::isPageWorkEligible(PhaseWorkItem const& item, bool prefill) const
+{
+    if (!mCacheManager.isPagedKVCache())
+    {
+        return true;
+    }
+    auto const reservation = mPageBundleReservations.find(item.requestId);
+    check::check(reservation != mPageBundleReservations.end(), "Queued phase work has no paged KV reservation.");
+    int32_t const targetTokens = prefill ? item.promptTokenCount : item.tokenCount + 1;
+    int32_t const targetBundles = mCacheManager.getPagedKVRequiredBundles(targetTokens);
+    int32_t const limit = mDrainRequestIds.find(item.requestId) != mDrainRequestIds.end()
+        ? reservation->second.fullBundles
+        : reservation->second.baseBundles;
+    return targetBundles <= limit;
+}
+
+void PhaseContextServingFacade::updateAdmissionPageReservation(PhaseAdmissionResult& result) const
 {
     KVPagePoolStats const pagePool = mCacheManager.getPagedKVPoolStats();
-    result.reservedPageBundles = mReservedPageBundles;
-    result.reservationAvailableBundles = pagePool.totalBundles > 0 ? pagePool.totalBundles - mReservedPageBundles : 0;
+    result.reservedPageBundles = guaranteedPageBundles();
+    result.reservationAvailableBundles
+        = pagePool.totalBundles > 0 ? pagePool.totalBundles - result.reservedPageBundles : 0;
 }
 
 int32_t PhaseContextServingFacade::submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
     int32_t promptTokenCount, PhaseSchedulingHints scheduling)
 {
     registerSource(requestId, context, contextRow);
-    int32_t const pageBundles = requiredPageBundles(context, contextRow, promptTokenCount);
+    PageBundleReservation const pageReservation = makePageBundleReservation(context, contextRow, promptTokenCount);
     try
     {
-        reservePageBundles(requestId, pageBundles);
+        reservePageBundles(requestId, pageReservation);
         return mLifecycle->submit(requestId, promptTokenCount, scheduling);
     }
     catch (...)
@@ -234,10 +378,11 @@ int32_t PhaseContextServingFacade::reserveForEncoder(uint64_t requestId, Decodin
     int32_t contextRow, int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling)
 {
     registerSource(requestId, context, contextRow);
-    int32_t const pageBundles = requiredPageBundles(context, contextRow, promptTokenCountEstimate);
+    PageBundleReservation const pageReservation
+        = makePageBundleReservation(context, contextRow, promptTokenCountEstimate);
     try
     {
-        reservePageBundles(requestId, pageBundles);
+        reservePageBundles(requestId, pageReservation);
         return mLifecycle->reserveForEncoder(requestId, promptTokenCountEstimate, scheduling);
     }
     catch (...)
@@ -260,7 +405,7 @@ void PhaseContextServingFacade::beginPrefillAfterEncoder(PhaseWorkItem const& it
     check::check(promptTokenCount == item.tokenCount, "Encoder handoff must provide the complete prompt in V1.");
     Registration const& source = registration(item.requestId);
     resizePageBundleReservation(
-        item.requestId, requiredPageBundles(*source.context, source.contextRow, promptTokenCount));
+        item.requestId, makePageBundleReservation(*source.context, source.contextRow, promptTokenCount));
     mLifecycle->beginPrefill(item.requestId, promptTokenCount, item.allowChunkedPrefill);
 }
 
@@ -276,21 +421,21 @@ PhaseAdmissionResult PhaseContextServingFacade::submitOrQueue(uint64_t requestId
     result.availableSlots = mLifecycle->availableSlotCount();
     result.pendingQueueDepth = mPendingAdmissions.size();
     result.pagePool = mCacheManager.getPagedKVPoolStats();
-    int32_t const pageBundles = requiredPageBundles(context, contextRow, promptTokenCount);
-    check::check(result.pagePool.totalBundles == 0 || pageBundles <= result.pagePool.totalBundles,
+    PageBundleReservation const pageReservation = makePageBundleReservation(context, contextRow, promptTokenCount);
+    check::check(result.pagePool.totalBundles == 0 || pageReservation.fullBundles <= result.pagePool.totalBundles,
         "Serving request exceeds the complete paged KV pool capacity.");
     try
     {
-        if (result.availableSlots > 0 && hasPageReservationCapacity(pageBundles))
+        if (result.availableSlots > 0 && hasPageReservationCapacity(pageReservation))
         {
-            reservePageBundles(requestId, pageBundles);
+            reservePageBundles(requestId, pageReservation);
             result.kvSlotId = mLifecycle->submit(requestId, promptTokenCount, scheduling);
             result.status = PhaseAdmissionStatus::kAdmitted;
         }
         else
         {
             check::check(mPendingAdmissions.size() < mMaxPendingAdmissions, "Serving pending admission queue is full.");
-            mPendingAdmissions.push_back({requestId, promptTokenCount, pageBundles, scheduling});
+            mPendingAdmissions.push_back({requestId, promptTokenCount, pageReservation, scheduling});
         }
     }
     catch (...)
@@ -317,10 +462,10 @@ void PhaseContextServingFacade::admitPendingRequests()
     }
     mPendingAdmissionRequired = false;
     while (!mPendingAdmissions.empty() && mLifecycle->availableSlotCount() > 0
-        && hasPageReservationCapacity(mPendingAdmissions.front().requiredPageBundles))
+        && hasPageReservationCapacity(mPendingAdmissions.front().pageReservation))
     {
         PendingAdmission const admission = mPendingAdmissions.front();
-        reservePageBundles(admission.requestId, admission.requiredPageBundles);
+        reservePageBundles(admission.requestId, admission.pageReservation);
         int32_t slot{};
         try
         {

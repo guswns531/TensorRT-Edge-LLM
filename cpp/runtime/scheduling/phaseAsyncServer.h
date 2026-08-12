@@ -40,6 +40,8 @@ struct PhaseAsyncServerConfig
 {
     //! Total requests owned by the server, including GPU work and admission queues.
     size_t maxInFlightRequests{};
+    //! Whole-request KV admission policy shared by text and multimodal requests.
+    PhasePageReservationConfig pageReservation;
 };
 
 struct PhaseAsyncSubmission

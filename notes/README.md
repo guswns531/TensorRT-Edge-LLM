@@ -66,6 +66,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 44. [Cosmos 구현 및 vLLM 비교 계획](65-cosmos-vllm-implementation-comparison-plan-20260812.md)
 45. [계획 구현 상태와 다음 실험](66-implementation-status-20260812.md)
 46. [Cosmos dynamic scheduler 구현 및 비교 결과](67-cosmos-dynamic-scheduler-results-20260812.md)
+47. [Cosmos paged-KV reservation 정책 구현과 실험](68-cosmos-page-reservation-policies-20260812.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.

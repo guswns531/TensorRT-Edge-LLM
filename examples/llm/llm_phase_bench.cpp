@@ -118,6 +118,10 @@ struct Args
     int32_t cudaGraphReserveMiB{};
     int32_t prefillTokenBudget{};
     bool dynamicDecodeBatching{};
+    rt::PhasePageReservationMode pageReservationMode{rt::PhasePageReservationMode::kFull};
+    int32_t pageReservationHeadroomTokens{128};
+    int32_t pageReservationOvercommitBundles{1};
+    int32_t pageReservationGrowthRequests{8};
 };
 
 struct Sample
@@ -275,6 +279,9 @@ void printUsage(char const* program)
         "[--dynamicDecodeBatching --schedulerCostJson FILE] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
+        "[--pageReservationMode full|headroom|bounded-overcommit "
+        "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
+        "--pageReservationGrowthRequests N] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
         "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --ttftTargetMs F --tpotTargetMs F "
         "--loadPriorityClasses N --loadSeed N --loadCsv FILE]",
@@ -329,6 +336,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         kMultimodalEngineDir,
         kTraceCsv,
         kTraceArrivalRate,
+        kPageReservationMode,
+        kPageReservationHeadroomTokens,
+        kPageReservationOvercommitBundles,
+        kPageReservationGrowthRequests,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -369,7 +380,12 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"inputFile", required_argument, nullptr, kInputFile},
         {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
         {"traceCsv", required_argument, nullptr, kTraceCsv},
-        {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate}, {"help", no_argument, nullptr, kHelp}, {}};
+        {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
+        {"pageReservationMode", required_argument, nullptr, kPageReservationMode},
+        {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
+        {"pageReservationOvercommitBundles", required_argument, nullptr, kPageReservationOvercommitBundles},
+        {"pageReservationGrowthRequests", required_argument, nullptr, kPageReservationGrowthRequests},
+        {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
     while ((optionId = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -436,6 +452,30 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kMultimodalEngineDir: args.multimodalEngineDir = optarg; break;
         case kTraceCsv: args.traceCsv = optarg; break;
         case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
+        case kPageReservationMode:
+        {
+            std::string const mode{optarg};
+            if (mode == "full")
+            {
+                args.pageReservationMode = rt::PhasePageReservationMode::kFull;
+            }
+            else if (mode == "headroom")
+            {
+                args.pageReservationMode = rt::PhasePageReservationMode::kHeadroom;
+            }
+            else if (mode == "bounded-overcommit")
+            {
+                args.pageReservationMode = rt::PhasePageReservationMode::kBoundedOvercommit;
+            }
+            else
+            {
+                return false;
+            }
+            break;
+        }
+        case kPageReservationHeadroomTokens: args.pageReservationHeadroomTokens = std::stoi(optarg); break;
+        case kPageReservationOvercommitBundles: args.pageReservationOvercommitBundles = std::stoi(optarg); break;
+        case kPageReservationGrowthRequests: args.pageReservationGrowthRequests = std::stoi(optarg); break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -450,7 +490,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0 && args.maxDecodeCudaGraphs >= -1
         && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1
         && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0
-        && (!args.dynamicDecodeBatching || !args.schedulerCostJson.empty())
+        && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
+        && args.pageReservationGrowthRequests > 0 && (!args.dynamicDecodeBatching || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty());
 }
 
@@ -1576,7 +1617,11 @@ int main(int argc, char** argv)
                 LOG_INFO("Text-only phase topology: CUDA=%p prefill=%p decode=%p",
                     static_cast<void*>(prefillCudaContext), prefillRunner->getExecutionContextIdentity(),
                     decodeRunner->getExecutionContextIdentity());
-                rt::PhaseAsyncServer server({traceRequests.size()}, facade, tokenizer, prefillStream);
+                rt::PhaseAsyncServerConfig serverConfig;
+                serverConfig.maxInFlightRequests = traceRequests.size();
+                serverConfig.pageReservation = {args.pageReservationMode, args.pageReservationHeadroomTokens,
+                    args.pageReservationOvercommitBundles, args.pageReservationGrowthRequests};
+                rt::PhaseAsyncServer server(serverConfig, facade, tokenizer, prefillStream);
                 runTrace(server);
             }
             else
@@ -1622,7 +1667,11 @@ int main(int argc, char** argv)
                         [&](rt::PhaseWorkItem const& item) { facade.beginPrefillAfterEncoder(item); }, encoderStream,
                         std::move(encoderSafety));
                     rt::PhaseOnlineCoordinator coordinator(encoderWorker, facade);
-                    rt::PhaseAsyncServer server({traceRequests.size()}, coordinator, encoderWorker, facade, tokenizer,
+                    rt::PhaseAsyncServerConfig serverConfig;
+                    serverConfig.maxInFlightRequests = traceRequests.size();
+                    serverConfig.pageReservation = {args.pageReservationMode, args.pageReservationHeadroomTokens,
+                        args.pageReservationOvercommitBundles, args.pageReservationGrowthRequests};
+                    rt::PhaseAsyncServer server(serverConfig, coordinator, encoderWorker, facade, tokenizer,
                         prefillStream, visionAdapter.get());
                     runTrace(server);
                     ELLM_CHECK(encoderWorker.empty(), "Real phase trace did not drain the encoder queue");

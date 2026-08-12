@@ -148,28 +148,36 @@ void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
 PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
 {
     PhaseQueueSnapshot result{};
-    result.prefillQueued = mPrefillQueue.size();
-    result.decodeQueued = mDecodeQueue.size();
     result.consecutiveDecodeBatches = mConsecutiveDecodeBatches;
-    if (!mPrefillQueue.empty())
+    auto const prefillSeed = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(),
+        [this](PhaseWorkItem const& item) { return isEligible(item, true); });
+    if (prefillSeed != mPrefillQueue.end())
     {
-        int32_t const bucketTokens = dispatchedPrefillTokens(mPrefillQueue.front());
-        bool const bucketInitial = mPrefillQueue.front().tokenOffset == 0;
+        int32_t const bucketTokens = dispatchedPrefillTokens(*prefillSeed);
+        bool const bucketInitial = prefillSeed->tokenOffset == 0;
         int32_t bucketRows{};
         for (PhaseWorkItem const& item : mPrefillQueue)
         {
-            if (bucketRows < mConfig.maxPrefillBatchSize && dispatchedPrefillTokens(item) == bucketTokens
-                && (item.tokenOffset == 0) == bucketInitial)
+            if (isEligible(item, true) && bucketRows < mConfig.maxPrefillBatchSize
+                && dispatchedPrefillTokens(item) == bucketTokens && (item.tokenOffset == 0) == bucketInitial)
             {
                 result.prefillCandidateTokens += bucketTokens;
                 ++bucketRows;
             }
         }
     }
-    int32_t const decodeCount = std::min<int32_t>(mConfig.maxDecodeBatchSize, mDecodeQueue.size());
-    for (int32_t i = 0; i < decodeCount; ++i)
+    result.prefillQueued = static_cast<size_t>(std::count_if(mPrefillQueue.begin(), mPrefillQueue.end(),
+        [this](PhaseWorkItem const& item) { return isEligible(item, true); }));
+    for (PhaseWorkItem const& item : mDecodeQueue)
     {
-        result.decodeCandidateTokens += mDecodeQueue[i].tokenCount;
+        if (isEligible(item, false))
+        {
+            ++result.decodeQueued;
+            if (result.decodeQueued <= static_cast<size_t>(mConfig.maxDecodeBatchSize))
+            {
+                result.decodeCandidateTokens += item.tokenCount;
+            }
+        }
     }
     auto const now = std::chrono::steady_clock::now();
     auto summarizeQueue = [&](std::deque<PhaseWorkItem> const& queue, bool prefill, double& oldestWaitUs,
@@ -177,6 +185,10 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         double waitUs{};
         for (PhaseWorkItem const& item : queue)
         {
+            if (!isEligible(item, prefill))
+            {
+                continue;
+            }
             auto const timestamp = mQueuedSince.find(item.requestId);
             check::check(timestamp != mQueuedSince.end(), "Queued request has no residence timestamp");
             double const itemWaitUs = std::chrono::duration<double, std::micro>(now - timestamp->second).count();
@@ -195,6 +207,11 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     summarizeQueue(
         mDecodeQueue, false, result.decodeOldestWaitUs, result.decodeMaxSloPressure, result.decodeHighestPriority);
     return result;
+}
+
+bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
+{
+    return !mConfig.eligibilityPolicy || mConfig.eligibilityPolicy(item, prefill);
 }
 
 PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const& state) const noexcept
@@ -335,17 +352,27 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         queueWaitUs = std::max(queueWaitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
         mQueuedSince.erase(timestamp);
     };
-    int32_t const count = std::min<int32_t>(maxBatchSize, queue.size());
+    int32_t const count = std::min<int32_t>(maxBatchSize,
+        std::count_if(queue.begin(), queue.end(),
+            [this, chunkPrefill](PhaseWorkItem const& item) { return isEligible(item, chunkPrefill); }));
     std::vector<PhaseWorkItem> batch;
     batch.reserve(count);
     if (!chunkPrefill)
     {
         for (int32_t i = 0; i < count; ++i)
         {
-            auto selected = queue.begin();
+            auto selected = std::find_if(
+                queue.begin(), queue.end(), [this](PhaseWorkItem const& item) { return isEligible(item, false); });
+            check::check(selected != queue.end(), "Eligible decode work disappeared during batch selection");
             if (mConfig.enablePriorityBatching)
             {
-                selected = std::max_element(queue.begin(), queue.end(), higherPriority);
+                for (auto it = std::next(selected); it != queue.end(); ++it)
+                {
+                    if (isEligible(*it, false) && higherPriority(*selected, *it))
+                    {
+                        selected = it;
+                    }
+                }
             }
             PhaseWorkItem item = *selected;
             queue.erase(selected);
@@ -356,10 +383,18 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         return batch;
     }
 
-    auto bucketSeed = queue.cbegin();
+    auto bucketSeed = std::find_if(
+        queue.cbegin(), queue.cend(), [this](PhaseWorkItem const& item) { return isEligible(item, true); });
+    check::check(bucketSeed != queue.cend(), "Eligible prefill work disappeared during batch selection");
     if (mConfig.enablePriorityBatching)
     {
-        bucketSeed = std::max_element(queue.cbegin(), queue.cend(), higherPriority);
+        for (auto it = std::next(bucketSeed); it != queue.cend(); ++it)
+        {
+            if (isEligible(*it, true) && higherPriority(*bucketSeed, *it))
+            {
+                bucketSeed = it;
+            }
+        }
     }
     if (mConfig.maxPrefillBatchTokens > 0)
     {
@@ -369,7 +404,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
             int32_t compatibleRows{};
             for (auto it = queue.begin(); it != queue.end(); ++it)
             {
-                if (dispatchedPrefillTokens(*it) == candidateTokens && (it->tokenOffset == 0) == candidateInitial)
+                if (isEligible(*it, true) && dispatchedPrefillTokens(*it) == candidateTokens
+                    && (it->tokenOffset == 0) == candidateInitial)
                 {
                     ++compatibleRows;
                 }
@@ -387,7 +423,13 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
             }
             return lhsScore.second < rhsScore.second;
         };
-        bucketSeed = std::max_element(queue.cbegin(), queue.cend(), lowerBucketScore);
+        for (auto it = queue.cbegin(); it != queue.cend(); ++it)
+        {
+            if (isEligible(*it, true) && lowerBucketScore(*bucketSeed, *it))
+            {
+                bucketSeed = it;
+            }
+        }
     }
     int32_t const bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
@@ -401,7 +443,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         auto selected = queue.end();
         for (auto it = queue.begin(); it != queue.end(); ++it)
         {
-            if (dispatchedPrefillTokens(*it) == bucketTokens && (it->tokenOffset == 0) == bucketInitial
+            if (isEligible(*it, true) && dispatchedPrefillTokens(*it) == bucketTokens
+                && (it->tokenOffset == 0) == bucketInitial
                 && (selected == queue.end() || (mConfig.enablePriorityBatching && higherPriority(*selected, *it))))
             {
                 selected = it;
@@ -458,7 +501,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 
 int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const noexcept
 {
-    int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, mDecodeQueue.size());
+    int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued));
     if (available <= 1 || !mConfig.enableDynamicDecodeBatching || mConfig.decodeBatchCosts.empty())
     {
         return available;
@@ -467,7 +510,10 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     int32_t maxContextLength{};
     for (PhaseWorkItem const& item : mDecodeQueue)
     {
-        maxContextLength = std::max(maxContextLength, item.tokenCount);
+        if (isEligible(item, false))
+        {
+            maxContextLength = std::max(maxContextLength, item.tokenCount);
+        }
     }
 
     struct Candidate
