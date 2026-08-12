@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace trt_edgellm
@@ -35,6 +36,15 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
+    check::check(mConfig.maxPrefillBatchTokens >= 0, "maxPrefillBatchTokens must be non-negative");
+    for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+    {
+        check::check(cost.batchSize > 0 && cost.batchSize <= mConfig.maxDecodeBatchSize,
+            "Decode cost batch size is outside the configured range");
+        check::check(cost.maxContextLength > 0, "Decode cost context length must be positive");
+        check::check(std::isfinite(cost.p95GpuMs) && cost.p95GpuMs > 0.0F,
+            "Decode cost p95 GPU time must be finite and positive");
+    }
     check::check(mConfig.minPrefillChunkTokens > 0, "minPrefillChunkTokens must be positive");
     check::check(mConfig.prefillChunkAlignment > 0, "prefillChunkAlignment must be positive");
     check::check(!mConfig.enableAdaptivePrefillChunking || mConfig.maxPrefillChunkTokens > 0,
@@ -48,6 +58,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxPredictedOverlapPrefillMs >= 0.0F, "maxPredictedOverlapPrefillMs must be non-negative");
     check::check(mConfig.minObservedOverlapRatio >= 0.0F && mConfig.minObservedOverlapRatio <= 1.0F,
         "minObservedOverlapRatio must be in [0, 1]");
+    check::check(mConfig.pagePressureDecodeThreshold >= 0.0F && mConfig.pagePressureDecodeThreshold <= 1.0F,
+        "pagePressureDecodeThreshold must be in [0, 1]");
     check::check(
         mConfig.metricsEwmaAlpha > 0.0F && mConfig.metricsEwmaAlpha <= 1.0F, "metricsEwmaAlpha must be in (0, 1]");
     check::check(mConfig.maxPriority > 0, "maxPriority must be positive");
@@ -235,6 +247,16 @@ PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
     {
         return PhaseDispatchKind::kPrefill;
     }
+    if (mConfig.pagePressureDecodeThreshold > 0.0F && telemetry.lastDispatch.has_value()
+        && telemetry.lastDispatch->pagePoolTotalBundles > 0)
+    {
+        float const pagePressure = static_cast<float>(telemetry.lastDispatch->pagePoolAllocatedBundles)
+            / static_cast<float>(telemetry.lastDispatch->pagePoolTotalBundles);
+        if (pagePressure >= mConfig.pagePressureDecodeThreshold)
+        {
+            return PhaseDispatchKind::kDecode;
+        }
+    }
     if (telemetry.sampleCount < mConfig.minMetricsSamples || telemetry.prefillGpuMsPerToken <= 0.0F)
     {
         return defaultDecision(state);
@@ -334,14 +356,47 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         return batch;
     }
 
-    auto bucketSeed = queue.begin();
+    auto bucketSeed = queue.cbegin();
     if (mConfig.enablePriorityBatching)
     {
-        bucketSeed = std::max_element(queue.begin(), queue.end(), higherPriority);
+        bucketSeed = std::max_element(queue.cbegin(), queue.cend(), higherPriority);
+    }
+    if (mConfig.maxPrefillBatchTokens > 0)
+    {
+        auto bucketScore = [&](PhaseWorkItem const& candidate) {
+            int32_t const candidateTokens = dispatchedPrefillTokens(candidate);
+            bool const candidateInitial = candidate.tokenOffset == 0;
+            int32_t compatibleRows{};
+            for (auto it = queue.begin(); it != queue.end(); ++it)
+            {
+                if (dispatchedPrefillTokens(*it) == candidateTokens && (it->tokenOffset == 0) == candidateInitial)
+                {
+                    ++compatibleRows;
+                }
+            }
+            int32_t const budgetRows = std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, candidateTokens));
+            int32_t const selectedRows = std::min({maxBatchSize, compatibleRows, budgetRows});
+            return std::pair<int32_t, double>{selectedRows * candidateTokens, priorityRank(candidate)};
+        };
+        auto const lowerBucketScore = [&](auto const& lhs, auto const& rhs) {
+            auto const lhsScore = bucketScore(lhs);
+            auto const rhsScore = bucketScore(rhs);
+            if (lhsScore.first != rhsScore.first)
+            {
+                return lhsScore.first < rhsScore.first;
+            }
+            return lhsScore.second < rhsScore.second;
+        };
+        bucketSeed = std::max_element(queue.cbegin(), queue.cend(), lowerBucketScore);
     }
     int32_t const bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
-    while (static_cast<int32_t>(batch.size()) < maxBatchSize)
+    int32_t const tokenBudget = mConfig.maxPrefillBatchTokens > 0
+        ? std::max(mConfig.maxPrefillBatchTokens, bucketTokens)
+        : std::numeric_limits<int32_t>::max();
+    int32_t const budgetRows = std::max(1, tokenBudget / std::max(1, bucketTokens));
+    int32_t const batchLimit = std::min(maxBatchSize, budgetRows);
+    while (static_cast<int32_t>(batch.size()) < batchLimit)
     {
         auto selected = queue.end();
         for (auto it = queue.begin(); it != queue.end(); ++it)
@@ -388,7 +443,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.decodeBatch = popBatch(mDecodeQueue, mConfig.maxDecodeBatchSize, false, plan.decodeQueueWaitUs);
+        plan.decodeBatch = popBatch(mDecodeQueue, selectDecodeBatchSize(state), false, plan.decodeQueueWaitUs);
     }
     if (kind == PhaseDispatchKind::kDecode)
     {
@@ -399,6 +454,95 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         mConsecutiveDecodeBatches = 0;
     }
     return plan;
+}
+
+int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const noexcept
+{
+    int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, mDecodeQueue.size());
+    if (available <= 1 || !mConfig.enableDynamicDecodeBatching || mConfig.decodeBatchCosts.empty())
+    {
+        return available;
+    }
+
+    int32_t maxContextLength{};
+    for (PhaseWorkItem const& item : mDecodeQueue)
+    {
+        maxContextLength = std::max(maxContextLength, item.tokenCount);
+    }
+
+    struct Candidate
+    {
+        int32_t batchSize{};
+        float p95GpuMs{};
+        int32_t contextLimit{};
+    };
+    std::vector<Candidate> candidates;
+    for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+    {
+        if (cost.batchSize > available || cost.maxContextLength < maxContextLength)
+        {
+            continue;
+        }
+        auto existing = std::find_if(candidates.begin(), candidates.end(),
+            [&](Candidate const& candidate) { return candidate.batchSize == cost.batchSize; });
+        if (existing == candidates.end())
+        {
+            candidates.push_back({cost.batchSize, cost.p95GpuMs, cost.maxContextLength});
+        }
+        else if (cost.maxContextLength < existing->contextLimit)
+        {
+            *existing = {cost.batchSize, cost.p95GpuMs, cost.maxContextLength};
+        }
+    }
+    if (candidates.empty())
+    {
+        return available;
+    }
+
+    bool const urgent = state.decodeMaxSloPressure >= 1.0;
+    double const remainingUs = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
+    Candidate const* selected{};
+    for (Candidate const& candidate : candidates)
+    {
+        double const costUs = static_cast<double>(candidate.p95GpuMs) * 1000.0;
+        if (urgent)
+        {
+            // Once the queue is already overdue, minimize work per token so
+            // overload can recover. Repeatedly choosing the shortest absolute
+            // kernel (usually BS1) makes queue growth unbounded.
+            double const efficiency = static_cast<double>(candidate.batchSize) / candidate.p95GpuMs;
+            double const selectedEfficiency
+                = selected == nullptr ? 0.0 : static_cast<double>(selected->batchSize) / selected->p95GpuMs;
+            if (selected == nullptr || efficiency > selectedEfficiency
+                || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
+            {
+                selected = &candidate;
+            }
+            continue;
+        }
+        if (costUs > remainingUs)
+        {
+            continue;
+        }
+        double const efficiency = static_cast<double>(candidate.batchSize) / candidate.p95GpuMs;
+        double const selectedEfficiency
+            = selected == nullptr ? 0.0 : static_cast<double>(selected->batchSize) / selected->p95GpuMs;
+        if (selected == nullptr || efficiency > selectedEfficiency
+            || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
+        {
+            selected = &candidate;
+        }
+    }
+    if (selected != nullptr)
+    {
+        return selected->batchSize;
+    }
+
+    auto const fastest
+        = std::min_element(candidates.begin(), candidates.end(), [](Candidate const& lhs, Candidate const& rhs) {
+              return lhs.p95GpuMs < rhs.p95GpuMs || (lhs.p95GpuMs == rhs.p95GpuMs && lhs.batchSize > rhs.batchSize);
+          });
+    return fastest->batchSize;
 }
 
 void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished)

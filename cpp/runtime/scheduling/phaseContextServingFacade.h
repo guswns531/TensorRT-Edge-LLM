@@ -54,6 +54,8 @@ struct PhaseAdmissionResult
     int32_t availableSlots{};
     size_t pendingQueueDepth{};
     KVPagePoolStats pagePool;
+    int32_t reservedPageBundles{};
+    int32_t reservationAvailableBundles{};
 };
 
 struct PhaseContextServingCallbacks
@@ -120,7 +122,8 @@ public:
         int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling = {});
     //! Make encoder-produced tokens and embeddings runnable by the prefill scheduler.
     void beginPrefillAfterEncoder(PhaseWorkItem const& item);
-    //! Admit immediately when a slot is free, otherwise apply bounded queue backpressure.
+    //! Admit immediately when a slot and whole-request page reservation are free.
+    //! Otherwise apply bounded queue backpressure.
     PhaseAdmissionResult submitOrQueue(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
         int32_t promptTokenCount, PhaseSchedulingHints scheduling = {});
     //! Cancel queued work. In-flight work can be cancelled after its event completes.
@@ -155,6 +158,7 @@ private:
     {
         uint64_t requestId{};
         int32_t promptTokenCount{};
+        int32_t requiredPageBundles{};
         PhaseSchedulingHints scheduling;
     };
 
@@ -164,6 +168,13 @@ private:
     void completeDecodeBatch(std::vector<PhaseWorkItem> const& batch);
     void registerSource(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow);
     void admitPendingRequests();
+    int32_t requiredPageBundles(
+        DecodingInferenceContext const& context, int32_t contextRow, int32_t promptTokenCount) const;
+    bool hasPageReservationCapacity(int32_t requiredBundles) const noexcept;
+    void reservePageBundles(uint64_t requestId, int32_t requiredBundles);
+    void resizePageBundleReservation(uint64_t requestId, int32_t requiredBundles);
+    void releasePageBundles(uint64_t requestId);
+    void updateAdmissionPageReservation(PhaseAdmissionResult& result) const noexcept;
     Registration& registration(uint64_t requestId);
     Registration const& registration(uint64_t requestId) const;
 
@@ -174,7 +185,9 @@ private:
     std::unique_ptr<PhasePrefillContextBatchAdapter> mPrefillAdapter;
     PhaseContextBatchAdapter mDecodeAdapter;
     std::unordered_map<uint64_t, Registration> mRegistrations;
+    std::unordered_map<uint64_t, int32_t> mPageBundleReservations;
     std::deque<PendingAdmission> mPendingAdmissions;
+    int32_t mReservedPageBundles{};
     size_t mMaxPendingAdmissions{};
     bool mPendingAdmissionRequired{};
     size_t mNextTerminalObserverId{1};

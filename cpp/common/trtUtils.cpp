@@ -309,8 +309,8 @@ private:
 std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
     nvinfer1::IExecutionContext* context, cudaStream_t stream)
 {
-    cudaGraph_t graph;
-    cudaGraphExec_t graphExec;
+    cudaGraph_t graph{};
+    cudaGraphExec_t graphExec{};
     bool executeStatus{true};
     try
     {
@@ -333,6 +333,14 @@ std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
             static_cast<void>(cudaStreamEndCapture(stream, &graph));
             static_cast<void>(cudaGetLastError());
         }
+        if (graphExec != nullptr)
+        {
+            static_cast<void>(cudaGraphExecDestroy(graphExec));
+        }
+        if (graph != nullptr)
+        {
+            static_cast<void>(cudaGraphDestroy(graph));
+        }
         // At this point, there should be no more cuda errors.
         CUDA_CHECK(cudaGetLastError());
         return std::nullopt;
@@ -340,6 +348,14 @@ std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
 
     if (!executeStatus)
     {
+        if (graphExec != nullptr)
+        {
+            static_cast<void>(cudaGraphExecDestroy(graphExec));
+        }
+        if (graph != nullptr)
+        {
+            static_cast<void>(cudaGraphDestroy(graph));
+        }
         return std::nullopt;
     }
 

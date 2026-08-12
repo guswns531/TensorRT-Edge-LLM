@@ -82,6 +82,7 @@ struct Args
     std::string inputFile;
     std::string multimodalEngineDir;
     std::string traceCsv;
+    std::string schedulerCostJson;
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t slotCount{};
@@ -106,6 +107,17 @@ struct Args
     bool contextAdapter{};
     bool adaptiveScheduler{};
     bool adaptiveChunking{};
+    bool cudaGraph{};
+    int32_t maxCudaGraphs{128};
+    int32_t maxPrefillCudaGraphs{-1};
+    int32_t maxDecodeCudaGraphs{-1};
+    int32_t maxCudaGraphMiB{};
+    int32_t maxPrefillCudaGraphMiB{-1};
+    int32_t maxDecodeCudaGraphMiB{-1};
+    int32_t cudaGraphChargeMiB{4};
+    int32_t cudaGraphReserveMiB{};
+    int32_t prefillTokenBudget{};
+    bool dynamicDecodeBatching{};
 };
 
 struct Sample
@@ -148,6 +160,8 @@ struct TraceRequestSample
     int32_t admissionAvailableSlots{};
     size_t admissionPendingQueueDepth{};
     rt::KVPagePoolStats admissionPagePool;
+    int32_t admissionReservedPageBundles{};
+    int32_t admissionReservationAvailableBundles{};
     rt::PhaseAsyncCompletion completion;
 };
 
@@ -213,6 +227,8 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
               "admission_status,admission_available_slots,admission_pending_queue_depth,"
               "admission_page_pool_total_bundles,admission_page_pool_allocated_bundles,"
               "admission_page_pool_available_bundles,admission_page_pool_pressure,"
+              "admission_reserved_page_bundles,admission_reservation_available_bundles,"
+              "admission_reserved_page_pressure,"
               "finish_reason,output_text\n";
     output << std::fixed << std::setprecision(6);
     for (TraceRequestSample const& sample : samples)
@@ -232,11 +248,16 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
                << sample.admissionPendingQueueDepth << ',' << sample.admissionPagePool.totalBundles << ','
                << sample.admissionPagePool.allocatedBundles << ',' << sample.admissionPagePool.availableBundles << ','
                << (sample.admissionPagePool.totalBundles > 0
-                       ? static_cast<double>(sample.admissionPagePool.allocatedBundles)
-                           / static_cast<double>(sample.admissionPagePool.totalBundles)
-                       : 0.0)
-               << ',' << rt::finishReasonName(response.finishReasons[0]) << ','
-               << csvQuote(response.outputTexts[0]) << '\n';
+                          ? static_cast<double>(sample.admissionPagePool.allocatedBundles)
+                              / static_cast<double>(sample.admissionPagePool.totalBundles)
+                          : 0.0)
+               << ',' << sample.admissionReservedPageBundles << ',' << sample.admissionReservationAvailableBundles
+               << ','
+               << (sample.admissionPagePool.totalBundles > 0 ? static_cast<double>(sample.admissionReservedPageBundles)
+                              / static_cast<double>(sample.admissionPagePool.totalBundles)
+                                                             : 0.0)
+               << ',' << rt::finishReasonName(response.finishReasons[0]) << ',' << csvQuote(response.outputTexts[0])
+               << '\n';
     }
 }
 
@@ -246,8 +267,12 @@ void printUsage(char const* program)
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] "
         "[--trtContextMode shared|independent] "
+        "[--cudaGraph --maxCudaGraphs N --maxPrefillCudaGraphs N --maxDecodeCudaGraphs N "
+        "--maxCudaGraphMiB N --maxPrefillCudaGraphMiB N --maxDecodeCudaGraphMiB N] "
+        "[--cudaGraphChargeMiB N --cudaGraphReserveMiB N] "
         "[--slotCount N] "
-        "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--outputCsv FILE] "
+        "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--prefillTokenBudget N] "
+        "[--dynamicDecodeBatching --schedulerCostJson FILE] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
@@ -275,6 +300,18 @@ bool parseArgs(Args& args, int argc, char** argv)
         kContextAdapter,
         kAdaptiveScheduler,
         kAdaptiveChunking,
+        kCudaGraph,
+        kMaxCudaGraphs,
+        kMaxPrefillCudaGraphs,
+        kMaxDecodeCudaGraphs,
+        kMaxCudaGraphMiB,
+        kMaxPrefillCudaGraphMiB,
+        kMaxDecodeCudaGraphMiB,
+        kCudaGraphChargeMiB,
+        kCudaGraphReserveMiB,
+        kPrefillTokenBudget,
+        kDynamicDecodeBatching,
+        kSchedulerCostJson,
         kLoadRequests,
         kArrivalRate,
         kLoadPromptMin,
@@ -305,7 +342,18 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"sharedContext", no_argument, nullptr, kLegacySharedContext},
         {"contextAdapter", no_argument, nullptr, kContextAdapter},
         {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler},
-        {"adaptiveChunking", no_argument, nullptr, kAdaptiveChunking},
+        {"adaptiveChunking", no_argument, nullptr, kAdaptiveChunking}, {"cudaGraph", no_argument, nullptr, kCudaGraph},
+        {"maxCudaGraphs", required_argument, nullptr, kMaxCudaGraphs},
+        {"maxPrefillCudaGraphs", required_argument, nullptr, kMaxPrefillCudaGraphs},
+        {"maxDecodeCudaGraphs", required_argument, nullptr, kMaxDecodeCudaGraphs},
+        {"maxCudaGraphMiB", required_argument, nullptr, kMaxCudaGraphMiB},
+        {"maxPrefillCudaGraphMiB", required_argument, nullptr, kMaxPrefillCudaGraphMiB},
+        {"maxDecodeCudaGraphMiB", required_argument, nullptr, kMaxDecodeCudaGraphMiB},
+        {"cudaGraphChargeMiB", required_argument, nullptr, kCudaGraphChargeMiB},
+        {"cudaGraphReserveMiB", required_argument, nullptr, kCudaGraphReserveMiB},
+        {"prefillTokenBudget", required_argument, nullptr, kPrefillTokenBudget},
+        {"dynamicDecodeBatching", no_argument, nullptr, kDynamicDecodeBatching},
+        {"schedulerCostJson", required_argument, nullptr, kSchedulerCostJson},
         {"loadRequests", required_argument, nullptr, kLoadRequests},
         {"arrivalRate", required_argument, nullptr, kArrivalRate},
         {"loadPromptMin", required_argument, nullptr, kLoadPromptMin},
@@ -359,6 +407,18 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kContextAdapter: args.contextAdapter = true; break;
         case kAdaptiveScheduler: args.adaptiveScheduler = true; break;
         case kAdaptiveChunking: args.adaptiveChunking = true; break;
+        case kCudaGraph: args.cudaGraph = true; break;
+        case kMaxCudaGraphs: args.maxCudaGraphs = std::stoi(optarg); break;
+        case kMaxPrefillCudaGraphs: args.maxPrefillCudaGraphs = std::stoi(optarg); break;
+        case kMaxDecodeCudaGraphs: args.maxDecodeCudaGraphs = std::stoi(optarg); break;
+        case kMaxCudaGraphMiB: args.maxCudaGraphMiB = std::stoi(optarg); break;
+        case kMaxPrefillCudaGraphMiB: args.maxPrefillCudaGraphMiB = std::stoi(optarg); break;
+        case kMaxDecodeCudaGraphMiB: args.maxDecodeCudaGraphMiB = std::stoi(optarg); break;
+        case kCudaGraphChargeMiB: args.cudaGraphChargeMiB = std::stoi(optarg); break;
+        case kCudaGraphReserveMiB: args.cudaGraphReserveMiB = std::stoi(optarg); break;
+        case kPrefillTokenBudget: args.prefillTokenBudget = std::stoi(optarg); break;
+        case kDynamicDecodeBatching: args.dynamicDecodeBatching = true; break;
+        case kSchedulerCostJson: args.schedulerCostJson = optarg; break;
         case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
         case kArrivalRate: args.arrivalRate = std::stod(optarg); break;
         case kLoadPromptMin: args.loadPromptMin = std::stoi(optarg); break;
@@ -386,12 +446,67 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.arrivalRate > 0.0 && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
         && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
         && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4
-        && args.traceArrivalRate > 0.0 && (args.inputFile.empty() || !args.traceCsv.empty());
+        && args.traceArrivalRate > 0.0 && args.maxCudaGraphs > 0 && args.maxPrefillCudaGraphs != 0
+        && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0 && args.maxDecodeCudaGraphs >= -1
+        && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1
+        && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0
+        && (!args.dynamicDecodeBatching || !args.schedulerCostJson.empty())
+        && (args.inputFile.empty() || !args.traceCsv.empty());
+}
+
+std::vector<rt::PhaseDecodeBatchCost> loadDecodeBatchCosts(std::filesystem::path const& path)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open scheduler cost model");
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(
+        root.contains("decode") && root.at("decode").is_array(), "Scheduler cost model must contain a decode array");
+    std::vector<rt::PhaseDecodeBatchCost> costs;
+    for (nlohmann::json const& point : root.at("decode"))
+    {
+        costs.push_back({point.at("batch_size").get<int32_t>(), point.at("max_context_length").get<int32_t>(),
+            point.at("p95_gpu_ms").get<float>()});
+    }
+    ELLM_CHECK(!costs.empty(), "Scheduler cost model contains no decode points");
+    return costs;
 }
 
 bool usesSharedTensorRTContext(Args const& args) noexcept
 {
     return args.trtContextMode == rt::PhaseTensorRTContextMode::kSharedSerialized;
+}
+
+void logCudaGraphStats(char const* phase, rt::EngineExecutor const& executor)
+{
+    rt::EngineExecutor::CudaGraphCacheStats const stats = executor.getCudaGraphCacheStats();
+    LOG_INFO(
+        "%s CUDA graph: enabled=%s cached=%zu captures=%lu launches=%lu enqueue=%lu "
+        "capture_failures=%lu launch_failures=%lu cache_limit_bypasses=%lu post_enqueue_captures=%lu "
+        "observation_evictions=%lu graph_bytes=%zu graph_budget_bytes=%zu graph_min_charge_bytes=%zu "
+        "global_reserve_bytes=%zu "
+        "graph_budget_bypasses=%lu "
+        "graph_budget_rejections=%lu global_reserve_bypasses=%lu global_reserve_rejections=%lu",
+        phase, stats.automaticCaptureEnabled ? "true" : "false", stats.cachedGraphs,
+        static_cast<unsigned long>(stats.captures), static_cast<unsigned long>(stats.graphLaunches),
+        static_cast<unsigned long>(stats.enqueueExecutions), static_cast<unsigned long>(stats.captureFailures),
+        static_cast<unsigned long>(stats.graphLaunchFailures), static_cast<unsigned long>(stats.cacheLimitBypasses),
+        static_cast<unsigned long>(stats.postEnqueueCaptures), static_cast<unsigned long>(stats.observationEvictions),
+        stats.cachedGraphBytes, stats.maxCachedGraphBytes, stats.minimumGraphChargeBytes, stats.minimumFreeMemoryBytes,
+        static_cast<unsigned long>(stats.graphMemoryBudgetBypasses),
+        static_cast<unsigned long>(stats.graphMemoryBudgetRejections),
+        static_cast<unsigned long>(stats.globalMemoryReserveBypasses),
+        static_cast<unsigned long>(stats.globalMemoryReserveRejections));
+}
+
+void logCudaMemory(char const* point)
+{
+    size_t freeBytes{};
+    size_t totalBytes{};
+    CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+    constexpr double kMIB_BYTES{1024.0 * 1024.0};
+    LOG_INFO("CUDA memory %s: used=%.1f MiB free=%.1f MiB total=%.1f MiB", point,
+        static_cast<double>(totalBytes - freeBytes) / kMIB_BYTES, static_cast<double>(freeBytes) / kMIB_BYTES,
+        static_cast<double>(totalBytes) / kMIB_BYTES);
 }
 
 void uploadInt32(rt::Tensor& tensor, std::vector<int32_t> const& values, cudaStream_t stream)
@@ -580,6 +695,8 @@ int main(int argc, char** argv)
     int32_t const configuredChunkSize = args.prefillChunkSize > 0 ? args.prefillChunkSize : args.inputLen;
     int32_t const phaseRounds = (args.inputLen + configuredChunkSize - 1) / configuredChunkSize;
     ELLM_CHECK(args.pastKVLen + phaseRounds <= config.maxKVCacheCapacity, "pastKVLen exceeds KV capacity");
+    ELLM_CHECK(!args.cudaGraph || !usesSharedTensorRTContext(args),
+        "--cudaGraph requires --trtContextMode independent so each phase owns its graph cache");
     LOG_INFO("Phase benchmark work per sample: %d prefill chunk(s), %d decode step(s)", phaseRounds, phaseRounds);
 
     cudaStream_t setupStream{};
@@ -608,6 +725,21 @@ int main(int argc, char** argv)
         independentExecutors = rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
         prefillRunner = &independentExecutors->prefillExecutor();
         decodeRunner = &independentExecutors->decodeExecutor();
+    }
+    if (args.cudaGraph)
+    {
+        int32_t const prefillLimit = args.maxPrefillCudaGraphs > 0 ? args.maxPrefillCudaGraphs : args.maxCudaGraphs;
+        int32_t const decodeLimit = args.maxDecodeCudaGraphs > 0 ? args.maxDecodeCudaGraphs : args.maxCudaGraphs;
+        int32_t const prefillMiB
+            = args.maxPrefillCudaGraphMiB >= 0 ? args.maxPrefillCudaGraphMiB : args.maxCudaGraphMiB;
+        int32_t const decodeMiB = args.maxDecodeCudaGraphMiB >= 0 ? args.maxDecodeCudaGraphMiB : args.maxCudaGraphMiB;
+        constexpr size_t kMIB_BYTES{1024U * 1024U};
+        size_t const graphChargeBytes = static_cast<size_t>(args.cudaGraphChargeMiB) * kMIB_BYTES;
+        size_t const graphReserveBytes = static_cast<size_t>(args.cudaGraphReserveMiB) * kMIB_BYTES;
+        prefillRunner->enableAutomaticCudaGraphCapture(static_cast<size_t>(prefillLimit),
+            static_cast<size_t>(prefillMiB) * kMIB_BYTES, graphChargeBytes, graphReserveBytes);
+        decodeRunner->enableAutomaticCudaGraphCapture(static_cast<size_t>(decodeLimit),
+            static_cast<size_t>(decodeMiB) * kMIB_BYTES, graphChargeBytes, graphReserveBytes);
     }
     bool const sharedTensorRTContext
         = prefillRunner->getExecutionContextIdentity() == decodeRunner->getExecutionContextIdentity();
@@ -804,6 +936,7 @@ int main(int argc, char** argv)
         decodeGemma4Ple->embed(decodePleTokenIds, setupStream);
     }
     CUDA_CHECK(cudaStreamSynchronize(setupStream));
+    logCudaMemory("before phase execution");
 
     auto enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
         ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.prefillBatch, "Unexpected prefill batch size");
@@ -1098,6 +1231,12 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
         facadeSchedulerConfig.maxPrefillChunkTokens
             = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
+        facadeSchedulerConfig.maxPrefillBatchTokens = args.prefillTokenBudget;
+        facadeSchedulerConfig.enableDynamicDecodeBatching = args.dynamicDecodeBatching;
+        if (args.dynamicDecodeBatching)
+        {
+            facadeSchedulerConfig.decodeBatchCosts = loadDecodeBatchCosts(args.schedulerCostJson);
+        }
         facadeSchedulerConfig.supportsChunkedPrefill = phaseContract.supportsChunkedPrefill;
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
         facadeSchedulerConfig.prefillQueueWaitTargetUs = args.ttftTargetMs * 1000.0;
@@ -1281,15 +1420,14 @@ int main(int argc, char** argv)
         facadeCallbacks.isDecodeFinished = [](uint64_t, rt::DecodingInferenceContext const& context, int32_t row) {
             return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
-        facadeCallbacks.onDispatchMetrics
-            = [&](rt::PhaseDispatchMetrics const& sample) {
-                  rt::PhaseDispatchMetrics telemetry = sample;
-                  rt::KVPagePoolStats const pool = cacheManager.getPagedKVPoolStats();
-                  telemetry.pagePoolTotalBundles = pool.totalBundles;
-                  telemetry.pagePoolAllocatedBundles = pool.allocatedBundles;
-                  telemetry.pagePoolAvailableBundles = pool.availableBundles;
-                  facadeDispatchMetrics.push_back(telemetry);
-              };
+        facadeCallbacks.onDispatchMetrics = [&](rt::PhaseDispatchMetrics const& sample) {
+            rt::PhaseDispatchMetrics telemetry = sample;
+            rt::KVPagePoolStats const pool = cacheManager.getPagedKVPoolStats();
+            telemetry.pagePoolTotalBundles = pool.totalBundles;
+            telemetry.pagePoolAllocatedBundles = pool.allocatedBundles;
+            telemetry.pagePoolAvailableBundles = pool.availableBundles;
+            facadeDispatchMetrics.push_back(telemetry);
+        };
         facadeCallbacks.onDispatch = [&](rt::PhaseDispatchMetrics const& sample) {
             kernelDispatchMetadata.schedulerDispatchIndex = sample.dispatchIndex;
             kernelDispatchMetadata.schedulerKind = static_cast<int32_t>(sample.kind);
@@ -1319,6 +1457,8 @@ int main(int argc, char** argv)
                 sample.admissionAvailableSlots = admission.availableSlots;
                 sample.admissionPendingQueueDepth = admission.pendingQueueDepth;
                 sample.admissionPagePool = admission.pagePool;
+                sample.admissionReservedPageBundles = admission.reservedPageBundles;
+                sample.admissionReservationAvailableBundles = admission.reservationAvailableBundles;
                 if (admission.status == rt::PhaseAdmissionStatus::kAdmitted && sample.admittedUs < 0)
                 {
                     sample.admittedUs = elapsedMicroseconds(traceStart);
@@ -1568,6 +1708,16 @@ int main(int argc, char** argv)
         ELLM_CHECK(facade.availableSlotCount() == phaseSlotCount,
             "Serving facade engine smoke did not release all stable slots");
         ELLM_CHECK(facade.registeredRequestCount() == 0, "Serving facade retained source registrations");
+        rt::KVPagePoolStats const finalPagePool = cacheManager.getPagedKVPoolStats();
+        if (finalPagePool.totalBundles > 0)
+        {
+            ELLM_CHECK(finalPagePool.allocatedBundles == 0,
+                "Serving facade engine smoke did not release all paged KV bundles");
+            ELLM_CHECK(finalPagePool.availableBundles == finalPagePool.totalBundles,
+                "Serving facade engine smoke did not restore the paged KV pool");
+            LOG_INFO("Serving facade final paged KV pool: allocated=%d available=%d total=%d",
+                finalPagePool.allocatedBundles, finalPagePool.availableBundles, finalPagePool.totalBundles);
+        }
         ELLM_CHECK(!facadeDispatchMetrics.empty(), "Serving facade emitted no dispatch metrics");
         std::filesystem::path dispatchCsv;
         if (continuousLoad)
@@ -1653,6 +1803,9 @@ int main(int argc, char** argv)
 
     if (realRequestTrace)
     {
+        logCudaGraphStats("Prefill", *prefillRunner);
+        logCudaGraphStats("Decode", *decodeRunner);
+        logCudaMemory("after phase execution");
         CUDA_CHECK(cudaStreamDestroy(prefillStream));
         CUDA_CHECK(cudaStreamDestroy(decodeStream));
         CUDA_CHECK(cudaStreamDestroy(setupStream));
@@ -1807,6 +1960,9 @@ int main(int argc, char** argv)
         fixedKernelGroupRecorder.writeCsv(args.kernelGroupCsv);
         LOG_INFO("Fixed-path kernel-group CUDA-event samples written to %s", args.kernelGroupCsv.c_str());
     }
+    logCudaGraphStats("Prefill", *prefillRunner);
+    logCudaGraphStats("Decode", *decodeRunner);
+    logCudaMemory("after phase execution");
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(prefillBegin));

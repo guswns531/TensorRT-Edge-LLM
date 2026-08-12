@@ -201,6 +201,10 @@ public:
     //! Return the current host page-pool ownership counters.
     KVPagePoolStats getPagedKVPoolStats() const noexcept;
 
+    //! Return the page bundles required to hold a complete sequence.
+    //! Non-paged caches return zero.
+    int32_t getPagedKVRequiredBundles(int32_t sequenceLength) const;
+
     //! Stable-slot physical page table [maxSlots, 2, maxPagesPerSequence].
     rt::Tensor& getKVPageIds();
 
@@ -341,12 +345,12 @@ private:
     rt::Tensor mDeviceKVPageIds{};            //!< Stable-slot physical page table
     std::optional<KVSlotAllocator> mSlotAllocator;
     std::optional<KVPageBundleAllocator> mPageAllocator;
-    mutable std::mutex mPageAllocatorMutex;      //!< Serializes host page ownership updates
+    mutable std::mutex mPageAllocatorMutex;         //!< Serializes host page ownership updates
     std::vector<int32_t> mHostGlobalKVCacheLengths; //!< Host mirror used by ordinary decode page reservation
-    std::vector<int32_t> mHostKVPageIds;         //!< Stable host staging for asynchronous page-table row uploads
-    int32_t mActiveBatchSize{};               //!< Number of active sequences
-    bool mKVCacheAllEmpty{true};              //!< True until the first commitSequenceLength call
-    std::vector<HeadDimGroup> mHeadDimGroups; //!< Pre-computed per-headDim groups for batched kernels
+    std::vector<int32_t> mHostKVPageIds;            //!< Stable host staging for asynchronous page-table row uploads
+    int32_t mActiveBatchSize{};                     //!< Number of active sequences
+    bool mKVCacheAllEmpty{true};                    //!< True until the first commitSequenceLength call
+    std::vector<HeadDimGroup> mHeadDimGroups;       //!< Pre-computed per-headDim groups for batched kernels
 };
 
 } // namespace rt

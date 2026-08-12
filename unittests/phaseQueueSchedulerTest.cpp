@@ -250,6 +250,90 @@ TEST(PhaseQueueSchedulerTest, BucketsPrefillByChunkLengthAndInitialState)
     EXPECT_EQ(continuation128.prefillBatch[0].tokenOffset, 128);
 }
 
+TEST(PhaseQueueSchedulerTest, AppliesPrefillTokenBudgetWithoutChangingChunkCompatibility)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 256;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({3, 128, 2, 0, 128});
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 2U);
+    EXPECT_EQ(first.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(first.prefillBatch[1].tokenCount, 128);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, TokenBudgetSelectsTheMostProductiveCompatibleBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 256;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64, 0, 0, 64});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({3, 128, 2, 0, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(plan.prefillBatch[1].tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}, {4, 512, 2.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+    scheduler.enqueueDecode({4, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchToRecoverAfterDeadline)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 0.001;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}, {4, 512, 2.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+    scheduler.enqueueDecode({4, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, PagePressurePrefersDecodeWithoutOverridingAnExpiredPrefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics pressure;
+    pressure.pagePoolTotalBundles = 100;
+    pressure.pagePoolAllocatedBundles = 90;
+    scheduler.observeMetrics(pressure);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+}
+
 TEST(PhaseQueueSchedulerTest, RequeuesChunksAndTransitionsToDecode)
 {
     PhaseQueueSchedulerConfig config;

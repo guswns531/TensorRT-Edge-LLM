@@ -82,7 +82,8 @@ def parse_engine(value: str) -> Engine:
 
 def materialize_trace(source: Path, destination: Path, seed: int,
                       arrival_rate: float, request_count: int,
-                      repeat_count: int, output_multiplier: float) -> None:
+                      repeat_count: int, total_requests: int,
+                      output_multiplier: float) -> None:
     root = json.loads(source.read_text(encoding="utf-8"))
     requests = list(root.get("requests", []))
     if not requests:
@@ -92,13 +93,17 @@ def materialize_trace(source: Path, destination: Path, seed: int,
     if repeat_count <= 0:
         raise ValueError("repeat_count must be positive")
     requests = [
-        json.loads(json.dumps(request))
-        for _ in range(repeat_count)
+        json.loads(json.dumps(request)) for _ in range(repeat_count)
         for request in requests
     ]
+    if total_requests > 0:
+        requests = requests[:total_requests]
     for request in requests:
-        original_length = int(request.get("max_generate_length", root.get("max_generate_length", 1)))
-        request["max_generate_length"] = max(1, math.ceil(original_length * output_multiplier))
+        original_length = int(
+            request.get("max_generate_length",
+                        root.get("max_generate_length", 1)))
+        request["max_generate_length"] = max(
+            1, math.ceil(original_length * output_multiplier))
     generator = random.Random(seed)
     elapsed_us = 0.0
     for index, request in enumerate(requests):
@@ -107,8 +112,7 @@ def materialize_trace(source: Path, destination: Path, seed: int,
         request["arrival_offset_us"] = round(elapsed_us)
     root["requests"] = requests
     root["max_generate_length"] = max(
-        int(request["max_generate_length"])
-        for request in requests)
+        int(request["max_generate_length"]) for request in requests)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(root, indent=2) + "\n", encoding="utf-8")
 
@@ -116,16 +120,14 @@ def materialize_trace(source: Path, destination: Path, seed: int,
 def scenarios(prefill_batches: list[int], decode_batches: list[int],
               context_modes: list[str]) -> list[Case]:
     return [
-        Case(prefill, decode, mode)
-        for mode in context_modes
-        for prefill in prefill_batches
-        for decode in decode_batches
+        Case(prefill, decode, mode) for mode in context_modes
+        for prefill in prefill_batches for decode in decode_batches
     ]
 
 
 def command_for(args: argparse.Namespace, engine: Engine, case: Case,
                 trace: Path, case_dir: Path) -> list[str]:
-    return [
+    command = [
         str(args.bench),
         "--engineDir",
         str(engine.directory),
@@ -157,6 +159,52 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         "--kernelGroupCsv",
         str(case_dir / "kernel-groups.csv"),
     ]
+    if args.cuda_graph:
+        if case.context_mode != "independent":
+            raise ValueError(
+                "CUDA graph phase execution requires independent contexts")
+        command.extend(
+            ["--cudaGraph", "--maxCudaGraphs",
+             str(args.max_cuda_graphs)])
+        if args.max_prefill_cuda_graphs > 0:
+            command.extend(
+                ["--maxPrefillCudaGraphs",
+                 str(args.max_prefill_cuda_graphs)])
+        if args.max_decode_cuda_graphs > 0:
+            command.extend(
+                ["--maxDecodeCudaGraphs",
+                 str(args.max_decode_cuda_graphs)])
+        if args.max_cuda_graph_mib > 0:
+            command.extend(["--maxCudaGraphMiB", str(args.max_cuda_graph_mib)])
+        if args.max_prefill_cuda_graph_mib >= 0:
+            command.extend([
+                "--maxPrefillCudaGraphMiB",
+                str(args.max_prefill_cuda_graph_mib)
+            ])
+        if args.max_decode_cuda_graph_mib >= 0:
+            command.extend([
+                "--maxDecodeCudaGraphMiB",
+                str(args.max_decode_cuda_graph_mib)
+            ])
+        command.extend(
+            ["--cudaGraphChargeMiB",
+             str(args.cuda_graph_charge_mib)])
+        if args.cuda_graph_reserve_mib > 0:
+            command.extend(
+                ["--cudaGraphReserveMiB",
+                 str(args.cuda_graph_reserve_mib)])
+    if args.prefill_token_budget > 0:
+        command.extend(
+            ["--prefillTokenBudget",
+             str(args.prefill_token_budget)])
+    if args.dynamic_decode_batching:
+        command.extend([
+            "--dynamicDecodeBatching", "--schedulerCostJson",
+            str(args.scheduler_cost_json)
+        ])
+    if args.adaptive_scheduler:
+        command.append("--adaptiveScheduler")
+    return command
 
 
 def summarize_requests(path: Path, engine: Engine, case: Case,
@@ -189,32 +237,52 @@ def summarize_requests(path: Path, engine: Engine, case: Case,
     }
 
 
-def summarize_dispatch(path: Path, engine: Engine, case: Case) -> list[dict[str, object]]:
+def summarize_dispatch(path: Path, engine: Engine,
+                       case: Case) -> list[dict[str, object]]:
     rows = read_csv(path)
     grouped: dict[tuple[int, int], list[dict[str, str]]] = {}
     for row in rows:
-        grouped.setdefault((int(row["prefill_batch"]), int(row["decode_batch"])), []).append(row)
+        grouped.setdefault(
+            (int(row["prefill_batch"]), int(row["decode_batch"])),
+            []).append(row)
     result = []
     for (prefill, decode), samples in sorted(grouped.items()):
         result.append({
-            "engine": engine.name,
-            "context_mode": case.context_mode,
-            "case": case.name,
-            "observed_prefill_batch": prefill,
-            "observed_decode_batch": decode,
-            "dispatches": len(samples),
-            "makespan_median_ms": statistics.median(float(row["makespan_gpu_ms"]) for row in samples),
-            "makespan_p95_ms": percentile([float(row["makespan_gpu_ms"]) for row in samples], 0.95),
-            "prefill_median_ms": statistics.median(float(row["prefill_gpu_ms"]) for row in samples),
-            "prefill_p95_ms": percentile([float(row["prefill_gpu_ms"]) for row in samples], 0.95),
-            "decode_median_ms": statistics.median(float(row["decode_gpu_ms"]) for row in samples),
-            "decode_p95_ms": percentile([float(row["decode_gpu_ms"]) for row in samples], 0.95),
-            "overlap_median": statistics.median(float(row["overlap_ratio"]) for row in samples),
+            "engine":
+            engine.name,
+            "context_mode":
+            case.context_mode,
+            "case":
+            case.name,
+            "observed_prefill_batch":
+            prefill,
+            "observed_decode_batch":
+            decode,
+            "dispatches":
+            len(samples),
+            "makespan_median_ms":
+            statistics.median(
+                float(row["makespan_gpu_ms"]) for row in samples),
+            "makespan_p95_ms":
+            percentile([float(row["makespan_gpu_ms"]) for row in samples],
+                       0.95),
+            "prefill_median_ms":
+            statistics.median(float(row["prefill_gpu_ms"]) for row in samples),
+            "prefill_p95_ms":
+            percentile([float(row["prefill_gpu_ms"]) for row in samples],
+                       0.95),
+            "decode_median_ms":
+            statistics.median(float(row["decode_gpu_ms"]) for row in samples),
+            "decode_p95_ms":
+            percentile([float(row["decode_gpu_ms"]) for row in samples], 0.95),
+            "overlap_median":
+            statistics.median(float(row["overlap_ratio"]) for row in samples),
         })
     return result
 
 
-def summarize_kernel(path: Path, engine: Engine, case: Case) -> list[dict[str, object]]:
+def summarize_kernel(path: Path, engine: Engine,
+                     case: Case) -> list[dict[str, object]]:
     rows = read_csv(path)
     grouped: dict[str, list[float]] = {}
     for row in rows:
@@ -237,12 +305,19 @@ def pressure_model(path: Path, engine: Engine, case: Case, page_bundles: int,
     """Estimate strict whole-request page admission pressure from completed rows."""
     rows = read_csv(path)
     requests = [{
-        "id": int(row["request_id"]),
-        "arrival": int(row["scheduled_arrival_us"]),
-        "done": int(row["completed_us"]),
-        "pages": math.ceil((int(row["prompt_tokens"]) + int(row["max_output_tokens"])) / tokens_per_page),
+        "id":
+        int(row["request_id"]),
+        "arrival":
+        int(row["scheduled_arrival_us"]),
+        "done":
+        int(row["completed_us"]),
+        "pages":
+        math.ceil((int(row["prompt_tokens"]) + int(row["max_output_tokens"])) /
+                  tokens_per_page),
     } for row in rows]
-    pending = list(sorted(requests, key=lambda request: (request["arrival"], request["id"])))
+    pending = list(
+        sorted(requests,
+               key=lambda request: (request["arrival"], request["id"])))
     active: dict[int, dict[str, int]] = {}
     now = 0
     blocked = 0
@@ -250,11 +325,15 @@ def pressure_model(path: Path, engine: Engine, case: Case, page_bundles: int,
     peak_allocated = 0
     peak_pressure = 0.0
     observed_peak_pressure = max(
-        (float(request.get("admission_page_pool_pressure", 0.0)) for request in rows),
+        (float(
+            request.get("admission_reserved_page_pressure",
+                        request.get("admission_page_pool_pressure", 0.0)))
+         for request in rows),
         default=0.0,
     )
     observed_peak_pending = max(
-        (int(request.get("admission_pending_queue_depth", 0)) for request in rows),
+        (int(request.get("admission_pending_queue_depth", 0))
+         for request in rows),
         default=0,
     )
     admission_events = 0
@@ -273,7 +352,8 @@ def pressure_model(path: Path, engine: Engine, case: Case, page_bundles: int,
         now = max(now, request["arrival"])
         release(now)
         waited = False
-        while active and (len(active) >= slot_count or allocated() + request["pages"] > page_bundles):
+        while active and (len(active) >= slot_count
+                          or allocated() + request["pages"] > page_bundles):
             next_done = min(item["done"] for item in active.values())
             now = max(now, next_done)
             release(now)
@@ -319,19 +399,45 @@ def main() -> None:
     parser.add_argument("--bench", type=Path, required=True)
     parser.add_argument("--source-trace", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--engine", action="append", type=parse_engine, required=True,
-                        help="NAME=ENGINE_DIR; repeat for indexed-linear and indexed-paged")
-    parser.add_argument("--prefill-batches", type=int, nargs="+", default=[1, 2, 4, 8])
-    parser.add_argument("--decode-batches", type=int, nargs="+", default=[1, 2, 4, 8, 16])
-    parser.add_argument("--context-modes", nargs="+", choices=("shared", "independent"),
+    parser.add_argument(
+        "--engine",
+        action="append",
+        type=parse_engine,
+        required=True,
+        help="NAME=ENGINE_DIR; repeat for indexed-linear and indexed-paged")
+    parser.add_argument("--prefill-batches",
+                        type=int,
+                        nargs="+",
+                        default=[1, 2, 4, 8])
+    parser.add_argument("--decode-batches",
+                        type=int,
+                        nargs="+",
+                        default=[1, 2, 4, 8, 16])
+    parser.add_argument("--context-modes",
+                        nargs="+",
+                        choices=("shared", "independent"),
                         default=["shared", "independent"])
     parser.add_argument("--arrival-rate", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--request-count", type=int, default=0)
-    parser.add_argument("--repeat-count", type=int, default=1,
-                        help="repeat the source request set to create a longer arrival trace")
-    parser.add_argument("--output-multiplier", type=float, default=1.0,
-                        help="multiply each request max_generate_length in the materialized trace")
+    parser.add_argument(
+        "--repeat-count",
+        type=int,
+        default=1,
+        help="repeat the source request set to create a longer arrival trace")
+    parser.add_argument(
+        "--total-requests",
+        type=int,
+        default=0,
+        help=
+        "trim the repeated trace to this exact request count; zero disables it"
+    )
+    parser.add_argument(
+        "--output-multiplier",
+        type=float,
+        default=1.0,
+        help=
+        "multiply each request max_generate_length in the materialized trace")
     parser.add_argument("--slot-count", type=int, default=16)
     parser.add_argument("--page-bundles", type=int, default=80)
     parser.add_argument("--tokens-per-page", type=int, default=128)
@@ -340,20 +446,110 @@ def main() -> None:
     # Real-trace warmup must start from an empty cache. Paged KV v1 rejects
     # the legacy system-prompt cache reuse path used by non-zero pastKVLen.
     parser.add_argument("--past-kv-len", type=int, default=0)
-    parser.add_argument("--case", action="append", help="run only CASE names, e.g. p4_d16_independent")
+    parser.add_argument("--case",
+                        action="append",
+                        help="run only CASE names, e.g. p4_d16_independent")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument("--cuda-graph",
+                        action="store_true",
+                        help="enable per-context CUDA graph capture/replay")
+    parser.add_argument(
+        "--max-cuda-graphs",
+        type=int,
+        default=128,
+        help="maximum graph variants cached by each phase context")
+    parser.add_argument(
+        "--max-prefill-cuda-graphs",
+        type=int,
+        default=0,
+        help="prefill graph limit override; zero inherits --max-cuda-graphs")
+    parser.add_argument(
+        "--max-decode-cuda-graphs",
+        type=int,
+        default=0,
+        help="decode graph limit override; zero inherits --max-cuda-graphs")
+    parser.add_argument(
+        "--max-cuda-graph-mib",
+        type=int,
+        default=0,
+        help="per-context graph memory budget; zero is unlimited")
+    parser.add_argument(
+        "--max-prefill-cuda-graph-mib",
+        type=int,
+        default=-1,
+        help="prefill graph MiB override; -1 inherits the common budget")
+    parser.add_argument(
+        "--max-decode-cuda-graph-mib",
+        type=int,
+        default=-1,
+        help="decode graph MiB override; -1 inherits the common budget")
+    parser.add_argument(
+        "--cuda-graph-charge-mib",
+        type=int,
+        default=4,
+        help="minimum conservative device-memory charge per graph")
+    parser.add_argument(
+        "--cuda-graph-reserve-mib",
+        type=int,
+        default=0,
+        help="global free-memory reserve retained while capturing graphs")
+    parser.add_argument(
+        "--prefill-token-budget",
+        type=int,
+        default=0,
+        help=
+        "total token budget for one compatible prefill batch; zero disables it"
+    )
+    parser.add_argument(
+        "--dynamic-decode-batching",
+        action="store_true",
+        help="select decode batch size using the measured scheduler cost model"
+    )
+    parser.add_argument(
+        "--scheduler-cost-json",
+        type=Path,
+        help="cost model produced by build_phase_scheduler_cost_model.py")
+    parser.add_argument(
+        "--adaptive-scheduler",
+        action="store_true",
+        help="enable the CUDA-event/SLO/page-pressure phase selector")
     args = parser.parse_args()
 
     if args.slot_count <= 0 or args.page_bundles <= 0 or args.tokens_per_page <= 0:
-        parser.error("slot-count, page-bundles, and tokens-per-page must be positive")
+        parser.error(
+            "slot-count, page-bundles, and tokens-per-page must be positive")
     if args.output_multiplier <= 0.0:
         parser.error("output-multiplier must be positive")
+    if args.total_requests < 0:
+        parser.error("total-requests must be non-negative")
+    if args.max_cuda_graphs <= 0:
+        parser.error("max-cuda-graphs must be positive")
+    if args.max_prefill_cuda_graphs < 0 or args.max_decode_cuda_graphs < 0:
+        parser.error("phase CUDA graph limits must be non-negative")
+    if args.max_cuda_graph_mib < 0 or args.max_prefill_cuda_graph_mib < -1 or args.max_decode_cuda_graph_mib < -1:
+        parser.error(
+            "CUDA graph memory budgets are outside the supported range")
+    if args.cuda_graph_charge_mib <= 0:
+        parser.error("cuda-graph-charge-mib must be positive")
+    if args.cuda_graph_reserve_mib < 0 or args.prefill_token_budget < 0:
+        parser.error(
+            "CUDA graph reserve and prefill token budget must be non-negative")
+    if args.dynamic_decode_batching and args.scheduler_cost_json is None:
+        parser.error(
+            "--dynamic-decode-batching requires --scheduler-cost-json")
+    if args.scheduler_cost_json is not None and not args.scheduler_cost_json.is_file(
+    ):
+        parser.error("scheduler-cost-json does not exist")
+    if args.cuda_graph and "shared" in args.context_modes:
+        parser.error("--cuda-graph requires independent-only context modes")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trace = args.output_dir / "materialized-trace.json"
-    materialize_trace(args.source_trace, trace, args.seed, args.arrival_rate, args.request_count,
-                      args.repeat_count, args.output_multiplier)
-    cases = scenarios(args.prefill_batches, args.decode_batches, args.context_modes)
+    materialize_trace(args.source_trace, trace, args.seed, args.arrival_rate,
+                      args.request_count, args.repeat_count,
+                      args.total_requests, args.output_multiplier)
+    cases = scenarios(args.prefill_batches, args.decode_batches,
+                      args.context_modes)
     if args.case:
         cases = [case for case in cases if case.name in args.case]
     summaries = []
@@ -372,30 +568,84 @@ def main() -> None:
             command = command_for(args, engine, case, trace, case_dir)
             started = time.monotonic()
             with log_path.open("w", encoding="utf-8") as log:
-                result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False, text=True)
+                result = subprocess.run(command,
+                                        stdout=log,
+                                        stderr=subprocess.STDOUT,
+                                        check=False,
+                                        text=True)
             elapsed = time.monotonic() - started
             status = {
-                "engine": engine.name,
-                "context_mode": case.context_mode,
-                "case": case.name,
-                "return_code": result.returncode,
-                "elapsed_s": elapsed,
-                "log": str(log_path),
+                "engine":
+                engine.name,
+                "context_mode":
+                case.context_mode,
+                "case":
+                case.name,
+                "return_code":
+                result.returncode,
+                "elapsed_s":
+                elapsed,
+                "materialized_requests":
+                len(json.loads(trace.read_text(encoding="utf-8"))["requests"]),
+                "arrival_rate":
+                args.arrival_rate,
+                "output_multiplier":
+                args.output_multiplier,
+                "cuda_graph":
+                args.cuda_graph,
+                "max_cuda_graphs":
+                args.max_cuda_graphs if args.cuda_graph else 0,
+                "max_prefill_cuda_graphs":
+                args.max_prefill_cuda_graphs if args.cuda_graph else 0,
+                "max_decode_cuda_graphs":
+                args.max_decode_cuda_graphs if args.cuda_graph else 0,
+                "max_cuda_graph_mib":
+                args.max_cuda_graph_mib if args.cuda_graph else 0,
+                "max_prefill_cuda_graph_mib":
+                args.max_prefill_cuda_graph_mib if args.cuda_graph else -1,
+                "max_decode_cuda_graph_mib":
+                args.max_decode_cuda_graph_mib if args.cuda_graph else -1,
+                "cuda_graph_charge_mib":
+                args.cuda_graph_charge_mib if args.cuda_graph else 0,
+                "cuda_graph_reserve_mib":
+                args.cuda_graph_reserve_mib if args.cuda_graph else 0,
+                "prefill_token_budget":
+                args.prefill_token_budget,
+                "dynamic_decode_batching":
+                args.dynamic_decode_batching,
+                "scheduler_cost_json":
+                str(args.scheduler_cost_json or ""),
+                "adaptive_scheduler":
+                args.adaptive_scheduler,
+                "log":
+                str(log_path),
             }
             statuses.append(status)
-            print(f"[{index}/{total}] {engine.name}/{case.name}: rc={result.returncode}", flush=True)
+            print(
+                f"[{index}/{total}] {engine.name}/{case.name}: rc={result.returncode}",
+                flush=True)
             request_csv = case_dir / "requests.csv"
             dispatch_csv = case_dir / "requests-dispatch.csv"
             kernel_csv = case_dir / "kernel-groups.csv"
-            if result.returncode == 0 and request_csv.exists() and dispatch_csv.exists() and kernel_csv.exists():
-                summaries.append(summarize_requests(request_csv, engine, case, result.returncode))
-                dispatches.extend(summarize_dispatch(dispatch_csv, engine, case))
+            if result.returncode == 0 and request_csv.exists(
+            ) and dispatch_csv.exists() and kernel_csv.exists():
+                summaries.append(
+                    summarize_requests(request_csv, engine, case,
+                                       result.returncode))
+                dispatches.extend(
+                    summarize_dispatch(dispatch_csv, engine, case))
                 kernels.extend(summarize_kernel(kernel_csv, engine, case))
-                pressure.append(pressure_model(request_csv, engine, case, args.page_bundles,
-                                               args.tokens_per_page, args.slot_count))
+                pressure.append(
+                    pressure_model(request_csv, engine, case,
+                                   args.page_bundles, args.tokens_per_page,
+                                   args.slot_count))
             elif not args.continue_on_error:
-                tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
-                raise RuntimeError(f"{engine.name}/{case.name} failed with {result.returncode}:\n{tail}")
+                tail = "\n".join(
+                    log_path.read_text(encoding="utf-8",
+                                       errors="replace").splitlines()[-40:])
+                raise RuntimeError(
+                    f"{engine.name}/{case.name} failed with {result.returncode}:\n{tail}"
+                )
     write_csv(args.output_dir / "status.csv", statuses)
     write_csv(args.output_dir / "request-summary.csv", summaries)
     write_csv(args.output_dir / "dispatch-cost-table.csv", dispatches)

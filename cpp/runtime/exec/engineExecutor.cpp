@@ -23,6 +23,7 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "runtime/exec/registryBuilder.h"
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 
@@ -249,22 +250,65 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
 bool EngineExecutor::execute(cudaStream_t stream)
 {
     size_t const hash = computeBindingHash();
+    BindingSnapshot const current = snapshotBindings();
     auto it = mGraphs.find(hash);
     if (it != mGraphs.end())
     {
-        BindingSnapshot const current = snapshotBindings();
         if (current == it->second.snapshot)
         {
             cudaError_t const err = cudaGraphLaunch(it->second.exec, stream);
             if (err == cudaSuccess)
             {
+                ++mCudaGraphStats.graphLaunches;
+                mLastSuccessfulBindings = current;
                 return true;
             }
+            ++mCudaGraphStats.graphLaunchFailures;
             LOG_WARNING("cudaGraphLaunch failed (%s), falling back to enqueueV3", cudaGetErrorString(err));
+            eraseCapturedGraph(it);
+            mUncapturableBindings[hash] = current;
+            return enqueueAndRemember(hash, current, stream);
         }
     }
 
-    return mContext->enqueueV3(stream);
+    bool const cacheHasCapacity = mGraphs.size() < mMaxAutomaticGraphs;
+    bool const memoryHasCapacity = graphMemoryBudgetHasCapacity();
+    bool const repeatedBindings = mLastSuccessfulBindings.has_value() && current == mLastSuccessfulBindings.value();
+    auto const observed = mObservedBindings.find(hash);
+    bool const observedPreviously = observed != mObservedBindings.end() && current == observed->second;
+    auto const uncapturable = mUncapturableBindings.find(hash);
+    bool const capturePreviouslyFailed = uncapturable != mUncapturableBindings.end() && current == uncapturable->second;
+    auto const budgetRejected = mBudgetRejectedBindings.find(hash);
+    bool const captureExceededBudget
+        = budgetRejected != mBudgetRejectedBindings.end() && current == budgetRejected->second;
+    size_t const estimatedNextGraphBytes = mGraphs.empty() || mCachedGraphBytes == 0U
+        ? mMinimumAutomaticGraphBytes
+        : std::max((mCachedGraphBytes + mGraphs.size() - 1U) / mGraphs.size(), mMinimumAutomaticGraphBytes);
+    bool const globalMemoryHasCapacity = globalMemoryReserveHasCapacity(estimatedNextGraphBytes);
+    if (mAutomaticGraphCaptureEnabled && cacheHasCapacity && memoryHasCapacity && globalMemoryHasCapacity
+        && repeatedBindings && !capturePreviouslyFailed && !captureExceededBudget)
+    {
+        return captureLaunchAndCache(hash, current, stream);
+    }
+    if (mAutomaticGraphCaptureEnabled && cacheHasCapacity && memoryHasCapacity && globalMemoryHasCapacity
+        && observedPreviously && !capturePreviouslyFailed && !captureExceededBudget)
+    {
+        return enqueueCaptureAndCache(hash, current, stream);
+    }
+    if (mAutomaticGraphCaptureEnabled && !cacheHasCapacity)
+    {
+        ++mCudaGraphStats.cacheLimitBypasses;
+    }
+    if (mAutomaticGraphCaptureEnabled && cacheHasCapacity && !memoryHasCapacity)
+    {
+        ++mCudaGraphStats.graphMemoryBudgetBypasses;
+    }
+    if (mAutomaticGraphCaptureEnabled && cacheHasCapacity && memoryHasCapacity && !globalMemoryHasCapacity)
+    {
+        ++mCudaGraphStats.globalMemoryReserveBypasses;
+    }
+
+    return enqueueAndRemember(hash, current, stream);
 }
 
 bool EngineExecutor::captureGraph(cudaStream_t stream)
@@ -276,6 +320,9 @@ bool EngineExecutor::captureGraph(cudaStream_t stream)
         return false;
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    size_t freeBytesBefore{};
+    size_t totalBytes{};
+    CUDA_CHECK(cudaMemGetInfo(&freeBytesBefore, &totalBytes));
 
     auto result = captureTRTCudaGraph(mContext.get(), stream);
     if (!result.has_value())
@@ -287,28 +334,44 @@ bool EngineExecutor::captureGraph(cudaStream_t stream)
     size_t const hash = computeBindingHash();
     BindingSnapshot const snap = snapshotBindings();
 
-    // If there was a previous graph for this hash, destroy it first.
-    auto it = mGraphs.find(hash);
-    if (it != mGraphs.end())
+    size_t const graphBytes = measureCapturedGraphBytes(freeBytesBefore);
+    if (!cacheCapturedGraph(hash, snap, *result, graphBytes))
     {
-        if (it->second.exec)
-        {
-            cudaGraphExecDestroy(it->second.exec);
-        }
-        if (it->second.graph)
-        {
-            cudaGraphDestroy(it->second.graph);
-        }
+        return false;
     }
-
-    CapturedGraph cg{};
-    cg.graph = result->first;
-    cg.exec = result->second;
-    cg.snapshot = snap;
-    mGraphs[hash] = cg;
+    ++mCudaGraphStats.enqueueExecutions;
+    ++mCudaGraphStats.captures;
+    mLastSuccessfulBindings = snap;
 
     LOG_INFO("captured graph (hash=0x%zx)", hash);
     return true;
+}
+
+void EngineExecutor::enableAutomaticCudaGraphCapture(
+    size_t maxCachedGraphs, size_t maxCachedGraphBytes, size_t minimumGraphChargeBytes, size_t minimumFreeMemoryBytes)
+{
+    ELLM_CHECK(maxCachedGraphs > 0U, "Automatic CUDA graph capture requires a non-zero cache limit");
+    ELLM_CHECK(
+        maxCachedGraphs <= std::numeric_limits<size_t>::max() / 4U, "Automatic CUDA graph cache limit is too large");
+    mAutomaticGraphCaptureEnabled = true;
+    mMaxAutomaticGraphs = maxCachedGraphs;
+    mMaxAutomaticGraphBytes = maxCachedGraphBytes;
+    mMinimumAutomaticGraphBytes = minimumGraphChargeBytes;
+    mMinimumFreeMemoryBytes = minimumFreeMemoryBytes;
+    mMaxObservedBindings = maxCachedGraphs * 4U;
+    mCudaGraphStats.automaticCaptureEnabled = true;
+}
+
+EngineExecutor::CudaGraphCacheStats EngineExecutor::getCudaGraphCacheStats() const noexcept
+{
+    CudaGraphCacheStats result = mCudaGraphStats;
+    result.cachedGraphs = mGraphs.size();
+    result.cachedGraphBytes = mCachedGraphBytes;
+    result.maxCachedGraphBytes = mMaxAutomaticGraphBytes;
+    result.minimumGraphChargeBytes = mMinimumAutomaticGraphBytes;
+    result.minimumFreeMemoryBytes = mMinimumFreeMemoryBytes;
+    result.automaticCaptureEnabled = mAutomaticGraphCaptureEnabled;
+    return result;
 }
 
 int64_t EngineExecutor::getRequiredContextMemorySize() const
@@ -343,8 +406,7 @@ bool EngineExecutor::setContextMemoryForProfile(int32_t profileIndex, Tensor& sh
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int64_t const requiredBytes = getRequiredContextMemorySizeForProfile(profileIndex);
-    ELLM_CHECK(sharedMem.getMemoryCapacity() >= requiredBytes,
-        "Profile-specific TensorRT context memory is too small");
+    ELLM_CHECK(sharedMem.getMemoryCapacity() >= requiredBytes, "Profile-specific TensorRT context memory is too small");
     mContext->setDeviceMemoryV2(sharedMem.rawPointer(), sharedMem.getMemoryCapacity());
     return true;
 }
@@ -451,6 +513,214 @@ EngineExecutor::BindingSnapshot EngineExecutor::snapshotBindings() const
         snap.bindings.emplace_back(addr, shape);
     }
     return snap;
+}
+
+bool EngineExecutor::enqueueAndRemember(size_t hash, BindingSnapshot const& snapshot, cudaStream_t stream)
+{
+    bool const success = mContext->enqueueV3(stream);
+    ++mCudaGraphStats.enqueueExecutions;
+    if (success)
+    {
+        mLastSuccessfulBindings = snapshot;
+        rememberBindingObservation(hash, snapshot);
+    }
+    return success;
+}
+
+bool EngineExecutor::captureLaunchAndCache(size_t hash, BindingSnapshot const& snapshot, cudaStream_t stream)
+{
+    // TensorRT requires one enqueue after a dynamic-shape change before graph
+    // capture. execute() only reaches here when the immediately preceding
+    // successful execution used the identical binding snapshot. Synchronizing
+    // this phase stream also keeps the context out of concurrent enqueue/capture.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    size_t freeBytesBefore{};
+    size_t totalBytes{};
+    CUDA_CHECK(cudaMemGetInfo(&freeBytesBefore, &totalBytes));
+    auto result = captureTRTCudaGraph(mContext.get(), stream);
+    if (!result.has_value())
+    {
+        ++mCudaGraphStats.captureFailures;
+        mUncapturableBindings[hash] = snapshot;
+        return enqueueAndRemember(hash, snapshot, stream);
+    }
+
+    size_t const graphBytes = measureCapturedGraphBytes(freeBytesBefore);
+    if (!cacheCapturedGraph(hash, snapshot, *result, graphBytes))
+    {
+        mBudgetRejectedBindings[hash] = snapshot;
+        return enqueueAndRemember(hash, snapshot, stream);
+    }
+
+    auto const graph = mGraphs.find(hash);
+    check::check(graph != mGraphs.end(), "Captured CUDA graph disappeared before launch");
+    cudaError_t const launchStatus = cudaGraphLaunch(graph->second.exec, stream);
+    if (launchStatus != cudaSuccess)
+    {
+        ++mCudaGraphStats.graphLaunchFailures;
+        LOG_WARNING(
+            "Captured CUDA graph launch failed (%s), falling back to enqueueV3", cudaGetErrorString(launchStatus));
+        eraseCapturedGraph(graph);
+        mUncapturableBindings[hash] = snapshot;
+        return enqueueAndRemember(hash, snapshot, stream);
+    }
+
+    ++mCudaGraphStats.captures;
+    ++mCudaGraphStats.graphLaunches;
+    mLastSuccessfulBindings = snapshot;
+    LOG_INFO("captured and launched graph (hash=0x%zx, cache=%zu/%zu)", hash, mGraphs.size(), mMaxAutomaticGraphs);
+    return true;
+}
+
+bool EngineExecutor::enqueueCaptureAndCache(size_t hash, BindingSnapshot const& snapshot, cudaStream_t stream)
+{
+    // The same snapshot was observed before, but another shape has run since.
+    // Execute this logical inference normally so TensorRT applies the current
+    // dynamic shape. Once it completes, capture the now-warm state without
+    // launching it; the current inference must never update live KV twice.
+    if (!enqueueAndRemember(hash, snapshot, stream))
+    {
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    size_t freeBytesBefore{};
+    size_t totalBytes{};
+    CUDA_CHECK(cudaMemGetInfo(&freeBytesBefore, &totalBytes));
+    auto result = captureTRTCudaGraph(mContext.get(), stream);
+    if (!result.has_value())
+    {
+        ++mCudaGraphStats.captureFailures;
+        mUncapturableBindings[hash] = snapshot;
+        return true;
+    }
+
+    size_t const graphBytes = measureCapturedGraphBytes(freeBytesBefore);
+    if (!cacheCapturedGraph(hash, snapshot, *result, graphBytes))
+    {
+        mBudgetRejectedBindings[hash] = snapshot;
+        return true;
+    }
+    ++mCudaGraphStats.captures;
+    ++mCudaGraphStats.postEnqueueCaptures;
+    LOG_INFO("captured recurring graph after enqueue (hash=0x%zx, cache=%zu/%zu)", hash, mGraphs.size(),
+        mMaxAutomaticGraphs);
+    return true;
+}
+
+bool EngineExecutor::cacheCapturedGraph(size_t hash, BindingSnapshot const& snapshot,
+    std::pair<cudaGraph_t, cudaGraphExec_t> const& capturedGraph, size_t estimatedDeviceBytes)
+{
+    auto existing = mGraphs.find(hash);
+    size_t const replacedBytes = existing == mGraphs.end() ? 0U : existing->second.estimatedDeviceBytes;
+    size_t const retainedBytes = mCachedGraphBytes - replacedBytes;
+    if (mAutomaticGraphCaptureEnabled && mMaxAutomaticGraphBytes > 0U
+        && estimatedDeviceBytes > mMaxAutomaticGraphBytes - std::min(retainedBytes, mMaxAutomaticGraphBytes))
+    {
+        static_cast<void>(cudaGraphExecDestroy(capturedGraph.second));
+        static_cast<void>(cudaGraphDestroy(capturedGraph.first));
+        ++mCudaGraphStats.graphMemoryBudgetRejections;
+        return false;
+    }
+
+    if (!globalMemoryReserveHasCapacity(estimatedDeviceBytes))
+    {
+        static_cast<void>(cudaGraphExecDestroy(capturedGraph.second));
+        static_cast<void>(cudaGraphDestroy(capturedGraph.first));
+        ++mCudaGraphStats.globalMemoryReserveRejections;
+        return false;
+    }
+
+    CapturedGraph captured{};
+    captured.graph = capturedGraph.first;
+    captured.exec = capturedGraph.second;
+    captured.snapshot = snapshot;
+    captured.estimatedDeviceBytes = estimatedDeviceBytes;
+    if (existing != mGraphs.end())
+    {
+        eraseCapturedGraph(existing);
+    }
+    mGraphs[hash] = captured;
+    mCachedGraphBytes += estimatedDeviceBytes;
+    return true;
+}
+
+void EngineExecutor::eraseCapturedGraph(std::unordered_map<size_t, CapturedGraph>::iterator graph) noexcept
+{
+    mCachedGraphBytes -= std::min(mCachedGraphBytes, graph->second.estimatedDeviceBytes);
+    static_cast<void>(cudaGraphExecDestroy(graph->second.exec));
+    static_cast<void>(cudaGraphDestroy(graph->second.graph));
+    mGraphs.erase(graph);
+}
+
+bool EngineExecutor::graphMemoryBudgetHasCapacity() const noexcept
+{
+    if (mMaxAutomaticGraphBytes == 0U)
+    {
+        return true;
+    }
+    if (mCachedGraphBytes >= mMaxAutomaticGraphBytes)
+    {
+        return false;
+    }
+    if (mGraphs.empty() || mCachedGraphBytes == 0U)
+    {
+        return mMinimumAutomaticGraphBytes <= mMaxAutomaticGraphBytes;
+    }
+    size_t const averageGraphBytes = (mCachedGraphBytes + mGraphs.size() - 1U) / mGraphs.size();
+    size_t const nextGraphBytes = std::max(averageGraphBytes, mMinimumAutomaticGraphBytes);
+    return nextGraphBytes <= mMaxAutomaticGraphBytes - mCachedGraphBytes;
+}
+
+bool EngineExecutor::globalMemoryReserveHasCapacity(size_t estimatedGraphBytes) const noexcept
+{
+    if (mMinimumFreeMemoryBytes == 0U)
+    {
+        return true;
+    }
+    size_t freeBytes{};
+    size_t totalBytes{};
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess)
+    {
+        return false;
+    }
+    return freeBytes >= mMinimumFreeMemoryBytes && freeBytes - mMinimumFreeMemoryBytes >= estimatedGraphBytes;
+}
+
+size_t EngineExecutor::measureCapturedGraphBytes(size_t freeBytesBefore) const
+{
+    size_t freeBytesAfter{};
+    size_t totalBytes{};
+    CUDA_CHECK(cudaMemGetInfo(&freeBytesAfter, &totalBytes));
+    size_t const measuredBytes = freeBytesBefore > freeBytesAfter ? freeBytesBefore - freeBytesAfter : 0U;
+    if (measuredBytes > 0U || mGraphs.empty())
+    {
+        return std::max(measuredBytes, mMinimumAutomaticGraphBytes);
+    }
+    size_t const averageGraphBytes = (mCachedGraphBytes + mGraphs.size() - 1U) / mGraphs.size();
+    return std::max(averageGraphBytes, mMinimumAutomaticGraphBytes);
+}
+
+void EngineExecutor::rememberBindingObservation(size_t hash, BindingSnapshot const& snapshot)
+{
+    if (!mAutomaticGraphCaptureEnabled)
+    {
+        return;
+    }
+    auto const existing = mObservedBindings.find(hash);
+    if (existing != mObservedBindings.end())
+    {
+        existing->second = snapshot;
+        return;
+    }
+    while (mObservedBindings.size() >= mMaxObservedBindings && !mObservedBindingOrder.empty())
+    {
+        size_t const oldest = mObservedBindingOrder.front();
+        mObservedBindingOrder.pop_front();
+        mObservedBindings.erase(oldest);
+        ++mCudaGraphStats.observationEvictions;
+    }
+    mObservedBindings.emplace(hash, snapshot);
+    mObservedBindingOrder.push_back(hash);
 }
 
 } // namespace rt

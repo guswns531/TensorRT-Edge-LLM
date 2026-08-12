@@ -87,6 +87,19 @@ rt::HybridCacheManager makeIndexedManager(int32_t maxBatchSize)
     return rt::HybridCacheManager(config, nullptr);
 }
 
+rt::HybridCacheManager makeIndexedPagedManager(int32_t maxBatchSize, int32_t pageBundles)
+{
+    constexpr int32_t kMAX_SEQUENCE_LENGTH = 256;
+    rt::HybridCacheManager::Config config{};
+    config.layerTypes = {rt::HybridCacheManager::LayerType::kAttention};
+    config.kvConfig = rt::KVCacheManager::Config{
+        1, maxBatchSize, kMAX_SEQUENCE_LENGTH, {rt::KVLayerConfig{1, 64}}, DataType::kHALF, true, pageBundles, 128};
+    config.mambaConfig.maxBatchSize = maxBatchSize;
+    config.indexedKVCache = true;
+    config.maxBatchSize = maxBatchSize;
+    return rt::HybridCacheManager(config, nullptr);
+}
+
 TEST(PhaseBatchStateTest, BindsAndGathersStableSlots)
 {
     int32_t const maxBatchSize = 4;
@@ -1120,6 +1133,71 @@ TEST(PhaseContextServingFacadeTest, AdmitsPacksScattersAndReusesReleasedSlots)
     EXPECT_EQ(terminals.back().requestId, 404U);
     EXPECT_EQ(terminals.back().status, rt::PhaseRequestStatus::kCancelled);
     EXPECT_EQ(observedTerminals.size(), 3U);
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseContextServingFacadeTest, AppliesWholeRequestPagedKVAdmissionBackpressure)
+{
+    constexpr int32_t kSLOT_COUNT = 3;
+    constexpr int32_t kPAGE_BUNDLES = 2;
+    constexpr int32_t kPROMPT_TOKENS = 64;
+    constexpr int32_t kOUTPUT_TOKENS = 64;
+    rt::HybridCacheManager cacheManager = makeIndexedPagedManager(kSLOT_COUNT, kPAGE_BUNDLES);
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    rt::TensorMap decodeTensorMap;
+    decodeTensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
+    decodeTensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+    rt::PhaseBatchState prefillState(kSLOT_COUNT, "phase_page_admission_test");
+    std::array<rt::DecodingInferenceContext, kSLOT_COUNT> contexts;
+    for (rt::DecodingInferenceContext& context : contexts)
+    {
+        context.initialize(1, kOUTPUT_TOKENS, std::nullopt, rt::OptionalInputTensors{}, "", decodeStream);
+        context.rawBatchedInputIds = {{1}};
+        context.tokenIds = context.rawBatchedInputIds;
+    }
+
+    std::vector<rt::PhaseAdmissionResult> admissions;
+    rt::PhaseContextServingCallbacks callbacks;
+    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+        prefillState.prepare(batch, cacheManager, stream);
+        prefillState.commit(cacheManager, kPROMPT_TOKENS, stream);
+    };
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.promptTokenCount; };
+    callbacks.isPrefillFinished = [](uint64_t, rt::DecodingInferenceContext const&, int32_t) { return true; };
+    callbacks.enqueueDecode = [](rt::DecodingInferenceContext&) {};
+    callbacks.completeDecode = [](rt::DecodingInferenceContext&) {};
+    callbacks.onAdmission = [&](rt::PhaseAdmissionResult const& result) { admissions.push_back(result); };
+
+    rt::PhaseQueueSchedulerConfig schedulerConfig;
+    schedulerConfig.maxPrefillBatchSize = kSLOT_COUNT;
+    schedulerConfig.maxDecodeBatchSize = kSLOT_COUNT;
+    schedulerConfig.maxPrefillChunkTokens = kPROMPT_TOKENS;
+    rt::PhaseContextServingFacade facade(kSLOT_COUNT, schedulerConfig, std::move(callbacks), cacheManager,
+        decodeTensorMap, prefillStream, decodeStream, rt::PhaseTensorRTContextMode::kSharedSerialized, nullptr, 0,
+        kSLOT_COUNT);
+
+    EXPECT_EQ(facade.submitOrQueue(101, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(102, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    rt::PhaseAdmissionResult const pending = facade.submitOrQueue(103, contexts[2], 0, kPROMPT_TOKENS);
+    EXPECT_EQ(pending.status, rt::PhaseAdmissionStatus::kPending);
+    EXPECT_EQ(pending.availableSlots, 1);
+    EXPECT_EQ(pending.reservedPageBundles, kPAGE_BUNDLES);
+    EXPECT_EQ(pending.reservationAvailableBundles, 0);
+    EXPECT_EQ(facade.pendingRequestCount(), 1U);
+
+    facade.runUntilIdle(4);
+    EXPECT_TRUE(facade.empty());
+    EXPECT_EQ(facade.availableSlotCount(), kSLOT_COUNT);
+    EXPECT_EQ(cacheManager.getPagedKVPoolStats().allocatedBundles, 0);
+    ASSERT_EQ(admissions.size(), 4U);
+    EXPECT_EQ(admissions.back().requestId, 103U);
+    EXPECT_EQ(admissions.back().status, rt::PhaseAdmissionStatus::kAdmitted);
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));

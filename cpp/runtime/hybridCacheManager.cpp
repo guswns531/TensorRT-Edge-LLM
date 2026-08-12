@@ -89,13 +89,13 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
             mDeviceGlobalKVCacheLengths.rawPointer(), 0, mDeviceGlobalKVCacheLengths.getMemoryCapacity(), stream));
         if (mConfig.kvConfig.pagedKVCache)
         {
-            mPageAllocator.emplace(KVPageBundleAllocator::Config{mConfig.maxBatchSize,
-                mConfig.kvConfig.numPageBundles, mConfig.kvConfig.maxSequenceLength,
-                mConfig.kvConfig.tokensPerPage});
+            mPageAllocator.emplace(KVPageBundleAllocator::Config{mConfig.maxBatchSize, mConfig.kvConfig.numPageBundles,
+                mConfig.kvConfig.maxSequenceLength, mConfig.kvConfig.tokensPerPage});
             int32_t const maxPages = mPageAllocator->maxPagesPerSequence();
             mDeviceKVPageIds = rt::Tensor({mConfig.maxBatchSize, 2, maxPages}, DeviceType::kGPU, DataType::kINT32,
                 "HybridCacheManager::mDeviceKVPageIds");
-            CUDA_CHECK(cudaMemsetAsync(mDeviceKVPageIds.rawPointer(), 0xFF, mDeviceKVPageIds.getMemoryCapacity(), stream));
+            CUDA_CHECK(
+                cudaMemsetAsync(mDeviceKVPageIds.rawPointer(), 0xFF, mDeviceKVPageIds.getMemoryCapacity(), stream));
             mHostGlobalKVCacheLengths.assign(mConfig.maxBatchSize, 0);
             mHostKVPageIds.assign(static_cast<size_t>(mConfig.maxBatchSize) * 2 * maxPages, -1);
         }
@@ -311,6 +311,19 @@ KVPagePoolStats HybridCacheManager::getPagedKVPoolStats() const noexcept
     return {mConfig.kvConfig.numPageBundles, mPageAllocator->allocatedBundles(), mPageAllocator->availableBundles()};
 }
 
+int32_t HybridCacheManager::getPagedKVRequiredBundles(int32_t sequenceLength) const
+{
+    if (!mConfig.kvConfig.pagedKVCache || !mPageAllocator.has_value())
+    {
+        return 0;
+    }
+    std::lock_guard<std::mutex> const lock(mPageAllocatorMutex);
+    KVPageBundleAllocator::Config const& config = mPageAllocator->getConfig();
+    check::check(sequenceLength >= 0 && sequenceLength <= config.maxSequenceLength,
+        "Paged KV admission sequence length is outside the configured capacity.");
+    return (sequenceLength + config.tokensPerPage - 1) / config.tokensPerPage;
+}
+
 void HybridCacheManager::preparePagedKVCapacity(
     std::vector<PhaseWorkItem> const& batch, bool decode, cudaStream_t stream)
 {
@@ -330,8 +343,8 @@ void HybridCacheManager::preparePagedKVCapacity(
             std::vector<int32_t> const row = mPageAllocator->makePhysicalPageTableRow(item.kvSlotId);
             size_t const offset = static_cast<size_t>(item.kvSlotId) * row.size();
             std::copy(row.begin(), row.end(), mHostKVPageIds.begin() + offset);
-            CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset,
-                mHostKVPageIds.data() + offset, row.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset, mHostKVPageIds.data() + offset,
+                row.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         }
     }
 }
@@ -359,8 +372,8 @@ void HybridCacheManager::preparePagedKVCapacityForActiveLengths(
             std::vector<int32_t> const pageRow = mPageAllocator->makePhysicalPageTableRow(slot);
             size_t const offset = static_cast<size_t>(slot) * pageRow.size();
             std::copy(pageRow.begin(), pageRow.end(), mHostKVPageIds.begin() + offset);
-            CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset,
-                mHostKVPageIds.data() + offset, pageRow.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset, mHostKVPageIds.data() + offset,
+                pageRow.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         }
     }
 }
@@ -449,8 +462,8 @@ void HybridCacheManager::resetForNewSequences(rt::Tensor const& reuseKVCacheLeng
         if (mConfig.kvConfig.pagedKVCache)
         {
             mPageAllocator->reset();
-            CUDA_CHECK(cudaMemsetAsync(
-                mDeviceKVPageIds.rawPointer(), 0xFF, mDeviceKVPageIds.getMemoryCapacity(), stream));
+            CUDA_CHECK(
+                cudaMemsetAsync(mDeviceKVPageIds.rawPointer(), 0xFF, mDeviceKVPageIds.getMemoryCapacity(), stream));
             std::fill(mHostKVPageIds.begin(), mHostKVPageIds.end(), -1);
             int32_t const* reuseData = reuseKVCacheLengths.dataPointer<int32_t>();
             for (int32_t row = 0; row < batchSize; ++row)

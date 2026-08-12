@@ -128,6 +128,15 @@ using PhaseSchedulingPolicy = std::function<PhaseDispatchKind(PhaseQueueSnapshot
 using PhaseMetricsSchedulingPolicy
     = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&, PhaseSchedulerTelemetry const&)>;
 
+//! Conservative decode cost point loaded from offline CUDA-event profiling.
+//! maxContextLength is the largest per-request KV length covered by the point.
+struct PhaseDecodeBatchCost
+{
+    int32_t batchSize{};
+    int32_t maxContextLength{};
+    float p95GpuMs{};
+};
+
 struct PhaseQueueSchedulerConfig
 {
     int32_t maxPrefillBatchSize{1};
@@ -138,6 +147,12 @@ struct PhaseQueueSchedulerConfig
     //! Maximum tokens dispatched per request in one prefill turn. Zero keeps
     //! the legacy whole-prompt behavior.
     int32_t maxPrefillChunkTokens{};
+    //! Optional total-token budget for one compatible prefill batch. Zero disables it.
+    int32_t maxPrefillBatchTokens{};
+    //! Select a decode batch cap from measured p95 costs and current TPOT
+    //! pressure. Empty costs preserve the legacy largest-available behavior.
+    bool enableDynamicDecodeBatching{};
+    std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
     //! Model contract gate. A model with atomic multimodal prefill can disable
     //! chunking for every work item; per-request allowChunkedPrefill remains
     //! the narrower override.
@@ -158,6 +173,9 @@ struct PhaseQueueSchedulerConfig
     double decodeQueueWaitTargetUs{2000.0};
     float maxPredictedOverlapPrefillMs{30.0F};
     float minObservedOverlapRatio{0.05F};
+    //! At or above this page-pool pressure, prefer draining decode work when
+    //! neither queue has already violated its SLO. Zero disables the rule.
+    float pagePressureDecodeThreshold{0.8F};
     size_t minMetricsSamples{2};
     float metricsEwmaAlpha{0.2F};
     //! Priority is constrained to [0, maxPriority]. Its contribution is bounded
@@ -225,6 +243,7 @@ private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
+    int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     std::vector<PhaseWorkItem> popBatch(

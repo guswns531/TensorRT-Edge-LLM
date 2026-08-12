@@ -63,6 +63,9 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 41. [Stable indexed-paged KV cache 설계와 구현 계획](48-stable-indexed-paged-kv-plan.md)
 42. [Cosmos indexed-paged KV 구현과 10GB GPU 검증](49-cosmos-paged-kv-implementation.md)
 43. [Real-request indexed-linear/indexed-paged cost matrix](50-real-request-indexed-paged-cost-matrix.md)
+44. [Cosmos 구현 및 vLLM 비교 계획](65-cosmos-vllm-implementation-comparison-plan-20260812.md)
+45. [계획 구현 상태와 다음 실험](66-implementation-status-20260812.md)
+46. [Cosmos dynamic scheduler 구현 및 비교 결과](67-cosmos-dynamic-scheduler-results-20260812.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.
@@ -92,8 +95,8 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
   system prompt cache, host offload, Mamba, 여러 `handleRequest()` 사이 continuous admission은 명시적으로
   거부한다. multimodal phase 실행은 독립 context와 model adapter가 있는 경우에만 opt-in이다. Qwen3-VL/Cosmos
   indexed decoder의 image trace까지 검증했으며, deepstack/M-RoPE image prefill은 현재 원자적 BS1로 제한한다.
-  CUDA graph는 smoke만 검증했다.
-- indexed-paged v1은 FP16 vanilla text attention, 128-token page, stable slot release를 지원한다. pool 부족의
-  online backpressure, prefix refcount/COW, speculative decoding, host offload와 image prefill paging은 아직
+  CUDA graph는 real-request와 1,024-request endurance까지 검증했다.
+- indexed-paged v1은 FP16 vanilla text attention, 128-token page, stable slot release와 whole-request page-reservation
+  backpressure를 지원한다. prefix refcount/COW, speculative decoding, host offload와 image prefill paging은 아직
   지원하지 않는다.
 - 성능 개선보다 정확성, 메모리 소유권, 의존성 검증을 먼저 완료한다.

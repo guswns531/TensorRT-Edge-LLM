@@ -240,5 +240,85 @@ saturation을 더 확인한 뒤 선택한다.
 
 P16/D64 builder의 activation memory는 prefill 약 1.14 GiB, decode 약 0.54 GiB로 P8/D32의
 약 0.54/0.26 GiB보다 크다. page128 pressure는 `0.828~0.859`, page256은 `0.434`였으므로
-P16/D64에는 page256이 더 안전하다. 아직 실제 BS64를 형성한 측정은 아니므로 arrival rate를
-더 높이고 request 수를 늘린 전용 queue-saturation case가 남아 있다.
+P16/D64에는 page256이 더 안전하다. 이 측정 시점에는 실제 BS64가 형성되지 않았으므로,
+다음 절의 더 높은 arrival rate와 request 수를 사용한 전용 queue-saturation case를 추가했다.
+
+## Max batch 80에서 실제 Decode BS64 포화 측정
+
+Independent 실행 중 prefill과 decode가 서로 다른 physical slot 집합을 동시에 사용하므로,
+`P16 + D64`를 완전히 허용하려면 `maxBatchSize=64`보다 큰 slot capacity가 필요하다. 이를 확인하기
+위해 다음 capability로 indexed-paged 엔진을 다시 build했다.
+
+```text
+maxBatchSize=80
+maxPrefillBatchSize=16
+maxDecodeBatchSize=64
+page pool=256
+stable slots=80
+prefill/decode TensorRT execution context=independent
+CUDA primary context=shared
+```
+
+실제 request workload는 288 requests, arrival rate 1,000 req/s, output multiplier 4, fixed 128-token
+prefill chunk, queue-default scheduler로 구성했다. 모든 요청은 text-only이고 output 상한은 최대
+128 tokens다. `P8/P16 x D32/D48/D64` 여섯 조합이 모두 성공했으며, D64 case에서는 요청한
+decode batch 64가 실제로 형성됐다.
+
+| prefill / decode cap | observed P/D | TTFT med/p95 (ms) | TPOT med/p95 (ms) | E2E med/p95 (ms) | tok/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| P8 / D32 | 8 / 32 | 3,240 / 6,776 | 21.7 / 29.0 | 4,698 / 8,051 | 2,828 |
+| P8 / D48 | 8 / 48 | 3,020 / 5,527 | 11.1 / 13.0 | 3,853 / 6,292 | 3,603 |
+| P8 / D64 | 8 / 64 | 3,000 / 5,450 | 10.7 / 11.6 | 3,857 / 6,189 | 3,602 |
+| P16 / D32 | 9 / 32 | 3,098 / 6,832 | 23.4 / 33.5 | 5,474 / 8,227 | 2,776 |
+| P16 / D48 | 9 / 48 | 3,022 / 5,308 | 11.0 / 14.1 | 3,744 / 6,204 | 3,646 |
+| P16 / D64 | 9 / 64 | 2,928 / 5,465 | 10.7 / 12.6 | 3,756 / 6,302 | 3,578 |
+
+이 포화 workload에서는 `P16/D48`이 `3,646 tok/s`로 가장 높은 처리량과 가장 낮은 E2E
+median을 보였다. `P8/D48` 대비 처리량 차이는 약 `+1.18%`로 작고 TPOT p95는 오히려
+약 `+8.1%`였으므로, 이 한 번의 trace만으로 항상 P16을 고정하는 근거로 사용하지 않는다.
+P16에서 D48을 D64로 늘리면 TPOT median/p95는 개선됐지만 처리량은 약 `-1.85%`였고 E2E
+median도 개선되지 않았다. P8에서도 D48과 D64의 처리량 차이는 `0.05%` 이내였다.
+
+`observed P=9`는 엔진이 P9까지만 지원한다는 의미가 아니다. `maxPrefillBatchSize=16`은 상한이고,
+현재 scheduler는 queue의 seed request와 `dispatchedPrefillTokens`가 같으며 initial/continuation
+상태가 같은 row만 한 batch로 묶는다. 실제 P9 dispatch에는 `9 x 128`, `9 x 96`, `9 x 117`,
+`9 x 21` token bucket이 각각 존재했다. 따라서 전체 prefill queue가 커도 dispatch 시점에 같은
+bucket에 있던 row가 최대 9개였다. 현재 정책은 가장 큰 bucket을 찾지 않고 queue seed의 bucket을
+사용하며, decode burst 사이에 prefill을 즉시 dispatch하므로 P16까지 기다리지 않는다.
+
+### 현재 권장 버전
+
+엔진 capability와 runtime scheduler 기본값을 분리한다.
+
+```text
+Engine capability:
+  independent TensorRT execution contexts
+  indexed-paged KV cache
+  maxBatchSize=80
+  maxPrefillBatchSize=16
+  maxDecodeBatchSize=64
+  pagePool=256
+  stableSlots=80
+
+Runtime default:
+  fixed prefill chunk=128
+  prefill cap=8
+  decode cap=48
+
+Saturation policy candidate:
+  compatible prefill bucket이 충분하면 P16/D48
+  TPOT pressure가 우선이고 slot/page headroom이 충분하면 일시적으로 D64
+```
+
+따라서 현재 종합 권장안은 P16/D64-capable independent indexed-paged 엔진을 유지하면서,
+보수적인 운영 기본값은 `P8/D48`, 충분히 포화된 queue에서는 `P16/D48`을 선택하는 것이다.
+D64는 실제 형성 가능함을 검증했지만 처리량 기본값이 아니라 TPOT tail을 줄이는 reserve cap으로
+사용한다. 다음 scheduler 개선은 compatible bucket 크기, queue wait, SLO pressure를 함께 보고
+P8/P16과 D48/D64를 선택해야 한다.
+
+원자료는 다음에 있다.
+
+```text
+.local/cosmos-reason2-2b/sweep-results/stress288-p16d64-b256-m80-s80/
+.local/cosmos-reason2-2b/sweep-engines/engine-fp16-paged-p16-d64-b256-m80/
+```

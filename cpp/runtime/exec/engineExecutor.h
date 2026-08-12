@@ -24,8 +24,10 @@
 #include "runtime/exec/tensorMap.h"
 #include "runtime/exec/tensorRegistry.h"
 #include <NvInferRuntime.h>
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -57,6 +59,29 @@ namespace rt
 class EngineExecutor
 {
 public:
+    //! @brief CUDA graph cache counters for one TensorRT execution context.
+    struct CudaGraphCacheStats
+    {
+        uint64_t enqueueExecutions{};
+        uint64_t graphLaunches{};
+        uint64_t captures{};
+        uint64_t captureFailures{};
+        uint64_t graphLaunchFailures{};
+        uint64_t cacheLimitBypasses{};
+        uint64_t postEnqueueCaptures{};
+        uint64_t observationEvictions{};
+        uint64_t graphMemoryBudgetBypasses{};
+        uint64_t graphMemoryBudgetRejections{};
+        uint64_t globalMemoryReserveBypasses{};
+        uint64_t globalMemoryReserveRejections{};
+        size_t cachedGraphs{};
+        size_t cachedGraphBytes{};
+        size_t maxCachedGraphBytes{};
+        size_t minimumGraphChargeBytes{};
+        size_t minimumFreeMemoryBytes{};
+        bool automaticCaptureEnabled{};
+    };
+
     //! @brief Destructor — destroys all captured CUDA graphs.
     ~EngineExecutor() noexcept;
 
@@ -114,6 +139,21 @@ public:
      * @return True if capture succeeded
      */
     bool captureGraph(cudaStream_t stream);
+
+    //! @brief Enable capture-on-repeat for stable binding states.
+    //!
+    //! The first execution of a binding state uses enqueueV3 to let TensorRT
+    //! apply deferred dynamic-shape updates. A consecutive recurrence is
+    //! captured and launched once. A non-consecutive recurrence is enqueued
+    //! once, then captured without launch for future reuse. Neither path adds
+    //! an extra inference on live KV-cache state. A zero byte budget is
+    //! unlimited. minimumGraphChargeBytes accounts conservatively for CUDA
+    //! allocations that become visible only on first graph launch.
+    void enableAutomaticCudaGraphCapture(size_t maxCachedGraphs, size_t maxCachedGraphBytes = 0U,
+        size_t minimumGraphChargeBytes = 0U, size_t minimumFreeMemoryBytes = 0U);
+
+    //! @brief Return CUDA graph cache counters for this execution context.
+    CudaGraphCacheStats getCudaGraphCacheStats() const noexcept;
 
     /*!
      * @brief Query required device memory for the execution context.
@@ -202,16 +242,49 @@ private:
         cudaGraph_t graph{nullptr};
         cudaGraphExec_t exec{nullptr};
         BindingSnapshot snapshot;
+        size_t estimatedDeviceBytes{};
     };
 
     //! Graph cache keyed by a hash of all binding addresses + shapes.
     std::unordered_map<size_t, CapturedGraph> mGraphs;
+
+    bool mAutomaticGraphCaptureEnabled{};
+    size_t mMaxAutomaticGraphs{};
+    size_t mMaxAutomaticGraphBytes{};
+    size_t mMinimumAutomaticGraphBytes{};
+    size_t mMinimumFreeMemoryBytes{};
+    size_t mCachedGraphBytes{};
+    size_t mMaxObservedBindings{};
+    std::optional<BindingSnapshot> mLastSuccessfulBindings;
+    std::unordered_map<size_t, BindingSnapshot> mObservedBindings;
+    std::deque<size_t> mObservedBindingOrder;
+    std::unordered_map<size_t, BindingSnapshot> mUncapturableBindings;
+    std::unordered_map<size_t, BindingSnapshot> mBudgetRejectedBindings;
+    CudaGraphCacheStats mCudaGraphStats;
 
     //! Hash all current binding addresses and shapes into a single key.
     size_t computeBindingHash() const;
 
     //! Build a full snapshot of the current binding state.
     BindingSnapshot snapshotBindings() const;
+
+    //! Enqueue normally and remember the binding state if successful.
+    bool enqueueAndRemember(size_t hash, BindingSnapshot const& snapshot, cudaStream_t stream);
+
+    //! Capture the current execution, launch it once, and cache it on success.
+    bool captureLaunchAndCache(size_t hash, BindingSnapshot const& snapshot, cudaStream_t stream);
+
+    //! Execute the current inference once, then capture without launching the
+    //! graph. This safely materializes a non-consecutive recurring shape.
+    bool enqueueCaptureAndCache(size_t hash, BindingSnapshot const& snapshot, cudaStream_t stream);
+
+    bool cacheCapturedGraph(size_t hash, BindingSnapshot const& snapshot,
+        std::pair<cudaGraph_t, cudaGraphExec_t> const& captured, size_t estimatedDeviceBytes);
+    void eraseCapturedGraph(std::unordered_map<size_t, CapturedGraph>::iterator graph) noexcept;
+    bool graphMemoryBudgetHasCapacity() const noexcept;
+    bool globalMemoryReserveHasCapacity(size_t estimatedGraphBytes) const noexcept;
+    size_t measureCapturedGraphBytes(size_t freeBytesBefore) const;
+    void rememberBindingObservation(size_t hash, BindingSnapshot const& snapshot);
 };
 
 } // namespace rt
