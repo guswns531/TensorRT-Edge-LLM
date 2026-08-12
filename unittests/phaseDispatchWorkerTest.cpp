@@ -1271,6 +1271,31 @@ TEST(PhaseContextServingFacadeTest, HeadroomPolicyAdmitsMoreRequestsWithOneDrain
     EXPECT_TRUE(facade.cancel(302));
     EXPECT_TRUE(facade.cancel(301));
 
+    rt::PhasePageReservationConfig adaptive;
+    adaptive.mode = rt::PhasePageReservationMode::kHeadroom;
+    adaptive.outputHeadroomTokens = 0;
+    adaptive.maxConcurrentGrowthRequests = 2;
+    adaptive.enableAdaptiveGrowthRequests = true;
+    adaptive.minConcurrentGrowthRequests = 1;
+    adaptive.growthTpotTargetUs = 0.001;
+    adaptive.growthPressureEwmaAlpha = 1.0F;
+    adaptive.growthScaleUpThreshold = 0.5F;
+    adaptive.growthAdjustmentInterval = 1;
+    adaptive.growthAdjustmentStep = 1;
+    facade.configurePageReservation(adaptive);
+    EXPECT_EQ(facade.submitOrQueue(401, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(402, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.pageReservationStats().growthRequestLimit, 1);
+    EXPECT_EQ(facade.pageReservationStats().growthRequestOwners, 1);
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+    ASSERT_TRUE(facade.dispatchNext());
+    facade.wait();
+    EXPECT_EQ(facade.pageReservationStats().growthRequestLimit, 2);
+    EXPECT_EQ(facade.pageReservationStats().growthRequestOwners, 2);
+    EXPECT_TRUE(facade.cancel(402));
+    EXPECT_TRUE(facade.cancel(401));
+
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }

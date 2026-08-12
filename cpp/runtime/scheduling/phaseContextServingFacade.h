@@ -62,7 +62,26 @@ struct PhasePageReservationConfig
     PhasePageReservationMode mode{PhasePageReservationMode::kFull};
     int32_t outputHeadroomTokens{128};
     int32_t maxOvercommitPageBundles{1};
+    //! Maximum number of tails guaranteed at admission.
     int32_t maxConcurrentGrowthRequests{8};
+    //! Adapt runnable growth owners within the guaranteed maximum.
+    bool enableAdaptiveGrowthRequests{};
+    int32_t minConcurrentGrowthRequests{1};
+    double growthTpotTargetUs{50000.0};
+    float growthPressureEwmaAlpha{0.2F};
+    float growthScaleUpThreshold{0.8F};
+    float growthScaleDownThreshold{0.35F};
+    int32_t growthAdjustmentInterval{8};
+    int32_t growthAdjustmentStep{4};
+};
+
+struct PhasePageReservationStats
+{
+    int32_t guaranteedPageBundles{};
+    int32_t baseReservedPageBundles{};
+    int32_t growthRequestLimit{};
+    int32_t growthRequestOwners{};
+    float growthTpotPressure{};
 };
 
 struct PhaseAdmissionResult
@@ -163,6 +182,7 @@ public:
     size_t pendingRequestCount() const noexcept;
     size_t registeredRequestCount() const noexcept;
     int32_t availableSlotCount() const noexcept;
+    PhasePageReservationStats pageReservationStats() const;
     std::optional<PhaseRequestSnapshot> request(uint64_t requestId) const;
     CUcontext cudaContext() const noexcept;
     //! Add a terminal observer without replacing the callbacks installed by the executor owner.
@@ -205,6 +225,7 @@ private:
     void resizePageBundleReservation(uint64_t requestId, PageBundleReservation reservation);
     void releasePageBundles(uint64_t requestId);
     void selectDrainOwners();
+    void observePageReservationMetrics(PhaseDispatchMetrics const& metrics);
     bool isPageWorkEligible(PhaseWorkItem const& item, bool prefill) const;
     void updateAdmissionPageReservation(PhaseAdmissionResult& result) const;
     Registration& registration(uint64_t requestId);
@@ -222,6 +243,9 @@ private:
     int32_t mBaseReservedPageBundles{};
     std::unordered_set<uint64_t> mDrainRequestIds;
     PhasePageReservationConfig mPageReservationConfig;
+    int32_t mGrowthRequestLimit{8};
+    float mGrowthTpotPressure{};
+    int32_t mGrowthMetricSamples{};
     size_t mMaxPendingAdmissions{};
     bool mPendingAdmissionRequired{};
     size_t mNextTerminalObserverId{1};

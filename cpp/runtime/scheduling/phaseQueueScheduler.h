@@ -96,6 +96,10 @@ struct PhaseDispatchMetrics
     int32_t pagePoolTotalBundles{};
     int32_t pagePoolAllocatedBundles{};
     int32_t pagePoolAvailableBundles{};
+    //! Logical page-growth controller state after this dispatch.
+    int32_t pageGrowthRequestLimit{};
+    int32_t pageGrowthRequestOwners{};
+    float pageGrowthTpotPressure{};
 };
 
 struct PhaseSchedulerTelemetry

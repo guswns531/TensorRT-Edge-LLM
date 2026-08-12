@@ -165,7 +165,13 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         str(args.page_reservation_overcommit_bundles),
         "--pageReservationGrowthRequests",
         str(args.page_reservation_growth_requests),
+        "--minPageGrowthRequests",
+        str(args.min_page_growth_requests),
+        "--pageGrowthTpotTargetMs",
+        str(args.growth_tpot_target_ms),
     ]
+    if args.adaptive_page_growth:
+        command.append("--adaptivePageGrowth")
     if args.cuda_graph:
         if case.context_mode != "independent":
             raise ValueError(
@@ -254,7 +260,7 @@ def summarize_dispatch(path: Path, engine: Engine,
             []).append(row)
     result = []
     for (prefill, decode), samples in sorted(grouped.items()):
-        result.append({
+        summary = {
             "engine":
             engine.name,
             "context_mode":
@@ -284,7 +290,30 @@ def summarize_dispatch(path: Path, engine: Engine,
             percentile([float(row["decode_gpu_ms"]) for row in samples], 0.95),
             "overlap_median":
             statistics.median(float(row["overlap_ratio"]) for row in samples),
-        })
+        }
+        if "page_growth_request_limit" in samples[0]:
+            limits = [int(row["page_growth_request_limit"]) for row in samples]
+            owners = [
+                int(row["page_growth_request_owners"]) for row in samples
+            ]
+            pressures = [
+                float(row["page_growth_tpot_pressure"]) for row in samples
+            ]
+            summary.update({
+                "page_growth_limit_median":
+                statistics.median(limits),
+                "page_growth_limit_max":
+                max(limits),
+                "page_growth_owners_median":
+                statistics.median(owners),
+                "page_growth_owners_max":
+                max(owners),
+                "page_growth_pressure_median":
+                statistics.median(pressures),
+                "page_growth_pressure_p95":
+                percentile(pressures, 0.95),
+            })
+        result.append(summary)
     return result
 
 
@@ -539,6 +568,21 @@ def main() -> None:
         type=int,
         default=8,
         help="requests allowed to grow beyond their base reservation together")
+    parser.add_argument(
+        "--adaptive-page-growth",
+        action="store_true",
+        help="adapt runnable growth leases using CUDA-event TPOT pressure")
+    parser.add_argument("--min-page-growth-requests",
+                        type=int,
+                        default=1,
+                        help="initial and minimum adaptive growth lease count")
+    parser.add_argument(
+        "--growth-tpot-target-ms",
+        type=float,
+        default=20.0,
+        help=
+        "adaptive growth controller target for queue wait plus decode GPU time"
+    )
     args = parser.parse_args()
 
     if args.slot_count <= 0 or args.page_bundles <= 0 or args.tokens_per_page <= 0:
@@ -564,6 +608,10 @@ def main() -> None:
             or args.page_reservation_overcommit_bundles < 0
             or args.page_reservation_growth_requests <= 0):
         parser.error("page reservation policy values must be non-negative")
+    if (args.min_page_growth_requests <= 0 or args.min_page_growth_requests
+            > args.page_reservation_growth_requests
+            or args.growth_tpot_target_ms <= 0.0):
+        parser.error("adaptive page growth bounds and target are invalid")
     if args.dynamic_decode_batching and args.scheduler_cost_json is None:
         parser.error(
             "--dynamic-decode-batching requires --scheduler-cost-json")
@@ -655,6 +703,12 @@ def main() -> None:
                 args.page_reservation_overcommit_bundles,
                 "page_reservation_growth_requests":
                 args.page_reservation_growth_requests,
+                "adaptive_page_growth":
+                args.adaptive_page_growth,
+                "min_page_growth_requests":
+                args.min_page_growth_requests,
+                "growth_tpot_target_ms":
+                args.growth_tpot_target_ms,
                 "log":
                 str(log_path),
             }

@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -122,6 +123,9 @@ struct Args
     int32_t pageReservationHeadroomTokens{128};
     int32_t pageReservationOvercommitBundles{1};
     int32_t pageReservationGrowthRequests{8};
+    bool adaptivePageGrowth{};
+    int32_t minPageGrowthRequests{1};
+    double pageGrowthTpotTargetMs{50.0};
 };
 
 struct Sample
@@ -281,7 +285,8 @@ void printUsage(char const* program)
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
-        "--pageReservationGrowthRequests N] "
+        "--pageReservationGrowthRequests N --adaptivePageGrowth --minPageGrowthRequests N "
+        "--pageGrowthTpotTargetMs F] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
         "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --ttftTargetMs F --tpotTargetMs F "
         "--loadPriorityClasses N --loadSeed N --loadCsv FILE]",
@@ -340,6 +345,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         kPageReservationHeadroomTokens,
         kPageReservationOvercommitBundles,
         kPageReservationGrowthRequests,
+        kAdaptivePageGrowth,
+        kMinPageGrowthRequests,
+        kPageGrowthTpotTargetMs,
         kHelp,
     };
     option const options[] = {{"engineDir", required_argument, nullptr, kEngineDir},
@@ -385,6 +393,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
         {"pageReservationOvercommitBundles", required_argument, nullptr, kPageReservationOvercommitBundles},
         {"pageReservationGrowthRequests", required_argument, nullptr, kPageReservationGrowthRequests},
+        {"adaptivePageGrowth", no_argument, nullptr, kAdaptivePageGrowth},
+        {"minPageGrowthRequests", required_argument, nullptr, kMinPageGrowthRequests},
+        {"pageGrowthTpotTargetMs", required_argument, nullptr, kPageGrowthTpotTargetMs},
         {"help", no_argument, nullptr, kHelp}, {}};
 
     int optionId{};
@@ -476,6 +487,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kPageReservationHeadroomTokens: args.pageReservationHeadroomTokens = std::stoi(optarg); break;
         case kPageReservationOvercommitBundles: args.pageReservationOvercommitBundles = std::stoi(optarg); break;
         case kPageReservationGrowthRequests: args.pageReservationGrowthRequests = std::stoi(optarg); break;
+        case kAdaptivePageGrowth: args.adaptivePageGrowth = true; break;
+        case kMinPageGrowthRequests: args.minPageGrowthRequests = std::stoi(optarg); break;
+        case kPageGrowthTpotTargetMs: args.pageGrowthTpotTargetMs = std::stod(optarg); break;
         case kHelp: printUsage(argv[0]); return false;
         default: return false;
         }
@@ -491,7 +505,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1
         && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0
         && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
-        && args.pageReservationGrowthRequests > 0 && (!args.dynamicDecodeBatching || !args.schedulerCostJson.empty())
+        && args.pageReservationGrowthRequests > 0 && args.minPageGrowthRequests > 0
+        && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
+        && std::isfinite(args.pageGrowthTpotTargetMs) && args.pageGrowthTpotTargetMs > 0.0
+        && (!args.dynamicDecodeBatching || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty());
 }
 
@@ -600,7 +617,8 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
     ELLM_CHECK(output.good(), "Failed to open dispatch metrics CSV: " + path.string());
     output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,decode_tokens,"
               "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
-              "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles\n";
+              "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
+              "page_growth_request_limit,page_growth_request_owners,page_growth_tpot_pressure\n";
     output << std::fixed << std::setprecision(6);
     for (rt::PhaseDispatchMetrics const& sample : metrics)
     {
@@ -609,7 +627,8 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
                << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
                << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
-               << sample.pagePoolAvailableBundles << '\n';
+               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }
 
@@ -1621,6 +1640,9 @@ int main(int argc, char** argv)
                 serverConfig.maxInFlightRequests = traceRequests.size();
                 serverConfig.pageReservation = {args.pageReservationMode, args.pageReservationHeadroomTokens,
                     args.pageReservationOvercommitBundles, args.pageReservationGrowthRequests};
+                serverConfig.pageReservation.enableAdaptiveGrowthRequests = args.adaptivePageGrowth;
+                serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
+                serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
                 rt::PhaseAsyncServer server(serverConfig, facade, tokenizer, prefillStream);
                 runTrace(server);
             }
@@ -1671,6 +1693,9 @@ int main(int argc, char** argv)
                     serverConfig.maxInFlightRequests = traceRequests.size();
                     serverConfig.pageReservation = {args.pageReservationMode, args.pageReservationHeadroomTokens,
                         args.pageReservationOvercommitBundles, args.pageReservationGrowthRequests};
+                    serverConfig.pageReservation.enableAdaptiveGrowthRequests = args.adaptivePageGrowth;
+                    serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
+                    serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
                     rt::PhaseAsyncServer server(serverConfig, coordinator, encoderWorker, facade, tokenizer,
                         prefillStream, visionAdapter.get());
                     runTrace(server);

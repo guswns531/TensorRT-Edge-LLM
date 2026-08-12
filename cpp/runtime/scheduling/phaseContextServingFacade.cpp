@@ -21,6 +21,7 @@
 #include "common/cudaMacros.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <numeric>
 #include <utility>
@@ -81,14 +82,42 @@ void PhaseContextServingFacade::configurePageReservation(PhasePageReservationCon
     check::check(config.outputHeadroomTokens >= 0, "Serving output page headroom cannot be negative.");
     check::check(config.maxOvercommitPageBundles >= 0, "Serving page overcommit bound cannot be negative.");
     check::check(config.maxConcurrentGrowthRequests > 0, "Serving concurrent page growth limit must be positive.");
+    check::check(config.minConcurrentGrowthRequests > 0
+            && config.minConcurrentGrowthRequests <= config.maxConcurrentGrowthRequests,
+        "Serving minimum concurrent page growth limit is invalid.");
+    check::check(std::isfinite(config.growthTpotTargetUs) && config.growthTpotTargetUs > 0.0,
+        "Serving page growth TPOT target must be finite and positive.");
+    check::check(std::isfinite(config.growthPressureEwmaAlpha) && config.growthPressureEwmaAlpha > 0.0F
+            && config.growthPressureEwmaAlpha <= 1.0F,
+        "Serving page growth EWMA alpha must be in (0, 1].");
+    check::check(std::isfinite(config.growthScaleDownThreshold) && std::isfinite(config.growthScaleUpThreshold)
+            && config.growthScaleDownThreshold >= 0.0F
+            && config.growthScaleDownThreshold < config.growthScaleUpThreshold,
+        "Serving page growth pressure thresholds are invalid.");
+    check::check(config.growthAdjustmentInterval > 0 && config.growthAdjustmentStep > 0,
+        "Serving page growth adjustment cadence must be positive.");
     mPageReservationConfig = config;
+    mGrowthRequestLimit
+        = config.enableAdaptiveGrowthRequests ? config.minConcurrentGrowthRequests : config.maxConcurrentGrowthRequests;
+    mGrowthTpotPressure = 0.0F;
+    mGrowthMetricSamples = 0;
 }
 
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()
 {
     PhaseRequestLifecycleCallbacks result;
     result.onSlotRelease = [this](int32_t slot) { mCacheManager.releasePagedKVSlot(slot); };
-    result.execution.onMetrics = mCallbacks.onDispatchMetrics;
+    result.execution.onMetrics = [this](PhaseDispatchMetrics const& metrics) {
+        observePageReservationMetrics(metrics);
+        if (mCallbacks.onDispatchMetrics)
+        {
+            PhaseDispatchMetrics enriched = metrics;
+            enriched.pageGrowthRequestLimit = mGrowthRequestLimit;
+            enriched.pageGrowthRequestOwners = static_cast<int32_t>(mDrainRequestIds.size());
+            enriched.pageGrowthTpotPressure = mGrowthTpotPressure;
+            mCallbacks.onDispatchMetrics(enriched);
+        }
+    };
     result.execution.onDispatch = mCallbacks.onDispatch;
     result.execution.enqueuePrefill
         = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueuePrefillBatch(batch, stream); };
@@ -324,11 +353,45 @@ void PhaseContextServingFacade::selectDrainOwners()
         return left.first > right.first || (left.first == right.first && left.second < right.second);
     });
     int32_t const availableGrowthLeases
-        = mPageReservationConfig.maxConcurrentGrowthRequests - static_cast<int32_t>(mDrainRequestIds.size());
+        = std::max(0, mGrowthRequestLimit - static_cast<int32_t>(mDrainRequestIds.size()));
     int32_t const growthCount = std::min<int32_t>(availableGrowthLeases, candidates.size());
     for (int32_t index{}; index < growthCount; ++index)
     {
         mDrainRequestIds.insert(candidates[static_cast<size_t>(index)].second);
+    }
+}
+
+void PhaseContextServingFacade::observePageReservationMetrics(PhaseDispatchMetrics const& metrics)
+{
+    if (!mPageReservationConfig.enableAdaptiveGrowthRequests || metrics.decodeBatchSize == 0
+        || mPageReservationConfig.mode == PhasePageReservationMode::kFull)
+    {
+        return;
+    }
+    double const observedTpotUs = metrics.decodeQueueWaitUs + static_cast<double>(metrics.decodeGpuMs) * 1000.0;
+    float const pressure = static_cast<float>(observedTpotUs / mPageReservationConfig.growthTpotTargetUs);
+    float const alpha = mPageReservationConfig.growthPressureEwmaAlpha;
+    mGrowthTpotPressure = mGrowthMetricSamples > 0 ? alpha * pressure + (1.0F - alpha) * mGrowthTpotPressure : pressure;
+    ++mGrowthMetricSamples;
+    if (mGrowthMetricSamples % mPageReservationConfig.growthAdjustmentInterval != 0)
+    {
+        return;
+    }
+    int32_t nextLimit = mGrowthRequestLimit;
+    if (mGrowthTpotPressure >= mPageReservationConfig.growthScaleUpThreshold)
+    {
+        nextLimit = std::min(mPageReservationConfig.maxConcurrentGrowthRequests,
+            mGrowthRequestLimit + mPageReservationConfig.growthAdjustmentStep);
+    }
+    else if (mGrowthTpotPressure <= mPageReservationConfig.growthScaleDownThreshold)
+    {
+        nextLimit = std::max(mPageReservationConfig.minConcurrentGrowthRequests,
+            mGrowthRequestLimit - mPageReservationConfig.growthAdjustmentStep);
+    }
+    if (nextLimit != mGrowthRequestLimit)
+    {
+        mGrowthRequestLimit = nextLimit;
+        selectDrainOwners();
     }
 }
 
@@ -677,6 +740,12 @@ size_t PhaseContextServingFacade::registeredRequestCount() const noexcept
 int32_t PhaseContextServingFacade::availableSlotCount() const noexcept
 {
     return mLifecycle->availableSlotCount();
+}
+
+PhasePageReservationStats PhaseContextServingFacade::pageReservationStats() const
+{
+    return {guaranteedPageBundles(), mBaseReservedPageBundles, mGrowthRequestLimit,
+        static_cast<int32_t>(mDrainRequestIds.size()), mGrowthTpotPressure};
 }
 
 std::optional<PhaseRequestSnapshot> PhaseContextServingFacade::request(uint64_t requestId) const
