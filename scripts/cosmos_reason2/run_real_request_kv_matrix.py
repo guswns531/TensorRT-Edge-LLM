@@ -140,6 +140,12 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         str(args.input_len),
         "--prefillChunkSize",
         str(args.chunk_size),
+        "--maxOverlapPrefillTokens",
+        str(args.max_overlap_prefill_tokens),
+        "--ttftTargetMs",
+        str(args.ttft_target_ms),
+        "--tpotTargetMs",
+        str(args.tpot_target_ms),
         "--pastKVLen",
         str(args.past_kv_len),
         "--warmup",
@@ -165,6 +171,8 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         str(args.page_reservation_overcommit_bundles),
         "--pageReservationGrowthRequests",
         str(args.page_reservation_growth_requests),
+        "--fullReservationPromptThresholdTokens",
+        str(args.full_reservation_prompt_threshold_tokens),
         "--minPageGrowthRequests",
         str(args.min_page_growth_requests),
         "--pageGrowthTpotTargetMs",
@@ -211,9 +219,22 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
             ["--prefillTokenBudget",
              str(args.prefill_token_budget)])
     if args.dynamic_decode_batching:
+        command.append("--dynamicDecodeBatching")
+    if args.dynamic_prefill_batching:
         command.extend([
-            "--dynamicDecodeBatching", "--schedulerCostJson",
-            str(args.scheduler_cost_json)
+            "--dynamicPrefillBatching", "--minDynamicPrefillBatchSize",
+            str(args.min_dynamic_prefill_batch_size)
+        ])
+    if args.prefill_slo_recovery:
+        command.append("--prefillSloRecovery")
+    if args.dynamic_decode_batching or args.dynamic_prefill_batching:
+        command.extend(["--schedulerCostJson", str(args.scheduler_cost_json)])
+    if args.wavefront_prefill_batching:
+        command.extend([
+            "--wavefrontPrefillBatching", "--prefillCohortSize",
+            str(args.prefill_cohort_size), "--prefillCohortTurns",
+            str(args.prefill_cohort_turns), "--decodeSlackSafetyFactor",
+            str(args.decode_slack_safety_factor)
         ])
     if args.adaptive_scheduler:
         command.append("--adaptiveScheduler")
@@ -479,6 +500,9 @@ def main() -> None:
     parser.add_argument("--tokens-per-page", type=int, default=128)
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--max-overlap-prefill-tokens", type=int, default=128)
+    parser.add_argument("--ttft-target-ms", type=float, default=500.0)
+    parser.add_argument("--tpot-target-ms", type=float, default=50.0)
     # Real-trace warmup must start from an empty cache. Paged KV v1 rejects
     # the legacy system-prompt cache reuse path used by non-zero pastKVLen.
     parser.add_argument("--past-kv-len", type=int, default=0)
@@ -542,6 +566,26 @@ def main() -> None:
         help="select decode batch size using the measured scheduler cost model"
     )
     parser.add_argument(
+        "--dynamic-prefill-batching",
+        action="store_true",
+        help="select prefill P using profiled cost and remaining decode slack")
+    parser.add_argument("--min-dynamic-prefill-batch-size",
+                        type=int,
+                        default=1)
+    parser.add_argument(
+        "--prefill-slo-recovery",
+        action="store_true",
+        help="allow expired TTFT to temporarily override decode interference")
+    parser.add_argument(
+        "--wavefront-prefill-batching",
+        action="store_true",
+        help="advance a bounded request cohort across fixed prefill chunks")
+    parser.add_argument("--prefill-cohort-size", type=int, default=8)
+    parser.add_argument("--prefill-cohort-turns", type=int, default=8)
+    parser.add_argument("--decode-slack-safety-factor",
+                        type=float,
+                        default=0.8)
+    parser.add_argument(
         "--scheduler-cost-json",
         type=Path,
         help="cost model produced by build_phase_scheduler_cost_model.py")
@@ -569,6 +613,13 @@ def main() -> None:
         default=8,
         help="requests allowed to grow beyond their base reservation together")
     parser.add_argument(
+        "--full-reservation-prompt-threshold-tokens",
+        type=int,
+        default=0,
+        help=
+        "use full reservation at or above this prompt length; zero disables it"
+    )
+    parser.add_argument(
         "--adaptive-page-growth",
         action="store_true",
         help="adapt runnable growth leases using CUDA-event TPOT pressure")
@@ -590,6 +641,9 @@ def main() -> None:
             "slot-count, page-bundles, and tokens-per-page must be positive")
     if args.output_multiplier <= 0.0:
         parser.error("output-multiplier must be positive")
+    if (args.max_overlap_prefill_tokens < 0 or args.ttft_target_ms <= 0.0
+            or args.tpot_target_ms <= 0.0):
+        parser.error("phase overlap and SLO settings are invalid")
     if args.total_requests < 0:
         parser.error("total-requests must be non-negative")
     if args.max_cuda_graphs <= 0:
@@ -606,15 +660,21 @@ def main() -> None:
             "CUDA graph reserve and prefill token budget must be non-negative")
     if (args.page_reservation_headroom_tokens < 0
             or args.page_reservation_overcommit_bundles < 0
-            or args.page_reservation_growth_requests <= 0):
+            or args.page_reservation_growth_requests <= 0
+            or args.full_reservation_prompt_threshold_tokens < 0):
         parser.error("page reservation policy values must be non-negative")
     if (args.min_page_growth_requests <= 0 or args.min_page_growth_requests
             > args.page_reservation_growth_requests
             or args.growth_tpot_target_ms <= 0.0):
         parser.error("adaptive page growth bounds and target are invalid")
-    if args.dynamic_decode_batching and args.scheduler_cost_json is None:
-        parser.error(
-            "--dynamic-decode-batching requires --scheduler-cost-json")
+    if ((args.dynamic_decode_batching or args.dynamic_prefill_batching)
+            and args.scheduler_cost_json is None):
+        parser.error("dynamic batching requires --scheduler-cost-json")
+    if (args.min_dynamic_prefill_batch_size <= 0
+            or args.min_dynamic_prefill_batch_size > max(args.prefill_batches)
+            or args.prefill_cohort_size <= 0 or args.prefill_cohort_turns <= 0
+            or not 0.0 < args.decode_slack_safety_factor <= 1.0):
+        parser.error("wavefront prefill settings are invalid")
     if args.scheduler_cost_json is not None and not args.scheduler_cost_json.is_file(
     ):
         parser.error("scheduler-cost-json does not exist")
@@ -689,8 +749,28 @@ def main() -> None:
                 args.cuda_graph_reserve_mib if args.cuda_graph else 0,
                 "prefill_token_budget":
                 args.prefill_token_budget,
+                "max_overlap_prefill_tokens":
+                args.max_overlap_prefill_tokens,
+                "ttft_target_ms":
+                args.ttft_target_ms,
+                "tpot_target_ms":
+                args.tpot_target_ms,
                 "dynamic_decode_batching":
                 args.dynamic_decode_batching,
+                "dynamic_prefill_batching":
+                args.dynamic_prefill_batching,
+                "min_dynamic_prefill_batch_size":
+                args.min_dynamic_prefill_batch_size,
+                "prefill_slo_recovery":
+                args.prefill_slo_recovery,
+                "wavefront_prefill_batching":
+                args.wavefront_prefill_batching,
+                "prefill_cohort_size":
+                args.prefill_cohort_size,
+                "prefill_cohort_turns":
+                args.prefill_cohort_turns,
+                "decode_slack_safety_factor":
+                args.decode_slack_safety_factor,
                 "scheduler_cost_json":
                 str(args.scheduler_cost_json or ""),
                 "adaptive_scheduler":
@@ -703,6 +783,8 @@ def main() -> None:
                 args.page_reservation_overcommit_bundles,
                 "page_reservation_growth_requests":
                 args.page_reservation_growth_requests,
+                "full_reservation_prompt_threshold_tokens":
+                args.full_reservation_prompt_threshold_tokens,
                 "adaptive_page_growth":
                 args.adaptive_page_growth,
                 "min_page_growth_requests":

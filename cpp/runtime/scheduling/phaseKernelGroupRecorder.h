@@ -61,6 +61,12 @@ struct PhaseKernelDispatchMetadata
     int32_t prefillBatchSize{};
     int32_t decodeBatchSize{};
     int32_t prefillTokens{};
+    int32_t prefillInitialRows{};
+    int32_t prefillContinuationRows{};
+    int32_t prefillFinalRows{};
+    int32_t prefillPastKVMean{};
+    int32_t prefillPastKVMax{};
+    int32_t prefillPastKVSpread{};
     int32_t decodeContextTokens{};
 };
 

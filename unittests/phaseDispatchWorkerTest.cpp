@@ -1263,6 +1263,19 @@ TEST(PhaseContextServingFacadeTest, HeadroomPolicyAdmitsMoreRequestsWithOneDrain
     EXPECT_TRUE(facade.cancel(202));
     EXPECT_TRUE(facade.cancel(201));
 
+    rt::PhasePageReservationConfig promptAware;
+    promptAware.mode = rt::PhasePageReservationMode::kHeadroom;
+    promptAware.outputHeadroomTokens = 0;
+    promptAware.maxConcurrentGrowthRequests = 1;
+    promptAware.fullReservationPromptThresholdTokens = kPROMPT_TOKENS;
+    facade.configurePageReservation(promptAware);
+    EXPECT_EQ(facade.submitOrQueue(251, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(252, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
+    EXPECT_EQ(facade.submitOrQueue(253, contexts[2], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kPending);
+    EXPECT_TRUE(facade.cancel(253));
+    EXPECT_TRUE(facade.cancel(252));
+    EXPECT_TRUE(facade.cancel(251));
+
     facade.configurePageReservation({rt::PhasePageReservationMode::kHeadroom, 0, 0, 2});
     EXPECT_EQ(facade.submitOrQueue(301, contexts[0], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);
     EXPECT_EQ(facade.submitOrQueue(302, contexts[1], 0, kPROMPT_TOKENS).status, rt::PhaseAdmissionStatus::kAdmitted);

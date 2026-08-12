@@ -1,0 +1,16 @@
+workload,variant,achieved_req_s,generated_token_s,ttft_p95_ms,tpot_p95_ms,e2e_p95_ms
+short,fixed_p2,86.7705,1880.0272,801.8670,19.9059,1030.3689
+short,dynamic_no_wavefront,92.2445,1998.6298,699.5983,23.2167,903.9492
+short,dynamic_conservative_wavefront,88.9324,1926.8680,731.6620,22.3797,936.2823
+balanced,fixed_p2,38.3519,3247.1281,1331.5150,14.7411,2237.9660
+balanced,dynamic_no_wavefront,40.0541,3391.2463,1203.7003,14.1237,2133.5654
+balanced,dynamic_conservative_wavefront,39.5451,3348.1531,1224.8390,14.0650,2142.4368
+decode_heavy,fixed_p2,18.3410,3692.6524,1943.6213,12.2776,4530.8148
+decode_heavy,dynamic_no_wavefront,18.7987,3784.7976,1834.4775,12.6207,4409.7666
+decode_heavy,dynamic_conservative_wavefront,18.6885,3762.6120,1869.1698,12.7708,4435.3805
+long_prefill,fixed_p2,11.4640,972.5295,7171.8848,21.9543,8035.1492
+long_prefill,dynamic_no_wavefront,12.7325,1080.1398,6005.7025,26.3622,7189.5514
+long_prefill,dynamic_conservative_wavefront,12.1766,1032.9842,6622.9430,26.0042,7536.8047
+bimodal,fixed_p2,10.8612,1471.6993,5240.9578,17.6891,7860.0596
+bimodal,dynamic_no_wavefront,11.5098,1559.5763,4776.8098,28.6815,7480.1854
+bimodal,dynamic_conservative_wavefront,11.0281,1494.3109,5274.0805,26.5037,7717.7926

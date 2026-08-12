@@ -141,13 +141,18 @@ void PhaseKernelGroupRecorder::writeCsv(std::filesystem::path const& path) const
     std::ofstream output(path);
     check::check(output.good(), "Failed to open kernel-group CSV output.");
     output << "dispatch_index,segment_index,scheduler_dispatch_index,scheduler_kind,prefill_batch,decode_batch,"
-              "prefill_tokens,decode_context_tokens,group,name,gpu_ms\n";
+              "prefill_tokens,prefill_initial_rows,prefill_continuation_rows,prefill_final_rows,"
+              "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,decode_context_tokens,"
+              "group,name,gpu_ms\n";
     output << std::fixed << std::setprecision(6);
     for (PhaseKernelGroupSample const& sample : mSamples)
     {
         output << sample.dispatchIndex << ',' << sample.segmentIndex << ',' << sample.dispatch.schedulerDispatchIndex
                << ',' << sample.dispatch.schedulerKind << ',' << sample.dispatch.prefillBatchSize << ','
                << sample.dispatch.decodeBatchSize << ',' << sample.dispatch.prefillTokens << ','
+               << sample.dispatch.prefillInitialRows << ',' << sample.dispatch.prefillContinuationRows << ','
+               << sample.dispatch.prefillFinalRows << ',' << sample.dispatch.prefillPastKVMean << ','
+               << sample.dispatch.prefillPastKVMax << ',' << sample.dispatch.prefillPastKVSpread << ','
                << sample.dispatch.decodeContextTokens << ',' << phaseKernelGroupName(sample.group) << ',' << sample.name
                << ',' << sample.gpuMs << '\n';
     }

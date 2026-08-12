@@ -216,8 +216,9 @@ PhaseAsyncSubmission PhaseAsyncServer::submit(LLMGenerationRequest request, Phas
     uint64_t const requestId = mNextRequestId++;
     auto state = std::make_unique<RequestState>();
     state->request = std::move(request);
-    state->scheduling = scheduling;
     state->submittedAt = std::chrono::steady_clock::now();
+    scheduling.submittedAt = state->submittedAt;
+    state->scheduling = scheduling;
     prepareRequest(*state);
     auto const [it, inserted] = mRequests.emplace(requestId, std::move(state));
     check::check(inserted, "Async server generated a duplicate request ID.");

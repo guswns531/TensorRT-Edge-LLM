@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <limits>
 #include <utility>
 
 namespace trt_edgellm
@@ -150,9 +151,43 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.kind = mInFlight.kind;
     mCurrentMetrics.prefillBatchSize = static_cast<int32_t>(mInFlight.prefillBatch.size());
     mCurrentMetrics.decodeBatchSize = static_cast<int32_t>(mInFlight.decodeBatch.size());
+    mCurrentMetrics.predictedPrefillGpuMs = mInFlight.predictedPrefillGpuMs;
+    mCurrentMetrics.predictedDecodeSlowdownMs = mInFlight.predictedDecodeSlowdownMs;
+    mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
+    int64_t prefillPastKVSum{};
+    mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();
+    mCurrentMetrics.prefillMinTtftSlackUs = mInFlight.prefillBatch.empty() ? 0.0 : std::numeric_limits<double>::max();
+    auto const now = std::chrono::steady_clock::now();
     for (PhaseWorkItem const& item : mInFlight.prefillBatch)
     {
         mCurrentMetrics.prefillTokens += item.tokenCount;
+        bool const initial = item.tokenOffset == 0;
+        bool const final = item.tokenOffset + item.tokenCount == item.promptTokenCount;
+        mCurrentMetrics.prefillInitialRows += initial ? 1 : 0;
+        mCurrentMetrics.prefillContinuationRows += initial ? 0 : 1;
+        mCurrentMetrics.prefillFinalRows += final ? 1 : 0;
+        mCurrentMetrics.prefillPastKVMin = std::min(mCurrentMetrics.prefillPastKVMin, item.tokenOffset);
+        mCurrentMetrics.prefillPastKVMax = std::max(mCurrentMetrics.prefillPastKVMax, item.tokenOffset);
+        prefillPastKVSum += item.tokenOffset;
+        mCurrentMetrics.prefillRemainingTokens += item.promptTokenCount - item.tokenOffset - item.tokenCount;
+        double const requestAgeUs
+            = std::chrono::duration<double, std::micro>(now - item.scheduling.submittedAt).count();
+        double const targetUs = item.scheduling.ttftTargetUs;
+        mCurrentMetrics.prefillOldestRequestAgeUs = std::max(mCurrentMetrics.prefillOldestRequestAgeUs, requestAgeUs);
+        if (targetUs > 0.0)
+        {
+            mCurrentMetrics.prefillMinTtftSlackUs
+                = std::min(mCurrentMetrics.prefillMinTtftSlackUs, targetUs - requestAgeUs);
+        }
+    }
+    if (mCurrentMetrics.prefillBatchSize > 0)
+    {
+        mCurrentMetrics.prefillPastKVMean = static_cast<int32_t>(prefillPastKVSum / mCurrentMetrics.prefillBatchSize);
+        mCurrentMetrics.prefillPastKVSpread = mCurrentMetrics.prefillPastKVMax - mCurrentMetrics.prefillPastKVMin;
+        if (mCurrentMetrics.prefillMinTtftSlackUs == std::numeric_limits<double>::max())
+        {
+            mCurrentMetrics.prefillMinTtftSlackUs = 0.0;
+        }
     }
     mCurrentMetrics.decodeTokens = static_cast<int32_t>(mInFlight.decodeBatch.size());
     for (PhaseWorkItem const& item : mInFlight.decodeBatch)

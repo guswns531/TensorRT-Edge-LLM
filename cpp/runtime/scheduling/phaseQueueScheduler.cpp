@@ -39,12 +39,30 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxPrefillBatchTokens >= 0, "maxPrefillBatchTokens must be non-negative");
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
     {
-        check::check(cost.batchSize > 0 && cost.batchSize <= mConfig.maxDecodeBatchSize,
-            "Decode cost batch size is outside the configured range");
+        check::check(cost.batchSize > 0, "Decode cost batch size must be positive");
         check::check(cost.maxContextLength > 0, "Decode cost context length must be positive");
         check::check(std::isfinite(cost.p95GpuMs) && cost.p95GpuMs > 0.0F,
             "Decode cost p95 GPU time must be finite and positive");
     }
+    for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
+    {
+        check::check(cost.batchSize > 0, "Prefill cost batch size must be positive");
+        check::check(cost.chunkLength > 0 && cost.maxPastKVLength >= 0 && cost.maxConcurrentDecodeBatchSize >= 0,
+            "Prefill cost shape bounds are invalid");
+        check::check(std::isfinite(cost.p95GpuMs) && cost.p95GpuMs > 0.0F && std::isfinite(cost.decodeSlowdownP95Ms)
+                && cost.decodeSlowdownP95Ms >= 0.0F,
+            "Prefill cost timings must be finite and non-negative");
+    }
+    check::check(!mConfig.enableDynamicPrefillBatching || !mConfig.prefillBatchCosts.empty(),
+        "Dynamic prefill batching requires profiled prefill costs");
+    check::check(mConfig.maxPrefillCohortSize > 0, "Prefill cohort size must be positive");
+    check::check(mConfig.maxPrefillCohortTurns > 0, "Prefill cohort turn limit must be positive");
+    check::check(std::isfinite(mConfig.decodeSlackSafetyFactor) && mConfig.decodeSlackSafetyFactor > 0.0F
+            && mConfig.decodeSlackSafetyFactor <= 1.0F,
+        "Decode slack safety factor must be in (0, 1]");
+    check::check(
+        mConfig.minDynamicPrefillBatchSize > 0 && mConfig.minDynamicPrefillBatchSize <= mConfig.maxPrefillBatchSize,
+        "Minimum dynamic prefill batch size must be positive and within the prefill batch limit");
     check::check(mConfig.minPrefillChunkTokens > 0, "minPrefillChunkTokens must be positive");
     check::check(mConfig.prefillChunkAlignment > 0, "prefillChunkAlignment must be positive");
     check::check(!mConfig.enableAdaptivePrefillChunking || mConfig.maxPrefillChunkTokens > 0,
@@ -130,17 +148,26 @@ bool PhaseQueueScheduler::cancel(uint64_t requestId)
     {
         check::check(mActiveRequestIds.erase(requestId) == 1, "Cancelled request is not active");
         check::check(mQueuedSince.erase(requestId) == 1, "Cancelled request has no queue timestamp");
+        mPrefillCohortIds.erase(requestId);
     }
     return erased;
 }
 void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
 {
+    if (item.scheduling.submittedAt == std::chrono::steady_clock::time_point{})
+    {
+        item.scheduling.submittedAt = std::chrono::steady_clock::now();
+    }
     mPrefillQueue.push_back(item);
     mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
 }
 
 void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
 {
+    if (item.scheduling.submittedAt == std::chrono::steady_clock::time_point{})
+    {
+        item.scheduling.submittedAt = std::chrono::steady_clock::now();
+    }
     mDecodeQueue.push_back(item);
     mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
 }
@@ -180,6 +207,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         }
     }
     auto const now = std::chrono::steady_clock::now();
+    result.prefillMinTtftSlackUs = std::numeric_limits<double>::max();
     auto summarizeQueue = [&](std::deque<PhaseWorkItem> const& queue, bool prefill, double& oldestWaitUs,
                               double& maxSloPressure, int32_t& highestPriority) {
         double waitUs{};
@@ -197,7 +225,15 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
             double const target = requestTarget > 0.0
                 ? requestTarget
                 : (prefill ? mConfig.prefillQueueWaitTargetUs : mConfig.decodeQueueWaitTargetUs);
-            maxSloPressure = std::max(maxSloPressure, itemWaitUs / target);
+            double const requestAgeUs
+                = std::chrono::duration<double, std::micro>(now - item.scheduling.submittedAt).count();
+            double const sloAgeUs = prefill ? requestAgeUs : itemWaitUs;
+            maxSloPressure = std::max(maxSloPressure, sloAgeUs / target);
+            if (prefill)
+            {
+                result.prefillOldestRequestAgeUs = std::max(result.prefillOldestRequestAgeUs, requestAgeUs);
+                result.prefillMinTtftSlackUs = std::min(result.prefillMinTtftSlackUs, target - requestAgeUs);
+            }
             highestPriority = std::max(highestPriority, item.scheduling.priority);
         }
         oldestWaitUs = waitUs;
@@ -206,6 +242,10 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         mPrefillQueue, true, result.prefillOldestWaitUs, result.prefillMaxSloPressure, result.prefillHighestPriority);
     summarizeQueue(
         mDecodeQueue, false, result.decodeOldestWaitUs, result.decodeMaxSloPressure, result.decodeHighestPriority);
+    if (result.prefillQueued == 0)
+    {
+        result.prefillMinTtftSlackUs = 0.0;
+    }
     return result;
 }
 
@@ -327,8 +367,96 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
     return std::max(minimum, aligned);
 }
 
-std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
-    std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill, double& queueWaitUs)
+int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates,
+    int32_t chunkLength, bool initialChunk, bool overlap, PhaseQueueSnapshot const& state, float& predictedGpuMs,
+    float& predictedDecodeSlowdownMs) const noexcept
+{
+    int32_t const available = std::min<int32_t>(mConfig.maxPrefillBatchSize, candidates.size());
+    if (available <= 0 || !mConfig.enableDynamicPrefillBatching)
+    {
+        return 0;
+    }
+
+    struct Candidate
+    {
+        int32_t batchSize{};
+        float gpuMs{};
+        float decodeInterferenceMs{};
+    };
+    std::vector<Candidate> profiled;
+    int32_t const firstBatchSize = std::min(available, mConfig.minDynamicPrefillBatchSize);
+    for (int32_t batchSize = firstBatchSize; batchSize <= available; ++batchSize)
+    {
+        int32_t maxPastKV{};
+        for (int32_t index = 0; index < batchSize; ++index)
+        {
+            maxPastKV = std::max(maxPastKV, candidates[static_cast<size_t>(index)]->tokenOffset);
+        }
+        PhasePrefillBatchCost const* selected{};
+        for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
+        {
+            if (cost.batchSize != batchSize || cost.chunkLength != chunkLength || cost.initialChunk != initialChunk
+                || cost.maxPastKVLength < maxPastKV
+                || cost.maxConcurrentDecodeBatchSize
+                    < std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued)))
+            {
+                continue;
+            }
+            if (selected == nullptr || cost.maxPastKVLength < selected->maxPastKVLength
+                || (cost.maxPastKVLength == selected->maxPastKVLength
+                    && cost.maxConcurrentDecodeBatchSize < selected->maxConcurrentDecodeBatchSize))
+            {
+                selected = &cost;
+            }
+        }
+        if (selected != nullptr)
+        {
+            float const interference = overlap ? selected->decodeSlowdownP95Ms : selected->p95GpuMs;
+            profiled.push_back({batchSize, selected->p95GpuMs, interference});
+        }
+    }
+    if (profiled.empty())
+    {
+        return 0;
+    }
+
+    double const remainingDecodeUs
+        = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
+    double const allowedInterferenceUs = remainingDecodeUs * mConfig.decodeSlackSafetyFactor;
+    bool const prefillRecovery
+        = mConfig.enablePrefillSloRecovery && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
+    Candidate const* selected{};
+    for (Candidate const& candidate : profiled)
+    {
+        bool const feasible = prefillRecovery || state.decodeQueued == 0
+            || static_cast<double>(candidate.decodeInterferenceMs) * 1000.0 <= allowedInterferenceUs;
+        if (!feasible)
+        {
+            continue;
+        }
+        double const efficiency = static_cast<double>(candidate.batchSize * chunkLength) / candidate.gpuMs;
+        double const selectedEfficiency
+            = selected == nullptr ? 0.0 : static_cast<double>(selected->batchSize * chunkLength) / selected->gpuMs;
+        if (selected == nullptr || efficiency > selectedEfficiency
+            || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
+        {
+            selected = &candidate;
+        }
+    }
+    if (selected == nullptr)
+    {
+        selected = &*std::min_element(profiled.begin(), profiled.end(), [](Candidate const& lhs, Candidate const& rhs) {
+            return lhs.decodeInterferenceMs < rhs.decodeInterferenceMs
+                || (lhs.decodeInterferenceMs == rhs.decodeInterferenceMs && lhs.gpuMs < rhs.gpuMs);
+        });
+    }
+    predictedGpuMs = selected->gpuMs;
+    predictedDecodeSlowdownMs = selected->decodeInterferenceMs;
+    return selected->batchSize;
+}
+
+std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize,
+    bool chunkPrefill, PhaseQueueSnapshot const& state, PhaseDispatchPlan& plan)
 {
     auto const now = std::chrono::steady_clock::now();
     auto priorityRank = [&](PhaseWorkItem const& item) {
@@ -346,9 +474,29 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         }
         return mQueuedSince.at(lhs.requestId) > mQueuedSince.at(rhs.requestId);
     };
+    auto ttftSlack = [&](PhaseWorkItem const& item) {
+        double const target
+            = item.scheduling.ttftTargetUs > 0.0 ? item.scheduling.ttftTargetUs : mConfig.prefillQueueWaitTargetUs;
+        double const ageUs = std::chrono::duration<double, std::micro>(now - item.scheduling.submittedAt).count();
+        return target - ageUs;
+    };
+    auto moreUrgentPrefill = [&](PhaseWorkItem const& lhs, PhaseWorkItem const& rhs) {
+        if (mConfig.enablePriorityBatching && priorityRank(lhs) != priorityRank(rhs))
+        {
+            return priorityRank(lhs) > priorityRank(rhs);
+        }
+        double const lhsSlack = ttftSlack(lhs);
+        double const rhsSlack = ttftSlack(rhs);
+        if (lhsSlack != rhsSlack)
+        {
+            return lhsSlack < rhsSlack;
+        }
+        return mQueuedSince.at(lhs.requestId) < mQueuedSince.at(rhs.requestId);
+    };
     auto recordQueueWait = [&](uint64_t requestId) {
         auto const timestamp = mQueuedSince.find(requestId);
         check::check(timestamp != mQueuedSince.end(), "Dispatched request has no queue timestamp");
+        double& queueWaitUs = chunkPrefill ? plan.prefillQueueWaitUs : plan.decodeQueueWaitUs;
         queueWaitUs = std::max(queueWaitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
         mQueuedSince.erase(timestamp);
     };
@@ -383,20 +531,36 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
         return batch;
     }
 
-    auto bucketSeed = std::find_if(
-        queue.cbegin(), queue.cend(), [this](PhaseWorkItem const& item) { return isEligible(item, true); });
+    if (mConfig.enableWavefrontPrefillBatching && mPrefillCohortTurns >= mConfig.maxPrefillCohortTurns)
+    {
+        mPrefillCohortIds.clear();
+        mPrefillCohortTurns = 0;
+    }
+    auto inActiveCohort = [&](PhaseWorkItem const& item) {
+        return !mConfig.enableWavefrontPrefillBatching || mPrefillCohortIds.empty()
+            || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
+    };
+    auto bucketSeed = std::find_if(queue.cbegin(), queue.cend(),
+        [&](PhaseWorkItem const& item) { return isEligible(item, true) && inActiveCohort(item); });
+    if (bucketSeed == queue.cend() && !mPrefillCohortIds.empty())
+    {
+        mPrefillCohortIds.clear();
+        mPrefillCohortTurns = 0;
+        bucketSeed = std::find_if(
+            queue.cbegin(), queue.cend(), [this](PhaseWorkItem const& item) { return isEligible(item, true); });
+    }
     check::check(bucketSeed != queue.cend(), "Eligible prefill work disappeared during batch selection");
-    if (mConfig.enablePriorityBatching)
+    if (mConfig.enablePriorityBatching || mConfig.enableWavefrontPrefillBatching)
     {
         for (auto it = std::next(bucketSeed); it != queue.cend(); ++it)
         {
-            if (isEligible(*it, true) && higherPriority(*bucketSeed, *it))
+            if (isEligible(*it, true) && inActiveCohort(*it) && moreUrgentPrefill(*it, *bucketSeed))
             {
                 bucketSeed = it;
             }
         }
     }
-    if (mConfig.maxPrefillBatchTokens > 0)
+    if (mConfig.maxPrefillBatchTokens > 0 && !mConfig.enableWavefrontPrefillBatching)
     {
         auto bucketScore = [&](PhaseWorkItem const& candidate) {
             int32_t const candidateTokens = dispatchedPrefillTokens(candidate);
@@ -433,33 +597,75 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(
     }
     int32_t const bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
+    if (mConfig.enableWavefrontPrefillBatching && mPrefillCohortIds.empty())
+    {
+        std::vector<PhaseWorkItem const*> compatible;
+        for (PhaseWorkItem const& item : queue)
+        {
+            if (isEligible(item, true) && dispatchedPrefillTokens(item) == bucketTokens
+                && (item.tokenOffset == 0) == bucketInitial)
+            {
+                compatible.push_back(&item);
+            }
+        }
+        std::stable_sort(compatible.begin(), compatible.end(),
+            [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) { return moreUrgentPrefill(*lhs, *rhs); });
+        int32_t const cohortLimit
+            = std::min({mConfig.maxPrefillCohortSize, maxBatchSize, static_cast<int32_t>(compatible.size())});
+        for (int32_t index = 0; index < cohortLimit; ++index)
+        {
+            mPrefillCohortIds.insert(compatible[static_cast<size_t>(index)]->requestId);
+        }
+    }
+    std::vector<PhaseWorkItem const*> compatible;
+    for (PhaseWorkItem const& item : queue)
+    {
+        bool const cohortEligible = !mConfig.enableWavefrontPrefillBatching
+            || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
+        if (cohortEligible && isEligible(item, true) && dispatchedPrefillTokens(item) == bucketTokens
+            && (item.tokenOffset == 0) == bucketInitial)
+        {
+            compatible.push_back(&item);
+        }
+    }
+    std::stable_sort(compatible.begin(), compatible.end(),
+        [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) { return moreUrgentPrefill(*lhs, *rhs); });
     int32_t const tokenBudget = mConfig.maxPrefillBatchTokens > 0
         ? std::max(mConfig.maxPrefillBatchTokens, bucketTokens)
         : std::numeric_limits<int32_t>::max();
     int32_t const budgetRows = std::max(1, tokenBudget / std::max(1, bucketTokens));
-    int32_t const batchLimit = std::min(maxBatchSize, budgetRows);
-    while (static_cast<int32_t>(batch.size()) < batchLimit)
+    int32_t batchLimit = std::min({maxBatchSize, budgetRows, static_cast<int32_t>(compatible.size())});
+    float predictedGpuMs{};
+    float predictedDecodeSlowdownMs{};
+    int32_t const dynamicLimit = selectPrefillBatchSize(compatible, bucketTokens, bucketInitial,
+        plan.kind == PhaseDispatchKind::kOverlap, state, predictedGpuMs, predictedDecodeSlowdownMs);
+    if (dynamicLimit > 0)
     {
-        auto selected = queue.end();
-        for (auto it = queue.begin(); it != queue.end(); ++it)
-        {
-            if (isEligible(*it, true) && dispatchedPrefillTokens(*it) == bucketTokens
-                && (it->tokenOffset == 0) == bucketInitial
-                && (selected == queue.end() || (mConfig.enablePriorityBatching && higherPriority(*selected, *it))))
-            {
-                selected = it;
-            }
-        }
-        if (selected == queue.end())
-        {
-            break;
-        }
+        batchLimit = std::min(batchLimit, dynamicLimit);
+        plan.predictedPrefillGpuMs = predictedGpuMs;
+        plan.predictedDecodeSlowdownMs = predictedDecodeSlowdownMs;
+    }
+    std::vector<uint64_t> selectedRequestIds;
+    for (int32_t index = 0; index < batchLimit; ++index)
+    {
+        selectedRequestIds.push_back(compatible[static_cast<size_t>(index)]->requestId);
+    }
+    for (uint64_t const requestId : selectedRequestIds)
+    {
+        auto selected = std::find_if(
+            queue.begin(), queue.end(), [requestId](PhaseWorkItem const& item) { return item.requestId == requestId; });
+        check::check(selected != queue.end(), "Selected prefill request disappeared before dispatch");
         PhaseWorkItem item = *selected;
         queue.erase(selected);
         item.tokenCount = bucketTokens;
         check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
         recordQueueWait(item.requestId);
         batch.push_back(item);
+    }
+    if (mConfig.enableWavefrontPrefillBatching)
+    {
+        ++mPrefillCohortTurns;
+        plan.prefillCohortSize = static_cast<int32_t>(mPrefillCohortIds.size());
     }
     return batch;
 }
@@ -482,11 +688,11 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.kind = kind;
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true, plan.prefillQueueWaitUs);
+        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true, state, plan);
     }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.decodeBatch = popBatch(mDecodeQueue, selectDecodeBatchSize(state), false, plan.decodeQueueWaitUs);
+        plan.decodeBatch = popBatch(mDecodeQueue, selectDecodeBatchSize(state), false, state, plan);
     }
     if (kind == PhaseDispatchKind::kDecode)
     {
@@ -605,6 +811,7 @@ void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingK
     {
         check::check(nextOffset == item.promptTokenCount, "A request cannot finish before its final prefill chunk");
         check::check(mActiveRequestIds.erase(item.requestId) == 1, "Finished prefill request is not active");
+        mPrefillCohortIds.erase(item.requestId);
         return;
     }
 
@@ -617,6 +824,7 @@ void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingK
     }
 
     item.tokenCount = resultingKVLength;
+    mPrefillCohortIds.erase(item.requestId);
     enqueueKnownDecode(item);
 }
 

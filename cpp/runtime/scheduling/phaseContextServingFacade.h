@@ -73,6 +73,8 @@ struct PhasePageReservationConfig
     float growthScaleDownThreshold{0.35F};
     int32_t growthAdjustmentInterval{8};
     int32_t growthAdjustmentStep{4};
+    //! Prompt length at which requests use full reservation; zero disables the fallback.
+    int32_t fullReservationPromptThresholdTokens{};
 };
 
 struct PhasePageReservationStats

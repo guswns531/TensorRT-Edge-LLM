@@ -96,6 +96,8 @@ void PhaseContextServingFacade::configurePageReservation(PhasePageReservationCon
         "Serving page growth pressure thresholds are invalid.");
     check::check(config.growthAdjustmentInterval > 0 && config.growthAdjustmentStep > 0,
         "Serving page growth adjustment cadence must be positive.");
+    check::check(config.fullReservationPromptThresholdTokens >= 0,
+        "Serving full-reservation prompt threshold cannot be negative.");
     mPageReservationConfig = config;
     mGrowthRequestLimit
         = config.enableAdaptiveGrowthRequests ? config.minConcurrentGrowthRequests : config.maxConcurrentGrowthRequests;
@@ -209,6 +211,11 @@ PhaseContextServingFacade::PageBundleReservation PhaseContextServingFacade::make
         sequenceLength <= std::numeric_limits<int32_t>::max(), "Serving page reservation sequence length overflowed.");
     int32_t const fullBundles = mCacheManager.getPagedKVRequiredBundles(static_cast<int32_t>(sequenceLength));
     int32_t const promptBundles = mCacheManager.getPagedKVRequiredBundles(promptTokenCount);
+    if (mPageReservationConfig.fullReservationPromptThresholdTokens > 0
+        && promptTokenCount >= mPageReservationConfig.fullReservationPromptThresholdTokens)
+    {
+        return {fullBundles, fullBundles};
+    }
     int32_t baseBundles = fullBundles;
     switch (mPageReservationConfig.mode)
     {

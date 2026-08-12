@@ -38,6 +38,8 @@ struct PhaseSchedulingHints
     int32_t priority{};
     double ttftTargetUs{};
     double tpotTargetUs{};
+    //! Original host admission time. An empty value is filled on first enqueue.
+    std::chrono::steady_clock::time_point submittedAt;
 };
 
 //! A unit of phase work. For prefill, tokenCount is the remaining prompt
@@ -84,6 +86,19 @@ struct PhaseDispatchMetrics
     int32_t prefillBatchSize{};
     int32_t decodeBatchSize{};
     int32_t prefillTokens{};
+    int32_t prefillInitialRows{};
+    int32_t prefillContinuationRows{};
+    int32_t prefillFinalRows{};
+    int32_t prefillPastKVMin{};
+    int32_t prefillPastKVMean{};
+    int32_t prefillPastKVMax{};
+    int32_t prefillPastKVSpread{};
+    int32_t prefillRemainingTokens{};
+    double prefillOldestRequestAgeUs{};
+    double prefillMinTtftSlackUs{};
+    float predictedPrefillGpuMs{};
+    float predictedDecodeSlowdownMs{};
+    int32_t prefillCohortSize{};
     int32_t decodeTokens{};
     int32_t decodeContextTokens{};
     double prefillQueueWaitUs{};
@@ -121,6 +136,8 @@ struct PhaseQueueSnapshot
     int32_t decodeCandidateTokens{};
     int32_t consecutiveDecodeBatches{};
     double prefillOldestWaitUs{};
+    double prefillOldestRequestAgeUs{};
+    double prefillMinTtftSlackUs{};
     double decodeOldestWaitUs{};
     double prefillMaxSloPressure{};
     double decodeMaxSloPressure{};
@@ -142,6 +159,20 @@ struct PhaseDecodeBatchCost
     float p95GpuMs{};
 };
 
+//! Conservative prefill cost point loaded from offline CUDA-event profiling.
+//! The point covers one uniform chunk shape up to the supplied past-KV and
+//! concurrent decode batch bounds.
+struct PhasePrefillBatchCost
+{
+    int32_t batchSize{};
+    int32_t chunkLength{};
+    int32_t maxPastKVLength{};
+    int32_t maxConcurrentDecodeBatchSize{};
+    bool initialChunk{};
+    float p95GpuMs{};
+    float decodeSlowdownP95Ms{};
+};
+
 struct PhaseQueueSchedulerConfig
 {
     int32_t maxPrefillBatchSize{1};
@@ -158,6 +189,18 @@ struct PhaseQueueSchedulerConfig
     //! pressure. Empty costs preserve the legacy largest-available behavior.
     bool enableDynamicDecodeBatching{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
+    //! Select a prefill row count from profiled p95 cost and decode slack.
+    bool enableDynamicPrefillBatching{};
+    //! Minimum dynamic prefill batch while at least this many compatible rows exist.
+    int32_t minDynamicPrefillBatchSize{1};
+    //! Let an expired TTFT override decode interference while decode remains within SLO.
+    bool enablePrefillSloRecovery{};
+    std::vector<PhasePrefillBatchCost> prefillBatchCosts;
+    //! Keep a bounded set of requests advancing at similar chunk frontiers.
+    bool enableWavefrontPrefillBatching{};
+    int32_t maxPrefillCohortSize{8};
+    int32_t maxPrefillCohortTurns{8};
+    float decodeSlackSafetyFactor{0.8F};
     //! Model contract gate. A model with atomic multimodal prefill can disable
     //! chunking for every work item; per-request allowChunkedPrefill remains
     //! the narrower override.
@@ -208,6 +251,9 @@ struct PhaseDispatchPlan
     //! Oldest selected row's host queue residence before dispatch.
     double prefillQueueWaitUs{};
     double decodeQueueWaitUs{};
+    float predictedPrefillGpuMs{};
+    float predictedDecodeSlowdownMs{};
+    int32_t prefillCohortSize{};
 };
 
 //! Host-side two-queue batch scheduler for phase-separated, dual-stream inference.
@@ -252,11 +298,14 @@ private:
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const noexcept;
+    int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,
+        bool initialChunk, bool overlap, PhaseQueueSnapshot const& snapshot, float& predictedGpuMs,
+        float& predictedDecodeSlowdownMs) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     bool isEligible(PhaseWorkItem const& item, bool prefill) const;
-    std::vector<PhaseWorkItem> popBatch(
-        std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill, double& queueWaitUs);
+    std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill,
+        PhaseQueueSnapshot const& snapshot, PhaseDispatchPlan& plan);
     void enqueueKnownPrefill(PhaseWorkItem item);
     void enqueueKnownDecode(PhaseWorkItem item);
 
@@ -268,6 +317,8 @@ private:
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     PhaseSchedulerTelemetry mTelemetry;
     int32_t mConsecutiveDecodeBatches{};
+    std::unordered_set<uint64_t> mPrefillCohortIds;
+    int32_t mPrefillCohortTurns{};
 };
 
 } // namespace rt

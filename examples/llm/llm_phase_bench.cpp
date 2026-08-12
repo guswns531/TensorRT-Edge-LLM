@@ -119,10 +119,18 @@ struct Args
     int32_t cudaGraphReserveMiB{};
     int32_t prefillTokenBudget{};
     bool dynamicDecodeBatching{};
+    bool dynamicPrefillBatching{};
+    int32_t minDynamicPrefillBatchSize{1};
+    bool prefillSloRecovery{};
+    bool wavefrontPrefillBatching{};
+    int32_t prefillCohortSize{8};
+    int32_t prefillCohortTurns{8};
+    float decodeSlackSafetyFactor{0.8F};
     rt::PhasePageReservationMode pageReservationMode{rt::PhasePageReservationMode::kFull};
     int32_t pageReservationHeadroomTokens{128};
     int32_t pageReservationOvercommitBundles{1};
     int32_t pageReservationGrowthRequests{8};
+    int32_t fullReservationPromptThresholdTokens{};
     bool adaptivePageGrowth{};
     int32_t minPageGrowthRequests{1};
     double pageGrowthTpotTargetMs{50.0};
@@ -280,12 +288,16 @@ void printUsage(char const* program)
         "[--cudaGraphChargeMiB N --cudaGraphReserveMiB N] "
         "[--slotCount N] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--prefillTokenBudget N] "
-        "[--dynamicDecodeBatching --schedulerCostJson FILE] [--outputCsv FILE] "
+        "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
+        "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
+        "--decodeSlackSafetyFactor F "
+        "--schedulerCostJson FILE] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
-        "--pageReservationGrowthRequests N --adaptivePageGrowth --minPageGrowthRequests N "
+        "--pageReservationGrowthRequests N --fullReservationPromptThresholdTokens N "
+        "--adaptivePageGrowth --minPageGrowthRequests N "
         "--pageGrowthTpotTargetMs F] "
         "[--loadRequests N --arrivalRate R --loadPromptMin N --loadPromptMax N "
         "--loadOutputMin N --loadOutputMax N --maxOverlapPrefillTokens N --ttftTargetMs F --tpotTargetMs F "
@@ -323,6 +335,13 @@ bool parseArgs(Args& args, int argc, char** argv)
         kCudaGraphReserveMiB,
         kPrefillTokenBudget,
         kDynamicDecodeBatching,
+        kDynamicPrefillBatching,
+        kMinDynamicPrefillBatchSize,
+        kPrefillSloRecovery,
+        kWavefrontPrefillBatching,
+        kPrefillCohortSize,
+        kPrefillCohortTurns,
+        kDecodeSlackSafetyFactor,
         kSchedulerCostJson,
         kLoadRequests,
         kArrivalRate,
@@ -345,6 +364,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kPageReservationHeadroomTokens,
         kPageReservationOvercommitBundles,
         kPageReservationGrowthRequests,
+        kFullReservationPromptThresholdTokens,
         kAdaptivePageGrowth,
         kMinPageGrowthRequests,
         kPageGrowthTpotTargetMs,
@@ -372,6 +392,13 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"cudaGraphReserveMiB", required_argument, nullptr, kCudaGraphReserveMiB},
         {"prefillTokenBudget", required_argument, nullptr, kPrefillTokenBudget},
         {"dynamicDecodeBatching", no_argument, nullptr, kDynamicDecodeBatching},
+        {"dynamicPrefillBatching", no_argument, nullptr, kDynamicPrefillBatching},
+        {"minDynamicPrefillBatchSize", required_argument, nullptr, kMinDynamicPrefillBatchSize},
+        {"prefillSloRecovery", no_argument, nullptr, kPrefillSloRecovery},
+        {"wavefrontPrefillBatching", no_argument, nullptr, kWavefrontPrefillBatching},
+        {"prefillCohortSize", required_argument, nullptr, kPrefillCohortSize},
+        {"prefillCohortTurns", required_argument, nullptr, kPrefillCohortTurns},
+        {"decodeSlackSafetyFactor", required_argument, nullptr, kDecodeSlackSafetyFactor},
         {"schedulerCostJson", required_argument, nullptr, kSchedulerCostJson},
         {"loadRequests", required_argument, nullptr, kLoadRequests},
         {"arrivalRate", required_argument, nullptr, kArrivalRate},
@@ -393,6 +420,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
         {"pageReservationOvercommitBundles", required_argument, nullptr, kPageReservationOvercommitBundles},
         {"pageReservationGrowthRequests", required_argument, nullptr, kPageReservationGrowthRequests},
+        {"fullReservationPromptThresholdTokens", required_argument, nullptr, kFullReservationPromptThresholdTokens},
         {"adaptivePageGrowth", no_argument, nullptr, kAdaptivePageGrowth},
         {"minPageGrowthRequests", required_argument, nullptr, kMinPageGrowthRequests},
         {"pageGrowthTpotTargetMs", required_argument, nullptr, kPageGrowthTpotTargetMs},
@@ -445,6 +473,13 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kCudaGraphReserveMiB: args.cudaGraphReserveMiB = std::stoi(optarg); break;
         case kPrefillTokenBudget: args.prefillTokenBudget = std::stoi(optarg); break;
         case kDynamicDecodeBatching: args.dynamicDecodeBatching = true; break;
+        case kDynamicPrefillBatching: args.dynamicPrefillBatching = true; break;
+        case kMinDynamicPrefillBatchSize: args.minDynamicPrefillBatchSize = std::stoi(optarg); break;
+        case kPrefillSloRecovery: args.prefillSloRecovery = true; break;
+        case kWavefrontPrefillBatching: args.wavefrontPrefillBatching = true; break;
+        case kPrefillCohortSize: args.prefillCohortSize = std::stoi(optarg); break;
+        case kPrefillCohortTurns: args.prefillCohortTurns = std::stoi(optarg); break;
+        case kDecodeSlackSafetyFactor: args.decodeSlackSafetyFactor = std::stof(optarg); break;
         case kSchedulerCostJson: args.schedulerCostJson = optarg; break;
         case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
         case kArrivalRate: args.arrivalRate = std::stod(optarg); break;
@@ -487,6 +522,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kPageReservationHeadroomTokens: args.pageReservationHeadroomTokens = std::stoi(optarg); break;
         case kPageReservationOvercommitBundles: args.pageReservationOvercommitBundles = std::stoi(optarg); break;
         case kPageReservationGrowthRequests: args.pageReservationGrowthRequests = std::stoi(optarg); break;
+        case kFullReservationPromptThresholdTokens:
+            args.fullReservationPromptThresholdTokens = std::stoi(optarg);
+            break;
         case kAdaptivePageGrowth: args.adaptivePageGrowth = true; break;
         case kMinPageGrowthRequests: args.minPageGrowthRequests = std::stoi(optarg); break;
         case kPageGrowthTpotTargetMs: args.pageGrowthTpotTargetMs = std::stod(optarg); break;
@@ -505,10 +543,13 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1
         && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0
         && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
-        && args.pageReservationGrowthRequests > 0 && args.minPageGrowthRequests > 0
-        && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
-        && std::isfinite(args.pageGrowthTpotTargetMs) && args.pageGrowthTpotTargetMs > 0.0
-        && (!args.dynamicDecodeBatching || !args.schedulerCostJson.empty())
+        && args.pageReservationGrowthRequests > 0 && args.fullReservationPromptThresholdTokens >= 0
+        && args.minPageGrowthRequests > 0 && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
+        && std::isfinite(args.pageGrowthTpotTargetMs) && args.pageGrowthTpotTargetMs > 0.0 && args.prefillCohortSize > 0
+        && args.minDynamicPrefillBatchSize > 0 && args.minDynamicPrefillBatchSize <= args.prefillBatch
+        && args.prefillCohortTurns > 0 && std::isfinite(args.decodeSlackSafetyFactor)
+        && args.decodeSlackSafetyFactor > 0.0F && args.decodeSlackSafetyFactor <= 1.0F
+        && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching) || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty());
 }
 
@@ -526,6 +567,25 @@ std::vector<rt::PhaseDecodeBatchCost> loadDecodeBatchCosts(std::filesystem::path
             point.at("p95_gpu_ms").get<float>()});
     }
     ELLM_CHECK(!costs.empty(), "Scheduler cost model contains no decode points");
+    return costs;
+}
+
+std::vector<rt::PhasePrefillBatchCost> loadPrefillBatchCosts(std::filesystem::path const& path)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open scheduler cost model");
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(
+        root.contains("prefill") && root.at("prefill").is_array(), "Scheduler cost model must contain a prefill array");
+    std::vector<rt::PhasePrefillBatchCost> costs;
+    for (nlohmann::json const& point : root.at("prefill"))
+    {
+        costs.push_back({point.at("batch_size").get<int32_t>(), point.at("chunk_length").get<int32_t>(),
+            point.at("max_past_kv_length").get<int32_t>(), point.at("max_concurrent_decode_batch_size").get<int32_t>(),
+            point.at("initial_chunk").get<bool>(), point.at("p95_gpu_ms").get<float>(),
+            point.at("decode_slowdown_p95_ms").get<float>()});
+    }
+    ELLM_CHECK(!costs.empty(), "Scheduler cost model contains no prefill points");
     return costs;
 }
 
@@ -615,7 +675,11 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
 {
     std::ofstream output(path);
     ELLM_CHECK(output.good(), "Failed to open dispatch metrics CSV: " + path.string());
-    output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,decode_tokens,"
+    output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,decode_tokens,decode_context_tokens,"
+              "prefill_initial_rows,prefill_continuation_rows,prefill_final_rows,prefill_past_kv_min,"
+              "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,prefill_remaining_tokens,"
+              "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
+              "predicted_decode_slowdown_ms,prefill_cohort_size,"
               "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
               "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
               "page_growth_request_limit,page_growth_request_owners,page_growth_tpot_pressure\n";
@@ -624,6 +688,12 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
     {
         output << sample.dispatchIndex << ',' << static_cast<int32_t>(sample.kind) << ',' << sample.prefillBatchSize
                << ',' << sample.decodeBatchSize << ',' << sample.prefillTokens << ',' << sample.decodeTokens << ','
+               << sample.decodeContextTokens << ',' << sample.prefillInitialRows << ','
+               << sample.prefillContinuationRows << ',' << sample.prefillFinalRows << ',' << sample.prefillPastKVMin
+               << ',' << sample.prefillPastKVMean << ',' << sample.prefillPastKVMax << ',' << sample.prefillPastKVSpread
+               << ',' << sample.prefillRemainingTokens << ',' << sample.prefillOldestRequestAgeUs << ','
+               << sample.prefillMinTtftSlackUs << ',' << sample.predictedPrefillGpuMs << ','
+               << sample.predictedDecodeSlowdownMs << ',' << sample.prefillCohortSize << ','
                << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
                << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
                << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
@@ -1297,6 +1367,17 @@ int main(int argc, char** argv)
         {
             facadeSchedulerConfig.decodeBatchCosts = loadDecodeBatchCosts(args.schedulerCostJson);
         }
+        facadeSchedulerConfig.enableDynamicPrefillBatching = args.dynamicPrefillBatching;
+        facadeSchedulerConfig.minDynamicPrefillBatchSize = args.minDynamicPrefillBatchSize;
+        facadeSchedulerConfig.enablePrefillSloRecovery = args.prefillSloRecovery;
+        if (args.dynamicPrefillBatching)
+        {
+            facadeSchedulerConfig.prefillBatchCosts = loadPrefillBatchCosts(args.schedulerCostJson);
+        }
+        facadeSchedulerConfig.enableWavefrontPrefillBatching = args.wavefrontPrefillBatching;
+        facadeSchedulerConfig.maxPrefillCohortSize = args.prefillCohortSize;
+        facadeSchedulerConfig.maxPrefillCohortTurns = args.prefillCohortTurns;
+        facadeSchedulerConfig.decodeSlackSafetyFactor = args.decodeSlackSafetyFactor;
         facadeSchedulerConfig.supportsChunkedPrefill = phaseContract.supportsChunkedPrefill;
         facadeSchedulerConfig.enableMetricsPolicy = args.adaptiveScheduler;
         facadeSchedulerConfig.prefillQueueWaitTargetUs = args.ttftTargetMs * 1000.0;
@@ -1494,6 +1575,12 @@ int main(int argc, char** argv)
             kernelDispatchMetadata.prefillBatchSize = sample.prefillBatchSize;
             kernelDispatchMetadata.decodeBatchSize = sample.decodeBatchSize;
             kernelDispatchMetadata.prefillTokens = sample.prefillTokens;
+            kernelDispatchMetadata.prefillInitialRows = sample.prefillInitialRows;
+            kernelDispatchMetadata.prefillContinuationRows = sample.prefillContinuationRows;
+            kernelDispatchMetadata.prefillFinalRows = sample.prefillFinalRows;
+            kernelDispatchMetadata.prefillPastKVMean = sample.prefillPastKVMean;
+            kernelDispatchMetadata.prefillPastKVMax = sample.prefillPastKVMax;
+            kernelDispatchMetadata.prefillPastKVSpread = sample.prefillPastKVSpread;
             kernelDispatchMetadata.decodeContextTokens = sample.decodeContextTokens;
         };
         facadeCallbacks.onAdmission = [&](rt::PhaseAdmissionResult const& admission) {
@@ -1641,6 +1728,8 @@ int main(int argc, char** argv)
                 serverConfig.pageReservation = {args.pageReservationMode, args.pageReservationHeadroomTokens,
                     args.pageReservationOvercommitBundles, args.pageReservationGrowthRequests};
                 serverConfig.pageReservation.enableAdaptiveGrowthRequests = args.adaptivePageGrowth;
+                serverConfig.pageReservation.fullReservationPromptThresholdTokens
+                    = args.fullReservationPromptThresholdTokens;
                 serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
                 serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
                 rt::PhaseAsyncServer server(serverConfig, facade, tokenizer, prefillStream);
@@ -1694,6 +1783,8 @@ int main(int argc, char** argv)
                     serverConfig.pageReservation = {args.pageReservationMode, args.pageReservationHeadroomTokens,
                         args.pageReservationOvercommitBundles, args.pageReservationGrowthRequests};
                     serverConfig.pageReservation.enableAdaptiveGrowthRequests = args.adaptivePageGrowth;
+                    serverConfig.pageReservation.fullReservationPromptThresholdTokens
+                        = args.fullReservationPromptThresholdTokens;
                     serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
                     serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
                     rt::PhaseAsyncServer server(serverConfig, coordinator, encoderWorker, facade, tokenizer,
@@ -1737,6 +1828,7 @@ int main(int argc, char** argv)
                     scheduling.priority = loadMetrics[index].priority;
                     scheduling.ttftTargetUs = args.ttftTargetMs * 1000.0;
                     scheduling.tpotTargetUs = args.tpotTargetMs * 1000.0;
+                    scheduling.submittedAt = std::chrono::steady_clock::now();
                     static_cast<void>(facade.submitOrQueue(
                         request.requestId, *facadeContexts[index], 0, request.promptTokenCount, scheduling));
                     ++submittedRequests;
