@@ -20,7 +20,9 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <optional>
+#include <vector>
 
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
@@ -274,6 +276,117 @@ TEST(ContextAttentionTest, compactLayout_Causal)
     // Text prefill attention with compact variable-length rows.
     TestContextAttentionCompactAccuracy({0, 17, 81, 112}, 16, 4, 128, 64, true);
     TestContextAttentionCompactAccuracy({0, 3, 35, 99, 128}, 8, 2, 256, 64, true);
+}
+
+TEST(ContextAttentionTest, compactLayout_CausalContinuationUsesSeparateQAndKVLengths)
+{
+    std::vector<int32_t> const cuQSeqLens{0, 2, 5, 6};
+    std::vector<int32_t> const cuKVSeqLens{0, 6, 10, 13};
+    int32_t constexpr batchSize = 3;
+    int32_t constexpr totalQTokens = 6;
+    int32_t constexpr totalKVTokens = 13;
+    int32_t constexpr maxQSeqLen = 3;
+    int32_t constexpr numQHeads = 8;
+    int32_t constexpr numKVHeads = 2;
+    int32_t constexpr headSize = 128;
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    AttentionInputLayout constexpr inputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
+    ContextAttentionMaskType constexpr maskType = ContextAttentionMaskType::CAUSAL;
+    if (!ContextFMHARunner::canImplement(headSize, smVersion, DataType::kHALF, inputLayout, maskType))
+    {
+        GTEST_SKIP() << "Context FMHA not supported for headSize=" << headSize << ", SM=" << smVersion;
+    }
+
+    std::vector<half> qInput(static_cast<size_t>(totalQTokens) * numQHeads * headSize);
+    std::vector<half> kInput(static_cast<size_t>(totalKVTokens) * numKVHeads * headSize);
+    std::vector<half> vInput(static_cast<size_t>(totalKVTokens) * numKVHeads * headSize);
+    uniformFloatInitialization(qInput, -0.5F, 0.5F);
+    uniformFloatInitialization(kInput, -0.5F, 0.5F);
+    uniformFloatInitialization(vInput, -0.5F, 0.5F);
+
+    rt::Tensor qTensor({totalQTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kTensor({totalKVTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vTensor({totalKVTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputTensor({totalQTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cuQTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(kTensor.rawPointer(), kInput.data(), kInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(vTensor.rawPointer(), vInput.data(), vInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        cuQTensor.rawPointer(), cuQSeqLens.data(), cuQSeqLens.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        cuKVTensor.rawPointer(), cuKVSeqLens.data(), cuKVSeqLens.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
+    ContextFMHARunner runner(DataType::kHALF, batchSize, maxQSeqLen, numQHeads, numKVHeads, headSize, smVersion,
+        inputLayout, maskType, /*isSPadded=*/false);
+    FusedMultiheadAttentionParamsV2 params{};
+    runner.setupParams(params, attentionScale);
+    params.q_ptr = qTensor.rawPointer();
+    params.k_ptr = kTensor.rawPointer();
+    params.v_ptr = vTensor.rawPointer();
+    params.o_ptr = outputTensor.rawPointer();
+    params.cu_q_seqlens = cuQTensor.dataPointer<int32_t>();
+    params.cu_kv_seqlens = cuKVTensor.dataPointer<int32_t>();
+    runner.dispatchFMHAKernel(params, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const output = copyDeviceToHost<half>(outputTensor);
+    for (int32_t row = 0; row < batchSize; ++row)
+    {
+        int32_t const qLength = cuQSeqLens[row + 1] - cuQSeqLens[row];
+        int32_t const kvLength = cuKVSeqLens[row + 1] - cuKVSeqLens[row];
+        int32_t const pastLength = kvLength - qLength;
+        ASSERT_GE(pastLength, 0);
+        for (int32_t q = 0; q < qLength; ++q)
+        {
+            int32_t const qToken = cuQSeqLens[row] + q;
+            int32_t const lastVisibleKV = pastLength + q;
+            for (int32_t qHead = 0; qHead < numQHeads; ++qHead)
+            {
+                int32_t const kvHead = qHead * numKVHeads / numQHeads;
+                std::vector<float> scores(lastVisibleKV + 1);
+                float maxScore = -std::numeric_limits<float>::infinity();
+                for (int32_t k = 0; k <= lastVisibleKV; ++k)
+                {
+                    int32_t const kvToken = cuKVSeqLens[row] + k;
+                    float score{0.0F};
+                    for (int32_t dim = 0; dim < headSize; ++dim)
+                    {
+                        size_t const qIndex = (static_cast<size_t>(qToken) * numQHeads + qHead) * headSize + dim;
+                        size_t const kIndex = (static_cast<size_t>(kvToken) * numKVHeads + kvHead) * headSize + dim;
+                        score += __half2float(qInput[qIndex]) * __half2float(kInput[kIndex]);
+                    }
+                    scores[k] = score * attentionScale;
+                    maxScore = std::max(maxScore, scores[k]);
+                }
+
+                float denominator{0.0F};
+                for (float& score : scores)
+                {
+                    score = std::exp(score - maxScore);
+                    denominator += score;
+                }
+                for (int32_t dim = 0; dim < headSize; ++dim)
+                {
+                    float expected{0.0F};
+                    for (int32_t k = 0; k <= lastVisibleKV; ++k)
+                    {
+                        int32_t const kvToken = cuKVSeqLens[row] + k;
+                        size_t const vIndex = (static_cast<size_t>(kvToken) * numKVHeads + kvHead) * headSize + dim;
+                        expected += scores[k] / denominator * __half2float(vInput[vIndex]);
+                    }
+                    size_t const outputIndex = (static_cast<size_t>(qToken) * numQHeads + qHead) * headSize + dim;
+                    EXPECT_TRUE(isclose(output[outputIndex], __float2half(expected), 1e-2, 1e-2))
+                        << "Mismatch at row=" << row << " q=" << q << " head=" << qHead << " dim=" << dim;
+                }
+            }
+        }
+    }
 }
 
 TEST(ContextAttentionTest, configurableScale)

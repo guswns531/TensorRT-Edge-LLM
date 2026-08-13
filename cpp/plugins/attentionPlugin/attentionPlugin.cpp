@@ -37,6 +37,7 @@
 #include "kernels/contextAttentionKernels/cuteDslFFPARunner.h"
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -275,6 +276,22 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::deinterleaveKVCache(rt::Tenso
     // seqLen > 0: compact copy of first seqLen tokens; seqLen == 0: full copy (also handles FP8 dequant).
     kernel::cvtKVLayoutBHSDToSplitKV(
         kvCacheTensor, kTensor, vTensor, rt::Tensor{}, seqLen, stream, kvSlotIds, kvPageIds);
+    return std::make_pair(std::move(kTensor), std::move(vTensor));
+}
+
+std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::gatherPackedKVCache(rt::Tensor const& kvCacheTensor,
+    rt::Tensor const& cuKVSeqLens, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
+    int32_t kvCacheCapacity, int32_t headSize, cudaStream_t stream, int32_t const* kvSlotIds, int32_t const* kvPageIds)
+{
+    int64_t const maxPackedTokens = static_cast<int64_t>(batchSize) * kvCacheCapacity;
+    size_t const halfSize = static_cast<size_t>(maxPackedTokens) * numKVHeads * headSize;
+    rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(
+        workspacePtr, {batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
+    half* ptr = kvWorkspaceTensor.dataPointer<half>();
+    rt::Tensor kTensor(ptr, rt::Coords{maxPackedTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vTensor(
+        ptr + halfSize, rt::Coords{maxPackedTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    kernel::gatherKVCacheToPackedSplitKV(kvCacheTensor, kTensor, vTensor, cuKVSeqLens, stream, kvSlotIds, kvPageIds);
     return std::make_pair(std::move(kTensor), std::move(vTensor));
 }
 
@@ -1322,7 +1339,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         rt::Tensor paddedCuKVSeqLensTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-            cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
+            cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream, packedPrefill);
 
         if (packedPrefill)
         {
@@ -1338,20 +1355,27 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             rt::Tensor packedVTensor(const_cast<void*>(inputs[kIN_V_IDX]),
                 rt::Coords{runtimeSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, vInputDesc.type);
 
-            kernel::launchApplyRopeWriteKVPacked(ropeCosSinTensor, std::nullopt, cuQSeqLensTensor, packedQTensor,
-                packedKTensor, packedVTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds, kvPageIds);
+            kernel::launchApplyRopeWriteKVPacked(ropeCosSinTensor, kvCacheEndIdxsTensor, cuQSeqLensTensor,
+                packedQTensor, packedKTensor, packedVTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds,
+                kvPageIds);
 
-            auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
+            auto [packedKCache, packedVCache]
+                = gatherPackedKVCache(kvCacheTensor, cuKVSeqLensTensor, alignedWorkspacePtr, runtimeBatchSize,
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, stream, kvSlotIds, kvPageIds);
+
+            constexpr int32_t kPACKED_PREFILL_CHUNK_SIZE = 128;
+            int32_t const maxQSeqLen = std::min(runtimeSeqLen, kPACKED_PREFILL_CHUNK_SIZE);
+            auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, maxQSeqLen, mNumQHeads, mNumKVHeads,
                 mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL,
                 /*isSPadded=*/false);
             FusedMultiheadAttentionParamsV2 params{};
             fmhaRunner.setupParams(params, mAttentionScale);
             params.q_ptr = packedQTensor.dataPointer<half>();
-            params.k_ptr = packedKTensor.dataPointer<half>();
-            params.v_ptr = packedVTensor.dataPointer<half>();
+            params.k_ptr = packedKCache.dataPointer<half>();
+            params.v_ptr = packedVCache.dataPointer<half>();
             params.o_ptr = attentionOutputTensor.dataPointer<half>();
             params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
-            params.cu_kv_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
+            params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
             fmhaRunner.dispatchFMHAKernel(params, stream);
             return 0;
         }

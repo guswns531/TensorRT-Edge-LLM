@@ -35,6 +35,7 @@ struct SeqLensTestCase
     std::vector<int32_t> expectedCuKVSeqLens;
     std::vector<int32_t> expectedKvCacheEndIdxs;
     std::vector<int32_t> expectedPaddedCuKVSeqLens;
+    bool inputIsPacked{false};
 };
 
 static void verifyCalCuQCuKVSeqLensAndKVEndIdxs(SeqLensTestCase const& tc)
@@ -62,7 +63,7 @@ static void verifyCalCuQCuKVSeqLensAndKVEndIdxs(SeqLensTestCase const& tc)
 
     cudaStream_t stream{nullptr};
     kernel::calCuQCuKVSeqLensAndKVEndIdxs(inputSeqLenTensor, kvCacheStartIdxTensor, cuQSeqLensTensor, cuKVSeqLensTensor,
-        kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, tc.runtimeSeqLen, stream);
+        kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, tc.runtimeSeqLen, stream, tc.inputIsPacked);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Read back and verify all outputs
@@ -162,6 +163,20 @@ TEST(UtilKernelTest, seqLens_chunkedPrefillVaryingLengths)
         .expectedCuKVSeqLens = {0, 150, 180},
         .expectedKvCacheEndIdxs = {150, 50},
         .expectedPaddedCuKVSeqLens = {0, 150, 200},
+    });
+}
+
+TEST(UtilKernelTest, seqLens_packedChunkedPrefillVaryingLengths)
+{
+    verifyCalCuQCuKVSeqLensAndKVEndIdxs({
+        .inputSeqLen = {50, 30, 7},
+        .kvCacheStartIndices = {100, 0, 129},
+        .runtimeSeqLen = 87,
+        .expectedCuQSeqLens = {0, 50, 80, 87},
+        .expectedCuKVSeqLens = {0, 150, 180, 316},
+        .expectedKvCacheEndIdxs = {150, 30, 136},
+        .expectedPaddedCuKVSeqLens = {0, 150, 180, 316},
+        .inputIsPacked = true,
     });
 }
 

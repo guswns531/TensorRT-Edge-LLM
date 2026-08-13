@@ -19,6 +19,8 @@
 
 #include "common/checkMacros.h"
 
+#include <algorithm>
+
 namespace trt_edgellm
 {
 namespace kernel
@@ -26,7 +28,7 @@ namespace kernel
 
 __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, int32_t const* kvCacheStartIndices,
     int32_t* cuQSeqlen, int32_t* cuKVSeqLens, int32_t* kvCacheEndIndices, int32_t* paddedCuKVSeqLens,
-    int32_t runtimeSeqLen, int32_t batchSize)
+    int32_t runtimeSeqLen, int32_t batchSize, bool inputIsPacked)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
@@ -53,8 +55,8 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 
             runningCuKvCacheLen += (kvCacheStartIdx + inputSeqLen[i]);
             cuKVSeqLens[i + 1] = runningCuKvCacheLen;
-            // To keep semantic consistency with the packed QKV layout for RoPE, use runtimeSeqLen here.
-            int32_t const kvEndIdx = kvCacheStartIdx + runtimeSeqLen;
+            // Padded QKV advances every row by runtimeSeqLen. Compact QKV advances by its actual row length.
+            int32_t const kvEndIdx = kvCacheStartIdx + (inputIsPacked ? inputSeqLen[i] : runtimeSeqLen);
             kvCacheEndIndices[i] = kvEndIdx;
 
             if (paddedCuKVSeqLens != nullptr)
@@ -68,7 +70,7 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
-    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream)
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream, bool inputIsPacked)
 {
     int32_t const runtimeBatchSize = static_cast<int32_t>(inputSeqLen.getShape()[0]);
 
@@ -100,7 +102,7 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     calCuQCuKVSeqLensAndKVEndIdxsKernel<<<1, 1, 0, stream>>>(inputSeqLen.dataPointer<int32_t>(),
         kvCacheStartIndices.dataPointer<int32_t>(), cuQSeqLens.dataPointer<int32_t>(),
         cuKVSeqLens.dataPointer<int32_t>(), kvCacheEndIdxs.dataPointer<int32_t>(), paddedPtr, runtimeSeqLen,
-        runtimeBatchSize);
+        runtimeBatchSize, inputIsPacked);
 }
 
 // ===== FMHA_v2 CUSTOM_MASK packed-mask builder for vision-block prefill =====
@@ -264,8 +266,7 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
     half* __restrict__ kDst,                                              // [B, dstS, H, D]
     half* __restrict__ vDst,                                              // [B, dstS, H, D]
     float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t srcS,
-    int32_t dstS, int32_t H, int32_t D, int32_t const* __restrict__ kvSlotIds,
-    int32_t const* __restrict__ kvPageIds)
+    int32_t dstS, int32_t H, int32_t D, int32_t const* __restrict__ kvSlotIds, int32_t const* __restrict__ kvPageIds)
 {
     uint32_t const token = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. dstS-1
     uint32_t const d = blockIdx.x * blockDim.x + threadIdx.x;     // 0 .. D-1
@@ -297,8 +298,7 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
         uint32_t const pagesPerSequence = srcS / kTOKENS_PER_PAGE;
         uint32_t const logicalPage = token / kTOKENS_PER_PAGE;
         uint32_t const tokenInPage = token % kTOKENS_PER_PAGE;
-        size_t const pageTableIndex
-            = (static_cast<size_t>(physicalBatch) * 2 + kv) * pagesPerSequence + logicalPage;
+        size_t const pageTableIndex = (static_cast<size_t>(physicalBatch) * 2 + kv) * pagesPerSequence + logicalPage;
         int64_t const physicalPage = kvPageIds != nullptr ? kvPageIds[pageTableIndex] : pageTableIndex;
         if (physicalPage < 0)
         {
@@ -385,6 +385,87 @@ void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tenso
     {
         check::check(false, "Unsupported KV cache dtype");
     }
+}
+
+__global__ void gatherKVCacheToPackedSplitKVKernel(half const* __restrict__ src, half* __restrict__ kDst,
+    half* __restrict__ vDst, int32_t const* __restrict__ cuKVSeqLens, int32_t const* __restrict__ kvSlotIds,
+    int32_t const* __restrict__ kvPageIds, int32_t batchSize, int32_t capacity, int32_t numHeads, int32_t headDim)
+{
+    int32_t const dim = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    int32_t const headPair = static_cast<int32_t>(blockIdx.z);
+    int32_t const batchIdx = headPair / (2 * numHeads);
+    int32_t const kvHeadPair = headPair % (2 * numHeads);
+    int32_t const kvIndex = kvHeadPair / numHeads;
+    int32_t const headIdx = kvHeadPair % numHeads;
+    if (batchIdx >= batchSize || dim >= headDim)
+    {
+        return;
+    }
+
+    int32_t const rowLength = cuKVSeqLens[batchIdx + 1] - cuKVSeqLens[batchIdx];
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    int32_t const pagesPerSequence = capacity / kTOKENS_PER_PAGE;
+    int32_t const physicalSlot = kvSlotIds[batchIdx];
+    for (int32_t token = static_cast<int32_t>(blockIdx.y); token < rowLength; token += gridDim.y)
+    {
+        int32_t const logicalPage = token / kTOKENS_PER_PAGE;
+        int32_t const tokenInPage = token % kTOKENS_PER_PAGE;
+        int64_t const pageTableIndex
+            = (static_cast<int64_t>(physicalSlot) * 2 + kvIndex) * pagesPerSequence + logicalPage;
+        int32_t const physicalPage = kvPageIds[pageTableIndex];
+        if (physicalPage < 0)
+        {
+            continue;
+        }
+
+        int64_t const srcIndex
+            = ((static_cast<int64_t>(physicalPage) * kTOKENS_PER_PAGE + tokenInPage) * numHeads + headIdx) * headDim
+            + dim;
+        int64_t const packedToken = static_cast<int64_t>(cuKVSeqLens[batchIdx]) + token;
+        int64_t const dstIndex = (packedToken * numHeads + headIdx) * headDim + dim;
+        if (kvIndex == 0)
+        {
+            kDst[dstIndex] = src[srcIndex];
+        }
+        else
+        {
+            vDst[dstIndex] = src[srcIndex];
+        }
+    }
+}
+
+void gatherKVCacheToPackedSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
+    rt::Tensor const& cuKVSeqLens, cudaStream_t stream, int32_t const* kvSlotIds, int32_t const* kvPageIds)
+{
+    rt::Coords const srcShape = src.getShape();
+    int32_t const batchSize = static_cast<int32_t>(srcShape[0]);
+    int32_t const numHeads = static_cast<int32_t>(srcShape[2]);
+    int32_t const capacity = static_cast<int32_t>(srcShape[3]);
+    int32_t const headDim = static_cast<int32_t>(srcShape[4]);
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    check::check(src.getDataType() == nvinfer1::DataType::kHALF, "Packed KV gather requires an FP16 source.");
+    check::check(srcShape[1] == 2, "Packed KV gather source must have shape [B,2,H,capacity,D].");
+    check::check(capacity % kTOKENS_PER_PAGE == 0, "Packed KV gather requires capacity divisible by 128.");
+    check::check(kvSlotIds != nullptr && kvPageIds != nullptr,
+        "Packed KV gather requires stable slot IDs and a physical page table.");
+    check::check(cuKVSeqLens.getDataType() == nvinfer1::DataType::kINT32 && cuKVSeqLens.getShape().getNumDims() == 1
+            && cuKVSeqLens.getShape()[0] == batchSize + 1,
+        "Packed KV gather cuKVSeqLens must have shape [B+1].");
+    rt::Coords const expectedDstShape{static_cast<int64_t>(batchSize) * capacity, numHeads, headDim};
+    check::check(kDst.getDataType() == nvinfer1::DataType::kHALF && kDst.getShape() == expectedDstShape,
+        "Packed K destination must have shape [B*capacity,H,D].");
+    check::check(vDst.getDataType() == nvinfer1::DataType::kHALF && vDst.getShape() == expectedDstShape,
+        "Packed V destination must have shape [B*capacity,H,D].");
+
+    constexpr uint32_t kTOKEN_TILES = 8;
+    uint32_t const dimThreads = headDim >= 128 ? 128U : 64U;
+    dim3 const block(dimThreads);
+    dim3 const grid(
+        (headDim + dimThreads - 1) / dimThreads, std::min<uint32_t>(capacity, kTOKEN_TILES), batchSize * 2 * numHeads);
+    gatherKVCacheToPackedSplitKVKernel<<<grid, block, 0, stream>>>(src.dataPointer<half>(), kDst.dataPointer<half>(),
+        vDst.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), kvSlotIds, kvPageIds, batchSize, capacity,
+        numHeads, headDim);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace kernel

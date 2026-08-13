@@ -134,11 +134,14 @@ void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* 
 //!                                out valid KV positions, breaking attention.
 //! \param[in]  runtimeSeqLen     Runtime sequence length (equals to the maximum of inputSeqLen).
 //! \param[in]  stream            CUDA stream used to launch the kernel.
+//! \param[in]  inputIsPacked     Whether Q/K/V use compact total-token layout. In packed mode, kvCacheEndIdxs and
+//!                                paddedCuKVSeqLens use each row's inputSeqLen instead of runtimeSeqLen.
 //! \note kvCacheStartIndices is optional. If it is not provided, kvStartIndices will be assumed to be 0.
 //! \throws std::runtime_error if tensor shapes are invalid
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
-    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream,
+    bool inputIsPacked = false);
 
 //! \brief Converts a combined KV cache into separate K and V tensors of shape [B, S, H, D].
 //!
@@ -158,6 +161,20 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
     rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds = nullptr,
     int32_t const* kvPageIds = nullptr);
+
+//! \brief Gather each active row's valid indexed KV prefix into compact split K/V tensors.
+//!
+//! The source retains stable indexed-paged ownership. Only the current attention invocation receives a compact,
+//! read-only workspace ordered by cuKVSeqLens; no physical KV pages or global slot lengths are moved.
+//! \param[in] src Source FP16 KV cache with logical shape [B, 2, H, capacity, D].
+//! \param[out] kDst Compact K workspace [B*capacity, H, D]. Only [0, cuKVSeqLens[B]) is written.
+//! \param[out] vDst Compact V workspace [B*capacity, H, D]. Only [0, cuKVSeqLens[B]) is written.
+//! \param[in] cuKVSeqLens Exclusive prefix sum of valid KV lengths, shape [B+1].
+//! \param[in] stream CUDA stream used to launch the kernel.
+//! \param[in] kvSlotIds Active row to stable physical slot mapping.
+//! \param[in] kvPageIds Stable-slot page table for true paged storage.
+void gatherKVCacheToPackedSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
+    rt::Tensor const& cuKVSeqLens, cudaStream_t stream, int32_t const* kvSlotIds, int32_t const* kvPageIds);
 
 } // namespace kernel
 } // namespace trt_edgellm

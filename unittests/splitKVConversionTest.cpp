@@ -33,6 +33,7 @@
 
 #include <cuda_fp16.h>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -191,6 +192,188 @@ TEST(SplitKVIndexedTest, GathersStablePhysicalSlots)
             }
         }
     }
+}
+
+TEST(SplitKVIndexedTest, GathersVariablePrefixesIntoPackedWorkspace)
+{
+    int32_t constexpr physicalSlots = 4;
+    int32_t constexpr activeRows = 3;
+    int32_t constexpr numHeads = 2;
+    int32_t constexpr capacity = 256;
+    int32_t constexpr headDim = 8;
+    int32_t constexpr tokensPerPage = 128;
+    int32_t constexpr pagesPerSequence = capacity / tokensPerPage;
+    int32_t constexpr physicalPages = physicalSlots * 2 * pagesPerSequence;
+    std::vector<int32_t> const slotIds{3, 0, 2};
+    std::vector<int32_t> const rowLengths{130, 3, 129};
+    std::vector<int32_t> const cuKVSeqLens{0, 130, 133, 262};
+    std::vector<int32_t> const pageIds{
+        6,
+        7,
+        8,
+        9,
+        4,
+        5,
+        14,
+        15,
+        0,
+        1,
+        2,
+        3,
+        10,
+        11,
+        12,
+        13,
+    };
+
+    size_t const srcVolume = static_cast<size_t>(physicalPages) * tokensPerPage * numHeads * headDim;
+    std::vector<half> srcHost(srcVolume);
+    for (int32_t page = 0; page < physicalPages; ++page)
+    {
+        for (int32_t token = 0; token < tokensPerPage; ++token)
+        {
+            for (int32_t head = 0; head < numHeads; ++head)
+            {
+                for (int32_t dim = 0; dim < headDim; ++dim)
+                {
+                    size_t const index
+                        = (((static_cast<size_t>(page) * tokensPerPage + token) * numHeads + head) * headDim + dim);
+                    srcHost[index] = __float2half(
+                        static_cast<float>(1000 * page + 10 * token + 2 * head) + static_cast<float>(dim) / 16.0F);
+                }
+            }
+        }
+    }
+
+    rt::Tensor backing({physicalSlots, 2, numHeads, capacity, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    CUDA_CHECK(cudaMemcpy(backing.rawPointer(), srcHost.data(), srcHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    rt::Tensor activeView(
+        backing.rawPointer(), {activeRows, 2, numHeads, capacity, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor slotTensor({activeRows}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor pageTensor({physicalSlots, 2, pagesPerSequence}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({activeRows + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(
+        cudaMemcpy(slotTensor.rawPointer(), slotIds.data(), slotIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(pageTensor.rawPointer(), pageIds.data(), pageIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(cuKVSeqLensTensor.rawPointer(), cuKVSeqLens.data(), cuKVSeqLens.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+
+    rt::Tensor kTensor({activeRows * capacity, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vTensor({activeRows * capacity, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    kernel::gatherKVCacheToPackedSplitKV(activeView, kTensor, vTensor, cuKVSeqLensTensor, nullptr,
+        slotTensor.dataPointer<int32_t>(), pageTensor.dataPointer<int32_t>());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const kHost = copyDeviceToHost<half>(kTensor);
+    auto const vHost = copyDeviceToHost<half>(vTensor);
+    for (int32_t row = 0; row < activeRows; ++row)
+    {
+        int32_t const slot = slotIds[row];
+        for (int32_t token = 0; token < rowLengths[row]; ++token)
+        {
+            int32_t const logicalPage = token / tokensPerPage;
+            int32_t const tokenInPage = token % tokensPerPage;
+            for (int32_t kv = 0; kv < 2; ++kv)
+            {
+                int32_t const page = pageIds[(slot * 2 + kv) * pagesPerSequence + logicalPage];
+                for (int32_t head = 0; head < numHeads; ++head)
+                {
+                    for (int32_t dim = 0; dim < headDim; ++dim)
+                    {
+                        size_t const srcIndex
+                            = (((static_cast<size_t>(page) * tokensPerPage + tokenInPage) * numHeads + head) * headDim
+                                + dim);
+                        size_t const dstIndex
+                            = ((static_cast<size_t>(cuKVSeqLens[row] + token) * numHeads + head) * headDim + dim);
+                        EXPECT_EQ(kv == 0 ? kHost[dstIndex] : vHost[dstIndex], srcHost[srcIndex]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(SplitKVIndexedTest, PackedPrefixGatherBenchmark)
+{
+    int32_t constexpr batchSize = 8;
+    int32_t constexpr numHeads = 8;
+    int32_t constexpr capacity = 2048;
+    int32_t constexpr headDim = 128;
+    int32_t constexpr tokensPerPage = 128;
+    int32_t constexpr pagesPerSequence = capacity / tokensPerPage;
+    int32_t constexpr maxPrefixLength = 1024;
+    std::vector<int32_t> const slotIds{0, 1, 2, 3, 4, 5, 6, 7};
+    std::vector<int32_t> const prefixLengths{128, 256, 384, 512, 640, 768, 896, 1024};
+    std::vector<int32_t> cuKVSeqLens(batchSize + 1, 0);
+    for (int32_t row = 0; row < batchSize; ++row)
+    {
+        cuKVSeqLens[row + 1] = cuKVSeqLens[row] + prefixLengths[row];
+    }
+    std::vector<int32_t> pageIds(batchSize * 2 * pagesPerSequence);
+    for (int32_t page = 0; page < static_cast<int32_t>(pageIds.size()); ++page)
+    {
+        pageIds[page] = page;
+    }
+
+    rt::Tensor cache({batchSize, 2, numHeads, capacity, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor slotTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor pageTensor({batchSize, 2, pagesPerSequence}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(
+        cudaMemcpy(slotTensor.rawPointer(), slotIds.data(), slotIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(pageTensor.rawPointer(), pageIds.data(), pageIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(cuKVSeqLensTensor.rawPointer(), cuKVSeqLens.data(), cuKVSeqLens.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+
+    rt::Tensor paddedK({batchSize, maxPrefixLength, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor paddedV({batchSize, maxPrefixLength, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor packedK({batchSize * capacity, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor packedV({batchSize * capacity, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    cudaStream_t stream{nullptr};
+    auto launchPadded = [&]() {
+        kernel::cvtKVLayoutBHSDToSplitKV(cache, paddedK, paddedV, rt::Tensor{}, maxPrefixLength, stream,
+            slotTensor.dataPointer<int32_t>(), pageTensor.dataPointer<int32_t>());
+    };
+    auto launchPacked = [&]() {
+        kernel::gatherKVCacheToPackedSplitKV(cache, packedK, packedV, cuKVSeqLensTensor, stream,
+            slotTensor.dataPointer<int32_t>(), pageTensor.dataPointer<int32_t>());
+    };
+
+    int32_t constexpr warmupIterations = 20;
+    int32_t constexpr benchmarkIterations = 100;
+    for (int32_t iteration = 0; iteration < warmupIterations; ++iteration)
+    {
+        launchPadded();
+        launchPacked();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaEvent_t startEvent, stopEvent;
+    CUDA_CHECK(cudaEventCreate(&startEvent));
+    CUDA_CHECK(cudaEventCreate(&stopEvent));
+    auto measure = [&](auto const& launch) {
+        CUDA_CHECK(cudaEventRecord(startEvent, stream));
+        for (int32_t iteration = 0; iteration < benchmarkIterations; ++iteration)
+        {
+            launch();
+        }
+        CUDA_CHECK(cudaEventRecord(stopEvent, stream));
+        CUDA_CHECK(cudaEventSynchronize(stopEvent));
+        float elapsedMs{0.0F};
+        CUDA_CHECK(cudaEventElapsedTime(&elapsedMs, startEvent, stopEvent));
+        return elapsedMs / benchmarkIterations;
+    };
+    float const paddedMs = measure(launchPadded);
+    float const packedMs = measure(launchPacked);
+    CUDA_CHECK(cudaEventDestroy(startEvent));
+    CUDA_CHECK(cudaEventDestroy(stopEvent));
+
+    std::cout << "Packed prefix gather benchmark: B=" << batchSize << " Hkv=" << numHeads << " D=" << headDim
+              << " capacity=" << capacity << " exact_tokens=" << cuKVSeqLens.back()
+              << " padded_tokens=" << batchSize * maxPrefixLength << " padded_ms=" << paddedMs
+              << " packed_ms=" << packedMs << std::endl;
 }
 
 // ===== 2. FP8 dequantization test =================================================

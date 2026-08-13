@@ -107,6 +107,12 @@ private:
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
         int32_t seqLen, cudaStream_t stream, int32_t const* kvSlotIds = nullptr, int32_t const* kvPageIds = nullptr);
 
+    //! Gather valid indexed-paged KV prefixes into compact split K/V workspace tensors.
+    static std::pair<rt::Tensor, rt::Tensor> gatherPackedKVCache(rt::Tensor const& kvCacheTensor,
+        rt::Tensor const& cuKVSeqLens, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
+        int32_t kvCacheCapacity, int32_t headSize, cudaStream_t stream, int32_t const* kvSlotIds,
+        int32_t const* kvPageIds);
+
     //! enqueue() body. enqueue() wraps it in a try/catch so a thrown error
     //! fails the call instead of terminating the process (enqueue is noexcept).
     int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
