@@ -106,6 +106,19 @@ void PhaseContextServingFacade::configurePageReservation(PhasePageReservationCon
     mGrowthMetricSamples = 0;
 }
 
+void PhaseContextServingFacade::resetSchedulingHistory()
+{
+    check::check(empty() && mRegistrations.empty() && mPendingAdmissions.empty() && mPageBundleReservations.empty(),
+        "Serving scheduling history can only be reset after all requests drain");
+    mLifecycle->resetSchedulingHistory();
+    mGrowthRequestLimit = mPageReservationConfig.enableAdaptiveGrowthRequests
+        ? mPageReservationConfig.minConcurrentGrowthRequests
+        : mPageReservationConfig.maxConcurrentGrowthRequests;
+    mGrowthTpotPressure = 0.0F;
+    mGrowthMetricSamples = 0;
+    mDrainRequestIds.clear();
+}
+
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()
 {
     PhaseRequestLifecycleCallbacks result;

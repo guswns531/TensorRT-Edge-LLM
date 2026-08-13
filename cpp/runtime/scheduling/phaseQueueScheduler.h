@@ -384,6 +384,11 @@ public:
     //! Update scheduling telemetry after one CUDA-complete dispatch.
     void observeMetrics(PhaseDispatchMetrics const& metrics);
     PhaseSchedulerTelemetry const& telemetry() const noexcept;
+    //! Reset learned scheduling history between benchmark epochs.
+    //!
+    //! Queue ownership is unchanged. The scheduler must be idle so a reset
+    //! cannot invalidate fairness or overlap debt for active requests.
+    void resetHistory();
 
 private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;

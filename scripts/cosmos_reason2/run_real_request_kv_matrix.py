@@ -222,6 +222,10 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
             command.extend(
                 ["--cudaGraphReserveMiB",
                  str(args.cuda_graph_reserve_mib)])
+        if args.trace_warmup_repeats > 0:
+            command.extend(
+                ["--traceWarmupRepeats",
+                 str(args.trace_warmup_repeats)])
     if args.prefill_token_budget > 0:
         command.extend(
             ["--prefillTokenBudget",
@@ -600,6 +604,12 @@ def main() -> None:
         default=0,
         help="global free-memory reserve retained while capturing graphs")
     parser.add_argument(
+        "--trace-warmup-repeats",
+        type=int,
+        default=0,
+        help=
+        "replay the text trace before measurement, retaining only CUDA graphs")
+    parser.add_argument(
         "--prefill-token-budget",
         type=int,
         default=0,
@@ -730,9 +740,13 @@ def main() -> None:
             "CUDA graph memory budgets are outside the supported range")
     if args.cuda_graph_charge_mib <= 0:
         parser.error("cuda-graph-charge-mib must be positive")
-    if args.cuda_graph_reserve_mib < 0 or args.prefill_token_budget < 0:
+    if (args.cuda_graph_reserve_mib < 0 or args.trace_warmup_repeats < 0
+            or args.prefill_token_budget < 0):
         parser.error(
-            "CUDA graph reserve and prefill token budget must be non-negative")
+            "CUDA graph reserve, trace warmup, and prefill token budget must be non-negative"
+        )
+    if args.trace_warmup_repeats > 0 and not args.cuda_graph:
+        parser.error("--trace-warmup-repeats requires --cuda-graph")
     if (args.page_reservation_headroom_tokens < 0
             or args.page_reservation_overcommit_bundles < 0
             or args.page_reservation_growth_requests <= 0
@@ -836,6 +850,8 @@ def main() -> None:
                 args.cuda_graph_charge_mib if args.cuda_graph else 0,
                 "cuda_graph_reserve_mib":
                 args.cuda_graph_reserve_mib if args.cuda_graph else 0,
+                "trace_warmup_repeats":
+                args.trace_warmup_repeats if args.cuda_graph else 0,
                 "prefill_token_budget":
                 args.prefill_token_budget,
                 "ragged_prefill_batching":

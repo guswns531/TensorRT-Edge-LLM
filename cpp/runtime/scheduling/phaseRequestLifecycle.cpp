@@ -228,6 +228,12 @@ void PhaseRequestLifecycle::runUntilIdle(size_t maxDispatches)
     mWorker->runUntilIdle(maxDispatches);
 }
 
+void PhaseRequestLifecycle::resetSchedulingHistory()
+{
+    check::check(empty(), "Scheduling history can only be reset after the request lifecycle drains");
+    mScheduler.resetHistory();
+}
+
 bool PhaseRequestLifecycle::empty() const noexcept
 {
     return mScheduler.empty() && !mWorker->busy() && activeRequestCount() == 0;

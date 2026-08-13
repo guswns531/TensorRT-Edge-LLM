@@ -100,6 +100,8 @@ public:
     int32_t availableSlotCount() const noexcept;
     std::optional<PhaseRequestSnapshot> request(uint64_t requestId) const;
     CUcontext cudaContext() const noexcept;
+    //! Reset scheduler telemetry after all requests and GPU work drain.
+    void resetSchedulingHistory();
 
 private:
     PhaseDispatchWorkerCallbacks makeWorkerCallbacks();

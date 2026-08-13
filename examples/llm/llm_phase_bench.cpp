@@ -97,6 +97,7 @@ struct Args
     int32_t loadRequests{};
     double arrivalRate{1000.0};
     double traceArrivalRate{10.0};
+    int32_t traceWarmupRepeats{};
     int32_t loadPromptMin{};
     int32_t loadPromptMax{};
     int32_t loadOutputMin{8};
@@ -310,7 +311,8 @@ void printUsage(char const* program)
         "--maxPredictedDecodeDebtMs F --tpotHysteresisEnterRatio F --tpotHysteresisExitRatio F "
         "--tpotHysteresisWindow N --minTpotHysteresisSamples N] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
-        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R --ignoreTraceEos] "
+        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R "
+        "--traceWarmupRepeats N --ignoreTraceEos] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
         "--pageReservationGrowthRequests N --fullReservationPromptThresholdTokens N "
@@ -388,6 +390,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kMultimodalEngineDir,
         kTraceCsv,
         kTraceArrivalRate,
+        kTraceWarmupRepeats,
         kIgnoreTraceEos,
         kPageReservationMode,
         kPageReservationHeadroomTokens,
@@ -456,6 +459,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
         {"traceCsv", required_argument, nullptr, kTraceCsv},
         {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
+        {"traceWarmupRepeats", required_argument, nullptr, kTraceWarmupRepeats},
         {"ignoreTraceEos", no_argument, nullptr, kIgnoreTraceEos},
         {"pageReservationMode", required_argument, nullptr, kPageReservationMode},
         {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
@@ -550,6 +554,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kMultimodalEngineDir: args.multimodalEngineDir = optarg; break;
         case kTraceCsv: args.traceCsv = optarg; break;
         case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
+        case kTraceWarmupRepeats: args.traceWarmupRepeats = std::stoi(optarg); break;
         case kIgnoreTraceEos: args.ignoreTraceEos = true; break;
         case kPageReservationMode:
         {
@@ -591,13 +596,14 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.arrivalRate > 0.0 && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
         && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
         && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4
-        && args.traceArrivalRate > 0.0 && args.maxCudaGraphs > 0 && args.maxPrefillCudaGraphs != 0
-        && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0 && args.maxDecodeCudaGraphs >= -1
-        && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1
-        && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0
-        && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
-        && args.pageReservationGrowthRequests > 0 && args.fullReservationPromptThresholdTokens >= 0
-        && args.minPageGrowthRequests > 0 && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
+        && args.traceArrivalRate > 0.0 && args.traceWarmupRepeats >= 0 && args.maxCudaGraphs > 0
+        && args.maxPrefillCudaGraphs != 0 && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0
+        && args.maxDecodeCudaGraphs >= -1 && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1
+        && args.maxDecodeCudaGraphMiB >= -1 && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0
+        && args.prefillTokenBudget >= 0 && args.pageReservationHeadroomTokens >= 0
+        && args.pageReservationOvercommitBundles >= 0 && args.pageReservationGrowthRequests > 0
+        && args.fullReservationPromptThresholdTokens >= 0 && args.minPageGrowthRequests > 0
+        && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
         && std::isfinite(args.pageGrowthTpotTargetMs) && args.pageGrowthTpotTargetMs > 0.0 && args.prefillCohortSize > 0
         && args.minDynamicPrefillBatchSize > 0 && args.minDynamicPrefillBatchSize <= args.prefillBatch
         && args.prefillCohortTurns > 0 && std::isfinite(args.decodeSlackSafetyFactor)
@@ -614,7 +620,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.tpotHardGuard
                 || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
-        && (args.inputFile.empty() || !args.traceCsv.empty());
+        && (args.inputFile.empty() || !args.traceCsv.empty())
+        && (args.traceWarmupRepeats == 0 || (!args.inputFile.empty() && args.cudaGraph));
 }
 
 rt::PhaseSchedulerProfile parseSchedulerProfile(std::string const& profile)
@@ -1410,14 +1417,19 @@ int main(int argc, char** argv)
     std::vector<TraceRequestMetadata> traceMetadata;
     bool traceHasVision{};
     bool traceHasPriority{};
-    if (realRequestTrace)
-    {
+    auto loadTraceRequests = [&]() {
         auto parsed = exampleUtils::parseRequestFile(args.inputFile, 1, -1, 0);
         ELLM_CHECK(parsed.first.empty(), "Real phase trace v1 does not support LoRA weights");
-        traceRequests = std::move(parsed.second);
-        ELLM_CHECK(!traceRequests.empty(), "Real phase trace contains no requests");
+        ELLM_CHECK(!parsed.second.empty(), "Real phase trace contains no requests");
+        return std::move(parsed.second);
+    };
+    if (realRequestTrace)
+    {
+        traceRequests = loadTraceRequests();
         traceHasVision = std::any_of(traceRequests.begin(), traceRequests.end(),
             [](auto const& request) { return !request.requests.front().imageBuffers.empty(); });
+        ELLM_CHECK(
+            args.traceWarmupRepeats == 0 || !traceHasVision, "Trace replay warmup v1 supports text-only requests");
         ELLM_CHECK(!traceHasVision || !usesSharedTensorRTContext(args),
             "Real multimodal trace requires independent TensorRT contexts");
         ELLM_CHECK(!traceHasVision || !args.multimodalEngineDir.empty(),
@@ -1532,11 +1544,12 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.enablePriorityBatching = args.loadPriorityClasses > 1 || traceHasPriority;
         facadeSchedulerConfig.enableAdaptivePrefillChunking = args.adaptiveChunking && configuredChunkSize > 0;
         facadeSchedulerConfig.minPrefillChunkTokens = std::min(32, std::max(1, configuredChunkSize));
+        bool collectServingMetrics{true};
         rt::PhaseKernelGroupRecorder kernelGroupRecorder;
         size_t kernelGroupDispatchIndex{};
         rt::PhaseKernelDispatchMetadata kernelDispatchMetadata;
         auto executeKernelSegments = [&](std::vector<rt::PhaseKernelSegment> const& segments) {
-            if (args.kernelGroupCsv.empty())
+            if (args.kernelGroupCsv.empty() || !collectServingMetrics)
             {
                 for (rt::PhaseKernelSegment const& segment : segments)
                 {
@@ -1716,6 +1729,10 @@ int main(int argc, char** argv)
             return context.finishedStates[static_cast<size_t>(row)] != 0;
         };
         facadeCallbacks.onDispatchMetrics = [&](rt::PhaseDispatchMetrics const& sample) {
+            if (!collectServingMetrics)
+            {
+                return;
+            }
             rt::PhaseDispatchMetrics telemetry = sample;
             rt::KVPagePoolStats const pool = cacheManager.getPagedKVPoolStats();
             telemetry.pagePoolTotalBundles = pool.totalBundles;
@@ -1805,7 +1822,7 @@ int main(int argc, char** argv)
             cacheManager.resetForNewSequences(hostZeroLengths, setupStream);
             CUDA_CHECK(cudaStreamSynchronize(setupStream));
 
-            auto runTrace = [&](rt::PhaseAsyncServer& server) {
+            auto runTrace = [&](rt::PhaseAsyncServer& server, bool logCompletions) {
                 traceStart = std::chrono::steady_clock::now();
                 size_t nextSubmission{};
                 size_t completionCount{};
@@ -1858,9 +1875,12 @@ int main(int argc, char** argv)
                         TraceRequestSample& sample = traceSamples.at(traceIndices.at(completion->requestId));
                         sample.completedUs = elapsedMicroseconds(traceStart);
                         sample.completion = std::move(*completion);
-                        LOG_INFO("Trace request %lu completed in %.3f ms: %s",
-                            static_cast<unsigned long>(sample.requestId), sample.completion.latencyMs,
-                            sample.completion.response.outputTexts.front().c_str());
+                        if (logCompletions)
+                        {
+                            LOG_INFO("Trace request %lu completed in %.3f ms: %s",
+                                static_cast<unsigned long>(sample.requestId), sample.completion.latencyMs,
+                                sample.completion.response.outputTexts.front().c_str());
+                        }
                         ++completionCount;
                         madeProgress = true;
                     }
@@ -1887,7 +1907,25 @@ int main(int argc, char** argv)
                 serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
                 serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
                 rt::PhaseAsyncServer server(serverConfig, facade, tokenizer, prefillStream);
-                runTrace(server);
+                for (int32_t repeat{}; repeat < args.traceWarmupRepeats; ++repeat)
+                {
+                    collectServingMetrics = false;
+                    LOG_INFO("Starting text trace graph warmup replay %d/%d", repeat + 1, args.traceWarmupRepeats);
+                    runTrace(server, false);
+                    facade.resetSchedulingHistory();
+                    traceRequests = loadTraceRequests();
+                    ELLM_CHECK(traceRequests.size() == traceMetadata.size(),
+                        "Reloaded trace request count differs from trace metadata");
+                    traceSamples = std::vector<TraceRequestSample>(traceRequests.size());
+                    traceIndices.clear();
+                    facadeDispatchMetrics.clear();
+                    kernelDispatchMetadata = {};
+                    kernelGroupDispatchIndex = 0;
+                    cacheManager.resetForNewSequences(hostZeroLengths, setupStream);
+                    CUDA_CHECK(cudaStreamSynchronize(setupStream));
+                }
+                collectServingMetrics = true;
+                runTrace(server, true);
             }
             else
             {
@@ -1943,7 +1981,7 @@ int main(int argc, char** argv)
                     serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
                     rt::PhaseAsyncServer server(serverConfig, coordinator, encoderWorker, facade, tokenizer,
                         prefillStream, visionAdapter.get());
-                    runTrace(server);
+                    runTrace(server, true);
                     ELLM_CHECK(encoderWorker.empty(), "Real phase trace did not drain the encoder queue");
                 }
                 CUDA_CHECK(cudaStreamDestroy(encoderStream));

@@ -190,6 +190,8 @@ public:
     //! Add a terminal observer without replacing the callbacks installed by the executor owner.
     size_t addTerminalObserver(std::function<void(PhaseRequestSnapshot const&)> observer);
     void removeTerminalObserver(size_t observerId) noexcept;
+    //! Reset scheduler and adaptive-admission history after the facade drains.
+    void resetSchedulingHistory();
 
 private:
     struct PageBundleReservation

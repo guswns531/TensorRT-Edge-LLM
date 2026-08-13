@@ -1,5 +1,11 @@
 # Cosmos 최신 scheduler와 vLLM 비교 및 발전 추이
 
+> 2026-08-13 후속 결과: short 전용 prefill token budget 512와 graph-only trace warmup을 조합해 Current short
+> 처리량을 1958.0 token/s까지 높였고 vLLM 격차를 -3.14%로 줄였다. exact replay가 없는 보수적 결과는
+> 1862.2 token/s, vLLM 대비 -7.88%다. 구현과 공정성 한계는
+> [77-cosmos-trace-graph-warmup-prefill-budget-20260813.md](77-cosmos-trace-graph-warmup-prefill-budget-20260813.md)에
+> 정리했다.
+
 ## 결론
 
 Cosmos-Reason2-2B FP16 text serving에서 최신 `throughput-balanced` 경로는 balanced workload의 실제 생성

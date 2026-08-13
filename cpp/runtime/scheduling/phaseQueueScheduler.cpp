@@ -1210,5 +1210,19 @@ PhaseSchedulerTelemetry const& PhaseQueueScheduler::telemetry() const noexcept
     return mTelemetry;
 }
 
+void PhaseQueueScheduler::resetHistory()
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Scheduling history can only be reset while the scheduler is idle");
+    mTelemetry = {};
+    mRecentDecodeTpotUs.clear();
+    mLatencySafeFallback = false;
+    mConsecutiveDecodeBatches = 0;
+    mConsecutiveOverlapBatches = 0;
+    mPredictedDecodeDebtUs = 0.0;
+    mPrefillCohortIds.clear();
+    mPrefillCohortTurns = 0;
+}
+
 } // namespace rt
 } // namespace trt_edgellm

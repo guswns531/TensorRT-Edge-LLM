@@ -148,6 +148,33 @@ TEST(PhaseQueueSchedulerTest, SupportsCustomMetricsPolicyAndEwmaTelemetry)
     EXPECT_FLOAT_EQ(scheduler.telemetry().lastDispatch->overlapRatio, 0.2F);
 }
 
+TEST(PhaseQueueSchedulerTest, ResetsLearnedHistoryOnlyWhileIdle)
+{
+    PhaseQueueScheduler scheduler;
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kOverlap;
+    sample.prefillBatchSize = 1;
+    sample.decodeBatchSize = 1;
+    sample.prefillTokens = 128;
+    sample.decodeContextTokens = 256;
+    sample.prefillGpuMs = 4.0F;
+    sample.decodeGpuMs = 2.0F;
+    sample.overlapRatio = 0.5F;
+    scheduler.observeMetrics(sample);
+    ASSERT_EQ(scheduler.telemetry().sampleCount, 1U);
+
+    scheduler.resetHistory();
+
+    EXPECT_EQ(scheduler.telemetry().sampleCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().overlapSampleCount, 0U);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().prefillGpuMsPerToken, 0.0F);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().decodeGpuMsPerContextToken, 0.0F);
+    EXPECT_FALSE(scheduler.telemetry().lastDispatch.has_value());
+
+    scheduler.enqueuePrefill({1, 128});
+    EXPECT_THROW(scheduler.resetHistory(), std::runtime_error);
+}
+
 TEST(PhaseQueueSchedulerTest, UsesPerRequestSloAndBoundedPriorityForUrgentQueues)
 {
     PhaseQueueSchedulerConfig config;
