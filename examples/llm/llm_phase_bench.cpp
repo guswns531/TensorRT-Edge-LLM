@@ -83,6 +83,7 @@ struct Args
     std::string inputFile;
     std::string multimodalEngineDir;
     std::string traceCsv;
+    std::string phaseTimelineCsv;
     std::string cudaGraphWarmupProfile;
     std::string schedulerCostJson;
     std::string schedulerProfile{"custom"};
@@ -202,6 +203,19 @@ struct TraceRequestMetadata
     int32_t priority{};
 };
 
+struct PrefillRequestTimelineSample
+{
+    uint64_t requestId{};
+    size_t schedulerDispatchIndex{};
+    size_t kernelDispatchIndex{};
+    int32_t tokenOffset{};
+    int32_t tokenCount{};
+    int32_t promptTokens{};
+    int64_t dispatchSelectedUs{};
+    int64_t packCompletedUs{};
+    int64_t phaseCompletedUs{-1};
+};
+
 std::vector<TraceRequestMetadata> readTraceMetadata(
     std::filesystem::path const& inputFile, size_t requestCount, double defaultArrivalRate)
 {
@@ -291,6 +305,33 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
     }
 }
 
+void writePrefillRequestTimeline(
+    std::filesystem::path const& path, std::vector<PrefillRequestTimelineSample> const& samples)
+{
+    if (path.has_parent_path())
+    {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream output(path);
+    ELLM_CHECK(output.is_open(), "Failed to open prefill request timeline CSV: " + path.string());
+    output << "request_id,scheduler_dispatch_index,kernel_dispatch_index,token_offset,token_count,prompt_tokens,"
+              "initial_chunk,final_chunk,dispatch_selected_us,pack_completed_us,phase_completed_us,host_pack_us,"
+              "phase_service_us\n";
+    for (PrefillRequestTimelineSample const& sample : samples)
+    {
+        ELLM_CHECK(
+            sample.phaseCompletedUs >= sample.packCompletedUs && sample.packCompletedUs >= sample.dispatchSelectedUs,
+            "Prefill request timeline timestamps are invalid");
+        output << sample.requestId << ',' << sample.schedulerDispatchIndex << ',' << sample.kernelDispatchIndex << ','
+               << sample.tokenOffset << ',' << sample.tokenCount << ',' << sample.promptTokens << ','
+               << (sample.tokenOffset == 0 ? 1 : 0) << ','
+               << (sample.tokenOffset + sample.tokenCount == sample.promptTokens ? 1 : 0) << ','
+               << sample.dispatchSelectedUs << ',' << sample.packCompletedUs << ',' << sample.phaseCompletedUs << ','
+               << sample.packCompletedUs - sample.dispatchSelectedUs << ','
+               << sample.phaseCompletedUs - sample.packCompletedUs << '\n';
+    }
+}
+
 void printUsage(char const* program)
 {
     LOG_INFO(
@@ -312,7 +353,7 @@ void printUsage(char const* program)
         "--maxPredictedDecodeDebtMs F --tpotHysteresisEnterRatio F --tpotHysteresisExitRatio F "
         "--tpotHysteresisWindow N --minTpotHysteresisSamples N] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
-        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R "
+        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --phaseTimelineCsv FILE --traceArrivalRate R "
         "--traceWarmupRepeats N --cudaGraphWarmupProfile FILE --ignoreTraceEos] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
@@ -390,6 +431,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kInputFile,
         kMultimodalEngineDir,
         kTraceCsv,
+        kPhaseTimelineCsv,
         kTraceArrivalRate,
         kTraceWarmupRepeats,
         kCudaGraphWarmupProfile,
@@ -460,6 +502,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"inputFile", required_argument, nullptr, kInputFile},
         {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
         {"traceCsv", required_argument, nullptr, kTraceCsv},
+        {"phaseTimelineCsv", required_argument, nullptr, kPhaseTimelineCsv},
         {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
         {"traceWarmupRepeats", required_argument, nullptr, kTraceWarmupRepeats},
         {"cudaGraphWarmupProfile", required_argument, nullptr, kCudaGraphWarmupProfile},
@@ -556,6 +599,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kInputFile: args.inputFile = optarg; break;
         case kMultimodalEngineDir: args.multimodalEngineDir = optarg; break;
         case kTraceCsv: args.traceCsv = optarg; break;
+        case kPhaseTimelineCsv: args.phaseTimelineCsv = optarg; break;
         case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
         case kTraceWarmupRepeats: args.traceWarmupRepeats = std::stoi(optarg); break;
         case kCudaGraphWarmupProfile: args.cudaGraphWarmupProfile = optarg; break;
@@ -625,6 +669,8 @@ bool parseArgs(Args& args, int argc, char** argv)
                 || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty())
+        && (args.phaseTimelineCsv.empty()
+            || (!args.inputFile.empty() && !args.traceCsv.empty() && !args.kernelGroupCsv.empty()))
         && (args.traceWarmupRepeats == 0 || (!args.inputFile.empty() && args.cudaGraph))
         && (args.cudaGraphWarmupProfile.empty() || (!args.inputFile.empty() && args.cudaGraph));
 }
@@ -1537,6 +1583,8 @@ int main(int argc, char** argv)
         std::chrono::steady_clock::time_point traceStart;
         std::vector<TraceRequestSample> traceSamples(traceRequests.size());
         std::unordered_map<uint64_t, size_t> traceIndices;
+        std::vector<PrefillRequestTimelineSample> prefillTimelineSamples;
+        std::unordered_map<uint64_t, size_t> activePrefillTimelineIndices;
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
         facadeSchedulerConfig.profile = parseSchedulerProfile(args.schedulerProfile);
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
@@ -1588,6 +1636,7 @@ int main(int argc, char** argv)
         rt::PhaseKernelGroupRecorder kernelGroupRecorder;
         size_t kernelGroupDispatchIndex{};
         rt::PhaseKernelDispatchMetadata kernelDispatchMetadata;
+        int64_t currentDispatchSelectedUs{};
         auto executeKernelSegments = [&](std::vector<rt::PhaseKernelSegment> const& segments) {
             if (args.kernelGroupCsv.empty() || !collectServingMetrics)
             {
@@ -1605,6 +1654,18 @@ int main(int argc, char** argv)
         facadeCallbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
             int32_t const batchSize = packed.batchSize();
             int32_t const chunkLength = packed.chunkLength();
+            size_t const currentKernelDispatchIndex = kernelGroupDispatchIndex;
+            if (realRequestTrace && collectServingMetrics && !args.phaseTimelineCsv.empty())
+            {
+                int64_t const packCompletedUs = elapsedMicroseconds(traceStart);
+                for (rt::PhasePrefillContextRow const& row : packed.rows())
+                {
+                    activePrefillTimelineIndices[row.requestId] = prefillTimelineSamples.size();
+                    prefillTimelineSamples.push_back({row.requestId, kernelDispatchMetadata.schedulerDispatchIndex,
+                        currentKernelDispatchIndex, row.tokenOffset, row.tokenCount, row.promptTokenCount,
+                        currentDispatchSelectedUs, packCompletedUs});
+                }
+            }
             bool const hasFinalPromptRow
                 = std::any_of(packed.rows().begin(), packed.rows().end(), [](rt::PhasePrefillContextRow const& row) {
                       return row.tokenOffset + row.tokenCount == row.promptTokenCount;
@@ -1686,6 +1747,17 @@ int main(int argc, char** argv)
             executeKernelSegments(segments);
         };
         facadeCallbacks.completePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
+            if (realRequestTrace && collectServingMetrics && !args.phaseTimelineCsv.empty())
+            {
+                int64_t const phaseCompletedUs = elapsedMicroseconds(traceStart);
+                for (rt::PhasePrefillContextRow const& row : packed.rows())
+                {
+                    auto const found = activePrefillTimelineIndices.find(row.requestId);
+                    ELLM_CHECK(found != activePrefillTimelineIndices.end(), "Missing active prefill timeline entry");
+                    prefillTimelineSamples.at(found->second).phaseCompletedUs = phaseCompletedUs;
+                    activePrefillTimelineIndices.erase(found);
+                }
+            }
             if (prefillSampler.pending())
             {
                 prefillSampler.completePrefill(packed);
@@ -1781,6 +1853,10 @@ int main(int argc, char** argv)
             facadeDispatchMetrics.push_back(telemetry);
         };
         facadeCallbacks.onDispatch = [&](rt::PhaseDispatchMetrics const& sample) {
+            if (realRequestTrace && collectServingMetrics)
+            {
+                currentDispatchSelectedUs = elapsedMicroseconds(traceStart);
+            }
             kernelDispatchMetadata.schedulerDispatchIndex = sample.dispatchIndex;
             kernelDispatchMetadata.schedulerKind = static_cast<int32_t>(sample.kind);
             kernelDispatchMetadata.prefillBatchSize = sample.prefillBatchSize;
@@ -2043,6 +2119,12 @@ int main(int argc, char** argv)
             }
             writeTraceMetrics(args.traceCsv, traceSamples);
             LOG_INFO("Real request phase trace metrics written to %s", args.traceCsv.c_str());
+            if (!args.phaseTimelineCsv.empty())
+            {
+                ELLM_CHECK(activePrefillTimelineIndices.empty(), "Real trace left active prefill timeline entries");
+                writePrefillRequestTimeline(args.phaseTimelineCsv, prefillTimelineSamples);
+                LOG_INFO("Prefill request timeline written to %s", args.phaseTimelineCsv.c_str());
+            }
         }
         else if (continuousLoad)
         {

@@ -77,6 +77,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 55. [Cosmos 최신 scheduler와 vLLM 비교 및 발전 추이](76-cosmos-vllm-latest-progress-20260813.md)
 56. [Cosmos exact-trace graph warmup과 short prefill budget](77-cosmos-trace-graph-warmup-prefill-budget-20260813.md)
 57. [Production phase-shape CUDA graph priming](78-cosmos-phase-shape-graph-priming-20260813.md)
+58. [Cosmos short TTFT 분해와 P8 검증](79-cosmos-short-ttft-breakdown-20260813.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.
