@@ -168,9 +168,6 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
 
-    ELLM_CHECK(mDeployment.base.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
-        "--multimodalEngineDir is required for VLM engine.");
-
     // -----------------------------------------------------------------------
     // 3. Construct Runners (registries built internally from the parsed configs).
     // -----------------------------------------------------------------------

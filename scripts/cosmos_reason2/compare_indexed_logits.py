@@ -21,21 +21,17 @@ import math
 import re
 from pathlib import Path
 
-import torch
-from safetensors import safe_open
+import numpy as np
+from safetensors.numpy import load_file
 
 ROUND_LOGITS = re.compile(r"^round_(\d+)\.logits$")
 
 
-def load_dump(path: Path) -> dict[str, torch.Tensor]:
-    tensors = {}
-    with safe_open(path, framework="pt") as handle:
-        for name in handle.keys():
-            tensors[name] = handle.get_tensor(name)
-    return tensors
+def load_dump(path: Path) -> dict[str, np.ndarray]:
+    return load_file(path)
 
 
-def rounds(tensors: dict[str, torch.Tensor]) -> list[int]:
+def rounds(tensors: dict[str, np.ndarray]) -> list[int]:
     result = []
     for name in tensors:
         match = ROUND_LOGITS.match(name)
@@ -50,12 +46,12 @@ def extract_tokens(args: argparse.Namespace) -> int:
     if not dump_rounds or dump_rounds != list(range(len(dump_rounds))):
         raise RuntimeError(f"non-contiguous dump rounds: {dump_rounds}")
     first = tensors["round_0.generated_token_ids"]
-    batch_size = first.numel()
+    batch_size = first.size
     token_rows = [[] for _ in range(batch_size)]
     for round_index in dump_rounds:
         generated = tensors[
             f"round_{round_index}.generated_token_ids"].reshape(-1)
-        if generated.numel() != batch_size:
+        if generated.size != batch_size:
             raise RuntimeError(
                 f"round {round_index}: active batch changed during token extraction"
             )
@@ -71,23 +67,23 @@ def extract_tokens(args: argparse.Namespace) -> int:
     return 0
 
 
-def cosine(reference: torch.Tensor, candidate: torch.Tensor) -> float:
-    reference = reference.double().flatten()
-    candidate = candidate.double().flatten()
-    if torch.equal(reference, candidate):
+def cosine(reference: np.ndarray, candidate: np.ndarray) -> float:
+    reference = reference.astype(np.float64, copy=False).flatten()
+    candidate = candidate.astype(np.float64, copy=False).flatten()
+    if np.array_equal(reference, candidate):
         return 1.0
-    denominator = float(
-        torch.linalg.vector_norm(reference) *
-        torch.linalg.vector_norm(candidate))
+    denominator = float(np.linalg.norm(reference) * np.linalg.norm(candidate))
     if denominator == 0.0:
-        return 1.0 if torch.equal(reference, candidate) else 0.0
-    return float(torch.dot(reference, candidate)) / denominator
+        return 1.0 if np.array_equal(reference, candidate) else 0.0
+    return float(np.dot(reference, candidate)) / denominator
 
 
-def top_two(logits: torch.Tensor) -> tuple[int, float, int, float]:
-    values, indices = torch.topk(logits.float().flatten(), k=2)
-    return (int(indices[0]), float(values[0]), int(indices[1]),
-            float(values[1]))
+def top_two(logits: np.ndarray) -> tuple[int, float, int, float]:
+    flattened = logits.astype(np.float32, copy=False).flatten()
+    indices = np.argpartition(flattened, -2)[-2:]
+    indices = indices[np.argsort(flattened[indices])[::-1]]
+    return (int(indices[0]), float(flattened[indices[0]]), int(indices[1]),
+            float(flattened[indices[1]]))
 
 
 def compare(args: argparse.Namespace) -> int:
@@ -112,7 +108,7 @@ def compare(args: argparse.Namespace) -> int:
         prefix = f"round_{round_index}"
         reference_lengths = reference[f"{prefix}.context_lengths"]
         candidate_lengths = candidate[f"{prefix}.context_lengths"]
-        if not torch.equal(reference_lengths, candidate_lengths):
+        if not np.array_equal(reference_lengths, candidate_lengths):
             print(
                 f"FAIL round {round_index}: context lengths "
                 f"{reference_lengths.tolist()} != {candidate_lengths.tolist()}"
@@ -135,18 +131,20 @@ def compare(args: argparse.Namespace) -> int:
         round_argmax_matches = 0
         round_rows = []
         for row in range(reference_logits.shape[0]):
-            row_reference = reference_logits[row].float()
-            row_candidate = candidate_logits[row].float()
+            row_reference = reference_logits[row].astype(np.float32,
+                                                         copy=False)
+            row_candidate = candidate_logits[row].astype(np.float32,
+                                                         copy=False)
             row_cosine = cosine(row_reference, row_candidate)
-            absolute_error = torch.abs(row_reference - row_candidate)
-            row_max_abs = float(torch.max(absolute_error))
-            row_mean_abs = float(torch.mean(absolute_error))
+            absolute_error = np.abs(row_reference - row_candidate)
+            row_max_abs = float(np.max(absolute_error))
+            row_mean_abs = float(np.mean(absolute_error))
             row_close_fraction = float(
-                torch.mean(
-                    torch.isclose(row_reference,
-                                  row_candidate,
-                                  atol=args.atol,
-                                  rtol=args.rtol).float()))
+                np.mean(
+                    np.isclose(row_reference,
+                               row_candidate,
+                               atol=args.atol,
+                               rtol=args.rtol)))
             reference_top1, reference_top1_value, reference_top2, reference_top2_value = top_two(
                 row_reference)
             candidate_top1, candidate_top1_value, candidate_top2, candidate_top2_value = top_two(
@@ -189,9 +187,9 @@ def compare(args: argparse.Namespace) -> int:
             -1)
         candidate_tokens = candidate[f"{prefix}.generated_token_ids"].reshape(
             -1)
-        matches = int(torch.sum(reference_tokens == candidate_tokens))
+        matches = int(np.sum(reference_tokens == candidate_tokens))
         greedy_matches += matches
-        greedy_total += reference_tokens.numel()
+        greedy_total += reference_tokens.size
         round_passed = (min(round_cosines) >= args.min_cosine and
                         round_min_close_fraction >= args.min_close_fraction)
         status = "PASS" if round_passed else "FAIL"
@@ -201,7 +199,7 @@ def compare(args: argparse.Namespace) -> int:
               f"max_mean_abs={round_mean_abs:.6g}, "
               f"min_close={round_min_close_fraction:.6f}, "
               f"argmax={round_argmax_matches}/{len(round_rows)}, "
-              f"sampled={matches}/{reference_tokens.numel()}")
+              f"sampled={matches}/{reference_tokens.size}")
         for row_report in round_rows:
             if not row_report["argmax_match"]:
                 print(f"  argmax mismatch row {row_report['row']}: "

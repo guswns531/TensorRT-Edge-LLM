@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-torch = pytest.importorskip("torch")
+np = pytest.importorskip("numpy")
 pytest.importorskip("safetensors")
 
 _SCRIPT = (Path(__file__).resolve().parents[2] / "scripts" / "cosmos_reason2" /
@@ -27,12 +27,12 @@ _GLOBALS = runpy.run_path(str(_SCRIPT))
 
 
 def test_cosine_returns_exact_one_for_identical_logits():
-    logits = torch.tensor([0.1, -0.3, 1.2], dtype=torch.float16)
-    assert _GLOBALS["cosine"](logits, logits.clone()) == 1.0
+    logits = np.array([0.1, -0.3, 1.2], dtype=np.float16)
+    assert _GLOBALS["cosine"](logits, logits.copy()) == 1.0
 
 
 def test_top_two_reports_indices_values_and_margin_inputs():
-    logits = torch.tensor([1.0, 4.0, 3.5, -2.0])
+    logits = np.array([1.0, 4.0, 3.5, -2.0])
     top1, top1_value, top2, top2_value = _GLOBALS["top_two"](logits)
     assert (top1, top2) == (1, 2)
     assert top1_value - top2_value == pytest.approx(0.5)
