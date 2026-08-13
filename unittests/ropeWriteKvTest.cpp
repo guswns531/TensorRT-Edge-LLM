@@ -772,6 +772,176 @@ TEST(RopeWriteKvPrefill, RaggedPaddingDoesNotAccessUnallocatedPage)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+TEST(RopeWriteKvPrefill, PackedRaggedRowsWriteStableIndexedSlots)
+{
+    constexpr int32_t kBATCH = 3;
+    constexpr int32_t kTOTAL_TOKENS = 6;
+    constexpr int32_t kPHYSICAL_SLOTS = 4;
+    constexpr int32_t kCAPACITY = 256;
+    constexpr int32_t kNUM_Q_HEADS = 4;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_DIM = 64;
+    std::vector<int32_t> const cuSeqLens{0, 3, 4, 6};
+    std::vector<int32_t> const pastLengths{0, 128, 5};
+    std::vector<int32_t> const endLengths{3, 129, 7};
+    std::vector<int32_t> const slotIds{3, 0, 2};
+
+    rt::Tensor qTensor({kTOTAL_TOKENS, kNUM_Q_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kTensor({kTOTAL_TOKENS, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vTensor({kTOTAL_TOKENS, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    std::vector<half> qInput(qTensor.getShape().volume());
+    std::vector<half> kInput(kTensor.getShape().volume());
+    std::vector<half> vInput(vTensor.getShape().volume());
+    uniformFloatInitialization(qInput);
+    uniformFloatInitialization(kInput);
+    uniformFloatInitialization(vInput);
+    copyHostToDevice(qTensor, qInput);
+    copyHostToDevice(kTensor, kInput);
+    copyHostToDevice(vTensor, vInput);
+
+    rt::Tensor backing(
+        {kPHYSICAL_SLOTS, 2, kNUM_KV_HEADS, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemset(backing.rawPointer(), 0, backing.getMemoryCapacity()));
+    rt::Tensor activeView(backing.rawPointer(), {kBATCH, 2, kNUM_KV_HEADS, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    rt::Tensor cosSinCache({1, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(cosSinCache.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, kHEAD_DIM, kCAPACITY, nullptr);
+    rt::Tensor cuSeqLensTensor({kBATCH + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor endLengthsTensor({kBATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor slotIdsTensor({kBATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(cuSeqLensTensor, cuSeqLens);
+    copyHostToDevice(endLengthsTensor, endLengths);
+    copyHostToDevice(slotIdsTensor, slotIds);
+
+    launchApplyRopeWriteKVPacked(cosSinCache, endLengthsTensor, cuSeqLensTensor, qTensor, kTensor, vTensor, activeView,
+        1.0F, 1.0F, nullptr, true, slotIdsTensor.dataPointer<int32_t>());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const qOutput = copyDeviceToHost<half>(qTensor);
+    auto const kOutput = copyDeviceToHost<half>(kTensor);
+    auto const cacheOutput = copyDeviceToHost<half>(backing);
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    constexpr int32_t kPAGES_PER_SEQUENCE = kCAPACITY / kTOKENS_PER_PAGE;
+    for (int32_t batchIdx = 0; batchIdx < kBATCH; ++batchIdx)
+    {
+        for (int32_t packedToken = cuSeqLens[batchIdx]; packedToken < cuSeqLens[batchIdx + 1]; ++packedToken)
+        {
+            int32_t const position = pastLengths[batchIdx] + packedToken - cuSeqLens[batchIdx];
+            int32_t const qOffset = packedToken * kNUM_Q_HEADS * kHEAD_DIM;
+            int32_t const kvOffset = packedToken * kNUM_KV_HEADS * kHEAD_DIM;
+            std::vector<half> const qToken(
+                qInput.begin() + qOffset, qInput.begin() + qOffset + kNUM_Q_HEADS * kHEAD_DIM);
+            std::vector<half> const kToken(
+                kInput.begin() + kvOffset, kInput.begin() + kvOffset + kNUM_KV_HEADS * kHEAD_DIM);
+            auto const qReference = ropeRef(qToken, kNUM_Q_HEADS, kHEAD_DIM, kHEAD_DIM, position, 1.0F, 10000.0F, true);
+            auto const kReference
+                = ropeRef(kToken, kNUM_KV_HEADS, kHEAD_DIM, kHEAD_DIM, position, 1.0F, 10000.0F, true);
+            for (int32_t index = 0; index < kNUM_Q_HEADS * kHEAD_DIM; ++index)
+            {
+                ASSERT_TRUE(isclose(qOutput[qOffset + index], qReference[index], 1e-3, 1e-3));
+            }
+            for (int32_t kvHead = 0; kvHead < kNUM_KV_HEADS; ++kvHead)
+            {
+                for (int32_t dim = 0; dim < kHEAD_DIM; ++dim)
+                {
+                    int32_t const headOffset = kvHead * kHEAD_DIM + dim;
+                    ASSERT_TRUE(isclose(kOutput[kvOffset + headOffset], kReference[headOffset], 1e-3, 1e-3));
+                    int32_t const logicalPage = position / kTOKENS_PER_PAGE;
+                    int32_t const tokenInPage = position % kTOKENS_PER_PAGE;
+                    auto physicalOffset = [&](int32_t kvIndex) {
+                        int64_t const physicalPage
+                            = (slotIds[batchIdx] * 2 + kvIndex) * kPAGES_PER_SEQUENCE + logicalPage;
+                        return ((physicalPage * kTOKENS_PER_PAGE + tokenInPage) * kNUM_KV_HEADS + kvHead) * kHEAD_DIM
+                            + dim;
+                    };
+                    ASSERT_TRUE(isclose(cacheOutput[physicalOffset(0)], kReference[headOffset], 1e-3, 1e-3));
+                    ASSERT_TRUE(isclose(cacheOutput[physicalOffset(1)], vInput[kvOffset + headOffset], 1e-5, 1e-5));
+                }
+            }
+        }
+    }
+}
+
+TEST(RopeWriteKvPrefill, PackedBenchmark)
+{
+    constexpr int32_t kBATCH = 8;
+    constexpr int32_t kPADDED_SEQ_LEN = 128;
+    constexpr int32_t kPACKED_TOKENS = 678;
+    constexpr int32_t kCAPACITY = 256;
+    constexpr int32_t kNUM_Q_HEADS = 16;
+    constexpr int32_t kNUM_KV_HEADS = 8;
+    constexpr int32_t kHEAD_DIM = 128;
+    constexpr int32_t kWARMUP = 20;
+    constexpr int32_t kITERATIONS = 200;
+    std::vector<int32_t> const inputLengths{128, 117, 109, 102, 96, 90, 33, 3};
+    std::vector<int32_t> const cuSeqLens{0, 128, 245, 354, 456, 552, 642, 675, 678};
+
+    rt::Tensor denseQ(
+        {kBATCH, kPADDED_SEQ_LEN, kNUM_Q_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor denseK(
+        {kBATCH, kPADDED_SEQ_LEN, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor denseV(
+        {kBATCH, kPADDED_SEQ_LEN, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor packedQ({kPACKED_TOKENS, kNUM_Q_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor packedK({kPACKED_TOKENS, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor packedV({kPACKED_TOKENS, kNUM_KV_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor denseCache(
+        {kBATCH, 2, kNUM_KV_HEADS, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor packedCache(
+        {kBATCH, 2, kNUM_KV_HEADS, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor cosSinCache({1, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor inputLengthsTensor({kBATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor cuSeqLensTensor({kBATCH + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    CUDA_CHECK(cudaMemset(denseQ.rawPointer(), 0, denseQ.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(denseK.rawPointer(), 0, denseK.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(denseV.rawPointer(), 0, denseV.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(packedQ.rawPointer(), 0, packedQ.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(packedK.rawPointer(), 0, packedK.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(packedV.rawPointer(), 0, packedV.getMemoryCapacity()));
+    initializeNormalRopeCosSin(cosSinCache.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, kHEAD_DIM, kCAPACITY, nullptr);
+    copyHostToDevice(inputLengthsTensor, inputLengths);
+    copyHostToDevice(cuSeqLensTensor, cuSeqLens);
+
+    auto launchDense = [&]() {
+        launchApplyRopeWriteKV(cosSinCache, std::nullopt, denseQ, denseK, denseV, denseCache, 1.0F, 1.0F, nullptr, true,
+            nullptr, nullptr, inputLengthsTensor.dataPointer<int32_t>());
+    };
+    auto launchPacked = [&]() {
+        launchApplyRopeWriteKVPacked(cosSinCache, std::nullopt, cuSeqLensTensor, packedQ, packedK, packedV, packedCache,
+            1.0F, 1.0F, nullptr, true);
+    };
+    for (int32_t iteration = 0; iteration < kWARMUP; ++iteration)
+    {
+        launchDense();
+        launchPacked();
+    }
+
+    cudaEvent_t startEvent;
+    cudaEvent_t stopEvent;
+    CUDA_CHECK(cudaEventCreate(&startEvent));
+    CUDA_CHECK(cudaEventCreate(&stopEvent));
+    auto measure = [&](auto const& launch) {
+        CUDA_CHECK(cudaEventRecord(startEvent));
+        for (int32_t iteration = 0; iteration < kITERATIONS; ++iteration)
+        {
+            launch();
+        }
+        CUDA_CHECK(cudaEventRecord(stopEvent));
+        CUDA_CHECK(cudaEventSynchronize(stopEvent));
+        float elapsedMs{};
+        CUDA_CHECK(cudaEventElapsedTime(&elapsedMs, startEvent, stopEvent));
+        return elapsedMs / kITERATIONS;
+    };
+    float const denseMs = measure(launchDense);
+    float const packedMs = measure(launchPacked);
+    CUDA_CHECK(cudaEventDestroy(startEvent));
+    CUDA_CHECK(cudaEventDestroy(stopEvent));
+
+    std::cout << "Packed RoPE/KV benchmark: dense_tokens=" << kBATCH * kPADDED_SEQ_LEN
+              << " packed_tokens=" << kPACKED_TOKENS << " dense_ms=" << denseMs << " packed_ms=" << packedMs
+              << " reduction_percent=" << (denseMs - packedMs) / denseMs * 100.0F << std::endl;
+}
+
 TEST(RopeWriteKvPrefill, AccuracyFp8)
 {
     // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, kvCacheCapacity = 2048, qLen = 512

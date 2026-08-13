@@ -99,7 +99,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     if (isCompact)
     {
         rt::launchFmhaReferenceCompact(
-            qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, false, resolvedAttentionScale, stream);
+            qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, causal, resolvedAttentionScale, stream);
     }
     else
     {
@@ -254,11 +254,11 @@ TEST(ContextAttentionTest, longSequence_Causal)
     TestContextAttentionAccuracy(1, 1024, 8, 2, 256, true);
 }
 
-// Convenience wrapper for compact layout (variable sequence lengths, non-causal)
+// Convenience wrapper for compact layout with variable sequence lengths.
 void TestContextAttentionCompactAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t maxSeqLen, std::optional<float> attentionScale = std::nullopt)
+    int32_t headSize, int32_t maxSeqLen, bool causal = false, std::optional<float> attentionScale = std::nullopt)
 {
-    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, maxSeqLen, true, false, attentionScale);
+    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, maxSeqLen, true, causal, attentionScale);
 }
 
 TEST(ContextAttentionTest, compactLayout_NonCausal)
@@ -267,6 +267,13 @@ TEST(ContextAttentionTest, compactLayout_NonCausal)
     TestContextAttentionCompactAccuracy({0, 32, 60, 88, 128}, 16, 16, 64, 128);
     TestContextAttentionCompactAccuracy({0, 16, 64}, 16, 16, 72, 128);
     TestContextAttentionCompactAccuracy({0, 100, 200, 300}, 8, 8, 80, 512);
+}
+
+TEST(ContextAttentionTest, compactLayout_Causal)
+{
+    // Text prefill attention with compact variable-length rows.
+    TestContextAttentionCompactAccuracy({0, 17, 81, 112}, 16, 4, 128, 64, true);
+    TestContextAttentionCompactAccuracy({0, 3, 35, 99, 128}, 8, 2, 256, 64, true);
 }
 
 TEST(ContextAttentionTest, configurableScale)
@@ -278,6 +285,6 @@ TEST(ContextAttentionTest, configurableScale)
     TestContextAttentionAccuracy(1, 64, 8, 2, 128, true, kCUSTOM_SCALE);
     TestContextAttentionAccuracy(1, 256, 8, 1, 256, true, kIDENTITY_SCALE);
     TestContextAttentionAccuracy(1, 256, 8, 1, 256, true, kCUSTOM_SCALE);
-    TestContextAttentionCompactAccuracy({0, 16, 48}, 8, 8, 64, 48, kIDENTITY_SCALE);
-    TestContextAttentionCompactAccuracy({0, 24, 64}, 8, 8, 80, 64, kCUSTOM_SCALE);
+    TestContextAttentionCompactAccuracy({0, 16, 48}, 8, 8, 64, 48, false, kIDENTITY_SCALE);
+    TestContextAttentionCompactAccuracy({0, 24, 64}, 8, 8, 80, 64, false, kCUSTOM_SCALE);
 }

@@ -122,9 +122,10 @@ __device__ __forceinline__ int64_t getKVCacheOffset(int32_t cacheSlot, int32_t k
 template <typename T, typename TCache>
 __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float const* cosSinCache,
     int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t const* kvSlotIds, int32_t const* kvPageIds,
-    int32_t const* inputSeqLengths, float kScaleQuantOrig, float vScaleQuantOrig, int32_t qSeqLen,
-    int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
-    uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, bool writeKInPlace)
+    int32_t const* inputSeqLengths, int32_t const* cuSeqLens, float kScaleQuantOrig, float vScaleQuantOrig,
+    int32_t batchSize, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
+    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
+    bool writeKInPlace)
 {
     // Each CTA will process multiple tokens of a single head which each thread handles 16 / sizeof(T) elements.
     // blockDim.x: number of threads to process each token, blockDim.y: number of tokens processed by each CTA.
@@ -153,15 +154,34 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
         return;
     }
 
-    // The physical input is padded to qSeqLen. inputSeqLengths bounds each logical row when ragged prefill is active.
-    int32_t const batchIdx = tokenIdx / qSeqLen;
+    int32_t batchIdx{};
+    int32_t tokenIdxInRow{};
+    int32_t rowSeqLen = qSeqLen;
+    if (cuSeqLens == nullptr)
+    {
+        // The physical input is padded to qSeqLen. inputSeqLengths bounds each logical row when ragged prefill is
+        // active.
+        batchIdx = tokenIdx / qSeqLen;
+        tokenIdxInRow = tokenIdx % qSeqLen;
+    }
+    else
+    {
+        // Packed rows are contiguous. Batch sizes are small enough that the linear lookup costs less than carrying
+        // a second per-token row-index binding through every exported attention layer.
+        while (batchIdx + 1 < batchSize && tokenIdx >= cuSeqLens[batchIdx + 1])
+        {
+            ++batchIdx;
+        }
+        tokenIdxInRow = tokenIdx - cuSeqLens[batchIdx];
+        rowSeqLen = cuSeqLens[batchIdx + 1] - cuSeqLens[batchIdx];
+    }
 
     // Determine the position of CosSin Cache to read from.
     // Need to handle three scenarios: Context, vanllia decode, and tree attention.
     // Workaround: For vanllia decode use kvCacheEndLens to compute token positions.
     int32_t sinCosCachePos{};
     bool const isPaddingToken = (tokenPosIds != nullptr && tokenPosIds[tokenIdx] == -1)
-        || (inputSeqLengths != nullptr && tokenIdx % qSeqLen >= inputSeqLengths[batchIdx]);
+        || (inputSeqLengths != nullptr && tokenIdxInRow >= inputSeqLengths[batchIdx]);
     if (tokenPosIds != nullptr)
     {
         sinCosCachePos = tokenPosIds[tokenIdx];
@@ -174,8 +194,8 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
     }
     else
     {
-        int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
-        sinCosCachePos = posStartId + tokenIdx % qSeqLen;
+        int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - rowSeqLen : 0;
+        sinCosCachePos = posStartId + tokenIdxInRow;
     }
     if (isPaddingToken)
     {
@@ -230,8 +250,8 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
         T* kPtr = k + kvOffset;
         T const* vPtr = v + kvOffset;
 
-        int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
-        int32_t const tokenIdxInCache = kvCacheStartIdx + tokenIdx % qSeqLen;
+        int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - rowSeqLen : 0;
+        int32_t const tokenIdxInCache = kvCacheStartIdx + tokenIdxInRow;
         bool const indexedKVCache = kvSlotIds != nullptr;
         int32_t const cacheSlot = indexedKVCache ? kvSlotIds[batchIdx] : batchIdx;
 
@@ -269,19 +289,21 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
 static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache,
     rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::OptionalInputTensor tokenPosIds,
     int32_t const* kvSlotIds, int32_t const* kvPageIds, float kScale, float vScale, cudaStream_t stream,
-    bool writeKInPlace, int32_t const* inputSeqLengths)
+    bool writeKInPlace, int32_t const* inputSeqLengths, rt::Tensor const* cuSeqLens)
 {
     auto const dt = kvCache.getDataType();
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
     constexpr uint32_t kTHREADS_PER_CTA = 128;
 
-    uint32_t const runtimeBatchSize = static_cast<uint32_t>(q.getShape()[0]);
-    uint32_t const runtimeSeqLen = static_cast<uint32_t>(q.getShape()[1]);
-    uint32_t const numQHeads = static_cast<uint32_t>(q.getShape()[2]);
-    uint32_t const headDim = static_cast<uint32_t>(q.getShape()[3]);
+    bool const packed = cuSeqLens != nullptr;
+    uint32_t const runtimeBatchSize
+        = packed ? static_cast<uint32_t>(cuSeqLens->getShape()[0] - 1) : static_cast<uint32_t>(q.getShape()[0]);
+    uint32_t const runtimeSeqLen = packed ? 0U : static_cast<uint32_t>(q.getShape()[1]);
+    uint32_t const numQHeads = static_cast<uint32_t>(q.getShape()[packed ? 1 : 2]);
+    uint32_t const headDim = static_cast<uint32_t>(q.getShape()[packed ? 2 : 3]);
     uint32_t const numKVHeads = static_cast<uint32_t>(kvCache.getShape()[2]);
     uint32_t const kvCacheCapacity = static_cast<uint32_t>(kvCache.getShape()[3]);
-    uint32_t const totalNumTokens = runtimeBatchSize * runtimeSeqLen;
+    uint32_t const totalNumTokens = packed ? static_cast<uint32_t>(q.getShape()[0]) : runtimeBatchSize * runtimeSeqLen;
 
     uint32_t const cosSinCacheBatchSize = static_cast<uint32_t>(cosSinCache.getShape()[0]);
     uint32_t const cosSinCacheSeqLen = static_cast<uint32_t>(cosSinCache.getShape()[1]);
@@ -296,6 +318,7 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
         = kvCacheEndLens.has_value() ? kvCacheEndLens.value().get().dataPointer<int32_t>() : nullptr;
     int32_t const* tokenPosIdsPtr
         = tokenPosIds.has_value() ? tokenPosIds.value().get().dataPointer<int32_t>() : nullptr;
+    int32_t const* cuSeqLensPtr = packed ? cuSeqLens->dataPointer<int32_t>() : nullptr;
 
     uint32_t const tokenPerCTA = kTHREADS_PER_CTA * kVEC_SIZE / headDim;
     uint32_t const bDimX = headDim / kVEC_SIZE;
@@ -310,18 +333,18 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
     {
         half* kvCachePtr = kvCache.dataPointer<half>();
         applyRopeWriteKV<half, half><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
-            kvCacheEndLensPtr, tokenPosIdsPtr, kvSlotIds, kvPageIds, inputSeqLengths, kScale, vScale, runtimeSeqLen,
-            totalNumTokens, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize,
-            cosSinCacheSeqLen, writeKInPlace);
+            kvCacheEndLensPtr, tokenPosIdsPtr, kvSlotIds, kvPageIds, inputSeqLengths, cuSeqLensPtr, kScale, vScale,
+            runtimeBatchSize, runtimeSeqLen, totalNumTokens, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim,
+            cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace);
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
     {
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
         applyRopeWriteKV<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
-            kvCacheEndLensPtr, tokenPosIdsPtr, kvSlotIds, kvPageIds, inputSeqLengths, kScale, vScale, runtimeSeqLen,
-            totalNumTokens, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize,
-            cosSinCacheSeqLen, writeKInPlace);
+            kvCacheEndLensPtr, tokenPosIdsPtr, kvSlotIds, kvPageIds, inputSeqLengths, cuSeqLensPtr, kScale, vScale,
+            runtimeBatchSize, runtimeSeqLen, totalNumTokens, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim,
+            cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace);
     }
 #endif
     else
@@ -356,7 +379,47 @@ void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTens
     }
 
     launchApplyRopeWriteKVKernel(q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, kvSlotIds, kvPageIds,
-        kScale, vScale, stream, writeKInPlace, inputSeqLengths);
+        kScale, vScale, stream, writeKInPlace, inputSeqLengths, nullptr);
+}
+
+void launchApplyRopeWriteKVPacked(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
+    rt::Tensor const& cuSeqLens, rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale,
+    float vScale, cudaStream_t stream, bool writeKInPlace, int32_t const* kvSlotIds, int32_t const* kvPageIds)
+{
+    constexpr int32_t kPACKED_DIMS = 3;
+    check::check(q.getShape().getNumDims() == kPACKED_DIMS && k.getShape().getNumDims() == kPACKED_DIMS
+            && v.getShape().getNumDims() == kPACKED_DIMS,
+        "Packed Q/K/V tensors shall have layout [totalTokens, heads, headDim].");
+    check::check(
+        kvCache.getDataType() == nvinfer1::DataType::kHALF, "Packed KV write currently supports FP16 cache only.");
+    check::check(cuSeqLens.getDataType() == nvinfer1::DataType::kINT32 && cuSeqLens.getShape().getNumDims() == 1
+            && cuSeqLens.getShape()[0] >= 2,
+        "cuSeqLens shall be a non-empty INT32 prefix-sum tensor.");
+
+    int64_t const batchSize = cuSeqLens.getShape()[0] - 1;
+    int64_t const totalTokens = q.getShape()[0];
+    int64_t const headDim = q.getShape()[2];
+    int64_t const numKVHeads = k.getShape()[1];
+    check::check(k.getShape()[0] == totalTokens && v.getShape()[0] == totalTokens,
+        "Packed Q/K/V shall have the same total-token dimension.");
+    check::check(k.getShape()[2] == headDim && v.getShape()[2] == headDim && kvCache.getShape()[4] == headDim,
+        "Head dimension shall be consistent between packed Q/K/V and KV cache.");
+    check::check(v.getShape()[1] == numKVHeads && kvCache.getShape()[2] == numKVHeads,
+        "K/V/KV cache shall have the same number of KV heads.");
+    check::check(kvPageIds != nullptr || kvCache.getShape()[0] == batchSize,
+        "Linear KV cache shall have the same number of active rows as cuSeqLens.");
+    check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == batchSize,
+        "CosSinCache shall have batch size 1 or equal to packed batch size.");
+    if (kvCacheEndLens.has_value())
+    {
+        check::check(kvCacheEndLens.value().get().getDataType() == nvinfer1::DataType::kINT32
+                && kvCacheEndLens.value().get().getShape()[0] == batchSize,
+            "kvCacheEndLens shall be INT32 with the packed batch size.");
+    }
+
+    rt::OptionalInputTensor tokenPosIds{std::nullopt};
+    launchApplyRopeWriteKVKernel(q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, kvSlotIds, kvPageIds,
+        kScale, vScale, stream, writeKInPlace, nullptr, &cuSeqLens);
 }
 
 void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
@@ -382,7 +445,7 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
         "CosSinCache shall have batch size 1 or equal to runtime batch size");
 
     launchApplyRopeWriteKVKernel(q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, nullptr, nullptr, kScale,
-        vScale, stream, false, nullptr);
+        vScale, stream, false, nullptr, nullptr);
 }
 
 // =============================================================================

@@ -55,6 +55,26 @@ void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTens
     bool writeKInPlace, int32_t const* kvSlotIds = nullptr, int32_t const* kvPageIds = nullptr,
     int32_t const* inputSeqLengths = nullptr);
 
+//! @brief Apply RoPE to compact Q/K rows and write packed K/V tokens into stable KV slots.
+//! @param[in] cosSinCache FP32 tensor with layout [1 or batchSize, capacity, rotaryDim].
+//! @param[in] kvCacheEndLens Optional INT32 [batchSize] cache lengths after inserting each packed row.
+//! @param[in] cuSeqLens INT32 [batchSize + 1] exclusive prefix sum of packed row lengths.
+//! @param[in,out] q FP16 compact tensor with layout [totalTokens, Hq, headDim].
+//! @param[in,out] k FP16 compact tensor with layout [totalTokens, Hkv, headDim].
+//! @param[in] v FP16 compact tensor with layout [totalTokens, Hkv, headDim].
+//! @param[out] kvCache FP16 logical tensor with layout [activeRows, 2, Hkv, capacity, headDim].
+//! @param[in] kScale K dequant scale. Use 1.0F for FP16 KV cache.
+//! @param[in] vScale V dequant scale. Use 1.0F for FP16 KV cache.
+//! @param[in] stream CUDA stream to launch the kernel.
+//! @param[in] writeKInPlace Whether to write the roped K back to the compact K tensor.
+//! @param[in] kvSlotIds Optional active-row to stable physical-slot mapping.
+//! @param[in] kvPageIds Optional stable-slot page table for indexed-paged KV.
+//! @throws std::runtime_error if tensor shape or data type is invalid.
+void launchApplyRopeWriteKVPacked(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
+    rt::Tensor const& cuSeqLens, rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale,
+    float vScale, cudaStream_t stream, bool writeKInPlace, int32_t const* kvSlotIds = nullptr,
+    int32_t const* kvPageIds = nullptr);
+
 //! @brief Launch the kernel when we are performing tree attention for speculative decoding.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
 //! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], the end position of KVCache after writing.
