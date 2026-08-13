@@ -68,6 +68,15 @@ def decode_context_length(row: dict[str, str], decode_batch: int) -> int:
     return math.ceil(int(row["decode_context_tokens"]) / decode_batch)
 
 
+def select_decode_cost_samples(
+        all_samples: list[float],
+        isolated_samples: list[float]) -> tuple[list[float], str]:
+    """Prefer decode-only samples so overlap interference is modeled separately."""
+    if isolated_samples:
+        return isolated_samples, "decode_only"
+    return all_samples, "all_dispatch_fallback"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, nargs="+", required=True)
@@ -226,14 +235,17 @@ def main() -> None:
 
     decode = []
     for (batch, context), values in sorted(decode_points.items()):
-        if len(values) < args.min_samples:
+        samples, sample_scope = select_decode_cost_samples(
+            values, decode_baseline.get((batch, context), []))
+        if len(samples) < args.min_samples:
             continue
         point = {
             "batch_size": batch,
             "max_context_length": context,
-            "samples": len(values),
-            "median_gpu_ms": statistics.median(values),
-            "p95_gpu_ms": percentile(values, 0.95),
+            "samples": len(samples),
+            "sample_scope": sample_scope,
+            "median_gpu_ms": statistics.median(samples),
+            "p95_gpu_ms": percentile(samples, 0.95),
         }
         decode.append(point)
         csv_rows.append({"phase": "decode", **point})
@@ -276,7 +288,7 @@ def main() -> None:
             "insufficient detailed prefill/decode/overlap samples")
 
     root = {
-        "schema_version": 5,
+        "schema_version": 6,
         "prefill_layout": args.prefill_layout,
         "source_files": [str(path) for path in paths],
         "decode": decode,

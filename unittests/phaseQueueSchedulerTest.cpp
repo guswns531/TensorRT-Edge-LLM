@@ -767,6 +767,31 @@ TEST(PhaseQueueSchedulerTest, DynamicRaggedPrefillUsesUsefulTokenEfficiency)
     EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 10.0F);
 }
 
+TEST(PhaseQueueSchedulerTest, PrefillOnlyDynamicBatchIgnoresQueuedDecodeCoverage)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxDecodeBatchSize = 32;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.decodeQueueWaitTargetUs = 100000.0;
+    config.prefillBatchCosts = {{4, 128, 0, 32, true, 20.0F, 10.0F}, {8, 128, 0, 0, true, 32.0F, 0.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128});
+    }
+    for (uint64_t requestId = 9; requestId <= 40; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128, static_cast<int32_t>(requestId - 9)});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.prefillBatch.size(), 8U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 32.0F);
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesThroughputEfficientBatchToRecoverExpiredTtft)
 {
     PhaseQueueSchedulerConfig config;

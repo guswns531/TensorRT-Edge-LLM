@@ -505,6 +505,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     };
     std::vector<Candidate> profiled;
     int32_t const firstBatchSize = std::min(available, mConfig.minDynamicPrefillBatchSize);
+    int32_t const requiredConcurrentDecodeBatchSize = overlap ? plannedDecodeBatchSize : 0;
     for (int32_t batchSize = firstBatchSize; batchSize <= available; ++batchSize)
     {
         int32_t maxPastKV{};
@@ -517,8 +518,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         {
             if (cost.batchSize != batchSize || cost.chunkLength < chunkLength || cost.initialChunk != initialChunk
                 || cost.maxPastKVLength < maxPastKV
-                || cost.maxConcurrentDecodeBatchSize
-                    < std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued)))
+                || cost.maxConcurrentDecodeBatchSize < requiredConcurrentDecodeBatchSize)
             {
                 continue;
             }
