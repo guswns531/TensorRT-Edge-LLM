@@ -93,6 +93,13 @@ def parse_engine(value: str) -> Engine:
     return Engine(name, Path(directory))
 
 
+def engine_uses_packed_prefill(engine: Engine) -> bool:
+    """Return whether the engine requires the packed-prefill I/O contract."""
+    config_path = engine.directory / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return bool(config.get("packed_prefill", False))
+
+
 def materialize_trace(source: Path, destination: Path, seed: int,
                       arrival_rate: float, request_count: int,
                       repeat_count: int, total_requests: int,
@@ -253,6 +260,8 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
              str(args.prefill_token_budget)])
     if args.ragged_prefill_batching:
         command.append("--raggedPrefillBatching")
+    if engine_uses_packed_prefill(engine):
+        command.append("--packedPrefillTokenLayout")
     if args.prefill_completion_bonus_tokens > 0:
         command.extend([
             "--prefillCompletionBonusTokens",

@@ -239,6 +239,9 @@ struct PhaseQueueSchedulerConfig
     //! Combine different text chunk lengths in one right-padded TensorRT batch.
     //! Initial and continuation chunks remain separate execution classes.
     bool enableRaggedPrefillBatching{};
+    //! Pack all valid text tokens into one [1,totalTokens] carrier. Requires
+    //! fixed 128-token chunks and an indexed-paged packed-prefill engine.
+    bool enablePackedPrefillTokenLayout{};
     //! Maximum virtual useful-token credit for each continuation row that
     //! completes a request's prefill. The scheduler caps the credit at the
     //! unused portion of one configured chunk and only grants it below half a

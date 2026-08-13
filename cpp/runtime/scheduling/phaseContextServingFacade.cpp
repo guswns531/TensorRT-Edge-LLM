@@ -60,7 +60,7 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
         check::check(maxPrefillChunkTokens > 0, "Packed prefill serving requires a positive maximum chunk length.");
         mPrefillAdapter = std::make_unique<PhasePrefillContextBatchAdapter>(schedulerConfig.maxPrefillBatchSize,
             maxPrefillChunkTokens, cacheManager, *prefillTensorMap, "phase_serving_prefill",
-            schedulerConfig.enableRaggedPrefillBatching);
+            schedulerConfig.enableRaggedPrefillBatching, schedulerConfig.enablePackedPrefillTokenLayout);
     }
     check::check(static_cast<bool>(mCallbacks.completePrefill), "Serving prefill completion callback is required.");
     bool const usesLegacyDecode = static_cast<bool>(mCallbacks.enqueueDecode);

@@ -297,6 +297,17 @@ TEST(PhaseQueueSchedulerTest, AppliesPrefillTokenBudgetWithoutChangingChunkCompa
     EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, PackedPrefillRequiresFixed128TokenChunks)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 64;
+    config.enablePackedPrefillTokenLayout = true;
+    EXPECT_THROW(PhaseQueueScheduler scheduler(config), std::runtime_error);
+
+    config.maxPrefillChunkTokens = 128;
+    EXPECT_NO_THROW(PhaseQueueScheduler scheduler(config));
+}
+
 TEST(PhaseQueueSchedulerTest, RightPadsRaggedPrefillWithinPaddedTokenBudget)
 {
     PhaseQueueSchedulerConfig config;

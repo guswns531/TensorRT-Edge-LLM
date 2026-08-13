@@ -85,6 +85,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
+    check::check(!mConfig.enablePackedPrefillTokenLayout || mConfig.maxPrefillChunkTokens == 128,
+        "Packed prefill token layout requires fixed 128-token chunks");
     check::check(mConfig.maxPrefillBatchTokens >= 0, "maxPrefillBatchTokens must be non-negative");
     check::check(mConfig.prefillCompletionBonusTokens >= 0, "prefillCompletionBonusTokens must be non-negative");
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)

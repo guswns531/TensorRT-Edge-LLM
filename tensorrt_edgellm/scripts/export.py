@@ -809,7 +809,8 @@ def _export_llm(model_dir: str,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
                 indexed_kv_cache: bool = False,
-                paged_kv_cache: bool = False) -> None:
+                paged_kv_cache: bool = False,
+                packed_prefill: bool = False) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -888,6 +889,7 @@ def _export_llm(model_dir: str,
             )
             model.config.indexed_kv_cache = indexed_kv_cache
             model.config.paged_kv_cache = paged_kv_cache
+            model.config.packed_prefill = packed_prefill
             if indexed_kv_cache:
                 model.config.use_vision_bidirectional_attention = False
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
@@ -2534,8 +2536,13 @@ def main() -> None:
         action="store_true",
         help=(
             "Export stable indexed attention with a shared 128-token physical "
-            "KV page table. Requires --indexed-kv-cache."
-        ),
+            "KV page table. Requires --indexed-kv-cache."),
+    )
+    p.add_argument(
+        "--packed-prefill",
+        action="store_true",
+        help=("Export an indexed-paged text engine that accepts fixed-128 "
+              "prefill rows packed into one token carrier."),
     )
     p.add_argument(
         "--externalize-weights",
@@ -2623,6 +2630,8 @@ def main() -> None:
         )
     if args.paged_kv_cache and not args.indexed_kv_cache:
         p.error("--paged-kv-cache requires --indexed-kv-cache")
+    if args.packed_prefill and not args.paged_kv_cache:
+        p.error("--packed-prefill requires --paged-kv-cache")
     if args.indexed_kv_cache and (args.eagle_base or args.mtp
                                   or args.dflash_base or args.dflash_draft):
         p.error("--indexed-kv-cache v1 supports vanilla decoding only")
@@ -2769,7 +2778,8 @@ def main() -> None:
                      tp_size=args.tp_size,
                      num_decoder_layers=args.num_decoder_layer,
                      indexed_kv_cache=args.indexed_kv_cache,
-                     paged_kv_cache=args.paged_kv_cache)),
+                     paged_kv_cache=args.paged_kv_cache,
+                     packed_prefill=args.packed_prefill)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

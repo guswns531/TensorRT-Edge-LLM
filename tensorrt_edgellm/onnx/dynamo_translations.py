@@ -157,19 +157,33 @@ def _paged_attention_plugin_translation(
     head_size: int,
     sliding_window_size: int,
     enable_fp8_kv_cache: int,
+    enable_packed_prefill: int,
     attention_scale: float,
     qkv_scales: Sequence[float],
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
-        query_states, key_states, value_states, past_key_value,
-        context_lengths, rope_rotary_cos_sin, kvcache_start_index,
-        kv_slot_ids, kv_page_ids,
-        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
-        head_size=head_size, enable_tree_attention=0,
+        query_states,
+        key_states,
+        value_states,
+        past_key_value,
+        context_lengths,
+        rope_rotary_cos_sin,
+        kvcache_start_index,
+        kv_slot_ids,
+        kv_page_ids,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        enable_tree_attention=0,
         enable_fp8_kv_cache=enable_fp8_kv_cache,
-        enable_vision_block_attention=0, enable_indexed_kv_cache=1,
-        enable_paged_kv_cache=1, sliding_window_size=sliding_window_size,
-        qkv_scales=qkv_scales, attention_scale=attention_scale, _outputs=2)
+        enable_vision_block_attention=0,
+        enable_indexed_kv_cache=1,
+        enable_paged_kv_cache=1,
+        enable_packed_prefill=enable_packed_prefill,
+        sliding_window_size=sliding_window_size,
+        qkv_scales=qkv_scales,
+        attention_scale=attention_scale,
+        _outputs=2)
     return attn_4d, present_kv
 
 

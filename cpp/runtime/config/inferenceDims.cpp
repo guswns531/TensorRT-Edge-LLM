@@ -40,8 +40,8 @@ std::string_view dimName(int64_t InferenceDims::* member)
 std::string toString(InferenceDims const& dims)
 {
     std::ostringstream ss;
-    ss << "{batch=" << dims.batch << ", seq_len=" << dims.seqLen << ", kv_len=" << dims.kvLen
-       << ", select_len=" << dims.selectLen << ", attn_seq_len=" << dims.attnMaskSeqLen
+    ss << "{batch=" << dims.batch << ", token_batch=" << dims.tokenBatch << ", seq_len=" << dims.seqLen
+       << ", kv_len=" << dims.kvLen << ", select_len=" << dims.selectLen << ", attn_seq_len=" << dims.attnMaskSeqLen
        << ", rope_batch=" << dims.ropeBatch << ", packed_mask_len=" << dims.packedMaskLen
        << ", start_index_len=" << dims.startIndexLen << ", spec_verify_phase_len=" << dims.specVerifyPhaseLen << "}";
     return ss.str();

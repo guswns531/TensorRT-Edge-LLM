@@ -56,7 +56,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
 
     // inputs_embeds: [batch, seq_len, hiddenSize] HALF
     reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
-        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
+        {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
 
     // logits: [batch, outputVocabSize] FLOAT for vanilla, or
     // [batch, seq_len, outputVocabSize] for SpecDecode. The engine binding
@@ -81,7 +81,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
 
     // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
     reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
-        {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+        {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::selectLen)}});
 
     // kvcache_start_index: [start_index_len] INT32. The engine's context profile
     // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
@@ -182,9 +182,10 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         // deepstack_embeds_%d: [batch, seq_len, hiddenSize] HALF — one per feature.
         // DeepstackBinding swaps the backing tensor (real per-request buffer
         // vs. shared zero buffer) between prefill and non-prefill phases.
-        reg.addTensor({std::string(binding_names::kDeepstackEmbedsTemplate) + "_%d", TensorIO::kInput,
-            nvinfer1::DataType::kHALF, {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)},
-            /*perLayer=*/cfg.numDeepstackFeatures});
+        reg.addTensor(
+            {std::string(binding_names::kDeepstackEmbedsTemplate) + "_%d", TensorIO::kInput, nvinfer1::DataType::kHALF,
+                {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)},
+                /*perLayer=*/cfg.numDeepstackFeatures});
     }
 
     // ---------------------------------------------------------------

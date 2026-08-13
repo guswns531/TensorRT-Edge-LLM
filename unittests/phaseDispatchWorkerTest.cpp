@@ -33,6 +33,7 @@
 #include <array>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <numeric>
 #include <unordered_map>
 #include <utility>
 
@@ -959,6 +960,80 @@ TEST(PhasePrefillContextBatchAdapterTest, RightPadsRaggedRowsAndCommitsActualLen
         copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{11, 20, 30, 43}));
     EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &previousBindings.slotIds());
     EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &previousBindings.lengths());
+}
+
+TEST(PhasePrefillContextBatchAdapterTest, PacksFixedChunksIntoOneTokenCarrierAndRestoresBindings)
+{
+    constexpr int32_t kMAX_SLOTS = 4;
+    constexpr int32_t kCHUNK_TOKENS = 128;
+    constexpr int32_t kFIRST_PROMPT_TOKENS = 200;
+    constexpr int32_t kSECOND_PROMPT_TOKENS = 170;
+    constexpr int32_t kFIRST_TAIL_TOKENS = kFIRST_PROMPT_TOKENS - kCHUNK_TOKENS;
+    constexpr int32_t kSECOND_TAIL_TOKENS = kSECOND_PROMPT_TOKENS - kCHUNK_TOKENS;
+    constexpr int32_t kTOTAL_TOKENS = kFIRST_TAIL_TOKENS + kSECOND_TAIL_TOKENS;
+    constexpr int32_t kVOCAB_SIZE = 32;
+    rt::HybridCacheManager cacheManager = makeIndexedPagedManager(kMAX_SLOTS, 8);
+    rt::PhaseBatchState initialState(2, "phase_packed_prefill_initial_state", true);
+    initialState.prepare(
+        {{101, kCHUNK_TOKENS, 3, 0, kFIRST_PROMPT_TOKENS}, {202, kCHUNK_TOKENS, 0, 0, kSECOND_PROMPT_TOKENS}},
+        cacheManager, nullptr);
+    initialState.commit(cacheManager, kCHUNK_TOKENS, nullptr);
+
+    rt::TensorMap tensorMap;
+    rt::PhaseBatchState previousBindings(kMAX_SLOTS, "phase_packed_prefill_previous_bindings");
+    previousBindings.bind(tensorMap);
+    rt::Tensor previousLastTokenIds(
+        {kMAX_SLOTS, 1}, rt::DeviceType::kGPU, DataType::kINT64, "phase_packed_prefill_previous_last_token_ids");
+    tensorMap.set(binding_names::kLastTokenIds, previousLastTokenIds);
+
+    rt::DecodingInferenceContext first;
+    first.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    first.rawBatchedInputIds.resize(1);
+    first.rawBatchedInputIds.front().resize(kFIRST_PROMPT_TOKENS);
+    std::iota(first.rawBatchedInputIds.front().begin(), first.rawBatchedInputIds.front().end(), 1000);
+    first.tokenIds = first.rawBatchedInputIds;
+
+    rt::DecodingInferenceContext second;
+    second.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    second.rawBatchedInputIds.resize(1);
+    second.rawBatchedInputIds.front().resize(kSECOND_PROMPT_TOKENS);
+    std::iota(second.rawBatchedInputIds.front().begin(), second.rawBatchedInputIds.front().end(), 2000);
+    second.tokenIds = second.rawBatchedInputIds;
+
+    rt::PhasePrefillContextBatchAdapter adapter(
+        2, kCHUNK_TOKENS, cacheManager, tensorMap, "phase_packed_prefill_adapter_test", true, true);
+    adapter.pack({{101, &first, 0, 3, kCHUNK_TOKENS, kFIRST_TAIL_TOKENS, kFIRST_PROMPT_TOKENS},
+                     {202, &second, 0, 0, kCHUNK_TOKENS, kSECOND_TAIL_TOKENS, kSECOND_PROMPT_TOKENS}},
+        nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    EXPECT_EQ(adapter.batchSize(), 2);
+    EXPECT_EQ(adapter.chunkLength(), kFIRST_TAIL_TOKENS);
+    EXPECT_EQ(adapter.engineSequenceLength(), kTOTAL_TOKENS);
+    EXPECT_EQ(adapter.tokenBatchSize(), 1);
+    EXPECT_TRUE(adapter.usesPackedTokenLayout());
+    EXPECT_EQ(adapter.tokenIds().getShape(), rt::Coords({1, kTOTAL_TOKENS}));
+    EXPECT_EQ(adapter.lastTokenIds().getShape(), rt::Coords({1, 2}));
+    std::vector<int32_t> expectedTokens;
+    expectedTokens.insert(expectedTokens.end(), first.rawBatchedInputIds.front().begin() + kCHUNK_TOKENS,
+        first.rawBatchedInputIds.front().end());
+    expectedTokens.insert(expectedTokens.end(), second.rawBatchedInputIds.front().begin() + kCHUNK_TOKENS,
+        second.rawBatchedInputIds.front().end());
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.tokenIds()), expectedTokens);
+    EXPECT_EQ(copyDeviceToHost<int64_t>(adapter.lastTokenIds()),
+        (std::vector<int64_t>{kFIRST_TAIL_TOKENS - 1, kTOTAL_TOKENS - 1}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.phaseBatchState().slotIds()), (std::vector<int32_t>{3, 0}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.phaseBatchState().lengths()),
+        (std::vector<int32_t>{kCHUNK_TOKENS, kCHUNK_TOKENS}));
+    EXPECT_EQ(tensorMap.get(binding_names::kLastTokenIds), &adapter.lastTokenIds());
+
+    rt::Tensor logits({1, 2, kVOCAB_SIZE}, rt::DeviceType::kGPU, DataType::kFLOAT, "phase_packed_prefill_logits");
+    adapter.reshapeOutputLogits(logits, kVOCAB_SIZE);
+    EXPECT_EQ(logits.getShape(), rt::Coords({2, kVOCAB_SIZE}));
+    adapter.complete();
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &previousBindings.slotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &previousBindings.lengths());
+    EXPECT_EQ(tensorMap.get(binding_names::kLastTokenIds), &previousLastTokenIds);
 }
 
 TEST(PhasePrefillContextBatchAdapterTest, PacksSingleAtomicMultimodalPrompt)

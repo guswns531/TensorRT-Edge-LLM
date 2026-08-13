@@ -124,6 +124,7 @@ struct Args
     int32_t cudaGraphReserveMiB{};
     int32_t prefillTokenBudget{};
     bool raggedPrefillBatching{};
+    bool packedPrefillTokenLayout{};
     int32_t prefillCompletionBonusTokens{};
     bool dynamicDecodeBatching{};
     bool dynamicPrefillBatching{};
@@ -344,7 +345,7 @@ void printUsage(char const* program)
         "[--cudaGraphChargeMiB N --cudaGraphReserveMiB N] "
         "[--slotCount N] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--prefillTokenBudget N] "
-        "[--raggedPrefillBatching --prefillCompletionBonusTokens N] "
+        "[--raggedPrefillBatching --packedPrefillTokenLayout --prefillCompletionBonusTokens N] "
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
         "--decodeSlackSafetyFactor F "
@@ -397,6 +398,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kCudaGraphReserveMiB,
         kPrefillTokenBudget,
         kRaggedPrefillBatching,
+        kPackedPrefillTokenLayout,
         kPrefillCompletionBonusTokens,
         kDynamicDecodeBatching,
         kDynamicPrefillBatching,
@@ -470,6 +472,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"cudaGraphReserveMiB", required_argument, nullptr, kCudaGraphReserveMiB},
         {"prefillTokenBudget", required_argument, nullptr, kPrefillTokenBudget},
         {"raggedPrefillBatching", no_argument, nullptr, kRaggedPrefillBatching},
+        {"packedPrefillTokenLayout", no_argument, nullptr, kPackedPrefillTokenLayout},
         {"prefillCompletionBonusTokens", required_argument, nullptr, kPrefillCompletionBonusTokens},
         {"dynamicDecodeBatching", no_argument, nullptr, kDynamicDecodeBatching},
         {"dynamicPrefillBatching", no_argument, nullptr, kDynamicPrefillBatching},
@@ -567,6 +570,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kCudaGraphReserveMiB: args.cudaGraphReserveMiB = std::stoi(optarg); break;
         case kPrefillTokenBudget: args.prefillTokenBudget = std::stoi(optarg); break;
         case kRaggedPrefillBatching: args.raggedPrefillBatching = true; break;
+        case kPackedPrefillTokenLayout: args.packedPrefillTokenLayout = true; break;
         case kPrefillCompletionBonusTokens: args.prefillCompletionBonusTokens = std::stoi(optarg); break;
         case kDynamicDecodeBatching: args.dynamicDecodeBatching = true; break;
         case kDynamicPrefillBatching: args.dynamicPrefillBatching = true; break;
@@ -1045,6 +1049,12 @@ int main(int argc, char** argv)
             "Continuous-load prompt plus output maximum exceeds KV capacity");
     }
     int32_t const configuredChunkSize = args.prefillChunkSize > 0 ? args.prefillChunkSize : args.inputLen;
+    ELLM_CHECK(args.packedPrefillTokenLayout == config.packedPrefill,
+        "--packedPrefillTokenLayout must match the engine packed_prefill export contract");
+    ELLM_CHECK(
+        !args.packedPrefillTokenLayout || configuredChunkSize == 128, "Packed prefill requires --prefillChunkSize 128");
+    ELLM_CHECK(!args.packedPrefillTokenLayout || (config.indexedKVCache && config.pagedKVCache),
+        "Packed prefill requires indexed-paged KV cache");
     int32_t const phaseRounds = (args.inputLen + configuredChunkSize - 1) / configuredChunkSize;
     ELLM_CHECK(args.pastKVLen + phaseRounds <= config.maxKVCacheCapacity, "pastKVLen exceeds KV capacity");
     ELLM_CHECK(!args.cudaGraph || !usesSharedTensorRTContext(args),
@@ -1302,25 +1312,45 @@ int main(int argc, char** argv)
             for (int32_t chunkOffset = 0; chunkOffset < args.inputLen; chunkOffset += configuredChunkSize)
             {
                 int32_t const chunkLength = std::min(configuredChunkSize, args.inputLen - chunkOffset);
-                check::check(prefillIO.inputsEmbeds.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                int32_t const tokenBatchSize = args.packedPrefillTokenLayout ? 1 : args.prefillBatch;
+                int32_t const engineSequenceLength
+                    = args.packedPrefillTokenLayout ? args.prefillBatch * chunkLength : chunkLength;
+                check::check(prefillIO.inputsEmbeds.reshape({tokenBatchSize, engineSequenceLength, config.hiddenSize}),
                     "Prefill input reshape failed");
                 check::check(
                     prefillIO.contextLengths.reshape({args.prefillBatch}), "Prefill context lengths reshape failed");
                 CUDA_CHECK(cudaMemsetAsync(
                     prefillIO.contextLengths.rawPointer(), 0, prefillIO.contextLengths.getMemoryCapacity(), stream));
                 kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, stream);
+                if (args.packedPrefillTokenLayout)
+                {
+                    check::check(prefillIO.selectTokenIndices.reshape({1, args.prefillBatch}),
+                        "Packed prefill select indices reshape failed");
+                    check::check(prefillIO.hostSelectTokenIndices.reshape({1, args.prefillBatch}),
+                        "Packed host prefill indices reshape failed");
+                    int64_t* hostSelectTokenIndices = prefillIO.hostSelectTokenIndices.dataPointer<int64_t>();
+                    for (int32_t row{}; row < args.prefillBatch; ++row)
+                    {
+                        hostSelectTokenIndices[row] = static_cast<int64_t>((row + 1) * chunkLength - 1);
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
+                        prefillIO.hostSelectTokenIndices.rawPointer(), args.prefillBatch * sizeof(int64_t),
+                        cudaMemcpyHostToDevice, stream));
+                }
                 if (prefillGemma4Ple)
                 {
-                    prefillGemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
+                    prefillGemma4Ple->reshapeOutputs(tokenBatchSize, engineSequenceLength);
                 }
                 for (rt::Tensor& deepstack : prefillIO.deepstackEmbeds)
                 {
-                    check::check(deepstack.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                    check::check(deepstack.reshape({tokenBatchSize, engineSequenceLength, config.hiddenSize}),
                         "Prefill deepstack reshape failed");
                     CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), stream));
                 }
                 bool const initialChunk = chunkOffset == 0;
-                auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
+                auto const prefillDims = args.packedPrefillTokenLayout
+                    ? config.packedPrefillDims(args.prefillBatch, engineSequenceLength)
+                    : config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
                 if (!prefillRunner->prepare(kPrefillProfile, prefillDims, prefillMap, stream)
                     || !prefillRunner->execute(stream))
                 {
@@ -1346,20 +1376,39 @@ int main(int argc, char** argv)
                         CUDA_CHECK(cudaMemsetAsync(prefillIO.selectTokenIndices.rawPointer(), 0,
                             prefillIO.selectTokenIndices.getMemoryCapacity(), segmentStream));
                     }
-                    check::check(prefillIO.inputsEmbeds.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                    int32_t const tokenBatchSize = args.packedPrefillTokenLayout ? 1 : args.prefillBatch;
+                    int32_t const engineSequenceLength
+                        = args.packedPrefillTokenLayout ? args.prefillBatch * chunkLength : chunkLength;
+                    check::check(
+                        prefillIO.inputsEmbeds.reshape({tokenBatchSize, engineSequenceLength, config.hiddenSize}),
                         "Prefill input reshape failed");
                     check::check(prefillIO.contextLengths.reshape({args.prefillBatch}),
                         "Prefill context lengths reshape failed");
                     CUDA_CHECK(cudaMemsetAsync(prefillIO.contextLengths.rawPointer(), 0,
                         prefillIO.contextLengths.getMemoryCapacity(), segmentStream));
                     kernel::incrementLengthTensor(prefillIO.contextLengths, chunkLength, segmentStream);
+                    if (args.packedPrefillTokenLayout)
+                    {
+                        check::check(prefillIO.selectTokenIndices.reshape({1, args.prefillBatch}),
+                            "Packed prefill select indices reshape failed");
+                        check::check(prefillIO.hostSelectTokenIndices.reshape({1, args.prefillBatch}),
+                            "Packed host prefill indices reshape failed");
+                        int64_t* hostSelectTokenIndices = prefillIO.hostSelectTokenIndices.dataPointer<int64_t>();
+                        for (int32_t row{}; row < args.prefillBatch; ++row)
+                        {
+                            hostSelectTokenIndices[row] = static_cast<int64_t>((row + 1) * chunkLength - 1);
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
+                            prefillIO.hostSelectTokenIndices.rawPointer(), args.prefillBatch * sizeof(int64_t),
+                            cudaMemcpyHostToDevice, segmentStream));
+                    }
                     if (prefillGemma4Ple)
                     {
-                        prefillGemma4Ple->reshapeOutputs(args.prefillBatch, chunkLength);
+                        prefillGemma4Ple->reshapeOutputs(tokenBatchSize, engineSequenceLength);
                     }
                     for (rt::Tensor& deepstack : prefillIO.deepstackEmbeds)
                     {
-                        check::check(deepstack.reshape({args.prefillBatch, chunkLength, config.hiddenSize}),
+                        check::check(deepstack.reshape({tokenBatchSize, engineSequenceLength, config.hiddenSize}),
                             "Prefill deepstack reshape failed");
                         CUDA_CHECK(
                             cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), segmentStream));
@@ -1367,7 +1416,11 @@ int main(int argc, char** argv)
                 }});
             segments.push_back({rt::PhaseKernelGroup::kPrefillEngine, {}, stream,
                 [&, chunkLength, initialChunk](cudaStream_t segmentStream) {
-                    auto const prefillDims = config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
+                    int32_t const engineSequenceLength
+                        = args.packedPrefillTokenLayout ? args.prefillBatch * chunkLength : chunkLength;
+                    auto const prefillDims = args.packedPrefillTokenLayout
+                        ? config.packedPrefillDims(args.prefillBatch, engineSequenceLength)
+                        : config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
                     if (!prefillRunner->prepare(kPrefillProfile, prefillDims, prefillMap, segmentStream)
                         || !prefillRunner->execute(segmentStream))
                     {
@@ -1598,6 +1651,7 @@ int main(int argc, char** argv)
             = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
         facadeSchedulerConfig.maxPrefillBatchTokens = args.prefillTokenBudget;
         facadeSchedulerConfig.enableRaggedPrefillBatching = args.raggedPrefillBatching;
+        facadeSchedulerConfig.enablePackedPrefillTokenLayout = args.packedPrefillTokenLayout;
         facadeSchedulerConfig.prefillCompletionBonusTokens = args.prefillCompletionBonusTokens;
         facadeSchedulerConfig.enableDynamicDecodeBatching = args.dynamicDecodeBatching;
         bool const profileUsesCosts = facadeSchedulerConfig.profile != rt::PhaseSchedulerProfile::kCustom;
@@ -1659,6 +1713,8 @@ int main(int argc, char** argv)
         facadeCallbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
             int32_t const batchSize = packed.batchSize();
             int32_t const chunkLength = packed.chunkLength();
+            int32_t const tokenBatchSize = packed.tokenBatchSize();
+            int32_t const engineSequenceLength = packed.engineSequenceLength();
             size_t const currentKernelDispatchIndex = kernelGroupDispatchIndex;
             if (realRequestTrace && collectServingMetrics && !args.phaseTimelineCsv.empty())
             {
@@ -1678,30 +1734,38 @@ int main(int argc, char** argv)
             std::vector<rt::PhaseKernelSegment> segments;
             segments.push_back({rt::PhaseKernelGroup::kPrefillPrepare, {}, packed.stream(),
                 [&](cudaStream_t stream) {
-                    check::check(prefillIO.inputsEmbeds.reshape({batchSize, chunkLength, config.hiddenSize}),
+                    check::check(
+                        prefillIO.inputsEmbeds.reshape({tokenBatchSize, engineSequenceLength, config.hiddenSize}),
                         "Serving prefill input reshape failed");
                     check::check(prefillIO.contextLengths.reshape({batchSize}),
                         "Serving prefill context lengths reshape failed");
-                    check::check(prefillIO.selectTokenIndices.reshape({batchSize, 1}),
-                        "Serving prefill select indices reshape failed");
                     check::check(prefillIO.hostContextLengths.reshape({batchSize}),
                         "Serving host prefill lengths reshape failed");
-                    check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
-                        "Serving host prefill indices reshape failed");
                     int32_t* hostContextLengths = prefillIO.hostContextLengths.dataPointer<int32_t>();
-                    int64_t* hostSelectTokenIndices = prefillIO.hostSelectTokenIndices.dataPointer<int64_t>();
                     for (int32_t row{}; row < batchSize; ++row)
                     {
                         int32_t const rowTokens = packed.rows()[static_cast<size_t>(row)].tokenCount;
                         hostContextLengths[row] = rowTokens;
-                        hostSelectTokenIndices[row] = static_cast<int64_t>(rowTokens - 1);
                     }
                     CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(),
                         prefillIO.hostContextLengths.rawPointer(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice,
                         stream));
-                    CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
-                        prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t),
-                        cudaMemcpyHostToDevice, stream));
+                    if (!packed.usesPackedTokenLayout())
+                    {
+                        check::check(prefillIO.selectTokenIndices.reshape({batchSize, 1}),
+                            "Serving prefill select indices reshape failed");
+                        check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
+                            "Serving host prefill indices reshape failed");
+                        int64_t* hostSelectTokenIndices = prefillIO.hostSelectTokenIndices.dataPointer<int64_t>();
+                        for (int32_t row{}; row < batchSize; ++row)
+                        {
+                            hostSelectTokenIndices[row]
+                                = static_cast<int64_t>(packed.rows()[static_cast<size_t>(row)].tokenCount - 1);
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync(prefillIO.selectTokenIndices.rawPointer(),
+                            prefillIO.hostSelectTokenIndices.rawPointer(), batchSize * sizeof(int64_t),
+                            cudaMemcpyHostToDevice, stream));
+                    }
                     prefillEmbedding.embed(
                         packed.tokenIds(), packed.visualEmbeddings(), std::nullopt, prefillIO, stream);
                     prefillEmbedding.prepareDeepstack(packed.tokenIds(), packed.deepstackFeatures(), prefillIO, stream);
@@ -1728,14 +1792,15 @@ int main(int argc, char** argv)
                     }
                     if (prefillGemma4Ple)
                     {
-                        prefillGemma4Ple->reshapeOutputs(batchSize, chunkLength);
+                        prefillGemma4Ple->reshapeOutputs(tokenBatchSize, engineSequenceLength);
                         prefillGemma4Ple->embed(packed.tokenIds(), stream);
                     }
-                    check::check(prefillIO.outputLogits.reshape({batchSize, config.outputVocabSize}),
-                        "Serving prefill logits reshape failed");
+                    packed.reshapeOutputLogits(prefillIO.outputLogits, config.outputVocabSize);
                 }});
             segments.push_back({rt::PhaseKernelGroup::kPrefillEngine, {}, packed.stream(), [&](cudaStream_t stream) {
-                                    auto const dims = config.prefillDims(batchSize, chunkLength, packed.initialChunk());
+                                    auto const dims = packed.usesPackedTokenLayout()
+                                        ? config.packedPrefillDims(batchSize, engineSequenceLength)
+                                        : config.prefillDims(batchSize, chunkLength, packed.initialChunk());
                                     ELLM_CHECK(prefillRunner->prepare(kPrefillProfile, dims, prefillMap, stream)
                                             && prefillRunner->execute(stream),
                                         "Serving facade packed prefill enqueue failed");

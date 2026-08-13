@@ -173,7 +173,15 @@ _attention_plugin_schema = OpSchema(
         OpSchema.Attribute(
             name="enable_paged_kv_cache",
             type=OpSchema.AttrType.INT,
-            description="Use input slot 8 as the stable-slot physical page table.",
+            description=
+            "Use input slot 8 as the stable-slot physical page table.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_packed_prefill",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Treat [1, total_tokens] context input as packed logical rows.",
             required=False,
         ),
         OpSchema.Attribute(

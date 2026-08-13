@@ -49,7 +49,8 @@ class PhasePrefillContextBatchAdapter
 {
 public:
     PhasePrefillContextBatchAdapter(int32_t maxBatchSize, int32_t maxChunkTokens, HybridCacheManager& cacheManager,
-        TensorMap& tensorMap, std::string const& name, bool enableRaggedPrefill = false);
+        TensorMap& tensorMap, std::string const& name, bool enableRaggedPrefill = false,
+        bool enablePackedTokenLayout = false);
     ~PhasePrefillContextBatchAdapter() noexcept;
 
     PhasePrefillContextBatchAdapter(PhasePrefillContextBatchAdapter const&) = delete;
@@ -65,6 +66,10 @@ public:
 
     Tensor& tokenIds() noexcept;
     Tensor const& hostTokenIds() const noexcept;
+    //! Device INT64 indices selecting one row-local or packed-global last token per request.
+    Tensor& lastTokenIds() noexcept;
+    //! Reinterpret packed [1,B,V] output storage as logical [B,V] for sampling.
+    void reshapeOutputLogits(Tensor& logits, int32_t vocabSize) const;
     //! Visual embeddings for a single-request atomic multimodal prefill.
     OptionalInputTensor visualEmbeddings() const noexcept;
     //! Raw deepstack features for a single-request atomic multimodal prefill.
@@ -76,7 +81,12 @@ public:
     std::vector<PhaseWorkItem> const& workItems() const noexcept;
     int32_t batchSize() const noexcept;
     int32_t chunkLength() const noexcept;
+    //! Sequence dimension presented to TensorRT (total tokens for packed layout).
+    int32_t engineSequenceLength() const noexcept;
+    //! First dimension presented to token tensors (1 for packed layout).
+    int32_t tokenBatchSize() const noexcept;
     bool initialChunk() const noexcept;
+    bool usesPackedTokenLayout() const noexcept;
     cudaStream_t stream() const noexcept;
     bool packed() const noexcept;
 
@@ -90,15 +100,20 @@ private:
     TensorMap& mTensorMap;
     Tensor mHostTokenIds;
     Tensor mDeviceTokenIds;
+    Tensor mHostLastTokenIds;
+    Tensor mDeviceLastTokenIds;
     PhaseBatchState mBatchState;
     std::vector<PhasePrefillContextRow> mRows;
     std::vector<PhaseWorkItem> mWorkItems;
     Tensor* mPreviousSlotIds{};
     Tensor* mPreviousLengths{};
+    Tensor* mPreviousLastTokenIds{};
     int32_t mBatchSize{};
     int32_t mChunkLength{};
+    int32_t mTotalTokenCount{};
     bool mInitialChunk{};
     bool mEnableRaggedPrefill{};
+    bool mEnablePackedTokenLayout{};
     cudaStream_t mStream{};
     bool mPacked{};
 };

@@ -670,6 +670,36 @@ TEST(RegistryBuilderTest, SymbolicDimsCanBeResolved)
     EXPECT_EQ(resolved.d[2], 4096);
 }
 
+TEST(RegistryBuilderTest, PackedPrefillUsesCarrierBatchForTokensAndLogicalBatchForKVMetadata)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.numAttentionLayers = 1;
+    cfg.numDecoderLayers = 1;
+    cfg.indexedKVCache = true;
+    cfg.pagedKVCache = true;
+    populateHybridFieldsFromScalars(cfg);
+    auto const registry = buildRegistryForLLM(cfg);
+    auto const dims = cfg.packedPrefillDims(/*logicalBatch=*/4, /*totalTokens=*/387);
+
+    auto findShape = [&](char const* name) {
+        auto const& specs = registry.allExpandedSpecs();
+        auto const found
+            = std::find_if(specs.begin(), specs.end(), [name](TensorSpec const& spec) { return spec.name == name; });
+        EXPECT_NE(found, specs.end());
+        return registry.resolveShape(found->shape, dims);
+    };
+    auto const embeds = findShape(trt_edgellm::binding_names::kInputsEmbeds);
+    EXPECT_EQ(embeds.d[0], 1);
+    EXPECT_EQ(embeds.d[1], 387);
+    auto const contextLengths = findShape(trt_edgellm::binding_names::kContextLengths);
+    EXPECT_EQ(contextLengths.d[0], 4);
+    auto const slotIds = findShape(trt_edgellm::binding_names::kKVSlotIds);
+    EXPECT_EQ(slotIds.d[0], 4);
+    auto const lastTokenIds = findShape(trt_edgellm::binding_names::kLastTokenIds);
+    EXPECT_EQ(lastTokenIds.d[0], 1);
+    EXPECT_EQ(lastTokenIds.d[1], 4);
+}
+
 // =====================================================================
 // Tier-1 #9: FP8 KV cache regression test — cycle {kHALF, kFP8, kBF16}
 // and assert the registry emits past_key_values_* bindings whose dtype

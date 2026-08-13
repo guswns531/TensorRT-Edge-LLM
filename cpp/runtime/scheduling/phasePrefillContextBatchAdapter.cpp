@@ -22,6 +22,7 @@
 #include "common/cudaMacros.h"
 
 #include <algorithm>
+#include <numeric>
 #include <set>
 #include <unordered_set>
 
@@ -31,7 +32,8 @@ namespace rt
 {
 
 PhasePrefillContextBatchAdapter::PhasePrefillContextBatchAdapter(int32_t maxBatchSize, int32_t maxChunkTokens,
-    HybridCacheManager& cacheManager, TensorMap& tensorMap, std::string const& name, bool enableRaggedPrefill)
+    HybridCacheManager& cacheManager, TensorMap& tensorMap, std::string const& name, bool enableRaggedPrefill,
+    bool enablePackedTokenLayout)
     : mMaxBatchSize(maxBatchSize)
     , mMaxChunkTokens(maxChunkTokens)
     , mCacheManager(cacheManager)
@@ -39,11 +41,18 @@ PhasePrefillContextBatchAdapter::PhasePrefillContextBatchAdapter(int32_t maxBatc
     , mHostTokenIds(
           {maxBatchSize, maxChunkTokens}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_token_ids")
     , mDeviceTokenIds({maxBatchSize, maxChunkTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_token_ids")
+    , mHostLastTokenIds({maxBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT64, name + "_host_last_token_ids")
+    , mDeviceLastTokenIds({maxBatchSize, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT64, name + "_last_token_ids")
     , mBatchState(maxBatchSize, name + "_batch", cacheManager.isIndexedKVCache())
     , mEnableRaggedPrefill(enableRaggedPrefill)
+    , mEnablePackedTokenLayout(enablePackedTokenLayout)
 {
     check::check(mMaxBatchSize > 0, "Phase prefill adapter max batch size must be positive.");
     check::check(mMaxChunkTokens > 0, "Phase prefill adapter max chunk length must be positive.");
+    check::check(!mEnablePackedTokenLayout || mMaxChunkTokens == 128,
+        "Packed phase prefill requires the fixed 128-token chunk contract.");
+    check::check(!mEnablePackedTokenLayout || mCacheManager.isPagedKVCache(),
+        "Packed phase prefill requires indexed-paged KV cache storage.");
 }
 
 PhasePrefillContextBatchAdapter::~PhasePrefillContextBatchAdapter() noexcept
@@ -70,9 +79,12 @@ void PhasePrefillContextBatchAdapter::validateRow(PhasePrefillContextRow const& 
         !row.context->audioEmbeddings.has_value(), "Phase prefill adapter v1 does not support audio features.");
     if (row.context->visualEmbeddings.has_value())
     {
+        check::check(!mEnablePackedTokenLayout, "Packed phase prefill v1 does not support visual embeddings.");
         check::check(row.tokenOffset == 0 && row.tokenCount == row.promptTokenCount,
             "Multimodal phase prefill must process the complete prompt atomically.");
     }
+    check::check(!mEnablePackedTokenLayout || row.context->deepstackFeatures.empty(),
+        "Packed phase prefill v1 does not support deepstack features.");
     check::check(row.context->loraWeightsName.empty(), "Phase prefill adapter v1 does not support LoRA.");
 }
 
@@ -124,33 +136,58 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
         "Phase prefill batch mixes initial and continuation chunks.");
     mBatchSize = static_cast<int32_t>(rows.size());
     mChunkLength = chunkLength;
+    mTotalTokenCount = std::accumulate(rows.begin(), rows.end(), 0,
+        [](int32_t total, PhasePrefillContextRow const& row) { return total + row.tokenCount; });
     mInitialChunk = initialChunk;
     mStream = stream;
-    check::check(mHostTokenIds.reshape({mBatchSize, mChunkLength}), "Host prefill token IDs reshape failed.");
-    check::check(mDeviceTokenIds.reshape({mBatchSize, mChunkLength}), "Device prefill token IDs reshape failed.");
+    rt::Coords const tokenShape
+        = mEnablePackedTokenLayout ? rt::Coords{1, mTotalTokenCount} : rt::Coords{mBatchSize, mChunkLength};
+    rt::Coords const lastTokenShape = mEnablePackedTokenLayout ? rt::Coords{1, mBatchSize} : rt::Coords{mBatchSize, 1};
+    check::check(mHostTokenIds.reshape(tokenShape), "Host prefill token IDs reshape failed.");
+    check::check(mDeviceTokenIds.reshape(tokenShape), "Device prefill token IDs reshape failed.");
+    check::check(mHostLastTokenIds.reshape({mBatchSize}), "Host prefill last-token IDs reshape failed.");
+    check::check(mDeviceLastTokenIds.reshape(lastTokenShape), "Device prefill last-token IDs reshape failed.");
 
     int32_t* hostTokens = mHostTokenIds.dataPointer<int32_t>();
-    std::fill_n(hostTokens, static_cast<size_t>(mBatchSize) * mChunkLength, 0);
+    int64_t* hostLastTokenIds = mHostLastTokenIds.dataPointer<int64_t>();
+    size_t const stagedTokenCount = mEnablePackedTokenLayout ? static_cast<size_t>(mTotalTokenCount)
+                                                             : static_cast<size_t>(mBatchSize) * mChunkLength;
+    std::fill_n(hostTokens, stagedTokenCount, 0);
     mRows = rows;
     mWorkItems.clear();
     mWorkItems.reserve(rows.size());
+    int32_t packedTokenOffset{};
     for (int32_t packedRow = 0; packedRow < mBatchSize; ++packedRow)
     {
         PhasePrefillContextRow const& row = rows[static_cast<size_t>(packedRow)];
         std::vector<int32_t> const& prompt = row.context->rawBatchedInputIds[static_cast<size_t>(row.contextRow)];
-        std::copy_n(prompt.begin() + row.tokenOffset, row.tokenCount,
-            hostTokens + static_cast<size_t>(packedRow) * mChunkLength);
+        int32_t const destinationOffset = mEnablePackedTokenLayout ? packedTokenOffset : packedRow * mChunkLength;
+        std::copy_n(prompt.begin() + row.tokenOffset, row.tokenCount, hostTokens + destinationOffset);
+        hostLastTokenIds[packedRow]
+            = mEnablePackedTokenLayout ? destinationOffset + row.tokenCount - 1 : row.tokenCount - 1;
+        packedTokenOffset += row.tokenCount;
         mWorkItems.push_back({row.requestId, row.tokenCount, row.kvSlotId, row.tokenOffset, row.promptTokenCount});
     }
     CUDA_CHECK(cudaMemcpyAsync(mDeviceTokenIds.rawPointer(), mHostTokenIds.rawPointer(),
-        static_cast<size_t>(mBatchSize) * mChunkLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        stagedTokenCount * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceLastTokenIds.rawPointer(), mHostLastTokenIds.rawPointer(),
+        static_cast<size_t>(mBatchSize) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
     mBatchState.prepare(mWorkItems, mCacheManager, stream);
     mPreviousSlotIds = mTensorMap.get(binding_names::kKVSlotIds);
     mPreviousLengths = mTensorMap.get(binding_names::kKVCacheStartIndex);
     check::check(mPreviousSlotIds != nullptr && mPreviousLengths != nullptr,
         "Phase prefill adapter requires existing KV slot and length bindings.");
+    if (mEnablePackedTokenLayout)
+    {
+        mPreviousLastTokenIds = mTensorMap.get(binding_names::kLastTokenIds);
+        check::check(mPreviousLastTokenIds != nullptr, "Packed phase prefill requires an existing last-token binding.");
+    }
     mBatchState.bind(mTensorMap);
+    if (mEnablePackedTokenLayout)
+    {
+        mTensorMap.set(binding_names::kLastTokenIds, mDeviceLastTokenIds);
+    }
     mPacked = true;
 }
 
@@ -162,6 +199,7 @@ void PhasePrefillContextBatchAdapter::complete()
     mWorkItems.clear();
     mBatchSize = 0;
     mChunkLength = 0;
+    mTotalTokenCount = 0;
     mInitialChunk = false;
     mStream = nullptr;
     mPacked = false;
@@ -177,8 +215,13 @@ void PhasePrefillContextBatchAdapter::restoreBindings() noexcept
     {
         mTensorMap.set(binding_names::kKVSlotIds, *mPreviousSlotIds);
         mTensorMap.set(binding_names::kKVCacheStartIndex, *mPreviousLengths);
+        if (mPreviousLastTokenIds != nullptr)
+        {
+            mTensorMap.set(binding_names::kLastTokenIds, *mPreviousLastTokenIds);
+        }
         mPreviousSlotIds = nullptr;
         mPreviousLengths = nullptr;
+        mPreviousLastTokenIds = nullptr;
     }
     catch (...)
     {
@@ -193,6 +236,21 @@ Tensor& PhasePrefillContextBatchAdapter::tokenIds() noexcept
 Tensor const& PhasePrefillContextBatchAdapter::hostTokenIds() const noexcept
 {
     return mHostTokenIds;
+}
+
+Tensor& PhasePrefillContextBatchAdapter::lastTokenIds() noexcept
+{
+    return mDeviceLastTokenIds;
+}
+
+void PhasePrefillContextBatchAdapter::reshapeOutputLogits(Tensor& logits, int32_t vocabSize) const
+{
+    check::check(mPacked, "No phase prefill context batch is packed.");
+    check::check(vocabSize > 0, "Phase prefill output vocabulary must be positive.");
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT && logits.getDeviceType() == DeviceType::kGPU,
+        "Phase prefill logits must be GPU FP32.");
+    check::check(logits.reshape({mBatchSize, vocabSize}),
+        "Phase prefill logits cannot be reinterpreted as one row per logical request.");
 }
 
 OptionalInputTensor PhasePrefillContextBatchAdapter::visualEmbeddings() const noexcept
@@ -248,9 +306,24 @@ int32_t PhasePrefillContextBatchAdapter::chunkLength() const noexcept
     return mChunkLength;
 }
 
+int32_t PhasePrefillContextBatchAdapter::engineSequenceLength() const noexcept
+{
+    return mEnablePackedTokenLayout ? mTotalTokenCount : mChunkLength;
+}
+
+int32_t PhasePrefillContextBatchAdapter::tokenBatchSize() const noexcept
+{
+    return mEnablePackedTokenLayout ? 1 : mBatchSize;
+}
+
 bool PhasePrefillContextBatchAdapter::initialChunk() const noexcept
 {
     return mInitialChunk;
+}
+
+bool PhasePrefillContextBatchAdapter::usesPackedTokenLayout() const noexcept
+{
+    return mEnablePackedTokenLayout;
 }
 
 cudaStream_t PhasePrefillContextBatchAdapter::stream() const noexcept

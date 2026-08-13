@@ -224,6 +224,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.config = config
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
         module_prefix = f"layers.{layer_idx}.self_attn"
 
@@ -333,6 +334,7 @@ class Attention(nn.Module):
                 head_size=self.head_dim,
                 sliding_window_size=self.sliding_window_size,
                 enable_fp8_kv_cache=self.enable_fp8_kv_cache,
+                enable_packed_prefill=self.config.packed_prefill,
                 attention_scale=self.attention_scale,
                 qkv_scales=kwargs["qkv_scales"],
             )
@@ -715,6 +717,8 @@ class CausalLM(nn.Module):
                             [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
+        token_batch = (torch.export.Dim("token_batch", min=1, max=256)
+                       if config.packed_prefill else batch)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
         past = torch.export.Dim("past_len", min=1, max=32768)
@@ -724,9 +728,9 @@ class CausalLM(nn.Module):
         kv_pages = torch.export.Dim("kv_pages", min=1, max=256)
         cache_batch = kv_slots if config.indexed_kv_cache else batch
 
-        num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if eagle_base else None
-        all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
+        num_selected = (torch.export.Dim("num_selected", min=1, max=256)
+                        if eagle_base or config.packed_prefill else None)
+        all_shapes: list = [{0: token_batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
             all_shapes.append({0: cache_batch, 3: past})  # past_key_values_i
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
@@ -736,12 +740,15 @@ class CausalLM(nn.Module):
             all_shapes.append({0: batch})  # kv_slot_ids
         if config.paged_kv_cache:
             all_shapes.append({0: kv_slots, 2: kv_pages})  # kv_page_ids
-        if eagle_base:
-            all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
+        if eagle_base or config.packed_prefill:
+            all_shapes.append({
+                0: token_batch,
+                1: num_selected
+            })  # last_token_ids
         else:
             all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nd):
-            all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
+            all_shapes.append({0: token_batch, 1: seq})  # deepstack_embeds_i
 
         # EAGLE3 base: add tree-attention inputs and hidden_states output.
         if eagle_base:

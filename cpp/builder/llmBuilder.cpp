@@ -188,8 +188,7 @@ bool LLMBuilder::build()
     {
         constexpr int64_t tokensPerPage = 128;
         int64_t const minBundles = mBuilderConfig.maxKVCacheCapacity / tokensPerPage;
-        if (mBuilderConfig.maxKVCacheCapacity % tokensPerPage != 0
-            || mBuilderConfig.kvCachePageBundles < minBundles)
+        if (mBuilderConfig.maxKVCacheCapacity % tokensPerPage != 0 || mBuilderConfig.kvCachePageBundles < minBundles)
         {
             LOG_ERROR("Paged KV requires capacity divisible by 128 and --kvCachePageBundles >= %ld.", minBundles);
             return false;
@@ -592,7 +591,6 @@ bool LLMBuilder::setupCommonProfiles(
     bool result = true;
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
-
     // Context lengths
     result &= setOptimizationProfile(&contextProfile, binding_names::kContextLengths, createDims({1}),
         createDims({maxPrefillBatchSize}), createDims({maxPrefillBatchSize}));
@@ -610,8 +608,7 @@ bool LLMBuilder::setupCommonProfiles(
     {
         constexpr int64_t tokensPerPage = 128;
         int64_t const maxPagesPerSequence = mBuilderConfig.maxKVCacheCapacity / tokensPerPage;
-        nvinfer1::Dims const pageTableShape
-            = createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSequence});
+        nvinfer1::Dims const pageTableShape = createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSequence});
         result &= setOptimizationProfile(
             &contextProfile, binding_names::kKVPageIds, pageTableShape, pageTableShape, pageTableShape);
         result &= setOptimizationProfile(
@@ -682,11 +679,23 @@ bool LLMBuilder::setupVanillaProfiles(
     bool result = true;
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
+    bool const packedPrefill = mModelConfig.value("packed_prefill", false);
+    constexpr int64_t kPACKED_PREFILL_CHUNK_TOKENS = 128;
+    int64_t const maxPackedTokens = maxPrefillBatchSize * kPACKED_PREFILL_CHUNK_TOKENS;
 
     // Input embeddings - always dynamic
-    result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
-        createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    if (packedPrefill)
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+            createDims({1, std::max<int64_t>(1, maxPackedTokens / 2), mHiddenSize}),
+            createDims({1, maxPackedTokens, mHiddenSize}));
+    }
+    else
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    }
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({maxDecodeBatchSize, 1, mHiddenSize}), createDims({maxDecodeBatchSize, 1, mHiddenSize}));
 
@@ -701,8 +710,16 @@ bool LLMBuilder::setupVanillaProfiles(
     }
 
     // Last token IDs
-    result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
-        createDims({maxPrefillBatchSize, 1}), createDims({maxPrefillBatchSize, 1}));
+    if (packedPrefill)
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+            createDims({1, std::max<int64_t>(1, maxPrefillBatchSize / 2)}), createDims({1, maxPrefillBatchSize}));
+    }
+    else
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+            createDims({maxPrefillBatchSize, 1}), createDims({maxPrefillBatchSize, 1}));
+    }
     result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({maxDecodeBatchSize, 1}), createDims({maxDecodeBatchSize, 1}));
 
@@ -916,6 +933,9 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
     bool foundPleInput = false;
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
+    bool const packedPrefill = mModelConfig.value("packed_prefill", false);
+    constexpr int64_t kPACKED_PREFILL_CHUNK_TOKENS = 128;
+    int64_t const maxPackedTokens = maxPrefillBatchSize * kPACKED_PREFILL_CHUNK_TOKENS;
     std::string_view const prefix = binding_names::kPleTokenEmbedsTemplate;
 
     for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
@@ -939,9 +959,18 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         }
 
         int64_t const pleHiddenSize = inputDims.d[2];
-        result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
-            createDims({maxPrefillBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
-            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
+        if (packedPrefill)
+        {
+            result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
+                createDims({1, std::max<int64_t>(1, maxPackedTokens / 2), pleHiddenSize}),
+                createDims({1, maxPackedTokens, pleHiddenSize}));
+        }
+        else
+        {
+            result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
+                createDims({maxPrefillBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
+                createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
+        }
 
         if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
         {
@@ -975,6 +1004,9 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
     bool result = true;
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
+    bool const packedPrefill = mModelConfig.value("packed_prefill", false);
+    constexpr int64_t kPACKED_PREFILL_CHUNK_TOKENS = 128;
+    int64_t const maxPackedTokens = maxPrefillBatchSize * kPACKED_PREFILL_CHUNK_TOKENS;
 
     // Dynamically detect all deepstack_embeds inputs in the network
     std::vector<std::string> deepstackInputs;
@@ -1002,9 +1034,20 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
         LOG_INFO("Setting up optimization profile for %s", deepstackInputName.c_str());
 
         // Same profile as inputs_embeds
-        result &= setOptimizationProfile(&contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
-            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
-            createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+        if (packedPrefill)
+        {
+            result
+                &= setOptimizationProfile(&contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
+                    createDims({1, std::max<int64_t>(1, maxPackedTokens / 2), mHiddenSize}),
+                    createDims({1, maxPackedTokens, mHiddenSize}));
+        }
+        else
+        {
+            result
+                &= setOptimizationProfile(&contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
+                    createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+                    createDims({maxPrefillBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+        }
 
         if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
         {
@@ -1166,8 +1209,7 @@ bool LLMBuilder::setupKVCacheProfiles(
     {
         int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
         int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-        nvinfer1::Dims minKVCacheShape
-            = createDims({minCacheBatchSize, 2, layerNumKVHeads, 0, layerHeadSize});
+        nvinfer1::Dims minKVCacheShape = createDims({minCacheBatchSize, 2, layerNumKVHeads, 0, layerHeadSize});
         nvinfer1::Dims optPrefillKVCacheShape
             = createDims({prefillCacheBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
         nvinfer1::Dims maxPrefillKVCacheShape

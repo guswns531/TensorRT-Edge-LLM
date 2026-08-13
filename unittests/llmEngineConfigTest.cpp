@@ -154,6 +154,45 @@ TEST_F(LLMEngineConfigTest, ParseIndexedKVCacheWithGroupedQueryAttention)
     EXPECT_EQ(cfg.numKVHeads, 8);
 }
 
+TEST_F(LLMEngineConfigTest, ParsePackedPrefillContract)
+{
+    Json json = makeMinimalConfig();
+    json["head_dim"] = 128;
+    json["indexed_kv_cache"] = true;
+    json["paged_kv_cache"] = true;
+    json["packed_prefill"] = true;
+    json["builder_config"]["kv_cache_page_bundles"] = 2;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path);
+    EXPECT_TRUE(cfg.indexedKVCache);
+    EXPECT_TRUE(cfg.pagedKVCache);
+    EXPECT_TRUE(cfg.packedPrefill);
+}
+
+TEST_F(LLMEngineConfigTest, PackedPrefillRequiresPagedCache)
+{
+    Json json = makeMinimalConfig();
+    json["head_dim"] = 128;
+    json["indexed_kv_cache"] = true;
+    json["packed_prefill"] = true;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, PackedPrefillRequiresHeadDimension128)
+{
+    Json json = makeMinimalConfig();
+    json["indexed_kv_cache"] = true;
+    json["paged_kv_cache"] = true;
+    json["packed_prefill"] = true;
+    json["builder_config"]["kv_cache_page_bundles"] = 2;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
 TEST_F(LLMEngineConfigTest, ReducedVocabSize)
 {
     Json json = makeMinimalConfig();
@@ -519,6 +558,7 @@ TEST(LLMEngineConfigRecipesTest, PrefillDims)
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
     auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/true);
     EXPECT_EQ(d.batch, 2);
+    EXPECT_EQ(d.tokenBatch, 2);
     EXPECT_EQ(d.seqLen, 128);
     EXPECT_EQ(d.kvLen, 4096);
     EXPECT_EQ(d.selectLen, 1);
@@ -526,6 +566,19 @@ TEST(LLMEngineConfigRecipesTest, PrefillDims)
     EXPECT_EQ(d.ropeBatch, 1);      // non-MRope
     EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
     EXPECT_EQ(d.startIndexLen, 0);  // plugin-path empty-cache sentinel
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+}
+
+TEST(LLMEngineConfigRecipesTest, PackedPrefillSeparatesLogicalAndTokenBatch)
+{
+    auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/true);
+    auto const d = cfg.packedPrefillDims(/*logicalBatch=*/4, /*totalTokens=*/387);
+    EXPECT_EQ(d.batch, 4);
+    EXPECT_EQ(d.tokenBatch, 1);
+    EXPECT_EQ(d.seqLen, 387);
+    EXPECT_EQ(d.selectLen, 4);
+    EXPECT_EQ(d.ropeBatch, 4);
+    EXPECT_EQ(d.startIndexLen, 4);
     EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
@@ -554,6 +607,7 @@ TEST(LLMEngineConfigRecipesTest, DecodeDims)
     auto const cfg = makeRecipeConfig(/*maxKV=*/2048, /*mrope=*/false);
     auto const d = cfg.decodeDims(/*batch=*/4);
     EXPECT_EQ(d.batch, 4);
+    EXPECT_EQ(d.tokenBatch, 4);
     EXPECT_EQ(d.seqLen, 1);
     EXPECT_EQ(d.kvLen, 2048);
     EXPECT_EQ(d.selectLen, 1);
