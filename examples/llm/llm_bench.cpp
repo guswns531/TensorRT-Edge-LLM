@@ -675,7 +675,10 @@ int main(int argc, char** argv)
         LOG_INFO("Image Size: %dx%d -> %ld image tokens (batch=%d)", args.imageHeight, args.imageWidth, imageTokens,
             args.batchSize);
 
-        standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
+        if (args.extractLayerInfo.any())
+        {
+            standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
+        }
     }
     else
     {
@@ -827,8 +830,13 @@ int main(int argc, char** argv)
         // --- Log engine config ---
         LOG_INFO("Engine config:\n%s", rt::formatEngineConfig(activeCfg).c_str());
 
-        // --- Standalone engine for layer metadata extraction ---
-        standaloneEngine = loadStandaloneEngine(enginePath);
+        // The standalone engine duplicates the TensorRT engine allocation. Load
+        // it only when layer metadata is requested so E2E-only profiling remains
+        // usable on memory-constrained devices.
+        if (args.extractLayerInfo.any())
+        {
+            standaloneEngine = loadStandaloneEngine(enginePath);
+        }
 
         // --- Fill PipelineIO tensors with random data ---
         nvinfer1::DataType const dtype = nvinfer1::DataType::kHALF;
@@ -947,8 +955,23 @@ int main(int argc, char** argv)
         auto const dims = deployment.base.decodeDims(B);
 
         resetState = [&]() {
-            std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+            auto& cacheManager = *resources->cacheManagers[kvCacheIndex];
+            if (cacheManager.isPagedKVCache())
+            {
+                std::memset(reuseKVCacheLengths.rawPointer(), 0, pastKVLenVec.size() * sizeof(int32_t));
+                cacheManager.resetForNewSequences(reuseKVCacheLengths, stream);
+                cacheManager.preparePagedKVCapacityForActiveLengths(pastKVLenVec, /*extraTokens=*/1, stream);
+                check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
+                CUDA_CHECK(cudaMemcpyAsync(io->contextLengths.rawPointer(), pastKVLenVec.data(),
+                    pastKVLenVec.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                cacheManager.commitSequenceLength(io->contextLengths, stream);
+            }
+            else
+            {
+                std::memcpy(
+                    reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
+                cacheManager.resetForNewSequences(reuseKVCacheLengths, stream);
+            }
         };
         step = [&, dims]() {
             stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
