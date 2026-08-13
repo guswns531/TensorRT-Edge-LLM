@@ -227,8 +227,21 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         ])
     if args.prefill_slo_recovery:
         command.append("--prefillSloRecovery")
-    if args.dynamic_decode_batching or args.dynamic_prefill_batching:
+    if args.scheduler_profile != "custom":
+        command.extend(["--schedulerProfile", args.scheduler_profile])
+    if (args.dynamic_decode_batching or args.dynamic_prefill_batching
+            or args.scheduler_profile != "custom" or args.tpot_hard_guard
+            or args.require_direct_overlap_cost):
         command.extend(["--schedulerCostJson", str(args.scheduler_cost_json)])
+    if args.tpot_hard_guard:
+        command.extend([
+            "--tpotHardGuard", "--maxConsecutiveOverlapBatches",
+            str(args.max_consecutive_overlap_batches),
+            "--maxPredictedDecodeDebtMs",
+            str(args.max_predicted_decode_debt_ms)
+        ])
+    if args.require_direct_overlap_cost:
+        command.append("--requireDirectOverlapCost")
     if args.wavefront_prefill_batching:
         command.extend([
             "--wavefrontPrefillBatching", "--prefillCohortSize",
@@ -589,6 +602,18 @@ def main() -> None:
         "--scheduler-cost-json",
         type=Path,
         help="cost model produced by build_phase_scheduler_cost_model.py")
+    parser.add_argument("--scheduler-profile",
+                        choices=("custom", "latency-safe", "balanced",
+                                 "long-prefill", "auto"),
+                        default="custom")
+    parser.add_argument("--tpot-hard-guard", action="store_true")
+    parser.add_argument("--require-direct-overlap-cost", action="store_true")
+    parser.add_argument("--max-consecutive-overlap-batches",
+                        type=int,
+                        default=4)
+    parser.add_argument("--max-predicted-decode-debt-ms",
+                        type=float,
+                        default=50.0)
     parser.add_argument(
         "--adaptive-scheduler",
         action="store_true",
@@ -667,9 +692,14 @@ def main() -> None:
             > args.page_reservation_growth_requests
             or args.growth_tpot_target_ms <= 0.0):
         parser.error("adaptive page growth bounds and target are invalid")
-    if ((args.dynamic_decode_batching or args.dynamic_prefill_batching)
+    if ((args.dynamic_decode_batching or args.dynamic_prefill_batching
+         or args.scheduler_profile != "custom" or args.tpot_hard_guard
+         or args.require_direct_overlap_cost)
             and args.scheduler_cost_json is None):
         parser.error("dynamic batching requires --scheduler-cost-json")
+    if (args.max_consecutive_overlap_batches <= 0
+            or args.max_predicted_decode_debt_ms < 0.0):
+        parser.error("TPOT hard guard bounds are invalid")
     if (args.min_dynamic_prefill_batch_size <= 0
             or args.min_dynamic_prefill_batch_size > max(args.prefill_batches)
             or args.prefill_cohort_size <= 0 or args.prefill_cohort_turns <= 0
@@ -773,6 +803,16 @@ def main() -> None:
                 args.decode_slack_safety_factor,
                 "scheduler_cost_json":
                 str(args.scheduler_cost_json or ""),
+                "scheduler_profile":
+                args.scheduler_profile,
+                "tpot_hard_guard":
+                args.tpot_hard_guard,
+                "require_direct_overlap_cost":
+                args.require_direct_overlap_cost,
+                "max_consecutive_overlap_batches":
+                args.max_consecutive_overlap_batches,
+                "max_predicted_decode_debt_ms":
+                args.max_predicted_decode_debt_ms,
                 "adaptive_scheduler":
                 args.adaptive_scheduler,
                 "page_reservation_mode":

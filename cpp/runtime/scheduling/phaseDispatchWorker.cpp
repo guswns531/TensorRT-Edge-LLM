@@ -153,6 +153,9 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.decodeBatchSize = static_cast<int32_t>(mInFlight.decodeBatch.size());
     mCurrentMetrics.predictedPrefillGpuMs = mInFlight.predictedPrefillGpuMs;
     mCurrentMetrics.predictedDecodeSlowdownMs = mInFlight.predictedDecodeSlowdownMs;
+    mCurrentMetrics.predictedDecodeDebtUs = mInFlight.predictedDecodeDebtUs;
+    mCurrentMetrics.consecutiveOverlapBatches = mInFlight.consecutiveOverlapBatches;
+    mCurrentMetrics.prefillDeferredForTpot = mInFlight.prefillDeferredForTpot;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     int64_t prefillPastKVSum{};
     mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();

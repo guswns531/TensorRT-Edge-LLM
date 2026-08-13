@@ -20,6 +20,7 @@
 #include "common/tensor.h"
 #include "runtime/exec/engineExecutor.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -38,6 +39,15 @@ struct IndependentEngineExecutorPairConfig
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
+    //! Per-context automatic graph policy. Zero byte budgets are unlimited;
+    //! the minimum charge prevents shape churn from overcommitting memory.
+    bool enableCudaGraph{};
+    size_t maxPrefillCudaGraphs{128};
+    size_t maxDecodeCudaGraphs{128};
+    size_t maxPrefillCudaGraphBytes{};
+    size_t maxDecodeCudaGraphBytes{};
+    size_t minimumCudaGraphChargeBytes{4U * 1024U * 1024U};
+    size_t minimumCudaFreeMemoryBytes{};
 };
 
 //! @brief Two independent TensorRT contexts over one deserialized engine.

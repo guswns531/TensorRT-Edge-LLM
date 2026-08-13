@@ -67,6 +67,17 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
     ELLM_CHECK(
         mDecodeExecutor->setContextMemoryForProfile(mConfig.decodeProfile, mDecodeContextMemory, mConfig.setupStream),
         "Failed to assign the decode TensorRT profile workspace");
+    if (mConfig.enableCudaGraph)
+    {
+        ELLM_CHECK(mConfig.maxPrefillCudaGraphs > 0U && mConfig.maxDecodeCudaGraphs > 0U,
+            "Independent CUDA graph cache limits must be positive");
+        ELLM_CHECK(
+            mConfig.minimumCudaGraphChargeBytes > 0U, "Independent CUDA graph minimum memory charge must be positive");
+        mPrefillExecutor->enableAutomaticCudaGraphCapture(mConfig.maxPrefillCudaGraphs,
+            mConfig.maxPrefillCudaGraphBytes, mConfig.minimumCudaGraphChargeBytes, mConfig.minimumCudaFreeMemoryBytes);
+        mDecodeExecutor->enableAutomaticCudaGraphCapture(mConfig.maxDecodeCudaGraphs, mConfig.maxDecodeCudaGraphBytes,
+            mConfig.minimumCudaGraphChargeBytes, mConfig.minimumCudaFreeMemoryBytes);
+    }
 }
 
 CUcontext IndependentEngineExecutorPair::streamContext(cudaStream_t stream)

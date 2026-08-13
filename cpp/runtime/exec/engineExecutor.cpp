@@ -366,6 +366,9 @@ EngineExecutor::CudaGraphCacheStats EngineExecutor::getCudaGraphCacheStats() con
 {
     CudaGraphCacheStats result = mCudaGraphStats;
     result.cachedGraphs = mGraphs.size();
+    result.observedBindingShapes = mObservedBindings.size();
+    result.uncapturableBindingShapes = mUncapturableBindings.size();
+    result.budgetRejectedBindingShapes = mBudgetRejectedBindings.size();
     result.cachedGraphBytes = mCachedGraphBytes;
     result.maxCachedGraphBytes = mMaxAutomaticGraphBytes;
     result.minimumGraphChargeBytes = mMinimumAutomaticGraphBytes;

@@ -105,7 +105,8 @@ def main() -> None:
             int(row["decode_context_tokens"]) / decode_batch)
         context_bucket = upper_bucket(mean_context,
                                       args.decode_context_buckets)
-        key = (decode_batch, context_bucket)
+        batch_bucket = upper_bucket(decode_batch, args.decode_batch_buckets)
+        key = (batch_bucket, context_bucket)
         decode_points.setdefault(key, []).append(float(row["decode_gpu_ms"]))
         if int(row["prefill_batch"]) == 0:
             decode_baseline.setdefault(key,
@@ -129,6 +130,8 @@ def main() -> None:
         return min(candidates)[1] if candidates else 0.0
 
     grouped: dict[tuple[int, int, int, int, bool], list[dict[str, float]]] = {}
+    overlap_grouped: dict[tuple[int, int, int, int, int, bool],
+                          list[dict[str, float]]] = {}
     for row in rows:
         prefill_batch = int(row["prefill_batch"])
         if prefill_batch <= 0 or float(row["prefill_gpu_ms"]) <= 0.0:
@@ -155,7 +158,7 @@ def main() -> None:
             slowdown = max(
                 0.0,
                 float(row["decode_gpu_ms"]) -
-                baseline_for(decode_batch, context_bucket))
+                baseline_for(decode_bucket, context_bucket))
         key = (prefill_batch, chunk_length, past_bucket, decode_bucket,
                initial)
         grouped.setdefault(key, []).append({
@@ -164,6 +167,23 @@ def main() -> None:
             "decode_slowdown_ms":
             slowdown,
         })
+        if decode_batch > 0 and float(row["decode_gpu_ms"]) > 0.0:
+            mean_context = math.ceil(
+                int(row["decode_context_tokens"]) / decode_batch)
+            context_bucket = upper_bucket(mean_context,
+                                          args.decode_context_buckets)
+            overlap_key = (prefill_batch, decode_bucket, chunk_length,
+                           past_bucket, context_bucket, initial)
+            overlap_grouped.setdefault(overlap_key, []).append({
+                "prefill_gpu_ms":
+                float(row["prefill_gpu_ms"]),
+                "decode_gpu_ms":
+                float(row["decode_gpu_ms"]),
+                "makespan_gpu_ms":
+                float(row["makespan_gpu_ms"]),
+                "decode_slowdown_ms":
+                slowdown,
+            })
 
     prefill = []
     csv_rows = []
@@ -199,21 +219,64 @@ def main() -> None:
             "p95_gpu_ms": percentile(values, 0.95),
         }
         decode.append(point)
-    if not prefill or not decode:
-        raise RuntimeError("insufficient detailed prefill/decode samples")
+        csv_rows.append({"phase": "decode", **point})
+
+    overlap = []
+    for key, samples in sorted(overlap_grouped.items()):
+        if len(samples) < args.min_samples:
+            continue
+        prefill_batch, decode_batch, chunk, past, context, initial = key
+        point = {
+            "prefill_batch_size":
+            prefill_batch,
+            "decode_batch_size":
+            decode_batch,
+            "chunk_length":
+            chunk,
+            "max_prefill_past_kv_length":
+            past,
+            "max_decode_context_length":
+            context,
+            "initial_chunk":
+            initial,
+            "samples":
+            len(samples),
+            "prefill_p95_gpu_ms":
+            percentile([sample["prefill_gpu_ms"] for sample in samples], 0.95),
+            "decode_p95_gpu_ms":
+            percentile([sample["decode_gpu_ms"] for sample in samples], 0.95),
+            "makespan_p95_gpu_ms":
+            percentile([sample["makespan_gpu_ms"] for sample in samples],
+                       0.95),
+            "decode_slowdown_p95_ms":
+            percentile([sample["decode_slowdown_ms"] for sample in samples],
+                       0.95),
+        }
+        overlap.append(point)
+        csv_rows.append({"phase": "overlap", **point})
+    if not prefill or not decode or not overlap:
+        raise RuntimeError(
+            "insufficient detailed prefill/decode/overlap samples")
 
     root = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_files": [str(path) for path in paths],
         "decode": decode,
         "prefill": prefill,
+        "overlap": overlap,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(root, indent=2) + "\n",
                                 encoding="utf-8")
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     with args.output_csv.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(csv_rows[0]))
+        fieldnames = ["phase"] + sorted(
+            {field
+             for row in csv_rows
+             for field in row if field != "phase"})
+        writer = csv.DictWriter(stream,
+                                fieldnames=fieldnames,
+                                extrasaction="ignore")
         writer.writeheader()
         writer.writerows(csv_rows)
 

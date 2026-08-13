@@ -29,9 +29,50 @@ namespace trt_edgellm
 namespace rt
 {
 
+namespace
+{
+
+void applySchedulerProfile(PhaseQueueSchedulerConfig& config)
+{
+    if (config.profile == PhaseSchedulerProfile::kCustom)
+    {
+        return;
+    }
+
+    config.enableDynamicDecodeBatching = true;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost
+        = config.requireDirectOverlapCost || config.profile == PhaseSchedulerProfile::kLatencySafe;
+    config.enablePrefillSloRecovery = config.profile == PhaseSchedulerProfile::kLongPrefill;
+    config.enableWavefrontPrefillBatching = config.profile == PhaseSchedulerProfile::kLongPrefill;
+    config.decodeRecoveryPressureThreshold = config.profile == PhaseSchedulerProfile::kLatencySafe ? 0.9F : 0.8F;
+    if (config.profile == PhaseSchedulerProfile::kLatencySafe)
+    {
+        config.maxConsecutiveOverlapBatches = 1;
+        config.maxPredictedDecodeDebtUs = 10000.0;
+    }
+    else if (config.profile == PhaseSchedulerProfile::kBalanced || config.profile == PhaseSchedulerProfile::kAuto)
+    {
+        config.maxConsecutiveOverlapBatches = 2;
+        config.maxPredictedDecodeDebtUs = 25000.0;
+    }
+    if (config.profile == PhaseSchedulerProfile::kBalanced || config.profile == PhaseSchedulerProfile::kAuto)
+    {
+        config.minDynamicPrefillBatchSize = std::min(2, config.maxPrefillBatchSize);
+    }
+    else if (config.profile == PhaseSchedulerProfile::kLatencySafe)
+    {
+        config.minDynamicPrefillBatchSize = 1;
+    }
+}
+
+} // namespace
+
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
 {
+    applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
@@ -53,8 +94,31 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
                 && cost.decodeSlowdownP95Ms >= 0.0F,
             "Prefill cost timings must be finite and non-negative");
     }
+    for (PhaseOverlapBatchCost const& cost : mConfig.overlapBatchCosts)
+    {
+        check::check(cost.prefillBatchSize > 0 && cost.decodeBatchSize > 0 && cost.chunkLength > 0
+                && cost.maxPrefillPastKVLength >= 0 && cost.maxDecodeContextLength > 0,
+            "Overlap cost shape bounds are invalid");
+        check::check(std::isfinite(cost.prefillP95GpuMs) && cost.prefillP95GpuMs > 0.0F
+                && std::isfinite(cost.decodeP95GpuMs) && cost.decodeP95GpuMs > 0.0F
+                && std::isfinite(cost.makespanP95GpuMs) && cost.makespanP95GpuMs > 0.0F
+                && std::isfinite(cost.decodeSlowdownP95Ms) && cost.decodeSlowdownP95Ms >= 0.0F,
+            "Overlap cost timings must be finite and non-negative");
+    }
     check::check(!mConfig.enableDynamicPrefillBatching || !mConfig.prefillBatchCosts.empty(),
         "Dynamic prefill batching requires profiled prefill costs");
+    check::check(std::isfinite(mConfig.decodeRecoveryPressureThreshold)
+            && mConfig.decodeRecoveryPressureThreshold > 0.0F && mConfig.decodeRecoveryPressureThreshold <= 1.0F,
+        "Decode recovery pressure threshold must be in (0, 1]");
+    check::check(!mConfig.requireDirectOverlapCost || !mConfig.overlapBatchCosts.empty(),
+        "Direct overlap cost enforcement requires profiled overlap costs");
+    check::check(mConfig.maxConsecutiveOverlapBatches > 0, "Maximum consecutive overlap batches must be positive");
+    check::check(std::isfinite(mConfig.maxPredictedDecodeDebtUs) && mConfig.maxPredictedDecodeDebtUs >= 0.0,
+        "Maximum predicted decode debt must be finite and non-negative");
+    check::check(mConfig.autoLongPrefillBacklogTokens > 0, "Auto-profile prefill backlog threshold must be positive");
+    check::check(std::isfinite(mConfig.autoDecodePressureLimit) && mConfig.autoDecodePressureLimit >= 0.0F
+            && mConfig.autoDecodePressureLimit <= 1.0F,
+        "Auto-profile decode pressure limit must be in [0, 1]");
     check::check(mConfig.maxPrefillCohortSize > 0, "Prefill cohort size must be positive");
     check::check(mConfig.maxPrefillCohortTurns > 0, "Prefill cohort turn limit must be positive");
     check::check(std::isfinite(mConfig.decodeSlackSafetyFactor) && mConfig.decodeSlackSafetyFactor > 0.0F
@@ -195,6 +259,14 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     }
     result.prefillQueued = static_cast<size_t>(std::count_if(mPrefillQueue.begin(), mPrefillQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, true); }));
+    for (PhaseWorkItem const& item : mPrefillQueue)
+    {
+        if (isEligible(item, true))
+        {
+            result.prefillRemainingTokens += item.tokenCount;
+            result.prefillContinuationRows += item.tokenOffset > 0 ? 1 : 0;
+        }
+    }
     for (PhaseWorkItem const& item : mDecodeQueue)
     {
         if (isEligible(item, false))
@@ -368,7 +440,8 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
 }
 
 int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates,
-    int32_t chunkLength, bool initialChunk, bool overlap, PhaseQueueSnapshot const& state, float& predictedGpuMs,
+    int32_t chunkLength, bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize,
+    int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, float& predictedGpuMs,
     float& predictedDecodeSlowdownMs) const noexcept
 {
     int32_t const available = std::min<int32_t>(mConfig.maxPrefillBatchSize, candidates.size());
@@ -409,27 +482,64 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
                 selected = &cost;
             }
         }
-        if (selected != nullptr)
+        PhaseOverlapBatchCost const* selectedOverlap{};
+        if (overlap)
         {
-            float const interference = overlap ? selected->decodeSlowdownP95Ms : selected->p95GpuMs;
-            profiled.push_back({batchSize, selected->p95GpuMs, interference});
+            for (PhaseOverlapBatchCost const& cost : mConfig.overlapBatchCosts)
+            {
+                if (cost.prefillBatchSize != batchSize || cost.chunkLength != chunkLength
+                    || cost.initialChunk != initialChunk || cost.decodeBatchSize < plannedDecodeBatchSize
+                    || cost.maxPrefillPastKVLength < maxPastKV
+                    || cost.maxDecodeContextLength < plannedDecodeMaxContextLength)
+                {
+                    continue;
+                }
+                if (selectedOverlap == nullptr || cost.decodeBatchSize < selectedOverlap->decodeBatchSize
+                    || (cost.decodeBatchSize == selectedOverlap->decodeBatchSize
+                        && cost.maxPrefillPastKVLength < selectedOverlap->maxPrefillPastKVLength)
+                    || (cost.decodeBatchSize == selectedOverlap->decodeBatchSize
+                        && cost.maxPrefillPastKVLength == selectedOverlap->maxPrefillPastKVLength
+                        && cost.maxDecodeContextLength < selectedOverlap->maxDecodeContextLength))
+                {
+                    selectedOverlap = &cost;
+                }
+            }
+        }
+        if (selected != nullptr && (!overlap || selectedOverlap != nullptr || !mConfig.requireDirectOverlapCost))
+        {
+            float const gpuMs = selectedOverlap != nullptr ? selectedOverlap->prefillP95GpuMs : selected->p95GpuMs;
+            float const interference = selectedOverlap != nullptr
+                ? selectedOverlap->decodeSlowdownP95Ms
+                : (overlap ? selected->decodeSlowdownP95Ms : selected->p95GpuMs);
+            profiled.push_back({batchSize, gpuMs, interference});
         }
     }
     if (profiled.empty())
     {
-        return 0;
+        return overlap && mConfig.enableTpotHardGuard && mConfig.requireDirectOverlapCost ? -1 : 0;
     }
 
     double const remainingDecodeUs
         = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
     double const allowedInterferenceUs = remainingDecodeUs * mConfig.decodeSlackSafetyFactor;
-    bool const prefillRecovery
-        = mConfig.enablePrefillSloRecovery && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
+    bool const automaticLongPrefillRecovery = mConfig.profile == PhaseSchedulerProfile::kAuto
+        && state.prefillRemainingTokens >= mConfig.autoLongPrefillBacklogTokens
+        && state.decodeMaxSloPressure < mConfig.autoDecodePressureLimit;
+    bool const prefillRecovery = (mConfig.enablePrefillSloRecovery || automaticLongPrefillRecovery)
+        && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
+    if (overlap && mConfig.enableTpotHardGuard && mConsecutiveOverlapBatches >= mConfig.maxConsecutiveOverlapBatches)
+    {
+        return -1;
+    }
     Candidate const* selected{};
     for (Candidate const& candidate : profiled)
     {
-        bool const feasible = prefillRecovery || state.decodeQueued == 0
-            || static_cast<double>(candidate.decodeInterferenceMs) * 1000.0 <= allowedInterferenceUs;
+        double const candidateInterferenceUs = static_cast<double>(candidate.decodeInterferenceMs) * 1000.0;
+        bool const debtFeasible = mConfig.maxPredictedDecodeDebtUs == 0.0
+            || mPredictedDecodeDebtUs + candidateInterferenceUs <= mConfig.maxPredictedDecodeDebtUs;
+        bool const feasible
+            = (prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
+            && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible);
         if (!feasible)
         {
             continue;
@@ -445,6 +555,10 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     }
     if (selected == nullptr)
     {
+        if (overlap && mConfig.enableTpotHardGuard)
+        {
+            return -1;
+        }
         selected = &*std::min_element(profiled.begin(), profiled.end(), [](Candidate const& lhs, Candidate const& rhs) {
             return lhs.decodeInterferenceMs < rhs.decodeInterferenceMs
                 || (lhs.decodeInterferenceMs == rhs.decodeInterferenceMs && lhs.gpuMs < rhs.gpuMs);
@@ -638,7 +752,15 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     float predictedGpuMs{};
     float predictedDecodeSlowdownMs{};
     int32_t const dynamicLimit = selectPrefillBatchSize(compatible, bucketTokens, bucketInitial,
-        plan.kind == PhaseDispatchKind::kOverlap, state, predictedGpuMs, predictedDecodeSlowdownMs);
+        plan.kind == PhaseDispatchKind::kOverlap, plan.plannedDecodeBatchSize, plan.plannedDecodeMaxContextLength,
+        state, predictedGpuMs, predictedDecodeSlowdownMs);
+    if (dynamicLimit < 0)
+    {
+        plan.prefillDeferredForTpot = true;
+        plan.predictedDecodeDebtUs = mPredictedDecodeDebtUs;
+        plan.consecutiveOverlapBatches = mConsecutiveOverlapBatches;
+        return batch;
+    }
     if (dynamicLimit > 0)
     {
         batchLimit = std::min(batchLimit, dynamicLimit);
@@ -686,23 +808,55 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 
     PhaseDispatchPlan plan;
     plan.kind = kind;
+    plan.plannedDecodeBatchSize
+        = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap ? selectDecodeBatchSize(state) : 0;
+    plan.plannedDecodeMaxContextLength = plan.plannedDecodeBatchSize > 0 ? decodeMaxContextLength() : 0;
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
         plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true, state, plan);
     }
+    if (kind == PhaseDispatchKind::kOverlap && plan.prefillDeferredForTpot)
+    {
+        plan.kind = PhaseDispatchKind::kDecode;
+    }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.decodeBatch = popBatch(mDecodeQueue, selectDecodeBatchSize(state), false, state, plan);
+        plan.decodeBatch = popBatch(mDecodeQueue, plan.plannedDecodeBatchSize, false, state, plan);
     }
-    if (kind == PhaseDispatchKind::kDecode)
+    if (plan.kind == PhaseDispatchKind::kDecode)
     {
         ++mConsecutiveDecodeBatches;
+        mConsecutiveOverlapBatches = 0;
+        mPredictedDecodeDebtUs = 0.0;
     }
-    else if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
+    else if (plan.kind == PhaseDispatchKind::kOverlap)
     {
         mConsecutiveDecodeBatches = 0;
+        ++mConsecutiveOverlapBatches;
+        mPredictedDecodeDebtUs += static_cast<double>(plan.predictedDecodeSlowdownMs) * 1000.0;
     }
+    else if (plan.kind == PhaseDispatchKind::kPrefill)
+    {
+        mConsecutiveDecodeBatches = 0;
+        mConsecutiveOverlapBatches = 0;
+        mPredictedDecodeDebtUs = 0.0;
+    }
+    plan.predictedDecodeDebtUs = mPredictedDecodeDebtUs;
+    plan.consecutiveOverlapBatches = mConsecutiveOverlapBatches;
     return plan;
+}
+
+int32_t PhaseQueueScheduler::decodeMaxContextLength() const noexcept
+{
+    int32_t maximum{};
+    for (PhaseWorkItem const& item : mDecodeQueue)
+    {
+        if (isEligible(item, false))
+        {
+            maximum = std::max(maximum, item.tokenCount);
+        }
+    }
+    return maximum;
 }
 
 int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const noexcept
@@ -713,45 +867,66 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         return available;
     }
 
-    int32_t maxContextLength{};
-    for (PhaseWorkItem const& item : mDecodeQueue)
-    {
-        if (isEligible(item, false))
-        {
-            maxContextLength = std::max(maxContextLength, item.tokenCount);
-        }
-    }
+    int32_t const maxContextLength = decodeMaxContextLength();
 
     struct Candidate
     {
         int32_t batchSize{};
         float p95GpuMs{};
         int32_t contextLimit{};
+        int32_t profiledBatchLimit{};
     };
     std::vector<Candidate> candidates;
+    int32_t coveringConfiguredBatch{std::numeric_limits<int32_t>::max()};
+    int32_t largestConfiguredBatch{};
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
     {
-        if (cost.batchSize > available || cost.maxContextLength < maxContextLength)
+        largestConfiguredBatch = std::max(largestConfiguredBatch, cost.batchSize);
+        if (cost.batchSize >= available)
+        {
+            coveringConfiguredBatch = std::min(coveringConfiguredBatch, cost.batchSize);
+        }
+    }
+    if (coveringConfiguredBatch == std::numeric_limits<int32_t>::max())
+    {
+        coveringConfiguredBatch = largestConfiguredBatch;
+    }
+    for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+    {
+        if (cost.maxContextLength < maxContextLength)
         {
             continue;
         }
+        int32_t const dispatchedBatchSize = std::min(cost.batchSize, available);
         auto existing = std::find_if(candidates.begin(), candidates.end(),
-            [&](Candidate const& candidate) { return candidate.batchSize == cost.batchSize; });
+            [&](Candidate const& candidate) { return candidate.batchSize == dispatchedBatchSize; });
         if (existing == candidates.end())
         {
-            candidates.push_back({cost.batchSize, cost.p95GpuMs, cost.maxContextLength});
+            candidates.push_back({dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, cost.batchSize});
         }
-        else if (cost.maxContextLength < existing->contextLimit)
+        else if (cost.batchSize < existing->profiledBatchLimit
+            || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength < existing->contextLimit))
         {
-            *existing = {cost.batchSize, cost.p95GpuMs, cost.maxContextLength};
+            *existing = {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, cost.batchSize};
         }
     }
     if (candidates.empty())
     {
         return available;
     }
+    bool const largestShapeCovered
+        = std::any_of(candidates.begin(), candidates.end(), [coveringConfiguredBatch](Candidate const& candidate) {
+              return candidate.profiledBatchLimit == coveringConfiguredBatch;
+          });
+    if (!largestShapeCovered)
+    {
+        // A smaller batch measured at this context is not evidence that a
+        // larger runnable batch is unsafe. Preserve legacy largest-available
+        // behavior instead of creating a low-BS backlog from sparse profiles.
+        return available;
+    }
 
-    bool const urgent = state.decodeMaxSloPressure >= 1.0;
+    bool const urgent = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold;
     double const remainingUs = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
     Candidate const* selected{};
     for (Candidate const& candidate : candidates)

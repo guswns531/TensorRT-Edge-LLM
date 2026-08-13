@@ -84,6 +84,7 @@ struct Args
     std::string multimodalEngineDir;
     std::string traceCsv;
     std::string schedulerCostJson;
+    std::string schedulerProfile{"custom"};
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t slotCount{};
@@ -126,6 +127,10 @@ struct Args
     int32_t prefillCohortSize{8};
     int32_t prefillCohortTurns{8};
     float decodeSlackSafetyFactor{0.8F};
+    bool tpotHardGuard{};
+    bool requireDirectOverlapCost{};
+    int32_t maxConsecutiveOverlapBatches{4};
+    double maxPredictedDecodeDebtMs{50.0};
     rt::PhasePageReservationMode pageReservationMode{rt::PhasePageReservationMode::kFull};
     int32_t pageReservationHeadroomTokens{128};
     int32_t pageReservationOvercommitBundles{1};
@@ -291,7 +296,9 @@ void printUsage(char const* program)
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
         "--decodeSlackSafetyFactor F "
-        "--schedulerCostJson FILE] [--outputCsv FILE] "
+        "--schedulerCostJson FILE --schedulerProfile custom|latency-safe|balanced|long-prefill|auto "
+        "--tpotHardGuard --requireDirectOverlapCost --maxConsecutiveOverlapBatches N "
+        "--maxPredictedDecodeDebtMs F] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
@@ -343,6 +350,11 @@ bool parseArgs(Args& args, int argc, char** argv)
         kPrefillCohortTurns,
         kDecodeSlackSafetyFactor,
         kSchedulerCostJson,
+        kSchedulerProfile,
+        kTpotHardGuard,
+        kRequireDirectOverlapCost,
+        kMaxConsecutiveOverlapBatches,
+        kMaxPredictedDecodeDebtMs,
         kLoadRequests,
         kArrivalRate,
         kLoadPromptMin,
@@ -400,6 +412,11 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"prefillCohortTurns", required_argument, nullptr, kPrefillCohortTurns},
         {"decodeSlackSafetyFactor", required_argument, nullptr, kDecodeSlackSafetyFactor},
         {"schedulerCostJson", required_argument, nullptr, kSchedulerCostJson},
+        {"schedulerProfile", required_argument, nullptr, kSchedulerProfile},
+        {"tpotHardGuard", no_argument, nullptr, kTpotHardGuard},
+        {"requireDirectOverlapCost", no_argument, nullptr, kRequireDirectOverlapCost},
+        {"maxConsecutiveOverlapBatches", required_argument, nullptr, kMaxConsecutiveOverlapBatches},
+        {"maxPredictedDecodeDebtMs", required_argument, nullptr, kMaxPredictedDecodeDebtMs},
         {"loadRequests", required_argument, nullptr, kLoadRequests},
         {"arrivalRate", required_argument, nullptr, kArrivalRate},
         {"loadPromptMin", required_argument, nullptr, kLoadPromptMin},
@@ -481,6 +498,11 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kPrefillCohortTurns: args.prefillCohortTurns = std::stoi(optarg); break;
         case kDecodeSlackSafetyFactor: args.decodeSlackSafetyFactor = std::stof(optarg); break;
         case kSchedulerCostJson: args.schedulerCostJson = optarg; break;
+        case kSchedulerProfile: args.schedulerProfile = optarg; break;
+        case kTpotHardGuard: args.tpotHardGuard = true; break;
+        case kRequireDirectOverlapCost: args.requireDirectOverlapCost = true; break;
+        case kMaxConsecutiveOverlapBatches: args.maxConsecutiveOverlapBatches = std::stoi(optarg); break;
+        case kMaxPredictedDecodeDebtMs: args.maxPredictedDecodeDebtMs = std::stod(optarg); break;
         case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
         case kArrivalRate: args.arrivalRate = std::stod(optarg); break;
         case kLoadPromptMin: args.loadPromptMin = std::stoi(optarg); break;
@@ -549,8 +571,37 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.minDynamicPrefillBatchSize > 0 && args.minDynamicPrefillBatchSize <= args.prefillBatch
         && args.prefillCohortTurns > 0 && std::isfinite(args.decodeSlackSafetyFactor)
         && args.decodeSlackSafetyFactor > 0.0F && args.decodeSlackSafetyFactor <= 1.0F
-        && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching) || !args.schedulerCostJson.empty())
+        && args.maxConsecutiveOverlapBatches > 0 && std::isfinite(args.maxPredictedDecodeDebtMs)
+        && args.maxPredictedDecodeDebtMs >= 0.0
+        && (args.schedulerProfile == "custom" || args.schedulerProfile == "latency-safe"
+            || args.schedulerProfile == "balanced" || args.schedulerProfile == "long-prefill"
+            || args.schedulerProfile == "auto")
+        && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.tpotHardGuard
+                || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
+            || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty());
+}
+
+rt::PhaseSchedulerProfile parseSchedulerProfile(std::string const& profile)
+{
+    if (profile == "custom")
+    {
+        return rt::PhaseSchedulerProfile::kCustom;
+    }
+    if (profile == "latency-safe")
+    {
+        return rt::PhaseSchedulerProfile::kLatencySafe;
+    }
+    if (profile == "balanced")
+    {
+        return rt::PhaseSchedulerProfile::kBalanced;
+    }
+    if (profile == "long-prefill")
+    {
+        return rt::PhaseSchedulerProfile::kLongPrefill;
+    }
+    ELLM_CHECK(profile == "auto", "Unsupported scheduler profile");
+    return rt::PhaseSchedulerProfile::kAuto;
 }
 
 std::vector<rt::PhaseDecodeBatchCost> loadDecodeBatchCosts(std::filesystem::path const& path)
@@ -589,6 +640,26 @@ std::vector<rt::PhasePrefillBatchCost> loadPrefillBatchCosts(std::filesystem::pa
     return costs;
 }
 
+std::vector<rt::PhaseOverlapBatchCost> loadOverlapBatchCosts(std::filesystem::path const& path)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open scheduler cost model");
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(root.contains("overlap") && root.at("overlap").is_array(),
+        "Scheduler cost model must contain an overlap array");
+    std::vector<rt::PhaseOverlapBatchCost> costs;
+    for (nlohmann::json const& point : root.at("overlap"))
+    {
+        costs.push_back({point.at("prefill_batch_size").get<int32_t>(), point.at("decode_batch_size").get<int32_t>(),
+            point.at("chunk_length").get<int32_t>(), point.at("max_prefill_past_kv_length").get<int32_t>(),
+            point.at("max_decode_context_length").get<int32_t>(), point.at("initial_chunk").get<bool>(),
+            point.at("prefill_p95_gpu_ms").get<float>(), point.at("decode_p95_gpu_ms").get<float>(),
+            point.at("makespan_p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>()});
+    }
+    ELLM_CHECK(!costs.empty(), "Scheduler cost model contains no overlap points");
+    return costs;
+}
+
 bool usesSharedTensorRTContext(Args const& args) noexcept
 {
     return args.trtContextMode == rt::PhaseTensorRTContextMode::kSharedSerialized;
@@ -599,6 +670,7 @@ void logCudaGraphStats(char const* phase, rt::EngineExecutor const& executor)
     rt::EngineExecutor::CudaGraphCacheStats const stats = executor.getCudaGraphCacheStats();
     LOG_INFO(
         "%s CUDA graph: enabled=%s cached=%zu captures=%lu launches=%lu enqueue=%lu "
+        "hit_rate=%.4f observed_shapes=%zu uncapturable_shapes=%zu budget_rejected_shapes=%zu "
         "capture_failures=%lu launch_failures=%lu cache_limit_bypasses=%lu post_enqueue_captures=%lu "
         "observation_evictions=%lu graph_bytes=%zu graph_budget_bytes=%zu graph_min_charge_bytes=%zu "
         "global_reserve_bytes=%zu "
@@ -606,10 +678,15 @@ void logCudaGraphStats(char const* phase, rt::EngineExecutor const& executor)
         "graph_budget_rejections=%lu global_reserve_bypasses=%lu global_reserve_rejections=%lu",
         phase, stats.automaticCaptureEnabled ? "true" : "false", stats.cachedGraphs,
         static_cast<unsigned long>(stats.captures), static_cast<unsigned long>(stats.graphLaunches),
-        static_cast<unsigned long>(stats.enqueueExecutions), static_cast<unsigned long>(stats.captureFailures),
-        static_cast<unsigned long>(stats.graphLaunchFailures), static_cast<unsigned long>(stats.cacheLimitBypasses),
-        static_cast<unsigned long>(stats.postEnqueueCaptures), static_cast<unsigned long>(stats.observationEvictions),
-        stats.cachedGraphBytes, stats.maxCachedGraphBytes, stats.minimumGraphChargeBytes, stats.minimumFreeMemoryBytes,
+        static_cast<unsigned long>(stats.enqueueExecutions),
+        stats.graphLaunches + stats.enqueueExecutions > 0 ? static_cast<double>(stats.graphLaunches)
+                / static_cast<double>(stats.graphLaunches + stats.enqueueExecutions)
+                                                          : 0.0,
+        stats.observedBindingShapes, stats.uncapturableBindingShapes, stats.budgetRejectedBindingShapes,
+        static_cast<unsigned long>(stats.captureFailures), static_cast<unsigned long>(stats.graphLaunchFailures),
+        static_cast<unsigned long>(stats.cacheLimitBypasses), static_cast<unsigned long>(stats.postEnqueueCaptures),
+        static_cast<unsigned long>(stats.observationEvictions), stats.cachedGraphBytes, stats.maxCachedGraphBytes,
+        stats.minimumGraphChargeBytes, stats.minimumFreeMemoryBytes,
         static_cast<unsigned long>(stats.graphMemoryBudgetBypasses),
         static_cast<unsigned long>(stats.graphMemoryBudgetRejections),
         static_cast<unsigned long>(stats.globalMemoryReserveBypasses),
@@ -679,7 +756,8 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
               "prefill_initial_rows,prefill_continuation_rows,prefill_final_rows,prefill_past_kv_min,"
               "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,prefill_remaining_tokens,"
               "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
-              "predicted_decode_slowdown_ms,prefill_cohort_size,"
+              "predicted_decode_slowdown_ms,predicted_decode_debt_us,consecutive_overlap_batches,"
+              "prefill_deferred_for_tpot,prefill_cohort_size,"
               "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
               "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
               "page_growth_request_limit,page_growth_request_owners,page_growth_tpot_pressure\n";
@@ -693,11 +771,12 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << ',' << sample.prefillPastKVMean << ',' << sample.prefillPastKVMax << ',' << sample.prefillPastKVSpread
                << ',' << sample.prefillRemainingTokens << ',' << sample.prefillOldestRequestAgeUs << ','
                << sample.prefillMinTtftSlackUs << ',' << sample.predictedPrefillGpuMs << ','
-               << sample.predictedDecodeSlowdownMs << ',' << sample.prefillCohortSize << ','
-               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
-               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
-               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
-               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << sample.predictedDecodeSlowdownMs << ',' << sample.predictedDecodeDebtUs << ','
+               << sample.consecutiveOverlapBatches << ',' << (sample.prefillDeferredForTpot ? 1 : 0) << ','
+               << sample.prefillCohortSize << ',' << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ','
+               << sample.prefillGpuMs << ',' << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ','
+               << sample.overlapRatio << ',' << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles
+               << ',' << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
                << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }
@@ -850,26 +929,28 @@ int main(int argc, char** argv)
     else
     {
         auto executor = rt::EngineExecutor::createForLLM(enginePath, config);
-        rt::IndependentEngineExecutorPairConfig const pairConfig{
-            kPrefillProfile, kDecodeProfile, setupStream, prefillStream, decodeStream};
-        independentExecutors = rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
-        prefillRunner = &independentExecutors->prefillExecutor();
-        decodeRunner = &independentExecutors->decodeExecutor();
-    }
-    if (args.cudaGraph)
-    {
+        rt::IndependentEngineExecutorPairConfig pairConfig;
+        pairConfig.prefillProfile = kPrefillProfile;
+        pairConfig.decodeProfile = kDecodeProfile;
+        pairConfig.setupStream = setupStream;
+        pairConfig.prefillStream = prefillStream;
+        pairConfig.decodeStream = decodeStream;
+        pairConfig.enableCudaGraph = args.cudaGraph;
         int32_t const prefillLimit = args.maxPrefillCudaGraphs > 0 ? args.maxPrefillCudaGraphs : args.maxCudaGraphs;
         int32_t const decodeLimit = args.maxDecodeCudaGraphs > 0 ? args.maxDecodeCudaGraphs : args.maxCudaGraphs;
         int32_t const prefillMiB
             = args.maxPrefillCudaGraphMiB >= 0 ? args.maxPrefillCudaGraphMiB : args.maxCudaGraphMiB;
         int32_t const decodeMiB = args.maxDecodeCudaGraphMiB >= 0 ? args.maxDecodeCudaGraphMiB : args.maxCudaGraphMiB;
         constexpr size_t kMIB_BYTES{1024U * 1024U};
-        size_t const graphChargeBytes = static_cast<size_t>(args.cudaGraphChargeMiB) * kMIB_BYTES;
-        size_t const graphReserveBytes = static_cast<size_t>(args.cudaGraphReserveMiB) * kMIB_BYTES;
-        prefillRunner->enableAutomaticCudaGraphCapture(static_cast<size_t>(prefillLimit),
-            static_cast<size_t>(prefillMiB) * kMIB_BYTES, graphChargeBytes, graphReserveBytes);
-        decodeRunner->enableAutomaticCudaGraphCapture(static_cast<size_t>(decodeLimit),
-            static_cast<size_t>(decodeMiB) * kMIB_BYTES, graphChargeBytes, graphReserveBytes);
+        pairConfig.maxPrefillCudaGraphs = static_cast<size_t>(prefillLimit);
+        pairConfig.maxDecodeCudaGraphs = static_cast<size_t>(decodeLimit);
+        pairConfig.maxPrefillCudaGraphBytes = static_cast<size_t>(prefillMiB) * kMIB_BYTES;
+        pairConfig.maxDecodeCudaGraphBytes = static_cast<size_t>(decodeMiB) * kMIB_BYTES;
+        pairConfig.minimumCudaGraphChargeBytes = static_cast<size_t>(args.cudaGraphChargeMiB) * kMIB_BYTES;
+        pairConfig.minimumCudaFreeMemoryBytes = static_cast<size_t>(args.cudaGraphReserveMiB) * kMIB_BYTES;
+        independentExecutors = rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
+        prefillRunner = &independentExecutors->prefillExecutor();
+        decodeRunner = &independentExecutors->decodeExecutor();
     }
     bool const sharedTensorRTContext
         = prefillRunner->getExecutionContextIdentity() == decodeRunner->getExecutionContextIdentity();
@@ -1356,6 +1437,7 @@ int main(int argc, char** argv)
         std::vector<TraceRequestSample> traceSamples(traceRequests.size());
         std::unordered_map<uint64_t, size_t> traceIndices;
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
+        facadeSchedulerConfig.profile = parseSchedulerProfile(args.schedulerProfile);
         facadeSchedulerConfig.maxPrefillBatchSize = args.prefillBatch;
         facadeSchedulerConfig.maxDecodeBatchSize = args.decodeBatch;
         facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
@@ -1363,16 +1445,25 @@ int main(int argc, char** argv)
             = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
         facadeSchedulerConfig.maxPrefillBatchTokens = args.prefillTokenBudget;
         facadeSchedulerConfig.enableDynamicDecodeBatching = args.dynamicDecodeBatching;
-        if (args.dynamicDecodeBatching)
+        bool const profileUsesCosts = facadeSchedulerConfig.profile != rt::PhaseSchedulerProfile::kCustom;
+        if (args.dynamicDecodeBatching || profileUsesCosts)
         {
             facadeSchedulerConfig.decodeBatchCosts = loadDecodeBatchCosts(args.schedulerCostJson);
         }
         facadeSchedulerConfig.enableDynamicPrefillBatching = args.dynamicPrefillBatching;
         facadeSchedulerConfig.minDynamicPrefillBatchSize = args.minDynamicPrefillBatchSize;
         facadeSchedulerConfig.enablePrefillSloRecovery = args.prefillSloRecovery;
-        if (args.dynamicPrefillBatching)
+        if (args.dynamicPrefillBatching || profileUsesCosts)
         {
             facadeSchedulerConfig.prefillBatchCosts = loadPrefillBatchCosts(args.schedulerCostJson);
+        }
+        facadeSchedulerConfig.enableTpotHardGuard = args.tpotHardGuard;
+        facadeSchedulerConfig.requireDirectOverlapCost = args.requireDirectOverlapCost;
+        facadeSchedulerConfig.maxConsecutiveOverlapBatches = args.maxConsecutiveOverlapBatches;
+        facadeSchedulerConfig.maxPredictedDecodeDebtUs = args.maxPredictedDecodeDebtMs * 1000.0;
+        if (args.tpotHardGuard || args.requireDirectOverlapCost || profileUsesCosts)
+        {
+            facadeSchedulerConfig.overlapBatchCosts = loadOverlapBatchCosts(args.schedulerCostJson);
         }
         facadeSchedulerConfig.enableWavefrontPrefillBatching = args.wavefrontPrefillBatching;
         facadeSchedulerConfig.maxPrefillCohortSize = args.prefillCohortSize;

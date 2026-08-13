@@ -98,6 +98,9 @@ struct PhaseDispatchMetrics
     double prefillMinTtftSlackUs{};
     float predictedPrefillGpuMs{};
     float predictedDecodeSlowdownMs{};
+    double predictedDecodeDebtUs{};
+    int32_t consecutiveOverlapBatches{};
+    bool prefillDeferredForTpot{};
     int32_t prefillCohortSize{};
     int32_t decodeTokens{};
     int32_t decodeContextTokens{};
@@ -133,6 +136,8 @@ struct PhaseQueueSnapshot
     size_t prefillQueued{};
     size_t decodeQueued{};
     int32_t prefillCandidateTokens{};
+    int64_t prefillRemainingTokens{};
+    int32_t prefillContinuationRows{};
     int32_t decodeCandidateTokens{};
     int32_t consecutiveDecodeBatches{};
     double prefillOldestWaitUs{};
@@ -173,8 +178,36 @@ struct PhasePrefillBatchCost
     float decodeSlowdownP95Ms{};
 };
 
+//! Directly observed independent-context overlap cost. Shape bounds are
+//! conservative upper buckets generated from CUDA-event dispatch samples.
+struct PhaseOverlapBatchCost
+{
+    int32_t prefillBatchSize{};
+    int32_t decodeBatchSize{};
+    int32_t chunkLength{};
+    int32_t maxPrefillPastKVLength{};
+    int32_t maxDecodeContextLength{};
+    bool initialChunk{};
+    float prefillP95GpuMs{};
+    float decodeP95GpuMs{};
+    float makespanP95GpuMs{};
+    float decodeSlowdownP95Ms{};
+};
+
+enum class PhaseSchedulerProfile
+{
+    kCustom,
+    kLatencySafe,
+    kBalanced,
+    kLongPrefill,
+    kAuto,
+};
+
 struct PhaseQueueSchedulerConfig
 {
+    //! Production presets only select scheduler policy behavior. Model and
+    //! engine shape limits remain explicit in the fields below.
+    PhaseSchedulerProfile profile{PhaseSchedulerProfile::kCustom};
     int32_t maxPrefillBatchSize{1};
     int32_t maxDecodeBatchSize{4};
     //! Default policy only overlaps short prefills. The initial value comes from
@@ -189,6 +222,9 @@ struct PhaseQueueSchedulerConfig
     //! pressure. Empty costs preserve the legacy largest-available behavior.
     bool enableDynamicDecodeBatching{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
+    //! Switch from deadline fitting to throughput-efficient backlog recovery
+    //! before the TPOT deadline is fully exhausted.
+    float decodeRecoveryPressureThreshold{1.0F};
     //! Select a prefill row count from profiled p95 cost and decode slack.
     bool enableDynamicPrefillBatching{};
     //! Minimum dynamic prefill batch while at least this many compatible rows exist.
@@ -196,6 +232,18 @@ struct PhaseQueueSchedulerConfig
     //! Let an expired TTFT override decode interference while decode remains within SLO.
     bool enablePrefillSloRecovery{};
     std::vector<PhasePrefillBatchCost> prefillBatchCosts;
+    //! Prefer direct Co(P,D,shape) measurements over slowdown inferred from
+    //! separately sampled prefill/decode rows.
+    std::vector<PhaseOverlapBatchCost> overlapBatchCosts;
+    //! Prevent a predicted TPOT violation by converting overlap to decode-only.
+    bool enableTpotHardGuard{};
+    //! If enabled, an uncovered overlap shape is unsafe instead of falling back
+    //! to the indirect prefill cost table.
+    bool requireDirectOverlapCost{};
+    int32_t maxConsecutiveOverlapBatches{4};
+    double maxPredictedDecodeDebtUs{50000.0};
+    int64_t autoLongPrefillBacklogTokens{4096};
+    float autoDecodePressureLimit{0.5F};
     //! Keep a bounded set of requests advancing at similar chunk frontiers.
     bool enableWavefrontPrefillBatching{};
     int32_t maxPrefillCohortSize{8};
@@ -253,6 +301,11 @@ struct PhaseDispatchPlan
     double decodeQueueWaitUs{};
     float predictedPrefillGpuMs{};
     float predictedDecodeSlowdownMs{};
+    double predictedDecodeDebtUs{};
+    int32_t consecutiveOverlapBatches{};
+    int32_t plannedDecodeBatchSize{};
+    int32_t plannedDecodeMaxContextLength{};
+    bool prefillDeferredForTpot{};
     int32_t prefillCohortSize{};
 };
 
@@ -298,9 +351,12 @@ private:
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const noexcept;
+    int32_t decodeMaxContextLength() const noexcept;
+    //! Returns -1 when the TPOT guard requires decode-only, zero when no
+    //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,
-        bool initialChunk, bool overlap, PhaseQueueSnapshot const& snapshot, float& predictedGpuMs,
-        float& predictedDecodeSlowdownMs) const noexcept;
+        bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize, int32_t plannedDecodeMaxContextLength,
+        PhaseQueueSnapshot const& snapshot, float& predictedGpuMs, float& predictedDecodeSlowdownMs) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     bool isEligible(PhaseWorkItem const& item, bool prefill) const;
@@ -317,6 +373,8 @@ private:
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     PhaseSchedulerTelemetry mTelemetry;
     int32_t mConsecutiveDecodeBatches{};
+    int32_t mConsecutiveOverlapBatches{};
+    double mPredictedDecodeDebtUs{};
     std::unordered_set<uint64_t> mPrefillCohortIds;
     int32_t mPrefillCohortTurns{};
 };

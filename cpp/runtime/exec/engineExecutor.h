@@ -75,6 +75,9 @@ public:
         uint64_t globalMemoryReserveBypasses{};
         uint64_t globalMemoryReserveRejections{};
         size_t cachedGraphs{};
+        size_t observedBindingShapes{};
+        size_t uncapturableBindingShapes{};
+        size_t budgetRejectedBindingShapes{};
         size_t cachedGraphBytes{};
         size_t maxCachedGraphBytes{};
         size_t minimumGraphChargeBytes{};
