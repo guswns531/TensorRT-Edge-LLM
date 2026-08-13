@@ -38,6 +38,14 @@ void applySchedulerProfile(PhaseQueueSchedulerConfig& config)
     {
         return;
     }
+    if (config.profile == PhaseSchedulerProfile::kThroughputBalanced)
+    {
+        config.enableTpotHardGuard = true;
+        config.requireDirectOverlapCost = true;
+        config.enableCostAwareOverlapAdmission = true;
+        config.enableTpotHysteresis = true;
+        return;
+    }
 
     config.enableDynamicDecodeBatching = true;
     config.enableDynamicPrefillBatching = true;
@@ -115,6 +123,16 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(
         !mConfig.enableCostAwareOverlapAdmission || (mConfig.enableTpotHardGuard && mConfig.requireDirectOverlapCost),
         "Cost-aware overlap admission requires direct costs and the TPOT hard guard");
+    check::check(!mConfig.enableTpotHysteresis || mConfig.enableCostAwareOverlapAdmission,
+        "TPOT hysteresis requires cost-aware overlap admission");
+    check::check(std::isfinite(mConfig.tpotHysteresisEnterRatio) && std::isfinite(mConfig.tpotHysteresisExitRatio)
+            && mConfig.tpotHysteresisExitRatio > 0.0F
+            && mConfig.tpotHysteresisExitRatio < mConfig.tpotHysteresisEnterRatio
+            && mConfig.tpotHysteresisEnterRatio <= 1.0F,
+        "TPOT hysteresis ratios must satisfy 0 < exit < enter <= 1");
+    check::check(mConfig.tpotHysteresisWindow > 0 && mConfig.minTpotHysteresisSamples > 0
+            && mConfig.minTpotHysteresisSamples <= mConfig.tpotHysteresisWindow,
+        "TPOT hysteresis sample bounds are invalid");
     check::check(mConfig.maxConsecutiveOverlapBatches > 0, "Maximum consecutive overlap batches must be positive");
     check::check(std::isfinite(mConfig.maxPredictedDecodeDebtUs) && mConfig.maxPredictedDecodeDebtUs >= 0.0,
         "Maximum predicted decode debt must be finite and non-negative");
@@ -352,7 +370,7 @@ PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const&
     {
         return PhaseDispatchKind::kOverlap;
     }
-    if (mConfig.enableCostAwareOverlapAdmission)
+    if (mConfig.enableCostAwareOverlapAdmission && !mLatencySafeFallback)
     {
         return PhaseDispatchKind::kOverlap;
     }
@@ -468,7 +486,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept
 {
     int32_t const available = std::min<int32_t>(mConfig.maxPrefillBatchSize, candidates.size());
-    bool const evaluateOversizedOverlap = overlap && mConfig.enableCostAwareOverlapAdmission
+    bool const evaluateOversizedOverlap = overlap && mConfig.enableCostAwareOverlapAdmission && !mLatencySafeFallback
         && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
     if (available <= 0 || (!mConfig.enableDynamicPrefillBatching && !evaluateOversizedOverlap))
     {
@@ -900,8 +918,9 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 
     PhaseDispatchPlan plan;
     plan.kind = kind;
+    plan.latencySafeFallback = mLatencySafeFallback;
     plan.overlapEvaluatedByCost = kind == PhaseDispatchKind::kOverlap && mConfig.enableCostAwareOverlapAdmission
-        && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
+        && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
     plan.plannedDecodeBatchSize
         = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap ? selectDecodeBatchSize(state) : 0;
     plan.plannedDecodeMaxContextLength = plan.plannedDecodeBatchSize > 0 ? decodeMaxContextLength() : 0;
@@ -1149,6 +1168,39 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         updateEwma(mTelemetry.overlapRatio, metrics.overlapRatio);
         ++mTelemetry.overlapSampleCount;
     }
+    if (mConfig.enableTpotHysteresis && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F)
+    {
+        double const sampleUs = metrics.decodeQueueWaitUs + static_cast<double>(metrics.decodeGpuMs) * 1000.0;
+        mRecentDecodeTpotUs.push_back(sampleUs);
+        if (mRecentDecodeTpotUs.size() > mConfig.tpotHysteresisWindow)
+        {
+            mRecentDecodeTpotUs.pop_front();
+        }
+        ++mTelemetry.decodeTpotSampleCount;
+        if (mRecentDecodeTpotUs.size() >= mConfig.minTpotHysteresisSamples)
+        {
+            std::vector<double> ordered(mRecentDecodeTpotUs.begin(), mRecentDecodeTpotUs.end());
+            std::sort(ordered.begin(), ordered.end());
+            size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1;
+            mTelemetry.recentDecodeTpotP95Us = ordered[p95Index];
+            mTelemetry.recentDecodeTpotPressure
+                = static_cast<float>(mTelemetry.recentDecodeTpotP95Us / mConfig.decodeQueueWaitTargetUs);
+            bool const previousFallback = mLatencySafeFallback;
+            if (!mLatencySafeFallback && mTelemetry.recentDecodeTpotPressure >= mConfig.tpotHysteresisEnterRatio)
+            {
+                mLatencySafeFallback = true;
+            }
+            else if (mLatencySafeFallback && mTelemetry.recentDecodeTpotPressure <= mConfig.tpotHysteresisExitRatio)
+            {
+                mLatencySafeFallback = false;
+            }
+            if (previousFallback != mLatencySafeFallback)
+            {
+                ++mTelemetry.tpotHysteresisTransitions;
+            }
+        }
+    }
+    mTelemetry.latencySafeFallback = mLatencySafeFallback;
     ++mTelemetry.sampleCount;
     mTelemetry.lastDispatch = metrics;
 }

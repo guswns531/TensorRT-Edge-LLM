@@ -860,6 +860,88 @@ TEST(PhaseQueueSchedulerTest, CostAwareAdmissionPreservesLegacyOverlapInsideStat
     EXPECT_FALSE(plan.overlapEvaluatedByCost);
 }
 
+TEST(PhaseQueueSchedulerTest, ThroughputBalancedProfileEnablesCostAwareOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.profile = PhaseSchedulerProfile::kThroughputBalanced;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}, {2, 128, 0, 1, true, 12.0F, 0.8F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F},
+        {2, 1, 128, 0, 512, true, 12.0F, 2.5F, 12.0F, 0.8F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_TRUE(plan.overlapEvaluatedByCost);
+    EXPECT_FALSE(plan.latencySafeFallback);
+}
+
+TEST(PhaseQueueSchedulerTest, TpotHysteresisFallsBackAndRecovers)
+{
+    PhaseQueueSchedulerConfig config;
+    config.profile = PhaseSchedulerProfile::kThroughputBalanced;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.decodeQueueWaitTargetUs = 50000.0;
+    config.tpotHysteresisEnterRatio = 0.8F;
+    config.tpotHysteresisExitRatio = 0.5F;
+    config.tpotHysteresisWindow = 3;
+    config.minTpotHysteresisSamples = 3;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}, {2, 128, 0, 1, true, 12.0F, 0.8F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F},
+        {2, 1, 128, 0, 512, true, 12.0F, 2.5F, 12.0F, 0.8F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics highTpot;
+    highTpot.decodeBatchSize = 1;
+    highTpot.decodeContextTokens = 128;
+    highTpot.decodeQueueWaitUs = 35000.0;
+    highTpot.decodeGpuMs = 10.0F;
+    scheduler.observeMetrics(highTpot);
+    scheduler.observeMetrics(highTpot);
+    scheduler.observeMetrics(highTpot);
+    EXPECT_TRUE(scheduler.telemetry().latencySafeFallback);
+    EXPECT_NEAR(scheduler.telemetry().recentDecodeTpotPressure, 0.9F, 1.0e-6F);
+    EXPECT_EQ(scheduler.telemetry().tpotHysteresisTransitions, 1U);
+
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({3, 128, 2});
+    PhaseDispatchPlan const fallback = scheduler.next();
+    EXPECT_EQ(fallback.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(fallback.latencySafeFallback);
+    EXPECT_FALSE(fallback.overlapEvaluatedByCost);
+    ASSERT_EQ(fallback.decodeBatch.size(), 1U);
+    scheduler.completeDecode(fallback.decodeBatch.front(), 129, false);
+
+    PhaseDispatchMetrics recoveredTpot = highTpot;
+    recoveredTpot.decodeQueueWaitUs = 0.0;
+    recoveredTpot.decodeGpuMs = 10.0F;
+    scheduler.observeMetrics(recoveredTpot);
+    scheduler.observeMetrics(recoveredTpot);
+    scheduler.observeMetrics(recoveredTpot);
+    EXPECT_FALSE(scheduler.telemetry().latencySafeFallback);
+    EXPECT_NEAR(scheduler.telemetry().recentDecodeTpotPressure, 0.2F, 1.0e-6F);
+    EXPECT_EQ(scheduler.telemetry().tpotHysteresisTransitions, 2U);
+
+    PhaseDispatchPlan const restored = scheduler.next();
+    EXPECT_EQ(restored.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(restored.overlapEvaluatedByCost);
+    EXPECT_FALSE(restored.latencySafeFallback);
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesDirectCostForPlannedDecodeBatch)
 {
     PhaseQueueSchedulerConfig config;

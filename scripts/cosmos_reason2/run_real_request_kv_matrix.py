@@ -241,6 +241,14 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         command.append("--prefillSloRecovery")
     if args.scheduler_profile != "custom":
         command.extend(["--schedulerProfile", args.scheduler_profile])
+    if args.scheduler_profile == "throughput-balanced":
+        command.extend([
+            "--tpotHysteresisEnterRatio",
+            str(args.tpot_hysteresis_enter_ratio), "--tpotHysteresisExitRatio",
+            str(args.tpot_hysteresis_exit_ratio), "--tpotHysteresisWindow",
+            str(args.tpot_hysteresis_window), "--minTpotHysteresisSamples",
+            str(args.min_tpot_hysteresis_samples)
+        ])
     if (args.dynamic_decode_batching or args.dynamic_prefill_batching
             or args.scheduler_profile != "custom" or args.tpot_hard_guard
             or args.require_direct_overlap_cost
@@ -633,7 +641,8 @@ def main() -> None:
         help="cost model produced by build_phase_scheduler_cost_model.py")
     parser.add_argument("--scheduler-profile",
                         choices=("custom", "latency-safe", "balanced",
-                                 "long-prefill", "auto"),
+                                 "throughput-balanced", "long-prefill",
+                                 "auto"),
                         default="custom")
     parser.add_argument("--tpot-hard-guard", action="store_true")
     parser.add_argument("--require-direct-overlap-cost", action="store_true")
@@ -647,6 +656,14 @@ def main() -> None:
     parser.add_argument("--max-predicted-decode-debt-ms",
                         type=float,
                         default=50.0)
+    parser.add_argument("--tpot-hysteresis-enter-ratio",
+                        type=float,
+                        default=0.8)
+    parser.add_argument("--tpot-hysteresis-exit-ratio",
+                        type=float,
+                        default=0.6)
+    parser.add_argument("--tpot-hysteresis-window", type=int, default=32)
+    parser.add_argument("--min-tpot-hysteresis-samples", type=int, default=8)
     parser.add_argument(
         "--adaptive-scheduler",
         action="store_true",
@@ -733,6 +750,12 @@ def main() -> None:
     if (args.max_consecutive_overlap_batches <= 0
             or args.max_predicted_decode_debt_ms < 0.0):
         parser.error("TPOT hard guard bounds are invalid")
+    if (not 0.0 < args.tpot_hysteresis_exit_ratio <
+            args.tpot_hysteresis_enter_ratio <= 1.0
+            or args.tpot_hysteresis_window <= 0
+            or args.min_tpot_hysteresis_samples <= 0
+            or args.min_tpot_hysteresis_samples > args.tpot_hysteresis_window):
+        parser.error("TPOT hysteresis bounds are invalid")
     if (args.min_dynamic_prefill_batch_size <= 0
             or args.min_dynamic_prefill_batch_size > max(args.prefill_batches)
             or args.prefill_cohort_size <= 0 or args.prefill_cohort_turns <= 0
@@ -843,6 +866,16 @@ def main() -> None:
                 str(args.scheduler_cost_json or ""),
                 "scheduler_profile":
                 args.scheduler_profile,
+                "effective_tpot_hard_guard":
+                args.tpot_hard_guard or args.scheduler_profile != "custom",
+                "effective_require_direct_overlap_cost":
+                args.require_direct_overlap_cost or args.scheduler_profile
+                in ("latency-safe", "throughput-balanced"),
+                "effective_cost_aware_overlap_admission":
+                args.cost_aware_overlap_admission
+                or args.scheduler_profile == "throughput-balanced",
+                "effective_tpot_hysteresis":
+                args.scheduler_profile == "throughput-balanced",
                 "tpot_hard_guard":
                 args.tpot_hard_guard,
                 "require_direct_overlap_cost":
@@ -853,6 +886,14 @@ def main() -> None:
                 args.max_consecutive_overlap_batches,
                 "max_predicted_decode_debt_ms":
                 args.max_predicted_decode_debt_ms,
+                "tpot_hysteresis_enter_ratio":
+                args.tpot_hysteresis_enter_ratio,
+                "tpot_hysteresis_exit_ratio":
+                args.tpot_hysteresis_exit_ratio,
+                "tpot_hysteresis_window":
+                args.tpot_hysteresis_window,
+                "min_tpot_hysteresis_samples":
+                args.min_tpot_hysteresis_samples,
                 "adaptive_scheduler":
                 args.adaptive_scheduler,
                 "page_reservation_mode":

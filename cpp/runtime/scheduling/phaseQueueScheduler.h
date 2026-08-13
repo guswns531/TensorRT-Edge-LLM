@@ -107,6 +107,7 @@ struct PhaseDispatchMetrics
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
+    bool latencySafeFallback{};
     int32_t prefillCostLookupRows{};
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
@@ -135,9 +136,14 @@ struct PhaseSchedulerTelemetry
 {
     size_t sampleCount{};
     size_t overlapSampleCount{};
+    size_t decodeTpotSampleCount{};
     float prefillGpuMsPerToken{};
     float decodeGpuMsPerContextToken{};
     float overlapRatio{};
+    double recentDecodeTpotP95Us{};
+    float recentDecodeTpotPressure{};
+    bool latencySafeFallback{};
+    size_t tpotHysteresisTransitions{};
     std::optional<PhaseDispatchMetrics> lastDispatch;
 };
 
@@ -210,6 +216,7 @@ enum class PhaseSchedulerProfile
     kCustom,
     kLatencySafe,
     kBalanced,
+    kThroughputBalanced,
     kLongPrefill,
     kAuto,
 };
@@ -259,6 +266,13 @@ struct PhaseQueueSchedulerConfig
     //! Larger candidates require direct coverage and the TPOT hard guard so an
     //! unsafe candidate becomes decode-only.
     bool enableCostAwareOverlapAdmission{};
+    //! Disable cap-exceeding cost-aware overlap when recent decode TPOT p95
+    //! reaches the enter ratio, and restore it only below the exit ratio.
+    bool enableTpotHysteresis{};
+    float tpotHysteresisEnterRatio{0.8F};
+    float tpotHysteresisExitRatio{0.6F};
+    size_t tpotHysteresisWindow{32};
+    size_t minTpotHysteresisSamples{8};
     int32_t maxConsecutiveOverlapBatches{4};
     double maxPredictedDecodeDebtUs{50000.0};
     int64_t autoLongPrefillBacklogTokens{4096};
@@ -327,6 +341,7 @@ struct PhaseDispatchPlan
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
+    bool latencySafeFallback{};
     int32_t prefillCostLookupRows{};
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
@@ -399,6 +414,8 @@ private:
     std::unordered_set<uint64_t> mInFlightRequestIds;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     PhaseSchedulerTelemetry mTelemetry;
+    std::deque<double> mRecentDecodeTpotUs;
+    bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};
     int32_t mConsecutiveOverlapBatches{};
     double mPredictedDecodeDebtUs{};

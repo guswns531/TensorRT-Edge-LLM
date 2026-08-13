@@ -134,6 +134,10 @@ struct Args
     bool costAwareOverlapAdmission{};
     int32_t maxConsecutiveOverlapBatches{4};
     double maxPredictedDecodeDebtMs{50.0};
+    float tpotHysteresisEnterRatio{0.8F};
+    float tpotHysteresisExitRatio{0.6F};
+    int32_t tpotHysteresisWindow{32};
+    int32_t minTpotHysteresisSamples{8};
     rt::PhasePageReservationMode pageReservationMode{rt::PhasePageReservationMode::kFull};
     int32_t pageReservationHeadroomTokens{128};
     int32_t pageReservationOvercommitBundles{1};
@@ -300,9 +304,11 @@ void printUsage(char const* program)
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
         "--decodeSlackSafetyFactor F "
-        "--schedulerCostJson FILE --schedulerProfile custom|latency-safe|balanced|long-prefill|auto "
+        "--schedulerCostJson FILE --schedulerProfile "
+        "custom|latency-safe|balanced|throughput-balanced|long-prefill|auto "
         "--tpotHardGuard --requireDirectOverlapCost --costAwareOverlapAdmission --maxConsecutiveOverlapBatches N "
-        "--maxPredictedDecodeDebtMs F] [--outputCsv FILE] "
+        "--maxPredictedDecodeDebtMs F --tpotHysteresisEnterRatio F --tpotHysteresisExitRatio F "
+        "--tpotHysteresisWindow N --minTpotHysteresisSamples N] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R --ignoreTraceEos] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
@@ -361,6 +367,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         kCostAwareOverlapAdmission,
         kMaxConsecutiveOverlapBatches,
         kMaxPredictedDecodeDebtMs,
+        kTpotHysteresisEnterRatio,
+        kTpotHysteresisExitRatio,
+        kTpotHysteresisWindow,
+        kMinTpotHysteresisSamples,
         kLoadRequests,
         kArrivalRate,
         kLoadPromptMin,
@@ -426,6 +436,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"costAwareOverlapAdmission", no_argument, nullptr, kCostAwareOverlapAdmission},
         {"maxConsecutiveOverlapBatches", required_argument, nullptr, kMaxConsecutiveOverlapBatches},
         {"maxPredictedDecodeDebtMs", required_argument, nullptr, kMaxPredictedDecodeDebtMs},
+        {"tpotHysteresisEnterRatio", required_argument, nullptr, kTpotHysteresisEnterRatio},
+        {"tpotHysteresisExitRatio", required_argument, nullptr, kTpotHysteresisExitRatio},
+        {"tpotHysteresisWindow", required_argument, nullptr, kTpotHysteresisWindow},
+        {"minTpotHysteresisSamples", required_argument, nullptr, kMinTpotHysteresisSamples},
         {"loadRequests", required_argument, nullptr, kLoadRequests},
         {"arrivalRate", required_argument, nullptr, kArrivalRate},
         {"loadPromptMin", required_argument, nullptr, kLoadPromptMin},
@@ -515,6 +529,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kCostAwareOverlapAdmission: args.costAwareOverlapAdmission = true; break;
         case kMaxConsecutiveOverlapBatches: args.maxConsecutiveOverlapBatches = std::stoi(optarg); break;
         case kMaxPredictedDecodeDebtMs: args.maxPredictedDecodeDebtMs = std::stod(optarg); break;
+        case kTpotHysteresisEnterRatio: args.tpotHysteresisEnterRatio = std::stof(optarg); break;
+        case kTpotHysteresisExitRatio: args.tpotHysteresisExitRatio = std::stof(optarg); break;
+        case kTpotHysteresisWindow: args.tpotHysteresisWindow = std::stoi(optarg); break;
+        case kMinTpotHysteresisSamples: args.minTpotHysteresisSamples = std::stoi(optarg); break;
         case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
         case kArrivalRate: args.arrivalRate = std::stod(optarg); break;
         case kLoadPromptMin: args.loadPromptMin = std::stoi(optarg); break;
@@ -585,10 +603,14 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.prefillCohortTurns > 0 && std::isfinite(args.decodeSlackSafetyFactor)
         && args.decodeSlackSafetyFactor > 0.0F && args.decodeSlackSafetyFactor <= 1.0F
         && args.maxConsecutiveOverlapBatches > 0 && std::isfinite(args.maxPredictedDecodeDebtMs)
-        && args.maxPredictedDecodeDebtMs >= 0.0
+        && args.maxPredictedDecodeDebtMs >= 0.0 && std::isfinite(args.tpotHysteresisEnterRatio)
+        && std::isfinite(args.tpotHysteresisExitRatio) && args.tpotHysteresisExitRatio > 0.0F
+        && args.tpotHysteresisExitRatio < args.tpotHysteresisEnterRatio && args.tpotHysteresisEnterRatio <= 1.0F
+        && args.tpotHysteresisWindow > 0 && args.minTpotHysteresisSamples > 0
+        && args.minTpotHysteresisSamples <= args.tpotHysteresisWindow
         && (args.schedulerProfile == "custom" || args.schedulerProfile == "latency-safe"
-            || args.schedulerProfile == "balanced" || args.schedulerProfile == "long-prefill"
-            || args.schedulerProfile == "auto")
+            || args.schedulerProfile == "balanced" || args.schedulerProfile == "throughput-balanced"
+            || args.schedulerProfile == "long-prefill" || args.schedulerProfile == "auto")
         && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.tpotHardGuard
                 || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
@@ -608,6 +630,10 @@ rt::PhaseSchedulerProfile parseSchedulerProfile(std::string const& profile)
     if (profile == "balanced")
     {
         return rt::PhaseSchedulerProfile::kBalanced;
+    }
+    if (profile == "throughput-balanced")
+    {
+        return rt::PhaseSchedulerProfile::kThroughputBalanced;
     }
     if (profile == "long-prefill")
     {
@@ -772,7 +798,8 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
               "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
               "predicted_decode_slowdown_ms,predicted_decode_debt_us,consecutive_overlap_batches,"
               "prefill_deferred_for_tpot,prefill_cost_coverage_miss,overlap_evaluated_by_cost,"
-              "prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,prefill_cost_lookup_max_past_kv_length,"
+              "latency_safe_fallback,prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,"
+              "prefill_cost_lookup_max_past_kv_length,"
               "planned_decode_batch,planned_decode_max_context_length,prefill_cohort_size,"
               "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
               "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
@@ -791,13 +818,13 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << sample.predictedDecodeSlowdownMs << ',' << sample.predictedDecodeDebtUs << ','
                << sample.consecutiveOverlapBatches << ',' << (sample.prefillDeferredForTpot ? 1 : 0) << ','
                << (sample.prefillCostCoverageMiss ? 1 : 0) << ',' << (sample.overlapEvaluatedByCost ? 1 : 0) << ','
-               << sample.prefillCostLookupRows << ',' << sample.prefillCostLookupChunkLength << ','
-               << sample.prefillCostLookupMaxPastKVLength << ',' << sample.plannedDecodeBatchSize << ','
-               << sample.plannedDecodeMaxContextLength << ',' << sample.prefillCohortSize << ','
-               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
-               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
-               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
-               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << (sample.latencySafeFallback ? 1 : 0) << ',' << sample.prefillCostLookupRows << ','
+               << sample.prefillCostLookupChunkLength << ',' << sample.prefillCostLookupMaxPastKVLength << ','
+               << sample.plannedDecodeBatchSize << ',' << sample.plannedDecodeMaxContextLength << ','
+               << sample.prefillCohortSize << ',' << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ','
+               << sample.prefillGpuMs << ',' << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ','
+               << sample.overlapRatio << ',' << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles
+               << ',' << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
                << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }
@@ -1486,6 +1513,10 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.enableCostAwareOverlapAdmission = args.costAwareOverlapAdmission;
         facadeSchedulerConfig.maxConsecutiveOverlapBatches = args.maxConsecutiveOverlapBatches;
         facadeSchedulerConfig.maxPredictedDecodeDebtUs = args.maxPredictedDecodeDebtMs * 1000.0;
+        facadeSchedulerConfig.tpotHysteresisEnterRatio = args.tpotHysteresisEnterRatio;
+        facadeSchedulerConfig.tpotHysteresisExitRatio = args.tpotHysteresisExitRatio;
+        facadeSchedulerConfig.tpotHysteresisWindow = static_cast<size_t>(args.tpotHysteresisWindow);
+        facadeSchedulerConfig.minTpotHysteresisSamples = static_cast<size_t>(args.minTpotHysteresisSamples);
         if (args.tpotHardGuard || args.requireDirectOverlapCost || args.costAwareOverlapAdmission || profileUsesCosts)
         {
             facadeSchedulerConfig.overlapBatchCosts = loadOverlapBatchCosts(args.schedulerCostJson);

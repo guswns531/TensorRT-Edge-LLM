@@ -159,6 +159,7 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.prefillDeferredForTpot = mInFlight.prefillDeferredForTpot;
     mCurrentMetrics.prefillCostCoverageMiss = mInFlight.prefillCostCoverageMiss;
     mCurrentMetrics.overlapEvaluatedByCost = mInFlight.overlapEvaluatedByCost;
+    mCurrentMetrics.latencySafeFallback = mInFlight.latencySafeFallback;
     mCurrentMetrics.prefillCostLookupRows = mInFlight.prefillCostLookupRows;
     mCurrentMetrics.prefillCostLookupChunkLength = mInFlight.prefillCostLookupChunkLength;
     mCurrentMetrics.prefillCostLookupMaxPastKVLength = mInFlight.prefillCostLookupMaxPastKVLength;
