@@ -283,6 +283,8 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         ])
     if args.ignore_eos:
         command.append("--ignoreTraceEos")
+    if args.token_streaming:
+        command.extend(["--tokenTraceCsv", str(case_dir / "tokens.csv")])
     if args.dynamic_decode_batching:
         command.append("--dynamicDecodeBatching")
     if args.dynamic_prefill_batching:
@@ -574,6 +576,10 @@ def main() -> None:
         "--ignore-eos",
         action="store_true",
         help="force every trace request to its configured output length")
+    parser.add_argument(
+        "--token-streaming",
+        action="store_true",
+        help="decode and record every incremental async-server token")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--request-count", type=int, default=0)
     parser.add_argument(
@@ -930,6 +936,8 @@ def main() -> None:
                 args.output_multiplier,
                 "ignore_eos":
                 args.ignore_eos,
+                "token_streaming":
+                args.token_streaming,
                 "cuda_graph":
                 args.cuda_graph,
                 "max_cuda_graphs":

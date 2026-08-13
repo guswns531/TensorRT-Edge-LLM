@@ -308,6 +308,45 @@ void PhaseAsyncServer::processTerminals()
     }
 }
 
+void PhaseAsyncServer::collectTokenEvents(uint64_t requestId, RequestState& state)
+{
+    if (!mConfig.enableTokenStreaming)
+    {
+        return;
+    }
+    int32_t const generated = state.context.currentGenerateLengths.front();
+    check::check(generated >= state.streamedTokens, "Async phase generated-token count moved backwards.");
+    std::vector<int32_t> const& tokens = state.context.tokenIds.front();
+    check::check(static_cast<size_t>(generated) <= tokens.size(),
+        "Async phase streaming observed an invalid generated-token count.");
+    size_t const generatedStart = tokens.size() - static_cast<size_t>(generated);
+    for (int32_t index = state.streamedTokens; index < generated; ++index)
+    {
+        int32_t const tokenId = tokens[generatedStart + static_cast<size_t>(index)];
+        std::vector<int32_t> const generatedPrefix(tokens.begin() + static_cast<std::ptrdiff_t>(generatedStart),
+            tokens.begin() + static_cast<std::ptrdiff_t>(generatedStart + static_cast<size_t>(index) + 1));
+        std::string const decoded = mTokenizer.decode(generatedPrefix, true);
+        std::string delta = decoded;
+        if (decoded.compare(0, state.streamedText.size(), state.streamedText) == 0)
+        {
+            delta.erase(0, state.streamedText.size());
+        }
+        state.streamedText = decoded;
+        double const elapsedMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
+        mTokenEvents.push_back({requestId, tokenId, std::move(delta), mTokenizer.isEosToken(tokenId), elapsedMs});
+    }
+    state.streamedTokens = generated;
+}
+
+void PhaseAsyncServer::collectTokenEvents()
+{
+    for (auto& [requestId, state] : mRequests)
+    {
+        collectTokenEvents(requestId, *state);
+    }
+}
+
 void PhaseAsyncServer::complete(uint64_t requestId, PhaseRequestStatus status)
 {
     auto const found = mRequests.find(requestId);
@@ -316,6 +355,7 @@ void PhaseAsyncServer::complete(uint64_t requestId, PhaseRequestStatus status)
         return;
     }
     RequestState& state = *found->second;
+    collectTokenEvents(requestId, state);
     LLMGenerationResponse response;
     response.outputIds.resize(1);
     response.outputTexts.resize(1);
@@ -363,10 +403,22 @@ bool PhaseAsyncServer::poll()
             progressed = mServingFacade.dispatchNext() || progressed;
         }
     }
+    collectTokenEvents();
     processTerminals();
     progressed = processCancellations() || progressed;
     progressed = admitWaitingVisionRequests() || progressed;
     return progressed;
+}
+
+std::optional<PhaseAsyncToken> PhaseAsyncServer::tryPopToken()
+{
+    if (mTokenEvents.empty())
+    {
+        return std::nullopt;
+    }
+    PhaseAsyncToken result = std::move(mTokenEvents.front());
+    mTokenEvents.pop_front();
+    return result;
 }
 
 std::optional<PhaseAsyncCompletion> PhaseAsyncServer::tryPopCompletion()

@@ -47,14 +47,17 @@
 #include "tokenizer/tokenizer.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iomanip>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -64,6 +67,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace trt_edgellm;
 
@@ -83,11 +88,13 @@ struct Args
     std::string inputFile;
     std::string multimodalEngineDir;
     std::string traceCsv;
+    std::string tokenTraceCsv;
     std::string phaseTimelineCsv;
     std::string cudaGraphWarmupProfile;
     std::string schedulerCostJson;
     std::string schedulerProfile{"custom"};
     bool ignoreTraceEos{};
+    bool ipcServer{};
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t slotCount{};
@@ -207,6 +214,16 @@ struct TraceRequestMetadata
     int32_t priority{};
 };
 
+struct TraceTokenSample
+{
+    uint64_t requestId{};
+    int32_t tokenIndex{};
+    int32_t tokenId{};
+    int64_t emittedUs{};
+    bool isEos{};
+    std::string text;
+};
+
 struct PrefillRequestTimelineSample
 {
     uint64_t requestId{};
@@ -309,6 +326,22 @@ void writeTraceMetrics(std::filesystem::path const& path, std::vector<TraceReque
     }
 }
 
+void writeTraceTokens(std::filesystem::path const& path, std::vector<TraceTokenSample> const& samples)
+{
+    if (path.has_parent_path())
+    {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream output(path);
+    ELLM_CHECK(output.is_open(), "Failed to open phase token trace CSV: " + path.string());
+    output << "request_id,token_index,token_id,emitted_us,is_eos,text\n";
+    for (TraceTokenSample const& sample : samples)
+    {
+        output << sample.requestId << ',' << sample.tokenIndex << ',' << sample.tokenId << ',' << sample.emittedUs
+               << ',' << (sample.isEos ? 1 : 0) << ',' << csvQuote(sample.text) << '\n';
+    }
+}
+
 void writePrefillRequestTimeline(
     std::filesystem::path const& path, std::vector<PrefillRequestTimelineSample> const& samples)
 {
@@ -358,8 +391,9 @@ void printUsage(char const* program)
         "--maxPredictedDecodeDebtMs F --tpotHysteresisEnterRatio F --tpotHysteresisExitRatio F "
         "--tpotHysteresisWindow N --minTpotHysteresisSamples N] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
-        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --phaseTimelineCsv FILE --traceArrivalRate R "
-        "--traceWarmupRepeats N --cudaGraphWarmupProfile FILE --ignoreTraceEos] "
+        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --tokenTraceCsv FILE "
+        "--phaseTimelineCsv FILE --traceArrivalRate R "
+        "--traceWarmupRepeats N --cudaGraphWarmupProfile FILE --ignoreTraceEos --ipcServer] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
         "--pageReservationGrowthRequests N --fullReservationPromptThresholdTokens N "
@@ -440,11 +474,13 @@ bool parseArgs(Args& args, int argc, char** argv)
         kInputFile,
         kMultimodalEngineDir,
         kTraceCsv,
+        kTokenTraceCsv,
         kPhaseTimelineCsv,
         kTraceArrivalRate,
         kTraceWarmupRepeats,
         kCudaGraphWarmupProfile,
         kIgnoreTraceEos,
+        kIpcServer,
         kPageReservationMode,
         kPageReservationHeadroomTokens,
         kPageReservationOvercommitBundles,
@@ -515,11 +551,12 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"inputFile", required_argument, nullptr, kInputFile},
         {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
         {"traceCsv", required_argument, nullptr, kTraceCsv},
+        {"tokenTraceCsv", required_argument, nullptr, kTokenTraceCsv},
         {"phaseTimelineCsv", required_argument, nullptr, kPhaseTimelineCsv},
         {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
         {"traceWarmupRepeats", required_argument, nullptr, kTraceWarmupRepeats},
         {"cudaGraphWarmupProfile", required_argument, nullptr, kCudaGraphWarmupProfile},
-        {"ignoreTraceEos", no_argument, nullptr, kIgnoreTraceEos},
+        {"ignoreTraceEos", no_argument, nullptr, kIgnoreTraceEos}, {"ipcServer", no_argument, nullptr, kIpcServer},
         {"pageReservationMode", required_argument, nullptr, kPageReservationMode},
         {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
         {"pageReservationOvercommitBundles", required_argument, nullptr, kPageReservationOvercommitBundles},
@@ -616,11 +653,13 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kInputFile: args.inputFile = optarg; break;
         case kMultimodalEngineDir: args.multimodalEngineDir = optarg; break;
         case kTraceCsv: args.traceCsv = optarg; break;
+        case kTokenTraceCsv: args.tokenTraceCsv = optarg; break;
         case kPhaseTimelineCsv: args.phaseTimelineCsv = optarg; break;
         case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
         case kTraceWarmupRepeats: args.traceWarmupRepeats = std::stoi(optarg); break;
         case kCudaGraphWarmupProfile: args.cudaGraphWarmupProfile = optarg; break;
         case kIgnoreTraceEos: args.ignoreTraceEos = true; break;
+        case kIpcServer: args.ipcServer = true; break;
         case kPageReservationMode:
         {
             std::string const mode{optarg};
@@ -687,10 +726,11 @@ bool parseArgs(Args& args, int argc, char** argv)
         && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.tpotHardGuard
                 || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
-        && (args.inputFile.empty() || !args.traceCsv.empty())
+        && (args.inputFile.empty() || !args.traceCsv.empty()) && (args.tokenTraceCsv.empty() || !args.inputFile.empty())
         && (args.phaseTimelineCsv.empty()
             || (!args.inputFile.empty() && !args.traceCsv.empty() && !args.kernelGroupCsv.empty()))
         && (args.traceWarmupRepeats == 0 || (!args.inputFile.empty() && args.cudaGraph))
+        && (!args.ipcServer || (!args.inputFile.empty() && args.traceWarmupRepeats == 0))
         && (args.cudaGraphWarmupProfile.empty() || (!args.inputFile.empty() && args.cudaGraph));
 }
 
@@ -1667,6 +1707,8 @@ int main(int argc, char** argv)
         std::chrono::steady_clock::time_point traceStart;
         std::vector<TraceRequestSample> traceSamples(traceRequests.size());
         std::unordered_map<uint64_t, size_t> traceIndices;
+        std::vector<TraceTokenSample> traceTokenSamples;
+        std::unordered_map<uint64_t, int32_t> traceTokenIndices;
         std::vector<PrefillRequestTimelineSample> prefillTimelineSamples;
         std::unordered_map<uint64_t, size_t> activePrefillTimelineIndices;
         rt::PhaseQueueSchedulerConfig facadeSchedulerConfig;
@@ -2108,6 +2150,16 @@ int main(int argc, char** argv)
                         madeProgress = true;
                     }
                     madeProgress = server.poll() || madeProgress;
+                    while (auto token = server.tryPopToken())
+                    {
+                        if (logCompletions)
+                        {
+                            int32_t& tokenIndex = traceTokenIndices[token->requestId];
+                            traceTokenSamples.push_back({token->requestId, tokenIndex++, token->tokenId,
+                                elapsedMicroseconds(traceStart), token->isEos, std::move(token->text)});
+                        }
+                        madeProgress = true;
+                    }
                     while (auto completion = server.tryPopCompletion())
                     {
                         TraceRequestSample& sample = traceSamples.at(traceIndices.at(completion->requestId));
@@ -2130,6 +2182,113 @@ int main(int argc, char** argv)
                 ELLM_CHECK(server.empty() && facade.empty(), "Real phase trace did not drain all LLM phase queues");
             };
 
+            auto runIpcTrace = [&](rt::PhaseAsyncServer& server) {
+                traceStart = std::chrono::steady_clock::now();
+                std::cout << "PHASE_EVENT\t" << nlohmann::json{{"type", "ready"}}.dump() << std::endl;
+                size_t submittedCount{};
+                size_t completionCount{};
+                std::string inputBuffer;
+                int const inputFlags = fcntl(STDIN_FILENO, F_GETFL, 0);
+                ELLM_CHECK(inputFlags >= 0 && fcntl(STDIN_FILENO, F_SETFL, inputFlags | O_NONBLOCK) == 0,
+                    "IPC phase trace failed to configure non-blocking input");
+                constexpr int64_t kTraceTimeoutUs = 300000000;
+                while (completionCount < traceRequests.size())
+                {
+                    int64_t const elapsedUs = elapsedMicroseconds(traceStart);
+                    ELLM_CHECK(elapsedUs < kTraceTimeoutUs, "IPC phase trace exceeded its timeout");
+                    bool madeProgress{};
+
+                    char chunk[16384];
+                    while (true)
+                    {
+                        ssize_t const bytesRead = read(STDIN_FILENO, chunk, sizeof(chunk));
+                        if (bytesRead > 0)
+                        {
+                            inputBuffer.append(chunk, static_cast<size_t>(bytesRead));
+                            continue;
+                        }
+                        ELLM_CHECK(bytesRead != 0, "IPC phase trace input closed before every request arrived");
+                        ELLM_CHECK(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR,
+                            "IPC phase trace failed to read standard input");
+                        break;
+                    }
+                    size_t newline{};
+                    while ((newline = inputBuffer.find('\n')) != std::string::npos)
+                    {
+                        std::string const line = inputBuffer.substr(0, newline);
+                        inputBuffer.erase(0, newline + 1);
+                        nlohmann::json const command = nlohmann::json::parse(line);
+                        size_t const requestIndex = command.at("request_index").get<size_t>();
+                        ELLM_CHECK(requestIndex < traceRequests.size(), "IPC phase request index is out of range");
+                        TraceRequestSample& sample = traceSamples[requestIndex];
+                        ELLM_CHECK(sample.submittedUs < 0, "IPC phase request index was submitted more than once");
+                        rt::LLMGenerationRequest& request = traceRequests[requestIndex];
+                        TraceRequestMetadata const& metadata = traceMetadata[requestIndex];
+                        if (metadata.maxGenerateLength.has_value())
+                        {
+                            request.maxGenerateLength = *metadata.maxGenerateLength;
+                        }
+                        request.disableSpecDecode = true;
+                        request.topK = 1;
+                        request.numLogprobs = 0;
+                        int32_t const maxOutputTokens = static_cast<int32_t>(request.maxGenerateLength);
+                        rt::PhaseSchedulingHints scheduling;
+                        scheduling.priority = metadata.priority;
+                        scheduling.ttftTargetUs = args.ttftTargetMs * 1000.0;
+                        scheduling.tpotTargetUs = args.tpotTargetMs * 1000.0;
+                        rt::PhaseAsyncSubmission const submission = server.submit(std::move(request), scheduling);
+                        sample.requestId = submission.requestId;
+                        sample.scheduledArrivalUs = elapsedUs;
+                        sample.submittedUs = elapsedMicroseconds(traceStart);
+                        if (submission.status != rt::PhaseRequestStatus::kPending)
+                        {
+                            sample.admittedUs = sample.submittedUs;
+                        }
+                        sample.maxOutputTokens = maxOutputTokens;
+                        sample.admissionStatus = submission.status;
+                        traceIndices.emplace(submission.requestId, requestIndex);
+                        std::optional<rt::PhaseRequestSnapshot> const snapshot = facade.request(submission.requestId);
+                        ELLM_CHECK(snapshot.has_value(), "Submitted IPC request is missing from the facade");
+                        sample.promptTokens = snapshot->promptTokenCount;
+                        ++submittedCount;
+                        madeProgress = true;
+                    }
+
+                    madeProgress = server.poll() || madeProgress;
+                    while (auto token = server.tryPopToken())
+                    {
+                        size_t const requestIndex = traceIndices.at(token->requestId);
+                        int32_t& tokenIndex = traceTokenIndices[token->requestId];
+                        nlohmann::json event{{"type", "token"}, {"request_index", requestIndex},
+                            {"token_index", tokenIndex++}, {"token_id", token->tokenId}, {"text", token->text},
+                            {"is_eos", token->isEos}, {"elapsed_ms", token->elapsedMs}};
+                        std::cout << "PHASE_EVENT\t" << event.dump() << std::endl;
+                        madeProgress = true;
+                    }
+                    while (auto completion = server.tryPopCompletion())
+                    {
+                        size_t const requestIndex = traceIndices.at(completion->requestId);
+                        TraceRequestSample& sample = traceSamples[requestIndex];
+                        sample.completedUs = elapsedMicroseconds(traceStart);
+                        sample.completion = std::move(*completion);
+                        nlohmann::json event{{"type", "completion"}, {"request_index", requestIndex},
+                            {"prompt_tokens", sample.promptTokens},
+                            {"output_tokens", sample.completion.response.outputIds.front().size()},
+                            {"finish_reason", rt::finishReasonName(sample.completion.response.finishReasons.front())},
+                            {"elapsed_ms", sample.completion.latencyMs}};
+                        std::cout << "PHASE_EVENT\t" << event.dump() << std::endl;
+                        ++completionCount;
+                        madeProgress = true;
+                    }
+                    if (!madeProgress)
+                    {
+                        std::this_thread::yield();
+                    }
+                }
+                ELLM_CHECK(submittedCount == traceRequests.size(), "IPC phase trace did not submit every request");
+                ELLM_CHECK(server.empty() && facade.empty(), "IPC phase trace did not drain all LLM phase queues");
+            };
+
             if (!traceHasVision)
             {
                 LOG_INFO("Text-only phase topology: CUDA=%p prefill=%p decode=%p",
@@ -2144,6 +2303,7 @@ int main(int argc, char** argv)
                     = args.fullReservationPromptThresholdTokens;
                 serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
                 serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
+                serverConfig.enableTokenStreaming = !args.tokenTraceCsv.empty() || args.ipcServer;
                 rt::PhaseAsyncServer server(serverConfig, facade, tokenizer, prefillStream);
                 for (int32_t repeat{}; repeat < args.traceWarmupRepeats; ++repeat)
                 {
@@ -2156,6 +2316,8 @@ int main(int argc, char** argv)
                         "Reloaded trace request count differs from trace metadata");
                     traceSamples = std::vector<TraceRequestSample>(traceRequests.size());
                     traceIndices.clear();
+                    traceTokenSamples.clear();
+                    traceTokenIndices.clear();
                     facadeDispatchMetrics.clear();
                     kernelDispatchMetadata = {};
                     kernelGroupDispatchIndex = 0;
@@ -2163,7 +2325,14 @@ int main(int argc, char** argv)
                     CUDA_CHECK(cudaStreamSynchronize(setupStream));
                 }
                 collectServingMetrics = true;
-                runTrace(server, true);
+                if (args.ipcServer)
+                {
+                    runIpcTrace(server);
+                }
+                else
+                {
+                    runTrace(server, true);
+                }
             }
             else
             {
@@ -2217,8 +2386,10 @@ int main(int argc, char** argv)
                         = args.fullReservationPromptThresholdTokens;
                     serverConfig.pageReservation.minConcurrentGrowthRequests = args.minPageGrowthRequests;
                     serverConfig.pageReservation.growthTpotTargetUs = args.pageGrowthTpotTargetMs * 1000.0;
+                    serverConfig.enableTokenStreaming = !args.tokenTraceCsv.empty() || args.ipcServer;
                     rt::PhaseAsyncServer server(serverConfig, coordinator, encoderWorker, facade, tokenizer,
                         prefillStream, visionAdapter.get());
+                    ELLM_CHECK(!args.ipcServer, "IPC phase server v1 supports text-only requests");
                     runTrace(server, true);
                     ELLM_CHECK(encoderWorker.empty(), "Real phase trace did not drain the encoder queue");
                 }
@@ -2226,6 +2397,11 @@ int main(int argc, char** argv)
             }
             writeTraceMetrics(args.traceCsv, traceSamples);
             LOG_INFO("Real request phase trace metrics written to %s", args.traceCsv.c_str());
+            if (!args.tokenTraceCsv.empty())
+            {
+                writeTraceTokens(args.tokenTraceCsv, traceTokenSamples);
+                LOG_INFO("Real request token trace written to %s", args.tokenTraceCsv.c_str());
+            }
             if (!args.phaseTimelineCsv.empty())
             {
                 ELLM_CHECK(activePrefillTimelineIndices.empty(), "Real trace left active prefill timeline entries");

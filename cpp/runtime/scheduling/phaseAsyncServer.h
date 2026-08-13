@@ -42,6 +42,8 @@ struct PhaseAsyncServerConfig
     size_t maxInFlightRequests{};
     //! Whole-request KV admission policy shared by text and multimodal requests.
     PhasePageReservationConfig pageReservation;
+    //! Publish each completed decode token through tryPopToken().
+    bool enableTokenStreaming{false};
 };
 
 struct PhaseAsyncSubmission
@@ -57,12 +59,21 @@ struct PhaseAsyncCompletion
     double latencyMs{};
 };
 
+struct PhaseAsyncToken
+{
+    uint64_t requestId{};
+    int32_t tokenId{};
+    std::string text;
+    bool isEos{};
+    double elapsedMs{};
+};
+
 //! Event-loop API that owns request state across asynchronous encoder/prefill/decode execution.
 //!
 //! All methods must be called from one host thread with the CUDA context used to construct the
 //! phase workers current on that thread. submit() accepts one logical request; continuous batching
 //! happens independently inside the encoder, prefill, and decode queues. V1 is greedy-only and
-//! rejects speculative decoding, LoRA, audio, logprobs, streaming channels, and stop strings.
+//! rejects speculative decoding, LoRA, audio, logprobs, legacy streaming channels, and stop strings.
 class PhaseAsyncServer
 {
 public:
@@ -86,6 +97,8 @@ public:
     bool cancel(uint64_t requestId);
     //! Advance CUDA-event completions and launch all currently runnable phases without synchronizing.
     bool poll();
+    //! Pop one server-owned incremental token event.
+    std::optional<PhaseAsyncToken> tryPopToken();
     std::optional<PhaseAsyncCompletion> tryPopCompletion();
 
     std::optional<PhaseRequestStatus> status(uint64_t requestId) const;
@@ -103,6 +116,8 @@ private:
         bool usesVision{};
         bool waitingForVisionSlot{};
         bool cancelRequested{};
+        int32_t streamedTokens{};
+        std::string streamedText;
     };
 
     void validateRequest(LLMGenerationRequest const& request) const;
@@ -111,6 +126,8 @@ private:
     bool admitWaitingVisionRequests();
     bool processCancellations();
     void processTerminals();
+    void collectTokenEvents();
+    void collectTokenEvents(uint64_t requestId, RequestState& state);
     void complete(uint64_t requestId, PhaseRequestStatus status);
 
     PhaseAsyncServerConfig mConfig;
@@ -125,6 +142,7 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<RequestState>> mRequests;
     std::deque<uint64_t> mWaitingVisionAdmissions;
     std::deque<PhaseRequestSnapshot> mTerminalSnapshots;
+    std::deque<PhaseAsyncToken> mTokenEvents;
     std::deque<PhaseAsyncCompletion> mCompletions;
 };
 
