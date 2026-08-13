@@ -158,6 +158,7 @@ def _paged_attention_plugin_translation(
     sliding_window_size: int,
     enable_fp8_kv_cache: int,
     enable_packed_prefill: int,
+    packed_prefill_max_chunk_tokens: int,
     attention_scale: float,
     qkv_scales: Sequence[float],
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
@@ -180,6 +181,7 @@ def _paged_attention_plugin_translation(
         enable_indexed_kv_cache=1,
         enable_paged_kv_cache=1,
         enable_packed_prefill=enable_packed_prefill,
+        packed_prefill_max_chunk_tokens=packed_prefill_max_chunk_tokens,
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
         attention_scale=attention_scale,

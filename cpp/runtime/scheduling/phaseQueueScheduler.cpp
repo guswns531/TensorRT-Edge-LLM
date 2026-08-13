@@ -85,8 +85,12 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
-    check::check(!mConfig.enablePackedPrefillTokenLayout || mConfig.maxPrefillChunkTokens == 128,
-        "Packed prefill token layout requires fixed 128-token chunks");
+    check::check(mConfig.decodeActivePrefillChunkTokens >= 0
+            && (mConfig.decodeActivePrefillChunkTokens == 0
+                || mConfig.decodeActivePrefillChunkTokens <= mConfig.maxPrefillChunkTokens),
+        "decodeActivePrefillChunkTokens must be zero or within the maximum prefill chunk length");
+    check::check(!mConfig.enablePackedPrefillTokenLayout || mConfig.maxPrefillChunkTokens > 0,
+        "Packed prefill token layout requires a positive maximum chunk length");
     check::check(mConfig.maxPrefillBatchTokens >= 0, "maxPrefillBatchTokens must be non-negative");
     check::check(mConfig.prefillCompletionBonusTokens >= 0, "prefillCompletionBonusTokens must be non-negative");
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
@@ -437,7 +441,13 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
         return item.tokenCount;
     }
 
-    int32_t const maximum = std::min(item.tokenCount, mConfig.maxPrefillChunkTokens);
+    int32_t maximum = std::min(item.tokenCount, mConfig.maxPrefillChunkTokens);
+    bool const largePrefillBacklog = mConfig.largePrefillChunkQueueThreshold > 0
+        && mPrefillQueue.size() >= mConfig.largePrefillChunkQueueThreshold;
+    if (!mDecodeQueue.empty() && !largePrefillBacklog && mConfig.decodeActivePrefillChunkTokens > 0)
+    {
+        maximum = std::min(maximum, mConfig.decodeActivePrefillChunkTokens);
+    }
     if (!mConfig.enableAdaptivePrefillChunking || mDecodeQueue.empty())
     {
         return maximum;
@@ -921,8 +931,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             queue.begin(), queue.end(), [requestId](PhaseWorkItem const& item) { return item.requestId == requestId; });
         check::check(selected != queue.end(), "Selected prefill request disappeared before dispatch");
         PhaseWorkItem item = *selected;
+        item.tokenCount = std::min(item.tokenCount, bucketTokens);
         queue.erase(selected);
-        item.tokenCount = dispatchedPrefillTokens(item);
         check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
         recordQueueWait(item.requestId);
         batch.push_back(item);

@@ -46,7 +46,8 @@ enum LLMBuildOptionId : int
     PROFILING_DETAILED = 713,
     MAX_PREFILL_BATCH_SIZE = 714,
     MAX_DECODE_BATCH_SIZE = 715,
-    KV_CACHE_PAGE_BUNDLES = 716
+    KV_CACHE_PAGE_BUNDLES = 716,
+    MAX_PREFILL_CHUNK_TOKENS = 717
 };
 
 struct LLMBuildArgs
@@ -60,6 +61,7 @@ struct LLMBuildArgs
     int64_t maxBatchSize{4};
     int64_t maxPrefillBatchSize{};
     int64_t maxDecodeBatchSize{};
+    int64_t maxPrefillChunkTokens{};
     int64_t kvCachePageBundles{};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
     bool specDraft{false};
@@ -75,6 +77,7 @@ void printUsage(char const* programName)
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--maxPrefillBatchSize <int>] "
                  "[--maxDecodeBatchSize <int>] [--kvCachePageBundles <int>] [--debug] [--maxLoraRank <int>]"
+                 "[--maxPrefillChunkTokens <int>] "
                  "[--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed]"
               << std::endl;
@@ -91,6 +94,7 @@ void printUsage(char const* programName)
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
     std::cerr << "  --maxPrefillBatchSize     Maximum prefill profile batch size. Default = maxBatchSize" << std::endl;
     std::cerr << "  --maxDecodeBatchSize      Maximum decode profile batch size. Default = maxBatchSize" << std::endl;
+    std::cerr << "  --maxPrefillChunkTokens   Packed-prefill row limit. Default = export contract" << std::endl;
     std::cerr << "  --kvCachePageBundles      Shared 128-token KV page-bundle count. Required by paged exports"
               << std::endl;
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
@@ -120,6 +124,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
         {"maxPrefillBatchSize", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE},
         {"maxDecodeBatchSize", required_argument, 0, LLMBuildOptionId::MAX_DECODE_BATCH_SIZE},
+        {"maxPrefillChunkTokens", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS},
         {"kvCachePageBundles", required_argument, 0, LLMBuildOptionId::KV_CACHE_PAGE_BUNDLES},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
         {"specDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT},
@@ -189,6 +194,12 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxDecodeBatchSize = std::stoi(optarg);
             }
             break;
+        case LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS:
+            if (optarg)
+            {
+                args.maxPrefillChunkTokens = std::stoi(optarg);
+            }
+            break;
         case LLMBuildOptionId::KV_CACHE_PAGE_BUNDLES:
             if (optarg)
             {
@@ -239,7 +250,8 @@ int main(int argc, char** argv)
     int64_t const maxPrefillBatchSize = args.maxPrefillBatchSize > 0 ? args.maxPrefillBatchSize : args.maxBatchSize;
     int64_t const maxDecodeBatchSize = args.maxDecodeBatchSize > 0 ? args.maxDecodeBatchSize : args.maxBatchSize;
     if (args.maxBatchSize <= 0 || maxPrefillBatchSize <= 0 || maxDecodeBatchSize <= 0
-        || maxPrefillBatchSize > args.maxBatchSize || maxDecodeBatchSize > args.maxBatchSize)
+        || maxPrefillBatchSize > args.maxBatchSize || maxDecodeBatchSize > args.maxBatchSize
+        || args.maxPrefillChunkTokens < 0)
     {
         LOG_ERROR("Phase batch limits must be positive and no greater than --maxBatchSize.");
         return EXIT_FAILURE;
@@ -276,6 +288,7 @@ int main(int argc, char** argv)
     config.maxBatchSize = args.maxBatchSize;
     config.maxPrefillBatchSize = args.maxPrefillBatchSize;
     config.maxDecodeBatchSize = args.maxDecodeBatchSize;
+    config.maxPrefillChunkTokens = args.maxPrefillChunkTokens;
     config.kvCachePageBundles = args.kvCachePageBundles;
     config.maxLoraRank = args.maxLoraRank;
     config.specDraft = args.specDraft;

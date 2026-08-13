@@ -810,7 +810,8 @@ def _export_llm(model_dir: str,
                 num_decoder_layers: "int | None" = None,
                 indexed_kv_cache: bool = False,
                 paged_kv_cache: bool = False,
-                packed_prefill: bool = False) -> None:
+                packed_prefill: bool = False,
+                packed_prefill_max_chunk_tokens: int = 128) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -890,6 +891,7 @@ def _export_llm(model_dir: str,
             model.config.indexed_kv_cache = indexed_kv_cache
             model.config.paged_kv_cache = paged_kv_cache
             model.config.packed_prefill = packed_prefill
+            model.config.packed_prefill_max_chunk_tokens = packed_prefill_max_chunk_tokens
             if indexed_kv_cache:
                 model.config.use_vision_bidirectional_attention = False
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
@@ -2541,8 +2543,15 @@ def main() -> None:
     p.add_argument(
         "--packed-prefill",
         action="store_true",
-        help=("Export an indexed-paged text engine that accepts fixed-128 "
-              "prefill rows packed into one token carrier."),
+        help=("Export an indexed-paged text engine that packs variable-length "
+              "prefill rows into one token carrier."),
+    )
+    p.add_argument(
+        "--packed-prefill-max-chunk-tokens",
+        type=int,
+        default=128,
+        help=("Maximum logical packed-prefill row length compiled into the "
+              "attention plugin. Default: 128."),
     )
     p.add_argument(
         "--externalize-weights",
@@ -2632,6 +2641,11 @@ def main() -> None:
         p.error("--paged-kv-cache requires --indexed-kv-cache")
     if args.packed_prefill and not args.paged_kv_cache:
         p.error("--packed-prefill requires --paged-kv-cache")
+    if args.packed_prefill_max_chunk_tokens <= 0:
+        p.error("--packed-prefill-max-chunk-tokens must be positive")
+    if (not args.packed_prefill
+            and args.packed_prefill_max_chunk_tokens != 128):
+        p.error("--packed-prefill-max-chunk-tokens requires --packed-prefill")
     if args.indexed_kv_cache and (args.eagle_base or args.mtp
                                   or args.dflash_base or args.dflash_draft):
         p.error("--indexed-kv-cache v1 supports vanilla decoding only")
@@ -2779,7 +2793,9 @@ def main() -> None:
                      num_decoder_layers=args.num_decoder_layer,
                      indexed_kv_cache=args.indexed_kv_cache,
                      paged_kv_cache=args.paged_kv_cache,
-                     packed_prefill=args.packed_prefill)),
+                     packed_prefill=args.packed_prefill,
+                     packed_prefill_max_chunk_tokens=args.
+                     packed_prefill_max_chunk_tokens)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

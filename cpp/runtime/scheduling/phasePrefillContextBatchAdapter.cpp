@@ -49,8 +49,6 @@ PhasePrefillContextBatchAdapter::PhasePrefillContextBatchAdapter(int32_t maxBatc
 {
     check::check(mMaxBatchSize > 0, "Phase prefill adapter max batch size must be positive.");
     check::check(mMaxChunkTokens > 0, "Phase prefill adapter max chunk length must be positive.");
-    check::check(!mEnablePackedTokenLayout || mMaxChunkTokens == 128,
-        "Packed phase prefill requires the fixed 128-token chunk contract.");
     check::check(!mEnablePackedTokenLayout || mCacheManager.isPagedKVCache(),
         "Packed phase prefill requires indexed-paged KV cache storage.");
 }

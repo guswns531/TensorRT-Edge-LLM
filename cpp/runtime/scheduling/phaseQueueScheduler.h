@@ -234,13 +234,22 @@ struct PhaseQueueSchedulerConfig
     //! Maximum tokens dispatched per request in one prefill turn. Zero keeps
     //! the legacy whole-prompt behavior.
     int32_t maxPrefillChunkTokens{};
+    //! Optional steady-state cap while decode work is queued. This permits a
+    //! larger queue-drain chunk when decode is empty without imposing that
+    //! interference on active decodes. Zero inherits maxPrefillChunkTokens.
+    int32_t decodeActivePrefillChunkTokens{};
+    //! Keep using maxPrefillChunkTokens while at least this many prefill
+    //! requests remain queued, even when decode is active. This drains a large
+    //! arrival burst before switching to the steady-state cap. Zero disables
+    //! backlog-triggered large chunks.
+    size_t largePrefillChunkQueueThreshold{};
     //! Optional total-token budget for one compatible prefill batch. Zero disables it.
     int32_t maxPrefillBatchTokens{};
     //! Combine different text chunk lengths in one right-padded TensorRT batch.
     //! Initial and continuation chunks remain separate execution classes.
     bool enableRaggedPrefillBatching{};
     //! Pack all valid text tokens into one [1,totalTokens] carrier. Requires
-    //! fixed 128-token chunks and an indexed-paged packed-prefill engine.
+    //! an indexed-paged packed-prefill engine with a compatible chunk limit.
     bool enablePackedPrefillTokenLayout{};
     //! Maximum virtual useful-token credit for each continuation row that
     //! completes a request's prefill. The scheduler caps the credit at the

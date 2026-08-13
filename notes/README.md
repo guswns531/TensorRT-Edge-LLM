@@ -86,6 +86,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 64. [Cosmos packed prefill 정확성 gate와 288-request trace 결과](85-cosmos-packed-prefill-correctness-and-288-traces-20260813.md)
 65. [Cosmos packed-prefill cost model과 dynamic scheduler 연결](86-cosmos-packed-cost-model-and-dynamic-scheduler-20260813.md)
 66. [Cosmos packed mixed-load dynamic batching 분석](87-cosmos-packed-mixed-load-dynamic-batching-20260813.md)
+67. [Cosmos variable-length packed prefill과 backlog-aware chunk 정책](88-cosmos-variable-packed-prefill-20260813.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.

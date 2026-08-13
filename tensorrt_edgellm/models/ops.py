@@ -283,6 +283,7 @@ def paged_attention_plugin(
     sliding_window_size: int,
     enable_fp8_kv_cache: bool,
     enable_packed_prefill: bool,
+    packed_prefill_max_chunk_tokens: int,
     attention_scale: float,
     qkv_scales: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -322,6 +323,7 @@ def _(query_states,
       sliding_window_size,
       enable_fp8_kv_cache,
       enable_packed_prefill,
+      packed_prefill_max_chunk_tokens,
       attention_scale,
       qkv_scales=None):
     batch_size, seq_len, _ = query_states.shape

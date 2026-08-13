@@ -179,6 +179,10 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         str(args.input_len),
         "--prefillChunkSize",
         str(args.chunk_size),
+        "--decodeActivePrefillChunkSize",
+        str(args.decode_active_chunk_size),
+        "--largePrefillChunkQueueThreshold",
+        str(args.large_chunk_queue_threshold),
         "--maxOverlapPrefillTokens",
         str(args.max_overlap_prefill_tokens),
         "--ttftTargetMs",
@@ -595,6 +599,18 @@ def main() -> None:
     parser.add_argument("--tokens-per-page", type=int, default=128)
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--decode-active-chunk-size",
+        type=int,
+        default=0,
+        help=("cap each prefill row while decode work is queued; zero uses "
+              "the common chunk size"))
+    parser.add_argument(
+        "--large-chunk-queue-threshold",
+        type=int,
+        default=0,
+        help=("retain the common chunk size above this prefill queue depth; "
+              "zero disables backlog-triggered large chunks"))
     parser.add_argument("--max-overlap-prefill-tokens", type=int, default=128)
     parser.add_argument("--ttft-target-ms", type=float, default=500.0)
     parser.add_argument("--tpot-target-ms", type=float, default=50.0)
@@ -788,6 +804,11 @@ def main() -> None:
             "slot-count, page-bundles, and tokens-per-page must be positive")
     if args.output_multiplier <= 0.0:
         parser.error("output-multiplier must be positive")
+    if (args.decode_active_chunk_size < 0
+            or args.decode_active_chunk_size > args.chunk_size):
+        parser.error("decode-active-chunk-size must be within chunk-size")
+    if args.large_chunk_queue_threshold < 0:
+        parser.error("large-chunk-queue-threshold must be non-negative")
     if (args.max_overlap_prefill_tokens < 0 or args.ttft_target_ms <= 0.0
             or args.tpot_target_ms <= 0.0):
         parser.error("phase overlap and SLO settings are invalid")
@@ -939,6 +960,10 @@ def main() -> None:
                 args.ragged_prefill_batching,
                 "prefill_completion_bonus_tokens":
                 args.prefill_completion_bonus_tokens,
+                "decode_active_chunk_size":
+                args.decode_active_chunk_size,
+                "large_chunk_queue_threshold":
+                args.large_chunk_queue_threshold,
                 "max_overlap_prefill_tokens":
                 args.max_overlap_prefill_tokens,
                 "ttft_target_ms":

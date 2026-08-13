@@ -335,6 +335,8 @@ class Attention(nn.Module):
                 sliding_window_size=self.sliding_window_size,
                 enable_fp8_kv_cache=self.enable_fp8_kv_cache,
                 enable_packed_prefill=self.config.packed_prefill,
+                packed_prefill_max_chunk_tokens=self.config.
+                packed_prefill_max_chunk_tokens,
                 attention_scale=self.attention_scale,
                 qkv_scales=kwargs["qkv_scales"],
             )

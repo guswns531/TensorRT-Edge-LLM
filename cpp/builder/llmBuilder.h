@@ -42,6 +42,7 @@ struct LLMBuilderConfig
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
     int64_t maxPrefillBatchSize{};    //!< Maximum prefill batch size (0 inherits maxBatchSize)
     int64_t maxDecodeBatchSize{};     //!< Maximum decode batch size (0 inherits maxBatchSize)
+    int64_t maxPrefillChunkTokens{};  //!< Packed-prefill row limit (0 inherits the export contract)
     int64_t maxLoraRank{0};           //!< Maximum LoRA rank (0 = no LoRA support)
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
     int64_t kvCachePageBundles{};     //!< Shared paged-KV bundle count (0 disables true paging)
@@ -65,6 +66,10 @@ struct LLMBuilderConfig
         if (maxDecodeBatchSize > 0)
         {
             json["max_decode_batch_size"] = maxDecodeBatchSize;
+        }
+        if (maxPrefillChunkTokens > 0)
+        {
+            json["max_prefill_chunk_tokens"] = maxPrefillChunkTokens;
         }
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
@@ -123,6 +128,10 @@ struct LLMBuilderConfig
         {
             config.maxDecodeBatchSize = json["max_decode_batch_size"];
         }
+        if (json.contains("max_prefill_chunk_tokens"))
+        {
+            config.maxPrefillChunkTokens = json["max_prefill_chunk_tokens"];
+        }
         if (json.contains("max_lora_rank"))
         {
             config.maxLoraRank = json["max_lora_rank"];
@@ -158,6 +167,7 @@ struct LLMBuilderConfig
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxPrefillBatchSize: " << getMaxPrefillBatchSize() << "\n";
         oss << "  maxDecodeBatchSize: " << getMaxDecodeBatchSize() << "\n";
+        oss << "  maxPrefillChunkTokens: " << maxPrefillChunkTokens << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
         oss << "  kvCachePageBundles: " << kvCachePageBundles << "\n";
@@ -211,6 +221,8 @@ public:
     bool build();
 
 private:
+    int64_t getMaxPackedPrefillChunkTokens() const;
+
     std::filesystem::path mOnnxDir;   //!< Directory containing ONNX model files
     std::filesystem::path mEngineDir; //!< Directory for saving built engine
     LLMBuilderConfig mBuilderConfig;  //!< Build configuration

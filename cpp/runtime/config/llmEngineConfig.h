@@ -78,12 +78,13 @@ struct LLMEngineConfig
     int32_t reducedVocabSize{0};            //!< 0 = no vocab reduction
 
     // --- Feature flags ---
-    bool isSpecDecodeBase{false};      //!< Base engine exposes speculative decoding verification bindings
-    bool indexedKVCache{false};        //!< Stable physical KV slots selected by the kv_slot_ids input
-    bool pagedKVCache{false};          //!< Allocate KV storage from a shared 128-token page-bundle pool
-    bool packedPrefill{false};         //!< Accept fixed-128 logical rows packed into one token carrier
-    int32_t kvCachePageBundles{};      //!< Number of shared K/V page bundles when pagedKVCache is enabled
-    int32_t kvCacheTokensPerPage{128}; //!< Physical page granularity for paged KV v1
+    bool isSpecDecodeBase{false};          //!< Base engine exposes speculative decoding verification bindings
+    bool indexedKVCache{false};            //!< Stable physical KV slots selected by the kv_slot_ids input
+    bool pagedKVCache{false};              //!< Allocate KV storage from a shared 128-token page-bundle pool
+    bool packedPrefill{false};             //!< Pack logical prefill rows into one token carrier
+    int32_t maxPackedPrefillChunkTokens{}; //!< Maximum logical packed-prefill row length
+    int32_t kvCachePageBundles{};          //!< Number of shared K/V page bundles when pagedKVCache is enabled
+    int32_t kvCacheTokensPerPage{128};     //!< Physical page granularity for paged KV v1
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in

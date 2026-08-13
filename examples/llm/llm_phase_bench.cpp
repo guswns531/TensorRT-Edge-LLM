@@ -93,6 +93,8 @@ struct Args
     int32_t slotCount{};
     int32_t inputLen{512};
     int32_t prefillChunkSize{};
+    int32_t decodeActivePrefillChunkSize{};
+    int32_t largePrefillChunkQueueThreshold{};
     int32_t pastKVLen{512};
     int32_t warmup{20};
     int32_t iterations{100};
@@ -338,7 +340,8 @@ void printUsage(char const* program)
 {
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
-        "[--prefillChunkSize N] [--pastKVLen N] [--warmup N] [--iterations N] "
+        "[--prefillChunkSize N] [--decodeActivePrefillChunkSize N] [--largePrefillChunkQueueThreshold N] "
+        "[--pastKVLen N] [--warmup N] [--iterations N] "
         "[--trtContextMode shared|independent] "
         "[--cudaGraph --maxCudaGraphs N --maxPrefillCudaGraphs N --maxDecodeCudaGraphs N "
         "--maxCudaGraphMiB N --maxPrefillCudaGraphMiB N --maxDecodeCudaGraphMiB N] "
@@ -378,6 +381,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         kSlotCount,
         kInputLen,
         kPrefillChunkSize,
+        kDecodeActivePrefillChunkSize,
+        kLargePrefillChunkQueueThreshold,
         kPastKVLen,
         kWarmup,
         kIterations,
@@ -455,6 +460,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"decodeBatch", required_argument, nullptr, kDecodeBatch}, {"inputLen", required_argument, nullptr, kInputLen},
         {"slotCount", required_argument, nullptr, kSlotCount},
         {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
+        {"decodeActivePrefillChunkSize", required_argument, nullptr, kDecodeActivePrefillChunkSize},
+        {"largePrefillChunkQueueThreshold", required_argument, nullptr, kLargePrefillChunkQueueThreshold},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
         {"trtContextMode", required_argument, nullptr, kTensorRTContextMode},
@@ -534,6 +541,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kSlotCount: args.slotCount = std::stoi(optarg); break;
         case kInputLen: args.inputLen = std::stoi(optarg); break;
         case kPrefillChunkSize: args.prefillChunkSize = std::stoi(optarg); break;
+        case kDecodeActivePrefillChunkSize: args.decodeActivePrefillChunkSize = std::stoi(optarg); break;
+        case kLargePrefillChunkQueueThreshold: args.largePrefillChunkQueueThreshold = std::stoi(optarg); break;
         case kPastKVLen: args.pastKVLen = std::stoi(optarg); break;
         case kWarmup: args.warmup = std::stoi(optarg); break;
         case kIterations: args.iterations = std::stoi(optarg); break;
@@ -648,15 +657,17 @@ bool parseArgs(Args& args, int argc, char** argv)
     }
     return !args.engineDir.empty() && args.prefillBatch > 0 && args.decodeBatch > 0 && args.slotCount >= 0
         && args.inputLen > 0 && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen
-        && args.pastKVLen >= 0 && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0
-        && args.arrivalRate > 0.0 && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
-        && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
-        && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4
-        && args.traceArrivalRate > 0.0 && args.traceWarmupRepeats >= 0 && args.maxCudaGraphs > 0
-        && args.maxPrefillCudaGraphs != 0 && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0
-        && args.maxDecodeCudaGraphs >= -1 && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1
-        && args.maxDecodeCudaGraphMiB >= -1 && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0
-        && args.prefillTokenBudget >= 0 && args.prefillCompletionBonusTokens >= 0
+        && args.decodeActivePrefillChunkSize >= 0
+        && (args.decodeActivePrefillChunkSize == 0 || args.decodeActivePrefillChunkSize <= args.prefillChunkSize)
+        && args.largePrefillChunkQueueThreshold >= 0 && args.pastKVLen >= 0 && args.warmup >= 0 && args.iterations > 0
+        && args.loadRequests >= 0 && args.arrivalRate > 0.0 && args.loadPromptMin >= 0 && args.loadPromptMax >= 0
+        && args.loadOutputMin > 0 && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0
+        && args.ttftTargetMs > 0.0 && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0
+        && args.loadPriorityClasses <= 4 && args.traceArrivalRate > 0.0 && args.traceWarmupRepeats >= 0
+        && args.maxCudaGraphs > 0 && args.maxPrefillCudaGraphs != 0 && args.maxPrefillCudaGraphs >= -1
+        && args.maxDecodeCudaGraphs != 0 && args.maxDecodeCudaGraphs >= -1 && args.maxCudaGraphMiB >= 0
+        && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1 && args.cudaGraphChargeMiB > 0
+        && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0 && args.prefillCompletionBonusTokens >= 0
         && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
         && args.pageReservationGrowthRequests > 0 && args.fullReservationPromptThresholdTokens >= 0
         && args.minPageGrowthRequests > 0 && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
@@ -1062,8 +1073,8 @@ int main(int argc, char** argv)
     int32_t const configuredChunkSize = args.prefillChunkSize > 0 ? args.prefillChunkSize : args.inputLen;
     ELLM_CHECK(args.packedPrefillTokenLayout == config.packedPrefill,
         "--packedPrefillTokenLayout must match the engine packed_prefill export contract");
-    ELLM_CHECK(
-        !args.packedPrefillTokenLayout || configuredChunkSize == 128, "Packed prefill requires --prefillChunkSize 128");
+    ELLM_CHECK(!args.packedPrefillTokenLayout || configuredChunkSize <= config.maxPackedPrefillChunkTokens,
+        "Packed prefill chunk size exceeds the engine export/build contract");
     ELLM_CHECK(!args.packedPrefillTokenLayout || (config.indexedKVCache && config.pagedKVCache),
         "Packed prefill requires indexed-paged KV cache");
     int32_t const phaseRounds = (args.inputLen + configuredChunkSize - 1) / configuredChunkSize;
@@ -1660,6 +1671,9 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxOverlapPrefillTokens = args.maxOverlapPrefillTokens;
         facadeSchedulerConfig.maxPrefillChunkTokens
             = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
+        facadeSchedulerConfig.decodeActivePrefillChunkTokens = args.decodeActivePrefillChunkSize;
+        facadeSchedulerConfig.largePrefillChunkQueueThreshold
+            = static_cast<size_t>(args.largePrefillChunkQueueThreshold);
         facadeSchedulerConfig.maxPrefillBatchTokens = args.prefillTokenBudget;
         facadeSchedulerConfig.enableRaggedPrefillBatching = args.raggedPrefillBatching;
         facadeSchedulerConfig.enablePackedPrefillTokenLayout = args.packedPrefillTokenLayout;

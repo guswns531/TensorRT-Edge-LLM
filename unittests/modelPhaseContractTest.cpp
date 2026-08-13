@@ -36,6 +36,21 @@ TEST(ModelPhaseContractTest, IndexedTextSupportsDynamicChunking)
     EXPECT_EQ(contract.maxPrefillChunkTokens, 1024);
 }
 
+TEST(ModelPhaseContractTest, PackedPrefillUsesEngineChunkContract)
+{
+    LLMEngineConfig config;
+    config.indexedKVCache = true;
+    config.pagedKVCache = true;
+    config.packedPrefill = true;
+    config.maxPackedPrefillChunkTokens = 256;
+    config.maxSupportedInputLength = 1024;
+
+    ModelPhaseContract const contract = makeModelPhaseContract(config);
+
+    EXPECT_TRUE(contract.supportsChunkedPrefill);
+    EXPECT_EQ(contract.maxPrefillChunkTokens, 256);
+}
+
 TEST(ModelPhaseContractTest, MultimodalRequiresAtomicPrefill)
 {
     LLMEngineConfig config;

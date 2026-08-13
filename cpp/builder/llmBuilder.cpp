@@ -163,6 +163,14 @@ LLMBuilder::LLMBuilder(
 {
 }
 
+int64_t LLMBuilder::getMaxPackedPrefillChunkTokens() const
+{
+    constexpr int64_t kLEGACY_PACKED_PREFILL_CHUNK_TOKENS = 128;
+    int64_t const exportLimit
+        = mModelConfig.value("packed_prefill_max_chunk_tokens", kLEGACY_PACKED_PREFILL_CHUNK_TOKENS);
+    return mBuilderConfig.maxPrefillChunkTokens > 0 ? mBuilderConfig.maxPrefillChunkTokens : exportLimit;
+}
+
 bool LLMBuilder::build()
 {
     std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
@@ -191,6 +199,20 @@ bool LLMBuilder::build()
         if (mBuilderConfig.maxKVCacheCapacity % tokensPerPage != 0 || mBuilderConfig.kvCachePageBundles < minBundles)
         {
             LOG_ERROR("Paged KV requires capacity divisible by 128 and --kvCachePageBundles >= %ld.", minBundles);
+            return false;
+        }
+    }
+    if (mModelConfig.value("packed_prefill", false))
+    {
+        constexpr int64_t kLEGACY_PACKED_PREFILL_CHUNK_TOKENS = 128;
+        int64_t const exportLimit
+            = mModelConfig.value("packed_prefill_max_chunk_tokens", kLEGACY_PACKED_PREFILL_CHUNK_TOKENS);
+        int64_t const buildLimit = getMaxPackedPrefillChunkTokens();
+        if (buildLimit <= 0 || buildLimit > exportLimit || buildLimit > mBuilderConfig.maxInputLen)
+        {
+            LOG_ERROR(
+                "Packed prefill requires 0 < --maxPrefillChunkTokens <= export limit (%ld) and maxInputLen (%ld).",
+                exportLimit, mBuilderConfig.maxInputLen);
             return false;
         }
     }
@@ -680,8 +702,7 @@ bool LLMBuilder::setupVanillaProfiles(
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
-    constexpr int64_t kPACKED_PREFILL_CHUNK_TOKENS = 128;
-    int64_t const maxPackedTokens = maxPrefillBatchSize * kPACKED_PREFILL_CHUNK_TOKENS;
+    int64_t const maxPackedTokens = maxPrefillBatchSize * getMaxPackedPrefillChunkTokens();
 
     // Input embeddings - always dynamic
     if (packedPrefill)
@@ -934,8 +955,7 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
-    constexpr int64_t kPACKED_PREFILL_CHUNK_TOKENS = 128;
-    int64_t const maxPackedTokens = maxPrefillBatchSize * kPACKED_PREFILL_CHUNK_TOKENS;
+    int64_t const maxPackedTokens = maxPrefillBatchSize * getMaxPackedPrefillChunkTokens();
     std::string_view const prefix = binding_names::kPleTokenEmbedsTemplate;
 
     for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
@@ -1005,8 +1025,7 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
     int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
-    constexpr int64_t kPACKED_PREFILL_CHUNK_TOKENS = 128;
-    int64_t const maxPackedTokens = maxPrefillBatchSize * kPACKED_PREFILL_CHUNK_TOKENS;
+    int64_t const maxPackedTokens = maxPrefillBatchSize * getMaxPackedPrefillChunkTokens();
 
     // Dynamically detect all deepstack_embeds inputs in the network
     std::vector<std::string> deepstackInputs;

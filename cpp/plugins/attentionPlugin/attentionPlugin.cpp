@@ -359,7 +359,8 @@ void AttentionPlugin::enforceVisionBlockKernelSupport() const
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
     int32_t slidingWindowSize, std::vector<float> const& qkvScales, std::optional<float> attentionScale,
-    int32_t enableIndexedKVCache, int32_t enablePagedKVCache, int32_t enablePackedPrefill)
+    int32_t enableIndexedKVCache, int32_t enablePagedKVCache, int32_t enablePackedPrefill,
+    int32_t packedPrefillMaxChunkTokens)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
@@ -370,6 +371,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mEnableIndexedKVCache(enableIndexedKVCache)
     , mEnablePagedKVCache(enablePagedKVCache)
     , mEnablePackedPrefill(enablePackedPrefill)
+    , mPackedPrefillMaxChunkTokens(packedPrefillMaxChunkTokens)
     , mEnableFp8KVCache(enableFp8KVCache)
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
     , mSlidingWindowSize(slidingWindowSize)
@@ -385,6 +387,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     ELLM_CHECK(!mEnablePackedPrefill || mHeadSize == 128, "Packed prefill v1 supports head size 128 only.");
     ELLM_CHECK(!mEnablePackedPrefill || mSlidingWindowSize <= 0,
         "Packed prefill v1 does not support sliding-window attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
+        "Packed prefill maximum chunk length must be positive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || mQkvScales.size() == 3,
         "FP8 KV cache enabled but qkv_scales has "
@@ -491,6 +495,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mEnableIndexedKVCache = parsePluginScalarField<int32_t>("enable_indexed_kv_cache", fc).value_or(0);
     mEnablePagedKVCache = parsePluginScalarField<int32_t>("enable_paged_kv_cache", fc).value_or(0);
     mEnablePackedPrefill = parsePluginScalarField<int32_t>("enable_packed_prefill", fc).value_or(0);
+    mPackedPrefillMaxChunkTokens = parsePluginScalarField<int32_t>("packed_prefill_max_chunk_tokens", fc).value_or(128);
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
     ELLM_CHECK(!mEnableIndexedKVCache || (!mEnableTreeAttention && !mEnableVisionBlockAttention),
@@ -502,6 +507,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     ELLM_CHECK(!mEnablePackedPrefill || mHeadSize == 128, "Packed prefill v1 supports head size 128 only.");
     ELLM_CHECK(!mEnablePackedPrefill || mSlidingWindowSize <= 0,
         "Packed prefill v1 does not support sliding-window attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
+        "Packed prefill maximum chunk length must be positive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
 
     // Parse qkv_scales float array
@@ -604,7 +611,7 @@ IPluginV3* AttentionPlugin::clone() noexcept
     {
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
             mEnableFp8KVCache, mEnableVisionBlockAttention, mSlidingWindowSize, mQkvScales, mAttentionScale,
-            mEnableIndexedKVCache, mEnablePagedKVCache, mEnablePackedPrefill);
+            mEnableIndexedKVCache, mEnablePagedKVCache, mEnablePackedPrefill, mPackedPrefillMaxChunkTokens);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -1363,8 +1370,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 = gatherPackedKVCache(kvCacheTensor, cuKVSeqLensTensor, alignedWorkspacePtr, runtimeBatchSize,
                     mNumKVHeads, kvCacheCapacity, mHeadSize, stream, kvSlotIds, kvPageIds);
 
-            constexpr int32_t kPACKED_PREFILL_CHUNK_SIZE = 128;
-            int32_t const maxQSeqLen = std::min(runtimeSeqLen, kPACKED_PREFILL_CHUNK_SIZE);
+            int32_t const maxQSeqLen = std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens);
             auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, maxQSeqLen, mNumQHeads, mNumKVHeads,
                 mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL,
                 /*isSPadded=*/false);
@@ -1756,6 +1762,8 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("enable_indexed_kv_cache", &mEnableIndexedKVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_paged_kv_cache", &mEnablePagedKVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_packed_prefill", &mEnablePackedPrefill, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back(
+        "packed_prefill_max_chunk_tokens", &mPackedPrefillMaxChunkTokens, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
@@ -1785,6 +1793,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_indexed_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_paged_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_packed_prefill", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("packed_prefill_max_chunk_tokens", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)
     mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
     // Optional QKV dequant scales [q, k, v] for FP8 attention

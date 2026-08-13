@@ -538,8 +538,10 @@ class ModelConfig:
     indexed_kv_cache: bool = False
     # True paged storage. Requires indexed_kv_cache and a runtime page-pool budget.
     paged_kv_cache: bool = False
-    # Pack fixed-size prefill rows into one [1, total_tokens] token carrier.
+    # Pack variable-length prefill rows into one [1, total_tokens] token carrier.
     packed_prefill: bool = False
+    # Maximum logical row length compiled into packed-prefill attention.
+    packed_prefill_max_chunk_tokens: int = 128
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)

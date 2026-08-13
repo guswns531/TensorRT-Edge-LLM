@@ -157,6 +157,26 @@ TEST_F(LLMEngineConfigTest, ParseIndexedKVCacheWithGroupedQueryAttention)
 TEST_F(LLMEngineConfigTest, ParsePackedPrefillContract)
 {
     Json json = makeMinimalConfig();
+    json["builder_config"]["max_input_len"] = 256;
+    json["head_dim"] = 128;
+    json["indexed_kv_cache"] = true;
+    json["paged_kv_cache"] = true;
+    json["packed_prefill"] = true;
+    json["packed_prefill_max_chunk_tokens"] = 256;
+    json["builder_config"]["kv_cache_page_bundles"] = 2;
+    json["builder_config"]["max_prefill_chunk_tokens"] = 192;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path);
+    EXPECT_TRUE(cfg.indexedKVCache);
+    EXPECT_TRUE(cfg.pagedKVCache);
+    EXPECT_TRUE(cfg.packedPrefill);
+    EXPECT_EQ(cfg.maxPackedPrefillChunkTokens, 192);
+}
+
+TEST_F(LLMEngineConfigTest, PackedPrefillDefaultsToLegacyChunkContract)
+{
+    Json json = makeMinimalConfig();
     json["head_dim"] = 128;
     json["indexed_kv_cache"] = true;
     json["paged_kv_cache"] = true;
@@ -165,9 +185,22 @@ TEST_F(LLMEngineConfigTest, ParsePackedPrefillContract)
     auto const path = writeJsonToTempFile(json);
 
     LLMEngineConfig const cfg = parseEngineConfig(path);
-    EXPECT_TRUE(cfg.indexedKVCache);
-    EXPECT_TRUE(cfg.pagedKVCache);
-    EXPECT_TRUE(cfg.packedPrefill);
+    EXPECT_EQ(cfg.maxPackedPrefillChunkTokens, 128);
+}
+
+TEST_F(LLMEngineConfigTest, PackedPrefillRejectsBuildChunkBeyondExportContract)
+{
+    Json json = makeMinimalConfig();
+    json["head_dim"] = 128;
+    json["indexed_kv_cache"] = true;
+    json["paged_kv_cache"] = true;
+    json["packed_prefill"] = true;
+    json["packed_prefill_max_chunk_tokens"] = 128;
+    json["builder_config"]["kv_cache_page_bundles"] = 2;
+    json["builder_config"]["max_prefill_chunk_tokens"] = 256;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
 }
 
 TEST_F(LLMEngineConfigTest, PackedPrefillRequiresPagedCache)

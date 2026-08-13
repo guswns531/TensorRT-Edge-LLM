@@ -62,7 +62,8 @@ inline ModelPhaseContract makeModelPhaseContract(LLMEngineConfig const& config)
     contract.supportsChunkedPrefill = !config.useVisionBidirectionalAttention;
     contract.requiresAtomicMultimodalPrefill = config.useVisionBidirectionalAttention;
     contract.supportsDynamicAdmission = config.indexedKVCache;
-    contract.maxPrefillChunkTokens = std::max(1, config.maxSupportedInputLength);
+    contract.maxPrefillChunkTokens
+        = config.packedPrefill ? config.maxPackedPrefillChunkTokens : std::max(1, config.maxSupportedInputLength);
     return contract;
 }
 

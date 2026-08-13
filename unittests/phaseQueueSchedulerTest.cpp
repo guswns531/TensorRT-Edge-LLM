@@ -297,14 +297,14 @@ TEST(PhaseQueueSchedulerTest, AppliesPrefillTokenBudgetWithoutChangingChunkCompa
     EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
 }
 
-TEST(PhaseQueueSchedulerTest, PackedPrefillRequiresFixed128TokenChunks)
+TEST(PhaseQueueSchedulerTest, PackedPrefillAcceptsAnyPositiveEngineChunkContract)
 {
     PhaseQueueSchedulerConfig config;
-    config.maxPrefillChunkTokens = 64;
+    config.maxPrefillChunkTokens = 0;
     config.enablePackedPrefillTokenLayout = true;
     EXPECT_THROW(PhaseQueueScheduler scheduler(config), std::runtime_error);
 
-    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillChunkTokens = 256;
     EXPECT_NO_THROW(PhaseQueueScheduler scheduler(config));
 }
 
@@ -443,6 +443,49 @@ TEST(PhaseQueueSchedulerTest, CompletionBonusDoesNotPromoteNearlyFullContinuatio
         EXPECT_EQ(item.tokenOffset, 0);
         EXPECT_EQ(item.tokenCount, 109);
     }
+}
+
+TEST(PhaseQueueSchedulerTest, UsesLargerQueueDrainChunkOnlyWhileDecodeIsEmpty)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxOverlapPrefillTokens = 256;
+    config.maxPrefillChunkTokens = 256;
+    config.decodeActivePrefillChunkTokens = 128;
+
+    PhaseQueueScheduler queueDrainScheduler(config);
+    queueDrainScheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    PhaseDispatchPlan const queueDrain = queueDrainScheduler.next();
+    ASSERT_EQ(queueDrain.prefillBatch.size(), 1U);
+    EXPECT_EQ(queueDrain.prefillBatch.front().tokenCount, 256);
+
+    PhaseQueueScheduler steadyStateScheduler(config);
+    steadyStateScheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    steadyStateScheduler.enqueueDecode({2, 512, 1});
+    PhaseDispatchPlan const steadyState = steadyStateScheduler.next();
+    ASSERT_EQ(steadyState.prefillBatch.size(), 1U);
+    EXPECT_EQ(steadyState.prefillBatch.front().tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsLargeChunksUntilPrefillBacklogDrains)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxOverlapPrefillTokens = 256;
+    config.maxPrefillChunkTokens = 256;
+    config.decodeActivePrefillChunkTokens = 128;
+    config.largePrefillChunkQueueThreshold = 2;
+
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueuePrefill({2, 256, 1, 0, 256});
+    scheduler.enqueueDecode({3, 512, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 256);
 }
 
 TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)

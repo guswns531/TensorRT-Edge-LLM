@@ -306,7 +306,8 @@ class AttentionPluginRunner:
                  attention_scale: Optional[float] = None,
                  enable_indexed_kv_cache=False,
                  enable_paged_kv_cache=False,
-                 enable_packed_prefill=False):
+                 enable_packed_prefill=False,
+                 packed_prefill_max_chunk_tokens=128):
         self.p = p
         self.tree = enable_tree_attention
         self.allow_empty_kv = allow_empty_kv
@@ -314,6 +315,7 @@ class AttentionPluginRunner:
         self.indexed_kv = enable_indexed_kv_cache
         self.paged_kv = enable_paged_kv_cache
         self.packed_prefill = enable_packed_prefill
+        self.packed_prefill_max_chunk_tokens = packed_prefill_max_chunk_tokens
         self.kv_dtype = trt.fp8 if p.enable_fp8_kv_cache else trt.float16
         self.runner = PluginRunner()
         self._build()
@@ -374,6 +376,8 @@ class AttentionPluginRunner:
             pf_int32("enable_indexed_kv_cache", int(self.indexed_kv)),
             pf_int32("enable_paged_kv_cache", int(self.paged_kv)),
             pf_int32("enable_packed_prefill", int(self.packed_prefill)),
+            pf_int32("packed_prefill_max_chunk_tokens",
+                     self.packed_prefill_max_chunk_tokens),
         ]
         if p.enable_fp8_kv_cache:
             fields.append(pf_float32("qkv_scales", p.qkv_scales))
@@ -1126,13 +1130,13 @@ def test_ragged_prefill(label, seqlens):
 
 
 def test_packed_prefill_indexed_paged():
-    """Compact [1,T,*] prefill uses context_lengths as the logical batch."""
-    seqlens = [8, 5, 3]
+    """Compact prefill supports logical rows beyond the legacy 128 tokens."""
+    seqlens = [129, 64, 3]
     total_tokens = sum(seqlens)
     cfg = dict(BASE)
-    cfg["kv_cache_capacity"] = 128
+    cfg["kv_cache_capacity"] = 256
     cfg["max_seq_len"] = total_tokens
-    cfg["max_position_embeddings"] = 128
+    cfg["max_position_embeddings"] = 256
     cfg["max_batch_size"] = 4
     p = AttentionParams(batch_size=len(seqlens),
                         seq_len=total_tokens,
@@ -1141,7 +1145,8 @@ def test_packed_prefill_indexed_paged():
     runner = AttentionPluginRunner(p,
                                    enable_indexed_kv_cache=True,
                                    enable_paged_kv_cache=True,
-                                   enable_packed_prefill=True)
+                                   enable_packed_prefill=True,
+                                   packed_prefill_max_chunk_tokens=256)
     gen = torch.Generator().manual_seed(9182)
     cos, sin, combined = _make_rope(p, gen)
     dense_qkv = torch.randn((len(seqlens), max(seqlens), p.qkv_hidden_size),
@@ -1160,9 +1165,11 @@ def test_packed_prefill_indexed_paged():
     context_lengths = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
     cache_indices = torch.zeros(len(seqlens), dtype=torch.int32, device=DEV)
     slot_ids = torch.tensor([3, 0, 2], dtype=torch.int32, device=DEV)
-    page_ids = torch.arange(p.max_batch_size * 2,
+    pages_per_sequence = p.kv_cache_capacity // 128
+    page_ids = torch.arange(p.max_batch_size * 2 * pages_per_sequence,
                             dtype=torch.int32,
-                            device=DEV).reshape(p.max_batch_size, 2, 1)
+                            device=DEV).reshape(p.max_batch_size, 2,
+                                                pages_per_sequence)
     attn_out, _ = runner.run(q,
                              k,
                              v,
@@ -1177,7 +1184,10 @@ def test_packed_prefill_indexed_paged():
     assert_close("packed-prefill", expected, attn_out[0], 1e-2, 1e-2)
     physical_pages = plugin_kv.reshape(p.max_batch_size * 2, 128,
                                        p.num_kv_heads, p.head_size)
-    assert torch.count_nonzero(physical_pages[2:4]) == 0, \
+    unleased_page_begin = 2 * pages_per_sequence
+    unleased_page_end = 2 * unleased_page_begin
+    assert torch.count_nonzero(physical_pages[unleased_page_begin:
+                                              unleased_page_end]) == 0, \
         "unleased slot 1 pages must remain untouched"
 
 

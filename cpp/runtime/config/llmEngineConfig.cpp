@@ -548,6 +548,11 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
     cfg.kvCachePageBundles = bc.value("kv_cache_page_bundles", 0);
+    constexpr int32_t kLEGACY_PACKED_PREFILL_CHUNK_TOKENS = 128;
+    int32_t const exportedPackedPrefillChunkTokens
+        = configJson.value("packed_prefill_max_chunk_tokens", kLEGACY_PACKED_PREFILL_CHUNK_TOKENS);
+    cfg.maxPackedPrefillChunkTokens
+        = cfg.packedPrefill ? bc.value("max_prefill_chunk_tokens", exportedPackedPrefillChunkTokens) : 0;
     if (cfg.pagedKVCache)
     {
         ELLM_CHECK(cfg.indexedKVCache, "paged_kv_cache requires indexed_kv_cache.");
@@ -562,6 +567,10 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         ELLM_CHECK(cfg.pagedKVCache, "packed_prefill requires paged_kv_cache.");
         ELLM_CHECK(cfg.headDim == 128, "packed_prefill v1 requires attention head dimension 128.");
         ELLM_CHECK(cfg.kvCacheDtype == nvinfer1::DataType::kHALF, "packed_prefill v1 requires FP16 KV cache.");
+        ELLM_CHECK(cfg.maxPackedPrefillChunkTokens > 0
+                && cfg.maxPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
+                && cfg.maxPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
+            "packed_prefill max chunk must be positive and no greater than the export and input limits.");
     }
 
     // Recurrent / conv state dtypes are only meaningful for hybrid engines
@@ -771,8 +780,9 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " maxKVCapacity=" << cfg.maxKVCacheCapacity << " pleEnabled=" << cfg.pleEnabled
        << " numPleInputs=" << cfg.numPleInputs << " pleHiddenSize=" << cfg.pleHiddenSize
        << " indexedKV=" << cfg.indexedKVCache << " pagedKV=" << cfg.pagedKVCache
-       << " packedPrefill=" << cfg.packedPrefill << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " packedPrefill=" << cfg.packedPrefill << " maxPackedPrefillChunk=" << cfg.maxPackedPrefillChunkTokens
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim

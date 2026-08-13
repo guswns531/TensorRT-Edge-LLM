@@ -185,6 +185,12 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="packed_prefill_max_chunk_tokens",
+            type=OpSchema.AttrType.INT,
+            description="Maximum logical row length for packed prefill.",
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="sliding_window_size",
             type=OpSchema.AttrType.INT,
             description=
