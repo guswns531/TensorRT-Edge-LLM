@@ -179,6 +179,11 @@ public:
     //! @return The leased physical KV slot ID.
     int32_t submit(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow, int32_t promptTokenCount,
         PhaseSchedulingHints scheduling = {});
+    //! Submit a request by reusing an immutable prefix from an active request.
+    //! At least one target prompt token remains for normal prefill sampling semantics.
+    int32_t submitWithPagedPrefix(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
+        int32_t promptTokenCount, uint64_t sourceRequestId, int32_t prefixLength, cudaStream_t stream,
+        PhaseSchedulingHints scheduling = {});
     //! Register source state and lease a slot before asynchronous encoder execution.
     int32_t reserveForEncoder(uint64_t requestId, DecodingInferenceContext& context, int32_t contextRow,
         int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling = {});

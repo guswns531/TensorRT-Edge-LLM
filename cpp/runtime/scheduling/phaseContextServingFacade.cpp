@@ -629,6 +629,43 @@ int32_t PhaseContextServingFacade::submit(uint64_t requestId, DecodingInferenceC
     }
 }
 
+int32_t PhaseContextServingFacade::submitWithPagedPrefix(uint64_t requestId, DecodingInferenceContext& context,
+    int32_t contextRow, int32_t promptTokenCount, uint64_t sourceRequestId, int32_t prefixLength, cudaStream_t stream,
+    PhaseSchedulingHints scheduling)
+{
+    check::check(mCacheManager.isIndexedKVCache() && mCacheManager.isPagedKVCache(),
+        "Serving prefix reuse requires indexed-paged KV cache mode.");
+    std::optional<PhaseRequestSnapshot> const source = mLifecycle->request(sourceRequestId);
+    check::check(source.has_value() && source->kvSlotId >= 0, "Serving prefix source request is not active.");
+    check::check(prefixLength > 0 && prefixLength <= source->kvLength && prefixLength < promptTokenCount,
+        "Serving prefix length is outside the reusable source/target range.");
+    registerSource(requestId, context, contextRow);
+    PageBundleReservation const pageReservation = makePageBundleReservation(context, contextRow, promptTokenCount);
+    int32_t targetSlot{-1};
+    try
+    {
+        reservePageBundles(requestId, pageReservation);
+        targetSlot = mLifecycle->reserveForEncoder(requestId, promptTokenCount, scheduling);
+        mCacheManager.sharePagedKVPrefix(source->kvSlotId, targetSlot, prefixLength, stream);
+        mLifecycle->beginPrefill(requestId, promptTokenCount, /*allowChunkedPrefill=*/true, prefixLength);
+        return targetSlot;
+    }
+    catch (...)
+    {
+        bool cancelled{};
+        if (targetSlot >= 0)
+        {
+            cancelled = mLifecycle->cancel(requestId);
+        }
+        if (!cancelled)
+        {
+            releasePageBundles(requestId);
+            mRegistrations.erase(requestId);
+        }
+        throw;
+    }
+}
+
 int32_t PhaseContextServingFacade::reserveForEncoder(uint64_t requestId, DecodingInferenceContext& context,
     int32_t contextRow, int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling)
 {

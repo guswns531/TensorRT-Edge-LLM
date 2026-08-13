@@ -218,6 +218,10 @@ public:
     //! Reserve the next token for every active handleRequest() sequence.
     void preparePagedKVCapacityForDecode(cudaStream_t stream);
 
+    //! Reuse an immutable prefix from one stable slot in an empty target slot.
+    //! Full pages are shared and a partial tail page is copied privately.
+    void sharePagedKVPrefix(int32_t sourceSlot, int32_t targetSlot, int32_t prefixLength, cudaStream_t stream);
+
     //! Release every physical page owned by a stable phase-server slot.
     //!
     //! The caller must invoke this only after the slot's final GPU event has

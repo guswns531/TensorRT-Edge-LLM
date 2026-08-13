@@ -37,8 +37,8 @@ KVPageBundleAllocator::KVPageBundleAllocator(Config const& config)
         "Paged KV v1 requires maximum sequence length divisible by 128.");
 
     mMaxPagesPerSequence = mConfig.maxSequenceLength / mConfig.tokensPerPage;
-    check::check(mConfig.numPageBundles >= mMaxPagesPerSequence,
-        "KV page-bundle pool cannot hold one maximum-length sequence.");
+    check::check(
+        mConfig.numPageBundles >= mMaxPagesPerSequence, "KV page-bundle pool cannot hold one maximum-length sequence.");
     reset();
 }
 
@@ -49,6 +49,7 @@ void KVPageBundleAllocator::reset()
     {
         mFreeBundles.insert(page);
     }
+    mBundleRefCounts.assign(mConfig.numPageBundles, 0);
     mSlotBundles.assign(mConfig.numSlots, {});
 }
 
@@ -77,8 +78,49 @@ void KVPageBundleAllocator::ensureCapacity(int32_t slot, int32_t sequenceLength)
     for (int32_t page : reserved)
     {
         mFreeBundles.erase(page);
+        check::check(mBundleRefCounts[page] == 0, "Free KV page bundle has a nonzero reference count.");
+        mBundleRefCounts[page] = 1;
         owned.push_back(page);
     }
+}
+
+KVPagePrefixShare KVPageBundleAllocator::sharePrefix(int32_t sourceSlot, int32_t targetSlot, int32_t prefixLength)
+{
+    validateSlot(sourceSlot);
+    validateSlot(targetSlot);
+    check::check(sourceSlot != targetSlot, "KV prefix source and target slots must differ.");
+    check::check(mSlotBundles[targetSlot].empty(), "KV prefix target slot must be empty.");
+    check::check(prefixLength > 0, "KV prefix length must be positive.");
+    int32_t const requiredPages = pagesForLength(prefixLength);
+    auto const& source = mSlotBundles[sourceSlot];
+    check::check(static_cast<int32_t>(source.size()) >= requiredPages,
+        "KV prefix source slot does not own the requested prefix.");
+
+    int32_t const tailTokens = prefixLength % mConfig.tokensPerPage;
+    int32_t const sharedBundles = prefixLength / mConfig.tokensPerPage;
+    check::check(
+        tailTokens == 0 || !mFreeBundles.empty(), "KV page-bundle pool cannot allocate a private prefix tail.");
+
+    auto& target = mSlotBundles[targetSlot];
+    target.reserve(requiredPages);
+    for (int32_t page = 0; page < sharedBundles; ++page)
+    {
+        int32_t const bundle = source[page];
+        ++mBundleRefCounts[bundle];
+        target.push_back(bundle);
+    }
+    KVPagePrefixShare result{sharedBundles, -1, -1, tailTokens};
+    if (tailTokens > 0)
+    {
+        int32_t const targetTail = *mFreeBundles.begin();
+        mFreeBundles.erase(targetTail);
+        check::check(mBundleRefCounts[targetTail] == 0, "Free KV tail bundle has a nonzero reference count.");
+        mBundleRefCounts[targetTail] = 1;
+        target.push_back(targetTail);
+        result.sourceTailBundle = source[sharedBundles];
+        result.targetTailBundle = targetTail;
+    }
+    return result;
 }
 
 void KVPageBundleAllocator::release(int32_t slot)
@@ -88,8 +130,13 @@ void KVPageBundleAllocator::release(int32_t slot)
     check::check(!owned.empty(), "KV page-bundle allocator detected a release of an empty slot.");
     for (int32_t page : owned)
     {
-        bool const inserted = mFreeBundles.insert(page).second;
-        check::check(inserted, "KV page-bundle allocator detected duplicate physical ownership.");
+        check::check(mBundleRefCounts[page] > 0, "KV page-bundle allocator detected an invalid reference count.");
+        --mBundleRefCounts[page];
+        if (mBundleRefCounts[page] == 0)
+        {
+            bool const inserted = mFreeBundles.insert(page).second;
+            check::check(inserted, "KV page-bundle allocator detected duplicate physical ownership.");
+        }
     }
     owned.clear();
 }
@@ -103,8 +150,7 @@ std::vector<int32_t> const& KVPageBundleAllocator::bundles(int32_t slot) const
 std::vector<int32_t> KVPageBundleAllocator::makePhysicalPageTable() const
 {
     constexpr int32_t kKV_PLANES = 2;
-    std::vector<int32_t> pageTable(
-        static_cast<size_t>(mConfig.numSlots) * kKV_PLANES * mMaxPagesPerSequence, -1);
+    std::vector<int32_t> pageTable(static_cast<size_t>(mConfig.numSlots) * kKV_PLANES * mMaxPagesPerSequence, -1);
     for (int32_t slot = 0; slot < mConfig.numSlots; ++slot)
     {
         std::vector<int32_t> const row = makePhysicalPageTableRow(slot);
@@ -142,6 +188,12 @@ int32_t KVPageBundleAllocator::allocatedBundles() const noexcept
 int32_t KVPageBundleAllocator::maxPagesPerSequence() const noexcept
 {
     return mMaxPagesPerSequence;
+}
+
+int32_t KVPageBundleAllocator::bundleRefCount(int32_t bundle) const
+{
+    check::check(bundle >= 0 && bundle < mConfig.numPageBundles, "KV page-bundle ID is out of range.");
+    return mBundleRefCounts[bundle];
 }
 
 KVPageBundleAllocator::Config const& KVPageBundleAllocator::getConfig() const noexcept

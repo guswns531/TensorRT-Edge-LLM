@@ -26,6 +26,15 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Result of attaching an immutable paged-KV prefix to another slot.
+struct KVPagePrefixShare
+{
+    int32_t sharedBundles{};      //!< Full immutable bundles shared by reference
+    int32_t sourceTailBundle{-1}; //!< Partial source bundle copied for private tail ownership
+    int32_t targetTailBundle{-1}; //!< Newly allocated private tail bundle
+    int32_t tailTokens{};         //!< Valid prefix tokens in the copied tail bundle
+};
+
 //! Host-side ownership manager for a shared paged KV-cache pool.
 //!
 //! A bundle ID denotes the same token range in every attention layer. Each
@@ -56,6 +65,11 @@ public:
     //! removed from the free-list and the slot's existing ownership is intact.
     void ensureCapacity(int32_t slot, int32_t sequenceLength);
 
+    //! Attach a source slot's immutable prefix to an empty target slot.
+    //! Full pages are refcounted. A partial final page gets a private target
+    //! bundle so later writes never mutate the source request.
+    KVPagePrefixShare sharePrefix(int32_t sourceSlot, int32_t targetSlot, int32_t prefixLength);
+
     //! Release every bundle owned by a slot.
     void release(int32_t slot);
 
@@ -77,6 +91,7 @@ public:
     int32_t availableBundles() const noexcept;
     int32_t allocatedBundles() const noexcept;
     int32_t maxPagesPerSequence() const noexcept;
+    int32_t bundleRefCount(int32_t bundle) const;
     Config const& getConfig() const noexcept;
 
 private:
@@ -86,6 +101,7 @@ private:
     Config mConfig{};
     int32_t mMaxPagesPerSequence{};
     std::set<int32_t> mFreeBundles;
+    std::vector<int32_t> mBundleRefCounts;
     std::vector<std::vector<int32_t>> mSlotBundles;
 };
 

@@ -393,6 +393,49 @@ void HybridCacheManager::preparePagedKVCapacityForDecode(cudaStream_t stream)
     preparePagedKVCapacityForActiveLengths(lengths, /*extraTokens=*/1, stream);
 }
 
+void HybridCacheManager::sharePagedKVPrefix(
+    int32_t sourceSlot, int32_t targetSlot, int32_t prefixLength, cudaStream_t stream)
+{
+    check::check(mConfig.indexedKVCache && mConfig.kvConfig.pagedKVCache && mPageAllocator.has_value(),
+        "Paged KV prefix sharing requires indexed-paged cache mode.");
+    std::lock_guard<std::mutex> const lock(mPageAllocatorMutex);
+    check::check(sourceSlot >= 0 && sourceSlot < static_cast<int32_t>(mHostGlobalKVCacheLengths.size())
+            && targetSlot >= 0 && targetSlot < static_cast<int32_t>(mHostGlobalKVCacheLengths.size()),
+        "Paged KV prefix slot is out of range.");
+    check::check(prefixLength <= mHostGlobalKVCacheLengths[sourceSlot],
+        "Paged KV prefix length exceeds the source slot length.");
+    KVPagePrefixShare const share = mPageAllocator->sharePrefix(sourceSlot, targetSlot, prefixLength);
+    if (share.tailTokens > 0)
+    {
+        constexpr int32_t kKV_PLANES{2};
+        size_t const elementBytes = rt::utils::getTypeSize(mConfig.kvConfig.kvCacheType);
+        for (int32_t layer = 0; layer < mKVCache.numLayers(); ++layer)
+        {
+            KVLayerConfig const& config = mKVCache.getLayerConfig(layer);
+            size_t const pageBytes = static_cast<size_t>(mConfig.kvConfig.tokensPerPage) * config.numKVHeads
+                * config.headDim * elementBytes;
+            char* const storage = static_cast<char*>(mKVCache.getCombinedKVCache(layer).rawPointer());
+            for (int32_t plane = 0; plane < kKV_PLANES; ++plane)
+            {
+                size_t const sourceOffset
+                    = static_cast<size_t>(share.sourceTailBundle * kKV_PLANES + plane) * pageBytes;
+                size_t const targetOffset
+                    = static_cast<size_t>(share.targetTailBundle * kKV_PLANES + plane) * pageBytes;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    storage + targetOffset, storage + sourceOffset, pageBytes, cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+    mHostGlobalKVCacheLengths[targetSlot] = prefixLength;
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceGlobalKVCacheLengths.dataPointer<int32_t>() + targetSlot,
+        mHostGlobalKVCacheLengths.data() + targetSlot, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    std::vector<int32_t> const row = mPageAllocator->makePhysicalPageTableRow(targetSlot);
+    size_t const offset = static_cast<size_t>(targetSlot) * row.size();
+    std::copy(row.begin(), row.end(), mHostKVPageIds.begin() + offset);
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVPageIds.dataPointer<int32_t>() + offset, mHostKVPageIds.data() + offset,
+        row.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+}
+
 void HybridCacheManager::releasePagedKVSlot(int32_t slot)
 {
     if (!mConfig.kvConfig.pagedKVCache)

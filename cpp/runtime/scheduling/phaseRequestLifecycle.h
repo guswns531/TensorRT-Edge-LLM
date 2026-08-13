@@ -84,7 +84,8 @@ public:
     int32_t reserveForEncoder(
         uint64_t requestId, int32_t promptTokenCountEstimate, PhaseSchedulingHints scheduling = {});
     //! Transition a reserved encoder request to the prefill queue.
-    void beginPrefill(uint64_t requestId, int32_t promptTokenCount, bool allowChunkedPrefill = true);
+    void beginPrefill(
+        uint64_t requestId, int32_t promptTokenCount, bool allowChunkedPrefill = true, int32_t prefixLength = 0);
     int32_t submit(uint64_t requestId, int32_t promptTokenCount, PhaseSchedulingHints scheduling = {});
     bool cancel(uint64_t requestId);
 

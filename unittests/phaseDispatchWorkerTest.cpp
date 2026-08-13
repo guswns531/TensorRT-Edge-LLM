@@ -695,6 +695,42 @@ TEST(PhaseRequestLifecycleTest, DefersPrefillUntilEncoderHandoff)
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
+TEST(PhaseRequestLifecycleTest, PrefixReuseQueuesOnlyUncachedPromptSuffix)
+{
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    rt::PhaseWorkItem observed;
+    rt::PhaseRequestLifecycleCallbacks callbacks;
+    callbacks.execution.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t) {
+        ASSERT_EQ(batch.size(), 1U);
+        observed = batch.front();
+    };
+    callbacks.execution.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.execution.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    callbacks.execution.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    rt::PhaseRequestLifecycle lifecycle(
+        1, rt::PhaseQueueSchedulerConfig{}, std::move(callbacks), prefillStream, decodeStream);
+
+    lifecycle.reserveForEncoder(/*requestId=*/9, /*promptTokenCountEstimate=*/384);
+    lifecycle.beginPrefill(
+        /*requestId=*/9, /*promptTokenCount=*/384, /*allowChunkedPrefill=*/true, /*prefixLength=*/256);
+    ASSERT_TRUE(lifecycle.request(9).has_value());
+    EXPECT_EQ(lifecycle.request(9)->kvLength, 256);
+    lifecycle.runUntilIdle(1);
+    EXPECT_EQ(observed.tokenOffset, 256);
+    EXPECT_EQ(observed.tokenCount, 128);
+    EXPECT_EQ(observed.promptTokenCount, 384);
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
 TEST(PhaseGreedySamplerTest, SamplesActualLogitsAndAppliesEosAndLengthState)
 {
     constexpr int32_t batchSize = 2;

@@ -379,6 +379,59 @@ TEST(HybridCacheManagerTests, PagedCapacityCrossesBoundaryAndEvictionClearsOnlyR
         (std::vector<int32_t>{-1, -1, -1, -1, 4, -1, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1}));
 }
 
+TEST(HybridCacheManagerTests, PagedPrefixSharesFullPageAndCopiesPrivateTail)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t kMAX_BATCH{4};
+    constexpr int32_t kTOKENS_PER_PAGE{128};
+    constexpr int32_t kHEAD_DIM{64};
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(1, kMAX_BATCH, 256, 1, kHEAD_DIM);
+    cfg.kvConfig.pagedKVCache = true;
+    cfg.kvConfig.numPageBundles = 6;
+    cfg.mambaConfig = makeMambaConfig(0, kMAX_BATCH);
+    cfg.maxBatchSize = kMAX_BATCH;
+    cfg.indexedKVCache = true;
+    rt::HybridCacheManager mgr(cfg, stream);
+
+    rt::Tensor reuseLengths({2}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memset(reuseLengths.rawPointer(), 0, reuseLengths.getMemoryCapacity());
+    mgr.resetForNewSequences(reuseLengths, stream);
+    mgr.preparePagedKVCapacityForActiveLengths({256, 0}, /*extraTokens=*/0, stream);
+
+    size_t const pageElements = static_cast<size_t>(kTOKENS_PER_PAGE) * kHEAD_DIM;
+    std::vector<half> sourceK(pageElements, __float2half(2.0F));
+    std::vector<half> sourceV(pageElements, __float2half(3.0F));
+    half* const storage = static_cast<half*>(mgr.getCombinedKVCache(0).rawPointer());
+    CUDA_CHECK(cudaMemcpyAsync(
+        storage + 2 * pageElements, sourceK.data(), pageElements * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        storage + 3 * pageElements, sourceV.data(), pageElements * sizeof(half), cudaMemcpyHostToDevice, stream));
+
+    mgr.sharePagedKVPrefix(/*sourceSlot=*/0, /*targetSlot=*/1, /*prefixLength=*/160, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(mgr.getGlobalKVCacheLengths()), (std::vector<int32_t>{0, 160, 0, 0}));
+    std::vector<int32_t> const pageTable = copyDeviceToHost<int32_t>(mgr.getKVPageIds());
+    EXPECT_EQ(std::vector<int32_t>(pageTable.begin() + 4, pageTable.begin() + 8), (std::vector<int32_t>{0, 4, 1, 5}));
+
+    std::vector<half> copiedK(pageElements);
+    std::vector<half> copiedV(pageElements);
+    CUDA_CHECK(
+        cudaMemcpy(copiedK.data(), storage + 4 * pageElements, pageElements * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(copiedV.data(), storage + 5 * pageElements, pageElements * sizeof(half), cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(isclose(copiedK.front(), __float2half(2.0F), 1e-2F, 1e-2F));
+    EXPECT_TRUE(isclose(copiedV.front(), __float2half(3.0F), 1e-2F, 1e-2F));
+
+    std::vector<half> targetWrite(pageElements, __float2half(9.0F));
+    CUDA_CHECK(cudaMemcpy(
+        storage + 4 * pageElements, targetWrite.data(), pageElements * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(sourceK.data(), storage + 2 * pageElements, pageElements * sizeof(half), cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(isclose(sourceK.front(), __float2half(2.0F), 1e-2F, 1e-2F));
+}
+
 // --- Compaction: attention-only, oldBatch < maxBatch ------------------------
 
 TEST(HybridCacheManagerTests, CompactBatchUniformKVSmallerThanMax)

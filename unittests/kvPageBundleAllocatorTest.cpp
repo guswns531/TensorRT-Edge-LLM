@@ -23,6 +23,7 @@
 #include <vector>
 
 using trt_edgellm::rt::KVPageBundleAllocator;
+using trt_edgellm::rt::KVPagePrefixShare;
 
 namespace
 {
@@ -88,14 +89,53 @@ TEST(KVPageBundleAllocatorTest, BuildsKAndVPhysicalPageTable)
     ASSERT_EQ(table.size(), 4U * 2U * static_cast<size_t>(stride));
 
     EXPECT_EQ(std::vector<int32_t>(table.begin(), table.begin() + stride), (std::vector<int32_t>{0, 2, -1, -1}));
-    EXPECT_EQ(std::vector<int32_t>(table.begin() + stride, table.begin() + 2 * stride),
-        (std::vector<int32_t>{1, 3, -1, -1}));
-    EXPECT_EQ(allocator.makePhysicalPageTableRow(0),
-        (std::vector<int32_t>{0, 2, -1, -1, 1, 3, -1, -1}));
+    EXPECT_EQ(
+        std::vector<int32_t>(table.begin() + stride, table.begin() + 2 * stride), (std::vector<int32_t>{1, 3, -1, -1}));
+    EXPECT_EQ(allocator.makePhysicalPageTableRow(0), (std::vector<int32_t>{0, 2, -1, -1, 1, 3, -1, -1}));
 
     int32_t const slot2Offset = 2 * 2 * stride;
     EXPECT_EQ(table[slot2Offset], 4);
     EXPECT_EQ(table[slot2Offset + stride], 5);
+}
+
+TEST(KVPageBundleAllocatorTest, SharesFullPrefixPagesUntilLastOwnerReleases)
+{
+    auto allocator = makeAllocator();
+    allocator.ensureCapacity(0, 256);
+
+    KVPagePrefixShare const share = allocator.sharePrefix(0, 1, 256);
+    EXPECT_EQ(share.sharedBundles, 2);
+    EXPECT_EQ(share.tailTokens, 0);
+    EXPECT_EQ(allocator.bundles(1), allocator.bundles(0));
+    EXPECT_EQ(allocator.bundleRefCount(0), 2);
+    EXPECT_EQ(allocator.bundleRefCount(1), 2);
+    EXPECT_EQ(allocator.allocatedBundles(), 2);
+
+    allocator.release(0);
+    EXPECT_EQ(allocator.allocatedBundles(), 2);
+    allocator.release(1);
+    EXPECT_EQ(allocator.allocatedBundles(), 0);
+}
+
+TEST(KVPageBundleAllocatorTest, GivesPartialPrefixTailPrivateOwnership)
+{
+    auto allocator = makeAllocator();
+    allocator.ensureCapacity(0, 256);
+
+    KVPagePrefixShare const share = allocator.sharePrefix(0, 1, 160);
+    EXPECT_EQ(share.sharedBundles, 1);
+    EXPECT_EQ(share.sourceTailBundle, 1);
+    EXPECT_EQ(share.targetTailBundle, 2);
+    EXPECT_EQ(share.tailTokens, 32);
+    EXPECT_EQ(allocator.bundles(1), (std::vector<int32_t>{0, 2}));
+    EXPECT_EQ(allocator.bundleRefCount(0), 2);
+    EXPECT_EQ(allocator.bundleRefCount(1), 1);
+    EXPECT_EQ(allocator.bundleRefCount(2), 1);
+
+    allocator.release(0);
+    allocator.ensureCapacity(2, 128);
+    EXPECT_EQ(allocator.bundles(2), (std::vector<int32_t>{1}));
+    EXPECT_EQ(allocator.bundles(1), (std::vector<int32_t>{0, 2}));
 }
 
 TEST(KVPageBundleAllocatorTest, RejectsInvalidLifecycleAndConfiguration)

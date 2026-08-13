@@ -145,18 +145,23 @@ int32_t PhaseRequestLifecycle::reserveForEncoder(
     return slot;
 }
 
-void PhaseRequestLifecycle::beginPrefill(uint64_t requestId, int32_t promptTokenCount, bool allowChunkedPrefill)
+void PhaseRequestLifecycle::beginPrefill(
+    uint64_t requestId, int32_t promptTokenCount, bool allowChunkedPrefill, int32_t prefixLength)
 {
     check::check(promptTokenCount > 0, "Phase request prompt length must be positive.");
+    check::check(prefixLength >= 0 && prefixLength < promptTokenCount,
+        "Phase request prefix length must leave at least one prefill token.");
     auto const it = mRequests.find(requestId);
     check::check(it != mRequests.end(), "Encoder completed for an unknown phase request.");
     PhaseRequestSnapshot& snapshot = it->second.snapshot;
     check::check(snapshot.status == PhaseRequestStatus::kEncoder, "Phase request is not waiting for encoder handoff.");
     snapshot.promptTokenCount = promptTokenCount;
+    snapshot.kvLength = prefixLength;
     snapshot.status = PhaseRequestStatus::kPrefill;
     try
     {
-        PhaseWorkItem item{requestId, promptTokenCount, snapshot.kvSlotId, 0, promptTokenCount, allowChunkedPrefill};
+        PhaseWorkItem item{requestId, promptTokenCount - prefixLength, snapshot.kvSlotId, prefixLength,
+            promptTokenCount, allowChunkedPrefill};
         item.scheduling = snapshot.scheduling;
         mScheduler.enqueuePrefill(std::move(item));
     }
