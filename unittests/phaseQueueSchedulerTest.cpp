@@ -782,6 +782,84 @@ TEST(PhaseQueueSchedulerTest, TpotHardGuardConvertsUnsafeOverlapToDecodeOnly)
     EXPECT_TRUE(plan.prefillDeferredForTpot);
 }
 
+TEST(PhaseQueueSchedulerTest, CostAwareAdmissionCanExceedStaticOverlapCap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}, {2, 128, 0, 1, true, 12.0F, 0.8F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F},
+        {2, 1, 128, 0, 512, true, 12.0F, 2.5F, 12.0F, 0.8F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_TRUE(plan.overlapEvaluatedByCost);
+}
+
+TEST(PhaseQueueSchedulerTest, CostAwareAdmissionDefersUncoveredShape)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 64;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}};
+    config.overlapBatchCosts = {{1, 1, 64, 0, 512, true, 4.0F, 2.0F, 4.0F, 0.5F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(plan.prefillBatch.empty());
+    EXPECT_TRUE(plan.prefillDeferredForTpot);
+    EXPECT_TRUE(plan.prefillCostCoverageMiss);
+    EXPECT_TRUE(plan.overlapEvaluatedByCost);
+}
+
+TEST(PhaseQueueSchedulerTest, CostAwareAdmissionPreservesLegacyOverlapInsideStaticCap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}};
+    config.overlapBatchCosts = {{1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64, 0, 0, 64});
+    scheduler.enqueuePrefill({2, 64, 1, 0, 64});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_FALSE(plan.prefillDeferredForTpot);
+    EXPECT_FALSE(plan.prefillCostCoverageMiss);
+    EXPECT_FALSE(plan.overlapEvaluatedByCost);
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesDirectCostForPlannedDecodeBatch)
 {
     PhaseQueueSchedulerConfig config;

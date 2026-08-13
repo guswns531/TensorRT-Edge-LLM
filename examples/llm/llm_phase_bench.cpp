@@ -85,6 +85,7 @@ struct Args
     std::string traceCsv;
     std::string schedulerCostJson;
     std::string schedulerProfile{"custom"};
+    bool ignoreTraceEos{};
     int32_t prefillBatch{1};
     int32_t decodeBatch{1};
     int32_t slotCount{};
@@ -130,6 +131,7 @@ struct Args
     float decodeSlackSafetyFactor{0.8F};
     bool tpotHardGuard{};
     bool requireDirectOverlapCost{};
+    bool costAwareOverlapAdmission{};
     int32_t maxConsecutiveOverlapBatches{4};
     double maxPredictedDecodeDebtMs{50.0};
     rt::PhasePageReservationMode pageReservationMode{rt::PhasePageReservationMode::kFull};
@@ -299,10 +301,10 @@ void printUsage(char const* program)
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
         "--decodeSlackSafetyFactor F "
         "--schedulerCostJson FILE --schedulerProfile custom|latency-safe|balanced|long-prefill|auto "
-        "--tpotHardGuard --requireDirectOverlapCost --maxConsecutiveOverlapBatches N "
+        "--tpotHardGuard --requireDirectOverlapCost --costAwareOverlapAdmission --maxConsecutiveOverlapBatches N "
         "--maxPredictedDecodeDebtMs F] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
-        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R] "
+        "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R --ignoreTraceEos] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
         "--pageReservationGrowthRequests N --fullReservationPromptThresholdTokens N "
@@ -356,6 +358,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kSchedulerProfile,
         kTpotHardGuard,
         kRequireDirectOverlapCost,
+        kCostAwareOverlapAdmission,
         kMaxConsecutiveOverlapBatches,
         kMaxPredictedDecodeDebtMs,
         kLoadRequests,
@@ -375,6 +378,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kMultimodalEngineDir,
         kTraceCsv,
         kTraceArrivalRate,
+        kIgnoreTraceEos,
         kPageReservationMode,
         kPageReservationHeadroomTokens,
         kPageReservationOvercommitBundles,
@@ -419,6 +423,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"schedulerProfile", required_argument, nullptr, kSchedulerProfile},
         {"tpotHardGuard", no_argument, nullptr, kTpotHardGuard},
         {"requireDirectOverlapCost", no_argument, nullptr, kRequireDirectOverlapCost},
+        {"costAwareOverlapAdmission", no_argument, nullptr, kCostAwareOverlapAdmission},
         {"maxConsecutiveOverlapBatches", required_argument, nullptr, kMaxConsecutiveOverlapBatches},
         {"maxPredictedDecodeDebtMs", required_argument, nullptr, kMaxPredictedDecodeDebtMs},
         {"loadRequests", required_argument, nullptr, kLoadRequests},
@@ -437,6 +442,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"multimodalEngineDir", required_argument, nullptr, kMultimodalEngineDir},
         {"traceCsv", required_argument, nullptr, kTraceCsv},
         {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
+        {"ignoreTraceEos", no_argument, nullptr, kIgnoreTraceEos},
         {"pageReservationMode", required_argument, nullptr, kPageReservationMode},
         {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
         {"pageReservationOvercommitBundles", required_argument, nullptr, kPageReservationOvercommitBundles},
@@ -506,6 +512,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kSchedulerProfile: args.schedulerProfile = optarg; break;
         case kTpotHardGuard: args.tpotHardGuard = true; break;
         case kRequireDirectOverlapCost: args.requireDirectOverlapCost = true; break;
+        case kCostAwareOverlapAdmission: args.costAwareOverlapAdmission = true; break;
         case kMaxConsecutiveOverlapBatches: args.maxConsecutiveOverlapBatches = std::stoi(optarg); break;
         case kMaxPredictedDecodeDebtMs: args.maxPredictedDecodeDebtMs = std::stod(optarg); break;
         case kLoadRequests: args.loadRequests = std::stoi(optarg); break;
@@ -525,6 +532,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kMultimodalEngineDir: args.multimodalEngineDir = optarg; break;
         case kTraceCsv: args.traceCsv = optarg; break;
         case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
+        case kIgnoreTraceEos: args.ignoreTraceEos = true; break;
         case kPageReservationMode:
         {
             std::string const mode{optarg};
@@ -582,7 +590,7 @@ bool parseArgs(Args& args, int argc, char** argv)
             || args.schedulerProfile == "balanced" || args.schedulerProfile == "long-prefill"
             || args.schedulerProfile == "auto")
         && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.tpotHardGuard
-                || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
+                || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty());
 }
@@ -763,7 +771,9 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
               "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,prefill_remaining_tokens,"
               "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
               "predicted_decode_slowdown_ms,predicted_decode_debt_us,consecutive_overlap_batches,"
-              "prefill_deferred_for_tpot,prefill_cohort_size,"
+              "prefill_deferred_for_tpot,prefill_cost_coverage_miss,overlap_evaluated_by_cost,"
+              "prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,prefill_cost_lookup_max_past_kv_length,"
+              "planned_decode_batch,planned_decode_max_context_length,prefill_cohort_size,"
               "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
               "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
               "page_growth_request_limit,page_growth_request_owners,page_growth_tpot_pressure\n";
@@ -780,10 +790,14 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << sample.prefillMinTtftSlackUs << ',' << sample.predictedPrefillGpuMs << ','
                << sample.predictedDecodeSlowdownMs << ',' << sample.predictedDecodeDebtUs << ','
                << sample.consecutiveOverlapBatches << ',' << (sample.prefillDeferredForTpot ? 1 : 0) << ','
-               << sample.prefillCohortSize << ',' << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ','
-               << sample.prefillGpuMs << ',' << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ','
-               << sample.overlapRatio << ',' << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles
-               << ',' << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << (sample.prefillCostCoverageMiss ? 1 : 0) << ',' << (sample.overlapEvaluatedByCost ? 1 : 0) << ','
+               << sample.prefillCostLookupRows << ',' << sample.prefillCostLookupChunkLength << ','
+               << sample.prefillCostLookupMaxPastKVLength << ',' << sample.plannedDecodeBatchSize << ','
+               << sample.plannedDecodeMaxContextLength << ',' << sample.prefillCohortSize << ','
+               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
+               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
+               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
+               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
                << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }
@@ -1418,7 +1432,8 @@ int main(int argc, char** argv)
             facadeContexts.push_back(std::move(source));
         }
 
-        std::vector<int32_t> const servingEosTokenIds = continuousLoad ? std::vector<int32_t>{} : config.eosTokenIds;
+        std::vector<int32_t> const servingEosTokenIds
+            = continuousLoad || (realRequestTrace && args.ignoreTraceEos) ? std::vector<int32_t>{} : config.eosTokenIds;
         rt::PhaseGreedySampler prefillSampler(
             args.prefillBatch, config.outputVocabSize, servingEosTokenIds, "phase_serving_prefill_sampler");
         rt::PhaseGreedySampler decodeSampler(
@@ -1461,15 +1476,17 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.enableDynamicPrefillBatching = args.dynamicPrefillBatching;
         facadeSchedulerConfig.minDynamicPrefillBatchSize = args.minDynamicPrefillBatchSize;
         facadeSchedulerConfig.enablePrefillSloRecovery = args.prefillSloRecovery;
-        if (args.dynamicPrefillBatching || profileUsesCosts)
+        if (args.dynamicPrefillBatching || args.costAwareOverlapAdmission || profileUsesCosts)
         {
             facadeSchedulerConfig.prefillBatchCosts = loadPrefillBatchCosts(args.schedulerCostJson);
         }
-        facadeSchedulerConfig.enableTpotHardGuard = args.tpotHardGuard;
-        facadeSchedulerConfig.requireDirectOverlapCost = args.requireDirectOverlapCost;
+        facadeSchedulerConfig.enableTpotHardGuard = args.tpotHardGuard || args.costAwareOverlapAdmission;
+        facadeSchedulerConfig.requireDirectOverlapCost
+            = args.requireDirectOverlapCost || args.costAwareOverlapAdmission;
+        facadeSchedulerConfig.enableCostAwareOverlapAdmission = args.costAwareOverlapAdmission;
         facadeSchedulerConfig.maxConsecutiveOverlapBatches = args.maxConsecutiveOverlapBatches;
         facadeSchedulerConfig.maxPredictedDecodeDebtUs = args.maxPredictedDecodeDebtMs * 1000.0;
-        if (args.tpotHardGuard || args.requireDirectOverlapCost || profileUsesCosts)
+        if (args.tpotHardGuard || args.requireDirectOverlapCost || args.costAwareOverlapAdmission || profileUsesCosts)
         {
             facadeSchedulerConfig.overlapBatchCosts = loadOverlapBatchCosts(args.schedulerCostJson);
         }

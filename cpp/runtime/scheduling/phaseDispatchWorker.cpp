@@ -157,6 +157,13 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.predictedDecodeDebtUs = mInFlight.predictedDecodeDebtUs;
     mCurrentMetrics.consecutiveOverlapBatches = mInFlight.consecutiveOverlapBatches;
     mCurrentMetrics.prefillDeferredForTpot = mInFlight.prefillDeferredForTpot;
+    mCurrentMetrics.prefillCostCoverageMiss = mInFlight.prefillCostCoverageMiss;
+    mCurrentMetrics.overlapEvaluatedByCost = mInFlight.overlapEvaluatedByCost;
+    mCurrentMetrics.prefillCostLookupRows = mInFlight.prefillCostLookupRows;
+    mCurrentMetrics.prefillCostLookupChunkLength = mInFlight.prefillCostLookupChunkLength;
+    mCurrentMetrics.prefillCostLookupMaxPastKVLength = mInFlight.prefillCostLookupMaxPastKVLength;
+    mCurrentMetrics.plannedDecodeBatchSize = mInFlight.plannedDecodeBatchSize;
+    mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     int64_t prefillPastKVSum{};
     mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();

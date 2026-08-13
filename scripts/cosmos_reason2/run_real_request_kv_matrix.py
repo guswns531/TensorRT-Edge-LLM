@@ -82,7 +82,8 @@ def parse_engine(value: str) -> Engine:
 def materialize_trace(source: Path, destination: Path, seed: int,
                       arrival_rate: float, request_count: int,
                       repeat_count: int, total_requests: int,
-                      output_multiplier: float) -> None:
+                      output_multiplier: float,
+                      preserve_arrival_offsets: bool) -> None:
     root = json.loads(source.read_text(encoding="utf-8"))
     requests = list(root.get("requests", []))
     if not requests:
@@ -103,12 +104,19 @@ def materialize_trace(source: Path, destination: Path, seed: int,
                         root.get("max_generate_length", 1)))
         request["max_generate_length"] = max(
             1, math.ceil(original_length * output_multiplier))
-    generator = random.Random(seed)
-    elapsed_us = 0.0
-    for index, request in enumerate(requests):
-        if index > 0:
-            elapsed_us += generator.expovariate(arrival_rate) * 1_000_000.0
-        request["arrival_offset_us"] = round(elapsed_us)
+    if preserve_arrival_offsets:
+        if repeat_count != 1 or not all("arrival_offset_us" in request
+                                        for request in requests):
+            raise ValueError(
+                "preserved arrival offsets require one repeat and an explicit offset on every request"
+            )
+    else:
+        generator = random.Random(seed)
+        elapsed_us = 0.0
+        for index, request in enumerate(requests):
+            if index > 0:
+                elapsed_us += generator.expovariate(arrival_rate) * 1_000_000.0
+            request["arrival_offset_us"] = round(elapsed_us)
     root["requests"] = requests
     root["max_generate_length"] = max(
         int(request["max_generate_length"]) for request in requests)
@@ -220,6 +228,8 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
              str(args.prefill_token_budget)])
     if args.ragged_prefill_batching:
         command.append("--raggedPrefillBatching")
+    if args.ignore_eos:
+        command.append("--ignoreTraceEos")
     if args.dynamic_decode_batching:
         command.append("--dynamicDecodeBatching")
     if args.dynamic_prefill_batching:
@@ -233,17 +243,22 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         command.extend(["--schedulerProfile", args.scheduler_profile])
     if (args.dynamic_decode_batching or args.dynamic_prefill_batching
             or args.scheduler_profile != "custom" or args.tpot_hard_guard
-            or args.require_direct_overlap_cost):
+            or args.require_direct_overlap_cost
+            or args.cost_aware_overlap_admission):
         command.extend(["--schedulerCostJson", str(args.scheduler_cost_json)])
     if args.tpot_hard_guard:
+        command.append("--tpotHardGuard")
+    if args.tpot_hard_guard or args.cost_aware_overlap_admission:
         command.extend([
-            "--tpotHardGuard", "--maxConsecutiveOverlapBatches",
+            "--maxConsecutiveOverlapBatches",
             str(args.max_consecutive_overlap_batches),
             "--maxPredictedDecodeDebtMs",
             str(args.max_predicted_decode_debt_ms)
         ])
     if args.require_direct_overlap_cost:
         command.append("--requireDirectOverlapCost")
+    if args.cost_aware_overlap_admission:
+        command.append("--costAwareOverlapAdmission")
     if args.wavefront_prefill_batching:
         command.extend([
             "--wavefrontPrefillBatching", "--prefillCohortSize",
@@ -490,6 +505,14 @@ def main() -> None:
                         choices=("shared", "independent"),
                         default=["shared", "independent"])
     parser.add_argument("--arrival-rate", type=float, default=30.0)
+    parser.add_argument(
+        "--preserve-arrival-offsets",
+        action="store_true",
+        help="retain explicit arrival_offset_us values from the source trace")
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="force every trace request to its configured output length")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--request-count", type=int, default=0)
     parser.add_argument(
@@ -614,6 +637,10 @@ def main() -> None:
                         default="custom")
     parser.add_argument("--tpot-hard-guard", action="store_true")
     parser.add_argument("--require-direct-overlap-cost", action="store_true")
+    parser.add_argument(
+        "--cost-aware-overlap-admission",
+        action="store_true",
+        help="replace the static overlap cap with direct-cost TPOT admission")
     parser.add_argument("--max-consecutive-overlap-batches",
                         type=int,
                         default=4)
@@ -699,8 +726,8 @@ def main() -> None:
             or args.growth_tpot_target_ms <= 0.0):
         parser.error("adaptive page growth bounds and target are invalid")
     if ((args.dynamic_decode_batching or args.dynamic_prefill_batching
-         or args.scheduler_profile != "custom" or args.tpot_hard_guard
-         or args.require_direct_overlap_cost)
+         or args.scheduler_profile != "custom" or args.tpot_hard_guard or
+         args.require_direct_overlap_cost or args.cost_aware_overlap_admission)
             and args.scheduler_cost_json is None):
         parser.error("dynamic batching requires --scheduler-cost-json")
     if (args.max_consecutive_overlap_batches <= 0
@@ -721,7 +748,8 @@ def main() -> None:
     trace = args.output_dir / "materialized-trace.json"
     materialize_trace(args.source_trace, trace, args.seed, args.arrival_rate,
                       args.request_count, args.repeat_count,
-                      args.total_requests, args.output_multiplier)
+                      args.total_requests, args.output_multiplier,
+                      args.preserve_arrival_offsets)
     cases = scenarios(args.prefill_batches, args.decode_batches,
                       args.context_modes)
     if args.case:
@@ -765,6 +793,8 @@ def main() -> None:
                 args.arrival_rate,
                 "output_multiplier":
                 args.output_multiplier,
+                "ignore_eos":
+                args.ignore_eos,
                 "cuda_graph":
                 args.cuda_graph,
                 "max_cuda_graphs":
@@ -817,6 +847,8 @@ def main() -> None:
                 args.tpot_hard_guard,
                 "require_direct_overlap_cost":
                 args.require_direct_overlap_cost,
+                "cost_aware_overlap_admission":
+                args.cost_aware_overlap_admission,
                 "max_consecutive_overlap_batches":
                 args.max_consecutive_overlap_batches,
                 "max_predicted_decode_debt_ms":

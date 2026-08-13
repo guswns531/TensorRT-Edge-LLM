@@ -61,6 +61,13 @@ def read_rows(paths: list[Path]) -> list[dict[str, str]]:
     return rows
 
 
+def decode_context_length(row: dict[str, str], decode_batch: int) -> int:
+    planned_max = row.get("planned_decode_max_context_length")
+    if planned_max:
+        return int(planned_max)
+    return math.ceil(int(row["decode_context_tokens"]) / decode_batch)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, nargs="+", required=True)
@@ -78,6 +85,10 @@ def main() -> None:
                         type=int,
                         nargs="+",
                         default=[128, 512, 1024, 1536, 2048])
+    parser.add_argument("--chunk-length-buckets",
+                        type=int,
+                        nargs="+",
+                        default=[32, 64, 96, 128])
     parser.add_argument("--min-samples", type=int, default=3)
     args = parser.parse_args()
 
@@ -101,9 +112,7 @@ def main() -> None:
         decode_batch = int(row["decode_batch"])
         if decode_batch <= 0 or float(row["decode_gpu_ms"]) <= 0.0:
             continue
-        mean_context = math.ceil(
-            int(row["decode_context_tokens"]) / decode_batch)
-        context_bucket = upper_bucket(mean_context,
+        context_bucket = upper_bucket(decode_context_length(row, decode_batch),
                                       args.decode_context_buckets)
         batch_bucket = upper_bucket(decode_batch, args.decode_batch_buckets)
         key = (batch_bucket, context_bucket)
@@ -146,17 +155,17 @@ def main() -> None:
             continue
         padded_tokens = int(
             row.get("prefill_padded_tokens") or row["prefill_tokens"])
-        chunk_length = padded_tokens // prefill_batch
+        chunk_length = upper_bucket(padded_tokens // prefill_batch,
+                                    args.chunk_length_buckets)
         past_bucket = upper_bucket(int(row["prefill_past_kv_max"]),
                                    args.past_kv_buckets)
         decode_batch = int(row["decode_batch"])
         decode_bucket = upper_bucket(decode_batch, args.decode_batch_buckets)
         slowdown = 0.0
         if decode_batch > 0 and float(row["decode_gpu_ms"]) > 0.0:
-            mean_context = math.ceil(
-                int(row["decode_context_tokens"]) / decode_batch)
-            context_bucket = upper_bucket(mean_context,
-                                          args.decode_context_buckets)
+            context_bucket = upper_bucket(
+                decode_context_length(row, decode_batch),
+                args.decode_context_buckets)
             slowdown = max(
                 0.0,
                 float(row["decode_gpu_ms"]) -
@@ -172,10 +181,9 @@ def main() -> None:
             float(row.get("prefill_packing_efficiency") or 1.0),
         })
         if decode_batch > 0 and float(row["decode_gpu_ms"]) > 0.0:
-            mean_context = math.ceil(
-                int(row["decode_context_tokens"]) / decode_batch)
-            context_bucket = upper_bucket(mean_context,
-                                          args.decode_context_buckets)
+            context_bucket = upper_bucket(
+                decode_context_length(row, decode_batch),
+                args.decode_context_buckets)
             overlap_key = (prefill_batch, decode_bucket, chunk_length,
                            past_bucket, context_bucket, initial)
             overlap_grouped.setdefault(overlap_key, []).append({

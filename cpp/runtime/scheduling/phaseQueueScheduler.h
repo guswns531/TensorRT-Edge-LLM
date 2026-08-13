@@ -105,6 +105,13 @@ struct PhaseDispatchMetrics
     double predictedDecodeDebtUs{};
     int32_t consecutiveOverlapBatches{};
     bool prefillDeferredForTpot{};
+    bool prefillCostCoverageMiss{};
+    bool overlapEvaluatedByCost{};
+    int32_t prefillCostLookupRows{};
+    int32_t prefillCostLookupChunkLength{};
+    int32_t prefillCostLookupMaxPastKVLength{};
+    int32_t plannedDecodeBatchSize{};
+    int32_t plannedDecodeMaxContextLength{};
     int32_t prefillCohortSize{};
     int32_t decodeTokens{};
     int32_t decodeContextTokens{};
@@ -247,6 +254,11 @@ struct PhaseQueueSchedulerConfig
     //! If enabled, an uncovered overlap shape is unsafe instead of falling back
     //! to the indirect prefill cost table.
     bool requireDirectOverlapCost{};
+    //! Let direct overlap costs replace the static maxOverlapPrefillTokens gate.
+    //! Prefills already covered by the static gate preserve legacy scheduling.
+    //! Larger candidates require direct coverage and the TPOT hard guard so an
+    //! unsafe candidate becomes decode-only.
+    bool enableCostAwareOverlapAdmission{};
     int32_t maxConsecutiveOverlapBatches{4};
     double maxPredictedDecodeDebtUs{50000.0};
     int64_t autoLongPrefillBacklogTokens{4096};
@@ -313,6 +325,11 @@ struct PhaseDispatchPlan
     int32_t plannedDecodeBatchSize{};
     int32_t plannedDecodeMaxContextLength{};
     bool prefillDeferredForTpot{};
+    bool prefillCostCoverageMiss{};
+    bool overlapEvaluatedByCost{};
+    int32_t prefillCostLookupRows{};
+    int32_t prefillCostLookupChunkLength{};
+    int32_t prefillCostLookupMaxPastKVLength{};
     int32_t prefillCohortSize{};
 };
 
@@ -363,7 +380,8 @@ private:
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,
         bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize, int32_t plannedDecodeMaxContextLength,
-        PhaseQueueSnapshot const& snapshot, float& predictedGpuMs, float& predictedDecodeSlowdownMs) const noexcept;
+        PhaseQueueSnapshot const& snapshot, float& predictedGpuMs, float& predictedDecodeSlowdownMs,
+        bool& costCoverageMiss) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     bool isPrefillBatchCompatible(
