@@ -1440,4 +1440,69 @@ TEST(PhaseContextServingFacadeTest, KeepsStableSlotsWhileDecodeBatchShrinksFourT
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
+TEST(PhaseContextServingFacadeTest, PrimesServingOwnedPhaseShapesAndReleasesSyntheticKV)
+{
+    constexpr int32_t kSlotCount = 4;
+    rt::HybridCacheManager cacheManager = makeIndexedPagedManager(kSlotCount, 8);
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    rt::TensorMap prefillTensorMap;
+    prefillTensorMap.set(binding_names::kKVSlotIds, cacheManager.getKVSlotIds());
+    prefillTensorMap.set(binding_names::kKVCacheStartIndex, cacheManager.getKVCacheLengths());
+    rt::TensorMap decodeTensorMap = prefillTensorMap;
+    int32_t prefillEnqueues{};
+    int32_t decodeEnqueues{};
+    rt::PhaseContextServingCallbacks callbacks;
+    callbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
+        ++prefillEnqueues;
+        packed.phaseBatchState().commit(cacheManager, packed.chunkLength(), packed.stream());
+    };
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
+    callbacks.enqueuePackedDecode = [&](rt::PhaseContextBatchAdapter& packed) {
+        ++decodeEnqueues;
+        packed.packedContext().phaseBatchState->commit(cacheManager, 1, packed.packedContext().stream);
+    };
+    callbacks.completePackedDecode = [](rt::PhaseContextBatchAdapter& packed) {
+        rt::DecodingInferenceContext& context = packed.packedContext();
+        for (int32_t row{}; row < context.activeBatchSize; ++row)
+        {
+            context.tokenIds[static_cast<size_t>(row)].push_back(42);
+            ++context.currentGenerateLengths[static_cast<size_t>(row)];
+        }
+    };
+
+    rt::PhaseQueueSchedulerConfig schedulerConfig;
+    schedulerConfig.maxPrefillBatchSize = kSlotCount;
+    schedulerConfig.maxDecodeBatchSize = kSlotCount;
+    schedulerConfig.maxPrefillChunkTokens = 16;
+    int resourceIdentities[6]{};
+    auto const safetyContract = rt::PhaseExecutionSafetyContract::independent(
+        {&resourceIdentities[0], &resourceIdentities[1], &resourceIdentities[2]},
+        {&resourceIdentities[3], &resourceIdentities[4], &resourceIdentities[5]});
+    rt::PhaseContextServingFacade facade(kSlotCount, schedulerConfig, std::move(callbacks), cacheManager,
+        decodeTensorMap, prefillStream, decodeStream, rt::PhaseTensorRTContextMode::kIndependentConcurrent,
+        &prefillTensorMap, 16, 0, safetyContract);
+
+    facade.primeCudaGraphShapes({
+        {rt::PhaseCudaGraphWarmupKind::kPrefill, 2, 8, 0, 2},
+        {rt::PhaseCudaGraphWarmupKind::kPrefill, 2, 8, 8, 2},
+        {rt::PhaseCudaGraphWarmupKind::kDecode, 4, 1, 16, 2},
+    });
+
+    EXPECT_EQ(prefillEnqueues, 4);
+    EXPECT_EQ(decodeEnqueues, 2);
+    EXPECT_TRUE(facade.empty());
+    EXPECT_EQ(facade.registeredRequestCount(), 0U);
+    rt::KVPagePoolStats const pool = cacheManager.getPagedKVPoolStats();
+    EXPECT_EQ(pool.allocatedBundles, 0);
+    EXPECT_EQ(pool.availableBundles, pool.totalBundles);
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{0, 0, 0, 0}));
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
 } // namespace

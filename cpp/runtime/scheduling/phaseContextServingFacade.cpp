@@ -39,6 +39,9 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
     PhaseExecutionSafetyContract safetyContract)
     : mCallbacks(std::move(callbacks))
     , mCacheManager(cacheManager)
+    , mMaxSlots(maxSlots)
+    , mPrefillStream(prefillStream)
+    , mDecodeStream(decodeStream)
     , mHostAdmissionSlotIds(
           {maxSlots}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_serving_host_admission_slots")
     , mDeviceAdmissionSlotIds({maxSlots}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_serving_admission_slots")
@@ -117,6 +120,124 @@ void PhaseContextServingFacade::resetSchedulingHistory()
     mGrowthTpotPressure = 0.0F;
     mGrowthMetricSamples = 0;
     mDrainRequestIds.clear();
+}
+
+void PhaseContextServingFacade::primeCudaGraphShapes(std::vector<PhaseCudaGraphWarmupShape> const& shapes)
+{
+    check::check(empty() && mRegistrations.empty() && mPendingAdmissions.empty() && mPageBundleReservations.empty(),
+        "Serving CUDA graph priming requires an idle facade");
+    check::check(mPrefillAdapter != nullptr, "Serving CUDA graph priming requires packed prefill support");
+
+    Tensor hostLengths({mMaxSlots}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_graph_warmup_lengths");
+    PhaseBatchState seedState(mMaxSlots, "phase_graph_warmup_seed", mCacheManager.isIndexedKVCache());
+    uint64_t requestId{std::numeric_limits<uint64_t>::max() / 2U};
+    auto resetLengths = [&](cudaStream_t stream) {
+        int32_t* lengths = hostLengths.dataPointer<int32_t>();
+        std::fill_n(lengths, mMaxSlots, 0);
+        mCacheManager.resetForNewSequences(hostLengths, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    };
+    auto seedLengths = [&](int32_t batchSize, int32_t contextLength, cudaStream_t stream) {
+        if (contextLength == 0)
+        {
+            return;
+        }
+        std::vector<PhaseWorkItem> work;
+        work.reserve(batchSize);
+        for (int32_t row{}; row < batchSize; ++row)
+        {
+            work.push_back({requestId++, contextLength, row, 0, contextLength});
+        }
+        seedState.prepare(work, mCacheManager, stream);
+        seedState.commit(mCacheManager, contextLength, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    };
+    auto releaseSlots = [&](int32_t batchSize) {
+        for (int32_t slot{}; slot < batchSize; ++slot)
+        {
+            mCacheManager.releasePagedKVSlot(slot);
+        }
+    };
+
+    for (PhaseCudaGraphWarmupShape const& shape : shapes)
+    {
+        check::check(shape.batchSize > 0 && shape.batchSize <= mMaxSlots,
+            "CUDA graph warmup batch size is outside the stable-slot capacity");
+        check::check(shape.tokenCount > 0 && shape.contextLength >= 0 && shape.repetitions >= 2,
+            "CUDA graph warmup shape values are invalid");
+        for (int32_t repetition{}; repetition < shape.repetitions; ++repetition)
+        {
+            cudaStream_t const stream
+                = shape.kind == PhaseCudaGraphWarmupKind::kPrefill ? mPrefillStream : mDecodeStream;
+            resetLengths(stream);
+            seedLengths(shape.batchSize, shape.contextLength, stream);
+            std::vector<std::unique_ptr<DecodingInferenceContext>> contexts;
+            contexts.reserve(shape.batchSize);
+
+            if (shape.kind == PhaseCudaGraphWarmupKind::kPrefill)
+            {
+                std::vector<PhasePrefillContextRow> rows;
+                rows.reserve(shape.batchSize);
+                int32_t const promptLength = shape.contextLength + shape.tokenCount + 1;
+                for (int32_t row{}; row < shape.batchSize; ++row)
+                {
+                    auto context = std::make_unique<DecodingInferenceContext>();
+                    context->initialize(1, 4, std::nullopt, OptionalInputTensors{}, "", stream);
+                    context->rawBatchedInputIds = {std::vector<int32_t>(promptLength, 0)};
+                    context->tokenIds = context->rawBatchedInputIds;
+                    context->effectivePrefillLengths = {promptLength};
+                    rows.push_back(
+                        {requestId++, context.get(), 0, row, shape.contextLength, shape.tokenCount, promptLength});
+                    contexts.push_back(std::move(context));
+                }
+                mPrefillAdapter->pack(rows, stream);
+                mCallbacks.enqueuePackedPrefill(*mPrefillAdapter);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (mCallbacks.completePackedPrefill)
+                {
+                    mCallbacks.completePackedPrefill(*mPrefillAdapter);
+                }
+                mPrefillAdapter->complete();
+            }
+            else
+            {
+                check::check(shape.tokenCount == 1, "Decode CUDA graph warmup token count must be one");
+                std::vector<PhaseContextRow> rows;
+                rows.reserve(shape.batchSize);
+                for (int32_t row{}; row < shape.batchSize; ++row)
+                {
+                    auto context = std::make_unique<DecodingInferenceContext>();
+                    context->initialize(1, 4, std::nullopt, OptionalInputTensors{}, "", stream);
+                    context->rawBatchedInputIds = {{0}};
+                    context->tokenIds = {{0}};
+                    context->effectivePrefillLengths = {shape.contextLength};
+                    rows.push_back({requestId++, context.get(), 0, row, shape.contextLength});
+                    contexts.push_back(std::move(context));
+                }
+                mDecodeAdapter.packDecode(rows, stream);
+                if (mCallbacks.enqueuePackedDecode)
+                {
+                    mCallbacks.enqueuePackedDecode(mDecodeAdapter);
+                }
+                else
+                {
+                    mCallbacks.enqueueDecode(mDecodeAdapter.packedContext());
+                }
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (mCallbacks.completePackedDecode)
+                {
+                    mCallbacks.completePackedDecode(mDecodeAdapter);
+                }
+                else
+                {
+                    mCallbacks.completeDecode(mDecodeAdapter.packedContext());
+                }
+                mDecodeAdapter.scatterDecode();
+            }
+            releaseSlots(shape.batchSize);
+        }
+    }
+    resetLengths(mPrefillStream);
 }
 
 PhaseRequestLifecycleCallbacks PhaseContextServingFacade::makeLifecycleCallbacks()

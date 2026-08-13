@@ -83,6 +83,7 @@ struct Args
     std::string inputFile;
     std::string multimodalEngineDir;
     std::string traceCsv;
+    std::string cudaGraphWarmupProfile;
     std::string schedulerCostJson;
     std::string schedulerProfile{"custom"};
     bool ignoreTraceEos{};
@@ -312,7 +313,7 @@ void printUsage(char const* program)
         "--tpotHysteresisWindow N --minTpotHysteresisSamples N] [--outputCsv FILE] "
         "[--kernelGroupCsv FILE] "
         "[--inputFile FILE --multimodalEngineDir DIR --traceCsv FILE --traceArrivalRate R "
-        "--traceWarmupRepeats N --ignoreTraceEos] "
+        "--traceWarmupRepeats N --cudaGraphWarmupProfile FILE --ignoreTraceEos] "
         "[--pageReservationMode full|headroom|bounded-overcommit "
         "--pageReservationHeadroomTokens N --pageReservationOvercommitBundles N "
         "--pageReservationGrowthRequests N --fullReservationPromptThresholdTokens N "
@@ -391,6 +392,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kTraceCsv,
         kTraceArrivalRate,
         kTraceWarmupRepeats,
+        kCudaGraphWarmupProfile,
         kIgnoreTraceEos,
         kPageReservationMode,
         kPageReservationHeadroomTokens,
@@ -460,6 +462,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"traceCsv", required_argument, nullptr, kTraceCsv},
         {"traceArrivalRate", required_argument, nullptr, kTraceArrivalRate},
         {"traceWarmupRepeats", required_argument, nullptr, kTraceWarmupRepeats},
+        {"cudaGraphWarmupProfile", required_argument, nullptr, kCudaGraphWarmupProfile},
         {"ignoreTraceEos", no_argument, nullptr, kIgnoreTraceEos},
         {"pageReservationMode", required_argument, nullptr, kPageReservationMode},
         {"pageReservationHeadroomTokens", required_argument, nullptr, kPageReservationHeadroomTokens},
@@ -555,6 +558,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kTraceCsv: args.traceCsv = optarg; break;
         case kTraceArrivalRate: args.traceArrivalRate = std::stod(optarg); break;
         case kTraceWarmupRepeats: args.traceWarmupRepeats = std::stoi(optarg); break;
+        case kCudaGraphWarmupProfile: args.cudaGraphWarmupProfile = optarg; break;
         case kIgnoreTraceEos: args.ignoreTraceEos = true; break;
         case kPageReservationMode:
         {
@@ -621,7 +625,8 @@ bool parseArgs(Args& args, int argc, char** argv)
                 || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty())
-        && (args.traceWarmupRepeats == 0 || (!args.inputFile.empty() && args.cudaGraph));
+        && (args.traceWarmupRepeats == 0 || (!args.inputFile.empty() && args.cudaGraph))
+        && (args.cudaGraphWarmupProfile.empty() || (!args.inputFile.empty() && args.cudaGraph));
 }
 
 rt::PhaseSchedulerProfile parseSchedulerProfile(std::string const& profile)
@@ -704,6 +709,39 @@ std::vector<rt::PhaseOverlapBatchCost> loadOverlapBatchCosts(std::filesystem::pa
     }
     ELLM_CHECK(!costs.empty(), "Scheduler cost model contains no overlap points");
     return costs;
+}
+
+std::vector<rt::PhaseCudaGraphWarmupShape> loadCudaGraphWarmupShapes(std::filesystem::path const& path)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open CUDA graph warmup profile");
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(root.value("version", 0) == 1, "Unsupported CUDA graph warmup profile version");
+    std::vector<rt::PhaseCudaGraphWarmupShape> shapes;
+    auto appendShapes = [&](char const* phase, rt::PhaseCudaGraphWarmupKind kind) {
+        if (!root.contains(phase))
+        {
+            return;
+        }
+        ELLM_CHECK(root.at(phase).is_array(), "CUDA graph warmup phase entry must be an array");
+        for (nlohmann::json const& entry : root.at(phase))
+        {
+            rt::PhaseCudaGraphWarmupShape shape;
+            shape.kind = kind;
+            shape.batchSize = entry.at("batch_size").get<int32_t>();
+            shape.tokenCount
+                = kind == rt::PhaseCudaGraphWarmupKind::kPrefill ? entry.at("chunk_length").get<int32_t>() : 1;
+            shape.contextLength = kind == rt::PhaseCudaGraphWarmupKind::kPrefill
+                ? entry.value("past_kv_length", 0)
+                : entry.at("context_length").get<int32_t>();
+            shape.repetitions = entry.value("repetitions", 2);
+            shapes.push_back(shape);
+        }
+    };
+    appendShapes("prefill", rt::PhaseCudaGraphWarmupKind::kPrefill);
+    appendShapes("decode", rt::PhaseCudaGraphWarmupKind::kDecode);
+    ELLM_CHECK(!shapes.empty(), "CUDA graph warmup profile contains no phase shapes");
+    return shapes;
 }
 
 bool usesSharedTensorRTContext(Args const& args) noexcept
@@ -1430,6 +1468,8 @@ int main(int argc, char** argv)
             [](auto const& request) { return !request.requests.front().imageBuffers.empty(); });
         ELLM_CHECK(
             args.traceWarmupRepeats == 0 || !traceHasVision, "Trace replay warmup v1 supports text-only requests");
+        ELLM_CHECK(args.cudaGraphWarmupProfile.empty() || !traceHasVision,
+            "CUDA graph shape priming v1 supports text-only requests");
         ELLM_CHECK(!traceHasVision || !usesSharedTensorRTContext(args),
             "Real multimodal trace requires independent TensorRT contexts");
         ELLM_CHECK(!traceHasVision || !args.multimodalEngineDir.empty(),
@@ -1821,6 +1861,21 @@ int main(int argc, char** argv)
             std::fill_n(hostZeroLengths.dataPointer<int32_t>(), phaseSlotCount, 0);
             cacheManager.resetForNewSequences(hostZeroLengths, setupStream);
             CUDA_CHECK(cudaStreamSynchronize(setupStream));
+
+            if (!args.cudaGraphWarmupProfile.empty())
+            {
+                collectServingMetrics = false;
+                std::vector<rt::PhaseCudaGraphWarmupShape> const shapes
+                    = loadCudaGraphWarmupShapes(args.cudaGraphWarmupProfile);
+                LOG_INFO("Priming %zu phase CUDA graph shape(s) from %s", shapes.size(),
+                    args.cudaGraphWarmupProfile.c_str());
+                facade.primeCudaGraphShapes(shapes);
+                facade.resetSchedulingHistory();
+                facadeDispatchMetrics.clear();
+                kernelDispatchMetadata = {};
+                kernelGroupDispatchIndex = 0;
+                collectServingMetrics = true;
+            }
 
             auto runTrace = [&](rt::PhaseAsyncServer& server, bool logCompletions) {
                 traceStart = std::chrono::steady_clock::now();

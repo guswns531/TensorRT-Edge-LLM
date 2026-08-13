@@ -34,6 +34,20 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+WORKLOAD_PREFILL_TOKEN_BUDGETS = {
+    "short": 512,
+    "balanced": 256,
+    "decode-heavy": 256,
+}
+
+
+def resolve_prefill_token_budget(workload_preset: str,
+                                 explicit_budget: int) -> int:
+    """Resolve a workload preset without overriding an explicit budget."""
+    if explicit_budget > 0 or workload_preset == "none":
+        return explicit_budget
+    return WORKLOAD_PREFILL_TOKEN_BUDGETS[workload_preset]
+
 
 @dataclass(frozen=True)
 class Engine:
@@ -226,6 +240,11 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
             command.extend(
                 ["--traceWarmupRepeats",
                  str(args.trace_warmup_repeats)])
+        if args.cuda_graph_warmup_profile is not None:
+            command.extend([
+                "--cudaGraphWarmupProfile",
+                str(args.cuda_graph_warmup_profile)
+            ])
     if args.prefill_token_budget > 0:
         command.extend(
             ["--prefillTokenBudget",
@@ -610,6 +629,14 @@ def main() -> None:
         help=
         "replay the text trace before measurement, retaining only CUDA graphs")
     parser.add_argument(
+        "--cuda-graph-warmup-profile",
+        type=Path,
+        help="phase binding-shape profile used to prime serving CUDA graphs")
+    parser.add_argument("--workload-preset",
+                        choices=("none", "short", "balanced", "decode-heavy"),
+                        default="none",
+                        help="select a validated Cosmos prefill token budget")
+    parser.add_argument(
         "--prefill-token-budget",
         type=int,
         default=0,
@@ -721,6 +748,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    args.prefill_token_budget = resolve_prefill_token_budget(
+        args.workload_preset, args.prefill_token_budget)
+
     if args.slot_count <= 0 or args.page_bundles <= 0 or args.tokens_per_page <= 0:
         parser.error(
             "slot-count, page-bundles, and tokens-per-page must be positive")
@@ -747,6 +777,11 @@ def main() -> None:
         )
     if args.trace_warmup_repeats > 0 and not args.cuda_graph:
         parser.error("--trace-warmup-repeats requires --cuda-graph")
+    if args.cuda_graph_warmup_profile is not None:
+        if not args.cuda_graph:
+            parser.error("--cuda-graph-warmup-profile requires --cuda-graph")
+        if not args.cuda_graph_warmup_profile.is_file():
+            parser.error("cuda-graph-warmup-profile does not exist")
     if (args.page_reservation_headroom_tokens < 0
             or args.page_reservation_overcommit_bundles < 0
             or args.page_reservation_growth_requests <= 0
@@ -852,6 +887,10 @@ def main() -> None:
                 args.cuda_graph_reserve_mib if args.cuda_graph else 0,
                 "trace_warmup_repeats":
                 args.trace_warmup_repeats if args.cuda_graph else 0,
+                "cuda_graph_warmup_profile":
+                str(args.cuda_graph_warmup_profile or ""),
+                "workload_preset":
+                args.workload_preset,
                 "prefill_token_budget":
                 args.prefill_token_budget,
                 "ragged_prefill_batching":

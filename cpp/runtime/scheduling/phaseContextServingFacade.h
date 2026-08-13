@@ -132,6 +132,25 @@ struct PhaseContextServingCallbacks
     std::function<void(PhaseDispatchMetrics const&)> onDispatch;
 };
 
+enum class PhaseCudaGraphWarmupKind
+{
+    kPrefill,
+    kDecode,
+};
+
+//! One model-independent phase binding shape to prime on serving-owned buffers.
+struct PhaseCudaGraphWarmupShape
+{
+    PhaseCudaGraphWarmupKind kind{PhaseCudaGraphWarmupKind::kPrefill};
+    int32_t batchSize{1};
+    //! Prefill chunk length. Decode always uses one token.
+    int32_t tokenCount{1};
+    //! Prefill past-KV length or decode context length.
+    int32_t contextLength{};
+    //! Consecutive executions; automatic capture normally requires two.
+    int32_t repetitions{2};
+};
+
 //! Connects continuous request admission to stable-slot packed decode execution.
 //!
 //! Source DecodingInferenceContext objects are borrowed and must outlive their
@@ -192,6 +211,11 @@ public:
     void removeTerminalObserver(size_t observerId) noexcept;
     //! Reset scheduler and adaptive-admission history after the facade drains.
     void resetSchedulingHistory();
+    //! Prime phase CUDA graph shapes using the same stable adapters as serving.
+    //!
+    //! The facade must be idle. Synthetic KV ownership is released before
+    //! returning and no scheduler telemetry is updated.
+    void primeCudaGraphShapes(std::vector<PhaseCudaGraphWarmupShape> const& shapes);
 
 private:
     struct PageBundleReservation
@@ -237,6 +261,9 @@ private:
 
     PhaseContextServingCallbacks mCallbacks;
     HybridCacheManager& mCacheManager;
+    int32_t mMaxSlots{};
+    cudaStream_t mPrefillStream{};
+    cudaStream_t mDecodeStream{};
     Tensor mHostAdmissionSlotIds;
     Tensor mDeviceAdmissionSlotIds;
     std::unique_ptr<PhasePrefillContextBatchAdapter> mPrefillAdapter;

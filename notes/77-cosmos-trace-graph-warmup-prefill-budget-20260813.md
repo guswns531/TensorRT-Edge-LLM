@@ -89,16 +89,14 @@ prefill/decode 2/11개에서 4/22개로 늘면서 약 56MiB가 추가됐다. 사
 우선했으므로 이 설정을 허용했지만, 10GB 장치의 free headroom은 약 211MiB에 불과하다.
 
 exact-trace replay는 graph cache 최적화의 상한선을 찾는 benchmark 기능이지 미래 shape를 미리 아는 production
-기능이 아니다. production에서는 최근 shape histogram이나 정해진 P/D bucket manifest로 대표 shape를 warmup해야 한다.
-다음 구현은 이 결과를 이용해 trace 내용 대신 `{phase, batch, chunk/context bucket}` 목록을 입력받는 profile-driven
-graph priming API로 일반화한다.
+기능이 아니다. 이 한계는 [production phase-shape CUDA graph priming](78-cosmos-phase-shape-graph-priming-20260813.md)으로
+해결했다. 최근 dispatch histogram에서 `{phase, batch, chunk/context}`만 추출하며 request text나 arrival sequence를
+재생하지 않는다.
 
 ## 다음 단계
 
-1. short preset의 prefill token budget을 512로 분리하고 balanced/decode-heavy는 256을 유지한다.
-2. exact replay를 profile-driven P/D shape manifest warmup으로 바꿔 production에서 재현 가능하게 한다.
-3. short의 남은 TTFT 12.23% 격차를 initial-prefill prepare/engine/sample kernel-group으로 분해한다.
-4. dense ragged `[B,Smax]`를 true packed/varlen layout으로 바꿔 P4/512의 padding과 graph shape 수를 줄인다.
+1. short의 남은 TTFT 격차를 initial-prefill prepare/engine/sample kernel-group으로 분해한다.
+2. dense ragged `[B,Smax]`를 true packed/varlen layout으로 바꿔 P4/512의 padding과 graph shape 수를 줄인다.
 
 artifact:
 
