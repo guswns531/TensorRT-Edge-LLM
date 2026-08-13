@@ -90,6 +90,9 @@ def main() -> None:
                         nargs="+",
                         default=[32, 64, 96, 128])
     parser.add_argument("--min-samples", type=int, default=3)
+    parser.add_argument("--prefill-layout",
+                        choices=["dense", "packed"],
+                        default="dense")
     args = parser.parse_args()
 
     if args.min_samples <= 0:
@@ -273,7 +276,8 @@ def main() -> None:
             "insufficient detailed prefill/decode/overlap samples")
 
     root = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "prefill_layout": args.prefill_layout,
         "source_files": [str(path) for path in paths],
         "decode": decode,
         "prefill": prefill,
@@ -284,10 +288,15 @@ def main() -> None:
                                 encoding="utf-8")
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     with args.output_csv.open("w", newline="", encoding="utf-8") as stream:
-        fieldnames = ["phase"] + sorted(
-            {field
-             for row in csv_rows
-             for field in row if field != "phase"})
+        csv_rows = [{
+            "prefill_layout": args.prefill_layout,
+            **row
+        } for row in csv_rows]
+        fieldnames = ["phase", "prefill_layout"] + sorted({
+            field
+            for row in csv_rows
+            for field in row if field not in {"phase", "prefill_layout"}
+        })
         writer = csv.DictWriter(stream,
                                 fieldnames=fieldnames,
                                 extrasaction="ignore")

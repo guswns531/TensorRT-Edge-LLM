@@ -726,6 +726,17 @@ std::vector<rt::PhaseDecodeBatchCost> loadDecodeBatchCosts(std::filesystem::path
     return costs;
 }
 
+void validateSchedulerCostPrefillLayout(std::filesystem::path const& path, bool const packedPrefillTokenLayout)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open scheduler cost model");
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    std::string const layout = root.value("prefill_layout", std::string{"dense"});
+    ELLM_CHECK(layout == "dense" || layout == "packed", "Unsupported scheduler cost prefill layout");
+    std::string const expectedLayout = packedPrefillTokenLayout ? "packed" : "dense";
+    ELLM_CHECK(layout == expectedLayout, "Scheduler cost prefill layout does not match engine prefill layout");
+}
+
 std::vector<rt::PhasePrefillBatchCost> loadPrefillBatchCosts(std::filesystem::path const& path)
 {
     std::ifstream stream(path);
@@ -1655,6 +1666,13 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.prefillCompletionBonusTokens = args.prefillCompletionBonusTokens;
         facadeSchedulerConfig.enableDynamicDecodeBatching = args.dynamicDecodeBatching;
         bool const profileUsesCosts = facadeSchedulerConfig.profile != rt::PhaseSchedulerProfile::kCustom;
+        bool const usesSchedulerCosts = args.dynamicDecodeBatching || args.dynamicPrefillBatching
+            || args.costAwareOverlapAdmission || args.tpotHardGuard || args.requireDirectOverlapCost
+            || profileUsesCosts;
+        if (usesSchedulerCosts)
+        {
+            validateSchedulerCostPrefillLayout(args.schedulerCostJson, args.packedPrefillTokenLayout);
+        }
         if (args.dynamicDecodeBatching || profileUsesCosts)
         {
             facadeSchedulerConfig.decodeBatchCosts = loadDecodeBatchCosts(args.schedulerCostJson);

@@ -1,0 +1,3 @@
+policy,runs,generated_token_s,ttft_p95_ms,tpot_p95_ms,e2e_p95_ms
+fixed_p8_d32,3,2934.477215,6948.940850,10.702288,7774.911337
+packed_dynamic,3,2937.016182,6943.630950,10.688480,7768.172629

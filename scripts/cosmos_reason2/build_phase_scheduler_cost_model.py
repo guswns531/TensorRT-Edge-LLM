@@ -13,9 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Aggregate CUDA-event kernel rows into a model-neutral scheduler cost model."""
 
 import argparse
@@ -69,6 +66,9 @@ def main() -> None:
                         nargs="+",
                         default=[128, 512, 1024, 1536, 2048])
     parser.add_argument("--min-samples", type=int, default=3)
+    parser.add_argument("--prefill-layout",
+                        choices=["dense", "packed"],
+                        default="dense")
     args = parser.parse_args()
 
     buckets = sorted(set(args.context_buckets))
@@ -123,7 +123,9 @@ def main() -> None:
 
     root = {
         "schema_version":
-        1,
+        2,
+        "prefill_layout":
+        args.prefill_layout,
         "source_files": [str(path) for path in paths],
         "decode": [{
             key: value
@@ -139,9 +141,13 @@ def main() -> None:
                                 encoding="utf-8")
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     with args.output_csv.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(normalized[0]))
+        csv_rows = [{
+            "prefill_layout": args.prefill_layout,
+            **point
+        } for point in normalized]
+        writer = csv.DictWriter(stream, fieldnames=list(csv_rows[0]))
         writer.writeheader()
-        writer.writerows(normalized)
+        writer.writerows(csv_rows)
 
 
 if __name__ == "__main__":

@@ -100,6 +100,16 @@ def engine_uses_packed_prefill(engine: Engine) -> bool:
     return bool(config.get("packed_prefill", False))
 
 
+def scheduler_cost_prefill_layout(path: Path) -> str:
+    """Return the prefill tensor layout represented by a scheduler cost model."""
+    root = json.loads(path.read_text(encoding="utf-8"))
+    layout = root.get("prefill_layout", "dense")
+    if layout not in {"dense", "packed"}:
+        raise ValueError(
+            f"unsupported scheduler cost prefill layout: {layout}")
+    return layout
+
+
 def materialize_trace(source: Path, destination: Path, seed: int,
                       arrival_rate: float, request_count: int,
                       repeat_count: int, total_requests: int,
@@ -836,6 +846,15 @@ def main() -> None:
     if args.scheduler_cost_json is not None and not args.scheduler_cost_json.is_file(
     ):
         parser.error("scheduler-cost-json does not exist")
+    if args.scheduler_cost_json is not None:
+        cost_layout = scheduler_cost_prefill_layout(args.scheduler_cost_json)
+        for engine in args.engine:
+            engine_layout = "packed" if engine_uses_packed_prefill(
+                engine) else "dense"
+            if cost_layout != engine_layout:
+                parser.error(
+                    f"scheduler cost prefill layout {cost_layout} does not match "
+                    f"engine {engine.name} layout {engine_layout}")
     if args.cuda_graph and "shared" in args.context_modes:
         parser.error("--cuda-graph requires independent-only context modes")
 

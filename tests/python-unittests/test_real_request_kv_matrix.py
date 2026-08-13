@@ -18,6 +18,8 @@ import json
 import runpy
 from pathlib import Path
 
+import pytest
+
 SCRIPT = (Path(__file__).resolve().parents[2] / "scripts" / "cosmos_reason2" /
           "run_real_request_kv_matrix.py")
 GLOBALS = runpy.run_path(str(SCRIPT))
@@ -78,3 +80,27 @@ def test_engine_uses_packed_prefill_defaults_to_legacy_layout(tmp_path):
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
 
     assert not GLOBALS["engine_uses_packed_prefill"](engine)
+
+
+def test_scheduler_cost_prefill_layout_defaults_to_dense(tmp_path):
+    cost_model = tmp_path / "cost-model.json"
+    cost_model.write_text("{}", encoding="utf-8")
+
+    assert GLOBALS["scheduler_cost_prefill_layout"](cost_model) == "dense"
+
+
+def test_scheduler_cost_prefill_layout_reads_packed_contract(tmp_path):
+    cost_model = tmp_path / "cost-model.json"
+    cost_model.write_text(json.dumps({"prefill_layout": "packed"}),
+                          encoding="utf-8")
+
+    assert GLOBALS["scheduler_cost_prefill_layout"](cost_model) == "packed"
+
+
+def test_scheduler_cost_prefill_layout_rejects_unknown_contract(tmp_path):
+    cost_model = tmp_path / "cost-model.json"
+    cost_model.write_text(json.dumps({"prefill_layout": "blocked"}),
+                          encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported scheduler cost"):
+        GLOBALS["scheduler_cost_prefill_layout"](cost_model)
