@@ -1147,7 +1147,10 @@ int main(int argc, char** argv)
 
     std::unordered_map<std::string, std::string> const emptyLoraMap;
     auto resources = rt::SharedResources::createForLLM(resourceConfig, emptyLoraMap, setupStream);
-    auto prefillIO = rt::PipelineIO::createForLLM(config, args.prefillBatch, args.inputLen, setupStream);
+    int32_t const maxPackedPrefillTokens = args.prefillBatch * configuredChunkSize;
+    auto prefillIO = args.packedPrefillTokenLayout
+        ? rt::PipelineIO::createForPackedPrefill(config, args.prefillBatch, maxPackedPrefillTokens, setupStream)
+        : rt::PipelineIO::createForLLM(config, args.prefillBatch, args.inputLen, setupStream);
     auto decodeIO = rt::PipelineIO::createForLLM(config, args.decodeBatch, 1, setupStream);
     rt::TensorMap prefillMap;
     rt::TensorMap decodeMap;

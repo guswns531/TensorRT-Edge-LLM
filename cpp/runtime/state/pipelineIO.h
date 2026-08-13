@@ -117,6 +117,11 @@ struct PipelineIO
     //! Build phase-local vanilla I/O without allocating the engine profile's full batch/sequence maxima.
     static PipelineIO createForLLM(
         LLMEngineConfig const& cfg, int32_t maxBatchSize, int32_t maxInputLength, cudaStream_t stream);
+    //! Build packed-prefill I/O with separate logical-row and token-carrier capacities.
+    //! Token-shaped tensors use `{1, maxTotalTokens, ...}` while logits,
+    //! lengths, selection indices, and M-RoPE retain `maxLogicalBatchSize`.
+    static PipelineIO createForPackedPrefill(
+        LLMEngineConfig const& cfg, int32_t maxLogicalBatchSize, int32_t maxTotalTokens, cudaStream_t stream);
 
     //! Build PipelineIO for a two-engine speculative-decoding runtime
     //! (basic I/O, hidden states, deepstack embeds, MRope cos/sin cache).

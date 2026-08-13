@@ -31,6 +31,25 @@ namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+void allocateBasicIOWithTokenShape(PipelineIO& io, int32_t maxLogicalBatch, int32_t maxTokenBatch, int32_t maxSeq,
+    int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype)
+{
+    io.inputsEmbeds = Tensor({maxTokenBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::inputsEmbeds");
+    io.outputLogits = Tensor(
+        {maxLogicalBatch, vocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
+    io.selectTokenIndices
+        = Tensor({1, maxLogicalBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
+    io.contextLengths
+        = Tensor({maxLogicalBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextLengths");
+    io.hostContextLengths
+        = Tensor({maxLogicalBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostContextLengths");
+    io.hostSelectTokenIndices = Tensor(
+        {1, maxLogicalBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT64, "PipelineIO::hostSelectTokenIndices");
+}
+} // namespace
+
 void allocateBasicIO(
     PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype)
 {
@@ -323,19 +342,18 @@ PipelineIO PipelineIO::createForLLM(
         "PipelineIO phase input length exceeds the engine profile.");
     PipelineIO io;
 
-    allocateBasicIO(io, maxBatchSize, maxInputLength, cfg.hiddenSize, cfg.outputVocabSize,
-        nvinfer1::DataType::kHALF);
+    allocateBasicIO(io, maxBatchSize, maxInputLength, cfg.hiddenSize, cfg.outputVocabSize, nvinfer1::DataType::kHALF);
 
     if (cfg.useVisionBidirectionalAttention)
     {
-        io.visionBlockIds = Tensor({maxBatchSize, maxInputLength}, DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+        io.visionBlockIds = Tensor(
+            {maxBatchSize, maxInputLength}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
     }
 
     if (cfg.numDeepstackFeatures > 0)
     {
-        allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, maxBatchSize, maxInputLength, cfg.hiddenSize,
-            nvinfer1::DataType::kHALF);
+        allocateDeepstackEmbeds(
+            io, cfg.numDeepstackFeatures, maxBatchSize, maxInputLength, cfg.hiddenSize, nvinfer1::DataType::kHALF);
         LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]", cfg.numDeepstackFeatures,
             maxBatchSize, maxInputLength, cfg.hiddenSize);
     }
@@ -344,8 +362,8 @@ PipelineIO PipelineIO::createForLLM(
     // streaming consumers (Qwen3-Omni Talker) read it; if the engine emits
     // hidden_states but no consumer is set, the buffer is harmless write-target;
     // if the engine has no hidden_states output the binding is silently skipped.
-    io.outputHiddenStates = Tensor({maxBatchSize, maxInputLength, cfg.hiddenSize},
-        DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
+    io.outputHiddenStates = Tensor({maxBatchSize, maxInputLength, cfg.hiddenSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
 
     if (cfg.ropeConfig.type == RopeType::kMRope)
     {
@@ -355,6 +373,42 @@ PipelineIO PipelineIO::createForLLM(
             cfg.rotaryDim, cfg.maxKVCacheCapacity, maxBatchSize, stream);
     }
 
+    return io;
+}
+
+PipelineIO PipelineIO::createForPackedPrefill(
+    LLMEngineConfig const& cfg, int32_t maxLogicalBatchSize, int32_t maxTotalTokens, cudaStream_t stream)
+{
+    check::check(cfg.packedPrefill, "Packed-prefill PipelineIO requires a packed-prefill engine.");
+    check::check(maxLogicalBatchSize > 0 && maxLogicalBatchSize <= cfg.maxSupportedPrefillBatchSize,
+        "Packed-prefill PipelineIO logical batch exceeds the engine profile.");
+    check::check(maxTotalTokens > 0 && maxTotalTokens <= cfg.maxSupportedInputLength,
+        "Packed-prefill PipelineIO token capacity exceeds the engine profile.");
+    PipelineIO io;
+    constexpr int32_t kTOKEN_BATCH{1};
+    allocateBasicIOWithTokenShape(io, maxLogicalBatchSize, kTOKEN_BATCH, maxTotalTokens, cfg.hiddenSize,
+        cfg.outputVocabSize, nvinfer1::DataType::kHALF);
+
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        io.visionBlockIds = Tensor(
+            {kTOKEN_BATCH, maxTotalTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+    }
+    if (cfg.numDeepstackFeatures > 0)
+    {
+        allocateDeepstackEmbeds(
+            io, cfg.numDeepstackFeatures, kTOKEN_BATCH, maxTotalTokens, cfg.hiddenSize, nvinfer1::DataType::kHALF);
+        LOG_INFO("Allocated %d packed deepstack embeds tensors with shape [1, %d, %d]", cfg.numDeepstackFeatures,
+            maxTotalTokens, cfg.hiddenSize);
+    }
+    io.outputHiddenStates = Tensor({kTOKEN_BATCH, maxTotalTokens, cfg.hiddenSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
+    if (cfg.ropeConfig.type == RopeType::kMRope)
+    {
+        allocateMRope(io, maxLogicalBatchSize, cfg.maxKVCacheCapacity, cfg.rotaryDim);
+        kernel::initializeTextOnlyMRopeCosSin(io.mropeCosSin.dataPointer<float>(), cfg.ropeConfig.rotaryTheta,
+            cfg.rotaryDim, cfg.maxKVCacheCapacity, maxLogicalBatchSize, stream);
+    }
     return io;
 }
 
