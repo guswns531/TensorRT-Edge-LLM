@@ -551,6 +551,66 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesUpperBucketForCurrentActiveRows)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 3U);
 }
 
+TEST(PhaseQueueSchedulerTest, DynamicDecodeInterpolatesPartiallyFilledProfileBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{2, 512, 1.5F}, {4, 512, 2.4F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 3U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesSelectedRowsTotalContextShape)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{2, 1024, 1.5F, 1200}, {4, 1024, 1.8F, 1200}, {4, 1024, 4.0F, 1600}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 1024});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.enqueueDecode({3, 128});
+    scheduler.enqueueDecode({4, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_EQ(plan.plannedDecodeContextTokens, 1152);
+    EXPECT_EQ(plan.plannedDecodeMaxContextLength, 1024);
+}
+
+TEST(PhaseQueueSchedulerTest, SnapshotReportsRunnableDecodeShapeAndLivePagePressure)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    config.metricsPolicy = [](PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const&) {
+        EXPECT_EQ(snapshot.decodeCandidateContextTokens, 384);
+        EXPECT_EQ(snapshot.decodeCandidateMaxContextLength, 256);
+        EXPECT_EQ(snapshot.pagePoolTotalBundles, 256);
+        EXPECT_EQ(snapshot.pagePoolAllocatedBundles, 200);
+        EXPECT_EQ(snapshot.pagePoolAvailableBundles, 56);
+        EXPECT_EQ(snapshot.pageReservationGuaranteedBundles, 224);
+        EXPECT_EQ(snapshot.pageReservationAvailableBundles, 32);
+        return PhaseDispatchKind::kDecode;
+    };
+    config.resourceSupplier = []() { return PhaseQueueResourceSnapshot{256, 200, 56, 224, 32}; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 1024});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_EQ(plan.plannedDecodeContextTokens, 384);
+    EXPECT_EQ(plan.plannedDecodeMaxContextLength, 256);
+}
+
 TEST(PhaseQueueSchedulerTest, PagePressurePrefersDecodeWithoutOverridingAnExpiredPrefill)
 {
     PhaseQueueSchedulerConfig config;

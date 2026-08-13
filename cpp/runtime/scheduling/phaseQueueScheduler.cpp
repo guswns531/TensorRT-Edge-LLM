@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <tuple>
 #include <utility>
 
 namespace trt_edgellm
@@ -97,6 +98,7 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     {
         check::check(cost.batchSize > 0, "Decode cost batch size must be positive");
         check::check(cost.maxContextLength > 0, "Decode cost context length must be positive");
+        check::check(cost.maxTotalContextTokens >= 0, "Decode cost total context tokens cannot be negative");
         check::check(std::isfinite(cost.p95GpuMs) && cost.p95GpuMs > 0.0F,
             "Decode cost p95 GPU time must be finite and positive");
     }
@@ -303,9 +305,22 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
             ++result.decodeQueued;
             if (result.decodeQueued <= static_cast<size_t>(mConfig.maxDecodeBatchSize))
             {
-                result.decodeCandidateTokens += item.tokenCount;
+                result.decodeCandidateContextTokens += item.tokenCount;
+                result.decodeCandidateMaxContextLength
+                    = std::max(result.decodeCandidateMaxContextLength, item.tokenCount);
             }
         }
+    }
+    result.decodeCandidateTokens = static_cast<int32_t>(std::min<int64_t>(
+        result.decodeCandidateContextTokens, static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    if (mConfig.resourceSupplier)
+    {
+        PhaseQueueResourceSnapshot const resources = mConfig.resourceSupplier();
+        result.pagePoolTotalBundles = resources.pagePoolTotalBundles;
+        result.pagePoolAllocatedBundles = resources.pagePoolAllocatedBundles;
+        result.pagePoolAvailableBundles = resources.pagePoolAvailableBundles;
+        result.pageReservationGuaranteedBundles = resources.pageReservationGuaranteedBundles;
+        result.pageReservationAvailableBundles = resources.pageReservationAvailableBundles;
     }
     auto const now = std::chrono::steady_clock::now();
     result.prefillMinTtftSlackUs = std::numeric_limits<double>::max();
@@ -409,11 +424,15 @@ PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
     {
         return PhaseDispatchKind::kPrefill;
     }
-    if (mConfig.pagePressureDecodeThreshold > 0.0F && telemetry.lastDispatch.has_value()
-        && telemetry.lastDispatch->pagePoolTotalBundles > 0)
+    int32_t const pagePoolTotal = state.pagePoolTotalBundles > 0
+        ? state.pagePoolTotalBundles
+        : (telemetry.lastDispatch.has_value() ? telemetry.lastDispatch->pagePoolTotalBundles : 0);
+    int32_t const pagePoolAllocated = state.pagePoolTotalBundles > 0
+        ? state.pagePoolAllocatedBundles
+        : (telemetry.lastDispatch.has_value() ? telemetry.lastDispatch->pagePoolAllocatedBundles : 0);
+    if (mConfig.pagePressureDecodeThreshold > 0.0F && pagePoolTotal > 0)
     {
-        float const pagePressure = static_cast<float>(telemetry.lastDispatch->pagePoolAllocatedBundles)
-            / static_cast<float>(telemetry.lastDispatch->pagePoolTotalBundles);
+        float const pagePressure = static_cast<float>(pagePoolAllocated) / static_cast<float>(pagePoolTotal);
         if (pagePressure >= mConfig.pagePressureDecodeThreshold)
         {
             return PhaseDispatchKind::kDecode;
@@ -966,7 +985,11 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
     plan.plannedDecodeBatchSize
         = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap ? selectDecodeBatchSize(state) : 0;
-    plan.plannedDecodeMaxContextLength = plan.plannedDecodeBatchSize > 0 ? decodeMaxContextLength() : 0;
+    if (plan.plannedDecodeBatchSize > 0)
+    {
+        std::tie(plan.plannedDecodeContextTokens, plan.plannedDecodeMaxContextLength)
+            = decodeCandidateShape(plan.plannedDecodeBatchSize);
+    }
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
         plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true, state, plan);
@@ -1002,17 +1025,21 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     return plan;
 }
 
-int32_t PhaseQueueScheduler::decodeMaxContextLength() const noexcept
+std::pair<int64_t, int32_t> PhaseQueueScheduler::decodeCandidateShape(int32_t maxRows) const noexcept
 {
+    int64_t total{};
     int32_t maximum{};
+    int32_t rows{};
     for (PhaseWorkItem const& item : mDecodeQueue)
     {
-        if (isEligible(item, false))
+        if (isEligible(item, false) && rows < maxRows)
         {
+            total += item.tokenCount;
             maximum = std::max(maximum, item.tokenCount);
+            ++rows;
         }
     }
-    return maximum;
+    return {total, maximum};
 }
 
 int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const noexcept
@@ -1023,15 +1050,29 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         return available;
     }
 
-    int32_t const maxContextLength = decodeMaxContextLength();
-
     struct Candidate
     {
         int32_t batchSize{};
         float p95GpuMs{};
         int32_t contextLimit{};
+        int64_t totalContextLimit{};
         int32_t profiledBatchLimit{};
     };
+    std::vector<int64_t> contextTotals(static_cast<size_t>(available) + 1U);
+    std::vector<int32_t> maxContextLengths(static_cast<size_t>(available) + 1U);
+    int32_t runnableRows{};
+    for (PhaseWorkItem const& item : mDecodeQueue)
+    {
+        if (!isEligible(item, false) || runnableRows >= available)
+        {
+            continue;
+        }
+        ++runnableRows;
+        contextTotals[static_cast<size_t>(runnableRows)]
+            = contextTotals[static_cast<size_t>(runnableRows - 1)] + item.tokenCount;
+        maxContextLengths[static_cast<size_t>(runnableRows)]
+            = std::max(maxContextLengths[static_cast<size_t>(runnableRows - 1)], item.tokenCount);
+    }
     std::vector<Candidate> candidates;
     int32_t coveringConfiguredBatch{std::numeric_limits<int32_t>::max()};
     int32_t largestConfiguredBatch{};
@@ -1049,21 +1090,29 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     }
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
     {
-        if (cost.maxContextLength < maxContextLength)
+        int32_t const dispatchedBatchSize = std::min(cost.batchSize, available);
+        int64_t const totalContextTokens = contextTotals[static_cast<size_t>(dispatchedBatchSize)];
+        int32_t const maxContextLength = maxContextLengths[static_cast<size_t>(dispatchedBatchSize)];
+        int64_t const totalContextLimit = cost.maxTotalContextTokens > 0
+            ? cost.maxTotalContextTokens
+            : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
+        if (cost.maxContextLength < maxContextLength || totalContextLimit < totalContextTokens)
         {
             continue;
         }
-        int32_t const dispatchedBatchSize = std::min(cost.batchSize, available);
         auto existing = std::find_if(candidates.begin(), candidates.end(),
             [&](Candidate const& candidate) { return candidate.batchSize == dispatchedBatchSize; });
         if (existing == candidates.end())
         {
-            candidates.push_back({dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, cost.batchSize});
+            candidates.push_back(
+                {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, totalContextLimit, cost.batchSize});
         }
         else if (cost.batchSize < existing->profiledBatchLimit
-            || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength < existing->contextLimit))
+            || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength < existing->contextLimit)
+            || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength == existing->contextLimit
+                && totalContextLimit < existing->totalContextLimit))
         {
-            *existing = {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, cost.batchSize};
+            *existing = {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, totalContextLimit, cost.batchSize};
         }
     }
     if (candidates.empty())
@@ -1080,6 +1129,30 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         // larger runnable batch is unsafe. Preserve legacy largest-available
         // behavior instead of creating a low-BS backlog from sparse profiles.
         return available;
+    }
+
+    for (Candidate& candidate : candidates)
+    {
+        if (candidate.profiledBatchLimit <= candidate.batchSize)
+        {
+            continue;
+        }
+        Candidate const* lower{};
+        for (Candidate const& other : candidates)
+        {
+            if (other.batchSize >= candidate.batchSize || (lower != nullptr && other.batchSize <= lower->batchSize))
+            {
+                continue;
+            }
+            lower = &other;
+        }
+        if (lower == nullptr)
+        {
+            continue;
+        }
+        float const fraction = static_cast<float>(candidate.batchSize - lower->batchSize)
+            / static_cast<float>(candidate.profiledBatchLimit - lower->batchSize);
+        candidate.p95GpuMs = lower->p95GpuMs + fraction * (candidate.p95GpuMs - lower->p95GpuMs);
     }
 
     bool const urgent = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold;

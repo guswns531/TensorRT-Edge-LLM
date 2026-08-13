@@ -731,7 +731,7 @@ std::vector<rt::PhaseDecodeBatchCost> loadDecodeBatchCosts(std::filesystem::path
     for (nlohmann::json const& point : root.at("decode"))
     {
         costs.push_back({point.at("batch_size").get<int32_t>(), point.at("max_context_length").get<int32_t>(),
-            point.at("p95_gpu_ms").get<float>()});
+            point.at("p95_gpu_ms").get<float>(), point.value("max_total_context_tokens", int64_t{})});
     }
     ELLM_CHECK(!costs.empty(), "Scheduler cost model contains no decode points");
     return costs;
@@ -912,19 +912,20 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
 {
     std::ofstream output(path);
     ELLM_CHECK(output.good(), "Failed to open dispatch metrics CSV: " + path.string());
-    output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,prefill_padded_tokens,"
-              "prefill_padding_tokens,prefill_packing_efficiency,decode_tokens,decode_context_tokens,"
-              "prefill_initial_rows,prefill_continuation_rows,prefill_final_rows,prefill_past_kv_min,"
-              "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,prefill_remaining_tokens,"
-              "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
-              "predicted_decode_slowdown_ms,predicted_decode_debt_us,consecutive_overlap_batches,"
-              "prefill_deferred_for_tpot,prefill_cost_coverage_miss,overlap_evaluated_by_cost,"
-              "latency_safe_fallback,prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,"
-              "prefill_cost_lookup_max_past_kv_length,"
-              "planned_decode_batch,planned_decode_max_context_length,prefill_cohort_size,"
-              "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
-              "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
-              "page_growth_request_limit,page_growth_request_owners,page_growth_tpot_pressure\n";
+    output
+        << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,prefill_padded_tokens,"
+           "prefill_padding_tokens,prefill_packing_efficiency,decode_tokens,decode_context_tokens,"
+           "prefill_initial_rows,prefill_continuation_rows,prefill_final_rows,prefill_past_kv_min,"
+           "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,prefill_remaining_tokens,"
+           "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
+           "predicted_decode_slowdown_ms,predicted_decode_debt_us,consecutive_overlap_batches,"
+           "prefill_deferred_for_tpot,prefill_cost_coverage_miss,overlap_evaluated_by_cost,"
+           "latency_safe_fallback,prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,"
+           "prefill_cost_lookup_max_past_kv_length,"
+           "planned_decode_batch,planned_decode_context_tokens,planned_decode_max_context_length,prefill_cohort_size,"
+           "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
+           "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
+           "page_growth_request_limit,page_growth_request_owners,page_growth_tpot_pressure\n";
     output << std::fixed << std::setprecision(6);
     for (rt::PhaseDispatchMetrics const& sample : metrics)
     {
@@ -941,11 +942,12 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << (sample.prefillCostCoverageMiss ? 1 : 0) << ',' << (sample.overlapEvaluatedByCost ? 1 : 0) << ','
                << (sample.latencySafeFallback ? 1 : 0) << ',' << sample.prefillCostLookupRows << ','
                << sample.prefillCostLookupChunkLength << ',' << sample.prefillCostLookupMaxPastKVLength << ','
-               << sample.plannedDecodeBatchSize << ',' << sample.plannedDecodeMaxContextLength << ','
-               << sample.prefillCohortSize << ',' << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ','
-               << sample.prefillGpuMs << ',' << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ','
-               << sample.overlapRatio << ',' << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles
-               << ',' << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << sample.plannedDecodeBatchSize << ',' << sample.plannedDecodeContextTokens << ','
+               << sample.plannedDecodeMaxContextLength << ',' << sample.prefillCohortSize << ','
+               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
+               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
+               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
+               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
                << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }

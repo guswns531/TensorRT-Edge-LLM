@@ -83,7 +83,7 @@ def main() -> None:
     if not paths:
         parser.error("no kernel-groups.csv inputs found")
 
-    grouped: dict[tuple[str, int, int], list[float]] = {}
+    grouped: dict[tuple[str, int, int], list[tuple[float, int]]] = {}
     for row in read_rows(paths):
         group = row["group"]
         if group not in {"prefill_engine", "decode_engine"}:
@@ -102,28 +102,39 @@ def main() -> None:
                 continue
             context = upper_bucket(math.ceil(total_tokens / batch), buckets)
             phase = "prefill"
-        grouped.setdefault((phase, batch, context),
-                           []).append(float(row["gpu_ms"]))
+        context_tokens = total_context if phase == "decode" else total_tokens
+        grouped.setdefault((phase, batch, context), []).append(
+            (float(row["gpu_ms"]), context_tokens))
 
     normalized: list[dict[str, object]] = []
-    for (phase, batch, context), values in sorted(grouped.items()):
-        if len(values) < args.min_samples:
+    for (phase, batch, context), samples in sorted(grouped.items()):
+        if len(samples) < args.min_samples:
             continue
+        values = [sample[0] for sample in samples]
         normalized.append({
-            "phase": phase,
-            "batch_size": batch,
-            "max_context_length": context,
-            "samples": len(values),
-            "median_gpu_ms": statistics.median(values),
-            "p95_gpu_ms": percentile(values, 0.95),
-            "max_gpu_ms": max(values),
+            "phase":
+            phase,
+            "batch_size":
+            batch,
+            "max_context_length":
+            context,
+            "samples":
+            len(values),
+            "max_total_context_tokens":
+            max(sample[1] for sample in samples),
+            "median_gpu_ms":
+            statistics.median(values),
+            "p95_gpu_ms":
+            percentile(values, 0.95),
+            "max_gpu_ms":
+            max(values),
         })
     if not any(point["phase"] == "decode" for point in normalized):
         raise RuntimeError("no decode cost point met the sample threshold")
 
     root = {
         "schema_version":
-        2,
+        3,
         "prefill_layout":
         args.prefill_layout,
         "source_files": [str(path) for path in paths],

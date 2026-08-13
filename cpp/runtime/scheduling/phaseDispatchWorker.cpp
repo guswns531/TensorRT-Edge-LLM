@@ -164,6 +164,7 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.prefillCostLookupChunkLength = mInFlight.prefillCostLookupChunkLength;
     mCurrentMetrics.prefillCostLookupMaxPastKVLength = mInFlight.prefillCostLookupMaxPastKVLength;
     mCurrentMetrics.plannedDecodeBatchSize = mInFlight.plannedDecodeBatchSize;
+    mCurrentMetrics.plannedDecodeContextTokens = mInFlight.plannedDecodeContextTokens;
     mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     int64_t prefillPastKVSum{};

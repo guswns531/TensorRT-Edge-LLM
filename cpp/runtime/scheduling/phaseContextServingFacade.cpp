@@ -75,6 +75,19 @@ PhaseContextServingFacade::PhaseContextServingFacade(int32_t maxSlots, PhaseQueu
     schedulerConfig.eligibilityPolicy = [this, configuredEligibility](PhaseWorkItem const& item, bool prefill) {
         return (!configuredEligibility || configuredEligibility(item, prefill)) && isPageWorkEligible(item, prefill);
     };
+    PhaseQueueResourceSupplier const configuredResourceSupplier = std::move(schedulerConfig.resourceSupplier);
+    schedulerConfig.resourceSupplier = [this, configuredResourceSupplier]() {
+        PhaseQueueResourceSnapshot result
+            = configuredResourceSupplier ? configuredResourceSupplier() : PhaseQueueResourceSnapshot{};
+        KVPagePoolStats const pool = mCacheManager.getPagedKVPoolStats();
+        result.pagePoolTotalBundles = pool.totalBundles;
+        result.pagePoolAllocatedBundles = pool.allocatedBundles;
+        result.pagePoolAvailableBundles = pool.availableBundles;
+        result.pageReservationGuaranteedBundles = guaranteedPageBundles();
+        result.pageReservationAvailableBundles
+            = pool.totalBundles > 0 ? pool.totalBundles - result.pageReservationGuaranteedBundles : 0;
+        return result;
+    };
     mLifecycle = std::make_unique<PhaseRequestLifecycle>(maxSlots, std::move(schedulerConfig), makeLifecycleCallbacks(),
         prefillStream, decodeStream, executionMode, safetyContract);
 }

@@ -25,6 +25,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace trt_edgellm
@@ -112,6 +113,7 @@ struct PhaseDispatchMetrics
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
     int32_t plannedDecodeBatchSize{};
+    int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
     int32_t prefillCohortSize{};
     int32_t decodeTokens{};
@@ -156,6 +158,9 @@ struct PhaseQueueSnapshot
     int64_t prefillRemainingTokens{};
     int32_t prefillContinuationRows{};
     int32_t decodeCandidateTokens{};
+    //! Total and maximum context lengths of the first runnable decode rows.
+    int64_t decodeCandidateContextTokens{};
+    int32_t decodeCandidateMaxContextLength{};
     int32_t consecutiveDecodeBatches{};
     double prefillOldestWaitUs{};
     double prefillOldestRequestAgeUs{};
@@ -165,6 +170,13 @@ struct PhaseQueueSnapshot
     double decodeMaxSloPressure{};
     int32_t prefillHighestPriority{};
     int32_t decodeHighestPriority{};
+    //! Current resource state supplied by the serving facade. Zero denotes a
+    //! linear cache or a scheduler without a resource supplier.
+    int32_t pagePoolTotalBundles{};
+    int32_t pagePoolAllocatedBundles{};
+    int32_t pagePoolAvailableBundles{};
+    int32_t pageReservationGuaranteedBundles{};
+    int32_t pageReservationAvailableBundles{};
 };
 
 using PhaseSchedulingPolicy = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&)>;
@@ -179,7 +191,22 @@ struct PhaseDecodeBatchCost
     int32_t batchSize{};
     int32_t maxContextLength{};
     float p95GpuMs{};
+    //! Largest sum of row context lengths covered by this point. Zero keeps
+    //! legacy behavior and derives batchSize * maxContextLength.
+    int64_t maxTotalContextTokens{};
 };
+
+//! Live cache and admission counters exposed to scheduler policies.
+struct PhaseQueueResourceSnapshot
+{
+    int32_t pagePoolTotalBundles{};
+    int32_t pagePoolAllocatedBundles{};
+    int32_t pagePoolAvailableBundles{};
+    int32_t pageReservationGuaranteedBundles{};
+    int32_t pageReservationAvailableBundles{};
+};
+
+using PhaseQueueResourceSupplier = std::function<PhaseQueueResourceSnapshot()>;
 
 //! Conservative prefill cost point loaded from offline CUDA-event profiling.
 //! The point covers one uniform chunk shape up to the supplied past-KV and
@@ -340,6 +367,8 @@ struct PhaseQueueSchedulerConfig
     //! Optional admission-growth gate. Ineligible work remains queued and keeps
     //! its residence timestamp until the cache owner permits further growth.
     PhaseWorkEligibilityPolicy eligibilityPolicy{};
+    //! Optional live page-pool/admission snapshot used by scheduling policy.
+    PhaseQueueResourceSupplier resourceSupplier{};
 };
 
 struct PhaseDispatchPlan
@@ -355,6 +384,7 @@ struct PhaseDispatchPlan
     double predictedDecodeDebtUs{};
     int32_t consecutiveOverlapBatches{};
     int32_t plannedDecodeBatchSize{};
+    int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
@@ -413,7 +443,7 @@ private:
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const noexcept;
-    int32_t decodeMaxContextLength() const noexcept;
+    std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const noexcept;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,

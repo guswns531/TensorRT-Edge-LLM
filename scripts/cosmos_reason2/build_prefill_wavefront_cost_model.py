@@ -120,6 +120,7 @@ def main() -> None:
 
     decode_baseline: dict[tuple[int, int], list[float]] = {}
     decode_points: dict[tuple[int, int], list[float]] = {}
+    decode_total_context_limits: dict[tuple[int, int], int] = {}
     for row in rows:
         decode_batch = int(row["decode_batch"])
         if decode_batch <= 0 or float(row["decode_gpu_ms"]) <= 0.0:
@@ -129,6 +130,9 @@ def main() -> None:
         batch_bucket = upper_bucket(decode_batch, args.decode_batch_buckets)
         key = (batch_bucket, context_bucket)
         decode_points.setdefault(key, []).append(float(row["decode_gpu_ms"]))
+        decode_total_context_limits[key] = max(
+            decode_total_context_limits.get(key, 0),
+            int(row["decode_context_tokens"]))
         if int(row["prefill_batch"]) == 0:
             decode_baseline.setdefault(key,
                                        []).append(float(row["decode_gpu_ms"]))
@@ -240,12 +244,20 @@ def main() -> None:
         if len(samples) < args.min_samples:
             continue
         point = {
-            "batch_size": batch,
-            "max_context_length": context,
-            "samples": len(samples),
-            "sample_scope": sample_scope,
-            "median_gpu_ms": statistics.median(samples),
-            "p95_gpu_ms": percentile(samples, 0.95),
+            "batch_size":
+            batch,
+            "max_context_length":
+            context,
+            "max_total_context_tokens":
+            decode_total_context_limits[(batch, context)],
+            "samples":
+            len(samples),
+            "sample_scope":
+            sample_scope,
+            "median_gpu_ms":
+            statistics.median(samples),
+            "p95_gpu_ms":
+            percentile(samples, 0.95),
         }
         decode.append(point)
         csv_rows.append({"phase": "decode", **point})
@@ -288,7 +300,7 @@ def main() -> None:
             "insufficient detailed prefill/decode/overlap samples")
 
     root = {
-        "schema_version": 6,
+        "schema_version": 7,
         "prefill_layout": args.prefill_layout,
         "source_files": [str(path) for path in paths],
         "decode": decode,
