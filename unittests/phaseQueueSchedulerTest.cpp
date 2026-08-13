@@ -380,6 +380,60 @@ TEST(PhaseQueueSchedulerTest, TokenBudgetSelectsTheMostProductiveCompatibleBucke
     EXPECT_EQ(plan.prefillBatch[1].tokenCount, 128);
 }
 
+TEST(PhaseQueueSchedulerTest, CompletionBonusSelectsFinalContinuationBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    config.prefillCompletionBonusTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+    for (uint64_t requestId = 5; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 3, static_cast<int32_t>(requestId - 1), 128, 131});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    for (PhaseWorkItem const& item : plan.prefillBatch)
+    {
+        EXPECT_EQ(item.tokenOffset, 128);
+        EXPECT_EQ(item.tokenCount, 3);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, CompletionBonusDoesNotPromoteNearlyFullContinuationChunks)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    config.prefillCompletionBonusTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 2; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 109, static_cast<int32_t>(requestId - 1), 0, 109});
+    }
+    for (uint64_t requestId = 5; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 108, static_cast<int32_t>(requestId - 1), 128, 236});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    for (PhaseWorkItem const& item : plan.prefillBatch)
+    {
+        EXPECT_EQ(item.tokenOffset, 0);
+        EXPECT_EQ(item.tokenCount, 109);
+    }
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
 {
     PhaseQueueSchedulerConfig config;

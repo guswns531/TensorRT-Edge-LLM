@@ -86,6 +86,7 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
     check::check(mConfig.maxPrefillBatchTokens >= 0, "maxPrefillBatchTokens must be non-negative");
+    check::check(mConfig.prefillCompletionBonusTokens >= 0, "prefillCompletionBonusTokens must be non-negative");
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
     {
         check::check(cost.batchSize > 0, "Decode cost batch size must be positive");
@@ -752,7 +753,14 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             int32_t usefulTokens{};
             int32_t paddedTokens{};
             int32_t rows{};
+            int32_t finalContinuationRows{};
+            int64_t completionCreditTokens{};
             double priority{};
+
+            int64_t productivity() const
+            {
+                return static_cast<int64_t>(usefulTokens) + completionCreditTokens;
+            }
         };
         auto bucketScore = [&](PhaseWorkItem const& candidate) {
             int32_t const candidateTokens = dispatchedPrefillTokens(candidate);
@@ -776,18 +784,41 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             int32_t const selectedRows
                 = std::min({maxBatchSize, static_cast<int32_t>(candidateRows.size()), budgetRows});
             int32_t usefulTokens{};
+            int32_t finalContinuationRows{};
+            int64_t completionCreditTokens{};
             for (int32_t index{}; index < selectedRows; ++index)
             {
-                usefulTokens += dispatchedPrefillTokens(*candidateRows[static_cast<size_t>(index)]);
+                PhaseWorkItem const& row = *candidateRows[static_cast<size_t>(index)];
+                int32_t const rowTokens = dispatchedPrefillTokens(row);
+                usefulTokens += rowTokens;
+                bool const finalContinuation
+                    = row.tokenOffset > 0 && row.tokenOffset + rowTokens == row.promptTokenCount;
+                finalContinuationRows += finalContinuation;
+                if (finalContinuation)
+                {
+                    int32_t const unusedChunkTokens = std::max(0, mConfig.maxPrefillChunkTokens - rowTokens);
+                    if (rowTokens < unusedChunkTokens)
+                    {
+                        completionCreditTokens += std::min(mConfig.prefillCompletionBonusTokens, unusedChunkTokens);
+                    }
+                }
             }
-            return BucketScore{usefulTokens, selectedRows * candidateTokens, selectedRows, priorityRank(candidate)};
+            return BucketScore{usefulTokens, selectedRows * candidateTokens, selectedRows, finalContinuationRows,
+                completionCreditTokens, priorityRank(candidate)};
         };
         auto const lowerBucketScore = [&](PhaseWorkItem const& lhs, PhaseWorkItem const& rhs) {
             auto const lhsScore = bucketScore(lhs);
             auto const rhsScore = bucketScore(rhs);
-            if (lhsScore.usefulTokens != rhsScore.usefulTokens)
+            int64_t const lhsProductivity = lhsScore.productivity();
+            int64_t const rhsProductivity = rhsScore.productivity();
+            if (lhsProductivity != rhsProductivity)
             {
-                return lhsScore.usefulTokens < rhsScore.usefulTokens;
+                return lhsProductivity < rhsProductivity;
+            }
+            if (mConfig.prefillCompletionBonusTokens > 0
+                && lhsScore.finalContinuationRows != rhsScore.finalContinuationRows)
+            {
+                return lhsScore.finalContinuationRows < rhsScore.finalContinuationRows;
             }
             int64_t const lhsEfficiency
                 = static_cast<int64_t>(lhsScore.usefulTokens) * std::max(1, rhsScore.paddedTokens);

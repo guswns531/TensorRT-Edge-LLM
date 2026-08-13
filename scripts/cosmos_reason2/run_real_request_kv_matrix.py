@@ -253,6 +253,11 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
              str(args.prefill_token_budget)])
     if args.ragged_prefill_batching:
         command.append("--raggedPrefillBatching")
+    if args.prefill_completion_bonus_tokens > 0:
+        command.extend([
+            "--prefillCompletionBonusTokens",
+            str(args.prefill_completion_bonus_tokens)
+        ])
     if args.ignore_eos:
         command.append("--ignoreTraceEos")
     if args.dynamic_decode_batching:
@@ -650,6 +655,12 @@ def main() -> None:
         action="store_true",
         help="right-pad different text chunk lengths into one prefill batch")
     parser.add_argument(
+        "--prefill-completion-bonus-tokens",
+        type=int,
+        default=0,
+        help="maximum virtual useful-token credit for a final continuation row"
+    )
+    parser.add_argument(
         "--dynamic-decode-batching",
         action="store_true",
         help="select decode batch size using the measured scheduler cost model"
@@ -773,9 +784,10 @@ def main() -> None:
     if args.cuda_graph_charge_mib <= 0:
         parser.error("cuda-graph-charge-mib must be positive")
     if (args.cuda_graph_reserve_mib < 0 or args.trace_warmup_repeats < 0
-            or args.prefill_token_budget < 0):
+            or args.prefill_token_budget < 0
+            or args.prefill_completion_bonus_tokens < 0):
         parser.error(
-            "CUDA graph reserve, trace warmup, and prefill token budget must be non-negative"
+            "CUDA graph reserve, trace warmup, and prefill scheduler credits must be non-negative"
         )
     if args.trace_warmup_repeats > 0 and not args.cuda_graph:
         parser.error("--trace-warmup-repeats requires --cuda-graph")
@@ -897,6 +909,8 @@ def main() -> None:
                 args.prefill_token_budget,
                 "ragged_prefill_batching":
                 args.ragged_prefill_batching,
+                "prefill_completion_bonus_tokens":
+                args.prefill_completion_bonus_tokens,
                 "max_overlap_prefill_tokens":
                 args.max_overlap_prefill_tokens,
                 "ttft_target_ms":

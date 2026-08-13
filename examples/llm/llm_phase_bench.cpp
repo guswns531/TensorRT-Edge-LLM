@@ -124,6 +124,7 @@ struct Args
     int32_t cudaGraphReserveMiB{};
     int32_t prefillTokenBudget{};
     bool raggedPrefillBatching{};
+    int32_t prefillCompletionBonusTokens{};
     bool dynamicDecodeBatching{};
     bool dynamicPrefillBatching{};
     int32_t minDynamicPrefillBatchSize{1};
@@ -343,7 +344,7 @@ void printUsage(char const* program)
         "[--cudaGraphChargeMiB N --cudaGraphReserveMiB N] "
         "[--slotCount N] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--prefillTokenBudget N] "
-        "[--raggedPrefillBatching] "
+        "[--raggedPrefillBatching --prefillCompletionBonusTokens N] "
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
         "--decodeSlackSafetyFactor F "
@@ -396,6 +397,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kCudaGraphReserveMiB,
         kPrefillTokenBudget,
         kRaggedPrefillBatching,
+        kPrefillCompletionBonusTokens,
         kDynamicDecodeBatching,
         kDynamicPrefillBatching,
         kMinDynamicPrefillBatchSize,
@@ -468,6 +470,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"cudaGraphReserveMiB", required_argument, nullptr, kCudaGraphReserveMiB},
         {"prefillTokenBudget", required_argument, nullptr, kPrefillTokenBudget},
         {"raggedPrefillBatching", no_argument, nullptr, kRaggedPrefillBatching},
+        {"prefillCompletionBonusTokens", required_argument, nullptr, kPrefillCompletionBonusTokens},
         {"dynamicDecodeBatching", no_argument, nullptr, kDynamicDecodeBatching},
         {"dynamicPrefillBatching", no_argument, nullptr, kDynamicPrefillBatching},
         {"minDynamicPrefillBatchSize", required_argument, nullptr, kMinDynamicPrefillBatchSize},
@@ -564,6 +567,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kCudaGraphReserveMiB: args.cudaGraphReserveMiB = std::stoi(optarg); break;
         case kPrefillTokenBudget: args.prefillTokenBudget = std::stoi(optarg); break;
         case kRaggedPrefillBatching: args.raggedPrefillBatching = true; break;
+        case kPrefillCompletionBonusTokens: args.prefillCompletionBonusTokens = std::stoi(optarg); break;
         case kDynamicDecodeBatching: args.dynamicDecodeBatching = true; break;
         case kDynamicPrefillBatching: args.dynamicPrefillBatching = true; break;
         case kMinDynamicPrefillBatchSize: args.minDynamicPrefillBatchSize = std::stoi(optarg); break;
@@ -648,10 +652,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.maxPrefillCudaGraphs != 0 && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0
         && args.maxDecodeCudaGraphs >= -1 && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1
         && args.maxDecodeCudaGraphMiB >= -1 && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0
-        && args.prefillTokenBudget >= 0 && args.pageReservationHeadroomTokens >= 0
-        && args.pageReservationOvercommitBundles >= 0 && args.pageReservationGrowthRequests > 0
-        && args.fullReservationPromptThresholdTokens >= 0 && args.minPageGrowthRequests > 0
-        && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
+        && args.prefillTokenBudget >= 0 && args.prefillCompletionBonusTokens >= 0
+        && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
+        && args.pageReservationGrowthRequests > 0 && args.fullReservationPromptThresholdTokens >= 0
+        && args.minPageGrowthRequests > 0 && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
         && std::isfinite(args.pageGrowthTpotTargetMs) && args.pageGrowthTpotTargetMs > 0.0 && args.prefillCohortSize > 0
         && args.minDynamicPrefillBatchSize > 0 && args.minDynamicPrefillBatchSize <= args.prefillBatch
         && args.prefillCohortTurns > 0 && std::isfinite(args.decodeSlackSafetyFactor)
@@ -1594,6 +1598,7 @@ int main(int argc, char** argv)
             = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
         facadeSchedulerConfig.maxPrefillBatchTokens = args.prefillTokenBudget;
         facadeSchedulerConfig.enableRaggedPrefillBatching = args.raggedPrefillBatching;
+        facadeSchedulerConfig.prefillCompletionBonusTokens = args.prefillCompletionBonusTokens;
         facadeSchedulerConfig.enableDynamicDecodeBatching = args.dynamicDecodeBatching;
         bool const profileUsesCosts = facadeSchedulerConfig.profile != rt::PhaseSchedulerProfile::kCustom;
         if (args.dynamicDecodeBatching || profileUsesCosts)

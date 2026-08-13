@@ -239,6 +239,12 @@ struct PhaseQueueSchedulerConfig
     //! Combine different text chunk lengths in one right-padded TensorRT batch.
     //! Initial and continuation chunks remain separate execution classes.
     bool enableRaggedPrefillBatching{};
+    //! Maximum virtual useful-token credit for each continuation row that
+    //! completes a request's prefill. The scheduler caps the credit at the
+    //! unused portion of one configured chunk and only grants it below half a
+    //! chunk, so large tails do not preempt productive initial work. Zero
+    //! preserves pure token selection.
+    int32_t prefillCompletionBonusTokens{};
     //! Select a decode batch cap from measured p95 costs and current TPOT
     //! pressure. Empty costs preserve the legacy largest-available behavior.
     bool enableDynamicDecodeBatching{};
