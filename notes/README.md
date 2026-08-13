@@ -72,6 +72,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 50. [Cosmos direct-overlap cost와 TPOT hard guard](71-cosmos-tpot-guard-direct-overlap-20260813.md)
 51. [Cosmos ragged prefill 구현과 vLLM 격차 축소](72-cosmos-ragged-prefill-20260813.md)
 52. [Cosmos ragged direct-cost admission과 controlled overlap probe](73-cosmos-ragged-cost-aware-admission-20260813.md)
+53. [Cosmos direct-cost v5 coverage 0과 workload regression gate](74-cosmos-direct-cost-v5-regression-gates-20260813.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.
