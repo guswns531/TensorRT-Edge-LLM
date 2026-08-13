@@ -86,6 +86,10 @@ struct PhaseDispatchMetrics
     int32_t prefillBatchSize{};
     int32_t decodeBatchSize{};
     int32_t prefillTokens{};
+    //! Runtime B*S footprint and unused right-padding tokens for ragged prefill.
+    int32_t prefillPaddedTokens{};
+    int32_t prefillPaddingTokens{};
+    float prefillPackingEfficiency{};
     int32_t prefillInitialRows{};
     int32_t prefillContinuationRows{};
     int32_t prefillFinalRows{};
@@ -218,6 +222,9 @@ struct PhaseQueueSchedulerConfig
     int32_t maxPrefillChunkTokens{};
     //! Optional total-token budget for one compatible prefill batch. Zero disables it.
     int32_t maxPrefillBatchTokens{};
+    //! Combine different text chunk lengths in one right-padded TensorRT batch.
+    //! Initial and continuation chunks remain separate execution classes.
+    bool enableRaggedPrefillBatching{};
     //! Select a decode batch cap from measured p95 costs and current TPOT
     //! pressure. Empty costs preserve the legacy largest-available behavior.
     bool enableDynamicDecodeBatching{};
@@ -359,6 +366,8 @@ private:
         PhaseQueueSnapshot const& snapshot, float& predictedGpuMs, float& predictedDecodeSlowdownMs) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
+    bool isPrefillBatchCompatible(
+        PhaseWorkItem const& item, int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept;
     bool isEligible(PhaseWorkItem const& item, bool prefill) const;
     std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill,
         PhaseQueueSnapshot const& snapshot, PhaseDispatchPlan& plan);

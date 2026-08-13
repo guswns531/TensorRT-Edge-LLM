@@ -916,6 +916,51 @@ TEST(PhasePrefillContextBatchAdapterTest, PacksPromptSlicesAndRestoresStableSlot
     EXPECT_THROW(adapter.pack({{1, &first, 0, 0, 0, 2, 5}, {2, &second, 0, 1, 2, 2, 5}}, nullptr), std::runtime_error);
 }
 
+TEST(PhasePrefillContextBatchAdapterTest, RightPadsRaggedRowsAndCommitsActualLengths)
+{
+    int32_t const maxSlots = 4;
+    rt::HybridCacheManager cacheManager = makeIndexedManager(maxSlots);
+    std::vector<int32_t> initialLengths{10, 20, 30, 40};
+    rt::Tensor hostLengths({maxSlots}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(hostLengths.rawPointer(), initialLengths.data(), initialLengths.size() * sizeof(int32_t));
+    cacheManager.resetForNewSequences(hostLengths, nullptr);
+
+    rt::TensorMap tensorMap;
+    rt::PhaseBatchState previousBindings(maxSlots, "phase_ragged_prefill_previous_bindings");
+    previousBindings.bind(tensorMap);
+
+    rt::DecodingInferenceContext first;
+    first.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    first.rawBatchedInputIds = {{10, 11, 12, 13, 14}};
+    first.tokenIds = first.rawBatchedInputIds;
+
+    rt::DecodingInferenceContext second;
+    second.initialize(1, 4, std::nullopt, rt::OptionalInputTensors{}, "", nullptr);
+    second.rawBatchedInputIds = {{20, 21, 22, 23, 24}};
+    second.tokenIds = second.rawBatchedInputIds;
+
+    rt::PhasePrefillContextBatchAdapter adapter(
+        2, 4, cacheManager, tensorMap, "phase_ragged_prefill_adapter_test", true);
+    adapter.pack({{101, &first, 0, 3, 2, 3, 5}, {202, &second, 0, 0, 4, 1, 5}}, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    EXPECT_EQ(adapter.chunkLength(), 3);
+    EXPECT_EQ(copyDeviceToHost<int32_t>(adapter.tokenIds()), (std::vector<int32_t>{12, 13, 14, 24, 0, 0}));
+
+    rt::Tensor increments({2}, rt::DeviceType::kGPU, DataType::kINT32, "phase_ragged_prefill_increments");
+    std::vector<int32_t> const hostIncrements{3, 1};
+    CUDA_CHECK(cudaMemcpy(increments.rawPointer(), hostIncrements.data(), hostIncrements.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    adapter.phaseBatchState().commit(cacheManager, increments, nullptr);
+    adapter.complete();
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    EXPECT_EQ(
+        copyDeviceToHost<int32_t>(cacheManager.getGlobalKVCacheLengths()), (std::vector<int32_t>{11, 20, 30, 43}));
+    EXPECT_EQ(tensorMap.get(binding_names::kKVSlotIds), &previousBindings.slotIds());
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &previousBindings.lengths());
+}
+
 TEST(PhasePrefillContextBatchAdapterTest, PacksSingleAtomicMultimodalPrompt)
 {
     rt::HybridCacheManager cacheManager = makeIndexedManager(2);

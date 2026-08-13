@@ -47,10 +47,13 @@ namespace kernel
 //!     Set to false (default) for chunked prefill with KV cache reuse, where FMHA reads KV from the transposed
 //!     KV cache, and for all decoding paths (vanilla / tree), where the XQA kernel reads KV from the cache.
 //! @param[in] kvSlotIds Optional active-row to stable physical-slot mapping. Enables the paged-XQA physical layout.
+//! @param[in] inputSeqLengths Optional valid input-token count per row. Padded tokens are zeroed in Q and do not
+//!     write KV cache entries.
 //! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
     rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    bool writeKInPlace, int32_t const* kvSlotIds = nullptr, int32_t const* kvPageIds = nullptr);
+    bool writeKInPlace, int32_t const* kvSlotIds = nullptr, int32_t const* kvPageIds = nullptr,
+    int32_t const* inputSeqLengths = nullptr);
 
 //! @brief Launch the kernel when we are performing tree attention for speculative decoding.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
@@ -95,10 +98,11 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
 //! @param[out] fp8QOut Optional FP8 output buffer for roped Q [batchSize, runtimeSeqLen, Hq, headDim].
 //!     When non-null, roped Q is quantized to FP8 E4M3 and stored here. Pass nullptr for FP16 in-place RoPE.
 //! @param[in] qScale Q dequant scale (quant→orig). Only used when fp8QOut is non-null.
+//! @param[in] inputSeqLengths Optional valid input-token count per row. Padded tokens do not write KV entries.
 void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q,
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
     void* fp8QOut = nullptr, float qScale = 1.0f, int32_t const* kvSlotIds = nullptr,
-    int32_t const* kvPageIds = nullptr);
+    int32_t const* kvPageIds = nullptr, int32_t const* inputSeqLengths = nullptr);
 
 //! @brief Launch kernel to apply RoPE to Q only (no KV write).
 //!

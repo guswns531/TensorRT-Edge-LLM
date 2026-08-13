@@ -31,7 +31,7 @@ namespace rt
 {
 
 PhasePrefillContextBatchAdapter::PhasePrefillContextBatchAdapter(int32_t maxBatchSize, int32_t maxChunkTokens,
-    HybridCacheManager& cacheManager, TensorMap& tensorMap, std::string const& name)
+    HybridCacheManager& cacheManager, TensorMap& tensorMap, std::string const& name, bool enableRaggedPrefill)
     : mMaxBatchSize(maxBatchSize)
     , mMaxChunkTokens(maxChunkTokens)
     , mCacheManager(cacheManager)
@@ -40,6 +40,7 @@ PhasePrefillContextBatchAdapter::PhasePrefillContextBatchAdapter(int32_t maxBatc
           {maxBatchSize, maxChunkTokens}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_token_ids")
     , mDeviceTokenIds({maxBatchSize, maxChunkTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_token_ids")
     , mBatchState(maxBatchSize, name + "_batch", cacheManager.isIndexedKVCache())
+    , mEnableRaggedPrefill(enableRaggedPrefill)
 {
     check::check(mMaxBatchSize > 0, "Phase prefill adapter max batch size must be positive.");
     check::check(mMaxChunkTokens > 0, "Phase prefill adapter max chunk length must be positive.");
@@ -82,7 +83,9 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
     check::check(
         static_cast<int32_t>(rows.size()) <= mMaxBatchSize, "Phase prefill batch exceeds its configured maximum.");
 
-    int32_t const chunkLength = rows.front().tokenCount;
+    int32_t const chunkLength = std::max_element(rows.begin(), rows.end(), [](auto const& lhs, auto const& rhs) {
+        return lhs.tokenCount < rhs.tokenCount;
+    })->tokenCount;
     check::check(chunkLength <= mMaxChunkTokens, "Phase prefill chunk exceeds its configured maximum.");
     std::unordered_set<uint64_t> requestIds;
     std::unordered_set<int32_t> slots;
@@ -90,7 +93,8 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
     for (PhasePrefillContextRow const& row : rows)
     {
         validateRow(row);
-        check::check(row.tokenCount == chunkLength, "Phase prefill batch mixes different chunk lengths.");
+        check::check(mEnableRaggedPrefill || row.tokenCount == chunkLength,
+            "Phase prefill batch mixes different chunk lengths without ragged prefill enabled.");
         check::check(requestIds.insert(row.requestId).second, "Phase prefill batch contains a duplicate request ID.");
         check::check(slots.insert(row.kvSlotId).second, "Phase prefill batch contains a duplicate KV slot.");
         check::check(sourceRows.insert({row.context, row.contextRow}).second,
@@ -126,6 +130,7 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
     check::check(mDeviceTokenIds.reshape({mBatchSize, mChunkLength}), "Device prefill token IDs reshape failed.");
 
     int32_t* hostTokens = mHostTokenIds.dataPointer<int32_t>();
+    std::fill_n(hostTokens, static_cast<size_t>(mBatchSize) * mChunkLength, 0);
     mRows = rows;
     mWorkItems.clear();
     mWorkItems.reserve(rows.size());
@@ -133,8 +138,8 @@ void PhasePrefillContextBatchAdapter::pack(std::vector<PhasePrefillContextRow> c
     {
         PhasePrefillContextRow const& row = rows[static_cast<size_t>(packedRow)];
         std::vector<int32_t> const& prompt = row.context->rawBatchedInputIds[static_cast<size_t>(row.contextRow)];
-        std::copy_n(
-            prompt.begin() + row.tokenOffset, mChunkLength, hostTokens + static_cast<size_t>(packedRow) * mChunkLength);
+        std::copy_n(prompt.begin() + row.tokenOffset, row.tokenCount,
+            hostTokens + static_cast<size_t>(packedRow) * mChunkLength);
         mWorkItems.push_back({row.requestId, row.tokenCount, row.kvSlotId, row.tokenOffset, row.promptTokenCount});
     }
     CUDA_CHECK(cudaMemcpyAsync(mDeviceTokenIds.rawPointer(), mHostTokenIds.rawPointer(),

@@ -144,7 +144,9 @@ def main() -> None:
             initial = False
         else:
             continue
-        chunk_length = int(row["prefill_tokens"]) // prefill_batch
+        padded_tokens = int(
+            row.get("prefill_padded_tokens") or row["prefill_tokens"])
+        chunk_length = padded_tokens // prefill_batch
         past_bucket = upper_bucket(int(row["prefill_past_kv_max"]),
                                    args.past_kv_buckets)
         decode_batch = int(row["decode_batch"])
@@ -166,6 +168,8 @@ def main() -> None:
             float(row["prefill_gpu_ms"]),
             "decode_slowdown_ms":
             slowdown,
+            "packing_efficiency":
+            float(row.get("prefill_packing_efficiency") or 1.0),
         })
         if decode_batch > 0 and float(row["decode_gpu_ms"]) > 0.0:
             mean_context = math.ceil(
@@ -193,6 +197,7 @@ def main() -> None:
         batch, chunk, past, decode, initial = key
         gpu = [sample["prefill_gpu_ms"] for sample in samples]
         slowdown = [sample["decode_slowdown_ms"] for sample in samples]
+        packing = [sample["packing_efficiency"] for sample in samples]
         point = {
             "batch_size": batch,
             "chunk_length": chunk,
@@ -203,6 +208,7 @@ def main() -> None:
             "median_gpu_ms": statistics.median(gpu),
             "p95_gpu_ms": percentile(gpu, 0.95),
             "decode_slowdown_p95_ms": percentile(slowdown, 0.95),
+            "median_packing_efficiency": statistics.median(packing),
         }
         prefill.append(point)
         csv_rows.append({"phase": "prefill", **point})
@@ -259,7 +265,7 @@ def main() -> None:
             "insufficient detailed prefill/decode/overlap samples")
 
     root = {
-        "schema_version": 3,
+        "schema_version": 4,
         "source_files": [str(path) for path in paths],
         "decode": decode,
         "prefill": prefill,

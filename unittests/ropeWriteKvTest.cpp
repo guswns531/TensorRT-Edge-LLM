@@ -737,6 +737,41 @@ TEST(RopeWriteKvPrefill, IndexedMultiHeadPagedLayoutRoundTrip)
     ASSERT_EQ(vActual, vExpected);
 }
 
+TEST(RopeWriteKvPrefill, RaggedPaddingDoesNotAccessUnallocatedPage)
+{
+    constexpr int32_t kBATCH = 2;
+    constexpr int32_t kSEQ_LEN = 128;
+    constexpr int32_t kCAPACITY = 256;
+    constexpr int32_t kNUM_HEADS = 1;
+    constexpr int32_t kHEAD_DIM = 64;
+    rt::Tensor qTensor({kBATCH, kSEQ_LEN, kNUM_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kTensor({kBATCH, kSEQ_LEN, kNUM_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vTensor({kBATCH, kSEQ_LEN, kNUM_HEADS, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemset(qTensor.rawPointer(), 0, qTensor.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(kTensor.rawPointer(), 0, kTensor.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(vTensor.rawPointer(), 0, vTensor.getMemoryCapacity()));
+
+    rt::Tensor physicalPool(
+        {kBATCH, 2, kNUM_HEADS, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor activeView(physicalPool.rawPointer(), {kBATCH, 2, kNUM_HEADS, kCAPACITY, kHEAD_DIM},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor cosSinCache({1, kCAPACITY, kHEAD_DIM}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(cosSinCache.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, kHEAD_DIM, kCAPACITY, nullptr);
+
+    rt::Tensor endLengths({kBATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor inputLengths({kBATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor slotIds({kBATCH}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor pageIds({kBATCH, 2, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(endLengths, std::vector<int32_t>{192, 192});
+    copyHostToDevice(inputLengths, std::vector<int32_t>{128, 64});
+    copyHostToDevice(slotIds, std::vector<int32_t>{0, 1});
+    copyHostToDevice(pageIds, std::vector<int32_t>{0, 1, 2, 3, 4, -1, 5, -1});
+
+    launchApplyRopeWriteKV(cosSinCache, endLengths, qTensor, kTensor, vTensor, activeView, 1.0F, 1.0F, nullptr, true,
+        slotIds.dataPointer<int32_t>(), pageIds.dataPointer<int32_t>(), inputLengths.dataPointer<int32_t>());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 TEST(RopeWriteKvPrefill, AccuracyFp8)
 {
     // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, kvCacheCapacity = 2048, qLen = 512

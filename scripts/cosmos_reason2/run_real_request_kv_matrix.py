@@ -218,6 +218,8 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         command.extend(
             ["--prefillTokenBudget",
              str(args.prefill_token_budget)])
+    if args.ragged_prefill_batching:
+        command.append("--raggedPrefillBatching")
     if args.dynamic_decode_batching:
         command.append("--dynamicDecodeBatching")
     if args.dynamic_prefill_batching:
@@ -574,6 +576,10 @@ def main() -> None:
         "total token budget for one compatible prefill batch; zero disables it"
     )
     parser.add_argument(
+        "--ragged-prefill-batching",
+        action="store_true",
+        help="right-pad different text chunk lengths into one prefill batch")
+    parser.add_argument(
         "--dynamic-decode-batching",
         action="store_true",
         help="select decode batch size using the measured scheduler cost model"
@@ -779,6 +785,8 @@ def main() -> None:
                 args.cuda_graph_reserve_mib if args.cuda_graph else 0,
                 "prefill_token_budget":
                 args.prefill_token_budget,
+                "ragged_prefill_batching":
+                args.ragged_prefill_batching,
                 "max_overlap_prefill_tokens":
                 args.max_overlap_prefill_tokens,
                 "ttft_target_ms":

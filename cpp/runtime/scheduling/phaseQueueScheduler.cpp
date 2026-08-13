@@ -246,16 +246,17 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     {
         int32_t const bucketTokens = dispatchedPrefillTokens(*prefillSeed);
         bool const bucketInitial = prefillSeed->tokenOffset == 0;
+        bool const allowRaggedBatch = prefillSeed->allowChunkedPrefill;
         int32_t bucketRows{};
         for (PhaseWorkItem const& item : mPrefillQueue)
         {
             if (isEligible(item, true) && bucketRows < mConfig.maxPrefillBatchSize
-                && dispatchedPrefillTokens(item) == bucketTokens && (item.tokenOffset == 0) == bucketInitial)
+                && isPrefillBatchCompatible(item, bucketTokens, bucketInitial, allowRaggedBatch))
             {
-                result.prefillCandidateTokens += bucketTokens;
                 ++bucketRows;
             }
         }
+        result.prefillCandidateTokens = bucketRows * bucketTokens;
     }
     result.prefillQueued = static_cast<size_t>(std::count_if(mPrefillQueue.begin(), mPrefillQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, true); }));
@@ -439,6 +440,21 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
     return std::max(minimum, aligned);
 }
 
+bool PhaseQueueScheduler::isPrefillBatchCompatible(
+    PhaseWorkItem const& item, int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept
+{
+    int32_t const itemTokens = dispatchedPrefillTokens(item);
+    if ((item.tokenOffset == 0) != initialChunk || itemTokens > paddedChunkLength)
+    {
+        return false;
+    }
+    if (itemTokens == paddedChunkLength)
+    {
+        return true;
+    }
+    return mConfig.enableRaggedPrefillBatching && allowRaggedBatch && item.allowChunkedPrefill;
+}
+
 int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates,
     int32_t chunkLength, bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize,
     int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, float& predictedGpuMs,
@@ -453,6 +469,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     struct Candidate
     {
         int32_t batchSize{};
+        int32_t usefulTokens{};
         float gpuMs{};
         float decodeInterferenceMs{};
     };
@@ -507,11 +524,16 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         }
         if (selected != nullptr && (!overlap || selectedOverlap != nullptr || !mConfig.requireDirectOverlapCost))
         {
+            int32_t usefulTokens{};
+            for (int32_t index{}; index < batchSize; ++index)
+            {
+                usefulTokens += dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]);
+            }
             float const gpuMs = selectedOverlap != nullptr ? selectedOverlap->prefillP95GpuMs : selected->p95GpuMs;
             float const interference = selectedOverlap != nullptr
                 ? selectedOverlap->decodeSlowdownP95Ms
                 : (overlap ? selected->decodeSlowdownP95Ms : selected->p95GpuMs);
-            profiled.push_back({batchSize, gpuMs, interference});
+            profiled.push_back({batchSize, usefulTokens, gpuMs, interference});
         }
     }
     if (profiled.empty())
@@ -544,9 +566,9 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         {
             continue;
         }
-        double const efficiency = static_cast<double>(candidate.batchSize * chunkLength) / candidate.gpuMs;
+        double const efficiency = static_cast<double>(candidate.usefulTokens) / candidate.gpuMs;
         double const selectedEfficiency
-            = selected == nullptr ? 0.0 : static_cast<double>(selected->batchSize * chunkLength) / selected->gpuMs;
+            = selected == nullptr ? 0.0 : static_cast<double>(selected->usefulTokens) / selected->gpuMs;
         if (selected == nullptr || efficiency > selectedEfficiency
             || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
         {
@@ -614,6 +636,21 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         queueWaitUs = std::max(queueWaitUs, std::chrono::duration<double, std::micro>(now - timestamp->second).count());
         mQueuedSince.erase(timestamp);
     };
+    auto orderPrefillRow = [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs, int32_t paddedChunkLength) {
+        int32_t const lhsTokens = dispatchedPrefillTokens(*lhs);
+        int32_t const rhsTokens = dispatchedPrefillTokens(*rhs);
+        bool const lhsExact = lhsTokens == paddedChunkLength;
+        bool const rhsExact = rhsTokens == paddedChunkLength;
+        if (lhsExact != rhsExact)
+        {
+            return lhsExact;
+        }
+        if (!lhsExact && lhsTokens != rhsTokens)
+        {
+            return lhsTokens > rhsTokens;
+        }
+        return moreUrgentPrefill(*lhs, *rhs);
+    };
     int32_t const count = std::min<int32_t>(maxBatchSize,
         std::count_if(queue.begin(), queue.end(),
             [this, chunkPrefill](PhaseWorkItem const& item) { return isEligible(item, chunkPrefill); }));
@@ -674,32 +711,64 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             }
         }
     }
-    if (mConfig.maxPrefillBatchTokens > 0 && !mConfig.enableWavefrontPrefillBatching)
+    if ((mConfig.maxPrefillBatchTokens > 0 || mConfig.enableRaggedPrefillBatching)
+        && !mConfig.enableWavefrontPrefillBatching)
     {
+        struct BucketScore
+        {
+            int32_t usefulTokens{};
+            int32_t paddedTokens{};
+            int32_t rows{};
+            double priority{};
+        };
         auto bucketScore = [&](PhaseWorkItem const& candidate) {
             int32_t const candidateTokens = dispatchedPrefillTokens(candidate);
             bool const candidateInitial = candidate.tokenOffset == 0;
-            int32_t compatibleRows{};
-            for (auto it = queue.begin(); it != queue.end(); ++it)
+            std::vector<PhaseWorkItem const*> candidateRows;
+            for (PhaseWorkItem const& item : queue)
             {
-                if (isEligible(*it, true) && dispatchedPrefillTokens(*it) == candidateTokens
-                    && (it->tokenOffset == 0) == candidateInitial)
+                if (isEligible(item, true)
+                    && isPrefillBatchCompatible(item, candidateTokens, candidateInitial, candidate.allowChunkedPrefill))
                 {
-                    ++compatibleRows;
+                    candidateRows.push_back(&item);
                 }
             }
-            int32_t const budgetRows = std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, candidateTokens));
-            int32_t const selectedRows = std::min({maxBatchSize, compatibleRows, budgetRows});
-            return std::pair<int32_t, double>{selectedRows * candidateTokens, priorityRank(candidate)};
+            std::stable_sort(
+                candidateRows.begin(), candidateRows.end(), [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
+                    return orderPrefillRow(lhs, rhs, candidateTokens);
+                });
+            int32_t const budgetRows = mConfig.maxPrefillBatchTokens > 0
+                ? std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, candidateTokens))
+                : maxBatchSize;
+            int32_t const selectedRows
+                = std::min({maxBatchSize, static_cast<int32_t>(candidateRows.size()), budgetRows});
+            int32_t usefulTokens{};
+            for (int32_t index{}; index < selectedRows; ++index)
+            {
+                usefulTokens += dispatchedPrefillTokens(*candidateRows[static_cast<size_t>(index)]);
+            }
+            return BucketScore{usefulTokens, selectedRows * candidateTokens, selectedRows, priorityRank(candidate)};
         };
-        auto const lowerBucketScore = [&](auto const& lhs, auto const& rhs) {
+        auto const lowerBucketScore = [&](PhaseWorkItem const& lhs, PhaseWorkItem const& rhs) {
             auto const lhsScore = bucketScore(lhs);
             auto const rhsScore = bucketScore(rhs);
-            if (lhsScore.first != rhsScore.first)
+            if (lhsScore.usefulTokens != rhsScore.usefulTokens)
             {
-                return lhsScore.first < rhsScore.first;
+                return lhsScore.usefulTokens < rhsScore.usefulTokens;
             }
-            return lhsScore.second < rhsScore.second;
+            int64_t const lhsEfficiency
+                = static_cast<int64_t>(lhsScore.usefulTokens) * std::max(1, rhsScore.paddedTokens);
+            int64_t const rhsEfficiency
+                = static_cast<int64_t>(rhsScore.usefulTokens) * std::max(1, lhsScore.paddedTokens);
+            if (lhsEfficiency != rhsEfficiency)
+            {
+                return lhsEfficiency < rhsEfficiency;
+            }
+            if (lhsScore.rows != rhsScore.rows)
+            {
+                return lhsScore.rows < rhsScore.rows;
+            }
+            return lhsScore.priority < rhsScore.priority;
         };
         for (auto it = queue.cbegin(); it != queue.cend(); ++it)
         {
@@ -711,19 +780,20 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     }
     int32_t const bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
+    bool const allowRaggedBatch = bucketSeed->allowChunkedPrefill;
     if (mConfig.enableWavefrontPrefillBatching && mPrefillCohortIds.empty())
     {
         std::vector<PhaseWorkItem const*> compatible;
         for (PhaseWorkItem const& item : queue)
         {
-            if (isEligible(item, true) && dispatchedPrefillTokens(item) == bucketTokens
-                && (item.tokenOffset == 0) == bucketInitial)
+            if (isEligible(item, true) && isPrefillBatchCompatible(item, bucketTokens, bucketInitial, allowRaggedBatch))
             {
                 compatible.push_back(&item);
             }
         }
-        std::stable_sort(compatible.begin(), compatible.end(),
-            [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) { return moreUrgentPrefill(*lhs, *rhs); });
+        std::stable_sort(compatible.begin(), compatible.end(), [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
+            return orderPrefillRow(lhs, rhs, bucketTokens);
+        });
         int32_t const cohortLimit
             = std::min({mConfig.maxPrefillCohortSize, maxBatchSize, static_cast<int32_t>(compatible.size())});
         for (int32_t index = 0; index < cohortLimit; ++index)
@@ -736,14 +806,14 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     {
         bool const cohortEligible = !mConfig.enableWavefrontPrefillBatching
             || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
-        if (cohortEligible && isEligible(item, true) && dispatchedPrefillTokens(item) == bucketTokens
-            && (item.tokenOffset == 0) == bucketInitial)
+        if (cohortEligible && isEligible(item, true)
+            && isPrefillBatchCompatible(item, bucketTokens, bucketInitial, allowRaggedBatch))
         {
             compatible.push_back(&item);
         }
     }
     std::stable_sort(compatible.begin(), compatible.end(),
-        [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) { return moreUrgentPrefill(*lhs, *rhs); });
+        [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) { return orderPrefillRow(lhs, rhs, bucketTokens); });
     int32_t const tokenBudget = mConfig.maxPrefillBatchTokens > 0
         ? std::max(mConfig.maxPrefillBatchTokens, bucketTokens)
         : std::numeric_limits<int32_t>::max();
@@ -779,7 +849,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         check::check(selected != queue.end(), "Selected prefill request disappeared before dispatch");
         PhaseWorkItem item = *selected;
         queue.erase(selected);
-        item.tokenCount = bucketTokens;
+        item.tokenCount = dispatchedPrefillTokens(item);
         check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
         recordQueueWait(item.requestId);
         batch.push_back(item);

@@ -19,6 +19,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 namespace trt_edgellm
 {
 namespace rt
@@ -266,6 +268,72 @@ TEST(PhaseQueueSchedulerTest, AppliesPrefillTokenBudgetWithoutChangingChunkCompa
     EXPECT_EQ(first.prefillBatch[0].tokenCount, 128);
     EXPECT_EQ(first.prefillBatch[1].tokenCount, 128);
     EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, RightPadsRaggedPrefillWithinPaddedTokenBudget)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 384;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 96, 1, 0, 96});
+    scheduler.enqueuePrefill({3, 64, 2, 0, 64});
+    scheduler.enqueuePrefill({4, 128, 3, 128, 256});
+
+    PhaseDispatchPlan const initial = scheduler.next();
+    ASSERT_EQ(initial.prefillBatch.size(), 3U);
+    EXPECT_EQ(initial.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(initial.prefillBatch[1].tokenCount, 96);
+    EXPECT_EQ(initial.prefillBatch[2].tokenCount, 64);
+    EXPECT_TRUE(std::all_of(initial.prefillBatch.begin(), initial.prefillBatch.end(),
+        [](PhaseWorkItem const& item) { return item.tokenOffset == 0; }));
+
+    PhaseDispatchPlan const continuation = scheduler.next();
+    ASSERT_EQ(continuation.prefillBatch.size(), 1U);
+    EXPECT_EQ(continuation.prefillBatch[0].requestId, 4U);
+    EXPECT_EQ(continuation.prefillBatch[0].tokenOffset, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, RaggedPrefillDoesNotPadAtomicRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128, true});
+    scheduler.enqueuePrefill({2, 64, 1, 0, 64, false});
+
+    PhaseDispatchPlan const text = scheduler.next();
+    ASSERT_EQ(text.prefillBatch.size(), 1U);
+    EXPECT_EQ(text.prefillBatch[0].requestId, 1U);
+    PhaseDispatchPlan const atomic = scheduler.next();
+    ASSERT_EQ(atomic.prefillBatch.size(), 1U);
+    EXPECT_EQ(atomic.prefillBatch[0].requestId, 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, RaggedOverlapPressureUsesPaddedTokenFootprint)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.policy = [](PhaseQueueSnapshot const& state) {
+        EXPECT_EQ(state.prefillCandidateTokens, 160);
+        return PhaseDispatchKind::kOverlap;
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 80, 0, 0, 80});
+    scheduler.enqueuePrefill({2, 40, 1, 0, 40});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
 }
 
 TEST(PhaseQueueSchedulerTest, TokenBudgetSelectsTheMostProductiveCompatibleBucket)
@@ -586,6 +654,25 @@ TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesLargestBatchInsideDecodeSlack)
     EXPECT_EQ(plan.prefillBatch.size(), 2U);
     EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 15.0F);
     EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 4.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicRaggedPrefillUsesUsefulTokenEfficiency)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.enableDynamicPrefillBatching = true;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 1, 1, 0, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 10.0F);
 }
 
 TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesThroughputEfficientBatchToRecoverExpiredTtft)

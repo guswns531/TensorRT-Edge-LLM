@@ -40,7 +40,8 @@ struct PhasePrefillContextRow
     int32_t promptTokenCount{};
 };
 
-//! Packs equal-length prompt chunks from independent request contexts.
+//! Packs prompt chunks from independent request contexts. Optional ragged
+//! batches are right-padded while per-row token counts remain authoritative.
 //!
 //! The adapter owns pinned/device token staging and phase-local indexed KV
 //! bindings. Source contexts and the TensorMap must outlive an in-flight pack.
@@ -48,7 +49,7 @@ class PhasePrefillContextBatchAdapter
 {
 public:
     PhasePrefillContextBatchAdapter(int32_t maxBatchSize, int32_t maxChunkTokens, HybridCacheManager& cacheManager,
-        TensorMap& tensorMap, std::string const& name);
+        TensorMap& tensorMap, std::string const& name, bool enableRaggedPrefill = false);
     ~PhasePrefillContextBatchAdapter() noexcept;
 
     PhasePrefillContextBatchAdapter(PhasePrefillContextBatchAdapter const&) = delete;
@@ -56,7 +57,7 @@ public:
     PhasePrefillContextBatchAdapter(PhasePrefillContextBatchAdapter&&) = delete;
     PhasePrefillContextBatchAdapter& operator=(PhasePrefillContextBatchAdapter&&) = delete;
 
-    //! Pack one uniform chunk-size bucket and bind its stable KV slots.
+    //! Pack one initial/continuation execution class and bind stable KV slots.
     void pack(std::vector<PhasePrefillContextRow> const& rows, cudaStream_t stream);
 
     //! Restore the exact bindings that were active before pack().
@@ -97,6 +98,7 @@ private:
     int32_t mBatchSize{};
     int32_t mChunkLength{};
     bool mInitialChunk{};
+    bool mEnableRaggedPrefill{};
     cudaStream_t mStream{};
     bool mPacked{};
 };

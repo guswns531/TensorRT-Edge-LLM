@@ -798,8 +798,7 @@ bool AttentionPlugin::supportsFormatCombination(
     };
 
     int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableIndexedKVCache ? kNUM_INDEXED_KV_INPUTS : 0)
-        + (mEnablePagedKVCache ? kNUM_PAGED_KV_INPUTS : 0)
-        + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (mEnablePagedKVCache ? kNUM_PAGED_KV_INPUTS : 0) + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
@@ -833,9 +832,8 @@ bool AttentionPlugin::supportsFormatCombination(
         case kIN_PAGED_KV_PAGE_IDX:
             if (mEnablePagedKVCache)
             {
-                result = inOut[pos].desc.type == DataType::kINT32
-                    && inOut[pos].desc.format == TensorFormat::kLINEAR && inOut[pos].desc.dims.nbDims == 3
-                    && inOut[pos].desc.dims.d[1] == 2;
+                result = inOut[pos].desc.type == DataType::kINT32 && inOut[pos].desc.format == TensorFormat::kLINEAR
+                    && inOut[pos].desc.dims.nbDims == 3 && inOut[pos].desc.dims.d[1] == 2;
             }
             break;
         default: break;
@@ -1419,7 +1417,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         {
             // headSize=512 prefill: apply RoPE, write K/V to cache, then use FFPA.
             kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds, kvPageIds);
+                vInputTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds, kvPageIds,
+                contextLengthTensor.dataPointer<int32_t>());
 
 #ifdef CUTE_DSL_FFPA_ENABLED
             if (!mCanImplementFFPA)
@@ -1487,7 +1486,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     // Single kernel: RoPE Q → FP8 output, RoPE K + write FP8 K/V to cache.
                     kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
                         kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream, fp8QTensor.rawPointer(),
-                        qScale, kvSlotIds, kvPageIds);
+                        qScale, kvSlotIds, kvPageIds, contextLengthTensor.dataPointer<int32_t>());
 
                     runner.run(fp8QTensor.rawPointer(),                 // Q  [b, s_q, h_q, d] FP8
                         kvCacheTensor.rawPointer(),                     // KV [b, 2, h_k, cap, d] FP8
@@ -1500,7 +1499,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     // FP16 path: RoPE Q in-place, write FP16 K/V to cache.
                     kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
                         kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream, nullptr, 1.0f, kvSlotIds,
-                        kvPageIds);
+                        kvPageIds, contextLengthTensor.dataPointer<int32_t>());
 
                     runner.run(qInputTensor.dataPointer<half>(),        // Q  [b, s_q, h_q, d]
                         kvCacheTensor.dataPointer<half>(),              // KV [b, 2, h_k, cap, d]
@@ -1528,7 +1527,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 {
                     // kvCache: [b, 2, hkv, s, d] -> split K [b, s, hkv, d] + V [b, s, hkv, d]
                     kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                        vInputTensor, kvCacheTensor, kScale, vScale, stream, false, kvSlotIds, kvPageIds);
+                        vInputTensor, kvCacheTensor, kScale, vScale, stream, false, kvSlotIds, kvPageIds,
+                        contextLengthTensor.dataPointer<int32_t>());
 
                     auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
                         mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream, kvSlotIds, kvPageIds);
@@ -1544,7 +1544,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 else
                 { // SEPARATE_Q_K_V
                     kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor,
-                        vInputTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds, kvPageIds);
+                        vInputTensor, kvCacheTensor, kScale, vScale, stream, true, kvSlotIds, kvPageIds,
+                        contextLengthTensor.dataPointer<int32_t>());
 
                     params.s_kv = runtimeSeqLen;
                     params.q_ptr = qInputTensor.dataPointer<half>();

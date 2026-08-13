@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -185,6 +186,14 @@ bool PhaseDispatchWorker::dispatchNext()
     }
     if (mCurrentMetrics.prefillBatchSize > 0)
     {
+        int32_t const paddedChunkLength = std::max_element(mInFlight.prefillBatch.begin(), mInFlight.prefillBatch.end(),
+            [](PhaseWorkItem const& lhs, PhaseWorkItem const& rhs) {
+                return lhs.tokenCount < rhs.tokenCount;
+            })->tokenCount;
+        mCurrentMetrics.prefillPaddedTokens = paddedChunkLength * mCurrentMetrics.prefillBatchSize;
+        mCurrentMetrics.prefillPaddingTokens = mCurrentMetrics.prefillPaddedTokens - mCurrentMetrics.prefillTokens;
+        mCurrentMetrics.prefillPackingEfficiency = static_cast<float>(mCurrentMetrics.prefillTokens)
+            / static_cast<float>(mCurrentMetrics.prefillPaddedTokens);
         mCurrentMetrics.prefillPastKVMean = static_cast<int32_t>(prefillPastKVSum / mCurrentMetrics.prefillBatchSize);
         mCurrentMetrics.prefillPastKVSpread = mCurrentMetrics.prefillPastKVMax - mCurrentMetrics.prefillPastKVMin;
         if (mCurrentMetrics.prefillMinTtftSlackUs == std::numeric_limits<double>::max())

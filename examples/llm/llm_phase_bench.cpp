@@ -119,6 +119,7 @@ struct Args
     int32_t cudaGraphChargeMiB{4};
     int32_t cudaGraphReserveMiB{};
     int32_t prefillTokenBudget{};
+    bool raggedPrefillBatching{};
     bool dynamicDecodeBatching{};
     bool dynamicPrefillBatching{};
     int32_t minDynamicPrefillBatchSize{1};
@@ -293,6 +294,7 @@ void printUsage(char const* program)
         "[--cudaGraphChargeMiB N --cudaGraphReserveMiB N] "
         "[--slotCount N] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--prefillTokenBudget N] "
+        "[--raggedPrefillBatching] "
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
         "--decodeSlackSafetyFactor F "
@@ -341,6 +343,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kCudaGraphChargeMiB,
         kCudaGraphReserveMiB,
         kPrefillTokenBudget,
+        kRaggedPrefillBatching,
         kDynamicDecodeBatching,
         kDynamicPrefillBatching,
         kMinDynamicPrefillBatchSize,
@@ -403,6 +406,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"cudaGraphChargeMiB", required_argument, nullptr, kCudaGraphChargeMiB},
         {"cudaGraphReserveMiB", required_argument, nullptr, kCudaGraphReserveMiB},
         {"prefillTokenBudget", required_argument, nullptr, kPrefillTokenBudget},
+        {"raggedPrefillBatching", no_argument, nullptr, kRaggedPrefillBatching},
         {"dynamicDecodeBatching", no_argument, nullptr, kDynamicDecodeBatching},
         {"dynamicPrefillBatching", no_argument, nullptr, kDynamicPrefillBatching},
         {"minDynamicPrefillBatchSize", required_argument, nullptr, kMinDynamicPrefillBatchSize},
@@ -489,6 +493,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kCudaGraphChargeMiB: args.cudaGraphChargeMiB = std::stoi(optarg); break;
         case kCudaGraphReserveMiB: args.cudaGraphReserveMiB = std::stoi(optarg); break;
         case kPrefillTokenBudget: args.prefillTokenBudget = std::stoi(optarg); break;
+        case kRaggedPrefillBatching: args.raggedPrefillBatching = true; break;
         case kDynamicDecodeBatching: args.dynamicDecodeBatching = true; break;
         case kDynamicPrefillBatching: args.dynamicPrefillBatching = true; break;
         case kMinDynamicPrefillBatchSize: args.minDynamicPrefillBatchSize = std::stoi(optarg); break;
@@ -752,7 +757,8 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
 {
     std::ofstream output(path);
     ELLM_CHECK(output.good(), "Failed to open dispatch metrics CSV: " + path.string());
-    output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,decode_tokens,decode_context_tokens,"
+    output << "dispatch_index,kind,prefill_batch,decode_batch,prefill_tokens,prefill_padded_tokens,"
+              "prefill_padding_tokens,prefill_packing_efficiency,decode_tokens,decode_context_tokens,"
               "prefill_initial_rows,prefill_continuation_rows,prefill_final_rows,prefill_past_kv_min,"
               "prefill_past_kv_mean,prefill_past_kv_max,prefill_past_kv_spread,prefill_remaining_tokens,"
               "prefill_oldest_request_age_us,prefill_min_ttft_slack_us,predicted_prefill_gpu_ms,"
@@ -765,8 +771,9 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
     for (rt::PhaseDispatchMetrics const& sample : metrics)
     {
         output << sample.dispatchIndex << ',' << static_cast<int32_t>(sample.kind) << ',' << sample.prefillBatchSize
-               << ',' << sample.decodeBatchSize << ',' << sample.prefillTokens << ',' << sample.decodeTokens << ','
-               << sample.decodeContextTokens << ',' << sample.prefillInitialRows << ','
+               << ',' << sample.decodeBatchSize << ',' << sample.prefillTokens << ',' << sample.prefillPaddedTokens
+               << ',' << sample.prefillPaddingTokens << ',' << sample.prefillPackingEfficiency << ','
+               << sample.decodeTokens << ',' << sample.decodeContextTokens << ',' << sample.prefillInitialRows << ','
                << sample.prefillContinuationRows << ',' << sample.prefillFinalRows << ',' << sample.prefillPastKVMin
                << ',' << sample.prefillPastKVMean << ',' << sample.prefillPastKVMax << ',' << sample.prefillPastKVSpread
                << ',' << sample.prefillRemainingTokens << ',' << sample.prefillOldestRequestAgeUs << ','
@@ -1444,6 +1451,7 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.maxPrefillChunkTokens
             = std::min(configuredChunkSize, phaseContract.maxPrefillChunkTokens);
         facadeSchedulerConfig.maxPrefillBatchTokens = args.prefillTokenBudget;
+        facadeSchedulerConfig.enableRaggedPrefillBatching = args.raggedPrefillBatching;
         facadeSchedulerConfig.enableDynamicDecodeBatching = args.dynamicDecodeBatching;
         bool const profileUsesCosts = facadeSchedulerConfig.profile != rt::PhaseSchedulerProfile::kCustom;
         if (args.dynamicDecodeBatching || profileUsesCosts)
@@ -1513,9 +1521,14 @@ int main(int argc, char** argv)
                         "Serving host prefill lengths reshape failed");
                     check::check(prefillIO.hostSelectTokenIndices.reshape({batchSize, 1}),
                         "Serving host prefill indices reshape failed");
-                    std::fill_n(prefillIO.hostContextLengths.dataPointer<int32_t>(), batchSize, chunkLength);
-                    std::fill_n(prefillIO.hostSelectTokenIndices.dataPointer<int64_t>(), batchSize,
-                        static_cast<int64_t>(chunkLength - 1));
+                    int32_t* hostContextLengths = prefillIO.hostContextLengths.dataPointer<int32_t>();
+                    int64_t* hostSelectTokenIndices = prefillIO.hostSelectTokenIndices.dataPointer<int64_t>();
+                    for (int32_t row{}; row < batchSize; ++row)
+                    {
+                        int32_t const rowTokens = packed.rows()[static_cast<size_t>(row)].tokenCount;
+                        hostContextLengths[row] = rowTokens;
+                        hostSelectTokenIndices[row] = static_cast<int64_t>(rowTokens - 1);
+                    }
                     CUDA_CHECK(cudaMemcpyAsync(prefillIO.contextLengths.rawPointer(),
                         prefillIO.hostContextLengths.rawPointer(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice,
                         stream));
@@ -1560,8 +1573,10 @@ int main(int argc, char** argv)
                                             && prefillRunner->execute(stream),
                                         "Serving facade packed prefill enqueue failed");
                                 }});
-            segments.push_back({rt::PhaseKernelGroup::kPrefillCacheCommit, {}, packed.stream(),
-                [&](cudaStream_t stream) { packed.phaseBatchState().commit(cacheManager, chunkLength, stream); }});
+            segments.push_back(
+                {rt::PhaseKernelGroup::kPrefillCacheCommit, {}, packed.stream(), [&](cudaStream_t stream) {
+                     packed.phaseBatchState().commit(cacheManager, prefillIO.contextLengths, stream);
+                 }});
             if (hasFinalPromptRow)
             {
                 segments.push_back({rt::PhaseKernelGroup::kPrefillSample, {}, packed.stream(),
