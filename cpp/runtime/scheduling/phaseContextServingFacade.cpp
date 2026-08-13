@@ -158,6 +158,43 @@ void PhaseContextServingFacade::primeCudaGraphShapes(std::vector<PhaseCudaGraphW
             mCacheManager.releasePagedKVSlot(slot);
         }
     };
+    auto pageCapacitySafeContextLength = [&](PhaseCudaGraphWarmupShape const& shape) {
+        if (!mCacheManager.isPagedKVCache())
+        {
+            return shape.contextLength;
+        }
+
+        // Graph cache identity depends on binding shapes and addresses, not device-resident length values. Keep the
+        // requested batch shape while bounding synthetic page ownership so a max-context profile cannot exhaust the
+        // shared pool before serving begins.
+        KVPagePoolStats const pool = mCacheManager.getPagedKVPoolStats();
+        int32_t const extraTokens = shape.kind == PhaseCudaGraphWarmupKind::kPrefill ? shape.tokenCount : 1;
+        int32_t const maxBundlesPerRow = pool.totalBundles / shape.batchSize;
+        check::check(maxBundlesPerRow > 0 && mCacheManager.getPagedKVRequiredBundles(extraTokens) <= maxBundlesPerRow,
+            "CUDA graph warmup page pool cannot hold one token span for every synthetic row");
+
+        int32_t const requestedTargetLength = shape.contextLength + extraTokens;
+        if (mCacheManager.getPagedKVRequiredBundles(requestedTargetLength) <= maxBundlesPerRow)
+        {
+            return shape.contextLength;
+        }
+
+        int32_t low = extraTokens;
+        int32_t high = requestedTargetLength;
+        while (low < high)
+        {
+            int32_t const middle = low + (high - low + 1) / 2;
+            if (mCacheManager.getPagedKVRequiredBundles(middle) <= maxBundlesPerRow)
+            {
+                low = middle;
+            }
+            else
+            {
+                high = middle - 1;
+            }
+        }
+        return low - extraTokens;
+    };
 
     for (PhaseCudaGraphWarmupShape const& shape : shapes)
     {
@@ -165,12 +202,13 @@ void PhaseContextServingFacade::primeCudaGraphShapes(std::vector<PhaseCudaGraphW
             "CUDA graph warmup batch size is outside the stable-slot capacity");
         check::check(shape.tokenCount > 0 && shape.contextLength >= 0 && shape.repetitions >= 2,
             "CUDA graph warmup shape values are invalid");
+        int32_t const contextLength = pageCapacitySafeContextLength(shape);
         for (int32_t repetition{}; repetition < shape.repetitions; ++repetition)
         {
             cudaStream_t const stream
                 = shape.kind == PhaseCudaGraphWarmupKind::kPrefill ? mPrefillStream : mDecodeStream;
             resetLengths(stream);
-            seedLengths(shape.batchSize, shape.contextLength, stream);
+            seedLengths(shape.batchSize, contextLength, stream);
             std::vector<std::unique_ptr<DecodingInferenceContext>> contexts;
             contexts.reserve(shape.batchSize);
 
@@ -178,7 +216,7 @@ void PhaseContextServingFacade::primeCudaGraphShapes(std::vector<PhaseCudaGraphW
             {
                 std::vector<PhasePrefillContextRow> rows;
                 rows.reserve(shape.batchSize);
-                int32_t const promptLength = shape.contextLength + shape.tokenCount + 1;
+                int32_t const promptLength = contextLength + shape.tokenCount + 1;
                 for (int32_t row{}; row < shape.batchSize; ++row)
                 {
                     auto context = std::make_unique<DecodingInferenceContext>();
@@ -186,8 +224,7 @@ void PhaseContextServingFacade::primeCudaGraphShapes(std::vector<PhaseCudaGraphW
                     context->rawBatchedInputIds = {std::vector<int32_t>(promptLength, 0)};
                     context->tokenIds = context->rawBatchedInputIds;
                     context->effectivePrefillLengths = {promptLength};
-                    rows.push_back(
-                        {requestId++, context.get(), 0, row, shape.contextLength, shape.tokenCount, promptLength});
+                    rows.push_back({requestId++, context.get(), 0, row, contextLength, shape.tokenCount, promptLength});
                     contexts.push_back(std::move(context));
                 }
                 mPrefillAdapter->pack(rows, stream);
@@ -210,8 +247,8 @@ void PhaseContextServingFacade::primeCudaGraphShapes(std::vector<PhaseCudaGraphW
                     context->initialize(1, 4, std::nullopt, OptionalInputTensors{}, "", stream);
                     context->rawBatchedInputIds = {{0}};
                     context->tokenIds = {{0}};
-                    context->effectivePrefillLengths = {shape.contextLength};
-                    rows.push_back({requestId++, context.get(), 0, row, shape.contextLength});
+                    context->effectivePrefillLengths = {contextLength};
+                    rows.push_back({requestId++, context.get(), 0, row, contextLength});
                     contexts.push_back(std::move(context));
                 }
                 mDecodeAdapter.packDecode(rows, stream);

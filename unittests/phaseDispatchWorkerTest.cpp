@@ -1518,7 +1518,7 @@ TEST(PhaseContextServingFacadeTest, KeepsStableSlotsWhileDecodeBatchShrinksFourT
 TEST(PhaseContextServingFacadeTest, PrimesServingOwnedPhaseShapesAndReleasesSyntheticKV)
 {
     constexpr int32_t kSlotCount = 4;
-    rt::HybridCacheManager cacheManager = makeIndexedPagedManager(kSlotCount, 8);
+    rt::HybridCacheManager cacheManager = makeIndexedPagedManager(kSlotCount, 4);
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
     CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
@@ -1530,6 +1530,7 @@ TEST(PhaseContextServingFacadeTest, PrimesServingOwnedPhaseShapesAndReleasesSynt
     rt::TensorMap decodeTensorMap = prefillTensorMap;
     int32_t prefillEnqueues{};
     int32_t decodeEnqueues{};
+    std::vector<int32_t> decodeKvLengths;
     rt::PhaseContextServingCallbacks callbacks;
     callbacks.enqueuePackedPrefill = [&](rt::PhasePrefillContextBatchAdapter& packed) {
         ++prefillEnqueues;
@@ -1538,6 +1539,10 @@ TEST(PhaseContextServingFacadeTest, PrimesServingOwnedPhaseShapesAndReleasesSynt
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) { return item.tokenOffset + item.tokenCount; };
     callbacks.enqueuePackedDecode = [&](rt::PhaseContextBatchAdapter& packed) {
         ++decodeEnqueues;
+        for (rt::PhaseContextRow const& row : packed.rows())
+        {
+            decodeKvLengths.push_back(row.kvLength);
+        }
         packed.packedContext().phaseBatchState->commit(cacheManager, 1, packed.packedContext().stream);
     };
     callbacks.completePackedDecode = [](rt::PhaseContextBatchAdapter& packed) {
@@ -1564,11 +1569,12 @@ TEST(PhaseContextServingFacadeTest, PrimesServingOwnedPhaseShapesAndReleasesSynt
     facade.primeCudaGraphShapes({
         {rt::PhaseCudaGraphWarmupKind::kPrefill, 2, 8, 0, 2},
         {rt::PhaseCudaGraphWarmupKind::kPrefill, 2, 8, 8, 2},
-        {rt::PhaseCudaGraphWarmupKind::kDecode, 4, 1, 16, 2},
+        {rt::PhaseCudaGraphWarmupKind::kDecode, 4, 1, 128, 2},
     });
 
     EXPECT_EQ(prefillEnqueues, 4);
     EXPECT_EQ(decodeEnqueues, 2);
+    EXPECT_EQ(decodeKvLengths, (std::vector<int32_t>(8, 127)));
     EXPECT_TRUE(facade.empty());
     EXPECT_EQ(facade.registeredRequestCount(), 0U);
     rt::KVPagePoolStats const pool = cacheManager.getPagedKVPoolStats();
