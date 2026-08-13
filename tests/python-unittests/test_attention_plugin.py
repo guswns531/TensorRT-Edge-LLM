@@ -303,11 +303,17 @@ class AttentionPluginRunner:
                  p: AttentionParams,
                  enable_tree_attention=False,
                  allow_empty_kv=False,
-                 attention_scale: Optional[float] = None):
+                 attention_scale: Optional[float] = None,
+                 enable_indexed_kv_cache=False,
+                 enable_paged_kv_cache=False,
+                 enable_packed_prefill=False):
         self.p = p
         self.tree = enable_tree_attention
         self.allow_empty_kv = allow_empty_kv
         self.attention_scale = attention_scale
+        self.indexed_kv = enable_indexed_kv_cache
+        self.paged_kv = enable_paged_kv_cache
+        self.packed_prefill = enable_packed_prefill
         self.kv_dtype = trt.fp8 if p.enable_fp8_kv_cache else trt.float16
         self.runner = PluginRunner()
         self._build()
@@ -349,6 +355,14 @@ class AttentionPluginRunner:
                                                  p.seq_len), (mb, ms, ms))
             profiles["position_ids"] = ((1, 1), (p.batch_size, p.seq_len),
                                         (mb, ms))
+        if self.indexed_kv:
+            input_specs.append(("kv_slot_ids", trt.int32, (-1, )))
+            profiles["kv_slot_ids"] = ((1, ), (p.batch_size, ), (mb, ))
+        if self.paged_kv:
+            pages = cap // 128
+            input_specs.append(("kv_page_ids", trt.int32, (-1, 2, pages)))
+            profiles["kv_page_ids"] = ((1, 2, pages), (p.batch_size, 2, pages),
+                                       (mb, 2, pages))
 
         fields = [
             pf_int32("num_q_heads", p.num_q_heads),
@@ -357,6 +371,9 @@ class AttentionPluginRunner:
             pf_int32("enable_tree_attention", int(self.tree)),
             pf_int32("enable_fp8_kv_cache", int(p.enable_fp8_kv_cache)),
             pf_int32("sliding_window_size", p.sliding_window_size),
+            pf_int32("enable_indexed_kv_cache", int(self.indexed_kv)),
+            pf_int32("enable_paged_kv_cache", int(self.paged_kv)),
+            pf_int32("enable_packed_prefill", int(self.packed_prefill)),
         ]
         if p.enable_fp8_kv_cache:
             fields.append(pf_float32("qkv_scales", p.qkv_scales))
@@ -382,6 +399,8 @@ class AttentionPluginRunner:
             cache_indices,
             tree_mask=None,
             position_ids=None,
+            kv_slot_ids=None,
+            kv_page_ids=None,
             input_shapes=None):
         """Execute; returns (attn_output fp16, kv_cache after update).
 
@@ -407,6 +426,10 @@ class AttentionPluginRunner:
         if self.tree:
             tensors["tree_mask"] = tree_mask
             tensors["position_ids"] = position_ids
+        if self.indexed_kv:
+            tensors["kv_slot_ids"] = kv_slot_ids
+        if self.paged_kv:
+            tensors["kv_page_ids"] = kv_page_ids
         self.runner.execute(tensors, input_shapes)
         return attn_out, kv_cache
 
@@ -1100,6 +1123,62 @@ def test_ragged_prefill(label, seqlens):
     ref_rows = _ragged_prefill_ref(qkv.float(), cos, sin, seqlens, p)
     for b, L in enumerate(seqlens):
         assert_close(f"ragged[{label}].b{b}", ref_rows[b], attn_out[b, :L])
+
+
+def test_packed_prefill_indexed_paged():
+    """Compact [1,T,*] prefill uses context_lengths as the logical batch."""
+    seqlens = [8, 5, 3]
+    total_tokens = sum(seqlens)
+    cfg = dict(BASE)
+    cfg["kv_cache_capacity"] = 128
+    cfg["max_seq_len"] = total_tokens
+    cfg["max_position_embeddings"] = 128
+    cfg["max_batch_size"] = 4
+    p = AttentionParams(batch_size=len(seqlens),
+                        seq_len=total_tokens,
+                        is_prefill=True,
+                        **cfg)
+    runner = AttentionPluginRunner(p,
+                                   enable_indexed_kv_cache=True,
+                                   enable_paged_kv_cache=True,
+                                   enable_packed_prefill=True)
+    gen = torch.Generator().manual_seed(9182)
+    cos, sin, combined = _make_rope(p, gen)
+    dense_qkv = torch.randn((len(seqlens), max(seqlens), p.qkv_hidden_size),
+                            generator=gen,
+                            dtype=torch.float32).to(DEV)
+    ref_rows = _ragged_prefill_ref(dense_qkv, cos, sin, seqlens, p)
+    packed_qkv = torch.cat(
+        [dense_qkv[row, :length] for row, length in enumerate(seqlens)],
+        dim=0).unsqueeze(0)
+    q, k, v = _split_qkv(packed_qkv, p)
+
+    plugin_kv = torch.zeros((p.max_batch_size, 2, p.num_kv_heads,
+                             p.kv_cache_capacity, p.head_size),
+                            dtype=torch.float16,
+                            device=DEV)
+    context_lengths = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
+    cache_indices = torch.zeros(len(seqlens), dtype=torch.int32, device=DEV)
+    slot_ids = torch.tensor([3, 0, 2], dtype=torch.int32, device=DEV)
+    page_ids = torch.arange(p.max_batch_size * 2,
+                            dtype=torch.int32,
+                            device=DEV).reshape(p.max_batch_size, 2, 1)
+    attn_out, _ = runner.run(q,
+                             k,
+                             v,
+                             plugin_kv,
+                             context_lengths,
+                             combined,
+                             cache_indices,
+                             kv_slot_ids=slot_ids,
+                             kv_page_ids=page_ids)
+
+    expected = torch.cat(ref_rows, dim=0)
+    assert_close("packed-prefill", expected, attn_out[0], 1e-2, 1e-2)
+    physical_pages = plugin_kv.reshape(p.max_batch_size * 2, 128,
+                                       p.num_kv_heads, p.head_size)
+    assert torch.count_nonzero(physical_pages[2:4]) == 0, \
+        "unleased slot 1 pages must remain untouched"
 
 
 # Batch invariance on RAGGED input (plugin-vs-plugin): permuting the rows (and
