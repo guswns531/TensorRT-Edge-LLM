@@ -50,6 +50,7 @@ class EventBroker:
         assert self.process.stdout is not None
         for line in self.process.stdout:
             if not line.startswith("PHASE_EVENT\t"):
+                print(line, end="", flush=True)
                 continue
             event = json.loads(line.split("\t", 1)[1])
             if event["type"] == "ready":
@@ -99,9 +100,14 @@ def make_handler(broker: EventBroker, model: str,
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                self.send_text(
-                    200 if broker.ready.is_set() else 503,
-                    "ok\n" if broker.ready.is_set() else "loading\n")
+                return_code = broker.process.poll()
+                if broker.ready.is_set():
+                    self.send_text(200, "ok\n")
+                elif return_code is not None:
+                    self.send_text(
+                        500, f"backend exited with code {return_code}\n")
+                else:
+                    self.send_text(503, "loading\n")
             elif self.path == "/version":
                 body = json.dumps({"backend": "TensorRT-Edge-LLM phase IPC"})
                 self.send_text(200, body)
@@ -204,6 +210,8 @@ def main() -> None:
                              make_handler(broker, args.model, args.timeout))
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
         server.server_close()
         if broker.process.poll() is None:
