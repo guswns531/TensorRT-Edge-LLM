@@ -219,7 +219,8 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // empty manager. Load external weights and validate against engine inputs.
     // This handles the base engine; the spec-decode draft engine loads its own
     // external weights from draft_config.json inside the EAGLE/MTP decoder.
-    mSharedResources->externalWeightManager->load(std::filesystem::path(engineDir), baseConfigPath, stream);
+    mSharedResources->externalWeightManager->load(
+        std::filesystem::path(engineDir), baseConfigPath, stream, &mEmbedding.table);
     mSharedResources->externalWeightManager->validateAgainstEngine(*mBaseExecutor, "base");
 
     // -----------------------------------------------------------------------

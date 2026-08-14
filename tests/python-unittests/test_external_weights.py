@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import types
+
 import numpy as np
 import pytest
 
@@ -215,3 +217,142 @@ def test_externalize_nvfp4_moe_geforce_plugin_initializers(tmp_path):
     assert set(expected_external_names).issubset(graph_inputs)
     assert set(expected_external_names).isdisjoint(remaining_initializers)
     assert "non_plugin_weight" in remaining_initializers
+
+
+def _make_tied_lm_head_model(onnx_path, tie_word_embeddings=True):
+    weight_name = "lm_head.weight"
+    initializers = [
+        _make_initializer(weight_name,
+                          np.arange(6, dtype=np.float16).reshape(3, 2))
+    ]
+    nodes = [
+        onnx.helper.make_node("Transpose", [weight_name], ["head_weight_t"],
+                              perm=[1, 0]),
+        onnx.helper.make_node("MatMul", ["hidden_states", "head_weight_t"],
+                              ["logits"]),
+    ]
+    graph = onnx.helper.make_graph(
+        nodes,
+        "tied_lm_head_external_weight_test",
+        [
+            onnx.helper.make_tensor_value_info(
+                "hidden_states", onnx.TensorProto.FLOAT16, [1, 2])
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                "logits", onnx.TensorProto.FLOAT16, [1, 3])
+        ],
+        initializers,
+    )
+    onnx.save_model(
+        onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 24)]),
+        onnx_path)
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            tie_word_embeddings=tie_word_embeddings,
+            hidden_size=2,
+            vocab_size=3,
+            reduced_vocab_size=None,
+            draft_vocab_size=None,
+        ),
+        lm_head=types.SimpleNamespace(weight=np.empty((3, 2))),
+    )
+
+
+def test_reuse_tied_lm_head_exposes_embedding_alias_without_sidecar(tmp_path):
+    onnx_path = tmp_path / "model.onnx"
+    model = _make_tied_lm_head_model(onnx_path)
+
+    manifest = external_weights.externalize_model_weights(
+        str(onnx_path),
+        model,
+        externalize_weights=["lm_head"],
+        reuse_tied_lm_head=True)
+
+    assert manifest == [{
+        "source": "embedding",
+        "kind": "tied_lm_head_weight",
+        "tensors": ["lm_head.weight"],
+    }]
+    assert not (tmp_path / "external_lm_head_weight.safetensors").exists()
+    patched_model = onnx.load(onnx_path, load_external_data=False)
+    head_input = next(graph_input for graph_input in patched_model.graph.input
+                      if graph_input.name == "lm_head.weight")
+    assert [dim.dim_value
+            for dim in head_input.type.tensor_type.shape.dim] == [2, 3]
+    assert "lm_head.weight" not in {
+        initializer.name
+        for initializer in patched_model.graph.initializer
+    }
+    assert not any(node.op_type == "Transpose"
+                   for node in patched_model.graph.node)
+    matmul = next(node for node in patched_model.graph.node
+                  if node.op_type == "MatMul")
+    assert list(matmul.input)[1] == "lm_head.weight"
+
+
+def test_reuse_tied_lm_head_rejects_untied_model(tmp_path):
+    onnx_path = tmp_path / "model.onnx"
+    model = _make_tied_lm_head_model(onnx_path, tie_word_embeddings=False)
+
+    with pytest.raises(ValueError, match="tie_word_embeddings=True"):
+        external_weights.externalize_model_weights(
+            str(onnx_path),
+            model,
+            externalize_weights=["lm_head"],
+            reuse_tied_lm_head=True)
+
+
+def test_reuse_tied_lm_head_preserves_optimized_weight_layout(tmp_path):
+    onnx_path = tmp_path / "model.onnx"
+    weight_name = "lm_head.weight"
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("MatMul", ["hidden_states", weight_name],
+                                  ["logits"])
+        ],
+        "optimized_tied_lm_head_test",
+        [
+            onnx.helper.make_tensor_value_info(
+                "hidden_states", onnx.TensorProto.FLOAT16, [1, 2])
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                "logits", onnx.TensorProto.FLOAT16, [1, 3])
+        ],
+        [
+            _make_initializer(weight_name,
+                              np.arange(6, dtype=np.float16).reshape(2, 3))
+        ],
+    )
+    onnx.save_model(
+        onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 24)]),
+        onnx_path)
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            tie_word_embeddings=True,
+            hidden_size=2,
+            vocab_size=3,
+            reduced_vocab_size=None,
+            draft_vocab_size=None,
+        ),
+        lm_head=types.SimpleNamespace(weight=np.empty((3, 2))),
+    )
+
+    external_weights.externalize_model_weights(str(onnx_path),
+                                               model,
+                                               externalize_weights=["lm_head"],
+                                               reuse_tied_lm_head=True)
+
+    patched_model = onnx.load(onnx_path, load_external_data=False)
+    head_input = next(graph_input for graph_input in patched_model.graph.input
+                      if graph_input.name == weight_name)
+    assert [dim.dim_value
+            for dim in head_input.type.tensor_type.shape.dim] == [2, 3]
+    assert not any(node.name == "TiedLmHeadEmbeddingTranspose"
+                   for node in patched_model.graph.node)
+    matmul = next(node for node in patched_model.graph.node
+                  if node.op_type == "MatMul")
+    assert list(matmul.input)[1] == weight_name

@@ -90,6 +90,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 68. [Cosmos와 vLLM의 남은 성능 차이](89-cosmos-vllm-remaining-gaps-20260813.md)
 69. [Cosmos production HTTP/SSE와 vLLM 공정 비교](93-cosmos-http-sse-vllm-fair-comparison-20260813.md)
 70. [Cosmos 전체 workload 재검증](94-cosmos-full-workload-revalidation-20260814.md)
+71. [Cosmos tied embedding/LM-head GPU 메모리 공유와 성능](95-cosmos-tied-embedding-lm-head-memory-20260814.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.

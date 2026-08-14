@@ -806,6 +806,7 @@ def _export_llm(model_dir: str,
                 dflash_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
+                reuse_tied_lm_head: bool = False,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
                 indexed_kv_cache: bool = False,
@@ -912,6 +913,7 @@ def _export_llm(model_dir: str,
                         fp8_embedding=fp8_embedding,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
+                        reuse_tied_lm_head=reuse_tied_lm_head,
                         config_filename=config_filename)
         except (OSError, ValueError, RuntimeError) as exc:
             logger.exception("[LLM] ONNX export failed")
@@ -2564,6 +2566,13 @@ def main() -> None:
               "int4_moe, nvfp4_moe, lm_head, all."),
     )
     p.add_argument(
+        "--reuse-tied-lm-head",
+        action="store_true",
+        help=("Expose a tied FP16 LM head as an engine input and bind the "
+              "existing runtime embedding buffer to it. This removes the "
+              "second GPU copy of the tied table."),
+    )
+    p.add_argument(
         "--max-kv-cache-capacity",
         type=int,
         default=4096,
@@ -2625,6 +2634,18 @@ def main() -> None:
     gemma4_mtp_assistant_dir = ""
     gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
+
+    if args.reuse_tied_lm_head:
+        if args.fp8_embedding:
+            p.error("--reuse-tied-lm-head cannot be combined with "
+                    "--fp8-embedding")
+        if args.reduced_vocab_dir:
+            p.error("--reuse-tied-lm-head cannot be combined with "
+                    "--reduced-vocab-dir")
+        if args.tp_size != 1:
+            p.error("--reuse-tied-lm-head currently requires --tp-size 1")
+        if args.mtp or args.eagle_base or args.dflash_base or args.dflash_draft:
+            p.error("--reuse-tied-lm-head v1 supports vanilla decoding only")
 
     if (model_type == "qwen3_tts"
             and config.get("tts_model_type") != "custom_voice"):
@@ -2789,6 +2810,7 @@ def main() -> None:
                      fp8_embedding=args.fp8_embedding,
                      reduced_vocab_dir=args.reduced_vocab_dir,
                      externalize_weights=externalize_weights,
+                     reuse_tied_lm_head=args.reuse_tied_lm_head,
                      tp_size=args.tp_size,
                      num_decoder_layers=args.num_decoder_layer,
                      indexed_kv_cache=args.indexed_kv_cache,
@@ -2857,6 +2879,8 @@ def main() -> None:
     logger.info(
         "External weights: %s",
         ", ".join(externalize_weights) if externalize_weights else "no")
+    logger.info("Reuse tied head : %s",
+                "yes" if args.reuse_tied_lm_head else "no")
     logger.info("TP size       : %d", args.tp_size)
     if args.num_decoder_layer is not None:
         logger.info("Decoder layers: first %d only (accuracy debug)",

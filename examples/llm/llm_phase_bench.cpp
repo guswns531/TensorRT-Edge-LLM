@@ -1211,12 +1211,12 @@ int main(int argc, char** argv)
         decodeDeepstack->useRealFeatures(decodeMap);
     }
 
-    resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream);
+    rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
+    resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream, &embedding.table);
     resources->externalWeightManager->validateAgainstEngine(*prefillRunner, "phase-shared");
     resources->externalWeightManager->registerTensorMapEntries(prefillMap);
     resources->externalWeightManager->registerAdditionalTensorMapEntries(decodeMap);
 
-    rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
     rt::EmbeddingPreprocessor prefillEmbedding(embedding, config);
     rt::EmbeddingPreprocessor decodeEmbedding(embedding, config);
 

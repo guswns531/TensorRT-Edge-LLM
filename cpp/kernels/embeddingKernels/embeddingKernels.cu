@@ -46,6 +46,23 @@ struct Fp16EmbeddingLoader
     }
 };
 
+//! \brief FP16 loader for a table stored in [hiddenSize, vocabSize] order.
+struct Fp16TransposedEmbeddingLoader
+{
+    static constexpr uint32_t vecSize = DVec<half>::vec_size;
+    half const* table{nullptr};
+    int32_t vocabSize{0};
+
+    __device__ __forceinline__ void load(int32_t tokenId, int64_t, uint32_t offset, DVec<half>& out) const
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < vecSize; ++i)
+        {
+            out[i] = table[static_cast<int64_t>(offset + i) * vocabSize + tokenId];
+        }
+    }
+};
+
 #if SUPPORTS_FP8
 //! \brief FP8 embedding loader with per-group dequantization
 struct Fp8EmbeddingLoader
@@ -528,8 +545,9 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
-    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[0]);
-    int64_t const hiddenSize = embeddingShape[1];
+    bool const transposedEmbedding = embeddingTable.getName() == "embedding_transposed";
+    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[transposedEmbedding ? 1 : 0]);
+    int64_t const hiddenSize = embeddingShape[transposedEmbedding ? 0 : 1];
 
     check::check(outputShape[0] == batchSize, "Output batch size mismatch");
     check::check(outputShape[1] == seqLen, "Output sequence length mismatch");
@@ -579,9 +597,18 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
     {
         check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16 or FP8");
         half const* embeddingTablePtr = embeddingTable.dataPointer<half>();
-
-        Fp16EmbeddingLoader loader{embeddingTablePtr};
-        launchEmbeddingLookupKernel(inputIdsPtr, loader, outputPtr, batchSize, seqLen, vocabSize, hiddenSize, stream);
+        if (transposedEmbedding)
+        {
+            Fp16TransposedEmbeddingLoader loader{embeddingTablePtr, vocabSize};
+            launchEmbeddingLookupKernel(
+                inputIdsPtr, loader, outputPtr, batchSize, seqLen, vocabSize, hiddenSize, stream);
+        }
+        else
+        {
+            Fp16EmbeddingLoader loader{embeddingTablePtr};
+            launchEmbeddingLookupKernel(
+                inputIdsPtr, loader, outputPtr, batchSize, seqLen, vocabSize, hiddenSize, stream);
+        }
     }
 }
 
@@ -601,11 +628,12 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
-    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[0]);
-    int64_t const hiddenSize = embeddingShape[1];
+    bool const transposedEmbedding = embeddingTable.getName() == "embedding_transposed";
+    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[transposedEmbedding ? 1 : 0]);
+    int64_t const hiddenSize = embeddingShape[transposedEmbedding ? 0 : 1];
     int64_t const imageTokenLen = imageShape[0];
 
-    check::check(embeddingShape[1] == imageShape[1], "Hidden size mismatch between embeddingTable and imageEmbeds");
+    check::check(hiddenSize == imageShape[1], "Hidden size mismatch between embeddingTable and imageEmbeds");
     check::check(outputShape[0] == batchSize, "Output batch size mismatch");
     check::check(outputShape[1] == seqLen, "Output sequence length mismatch");
     check::check(outputShape[2] == hiddenSize, "Output hidden size mismatch");
@@ -658,10 +686,18 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
     {
         check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16 or FP8");
         half const* embeddingTablePtr = embeddingTable.dataPointer<half>();
-
-        Fp16EmbeddingLoader loader{embeddingTablePtr};
-        launchEmbeddingLookupWithImageInsertionKernel(inputIdsPtr, loader, imageEmbedsPtr, outputPtr, batchSize, seqLen,
-            vocabSize, hiddenSize, imageTokenLen, stream);
+        if (transposedEmbedding)
+        {
+            Fp16TransposedEmbeddingLoader loader{embeddingTablePtr, vocabSize};
+            launchEmbeddingLookupWithImageInsertionKernel(inputIdsPtr, loader, imageEmbedsPtr, outputPtr, batchSize,
+                seqLen, vocabSize, hiddenSize, imageTokenLen, stream);
+        }
+        else
+        {
+            Fp16EmbeddingLoader loader{embeddingTablePtr};
+            launchEmbeddingLookupWithImageInsertionKernel(inputIdsPtr, loader, imageEmbedsPtr, outputPtr, batchSize,
+                seqLen, vocabSize, hiddenSize, imageTokenLen, stream);
+        }
     }
 }
 
@@ -735,8 +771,9 @@ void embeddingLookupMultimodal(rt::Tensor const& inputIds, rt::Tensor const& emb
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
-    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[0]);
-    int64_t const hiddenSize = embeddingShape[1];
+    bool const transposedEmbedding = embeddingTable.getName() == "embedding_transposed";
+    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[transposedEmbedding ? 1 : 0]);
+    int64_t const hiddenSize = embeddingShape[transposedEmbedding ? 0 : 1];
 
     // Validate output shape
     check::check(outputShape[0] == batchSize, "Output batch size mismatch");
@@ -841,11 +878,20 @@ void embeddingLookupMultimodal(rt::Tensor const& inputIds, rt::Tensor const& emb
     {
         check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16 or FP8");
         half const* embeddingTablePtr = embeddingTable.dataPointer<half>();
-
-        Fp16EmbeddingLoader loader{embeddingTablePtr};
-        launchEmbeddingLookupMultimodalKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue,
-            imageEmbedsPtr, imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize,
-            seqLen, vocabSize, hiddenSize, stream);
+        if (transposedEmbedding)
+        {
+            Fp16TransposedEmbeddingLoader loader{embeddingTablePtr, vocabSize};
+            launchEmbeddingLookupMultimodalKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue,
+                imageEmbedsPtr, imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize,
+                seqLen, vocabSize, hiddenSize, stream);
+        }
+        else
+        {
+            Fp16EmbeddingLoader loader{embeddingTablePtr};
+            launchEmbeddingLookupMultimodalKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue,
+                imageEmbedsPtr, imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize,
+                seqLen, vocabSize, hiddenSize, stream);
+        }
     }
 }
 

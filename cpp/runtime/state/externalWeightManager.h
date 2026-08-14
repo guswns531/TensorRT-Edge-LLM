@@ -62,7 +62,11 @@ public:
     //!
     //! @throws std::runtime_error if an external weight file cannot be loaded or
     //! if `load()` has already been called.
-    void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream);
+    void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream,
+        Tensor* tiedEmbedding = nullptr);
+
+    //! Return true when @p configPath aliases an engine weight input to the runtime embedding table.
+    static bool requiresTiedEmbedding(std::filesystem::path const& configPath);
 
     //! Validate loaded external weight tensors against @p executor.
     //!

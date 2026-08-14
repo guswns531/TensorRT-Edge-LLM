@@ -33,7 +33,8 @@ namespace kernel
 //! For FP8 tables, scales must be provided for per-group dequantization.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] embeddingTable Embedding table in [vocabSize, hiddenSize], or FP16 [hiddenSize, vocabSize] when its
+//!                           tensor name is ``embedding_transposed``
 //! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize]
 //!                   Required when embeddingTable is FP8, std::nullopt for FP16
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
@@ -49,7 +50,8 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
 //! Text tokens use the embedding table, image tokens use FP16 imageEmbeds.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] embeddingTable Embedding table in [vocabSize, hiddenSize], or FP16 [hiddenSize, vocabSize] when its
+//!                           tensor name is ``embedding_transposed``
 //! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize]
 //!                   Required when embeddingTable is FP8, std::nullopt for FP16
 //! \param[in] imageEmbeds Image embeddings with shape [imageTokenLen, hiddenSize], dtype FP16
@@ -95,7 +97,8 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
 //! To indicate the presence of a modality, both token ID and the corresponding embedding tensor must be provided.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] embeddingTable Text table in [vocabSize, hiddenSize], or FP16 [hiddenSize, vocabSize] when its tensor
+//!                           name is ``embedding_transposed``
 //! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize]
 //!                   Required when embeddingTable is FP8, std::nullopt for FP16
 //! \param[in] multimodalIndices Pre-computed indices for audio/image embeddings [batchSize, seqLen],

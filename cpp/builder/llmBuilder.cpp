@@ -1782,6 +1782,11 @@ bool LLMBuilder::copyExternalWeightFiles()
     bool allSuccess = true;
     for (auto const& fileEntry : externalWeightFiles)
     {
+        if (fileEntry.is_object() && fileEntry.value("source", "") == "embedding")
+        {
+            LOG_INFO("Tied LM-head reuses embedding.safetensors at runtime; no external weight file to copy");
+            continue;
+        }
         if (!fileEntry.is_object() || !fileEntry.contains("file") || !fileEntry["file"].is_string())
         {
             LOG_ERROR("Malformed external weight file entry: %s", fileEntry.dump().c_str());
