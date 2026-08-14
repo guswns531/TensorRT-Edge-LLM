@@ -331,6 +331,19 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
         ])
     if args.adaptive_scheduler:
         command.append("--adaptiveScheduler")
+    if args.adaptive_chunking:
+        command.append("--adaptiveChunking")
+        if args.adaptive_chunk_candidates:
+            command.extend([
+                "--adaptiveChunkCandidates",
+                ",".join(
+                    str(candidate)
+                    for candidate in args.adaptive_chunk_candidates),
+                "--adaptiveChunkDecodePressureThreshold",
+                str(args.adaptive_chunk_decode_pressure_threshold),
+            ])
+        if args.adaptive_chunk_split_completion:
+            command.append("--adaptiveChunkSplitCompletion")
     return command
 
 
@@ -448,6 +461,43 @@ def summarize_kernel(path: Path, engine: Engine,
         "gpu_mean_ms": statistics.mean(values),
         "gpu_max_ms": max(values),
     } for group, values in sorted(grouped.items())]
+
+
+def summarize_prefill_chunks(path: Path, engine: Engine,
+                             case: Case) -> list[dict[str, object]]:
+    """Count dispatched request-row chunk shapes, including final tails."""
+    rows = read_csv(path)
+    grouped: dict[tuple[int, bool, bool], list[dict[str, str]]] = {}
+    for row in rows:
+        key = (int(row["token_count"]), row["initial_chunk"] == "1",
+               row["final_chunk"] == "1")
+        grouped.setdefault(key, []).append(row)
+    total = len(rows)
+    return [{
+        "engine":
+        engine.name,
+        "context_mode":
+        case.context_mode,
+        "case":
+        case.name,
+        "chunk_tokens":
+        chunk_tokens,
+        "initial_chunk":
+        initial_chunk,
+        "final_chunk":
+        final_chunk,
+        "rows":
+        len(samples),
+        "row_fraction":
+        len(samples) / total,
+        "host_pack_median_us":
+        statistics.median(float(row["host_pack_us"]) for row in samples),
+        "phase_service_median_us":
+        statistics.median(float(row["phase_service_us"]) for row in samples),
+        "phase_service_p95_us":
+        percentile([float(row["phase_service_us"]) for row in samples], 0.95),
+    } for (chunk_tokens, initial_chunk,
+           final_chunk), samples in sorted(grouped.items())]
 
 
 def pressure_model(path: Path, engine: Engine, case: Case, page_bundles: int,
@@ -759,6 +809,26 @@ def main() -> None:
         "--adaptive-scheduler",
         action="store_true",
         help="enable the CUDA-event/SLO/page-pressure phase selector")
+    parser.add_argument(
+        "--adaptive-chunking",
+        action="store_true",
+        help="adapt prefill chunks from observed CUDA-event cost")
+    parser.add_argument(
+        "--adaptive-chunk-candidates",
+        type=int,
+        nargs="+",
+        default=[],
+        help="bounded profiled chunk shapes, for example 64 128")
+    parser.add_argument(
+        "--adaptive-chunk-decode-pressure-threshold",
+        type=float,
+        default=0.8,
+        help="decode queue/TPOT pressure that selects the smallest chunk")
+    parser.add_argument(
+        "--adaptive-chunk-split-completion",
+        action="store_true",
+        help=
+        "allow pressure to split a row that could finish in one maximum chunk")
     parser.add_argument("--page-reservation-mode",
                         choices=("full", "headroom", "bounded-overcommit"),
                         default="full",
@@ -813,6 +883,24 @@ def main() -> None:
     if (args.decode_active_chunk_size < 0
             or args.decode_active_chunk_size > args.chunk_size):
         parser.error("decode-active-chunk-size must be within chunk-size")
+    if args.adaptive_chunk_candidates:
+        if not args.adaptive_chunking:
+            parser.error(
+                "adaptive-chunk-candidates requires --adaptive-chunking")
+        if (any(candidate <= 0 or candidate > args.chunk_size
+                for candidate in args.adaptive_chunk_candidates)
+                or args.adaptive_chunk_candidates != sorted(
+                    set(args.adaptive_chunk_candidates))):
+            parser.error(
+                "adaptive chunk candidates must be unique, increasing, and within chunk-size"
+            )
+    if args.adaptive_chunk_split_completion and not args.adaptive_chunk_candidates:
+        parser.error(
+            "adaptive-chunk-split-completion requires bounded chunk candidates"
+        )
+    if not 0.0 < args.adaptive_chunk_decode_pressure_threshold <= 1.0:
+        parser.error(
+            "adaptive chunk decode pressure threshold must be in (0, 1]")
     if args.large_chunk_queue_threshold < 0:
         parser.error("large-chunk-queue-threshold must be non-negative")
     if (args.max_overlap_prefill_tokens < 0 or args.ttft_target_ms <= 0.0
@@ -898,6 +986,7 @@ def main() -> None:
     summaries = []
     dispatches = []
     kernels = []
+    chunks = []
     pressure = []
     statuses = []
     total = len(args.engine) * len(cases)
@@ -1028,6 +1117,16 @@ def main() -> None:
                 args.min_tpot_hysteresis_samples,
                 "adaptive_scheduler":
                 args.adaptive_scheduler,
+                "adaptive_chunking":
+                args.adaptive_chunking,
+                "adaptive_chunk_candidates":
+                ",".join(
+                    str(candidate)
+                    for candidate in args.adaptive_chunk_candidates),
+                "adaptive_chunk_decode_pressure_threshold":
+                args.adaptive_chunk_decode_pressure_threshold,
+                "adaptive_chunk_split_completion":
+                args.adaptive_chunk_split_completion,
                 "page_reservation_mode":
                 args.page_reservation_mode,
                 "page_reservation_headroom_tokens":
@@ -1054,14 +1153,19 @@ def main() -> None:
             request_csv = case_dir / "requests.csv"
             dispatch_csv = case_dir / "requests-dispatch.csv"
             kernel_csv = case_dir / "kernel-groups.csv"
+            prefill_timeline_csv = case_dir / "prefill-request-timeline.csv"
             if result.returncode == 0 and request_csv.exists(
-            ) and dispatch_csv.exists() and kernel_csv.exists():
+            ) and dispatch_csv.exists() and kernel_csv.exists(
+            ) and prefill_timeline_csv.exists():
                 summaries.append(
                     summarize_requests(request_csv, engine, case,
                                        result.returncode))
                 dispatches.extend(
                     summarize_dispatch(dispatch_csv, engine, case))
                 kernels.extend(summarize_kernel(kernel_csv, engine, case))
+                chunks.extend(
+                    summarize_prefill_chunks(prefill_timeline_csv, engine,
+                                             case))
                 pressure.append(
                     pressure_model(request_csv, engine, case,
                                    args.page_bundles, args.tokens_per_page,
@@ -1077,6 +1181,7 @@ def main() -> None:
     write_csv(args.output_dir / "request-summary.csv", summaries)
     write_csv(args.output_dir / "dispatch-cost-table.csv", dispatches)
     write_csv(args.output_dir / "kernel-cost-table.csv", kernels)
+    write_csv(args.output_dir / "prefill-chunk-table.csv", chunks)
     write_csv(args.output_dir / "page-pressure-model.csv", pressure)
     print(f"wrote matrix artifacts to {args.output_dir}")
 

@@ -35,7 +35,8 @@ TEST(PipelineIOTest, PackedPrefillSeparatesLogicalRowsFromTokenCarrier)
     config.packedPrefill = true;
     config.maxSupportedBatchSize = kLOGICAL_BATCH;
     config.maxSupportedPrefillBatchSize = kLOGICAL_BATCH;
-    config.maxSupportedInputLength = kTOTAL_TOKENS;
+    config.maxSupportedInputLength = 1024;
+    config.maxPackedPrefillChunkTokens = 128;
     config.hiddenSize = kHIDDEN_SIZE;
     config.outputVocabSize = kVOCAB_SIZE;
     config.numDeepstackFeatures = kDEEPSTACK_FEATURES;
@@ -53,6 +54,26 @@ TEST(PipelineIOTest, PackedPrefillSeparatesLogicalRowsFromTokenCarrier)
     EXPECT_EQ(io.deepstackEmbeds.front().getShape()[1], kTOTAL_TOKENS);
     EXPECT_EQ(io.outputHiddenStates.getShape()[0], 1);
     EXPECT_EQ(io.outputHiddenStates.getShape()[1], kTOTAL_TOKENS);
+}
+
+TEST(PipelineIOTest, PackedPrefillAcceptsCarrierBeyondPerRowInputLimit)
+{
+    constexpr int32_t kLOGICAL_BATCH{8};
+    constexpr int32_t kCHUNK_TOKENS{256};
+    LLMEngineConfig config;
+    config.packedPrefill = true;
+    config.maxSupportedBatchSize = kLOGICAL_BATCH;
+    config.maxSupportedPrefillBatchSize = kLOGICAL_BATCH;
+    config.maxSupportedInputLength = 1024;
+    config.maxPackedPrefillChunkTokens = kCHUNK_TOKENS;
+    config.hiddenSize = 16;
+    config.outputVocabSize = 32;
+
+    EXPECT_NO_THROW(
+        PipelineIO::createForPackedPrefill(config, kLOGICAL_BATCH, kLOGICAL_BATCH * kCHUNK_TOKENS, nullptr));
+    EXPECT_THROW(
+        PipelineIO::createForPackedPrefill(config, kLOGICAL_BATCH, kLOGICAL_BATCH * kCHUNK_TOKENS + 1, nullptr),
+        std::runtime_error);
 }
 
 } // namespace

@@ -164,6 +164,24 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(
         !mConfig.enableAdaptivePrefillChunking || mConfig.minPrefillChunkTokens <= mConfig.maxPrefillChunkTokens,
         "Adaptive minimum prefill chunk exceeds the maximum");
+    check::check(mConfig.adaptivePrefillChunkCandidates.empty() || mConfig.enableAdaptivePrefillChunking,
+        "Adaptive prefill chunk candidates require adaptive prefill chunking");
+    check::check(!mConfig.allowAdaptivePrefillCompletionSplit
+            || (mConfig.enableAdaptivePrefillChunking && !mConfig.adaptivePrefillChunkCandidates.empty()),
+        "Adaptive prefill completion splitting requires bounded adaptive prefill chunking");
+    int32_t previousChunkCandidate{};
+    for (int32_t const candidate : mConfig.adaptivePrefillChunkCandidates)
+    {
+        check::check(candidate > previousChunkCandidate,
+            "Adaptive prefill chunk candidates must be positive, unique, and strictly increasing");
+        check::check(candidate <= mConfig.maxPrefillChunkTokens,
+            "Adaptive prefill chunk candidate exceeds the maximum prefill chunk length");
+        previousChunkCandidate = candidate;
+    }
+    check::check(std::isfinite(mConfig.adaptivePrefillChunkDecodePressureThreshold)
+            && mConfig.adaptivePrefillChunkDecodePressureThreshold > 0.0F
+            && mConfig.adaptivePrefillChunkDecodePressureThreshold <= 1.0F,
+        "Adaptive prefill chunk decode pressure threshold must be in (0, 1]");
     check::check(mConfig.decodeBurstLimit > 0, "decodeBurstLimit must be positive");
     check::check(mConfig.prefillQueueWaitTargetUs > 0.0, "prefillQueueWaitTargetUs must be positive");
     check::check(mConfig.decodeQueueWaitTargetUs > 0.0, "decodeQueueWaitTargetUs must be positive");
@@ -474,7 +492,7 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
 
     int32_t const minimum = std::min(maximum, mConfig.minPrefillChunkTokens);
     int32_t selected = maximum;
-    if (mTelemetry.prefillGpuMsPerToken > 0.0F)
+    if (mConfig.adaptivePrefillChunkCandidates.empty() && mTelemetry.prefillGpuMsPerToken > 0.0F)
     {
         float const budgetTokens = mConfig.maxPredictedOverlapPrefillMs / mTelemetry.prefillGpuMsPerToken;
         if (budgetTokens <= static_cast<float>(minimum))
@@ -487,12 +505,58 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
         }
     }
 
-    if (mTelemetry.overlapSampleCount > 0 && mTelemetry.overlapRatio < mConfig.minObservedOverlapRatio)
+    if (mConfig.adaptivePrefillChunkCandidates.empty() && mTelemetry.overlapSampleCount > 0
+        && mTelemetry.overlapRatio < mConfig.minObservedOverlapRatio)
+    {
+        selected = minimum;
+    }
+
+    float const decodeQueuePressure
+        = std::min(1.0F, static_cast<float>(mDecodeQueue.size()) / static_cast<float>(mConfig.maxDecodeBatchSize));
+    float const decodePressure = decodeQueuePressure * mTelemetry.recentDecodeTpotPressure;
+    if (!mConfig.adaptivePrefillChunkCandidates.empty() && maximum == item.tokenCount
+        && (!mConfig.allowAdaptivePrefillCompletionSplit
+            || decodePressure < mConfig.adaptivePrefillChunkDecodePressureThreshold))
+    {
+        return maximum;
+    }
+    if (!mConfig.adaptivePrefillChunkCandidates.empty()
+        && decodePressure >= mConfig.adaptivePrefillChunkDecodePressureThreshold)
     {
         selected = minimum;
     }
 
     selected = std::clamp(selected, minimum, maximum);
+    if (!mConfig.adaptivePrefillChunkCandidates.empty())
+    {
+        int32_t boundedCandidate{};
+        int32_t smallestRunnableCandidate{};
+        for (int32_t const candidate : mConfig.adaptivePrefillChunkCandidates)
+        {
+            if (candidate > maximum)
+            {
+                break;
+            }
+            if (smallestRunnableCandidate == 0)
+            {
+                smallestRunnableCandidate = candidate;
+            }
+            if (candidate <= selected)
+            {
+                boundedCandidate = candidate;
+            }
+        }
+        if (boundedCandidate > 0)
+        {
+            return boundedCandidate;
+        }
+        if (smallestRunnableCandidate > 0)
+        {
+            return smallestRunnableCandidate;
+        }
+        // Only the final request tail may be smaller than the profiled set.
+        return maximum;
+    }
     int32_t const aligned = selected / mConfig.prefillChunkAlignment * mConfig.prefillChunkAlignment;
     return std::max(minimum, aligned);
 }
@@ -980,6 +1044,10 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 
     PhaseDispatchPlan plan;
     plan.kind = kind;
+    plan.adaptiveChunkDecodeQueuePressure
+        = std::min(1.0F, static_cast<float>(mDecodeQueue.size()) / static_cast<float>(mConfig.maxDecodeBatchSize));
+    plan.adaptiveChunkObservedTpotPressure = mTelemetry.recentDecodeTpotPressure;
+    plan.adaptiveChunkCombinedPressure = plan.adaptiveChunkDecodeQueuePressure * plan.adaptiveChunkObservedTpotPressure;
     plan.latencySafeFallback = mLatencySafeFallback;
     plan.overlapEvaluatedByCost = kind == PhaseDispatchKind::kOverlap && mConfig.enableCostAwareOverlapAdmission
         && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
@@ -1270,7 +1338,9 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     auto updateEwma = [alpha = mConfig.metricsEwmaAlpha](float& average, float sample) {
         average = average > 0.0F ? alpha * sample + (1.0F - alpha) * average : sample;
     };
-    if (metrics.prefillTokens > 0 && metrics.prefillGpuMs > 0.0F)
+    bool const representativePrefillCostSample = mConfig.adaptivePrefillChunkCandidates.empty()
+        || metrics.prefillTokens >= mConfig.adaptivePrefillChunkCandidates.back();
+    if (metrics.prefillTokens > 0 && metrics.prefillGpuMs > 0.0F && representativePrefillCostSample)
     {
         updateEwma(mTelemetry.prefillGpuMsPerToken, metrics.prefillGpuMs / static_cast<float>(metrics.prefillTokens));
     }
@@ -1284,7 +1354,9 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         updateEwma(mTelemetry.overlapRatio, metrics.overlapRatio);
         ++mTelemetry.overlapSampleCount;
     }
-    if (mConfig.enableTpotHysteresis && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F)
+    bool const collectDecodeTpot = mConfig.enableTpotHysteresis
+        || (mConfig.enableAdaptivePrefillChunking && !mConfig.adaptivePrefillChunkCandidates.empty());
+    if (collectDecodeTpot && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F)
     {
         double const sampleUs = metrics.decodeQueueWaitUs + static_cast<double>(metrics.decodeGpuMs) * 1000.0;
         mRecentDecodeTpotUs.push_back(sampleUs);
@@ -1301,18 +1373,21 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             mTelemetry.recentDecodeTpotP95Us = ordered[p95Index];
             mTelemetry.recentDecodeTpotPressure
                 = static_cast<float>(mTelemetry.recentDecodeTpotP95Us / mConfig.decodeQueueWaitTargetUs);
-            bool const previousFallback = mLatencySafeFallback;
-            if (!mLatencySafeFallback && mTelemetry.recentDecodeTpotPressure >= mConfig.tpotHysteresisEnterRatio)
+            if (mConfig.enableTpotHysteresis)
             {
-                mLatencySafeFallback = true;
-            }
-            else if (mLatencySafeFallback && mTelemetry.recentDecodeTpotPressure <= mConfig.tpotHysteresisExitRatio)
-            {
-                mLatencySafeFallback = false;
-            }
-            if (previousFallback != mLatencySafeFallback)
-            {
-                ++mTelemetry.tpotHysteresisTransitions;
+                bool const previousFallback = mLatencySafeFallback;
+                if (!mLatencySafeFallback && mTelemetry.recentDecodeTpotPressure >= mConfig.tpotHysteresisEnterRatio)
+                {
+                    mLatencySafeFallback = true;
+                }
+                else if (mLatencySafeFallback && mTelemetry.recentDecodeTpotPressure <= mConfig.tpotHysteresisExitRatio)
+                {
+                    mLatencySafeFallback = false;
+                }
+                if (previousFallback != mLatencySafeFallback)
+                {
+                    ++mTelemetry.tpotHysteresisTransitions;
+                }
             }
         }
     }

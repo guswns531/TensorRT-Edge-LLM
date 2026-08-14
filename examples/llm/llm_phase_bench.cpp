@@ -122,6 +122,9 @@ struct Args
     bool contextAdapter{};
     bool adaptiveScheduler{};
     bool adaptiveChunking{};
+    std::vector<int32_t> adaptiveChunkCandidates;
+    float adaptiveChunkDecodePressureThreshold{0.8F};
+    bool adaptiveChunkSplitCompletion{};
     bool cudaGraph{};
     int32_t maxCudaGraphs{128};
     int32_t maxPrefillCudaGraphs{-1};
@@ -380,7 +383,9 @@ void printUsage(char const* program)
         "--maxCudaGraphMiB N --maxPrefillCudaGraphMiB N --maxDecodeCudaGraphMiB N] "
         "[--cudaGraphChargeMiB N --cudaGraphReserveMiB N] "
         "[--slotCount N] "
-        "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking] [--prefillTokenBudget N] "
+        "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking "
+        "--adaptiveChunkCandidates 64,128 --adaptiveChunkDecodePressureThreshold F "
+        "--adaptiveChunkSplitCompletion] [--prefillTokenBudget N] "
         "[--raggedPrefillBatching --packedPrefillTokenLayout --prefillCompletionBonusTokens N] "
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
@@ -426,6 +431,9 @@ bool parseArgs(Args& args, int argc, char** argv)
         kContextAdapter,
         kAdaptiveScheduler,
         kAdaptiveChunking,
+        kAdaptiveChunkCandidates,
+        kAdaptiveChunkDecodePressureThreshold,
+        kAdaptiveChunkSplitCompletion,
         kCudaGraph,
         kMaxCudaGraphs,
         kMaxPrefillCudaGraphs,
@@ -504,8 +512,11 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"sharedContext", no_argument, nullptr, kLegacySharedContext},
         {"contextAdapter", no_argument, nullptr, kContextAdapter},
         {"adaptiveScheduler", no_argument, nullptr, kAdaptiveScheduler},
-        {"adaptiveChunking", no_argument, nullptr, kAdaptiveChunking}, {"cudaGraph", no_argument, nullptr, kCudaGraph},
-        {"maxCudaGraphs", required_argument, nullptr, kMaxCudaGraphs},
+        {"adaptiveChunking", no_argument, nullptr, kAdaptiveChunking},
+        {"adaptiveChunkCandidates", required_argument, nullptr, kAdaptiveChunkCandidates},
+        {"adaptiveChunkDecodePressureThreshold", required_argument, nullptr, kAdaptiveChunkDecodePressureThreshold},
+        {"adaptiveChunkSplitCompletion", no_argument, nullptr, kAdaptiveChunkSplitCompletion},
+        {"cudaGraph", no_argument, nullptr, kCudaGraph}, {"maxCudaGraphs", required_argument, nullptr, kMaxCudaGraphs},
         {"maxPrefillCudaGraphs", required_argument, nullptr, kMaxPrefillCudaGraphs},
         {"maxDecodeCudaGraphs", required_argument, nullptr, kMaxDecodeCudaGraphs},
         {"maxCudaGraphMiB", required_argument, nullptr, kMaxCudaGraphMiB},
@@ -605,6 +616,37 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kContextAdapter: args.contextAdapter = true; break;
         case kAdaptiveScheduler: args.adaptiveScheduler = true; break;
         case kAdaptiveChunking: args.adaptiveChunking = true; break;
+        case kAdaptiveChunkCandidates:
+        {
+            std::string const candidates{optarg};
+            size_t begin{};
+            while (begin < candidates.size())
+            {
+                size_t const end = candidates.find(',', begin);
+                std::string const value = candidates.substr(begin, end - begin);
+                size_t parsed{};
+                int32_t const candidate = std::stoi(value, &parsed);
+                if (parsed != value.size() || candidate <= 0)
+                {
+                    return false;
+                }
+                args.adaptiveChunkCandidates.push_back(candidate);
+                if (end == std::string::npos)
+                {
+                    break;
+                }
+                begin = end + 1;
+            }
+            if (args.adaptiveChunkCandidates.empty())
+            {
+                return false;
+            }
+            break;
+        }
+        case kAdaptiveChunkDecodePressureThreshold:
+            args.adaptiveChunkDecodePressureThreshold = std::stof(optarg);
+            break;
+        case kAdaptiveChunkSplitCompletion: args.adaptiveChunkSplitCompletion = true; break;
         case kCudaGraph: args.cudaGraph = true; break;
         case kMaxCudaGraphs: args.maxCudaGraphs = std::stoi(optarg); break;
         case kMaxPrefillCudaGraphs: args.maxPrefillCudaGraphs = std::stoi(optarg); break;
@@ -720,6 +762,16 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.tpotHysteresisExitRatio < args.tpotHysteresisEnterRatio && args.tpotHysteresisEnterRatio <= 1.0F
         && args.tpotHysteresisWindow > 0 && args.minTpotHysteresisSamples > 0
         && args.minTpotHysteresisSamples <= args.tpotHysteresisWindow
+        && (args.adaptiveChunkCandidates.empty()
+            || (args.adaptiveChunking
+                && std::is_sorted(
+                    args.adaptiveChunkCandidates.begin(), args.adaptiveChunkCandidates.end(), std::less<int32_t>{})
+                && std::adjacent_find(args.adaptiveChunkCandidates.begin(), args.adaptiveChunkCandidates.end())
+                    == args.adaptiveChunkCandidates.end()
+                && args.adaptiveChunkCandidates.back() <= args.prefillChunkSize))
+        && std::isfinite(args.adaptiveChunkDecodePressureThreshold) && args.adaptiveChunkDecodePressureThreshold > 0.0F
+        && args.adaptiveChunkDecodePressureThreshold <= 1.0F
+        && (!args.adaptiveChunkSplitCompletion || (args.adaptiveChunking && !args.adaptiveChunkCandidates.empty()))
         && (args.schedulerProfile == "custom" || args.schedulerProfile == "latency-safe"
             || args.schedulerProfile == "balanced" || args.schedulerProfile == "throughput-balanced"
             || args.schedulerProfile == "long-prefill" || args.schedulerProfile == "auto")
@@ -962,6 +1014,8 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
            "prefill_deferred_for_tpot,prefill_cost_coverage_miss,overlap_evaluated_by_cost,"
            "latency_safe_fallback,prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,"
            "prefill_cost_lookup_max_past_kv_length,"
+           "adaptive_chunk_decode_queue_pressure,adaptive_chunk_observed_tpot_pressure,"
+           "adaptive_chunk_combined_pressure,"
            "planned_decode_batch,planned_decode_context_tokens,planned_decode_max_context_length,prefill_cohort_size,"
            "prefill_queue_wait_us,decode_queue_wait_us,prefill_gpu_ms,decode_gpu_ms,makespan_gpu_ms,overlap_ratio,"
            "page_pool_total_bundles,page_pool_allocated_bundles,page_pool_available_bundles,"
@@ -982,12 +1036,13 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << (sample.prefillCostCoverageMiss ? 1 : 0) << ',' << (sample.overlapEvaluatedByCost ? 1 : 0) << ','
                << (sample.latencySafeFallback ? 1 : 0) << ',' << sample.prefillCostLookupRows << ','
                << sample.prefillCostLookupChunkLength << ',' << sample.prefillCostLookupMaxPastKVLength << ','
-               << sample.plannedDecodeBatchSize << ',' << sample.plannedDecodeContextTokens << ','
-               << sample.plannedDecodeMaxContextLength << ',' << sample.prefillCohortSize << ','
-               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
-               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
-               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
-               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << sample.adaptiveChunkDecodeQueuePressure << ',' << sample.adaptiveChunkObservedTpotPressure << ','
+               << sample.adaptiveChunkCombinedPressure << ',' << sample.plannedDecodeBatchSize << ','
+               << sample.plannedDecodeContextTokens << ',' << sample.plannedDecodeMaxContextLength << ','
+               << sample.prefillCohortSize << ',' << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ','
+               << sample.prefillGpuMs << ',' << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ','
+               << sample.overlapRatio << ',' << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles
+               << ',' << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
                << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }
@@ -1769,7 +1824,16 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.decodeQueueWaitTargetUs = args.tpotTargetMs * 1000.0;
         facadeSchedulerConfig.enablePriorityBatching = args.loadPriorityClasses > 1 || traceHasPriority;
         facadeSchedulerConfig.enableAdaptivePrefillChunking = args.adaptiveChunking && configuredChunkSize > 0;
-        facadeSchedulerConfig.minPrefillChunkTokens = std::min(32, std::max(1, configuredChunkSize));
+        facadeSchedulerConfig.adaptivePrefillChunkCandidates = args.adaptiveChunkCandidates;
+        if (!args.adaptiveChunkCandidates.empty())
+        {
+            facadeSchedulerConfig.adaptivePrefillChunkDecodePressureThreshold
+                = args.adaptiveChunkDecodePressureThreshold;
+            facadeSchedulerConfig.allowAdaptivePrefillCompletionSplit = args.adaptiveChunkSplitCompletion;
+        }
+        facadeSchedulerConfig.minPrefillChunkTokens = args.adaptiveChunkCandidates.empty()
+            ? std::min(32, std::max(1, configuredChunkSize))
+            : args.adaptiveChunkCandidates.front();
         bool collectServingMetrics{true};
         rt::PhaseKernelGroupRecorder kernelGroupRecorder;
         size_t kernelGroupDispatchIndex{};
@@ -2566,7 +2630,11 @@ int main(int argc, char** argv)
             LOG_INFO("Serving dispatch metrics written to %s", dispatchCsv.c_str());
         }
         LOG_INFO("Serving facade scheduler policy: %s", args.adaptiveScheduler ? "adaptive_metrics" : "queue_default");
-        LOG_INFO("Serving facade prefill chunk policy: %s", args.adaptiveChunking ? "adaptive_cuda_cost" : "fixed");
+        LOG_INFO("Serving facade prefill chunk policy: %s candidates=%zu decode_pressure=%.3f split_completion=%d",
+            args.adaptiveChunking ? (args.adaptiveChunkCandidates.empty() ? "adaptive_cuda_cost" : "adaptive_bounded")
+                                  : "fixed",
+            args.adaptiveChunkCandidates.size(), facadeSchedulerConfig.adaptivePrefillChunkDecodePressureThreshold,
+            facadeSchedulerConfig.allowAdaptivePrefillCompletionSplit ? 1 : 0);
         LOG_INFO(
             "Serving facade engine run passed: %zu request context(s), stable admission -> actual greedy "
             "sampling -> repeated packed decode -> scatter -> slot release",

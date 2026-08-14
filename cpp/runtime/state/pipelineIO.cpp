@@ -382,7 +382,9 @@ PipelineIO PipelineIO::createForPackedPrefill(
     check::check(cfg.packedPrefill, "Packed-prefill PipelineIO requires a packed-prefill engine.");
     check::check(maxLogicalBatchSize > 0 && maxLogicalBatchSize <= cfg.maxSupportedPrefillBatchSize,
         "Packed-prefill PipelineIO logical batch exceeds the engine profile.");
-    check::check(maxTotalTokens > 0 && maxTotalTokens <= cfg.maxSupportedInputLength,
+    int64_t const maxProfileTokens
+        = static_cast<int64_t>(cfg.maxSupportedPrefillBatchSize) * cfg.maxPackedPrefillChunkTokens;
+    check::check(maxTotalTokens > 0 && static_cast<int64_t>(maxTotalTokens) <= maxProfileTokens,
         "Packed-prefill PipelineIO token capacity exceeds the engine profile.");
     PipelineIO io;
     constexpr int32_t kTOKEN_BATCH{1};

@@ -112,6 +112,9 @@ struct PhaseDispatchMetrics
     int32_t prefillCostLookupRows{};
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
+    float adaptiveChunkDecodeQueuePressure{};
+    float adaptiveChunkObservedTpotPressure{};
+    float adaptiveChunkCombinedPressure{};
     int32_t plannedDecodeBatchSize{};
     int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
@@ -338,6 +341,20 @@ struct PhaseQueueSchedulerConfig
     bool enableAdaptivePrefillChunking{};
     int32_t minPrefillChunkTokens{32};
     int32_t prefillChunkAlignment{8};
+    //! Optional profiled chunk shapes for bounded adaptive selection. Values
+    //! must be strictly increasing and no larger than maxPrefillChunkTokens.
+    //! An empty vector preserves the legacy aligned continuous selection.
+    //! A request's final tail may be smaller than the first candidate.
+    std::vector<int32_t> adaptivePrefillChunkCandidates;
+    //! Select the smallest bounded candidate once decode queue occupancy
+    //! multiplied by observed TPOT pressure reaches this ratio. Requiring
+    //! both signals avoids shrinking chunks merely because a healthy decode
+    //! batch is full.
+    float adaptivePrefillChunkDecodePressureThreshold{0.8F};
+    //! Permit pressure to split a row that would otherwise finish within the
+    //! maximum chunk. Disabled by default because an extra TensorRT enqueue
+    //! can cost more than the shorter interference window.
+    bool allowAdaptivePrefillCompletionSplit{};
     //! Admit one prefill batch after this many decode-only decisions so a
     //! continuous decode queue cannot starve new requests forever.
     int32_t decodeBurstLimit{8};
@@ -393,6 +410,9 @@ struct PhaseDispatchPlan
     int32_t prefillCostLookupRows{};
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
+    float adaptiveChunkDecodeQueuePressure{};
+    float adaptiveChunkObservedTpotPressure{};
+    float adaptiveChunkCombinedPressure{};
     int32_t prefillCohortSize{};
 };
 

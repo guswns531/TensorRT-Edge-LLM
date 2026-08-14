@@ -163,6 +163,9 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.prefillCostLookupRows = mInFlight.prefillCostLookupRows;
     mCurrentMetrics.prefillCostLookupChunkLength = mInFlight.prefillCostLookupChunkLength;
     mCurrentMetrics.prefillCostLookupMaxPastKVLength = mInFlight.prefillCostLookupMaxPastKVLength;
+    mCurrentMetrics.adaptiveChunkDecodeQueuePressure = mInFlight.adaptiveChunkDecodeQueuePressure;
+    mCurrentMetrics.adaptiveChunkObservedTpotPressure = mInFlight.adaptiveChunkObservedTpotPressure;
+    mCurrentMetrics.adaptiveChunkCombinedPressure = mInFlight.adaptiveChunkCombinedPressure;
     mCurrentMetrics.plannedDecodeBatchSize = mInFlight.plannedDecodeBatchSize;
     mCurrentMetrics.plannedDecodeContextTokens = mInFlight.plannedDecodeContextTokens;
     mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
