@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm::rt
@@ -72,6 +73,7 @@ struct IndependentPhaseRequestAdapter
 enum class IndependentPhaseServerStatus
 {
     kAdmitted,
+    kQueued,
     kBackpressure,
     kDuplicateRequest,
     kCompleted,
@@ -85,6 +87,7 @@ struct IndependentPhaseServerConfig
     std::vector<int32_t> eosTokenIds;
     bool enablePrefixReuse{};
     bool enableCudaGraphs{};
+    size_t maxPendingRequests{};
 };
 
 struct IndependentPhaseServerSubmission
@@ -129,6 +132,9 @@ public:
 
     IndependentPhaseServerSubmission submit(uint64_t requestId, std::vector<int32_t> promptTokens,
         int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
+    //! Queue a request when slots/pages are temporarily unavailable.
+    IndependentPhaseServerSubmission submitOrQueue(uint64_t requestId, std::vector<int32_t> promptTokens,
+        int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
     bool cancel(uint64_t requestId);
     //! Capture the currently prepared phase shapes for later execute() replay.
     bool capturePreparedGraphs();
@@ -138,6 +144,7 @@ public:
     std::optional<IndependentPhaseServerToken> tryPopToken();
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
     size_t inFlightCount() const noexcept;
+    size_t pendingCount() const noexcept;
     bool empty() const noexcept;
 
 private:
@@ -151,9 +158,18 @@ private:
         std::chrono::steady_clock::time_point submittedAt;
     };
 
+    struct PendingRequest
+    {
+        uint64_t requestId{};
+        std::vector<int32_t> promptTokens;
+        int32_t maxOutputTokens{};
+        PhaseSchedulingHints scheduling;
+    };
+
     IndependentPhaseCoordinatorCallbacks makeCallbacks();
     std::vector<IndependentPhaseRequestView> makeViews(std::vector<PhaseWorkItem> const& batch) const;
     bool isEos(int32_t tokenId) const noexcept;
+    bool admitPendingRequests();
     void processSamplingTickets();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
@@ -165,6 +181,8 @@ private:
     IndependentPhaseRequestAdapter mAdapter;
     PhasePrefixReuseCache* mPrefixCache{};
     std::unordered_map<uint64_t, RequestState> mRequests;
+    std::deque<PendingRequest> mPendingRequests;
+    std::unordered_set<uint64_t> mPendingRequestIds;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;

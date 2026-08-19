@@ -658,6 +658,7 @@ int main(int argc, char** argv)
         serverConfig.eosTokenIds = config.eosTokenIds;
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
+        serverConfig.maxPendingRequests = 1024;
         std::unique_ptr<rt::PhasePrefixReuseCache> semanticPrefixCache;
         if (enablePrefixReuse)
         {
@@ -822,8 +823,9 @@ int main(int argc, char** argv)
                     {
                         maxOutputTokens = requestPayload.at("max_generate_length").get<int32_t>();
                     }
-                    auto const submission = semanticServer.submit(requestId, tokenIds, maxOutputTokens);
-                    if (submission.status == rt::IndependentPhaseServerStatus::kAdmitted)
+                    auto const submission = semanticServer.submitOrQueue(requestId, tokenIds, maxOutputTokens);
+                    if (submission.status == rt::IndependentPhaseServerStatus::kAdmitted
+                        || submission.status == rt::IndependentPhaseServerStatus::kQueued)
                     {
                         promptLengths[requestId] = static_cast<int32_t>(tokenIds.size());
                         lines.pop_front();

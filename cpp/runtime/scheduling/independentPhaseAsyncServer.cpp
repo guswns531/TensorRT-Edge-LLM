@@ -55,7 +55,8 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
 {
     IndependentPhaseServerSubmission result{requestId};
-    if (mRequests.find(requestId) != mRequests.end() || promptTokens.empty())
+    if (mRequests.find(requestId) != mRequests.end() || mPendingRequestIds.find(requestId) != mPendingRequestIds.end()
+        || promptTokens.empty())
     {
         result.status = IndependentPhaseServerStatus::kDuplicateRequest;
         return result;
@@ -102,12 +103,40 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     return result;
 }
 
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueue(
+    uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    IndependentPhaseServerSubmission result = submit(requestId, promptTokens, maxOutputTokens, scheduling);
+    if (result.status != IndependentPhaseServerStatus::kBackpressure)
+    {
+        return result;
+    }
+    if (mConfig.maxPendingRequests == 0 || mPendingRequests.size() >= mConfig.maxPendingRequests
+        || mPendingRequestIds.find(requestId) != mPendingRequestIds.end()
+        || mRequests.find(requestId) != mRequests.end() || promptTokens.empty())
+    {
+        return result;
+    }
+    mPendingRequests.push_back({requestId, std::move(promptTokens), maxOutputTokens, scheduling});
+    mPendingRequestIds.insert(requestId);
+    result.status = IndependentPhaseServerStatus::kQueued;
+    return result;
+}
+
 bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
 {
     auto it = mRequests.find(requestId);
     if (it == mRequests.end())
     {
-        return false;
+        if (mPendingRequestIds.erase(requestId) == 0)
+        {
+            return false;
+        }
+        auto const pending = std::find_if(mPendingRequests.begin(), mPendingRequests.end(),
+            [&](PendingRequest const& request) { return request.requestId == requestId; });
+        ELLM_CHECK(pending != mPendingRequests.end(), "Pending request index is inconsistent");
+        mPendingRequests.erase(pending);
+        return true;
     }
     if (!mCoordinator.scheduler().cancel(requestId))
     {
@@ -127,8 +156,10 @@ bool IndependentPhaseAsyncServer::capturePreparedGraphs()
 
 bool IndependentPhaseAsyncServer::poll()
 {
-    bool progressed = mCoordinator.poll();
+    bool progressed = admitPendingRequests();
+    progressed = mCoordinator.poll() || progressed;
     processSamplingTickets();
+    progressed = admitPendingRequests() || progressed;
     if (!mCoordinator.busy() && !mCoordinator.empty())
     {
         progressed = mCoordinator.dispatchNext() || progressed;
@@ -175,9 +206,38 @@ size_t IndependentPhaseAsyncServer::inFlightCount() const noexcept
     return mRequests.size();
 }
 
+size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
+{
+    return mPendingRequests.size();
+}
+
 bool IndependentPhaseAsyncServer::empty() const noexcept
 {
-    return mRequests.empty() && mSamplingTickets.empty() && mCoordinator.empty();
+    return mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty() && mCoordinator.empty();
+}
+
+bool IndependentPhaseAsyncServer::admitPendingRequests()
+{
+    bool admitted{};
+    while (!mPendingRequests.empty())
+    {
+        PendingRequest request = std::move(mPendingRequests.front());
+        mPendingRequests.pop_front();
+        mPendingRequestIds.erase(request.requestId);
+        IndependentPhaseServerSubmission const result
+            = submit(request.requestId, request.promptTokens, request.maxOutputTokens, request.scheduling);
+        if (result.status == IndependentPhaseServerStatus::kAdmitted)
+        {
+            admitted = true;
+            continue;
+        }
+        ELLM_CHECK(result.status == IndependentPhaseServerStatus::kBackpressure,
+            "Pending phase request became invalid during admission");
+        mPendingRequests.push_front(std::move(request));
+        mPendingRequestIds.insert(mPendingRequests.front().requestId);
+        break;
+    }
+    return admitted;
 }
 
 IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks()
