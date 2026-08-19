@@ -1913,9 +1913,8 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context,
     }
     if (!sampleOutput)
     {
-        // The next chunk reuses pinned host token/length staging buffers. Make
-        // the current H2D and engine read terminal before the host overwrites them.
-        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+        // Wavefront commit follows on the same stream and makes the engine and
+        // reusable pinned staging terminal before the next wave.
         return true;
     }
 

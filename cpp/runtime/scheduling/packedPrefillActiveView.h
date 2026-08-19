@@ -62,11 +62,9 @@ private:
     Tensor mDeviceActiveLengths;
     Tensor mHostGlobalIncrements;
     Tensor mDeviceGlobalIncrements;
-    Tensor mActiveMRope;
     std::vector<int32_t> mSourceRows;
     Tensor* mPreviousPageTable{};
     Tensor* mPreviousLengths{};
-    Tensor* mPreviousRope{};
     bool mPrepared{};
 };
 

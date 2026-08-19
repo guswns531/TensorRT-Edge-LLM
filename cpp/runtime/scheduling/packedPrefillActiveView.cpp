@@ -46,11 +46,6 @@ PackedPrefillActiveView::PackedPrefillActiveView(LLMEngineConfig const& config, 
           "PackedPrefillActiveView::deviceGlobalIncrements")
 {
     ELLM_CHECK(config.packedPrefill, "Packed prefill active view requires a packed engine");
-    if (config.ropeConfig.type == RopeType::kMRope)
-    {
-        mActiveMRope = Tensor({config.maxSupportedBatchSize, config.maxKVCacheCapacity, config.rotaryDim},
-            DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PackedPrefillActiveView::activeMRope");
-    }
 }
 
 PackedPrefillActiveView::~PackedPrefillActiveView() noexcept
@@ -103,23 +98,12 @@ void PackedPrefillActiveView::prepare(
 
     mTensorMap.set(binding_names::kKVPageTable, mActivePageTable.kernelView());
     mTensorMap.set(binding_names::kKVCacheStartIndex, mDeviceActiveLengths);
-    if (mConfig.ropeConfig.type == RopeType::kMRope)
-    {
-        mPreviousRope = mTensorMap.get(binding_names::kRopeCosSin);
-        ELLM_CHECK(mPreviousRope != nullptr, "Packed prefill active view requires an M-RoPE binding");
-        ELLM_CHECK(mActiveMRope.reshape({activeCount, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
-            "Packed prefill active M-RoPE reshape failed");
-        size_t const rowBytes = static_cast<size_t>(mConfig.maxKVCacheCapacity) * mConfig.rotaryDim * sizeof(float);
-        auto const* source = static_cast<std::byte const*>(mPipelineIO.mropeCosSin.rawPointer());
-        auto* destination = static_cast<std::byte*>(mActiveMRope.rawPointer());
-        for (size_t activeRow = 0; activeRow < sourceRows.size(); ++activeRow)
-        {
-            CUDA_CHECK(cudaMemcpyAsync(destination + activeRow * rowBytes,
-                source + static_cast<size_t>(sourceRows[activeRow]) * rowBytes, rowBytes, cudaMemcpyDeviceToDevice,
-                stream));
-        }
-        mTensorMap.set(binding_names::kRopeCosSin, mActiveMRope);
-    }
+    // Packed v1 admits only text-only requests. Text M-RoPE rows are identical,
+    // so the existing binding's first activeCount rows remain valid even when
+    // the selected KV rows are non-contiguous.
+    ELLM_CHECK(mConfig.ropeConfig.type != RopeType::kMRope
+            || mTensorMap.get(binding_names::kRopeCosSin) == &mPipelineIO.mropeCosSin,
+        "Packed prefill text M-RoPE binding was unexpectedly replaced");
     mSourceRows = sourceRows;
     mPrepared = true;
 }
@@ -169,13 +153,8 @@ void PackedPrefillActiveView::restoreBindings() noexcept
     {
         mTensorMap.set(binding_names::kKVPageTable, *mPreviousPageTable);
         mTensorMap.set(binding_names::kKVCacheStartIndex, *mPreviousLengths);
-        if (mPreviousRope != nullptr)
-        {
-            mTensorMap.set(binding_names::kRopeCosSin, *mPreviousRope);
-        }
         mPreviousPageTable = nullptr;
         mPreviousLengths = nullptr;
-        mPreviousRope = nullptr;
     }
     catch (...)
     {
