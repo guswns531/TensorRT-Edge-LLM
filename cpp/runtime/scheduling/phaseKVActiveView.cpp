@@ -90,6 +90,57 @@ void PhaseKVActiveView::commitLengths(std::vector<int32_t> const& resultingLengt
     }
 }
 
+void PhaseKVActiveView::preparePrefillMetadata(
+    PipelineIO& io, std::vector<int32_t> const& chunkLengths, cudaStream_t stream) const
+{
+    ELLM_CHECK(mPrepared, "Phase KV active view is not prepared");
+    ELLM_CHECK(
+        chunkLengths.size() == mActiveStableSlots.size(), "Phase prefill chunk count does not match the active batch");
+    int32_t const batchSize = static_cast<int32_t>(chunkLengths.size());
+    ELLM_CHECK(io.selectTokenIndices.reshape({batchSize, 1}), "Phase prefill select-token reshape failed");
+    ELLM_CHECK(io.contextLengths.reshape({batchSize}), "Phase prefill context-length reshape failed");
+    ELLM_CHECK(io.hostSelectTokenIndices.reshape({batchSize, 1}), "Phase prefill host select-token reshape failed");
+    ELLM_CHECK(io.hostContextLengths.reshape({batchSize}), "Phase prefill host context-length reshape failed");
+
+    int64_t* selectTokenIndices = io.hostSelectTokenIndices.dataPointer<int64_t>();
+    int32_t* contextLengths = io.hostContextLengths.dataPointer<int32_t>();
+    for (int32_t row = 0; row < batchSize; ++row)
+    {
+        int32_t const chunkLength = chunkLengths[static_cast<size_t>(row)];
+        ELLM_CHECK(chunkLength > 0, "Phase prefill chunk length must be positive");
+        int32_t const stableSlot = mActiveStableSlots[static_cast<size_t>(row)];
+        int32_t const resultingLength = mOwnership.length(stableSlot) + chunkLength;
+        ELLM_CHECK(resultingLength <= mOwnership.config().maxSequenceLength,
+            "Phase prefill metadata exceeds the stable slot sequence capacity");
+        selectTokenIndices[row] = chunkLength - 1;
+        contextLengths[row] = resultingLength;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(io.selectTokenIndices.rawPointer(), io.hostSelectTokenIndices.rawPointer(),
+        static_cast<size_t>(batchSize) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), io.hostContextLengths.rawPointer(),
+        static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+}
+
+void PhaseKVActiveView::prepareDecodeMetadata(PipelineIO& io, cudaStream_t stream) const
+{
+    ELLM_CHECK(mPrepared, "Phase KV active view is not prepared");
+    int32_t const batchSize = static_cast<int32_t>(mActiveStableSlots.size());
+    ELLM_CHECK(io.selectTokenIndices.reshape({batchSize, 1}), "Phase decode select-token reshape failed");
+    ELLM_CHECK(io.contextLengths.reshape({batchSize}), "Phase decode context-length reshape failed");
+    ELLM_CHECK(io.hostContextLengths.reshape({batchSize}), "Phase decode host context-length reshape failed");
+
+    CUDA_CHECK(cudaMemsetAsync(
+        io.selectTokenIndices.rawPointer(), 0, static_cast<size_t>(batchSize) * sizeof(int64_t), stream));
+    int32_t* contextLengths = io.hostContextLengths.dataPointer<int32_t>();
+    for (int32_t row = 0; row < batchSize; ++row)
+    {
+        int32_t const stableSlot = mActiveStableSlots[static_cast<size_t>(row)];
+        contextLengths[row] = mOwnership.length(stableSlot) + 1;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), io.hostContextLengths.rawPointer(),
+        static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+}
+
 KVPageTable& PhaseKVActiveView::pageTable() noexcept
 {
     return mPageTable;

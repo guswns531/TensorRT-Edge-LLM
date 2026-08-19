@@ -94,7 +94,7 @@ int main(int argc, char** argv)
         int32_t const prefillSlot = ownership.reserve();
         int32_t const decodeSlot = ownership.reserve();
         ownership.ensureCapacity(prefillSlot, 128);
-        ownership.ensureCapacity(decodeSlot, 128);
+        ownership.ensureCapacity(decodeSlot, 129);
         ownership.setLength(prefillSlot, 0);
         ownership.setLength(decodeSlot, 128);
         rt::PhaseKVActiveView prefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "prefill");
@@ -102,10 +102,27 @@ int main(int argc, char** argv)
         prefillKV.prepare({prefillSlot}, prefillStream);
         decodeKV.prepare({decodeSlot}, decodeStream);
 
+        ELLM_CHECK(
+            prefillIO->inputsEmbeds.reshape({1, 128, config.hiddenSize}), "Failed to reshape prefill input embeddings");
+        ELLM_CHECK(
+            decodeIO->inputsEmbeds.reshape({1, 1, config.hiddenSize}), "Failed to reshape decode input embeddings");
+        CUDA_CHECK(cudaMemsetAsync(
+            prefillIO->inputsEmbeds.rawPointer(), 0, prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
+        CUDA_CHECK(cudaMemsetAsync(
+            decodeIO->inputsEmbeds.rawPointer(), 0, decodeIO->inputsEmbeds.getMemoryCapacity(), decodeStream));
+        prefillKV.preparePrefillMetadata(*prefillIO, {128}, prefillStream);
+        decodeKV.prepareDecodeMetadata(*decodeIO, decodeStream);
+
         ELLM_CHECK(pair->prefillExecutor().prepare(0, config.prefillDims(1, 128, false), prefillMap, prefillStream),
             "Failed to bind the stable paged-KV prefill view");
         ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
             "Failed to bind the stable paged-KV decode view");
+        ELLM_CHECK(pair->prefillExecutor().execute(prefillStream), "Failed to execute stable paged-KV prefill");
+        ELLM_CHECK(pair->decodeExecutor().execute(decodeStream), "Failed to execute stable paged-KV decode");
+        CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+        CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+        prefillKV.commitLengths({128});
+        decodeKV.commitLengths({129});
         prefillKV.complete();
         decodeKV.complete();
 

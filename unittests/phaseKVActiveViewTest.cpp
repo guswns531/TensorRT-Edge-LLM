@@ -73,6 +73,42 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     EXPECT_EQ(prefillLength, (std::vector<int32_t>{96}));
     EXPECT_EQ(decodeLengths, (std::vector<int32_t>{64, 192}));
 
+    rt::PipelineIO prefillIO = rt::PipelineIO::createForLLM(
+        [] {
+            rt::LLMEngineConfig config;
+            config.maxSupportedBatchSize = 2;
+            config.maxSupportedInputLength = 128;
+            config.maxKVCacheCapacity = 512;
+            config.hiddenSize = 8;
+            config.outputVocabSize = 16;
+            config.numDeepstackFeatures = 0;
+            return config;
+        }(),
+        prefillStream);
+    prefill.preparePrefillMetadata(prefillIO, {32}, prefillStream);
+    std::vector<int32_t> prefillContextLength(1);
+    CUDA_CHECK(cudaMemcpy(
+        prefillContextLength.data(), prefillIO.contextLengths.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(prefillContextLength, (std::vector<int32_t>{128}));
+
+    rt::PipelineIO decodeIO = rt::PipelineIO::createForLLM(
+        [] {
+            rt::LLMEngineConfig config;
+            config.maxSupportedBatchSize = 2;
+            config.maxSupportedInputLength = 128;
+            config.maxKVCacheCapacity = 512;
+            config.hiddenSize = 8;
+            config.outputVocabSize = 16;
+            config.numDeepstackFeatures = 0;
+            return config;
+        }(),
+        decodeStream);
+    decode.prepareDecodeMetadata(decodeIO, decodeStream);
+    std::vector<int32_t> decodeContextLengths(2);
+    CUDA_CHECK(cudaMemcpy(decodeContextLengths.data(), decodeIO.contextLengths.rawPointer(), 2 * sizeof(int32_t),
+        cudaMemcpyDeviceToHost));
+    EXPECT_EQ(decodeContextLengths, (std::vector<int32_t>{65, 193}));
+
     prefill.commitLengths({128});
     decode.commitLengths({65, 193});
     EXPECT_EQ(ownership.length(slot2), 128);
