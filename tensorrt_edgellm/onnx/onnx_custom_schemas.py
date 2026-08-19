@@ -256,6 +256,19 @@ _attention_plugin_schema = OpSchema(
             "input then carries Q only [B, S, Hq*D] (0(false), 1(true)).",
             required=False,
         ),
+        OpSchema.Attribute(
+            name="enable_packed_prefill",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Treat a [1, total_tokens] context input as packed logical rows.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="packed_prefill_max_chunk_tokens",
+            type=OpSchema.AttrType.INT,
+            description="Maximum logical row length for packed prefill.",
+            required=False,
+        ),
     ],
 )
 

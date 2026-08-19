@@ -38,6 +38,15 @@ _LLM_EXPORT_PATH = os.path.normpath(
                  "checkpoint_utils.py"))
 _CONFIG_PATH = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "config.py"))
+_ATTENTION_OP_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "models",
+                 "ops.py"))
+_ATTENTION_TRANSLATION_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "onnx",
+                 "dynamo_translations.py"))
+_ATTENTION_SCHEMA_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "onnx",
+                 "onnx_custom_schemas.py"))
 
 
 def _load_source():
@@ -97,6 +106,15 @@ def test_packed_prefill_metadata_defaults_and_sidecar_write_are_present():
                      config_source)
     assert 'out["packed_prefill"] = bool(config.packed_prefill)' in export_source
     assert 'out["packed_prefill_max_chunk_tokens"]' in export_source
+
+
+def test_packed_prefill_attention_attributes_are_wired_end_to_end():
+    for path in (_ATTENTION_OP_PATH, _ATTENTION_TRANSLATION_PATH,
+                 _ATTENTION_SCHEMA_PATH):
+        with open(path, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+        assert "enable_packed_prefill" in source
+        assert "packed_prefill_max_chunk_tokens" in source
 
 
 # ---------------------------------------------------------------------------

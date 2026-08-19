@@ -116,6 +116,10 @@ def attention_plugin(
     # Whether this layer reads K/V from a donated (shared) cache: the packed input
     # carries Q only. Default 0 so torch.export strips the kwarg for normal layers.
     enable_kv_shared: int = 0,
+    # Pack logical prefill rows into one [1, total_tokens] token carrier.
+    enable_packed_prefill: int = 0,
+    # Maximum logical row length compiled into the packed attention kernel.
+    packed_prefill_max_chunk_tokens: int = 128,
     # Runtime skip-softmax override carrier: 1-D INT8 dummy whose LENGTH encodes the
     # runtime scale-factor override (0 = keep the engine default). Default None so
     # torch.export strips it for models that do not wire the runtime knob.
@@ -220,6 +224,8 @@ def _(
     rms_norm_eps=1e-6,
     enable_qk_norm=0,
     enable_kv_shared=0,
+    enable_packed_prefill=0,
+    packed_prefill_max_chunk_tokens=128,
     skip_softmax_scale=None,
 ):
     batch_size, seq_len, _ = qkv.shape

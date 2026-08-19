@@ -76,6 +76,8 @@ def _attention_plugin_translation(
     rms_norm_eps: float = 1e-6,
     enable_qk_norm: int = 0,
     enable_kv_shared: int = 0,
+    enable_packed_prefill: int = 0,
+    packed_prefill_max_chunk_tokens: int = 128,
     skip_softmax_scale: onnxscript.INT8 = None,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
@@ -123,6 +125,8 @@ def _attention_plugin_translation(
         rms_norm_eps=rms_norm_eps,
         enable_qk_norm=enable_qk_norm,
         enable_kv_shared=enable_kv_shared,
+        enable_packed_prefill=enable_packed_prefill,
+        packed_prefill_max_chunk_tokens=packed_prefill_max_chunk_tokens,
         _outputs=2,
     )
     return attn_4d, present_kv

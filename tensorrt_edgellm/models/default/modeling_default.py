@@ -343,6 +343,9 @@ class Attention(nn.Module):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
+            "enable_packed_prefill": int(self.config.packed_prefill),
+            "packed_prefill_max_chunk_tokens":
+            self.config.packed_prefill_max_chunk_tokens,
             "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
         # Wire the runtime override carrier iff skip-softmax is enabled (scale
