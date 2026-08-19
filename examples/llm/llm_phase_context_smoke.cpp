@@ -22,13 +22,16 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
+#include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -353,6 +356,93 @@ int main(int argc, char** argv)
             "request101_kv=%d request102_kv=%d request103_kv=%d",
             dispatchMetrics.size(), overlapDispatches, totalMakespanMs, ownership.length(prefillSlot0),
             ownership.length(prefillSlot1), ownership.length(decodeSlot));
+
+        ownership.release(prefillSlot0);
+        ownership.release(prefillSlot1);
+        ownership.release(decodeSlot);
+
+        rt::PhaseContinuousLoadGenerator load({16, 1000.0, 128, 512, 2, 6, 20260819, 10000});
+        std::deque<rt::PhaseLoadRequest> pendingAdmissions;
+        std::unordered_map<uint64_t, int32_t> traceSlots;
+        std::unordered_map<uint64_t, int32_t> traceOutputTargets;
+        std::unordered_map<uint64_t, int32_t> traceDecodeSteps;
+        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> traceSubmittedAt;
+        std::vector<double> traceLatenciesMs;
+        size_t completedRequests{};
+        rt::IndependentPhaseCoordinatorCallbacks traceCallbacks;
+        traceCallbacks.isDecodeFinished = [&](rt::PhaseWorkItem const& item, int32_t) {
+            int32_t const steps = ++traceDecodeSteps[item.requestId];
+            bool const finished = steps >= traceOutputTargets.at(item.requestId);
+            if (finished)
+            {
+                auto const now = std::chrono::steady_clock::now();
+                traceLatenciesMs.push_back(
+                    std::chrono::duration<double, std::milli>(now - traceSubmittedAt.at(item.requestId)).count());
+                ownership.release(traceSlots.at(item.requestId));
+                ++completedRequests;
+            }
+            return finished;
+        };
+        rt::IndependentPhaseCoordinator traceCoordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
+            *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
+
+        auto const traceStart = std::chrono::steady_clock::now();
+        size_t loopIterations{};
+        while (completedRequests < load.schedule().size())
+        {
+            int64_t const elapsedUs
+                = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - traceStart)
+                      .count();
+            std::vector<rt::PhaseLoadRequest> ready = load.popReady(elapsedUs);
+            pendingAdmissions.insert(pendingAdmissions.end(), ready.begin(), ready.end());
+            while (!pendingAdmissions.empty() && ownership.availableSlots() > 0)
+            {
+                rt::PhaseLoadRequest const request = pendingAdmissions.front();
+                int32_t const slot = ownership.reserve();
+                ownership.ensureCapacity(slot, request.promptTokenCount + request.maxOutputTokens);
+                ownership.setLength(slot, 0);
+                traceSlots[request.requestId] = slot;
+                traceOutputTargets[request.requestId] = request.maxOutputTokens;
+                traceSubmittedAt[request.requestId] = traceStart + std::chrono::microseconds(request.arrivalOffsetUs);
+                traceCoordinator.enqueuePrefill(
+                    {request.requestId, request.promptTokenCount, slot, 0, request.promptTokenCount});
+                pendingAdmissions.pop_front();
+            }
+            if (traceCoordinator.busy())
+            {
+                static_cast<void>(traceCoordinator.poll());
+            }
+            else if (!traceCoordinator.empty())
+            {
+                static_cast<void>(traceCoordinator.dispatchNext());
+            }
+            ELLM_CHECK(++loopIterations < 10000000, "Continuous phase load loop exceeded its runaway guard");
+        }
+        if (traceCoordinator.busy())
+        {
+            traceCoordinator.wait();
+        }
+        auto const traceEnd = std::chrono::steady_clock::now();
+        std::sort(traceLatenciesMs.begin(), traceLatenciesMs.end());
+        size_t const p95Index = std::min(
+            traceLatenciesMs.size() - 1, static_cast<size_t>(0.95 * static_cast<double>(traceLatenciesMs.size())));
+        double totalLatencyMs{};
+        for (double const latency : traceLatenciesMs)
+        {
+            totalLatencyMs += latency;
+        }
+        double const elapsedSeconds = std::chrono::duration<double>(traceEnd - traceStart).count();
+        size_t const traceOverlapDispatches = static_cast<size_t>(std::count_if(traceCoordinator.metrics().begin(),
+            traceCoordinator.metrics().end(),
+            [](rt::PhaseDispatchMetrics const& metrics) { return metrics.kind == rt::PhaseDispatchKind::kOverlap; }));
+        ELLM_CHECK(traceCoordinator.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+            "Continuous phase load did not release every request and stable slot");
+        LOG_INFO(
+            "Continuous phase load passed: requests=%zu dispatches=%zu overlaps=%zu throughput=%.2f req/s "
+            "mean_latency=%.3f ms p95_latency=%.3f ms",
+            completedRequests, traceCoordinator.metrics().size(), traceOverlapDispatches,
+            static_cast<double>(completedRequests) / elapsedSeconds,
+            totalLatencyMs / static_cast<double>(traceLatenciesMs.size()), traceLatenciesMs[p95Index]);
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));
