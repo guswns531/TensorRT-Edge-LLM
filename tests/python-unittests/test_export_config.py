@@ -38,6 +38,9 @@ _LLM_EXPORT_PATH = os.path.normpath(
                  "checkpoint_utils.py"))
 _CONFIG_PATH = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "config.py"))
+_EXPORT_CLI_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "scripts",
+                 "export.py"))
 _ATTENTION_OP_PATH = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "models",
                  "ops.py"))
@@ -106,6 +109,19 @@ def test_packed_prefill_metadata_defaults_and_sidecar_write_are_present():
                      config_source)
     assert 'out["packed_prefill"] = bool(config.packed_prefill)' in export_source
     assert 'out["packed_prefill_max_chunk_tokens"]' in export_source
+    with open(_EXPORT_CLI_PATH, "r", encoding="utf-8") as source_file:
+        cli_source = source_file.read()
+    assert '"--packed-prefill"' in cli_source
+    assert '"--packed-prefill-max-chunk-tokens"' in cli_source
+    assert "model.config.packed_prefill = packed_prefill" in cli_source
+    modeling_source_path = os.path.normpath(
+        os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "models",
+                     "default", "modeling_default.py"))
+    with open(modeling_source_path, "r", encoding="utf-8") as source_file:
+        modeling_source = source_file.read()
+    assert 'torch.export.Dim("token_batch"' in modeling_source
+    assert re.search(r"\{\s*0:\s*token_batch,\s*1:\s*num_selected\s*\}",
+                     modeling_source)
 
 
 def test_packed_prefill_attention_attributes_are_wired_end_to_end():

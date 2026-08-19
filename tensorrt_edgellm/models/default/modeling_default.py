@@ -226,6 +226,9 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_packed_prefill = bool(config.packed_prefill)
+        self.packed_prefill_max_chunk_tokens = int(
+            config.packed_prefill_max_chunk_tokens)
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
         # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled).
         self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
@@ -343,9 +346,9 @@ class Attention(nn.Module):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
-            "enable_packed_prefill": int(self.config.packed_prefill),
+            "enable_packed_prefill": int(self.enable_packed_prefill),
             "packed_prefill_max_chunk_tokens":
-            self.config.packed_prefill_max_chunk_tokens,
+            self.packed_prefill_max_chunk_tokens,
             "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
         # Wire the runtime override carrier iff skip-softmax is enabled (scale
@@ -889,6 +892,8 @@ class CausalLM(nn.Module):
                             [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
+        token_batch = (torch.export.Dim("token_batch", min=1, max=256)
+                       if config.packed_prefill else batch)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
@@ -897,9 +902,9 @@ class CausalLM(nn.Module):
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
-        num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if eagle_base else None
-        all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
+        num_selected = (torch.export.Dim("num_selected", min=1, max=256)
+                        if eagle_base or config.packed_prefill else None)
+        all_shapes: list = [{0: token_batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
             all_shapes.append({1:
                                num_pages})  # past_key_values_i (pool-shaped)
@@ -907,12 +912,15 @@ class CausalLM(nn.Module):
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
         all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
-        if eagle_base:
-            all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
+        if eagle_base or config.packed_prefill:
+            all_shapes.append({
+                0: token_batch,
+                1: num_selected
+            })  # last_token_ids
         else:
             all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nd):
-            all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
+            all_shapes.append({0: token_batch, 1: seq})  # deepstack_embeds_i
 
         # EAGLE3 base: add tree-attention inputs and hidden_states output.
         if eagle_base:

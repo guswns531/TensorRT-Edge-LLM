@@ -945,7 +945,9 @@ def _export_llm(model_dir: str,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
                 skip_softmax_scale_factor: "float | None" = None,
-                quantization_override: "str | None" = None) -> None:
+                quantization_override: "str | None" = None,
+                packed_prefill: bool = False,
+                packed_prefill_max_chunk_tokens: int = 128) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -1020,12 +1022,16 @@ def _export_llm(model_dir: str,
 
             # Build config overrides for on-the-fly quantization of BF16 MoE
             # checkpoints (e.g. --quantization int4_awq on a QAT-unquantized ckpt).
-            _extra_configs = None
+            _extra_configs = {
+                "packed_prefill": packed_prefill,
+                "packed_prefill_max_chunk_tokens":
+                packed_prefill_max_chunk_tokens,
+            }
             if quantization_override == "int4_awq" and _needs_moe_quantization:
-                _extra_configs = {
+                _extra_configs.update({
                     "_needs_moe_quantization": True,
                     "_use_int4_moe_plugin": True,
-                }
+                })
 
             model = AutoModel.from_pretrained(
                 model_dir,
@@ -1047,6 +1053,9 @@ def _export_llm(model_dir: str,
                 num_decoder_layers=num_decoder_layers,
                 extra_configs=_extra_configs,
             )
+            model.config.packed_prefill = packed_prefill
+            model.config.packed_prefill_max_chunk_tokens = \
+                packed_prefill_max_chunk_tokens
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
@@ -3802,6 +3811,19 @@ def main() -> None:
               "int4_moe, nvfp4_moe, lm_head, all."),
     )
     p.add_argument(
+        "--packed-prefill",
+        action="store_true",
+        help=(
+            "Pack a logical prefill batch into one contiguous token carrier. "
+            "The v1 path is vanilla attention-only, FP16 KV, head size 128."),
+    )
+    p.add_argument(
+        "--packed-prefill-max-chunk-tokens",
+        type=int,
+        default=128,
+        help=("Maximum logical row length for packed prefill. Default: 128."),
+    )
+    p.add_argument(
         "--max-kv-cache-capacity",
         type=int,
         default=4096,
@@ -3925,7 +3947,10 @@ def main() -> None:
             if not args.skip_llm:
                 _export_llm(model_dir,
                             os.path.join(args.output_dir, "llm"),
-                            model_type="cosmos3_edge")
+                            model_type="cosmos3_edge",
+                            packed_prefill=args.packed_prefill,
+                            packed_prefill_max_chunk_tokens=args.
+                            packed_prefill_max_chunk_tokens)
             # SigLIP2 ViT + PatchMerger -> visual/ for the standard
             # visual_build + multimodal runtime. The vision tower is read
             # directly from its checkpoint shards (the root index maps it to
@@ -3960,6 +3985,16 @@ def main() -> None:
 
     if args.mtp_tree_base:
         args.mtp = True
+    if args.packed_prefill_max_chunk_tokens <= 0:
+        p.error("--packed-prefill-max-chunk-tokens must be positive")
+    if (not args.packed_prefill
+            and args.packed_prefill_max_chunk_tokens != 128):
+        p.error("--packed-prefill-max-chunk-tokens requires --packed-prefill")
+    if args.packed_prefill and (args.eagle_base or args.mtp or args.dflash_base
+                                or args.dflash_draft or args.dspark_base
+                                or args.dspark_draft):
+        p.error(
+            "--packed-prefill v1 supports vanilla autoregressive export only")
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
     if args.eagle_draft_dir and not args.eagle_base:
@@ -4196,28 +4231,30 @@ def main() -> None:
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only
-         and _allow("thinker"), "thinker", lambda out: _export_llm(
-             model_dir,
-             out,
-             model_type=model_type,
-             eagle_base=args.eagle_base,
-             eagle_draft_dir=args.eagle_draft_dir,
-             mtp_base=args.mtp and not gemma4_mtp_requested,
-             mtp_tree_base=args.mtp_tree_base,
-             dflash_base=args.dflash_base,
-             dflash_tree_base=args.dflash_tree_base,
-             dflash_draft_dir=args.dflash_draft_dir,
-             dspark_base=args.dspark_base,
-             dspark_draft_dir=args.dspark_draft_dir,
-             gemma4_mtp_base=gemma4_mtp_requested,
-             fp8_embedding=args.fp8_embedding,
-             reduced_vocab_dir=args.reduced_vocab_dir,
-             externalize_weights=externalize_weights,
-             tp_size=args.tp_size,
-             num_decoder_layers=args.num_decoder_layer,
-             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
-             quantization_override=getattr(args, 'quantization', None))),
+         and not _draft_only and _allow("thinker"), "thinker", lambda out:
+         _export_llm(model_dir,
+                     out,
+                     model_type=model_type,
+                     eagle_base=args.eagle_base,
+                     eagle_draft_dir=args.eagle_draft_dir,
+                     mtp_base=args.mtp and not gemma4_mtp_requested,
+                     mtp_tree_base=args.mtp_tree_base,
+                     dflash_base=args.dflash_base,
+                     dflash_tree_base=args.dflash_tree_base,
+                     dflash_draft_dir=args.dflash_draft_dir,
+                     dspark_base=args.dspark_base,
+                     dspark_draft_dir=args.dspark_draft_dir,
+                     gemma4_mtp_base=gemma4_mtp_requested,
+                     fp8_embedding=args.fp8_embedding,
+                     reduced_vocab_dir=args.reduced_vocab_dir,
+                     externalize_weights=externalize_weights,
+                     tp_size=args.tp_size,
+                     num_decoder_layers=args.num_decoder_layer,
+                     skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+                     quantization_override=getattr(args, 'quantization', None),
+                     packed_prefill=args.packed_prefill,
+                     packed_prefill_max_chunk_tokens=args.
+                     packed_prefill_max_chunk_tokens)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

@@ -91,19 +91,21 @@ void PhaseKVActiveView::commitLengths(std::vector<int32_t> const& resultingLengt
 }
 
 void PhaseKVActiveView::preparePrefillMetadata(
-    PipelineIO& io, std::vector<int32_t> const& chunkLengths, cudaStream_t stream) const
+    PipelineIO& io, std::vector<int32_t> const& chunkLengths, cudaStream_t stream, bool packedTokenLayout) const
 {
     ELLM_CHECK(mPrepared, "Phase KV active view is not prepared");
     ELLM_CHECK(
         chunkLengths.size() == mActiveStableSlots.size(), "Phase prefill chunk count does not match the active batch");
     int32_t const batchSize = static_cast<int32_t>(chunkLengths.size());
-    ELLM_CHECK(io.selectTokenIndices.reshape({batchSize, 1}), "Phase prefill select-token reshape failed");
+    Coords const selectShape = packedTokenLayout ? Coords{1, batchSize} : Coords{batchSize, 1};
+    ELLM_CHECK(io.selectTokenIndices.reshape(selectShape), "Phase prefill select-token reshape failed");
     ELLM_CHECK(io.contextLengths.reshape({batchSize}), "Phase prefill context-length reshape failed");
-    ELLM_CHECK(io.hostSelectTokenIndices.reshape({batchSize, 1}), "Phase prefill host select-token reshape failed");
+    ELLM_CHECK(io.hostSelectTokenIndices.reshape(selectShape), "Phase prefill host select-token reshape failed");
     ELLM_CHECK(io.hostContextLengths.reshape({batchSize}), "Phase prefill host context-length reshape failed");
 
     int64_t* selectTokenIndices = io.hostSelectTokenIndices.dataPointer<int64_t>();
     int32_t* contextLengths = io.hostContextLengths.dataPointer<int32_t>();
+    int64_t packedTokenOffset{};
     for (int32_t row = 0; row < batchSize; ++row)
     {
         int32_t const chunkLength = chunkLengths[static_cast<size_t>(row)];
@@ -112,8 +114,9 @@ void PhaseKVActiveView::preparePrefillMetadata(
         int32_t const resultingLength = mOwnership.length(stableSlot) + chunkLength;
         ELLM_CHECK(resultingLength <= mOwnership.config().maxSequenceLength,
             "Phase prefill metadata exceeds the stable slot sequence capacity");
-        selectTokenIndices[row] = chunkLength - 1;
+        selectTokenIndices[row] = packedTokenLayout ? packedTokenOffset + chunkLength - 1 : chunkLength - 1;
         contextLengths[row] = resultingLength;
+        packedTokenOffset += chunkLength;
     }
     CUDA_CHECK(cudaMemcpyAsync(io.selectTokenIndices.rawPointer(), io.hostSelectTokenIndices.rawPointer(),
         static_cast<size_t>(batchSize) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));

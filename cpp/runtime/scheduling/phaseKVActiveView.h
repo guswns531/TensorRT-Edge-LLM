@@ -56,8 +56,9 @@ public:
     //! Commit one resulting length per active row into stable ownership.
     void commitLengths(std::vector<int32_t> const& resultingLengths);
 
-    //! Prepare select-token and context-length metadata for dense prefill rows.
-    void preparePrefillMetadata(PipelineIO& io, std::vector<int32_t> const& chunkLengths, cudaStream_t stream) const;
+    //! Prepare select-token and context-length metadata for dense or compact packed prefill rows.
+    void preparePrefillMetadata(PipelineIO& io, std::vector<int32_t> const& chunkLengths, cudaStream_t stream,
+        bool packedTokenLayout = false) const;
 
     //! Prepare select-token and context-length metadata for one-token decode rows.
     void prepareDecodeMetadata(PipelineIO& io, cudaStream_t stream) const;

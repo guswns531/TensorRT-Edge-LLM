@@ -91,29 +91,51 @@ int main(int argc, char** argv)
 
         rt::StableKVPageManager ownership({config.maxSupportedBatchSize, config.maxSupportedBatchSize,
             config.kvPoolPages, config.maxKVCacheCapacity, 128});
-        int32_t const prefillSlot = ownership.reserve();
+        int32_t const prefillSlot0 = ownership.reserve();
+        int32_t const prefillSlot1 = config.packedPrefill ? ownership.reserve() : -1;
         int32_t const decodeSlot = ownership.reserve();
-        ownership.ensureCapacity(prefillSlot, 128);
+        ownership.ensureCapacity(prefillSlot0, 128);
+        if (config.packedPrefill)
+        {
+            ownership.ensureCapacity(prefillSlot1, 128);
+        }
         ownership.ensureCapacity(decodeSlot, 129);
-        ownership.setLength(prefillSlot, 0);
+        ownership.setLength(prefillSlot0, 0);
+        if (config.packedPrefill)
+        {
+            ownership.setLength(prefillSlot1, 0);
+        }
         ownership.setLength(decodeSlot, 128);
         rt::PhaseKVActiveView prefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "prefill");
         rt::PhaseKVActiveView decodeKV(config.maxSupportedBatchSize, ownership, decodeMap, "decode");
-        prefillKV.prepare({prefillSlot}, prefillStream);
+        std::vector<int32_t> const prefillSlots = config.packedPrefill
+            ? std::vector<int32_t>{prefillSlot0, prefillSlot1}
+            : std::vector<int32_t>{prefillSlot0};
+        std::vector<int32_t> const prefillChunkLengths
+            = config.packedPrefill ? std::vector<int32_t>{96, 32} : std::vector<int32_t>{128};
+        prefillKV.prepare(prefillSlots, prefillStream);
         decodeKV.prepare({decodeSlot}, decodeStream);
 
-        ELLM_CHECK(
-            prefillIO->inputsEmbeds.reshape({1, 128, config.hiddenSize}), "Failed to reshape prefill input embeddings");
+        int32_t const prefillTotalTokens = 128;
+        ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, prefillTotalTokens, config.hiddenSize}),
+            "Failed to reshape prefill input embeddings");
         ELLM_CHECK(
             decodeIO->inputsEmbeds.reshape({1, 1, config.hiddenSize}), "Failed to reshape decode input embeddings");
         CUDA_CHECK(cudaMemsetAsync(
             prefillIO->inputsEmbeds.rawPointer(), 0, prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
         CUDA_CHECK(cudaMemsetAsync(
             decodeIO->inputsEmbeds.rawPointer(), 0, decodeIO->inputsEmbeds.getMemoryCapacity(), decodeStream));
-        prefillKV.preparePrefillMetadata(*prefillIO, {128}, prefillStream);
+        for (rt::Tensor& deepstack : prefillIO->deepstackEmbeds)
+        {
+            CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), prefillStream));
+        }
+        prefillKV.preparePrefillMetadata(*prefillIO, prefillChunkLengths, prefillStream, config.packedPrefill);
         decodeKV.prepareDecodeMetadata(*decodeIO, decodeStream);
 
-        ELLM_CHECK(pair->prefillExecutor().prepare(0, config.prefillDims(1, 128, false), prefillMap, prefillStream),
+        rt::InferenceDims const prefillDims = config.packedPrefill
+            ? config.packedPrefillDims(static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens)
+            : config.prefillDims(1, prefillTotalTokens, false);
+        ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
             "Failed to bind the stable paged-KV prefill view");
         ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
             "Failed to bind the stable paged-KV decode view");
@@ -121,7 +143,7 @@ int main(int argc, char** argv)
         ELLM_CHECK(pair->decodeExecutor().execute(decodeStream), "Failed to execute stable paged-KV decode");
         CUDA_CHECK(cudaStreamSynchronize(prefillStream));
         CUDA_CHECK(cudaStreamSynchronize(decodeStream));
-        prefillKV.commitLengths({128});
+        prefillKV.commitLengths(prefillChunkLengths);
         decodeKV.commitLengths({129});
         prefillKV.complete();
         decodeKV.complete();

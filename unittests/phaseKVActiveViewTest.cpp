@@ -122,6 +122,27 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     EXPECT_EQ(decodeMap.get(binding_names::kKVCacheStartIndex), &legacyLengths);
     EXPECT_EQ(decodeMap.get(binding_names::kKVPageTable), &legacyPageTable.kernelView());
 
+    prefill.prepare({slot0, slot2}, prefillStream);
+    rt::PipelineIO packedIO = rt::PipelineIO::createForLLM(
+        [] {
+            rt::LLMEngineConfig config;
+            config.maxSupportedBatchSize = 2;
+            config.maxSupportedInputLength = 128;
+            config.maxKVCacheCapacity = 512;
+            config.hiddenSize = 8;
+            config.outputVocabSize = 16;
+            return config;
+        }(),
+        prefillStream);
+    prefill.preparePrefillMetadata(packedIO, {3, 2}, prefillStream, true);
+    std::vector<int64_t> packedSelectIndices(2);
+    CUDA_CHECK(cudaMemcpy(packedSelectIndices.data(), packedIO.selectTokenIndices.rawPointer(),
+        packedSelectIndices.size() * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(packedSelectIndices, (std::vector<int64_t>{2, 4}));
+    EXPECT_EQ(packedIO.selectTokenIndices.getShape()[0], 1);
+    EXPECT_EQ(packedIO.selectTokenIndices.getShape()[1], 2);
+    prefill.complete();
+
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
