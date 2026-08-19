@@ -17,6 +17,8 @@
 
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 
+#include "runtime/scheduling/phaseVisionAdapter.h"
+
 #include "common/checkMacros.h"
 
 #include <algorithm>
@@ -56,6 +58,22 @@ IndependentPhaseAsyncServer::~IndependentPhaseAsyncServer() noexcept
 IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
 {
+    return submitImpl(requestId, std::move(promptTokens), nullptr, maxOutputTokens, scheduling);
+}
+
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitWithVision(uint64_t requestId,
+    std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens,
+    PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(visionPayload != nullptr, "Vision phase submission requires an encoded payload");
+    return submitImpl(requestId, std::move(promptTokens), std::move(visionPayload), maxOutputTokens, scheduling);
+}
+
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_t requestId,
+    std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens,
+    PhaseSchedulingHints scheduling)
+{
+    bool const allowChunkedPrefill = true;
     IndependentPhaseServerSubmission result{requestId};
     if (mRequests.find(requestId) != mRequests.end() || mPendingRequestIds.find(requestId) != mPendingRequestIds.end()
         || promptTokens.empty())
@@ -98,10 +116,11 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     state.kvSlotId = slot;
     state.scheduling = scheduling;
     state.submittedAt = std::chrono::steady_clock::now();
+    state.visionPayload = std::move(visionPayload);
     mRequests.emplace(requestId, std::move(state));
     int32_t const remaining = static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()) - reusedPrefixTokens;
     mCoordinator.enqueuePrefill({requestId, remaining, slot, reusedPrefixTokens,
-        static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()), true, scheduling});
+        static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()), allowChunkedPrefill, scheduling});
     result.status = IndependentPhaseServerStatus::kAdmitted;
     result.kvSlotId = slot;
     result.reusedPrefixTokens = reusedPrefixTokens;
@@ -111,7 +130,23 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
 IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueue(
     uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
 {
-    IndependentPhaseServerSubmission result = submit(requestId, promptTokens, maxOutputTokens, scheduling);
+    return submitOrQueueImpl(requestId, std::move(promptTokens), nullptr, maxOutputTokens, scheduling);
+}
+
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueueWithVision(uint64_t requestId,
+    std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens,
+    PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(visionPayload != nullptr, "Queued vision phase submission requires an encoded payload");
+    return submitOrQueueImpl(requestId, std::move(promptTokens), std::move(visionPayload), maxOutputTokens, scheduling);
+}
+
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueueImpl(uint64_t requestId,
+    std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens,
+    PhaseSchedulingHints scheduling)
+{
+    IndependentPhaseServerSubmission result
+        = submitImpl(requestId, promptTokens, visionPayload, maxOutputTokens, scheduling);
     if (result.status != IndependentPhaseServerStatus::kBackpressure)
     {
         return result;
@@ -122,7 +157,8 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueue(
     {
         return result;
     }
-    mPendingRequests.push_back({requestId, std::move(promptTokens), maxOutputTokens, scheduling});
+    mPendingRequests.push_back(
+        {requestId, std::move(promptTokens), maxOutputTokens, scheduling, std::move(visionPayload)});
     mPendingRequestIds.insert(requestId);
     result.status = IndependentPhaseServerStatus::kQueued;
     return result;
@@ -230,6 +266,11 @@ bool IndependentPhaseAsyncServer::empty() const noexcept
         && mCoordinator.empty();
 }
 
+CUcontext IndependentPhaseAsyncServer::cudaContext() const noexcept
+{
+    return mCoordinator.cudaContext();
+}
+
 bool IndependentPhaseAsyncServer::admitPendingRequests()
 {
     bool admitted{};
@@ -238,8 +279,8 @@ bool IndependentPhaseAsyncServer::admitPendingRequests()
         PendingRequest request = std::move(mPendingRequests.front());
         mPendingRequests.pop_front();
         mPendingRequestIds.erase(request.requestId);
-        IndependentPhaseServerSubmission const result
-            = submit(request.requestId, request.promptTokens, request.maxOutputTokens, request.scheduling);
+        IndependentPhaseServerSubmission const result = submitImpl(request.requestId, request.promptTokens,
+            request.visionPayload, request.maxOutputTokens, request.scheduling);
         if (result.status == IndependentPhaseServerStatus::kAdmitted)
         {
             admitted = true;
@@ -349,7 +390,8 @@ std::vector<IndependentPhaseRequestView> IndependentPhaseAsyncServer::makeViews(
     {
         auto const it = mRequests.find(work.requestId);
         ELLM_CHECK(it != mRequests.end(), "Phase adapter requested an unknown request");
-        views.push_back({work.requestId, work, &it->second.promptTokens, &it->second.generatedTokens});
+        views.push_back({work.requestId, work, &it->second.promptTokens, &it->second.generatedTokens,
+            it->second.visionPayload.get()});
     }
     return views;
 }

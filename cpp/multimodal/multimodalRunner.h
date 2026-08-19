@@ -89,6 +89,10 @@ public:
      */
     bool setContextMemory(rt::Tensor& sharedContextMemory);
 
+    //! Allocate and bind runner-owned USER_MANAGED TensorRT context memory.
+    //! Idempotent and required before a runner initialization that enqueues work.
+    void allocateContextMemory();
+
     /*!
      * @brief Create appropriate multimodal runner instance
      *
@@ -121,7 +125,8 @@ public:
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) = 0;
+        cudaStream_t stream, bool imageOnly = false)
+        = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
@@ -207,6 +212,7 @@ protected:
     metrics::MultimodalMetrics mMultimodalMetrics;              //!< Performance metrics
     //! Owns the encoder's externalized weights; the context points into them.
     std::unique_ptr<ExternalWeightManager> mExternalWeights;
+    rt::Tensor mOwnedContextMemory;     //!< Encoder context memory for independent execution.
     bool mExternalWeightsLoaded{false}; //!< Guards the idempotent load
 };
 

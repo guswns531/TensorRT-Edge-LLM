@@ -26,6 +26,10 @@ contexts.
 - `PhaseVisionAdapter` runs the v0.10 model-specific `MultimodalRunner` on an
   encoder stream and copies embedding, deepstack, token, and M-RoPE outputs to
   request-owned GPU storage.
+- `PhaseThreeCoordinator` owns encoder admission/cancellation and hands a
+  completed request-owned payload to the continuous prefill/decode server.
+- Phase-sized I/O keeps the decode context at sequence length one instead of
+  duplicating prefill-sized embedding, hidden-state, and deepstack buffers.
 
 ## Original Current parity
 
@@ -39,10 +43,10 @@ contexts.
 | first-shape CUDA graph capture | complete, bounded to P4/D8 graph shapes |
 | prefix sharing and greedy identity gate | complete |
 | model capability contract | complete |
-| request-owned Gemma/Cosmos encoder outputs | adapter complete; HTTP image submission pending |
+| request-owned Gemma/Cosmos encoder outputs | complete for the C++ three-phase submission path |
 | page reservation/growth leases | complete: full/headroom modes and decode growth wait queue |
 | tied embedding/LM-head reuse | pending exact-identity gate |
-| complete three-phase encoder queue coordinator | pending |
+| complete three-phase encoder queue coordinator | complete, including queued cancel and one encoder in flight |
 
 ## Validation
 
@@ -54,6 +58,15 @@ The TensorRT 11.0 / CUDA 13.3 SM86 container validated:
 - Continuous trace: 16 requests, 46 dispatches, 22 overlap dispatches.
 - Non-graph overlap: `1.183x`; graph-enabled overlap: `1.145x` for the
   prepared shape on the RTX 3080 test host.
+- Cosmos image request: independent encoder context/stream -> request-owned
+  embedding and M-RoPE -> 128-token chunked prefill -> decode completion.
+
+The Cosmos gate initially exposed two independent host-side defects: the
+three-phase path had not populated `formattedRequests`, and a function call
+could move the request payload before reading its token vector. Both are now
+fixed. Image embeddings and deepstack tensors are viewed from the cumulative
+image-token offset for each prefill chunk, so later chunks do not restart from
+feature row zero.
 
 ## Prefix reuse gate
 

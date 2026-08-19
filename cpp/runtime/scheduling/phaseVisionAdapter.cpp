@@ -58,6 +58,13 @@ Tensor PhaseVisionAdapter::copyTensor(Tensor const& source, std::string const& n
 bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& request)
 {
     ELLM_CHECK(mRequests.empty(), "Phase vision adapter currently permits one in-flight encoder request");
+    request.formattedRequests.resize(request.requests.size());
+    for (size_t index = 0; index < request.requests.size(); ++index)
+    {
+        ELLM_CHECK(mTokenizer.applyChatTemplate(request.requests[index], request.formattedRequests[index],
+                       request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
+            "Failed to format phase vision request");
+    }
     auto payload = std::make_unique<PhaseVisionPayload>();
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {

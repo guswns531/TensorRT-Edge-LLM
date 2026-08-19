@@ -415,10 +415,17 @@ void buildTensorMapForGemma4MTPDraft(
 
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
 {
-    PipelineIO io;
-
     int32_t const maxSeqLen = cfg.isDiffusionBackbone ? std::max(cfg.diffusionCanvasLength, cfg.maxSupportedInputLength)
                                                       : cfg.maxSupportedInputLength;
+    return createForLLMPhase(cfg, maxSeqLen, stream);
+}
+
+PipelineIO PipelineIO::createForLLMPhase(LLMEngineConfig const& cfg, int32_t maxSeqLen, cudaStream_t stream)
+{
+    PipelineIO io;
+
+    ELLM_CHECK(maxSeqLen > 0 && maxSeqLen <= std::max(cfg.maxSupportedInputLength, cfg.diffusionCanvasLength),
+        "PipelineIO phase sequence length is outside the engine capacity");
     allocateBasicIO(
         io, cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize, cfg.outputVocabSize, nvinfer1::DataType::kHALF);
 
@@ -435,16 +442,16 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
 
     if (cfg.useVisionBidirectionalAttention)
     {
-        io.visionBlockIds = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength}, DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+        io.visionBlockIds = Tensor({cfg.maxSupportedBatchSize, maxSeqLen}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "PipelineIO::visionBlockIds");
     }
 
     if (hasDeepstackFeatures(cfg))
     {
-        allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength,
-            cfg.hiddenSize, nvinfer1::DataType::kHALF);
+        allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize,
+            nvinfer1::DataType::kHALF);
         LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]", cfg.numDeepstackFeatures,
-            cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize);
+            cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize);
     }
 
     // Engine-output hidden states for the vanilla LLM path. Always allocated:

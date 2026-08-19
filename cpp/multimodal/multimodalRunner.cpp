@@ -129,6 +129,22 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
     return true;
 }
 
+void MultimodalRunner::allocateContextMemory()
+{
+    if (!mOwnedContextMemory.isEmpty())
+    {
+        return;
+    }
+    int64_t const requiredSize = getRequiredContextMemorySize();
+    if (requiredSize == 0)
+    {
+        return;
+    }
+    mOwnedContextMemory
+        = rt::Tensor({requiredSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "multimodal_context_memory");
+    ELLM_CHECK(setContextMemory(mOwnedContextMemory), "Failed to bind multimodal context memory");
+}
+
 namespace
 {
 //! \brief Construct a QwenViTRunner-family runner, then run its two-phase initialize().
@@ -240,8 +256,6 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
         throw std::runtime_error("Unsupported model type: " + modelTypeStr);
     }
 
-    // The Qwen family already bound inside its factory helper, before
-    // initialize(); this is a no-op there and the real call for everyone else.
     multimodalRunner->loadExternalWeights(multimodalEngineDir, checkpointDir, stream);
 
     return multimodalRunner;

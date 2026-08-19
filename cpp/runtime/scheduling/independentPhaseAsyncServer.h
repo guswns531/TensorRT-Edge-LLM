@@ -36,6 +36,8 @@
 namespace trt_edgellm::rt
 {
 
+struct PhaseVisionPayload;
+
 //! Request view passed to a model-specific text or multimodal adapter.
 struct IndependentPhaseRequestView
 {
@@ -43,6 +45,7 @@ struct IndependentPhaseRequestView
     PhaseWorkItem work;
     std::vector<int32_t> const* promptTokens{};
     std::vector<int32_t> const* generatedTokens{};
+    PhaseVisionPayload* visionPayload{};
 };
 
 //! CUDA event plus host collection callback for asynchronous greedy sampling.
@@ -145,6 +148,12 @@ public:
     //! Queue a request when slots/pages are temporarily unavailable.
     IndependentPhaseServerSubmission submitOrQueue(uint64_t requestId, std::vector<int32_t> promptTokens,
         int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
+    IndependentPhaseServerSubmission submitWithVision(uint64_t requestId, std::vector<int32_t> promptTokens,
+        std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens = 0,
+        PhaseSchedulingHints scheduling = {});
+    IndependentPhaseServerSubmission submitOrQueueWithVision(uint64_t requestId, std::vector<int32_t> promptTokens,
+        std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens = 0,
+        PhaseSchedulingHints scheduling = {});
     bool cancel(uint64_t requestId);
     //! Capture the currently prepared phase shapes for later execute() replay.
     bool capturePreparedGraphs();
@@ -156,6 +165,7 @@ public:
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
     bool empty() const noexcept;
+    CUcontext cudaContext() const noexcept;
 
 private:
     struct RequestState
@@ -166,6 +176,7 @@ private:
         int32_t kvSlotId{-1};
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
+        std::shared_ptr<PhaseVisionPayload> visionPayload;
     };
 
     struct PendingRequest
@@ -174,9 +185,14 @@ private:
         std::vector<int32_t> promptTokens;
         int32_t maxOutputTokens{};
         PhaseSchedulingHints scheduling;
+        std::shared_ptr<PhaseVisionPayload> visionPayload;
     };
 
     IndependentPhaseCoordinatorCallbacks makeCallbacks();
+    IndependentPhaseServerSubmission submitImpl(uint64_t requestId, std::vector<int32_t> promptTokens,
+        std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens, PhaseSchedulingHints scheduling);
+    IndependentPhaseServerSubmission submitOrQueueImpl(uint64_t requestId, std::vector<int32_t> promptTokens,
+        std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens, PhaseSchedulingHints scheduling);
     std::vector<IndependentPhaseRequestView> makeViews(std::vector<PhaseWorkItem> const& batch) const;
     bool isEos(int32_t tokenId) const noexcept;
     bool admitPendingRequests();

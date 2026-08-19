@@ -21,6 +21,7 @@
 #include "common/trtUtils.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
@@ -29,6 +30,8 @@
 #include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/scheduling/phaseThreeCoordinator.h"
+#include "runtime/scheduling/phaseVisionAdapter.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "sampler/sampling.h"
@@ -220,7 +223,7 @@ int main(int argc, char** argv)
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
         auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(config, setupStream));
-        auto decodeIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(config, setupStream));
+        auto decodeIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(config, 1, setupStream));
         rt::TensorMap prefillMap;
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
@@ -535,6 +538,46 @@ int main(int argc, char** argv)
 
         auto stageTokens = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
                                rt::TensorMap& map, cudaStream_t stream, bool prefill) {
+            rt::OptionalInputTensor visionEmbedding;
+            rt::OptionalInputTensors deepstackFeatures;
+            rt::Tensor visionEmbeddingView;
+            std::vector<rt::Tensor> deepstackFeatureViews;
+            if (!views.empty() && views.front().visionPayload != nullptr)
+            {
+                ELLM_CHECK(views.size() == 1U, "Multimodal phase v1 requires an atomic single-row prefill");
+                rt::PhaseVisionPayload& payload = *views.front().visionPayload;
+                auto const chunkBegin = views.front().promptTokens->begin() + views.front().work.tokenOffset;
+                auto const chunkEnd = chunkBegin + views.front().work.tokenCount;
+                int64_t const imageOffset
+                    = std::count(views.front().promptTokens->begin(), chunkBegin, config.imageTokenId);
+                int64_t const imageTokens = std::count(chunkBegin, chunkEnd, config.imageTokenId);
+                if (imageTokens > 0)
+                {
+                    auto makeFeatureView = [&](rt::Tensor& feature, std::string const& name) {
+                        rt::Coords const shape = feature.getShape();
+                        ELLM_CHECK(shape.getNumDims() == 2 && imageOffset + imageTokens <= shape[0],
+                            "Multimodal chunk is outside its request-owned feature buffer");
+                        size_t const rowBytes
+                            = static_cast<size_t>(shape[1]) * rt::utils::getTypeSize(feature.getDataType());
+                        auto* const data = static_cast<std::byte*>(feature.rawPointer()) + imageOffset * rowBytes;
+                        return rt::Tensor(data, {shape[0] - imageOffset, shape[1]}, rt::DeviceType::kGPU,
+                            feature.getDataType(), name);
+                    };
+                    visionEmbeddingView = makeFeatureView(payload.outputEmbedding, "phase_vision_chunk");
+                    visionEmbedding = std::cref(visionEmbeddingView);
+                    deepstackFeatureViews.reserve(payload.deepstackFeatures.size());
+                    deepstackFeatures.reserve(payload.deepstackFeatures.size());
+                    for (rt::Tensor& feature : payload.deepstackFeatures)
+                    {
+                        deepstackFeatureViews.push_back(makeFeatureView(feature, "phase_deepstack_chunk"));
+                        deepstackFeatures.push_back(std::cref(deepstackFeatureViews.back()));
+                    }
+                }
+                if (!payload.mropeCosSin.isEmpty())
+                {
+                    map.set(binding_names::kRopeCosSin, payload.mropeCosSin);
+                }
+            }
             int32_t totalTokens{};
             for (rt::IndependentPhaseRequestView const& view : views)
             {
@@ -564,8 +607,8 @@ int main(int argc, char** argv)
             }
             CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
                 static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-            embeddingPreprocessor.embed(deviceIds, std::nullopt, std::nullopt, io, stream);
-            embeddingPreprocessor.prepareDeepstack(deviceIds, rt::OptionalInputTensors{}, io, stream);
+            embeddingPreprocessor.embed(deviceIds, visionEmbedding, std::nullopt, io, stream);
+            embeddingPreprocessor.prepareDeepstack(deviceIds, deepstackFeatures, io, stream);
             if (prefill)
             {
                 for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
@@ -673,7 +716,49 @@ int main(int argc, char** argv)
             serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter), semanticPrefixCache.get());
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
-        if (prefixReuseGate)
+        char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
+        char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
+        if (visionEngineDir != nullptr && visionImagePath != nullptr)
+        {
+            cudaStream_t encoderStream{};
+            CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+            {
+                auto runner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
+                    config.maxKVCacheCapacity, encoderStream, checkpointDir);
+                runner->allocateContextMemory();
+                rt::PhaseVisionAdapter visionAdapter(*runner, tokenizer, config, encoderStream);
+                rt::PhaseThreeCoordinator threePhase(visionAdapter, semanticServer);
+
+                rt::LLMGenerationRequest request{};
+                rt::LLMGenerationRequest::Request logicalRequest;
+                logicalRequest.messages.push_back(
+                    {"user", {{"image", visionImagePath}, {"text", "Describe the image briefly."}}});
+                logicalRequest.imageBuffers.push_back(rt::imageUtils::loadImageFromFile(visionImagePath));
+                request.requests.push_back(std::move(logicalRequest));
+                request.temperature = 0.0F;
+                request.topP = 1.0F;
+                request.topK = 1;
+                request.maxGenerateLength = kSEMANTIC_OUTPUT_TOKENS;
+                request.applyChatTemplate = true;
+                request.addGenerationPrompt = true;
+                auto const submitted = threePhase.submit(23000, std::move(request), kSEMANTIC_OUTPUT_TOKENS);
+                ELLM_CHECK(submitted == rt::PhaseThreeSubmissionStatus::kEncoding,
+                    "Three-phase vision request did not enter the encoder");
+                size_t pollCount{};
+                while (!threePhase.empty())
+                {
+                    static_cast<void>(threePhase.poll());
+                    ELLM_CHECK(++pollCount < 1000000U, "Three-phase vision request exceeded its poll guard");
+                }
+                auto completion = threePhase.tryPopCompletion();
+                ELLM_CHECK(completion.has_value() && !completion->generatedTokens.empty(),
+                    "Three-phase vision request produced no output");
+                LOG_INFO("Three-phase vision request passed: output='%s'",
+                    tokenizer.decode(completion->generatedTokens, false).c_str());
+            }
+            CUDA_CHECK(cudaStreamDestroy(encoderStream));
+        }
+        else if (prefixReuseGate)
         {
             ELLM_CHECK(enablePrefixReuse && semanticPrefixCache != nullptr,
                 "Prefix reuse gate requires TRT_EDGELLM_ENABLE_PREFIX_REUSE=1");
