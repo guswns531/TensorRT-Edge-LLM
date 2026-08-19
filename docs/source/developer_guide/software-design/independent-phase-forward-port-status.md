@@ -23,6 +23,26 @@ contexts.
   prepared prefill/decode shapes.
 - Adaptive chunk candidates use observed CUDA-event telemetry. Experimental
   placeholder cost points were removed.
+- `PhaseVisionAdapter` runs the v0.10 model-specific `MultimodalRunner` on an
+  encoder stream and copies embedding, deepstack, token, and M-RoPE outputs to
+  request-owned GPU storage.
+
+## Original Current parity
+
+| capability | v0.10 forward-port status |
+| --- | --- |
+| independent prefill/decode contexts | complete |
+| stable paged KV ownership | complete |
+| packed/adaptive chunked prefill | complete |
+| internal pending admission and queued cancel | complete |
+| per-token SSE streaming | complete |
+| first-shape CUDA graph capture | complete, bounded to P4/D8 graph shapes |
+| prefix sharing and greedy identity gate | complete |
+| model capability contract | complete |
+| request-owned Gemma/Cosmos encoder outputs | adapter complete; HTTP image submission pending |
+| page reservation/growth leases | pending |
+| tied embedding/LM-head reuse | pending exact-identity gate |
+| complete three-phase encoder queue coordinator | pending |
 
 ## Validation
 

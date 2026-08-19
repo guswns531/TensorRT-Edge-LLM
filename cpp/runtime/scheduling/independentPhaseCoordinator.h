@@ -84,6 +84,8 @@ public:
     bool capturePreparedGraphs();
     //! Capture a graph the first time each production phase shape is observed.
     void setGraphCaptureEnabled(bool enabled) noexcept;
+    //! Bound production graph-cache shape counts per phase.
+    void setGraphCaptureLimits(size_t maxPrefillGraphs, size_t maxDecodeGraphs) noexcept;
 
     bool empty() const noexcept;
     bool busy() const noexcept;
@@ -118,6 +120,8 @@ private:
     std::unordered_set<std::string> mCapturedPrefillShapes;
     std::unordered_set<std::string> mCapturedDecodeShapes;
     bool mGraphCaptureEnabled{};
+    size_t mMaxPrefillGraphs{};
+    size_t mMaxDecodeGraphs{};
 };
 
 } // namespace trt_edgellm::rt

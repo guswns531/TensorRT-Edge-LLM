@@ -88,6 +88,8 @@ struct IndependentPhaseServerConfig
     bool enablePrefixReuse{};
     bool enableCudaGraphs{};
     size_t maxPendingRequests{};
+    size_t maxPrefillGraphs{4U};
+    size_t maxDecodeGraphs{8U};
 };
 
 struct IndependentPhaseServerSubmission

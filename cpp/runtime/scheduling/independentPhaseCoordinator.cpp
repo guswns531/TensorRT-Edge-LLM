@@ -131,10 +131,12 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
                    mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens), mPrefillMap, stream),
         "Independent packed prefill prepare failed");
     std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(totalTokens);
-    if (mGraphCaptureEnabled && mCapturedPrefillShapes.insert(graphShape).second)
+    if (mGraphCaptureEnabled && mCapturedPrefillShapes.find(graphShape) == mCapturedPrefillShapes.end()
+        && mCapturedPrefillShapes.size() < mMaxPrefillGraphs)
     {
         ELLM_CHECK(
             mExecutors.prefillExecutor().captureGraph(stream), "Independent packed prefill graph capture failed");
+        mCapturedPrefillShapes.insert(graphShape);
     }
     ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent packed prefill execute failed");
 }
@@ -164,9 +166,11 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
                    mConfig.decodeDims(static_cast<int64_t>(batch.size())), mDecodeMap, stream),
         "Independent decode prepare failed");
     std::string const graphShape = std::to_string(batch.size());
-    if (mGraphCaptureEnabled && mCapturedDecodeShapes.insert(graphShape).second)
+    if (mGraphCaptureEnabled && mCapturedDecodeShapes.find(graphShape) == mCapturedDecodeShapes.end()
+        && mCapturedDecodeShapes.size() < mMaxDecodeGraphs)
     {
         ELLM_CHECK(mExecutors.decodeExecutor().captureGraph(stream), "Independent decode graph capture failed");
+        mCapturedDecodeShapes.insert(graphShape);
     }
     ELLM_CHECK(mExecutors.decodeExecutor().execute(stream), "Independent decode execute failed");
 }
@@ -242,6 +246,12 @@ bool IndependentPhaseCoordinator::capturePreparedGraphs()
 void IndependentPhaseCoordinator::setGraphCaptureEnabled(bool enabled) noexcept
 {
     mGraphCaptureEnabled = enabled;
+}
+
+void IndependentPhaseCoordinator::setGraphCaptureLimits(size_t maxPrefillGraphs, size_t maxDecodeGraphs) noexcept
+{
+    mMaxPrefillGraphs = maxPrefillGraphs;
+    mMaxDecodeGraphs = maxDecodeGraphs;
 }
 
 bool IndependentPhaseCoordinator::empty() const noexcept
