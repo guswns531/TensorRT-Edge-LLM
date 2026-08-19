@@ -102,6 +102,7 @@ struct Args
     int32_t prefillChunkSize{};
     int32_t decodeActivePrefillChunkSize{};
     int32_t largePrefillChunkQueueThreshold{};
+    int32_t prefillPastKVLen{};
     int32_t pastKVLen{512};
     int32_t warmup{20};
     int32_t iterations{100};
@@ -381,7 +382,7 @@ void printUsage(char const* program)
     LOG_INFO(
         "Usage: %s --engineDir DIR [--prefillBatch N] [--decodeBatch N] [--inputLen N] "
         "[--prefillChunkSize N] [--decodeActivePrefillChunkSize N] [--largePrefillChunkQueueThreshold N] "
-        "[--pastKVLen N] [--warmup N] [--iterations N] "
+        "[--prefillPastKVLen N] [--pastKVLen N] [--warmup N] [--iterations N] "
         "[--trtContextMode shared|independent] "
         "[--cudaGraph --maxCudaGraphs N --maxPrefillCudaGraphs N --maxDecodeCudaGraphs N "
         "--maxCudaGraphMiB N --maxPrefillCudaGraphMiB N --maxDecodeCudaGraphMiB N] "
@@ -428,6 +429,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         kPrefillChunkSize,
         kDecodeActivePrefillChunkSize,
         kLargePrefillChunkQueueThreshold,
+        kPrefillPastKVLen,
         kPastKVLen,
         kWarmup,
         kIterations,
@@ -516,6 +518,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"prefillChunkSize", required_argument, nullptr, kPrefillChunkSize},
         {"decodeActivePrefillChunkSize", required_argument, nullptr, kDecodeActivePrefillChunkSize},
         {"largePrefillChunkQueueThreshold", required_argument, nullptr, kLargePrefillChunkQueueThreshold},
+        {"prefillPastKVLen", required_argument, nullptr, kPrefillPastKVLen},
         {"pastKVLen", required_argument, nullptr, kPastKVLen}, {"warmup", required_argument, nullptr, kWarmup},
         {"iterations", required_argument, nullptr, kIterations}, {"outputCsv", required_argument, nullptr, kOutputCsv},
         {"trtContextMode", required_argument, nullptr, kTensorRTContextMode},
@@ -605,6 +608,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case kPrefillChunkSize: args.prefillChunkSize = std::stoi(optarg); break;
         case kDecodeActivePrefillChunkSize: args.decodeActivePrefillChunkSize = std::stoi(optarg); break;
         case kLargePrefillChunkQueueThreshold: args.largePrefillChunkQueueThreshold = std::stoi(optarg); break;
+        case kPrefillPastKVLen: args.prefillPastKVLen = std::stoi(optarg); break;
         case kPastKVLen: args.pastKVLen = std::stoi(optarg); break;
         case kWarmup: args.warmup = std::stoi(optarg); break;
         case kIterations: args.iterations = std::stoi(optarg); break;
@@ -758,15 +762,16 @@ bool parseArgs(Args& args, int argc, char** argv)
         && args.inputLen > 0 && args.prefillChunkSize >= 0 && args.prefillChunkSize <= args.inputLen
         && args.decodeActivePrefillChunkSize >= 0
         && (args.decodeActivePrefillChunkSize == 0 || args.decodeActivePrefillChunkSize <= args.prefillChunkSize)
-        && args.largePrefillChunkQueueThreshold >= 0 && args.pastKVLen >= 0 && args.warmup >= 0 && args.iterations > 0
-        && args.loadRequests >= 0 && args.arrivalRate > 0.0 && args.loadPromptMin >= 0 && args.loadPromptMax >= 0
-        && args.loadOutputMin > 0 && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0
-        && args.ttftTargetMs > 0.0 && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0
-        && args.loadPriorityClasses <= 4 && args.traceArrivalRate > 0.0 && args.traceWarmupRepeats >= 0
-        && args.maxCudaGraphs > 0 && args.maxPrefillCudaGraphs != 0 && args.maxPrefillCudaGraphs >= -1
-        && args.maxDecodeCudaGraphs != 0 && args.maxDecodeCudaGraphs >= -1 && args.maxCudaGraphMiB >= 0
-        && args.maxPrefillCudaGraphMiB >= -1 && args.maxDecodeCudaGraphMiB >= -1 && args.cudaGraphChargeMiB > 0
-        && args.cudaGraphReserveMiB >= 0 && args.prefillTokenBudget >= 0 && args.prefillCompletionBonusTokens >= 0
+        && args.largePrefillChunkQueueThreshold >= 0 && args.prefillPastKVLen >= 0 && args.pastKVLen >= 0
+        && args.warmup >= 0 && args.iterations > 0 && args.loadRequests >= 0 && args.arrivalRate > 0.0
+        && args.loadPromptMin >= 0 && args.loadPromptMax >= 0 && args.loadOutputMin > 0
+        && args.loadOutputMin <= args.loadOutputMax && args.maxOverlapPrefillTokens >= 0 && args.ttftTargetMs > 0.0
+        && args.tpotTargetMs > 0.0 && args.loadPriorityClasses > 0 && args.loadPriorityClasses <= 4
+        && args.traceArrivalRate > 0.0 && args.traceWarmupRepeats >= 0 && args.maxCudaGraphs > 0
+        && args.maxPrefillCudaGraphs != 0 && args.maxPrefillCudaGraphs >= -1 && args.maxDecodeCudaGraphs != 0
+        && args.maxDecodeCudaGraphs >= -1 && args.maxCudaGraphMiB >= 0 && args.maxPrefillCudaGraphMiB >= -1
+        && args.maxDecodeCudaGraphMiB >= -1 && args.cudaGraphChargeMiB > 0 && args.cudaGraphReserveMiB >= 0
+        && args.prefillTokenBudget >= 0 && args.prefillCompletionBonusTokens >= 0
         && args.pageReservationHeadroomTokens >= 0 && args.pageReservationOvercommitBundles >= 0
         && args.pageReservationGrowthRequests > 0 && args.fullReservationPromptThresholdTokens >= 0
         && args.minPageGrowthRequests > 0 && args.minPageGrowthRequests <= args.pageReservationGrowthRequests
@@ -1203,6 +1208,8 @@ int main(int argc, char** argv)
         "Packed prefill requires indexed-paged KV cache");
     int32_t const phaseRounds = (args.inputLen + configuredChunkSize - 1) / configuredChunkSize;
     ELLM_CHECK(args.pastKVLen + phaseRounds <= config.maxKVCacheCapacity, "pastKVLen exceeds KV capacity");
+    ELLM_CHECK(args.prefillPastKVLen + args.inputLen <= config.maxKVCacheCapacity,
+        "prefillPastKVLen plus inputLen exceeds KV capacity");
     ELLM_CHECK(!args.cudaGraph || !usesSharedTensorRTContext(args),
         "--cudaGraph requires --trtContextMode independent so each phase owns its graph cache");
     LOG_INFO("Phase benchmark work per sample: %d prefill chunk(s), %d decode step(s)", phaseRounds, phaseRounds);
@@ -1329,12 +1336,15 @@ int main(int argc, char** argv)
     std::iota(prefillSlots.begin(), prefillSlots.end(), 0);
     std::vector<int32_t> decodeSlots(args.decodeBatch);
     bool const reuseWarmupSlots = args.prefillBatch + args.decodeBatch > phaseSlotCount;
+    ELLM_CHECK(!config.pagedKVCache || !reuseWarmupSlots || (args.prefillPastKVLen == 0 && args.pastKVLen == 0),
+        "Paged fixed-shape synthetic past-KV requires disjoint prefill/decode slots");
     std::iota(decodeSlots.begin(), decodeSlots.end(), reuseWarmupSlots ? 0 : args.prefillBatch);
     std::vector<rt::PhaseWorkItem> prefillBatch;
     std::vector<rt::PhaseWorkItem> decodeBatch;
     for (int32_t row = 0; row < args.prefillBatch; ++row)
     {
-        prefillBatch.push_back({static_cast<uint64_t>(row), args.inputLen, prefillSlots[row], 0, args.inputLen});
+        prefillBatch.push_back({static_cast<uint64_t>(row), args.inputLen, prefillSlots[row], args.prefillPastKVLen,
+            args.prefillPastKVLen + args.inputLen});
     }
     for (int32_t row = 0; row < args.decodeBatch; ++row)
     {
@@ -1347,11 +1357,18 @@ int main(int argc, char** argv)
     decodeBatchState.bind(decodeMap);
 
     std::vector<int32_t> initialSlotLengths(phaseSlotCount, 0);
-    if (!reuseWarmupSlots)
+    if (!config.pagedKVCache)
     {
-        for (int32_t const slot : decodeSlots)
+        for (int32_t const slot : prefillSlots)
         {
-            initialSlotLengths[slot] = args.pastKVLen;
+            initialSlotLengths[slot] = args.prefillPastKVLen;
+        }
+        if (!reuseWarmupSlots)
+        {
+            for (int32_t const slot : decodeSlots)
+            {
+                initialSlotLengths[slot] = args.pastKVLen;
+            }
         }
     }
     rt::Tensor hostInitialSlotLengths(
@@ -1359,6 +1376,30 @@ int main(int argc, char** argv)
     std::copy(initialSlotLengths.begin(), initialSlotLengths.end(), hostInitialSlotLengths.dataPointer<int32_t>());
     auto& cacheManager = *resources->cacheManagers[0];
     cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
+    rt::PhaseBatchState syntheticPastState(
+        std::max(args.prefillBatch, args.decodeBatch), "phase_synthetic_past", phaseContract.indexedKVCache);
+    auto initializeSyntheticPagedPast = [&](cudaStream_t stream) {
+        if (!config.pagedKVCache)
+        {
+            return;
+        }
+        auto initializeSlots = [&](std::vector<int32_t> const& slots, int32_t length, uint64_t requestIdBase) {
+            if (length == 0)
+            {
+                return;
+            }
+            std::vector<rt::PhaseWorkItem> items;
+            items.reserve(slots.size());
+            for (size_t index{}; index < slots.size(); ++index)
+            {
+                items.push_back({requestIdBase + index, length, slots[index], 0, length});
+            }
+            syntheticPastState.prepare(items, cacheManager, stream);
+            syntheticPastState.commit(cacheManager, length, stream);
+        };
+        initializeSlots(prefillSlots, args.prefillPastKVLen, 20000);
+        initializeSlots(decodeSlots, args.pastKVLen, 30000);
+    };
     auto resetForDecodeWarmup = [&](cudaStream_t stream) {
         if (!reuseWarmupSlots)
         {
@@ -1405,6 +1446,7 @@ int main(int argc, char** argv)
     size_t fixedKernelGroupDispatchIndex{};
     rt::PhaseKernelDispatchMetadata fixedKernelDispatchMetadata;
     bool const recordFixedKernelGroups = !args.kernelGroupCsv.empty();
+    bool fixedKernelRecordingActive{};
 
     uploadInt32(prefillIO.contextLengths, std::vector<int32_t>(args.prefillBatch, args.inputLen), setupStream);
     uploadInt32(decodeIO.contextLengths, std::vector<int32_t>(args.decodeBatch, args.pastKVLen + 1), setupStream);
@@ -1453,7 +1495,7 @@ int main(int argc, char** argv)
 
     auto enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
         ELLM_CHECK(static_cast<int32_t>(batch.size()) == args.prefillBatch, "Unexpected prefill batch size");
-        if (!recordFixedKernelGroups)
+        if (!fixedKernelRecordingActive)
         {
             prefillBatchState.prepare(batch, cacheManager, stream);
             CUDA_CHECK(cudaMemsetAsync(prefillIO.selectTokenIndices.rawPointer(), 0,
@@ -1496,7 +1538,7 @@ int main(int argc, char** argv)
                         "Prefill deepstack reshape failed");
                     CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), stream));
                 }
-                bool const initialChunk = chunkOffset == 0;
+                bool const initialChunk = args.prefillPastKVLen == 0 && chunkOffset == 0;
                 auto const prefillDims = args.packedPrefillTokenLayout
                     ? config.packedPrefillDims(args.prefillBatch, engineSequenceLength)
                     : config.prefillDims(args.prefillBatch, chunkLength, initialChunk);
@@ -1516,10 +1558,11 @@ int main(int argc, char** argv)
         for (int32_t chunkOffset = 0; chunkOffset < args.inputLen; chunkOffset += configuredChunkSize)
         {
             int32_t const chunkLength = std::min(configuredChunkSize, args.inputLen - chunkOffset);
-            bool const initialChunk = chunkOffset == 0;
+            bool const firstChunk = chunkOffset == 0;
+            bool const initialChunk = args.prefillPastKVLen == 0 && firstChunk;
             segments.push_back({rt::PhaseKernelGroup::kPrefillPrepare, {}, stream,
-                [&, chunkLength, initialChunk](cudaStream_t segmentStream) {
-                    if (initialChunk)
+                [&, chunkLength, firstChunk](cudaStream_t segmentStream) {
+                    if (firstChunk)
                     {
                         prefillBatchState.prepare(batch, cacheManager, segmentStream);
                         CUDA_CHECK(cudaMemsetAsync(prefillIO.selectTokenIndices.rawPointer(), 0,
@@ -1590,7 +1633,7 @@ int main(int argc, char** argv)
     };
     auto executeDecode = [&](rt::PhaseBatchState& activeBatchState, int32_t rounds, cudaStream_t stream) {
         int32_t const batchSize = activeBatchState.lengths().getShape()[0];
-        if (!recordFixedKernelGroups)
+        if (!fixedKernelRecordingActive)
         {
             check::check(decodeIO.contextLengths.reshape({batchSize}), "Decode context lengths reshape failed");
             check::check(
@@ -1703,6 +1746,8 @@ int main(int argc, char** argv)
     // Exercise actual source-context admission outside the fixed-shape timed samples.
     bool const continuousLoad = args.loadRequests > 0;
     bool const realRequestTrace = !args.inputFile.empty();
+    ELLM_CHECK((!continuousLoad && !realRequestTrace) || args.prefillPastKVLen == 0,
+        "--prefillPastKVLen is supported only by the fixed-shape microbenchmark");
     std::vector<rt::LLMGenerationRequest> traceRequests;
     std::vector<TraceRequestMetadata> traceMetadata;
     bool traceHasVision{};
@@ -2708,13 +2753,19 @@ int main(int argc, char** argv)
     size_t fixedSchedulerDispatchIndex{};
     auto runOnce = [&](bool concurrent) {
         cacheManager.resetForNewSequences(hostInitialSlotLengths, setupStream);
+        initializeSyntheticPagedPast(setupStream);
         fixedKernelDispatchMetadata.schedulerDispatchIndex = fixedSchedulerDispatchIndex++;
         fixedKernelDispatchMetadata.schedulerKind
             = static_cast<int32_t>(concurrent ? rt::PhaseDispatchKind::kOverlap : rt::PhaseDispatchKind::kNone);
         fixedKernelDispatchMetadata.prefillBatchSize = args.prefillBatch;
         fixedKernelDispatchMetadata.decodeBatchSize = args.decodeBatch;
-        fixedKernelDispatchMetadata.prefillTokens = args.inputLen;
-        fixedKernelDispatchMetadata.decodeContextTokens = args.pastKVLen;
+        fixedKernelDispatchMetadata.prefillTokens = args.prefillBatch * args.inputLen;
+        fixedKernelDispatchMetadata.prefillInitialRows = args.prefillPastKVLen == 0 ? args.prefillBatch : 0;
+        fixedKernelDispatchMetadata.prefillContinuationRows = args.prefillPastKVLen > 0 ? args.prefillBatch : 0;
+        fixedKernelDispatchMetadata.prefillFinalRows = args.prefillBatch;
+        fixedKernelDispatchMetadata.prefillPastKVMean = args.prefillPastKVLen;
+        fixedKernelDispatchMetadata.prefillPastKVMax = args.prefillPastKVLen;
+        fixedKernelDispatchMetadata.decodeContextTokens = args.decodeBatch * args.pastKVLen;
         CUDA_CHECK(cudaEventRecord(start, setupStream));
         if (concurrent)
         {
@@ -2800,6 +2851,7 @@ int main(int argc, char** argv)
     // first enqueue. Prime both modes before collecting user-visible samples;
     // otherwise the fixed loop order (sequential first, concurrent second)
     // makes a zero-warmup run report a false multi-x speedup for concurrent mode.
+    fixedKernelRecordingActive = recordFixedKernelGroups;
     static_cast<void>(runOnce(false));
     static_cast<void>(runOnce(true));
     for (int32_t i = 0; i < args.warmup; ++i)
