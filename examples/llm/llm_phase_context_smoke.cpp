@@ -602,6 +602,8 @@ int main(int argc, char** argv)
             = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io, rt::TensorMap& map,
                   cudaStream_t stream) { stageTokens(views, io, map, stream, false); };
         semanticAdapter.submitSampling = submitSampling;
+        bool const enablePrefixReuse = std::getenv("TRT_EDGELLM_ENABLE_PREFIX_REUSE") != nullptr;
+        semanticAdapter.supportsPageAlignedPrefixReuse = enablePrefixReuse;
 
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
@@ -641,6 +643,7 @@ int main(int argc, char** argv)
         serverConfig.maxInFlightRequests = config.maxSupportedBatchSize;
         serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
         serverConfig.eosTokenIds = config.eosTokenIds;
+        serverConfig.enablePrefixReuse = enablePrefixReuse;
         rt::IndependentPhaseAsyncServer semanticServer(
             serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter));
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;

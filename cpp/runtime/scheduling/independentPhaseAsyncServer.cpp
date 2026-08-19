@@ -63,24 +63,39 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     {
         return result;
     }
+    if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && !mActiveSharedPrefixSources.empty())
+    {
+        // A v1 packed-prefill engine must not mix a suffix that reads a
+        // shared page with an unrelated initial row in the same dispatch.
+        // Keep admission queued until the active shared-prefix reader retires.
+        return result;
+    }
     maxOutputTokens = maxOutputTokens > 0 ? maxOutputTokens : mConfig.defaultMaxOutputTokens;
 
     int32_t const slot = mOwnership.reserve();
     int32_t reusedPrefixTokens{};
+    int32_t sharedPrefixSourceSlot{-1};
     try
     {
         if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && mPrefixCache != nullptr)
         {
-            if (auto const match = mPrefixCache->lookup(promptTokens); match.has_value())
+            if (auto const match = mPrefixCache->lookup(promptTokens); match.has_value()
+                && mActiveSharedPrefixSources.find(match->sourceSlot) == mActiveSharedPrefixSources.end())
             {
                 mOwnership.sharePrefix(match->sourceSlot, slot, match->matchedTokens);
                 reusedPrefixTokens = match->matchedTokens;
+                sharedPrefixSourceSlot = match->sourceSlot;
+                mActiveSharedPrefixSources.insert(match->sourceSlot);
             }
         }
         mOwnership.ensureCapacity(slot, static_cast<int32_t>(promptTokens.size()) + maxOutputTokens);
     }
     catch (std::runtime_error const&)
     {
+        if (sharedPrefixSourceSlot >= 0)
+        {
+            mActiveSharedPrefixSources.erase(sharedPrefixSourceSlot);
+        }
         mOwnership.release(slot);
         return result;
     }
@@ -89,6 +104,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     state.promptTokens = std::move(promptTokens);
     state.maxOutputTokens = maxOutputTokens;
     state.kvSlotId = slot;
+    state.sharedPrefixSourceSlot = sharedPrefixSourceSlot;
     state.scheduling = scheduling;
     state.submittedAt = std::chrono::steady_clock::now();
     mRequests.emplace(requestId, std::move(state));
@@ -111,6 +127,10 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
     if (!mCoordinator.scheduler().cancel(requestId))
     {
         return false;
+    }
+    if (it->second.sharedPrefixSourceSlot >= 0)
+    {
+        mActiveSharedPrefixSources.erase(it->second.sharedPrefixSourceSlot);
     }
     mOwnership.release(it->second.kvSlotId);
     mRequests.erase(it);
@@ -292,6 +312,10 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId)
     else
     {
         mOwnership.release(state.kvSlotId);
+    }
+    if (state.sharedPrefixSourceSlot >= 0)
+    {
+        mActiveSharedPrefixSources.erase(state.sharedPrefixSourceSlot);
     }
     double const latencyMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();

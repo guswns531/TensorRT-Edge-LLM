@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm::rt
@@ -135,6 +136,7 @@ private:
         std::vector<int32_t> generatedTokens;
         int32_t maxOutputTokens{};
         int32_t kvSlotId{-1};
+        int32_t sharedPrefixSourceSlot{-1};
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
     };
@@ -153,6 +155,7 @@ private:
     IndependentPhaseRequestAdapter mAdapter;
     PhasePrefixReuseCache* mPrefixCache{};
     std::unordered_map<uint64_t, RequestState> mRequests;
+    std::unordered_set<int32_t> mActiveSharedPrefixSources;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
 };
