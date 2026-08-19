@@ -45,6 +45,7 @@ enum LLMBuildOptionId : int
     MAX_DRAFT_TREE_SIZE = 712,
     PROFILING_DETAILED = 713,
     MAX_KV_POOL_PAGES = 714,
+    MAX_PREFILL_CHUNK_TOKENS = 715,
 };
 
 struct LLMBuildArgs
@@ -55,6 +56,7 @@ struct LLMBuildArgs
     int64_t maxInputLen{1024};
     int64_t maxKVCacheCapacity{4096};
     int64_t maxKVPoolPages{0};
+    int64_t maxPrefillChunkTokens{128};
     bool debug{false};
     int64_t maxBatchSize{4};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
@@ -71,6 +73,7 @@ void printUsage(char const* programName)
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  " [--maxKVPoolPages <int>]"
+                 " [--maxPrefillChunkTokens <int>]"
                  " [--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed]"
               << std::endl;
@@ -88,6 +91,7 @@ void printUsage(char const* programName)
                  "(minimum active pages)"
               << std::endl;
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
+    std::cerr << "  --maxPrefillChunkTokens   Maximum logical packed-prefill row length. Default = 128" << std::endl;
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
               << std::endl;
@@ -112,6 +116,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"maxInputLen", required_argument, 0, LLMBuildOptionId::MAX_INPUT_LEN},
         {"maxKVCacheCapacity", required_argument, 0, LLMBuildOptionId::MAX_KV_CACHE_CAPACITY},
         {"maxKVPoolPages", required_argument, 0, LLMBuildOptionId::MAX_KV_POOL_PAGES},
+        {"maxPrefillChunkTokens", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
@@ -167,6 +172,17 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
             if (optarg)
             {
                 args.maxKVPoolPages = std::stoll(optarg);
+            }
+            break;
+        case LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS:
+            if (optarg)
+            {
+                args.maxPrefillChunkTokens = std::stoll(optarg);
+            }
+            else
+            {
+                LOG_ERROR("--maxPrefillChunkTokens requires option argument.");
+                return false;
             }
             break;
         case LLMBuildOptionId::DEBUG: args.debug = true; break;
@@ -242,6 +258,7 @@ int main(int argc, char** argv)
     config.maxInputLen = args.maxInputLen;
     config.maxKVCacheCapacity = args.maxKVCacheCapacity;
     config.maxKVPoolPages = args.maxKVPoolPages;
+    config.maxPrefillChunkTokens = args.maxPrefillChunkTokens;
     config.maxBatchSize = args.maxBatchSize;
     config.maxLoraRank = args.maxLoraRank;
     config.specDraft = args.specDraft;

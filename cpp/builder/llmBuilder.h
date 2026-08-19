@@ -52,6 +52,7 @@ struct LLMBuilderConfig
     //! Exact physical K-page count for the engine's KV pool. Zero selects the minimum active pages.
     //! Kept after the original aggregate fields so existing positional initializers remain source-compatible.
     int64_t maxKVPoolPages{0};
+    int64_t maxPrefillChunkTokens{128}; //!< Maximum logical row length for packed prefill
 
     //! Resolve the exact physical K-page count serialized into the engine binding shape.
     //! @return `maxKVPoolPages`, or the minimum active pages when it is zero
@@ -90,6 +91,7 @@ struct LLMBuilderConfig
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
+        json["max_prefill_chunk_tokens"] = maxPrefillChunkTokens;
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -145,6 +147,10 @@ struct LLMBuilderConfig
         {
             config.maxKVPoolPages = json["max_kv_pool_pages"];
         }
+        if (json.contains("max_prefill_chunk_tokens"))
+        {
+            config.maxPrefillChunkTokens = json["max_prefill_chunk_tokens"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -169,6 +175,7 @@ struct LLMBuilderConfig
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
         oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
+        oss << "  maxPrefillChunkTokens: " << maxPrefillChunkTokens << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -254,6 +261,9 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupVanillaProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+
+    //! Maximum logical row length encoded by a packed-prefill ONNX graph.
+    int64_t getMaxPackedPrefillChunkTokens() const;
 
     //! Effective opt-shape token count for a generation-time optimization profile.
     //!

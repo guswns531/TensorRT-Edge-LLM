@@ -77,6 +77,15 @@ TEST(LLMBuilderConfigTest, PoolPagesRoundTripThroughJson)
     EXPECT_EQ(parsed.resolvedKVPoolPages(), 9);
 }
 
+TEST(LLMBuilderConfigTest, PackedPrefillChunkLimitRoundTripsThroughJson)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxPrefillChunkTokens = 64;
+    LLMBuilderConfig const parsed = LLMBuilderConfig::fromJson(config.toJson());
+    EXPECT_EQ(parsed.maxPrefillChunkTokens, 64);
+    EXPECT_EQ(parsed.toJson().at("max_prefill_chunk_tokens"), 64);
+}
+
 TEST(LLMBuilderConfigTest, PoolPagesRejectDerivedVIdOverflow)
 {
     LLMBuilderConfig config = makeConfig();
