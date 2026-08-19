@@ -21,6 +21,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
+#include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
 #include "runtime/state/pipelineIO.h"
@@ -324,89 +325,20 @@ int main(int argc, char** argv)
             {1, 3, 128, 2048, 2048, false, 13.7F, 8.1F, 13.7F, 2.5F},
             {2, 3, 128, 2048, 2048, false, 13.7F, 8.1F, 13.7F, 2.5F},
         };
-        rt::PhaseQueueScheduler scheduler(schedulerConfig);
-
         std::unordered_map<uint64_t, int32_t> decodeSteps;
-        std::vector<rt::PhaseDispatchMetrics> dispatchMetrics;
-        rt::PhaseDispatchWorkerCallbacks callbacks;
-        callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
-            std::vector<int32_t> slots;
-            std::vector<int32_t> chunks;
-            int32_t totalTokens{};
-            for (rt::PhaseWorkItem const& item : batch)
-            {
-                slots.push_back(item.kvSlotId);
-                chunks.push_back(item.tokenCount);
-                totalTokens += item.tokenCount;
-                ownership.ensureCapacity(item.kvSlotId, ownership.length(item.kvSlotId) + item.tokenCount);
-            }
-            prefillKV.prepare(slots, stream);
-            ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, totalTokens, config.hiddenSize}),
-                "Queued packed prefill embedding reshape failed");
-            prefillKV.preparePrefillMetadata(*prefillIO, chunks, stream, true);
-            ELLM_CHECK(
-                pair->prefillExecutor().prepare(
-                    0, config.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens), prefillMap, stream),
-                "Queued packed prefill prepare failed");
-            ELLM_CHECK(pair->prefillExecutor().execute(stream), "Queued packed prefill execute failed");
-        };
-        callbacks.completePrefillBatch = [&](std::vector<rt::PhaseWorkItem> const& batch) {
-            std::vector<int32_t> resultingLengths;
-            for (rt::PhaseWorkItem const& item : batch)
-            {
-                resultingLengths.push_back(ownership.length(item.kvSlotId) + item.tokenCount);
-            }
-            prefillKV.commitLengths(resultingLengths);
-            prefillKV.complete();
-        };
-        callbacks.completePrefill = [&](rt::PhaseWorkItem const& item) {
-            return rt::PhasePrefillCompletion{ownership.length(item.kvSlotId), false};
-        };
-        callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
-            std::vector<int32_t> slots;
-            for (rt::PhaseWorkItem const& item : batch)
-            {
-                slots.push_back(item.kvSlotId);
-                ownership.ensureCapacity(item.kvSlotId, ownership.length(item.kvSlotId) + 1);
-            }
-            decodeKV.prepare(slots, stream);
-            ELLM_CHECK(decodeIO->inputsEmbeds.reshape({static_cast<int64_t>(batch.size()), 1, config.hiddenSize}),
-                "Queued decode embedding reshape failed");
-            decodeKV.prepareDecodeMetadata(*decodeIO, stream);
-            ELLM_CHECK(pair->decodeExecutor().prepare(
-                           1, config.decodeDims(static_cast<int64_t>(batch.size())), decodeMap, stream),
-                "Queued decode prepare failed");
-            ELLM_CHECK(pair->decodeExecutor().execute(stream), "Queued decode execute failed");
-        };
-        callbacks.completeDecodeBatch = [&](std::vector<rt::PhaseWorkItem> const& batch) {
-            std::vector<int32_t> resultingLengths;
-            for (rt::PhaseWorkItem const& item : batch)
-            {
-                resultingLengths.push_back(ownership.length(item.kvSlotId) + 1);
-            }
-            decodeKV.commitLengths(resultingLengths);
-            decodeKV.complete();
-        };
-        callbacks.completeDecode = [&](rt::PhaseWorkItem const& item) {
-            int32_t const steps = ++decodeSteps[item.requestId];
-            return rt::PhaseDecodeCompletion{ownership.length(item.kvSlotId), steps >= 2};
-        };
-        callbacks.onMetrics = [&](rt::PhaseDispatchMetrics const& metrics) { dispatchMetrics.push_back(metrics); };
-
-        rt::PhaseExecutionSafetyContract const safety = rt::PhaseExecutionSafetyContract::independent(
-            {pair->prefillExecutor().getExecutionContextIdentity(), pair->prefillContextMemory().rawPointer(),
-                prefillIO.get()},
-            {pair->decodeExecutor().getExecutionContextIdentity(), pair->decodeContextMemory().rawPointer(),
-                decodeIO.get()});
-        rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream,
-            rt::PhaseTensorRTContextMode::kIndependentConcurrent, safety);
+        rt::IndependentPhaseCoordinatorCallbacks coordinatorCallbacks;
+        coordinatorCallbacks.isDecodeFinished
+            = [&](rt::PhaseWorkItem const& item, int32_t) { return ++decodeSteps[item.requestId] >= 2; };
+        rt::IndependentPhaseCoordinator coordinator(config, schedulerConfig, *pair, ownership, *prefillIO, *decodeIO,
+            prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks));
 
         rt::PhaseSchedulingHints decodeHints;
         decodeHints.tpotTargetUs = 50000.0;
-        scheduler.enqueuePrefill({101, 256, prefillSlot0, 0, 256});
-        scheduler.enqueuePrefill({102, 256, prefillSlot1, 0, 256});
-        scheduler.enqueueDecode({103, 128, decodeSlot, 0, 0, true, decodeHints});
-        worker.runUntilIdle(32);
+        coordinator.enqueuePrefill({101, 256, prefillSlot0, 0, 256});
+        coordinator.enqueuePrefill({102, 256, prefillSlot1, 0, 256});
+        coordinator.enqueueDecode({103, 128, decodeSlot, 0, 0, true, decodeHints});
+        coordinator.runUntilIdle(32);
+        std::vector<rt::PhaseDispatchMetrics> const& dispatchMetrics = coordinator.metrics();
         size_t const overlapDispatches = static_cast<size_t>(std::count_if(dispatchMetrics.begin(),
             dispatchMetrics.end(),
             [](rt::PhaseDispatchMetrics const& metrics) { return metrics.kind == rt::PhaseDispatchKind::kOverlap; }));
@@ -415,7 +347,7 @@ int main(int argc, char** argv)
         {
             totalMakespanMs += metrics.makespanGpuMs;
         }
-        ELLM_CHECK(scheduler.empty() && overlapDispatches > 0, "Cost-aware phase queue did not drain with overlap");
+        ELLM_CHECK(coordinator.empty() && overlapDispatches > 0, "Cost-aware phase queue did not drain with overlap");
         LOG_INFO(
             "Cost-aware phase queue passed: dispatches=%zu overlap_dispatches=%zu total_makespan=%.4f ms "
             "request101_kv=%d request102_kv=%d request103_kv=%d",
