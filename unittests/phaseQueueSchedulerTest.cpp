@@ -851,6 +851,151 @@ TEST(PhaseQueueSchedulerTest, RejectsInvalidAdaptiveChunkCandidates)
     EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
 }
 
+TEST(PhaseQueueSchedulerTest, JointPrefillShapeTradesThroughputForDecodeInterference)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.decodeQueueWaitTargetUs = 50000.0;
+    config.prefillBatchCosts = {
+        {4, 64, 0, 1, true, 8.0F, 1.0F},
+        {4, 128, 0, 1, true, 12.0F, 8.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+    scheduler.enqueueDecode({10, 128, 4});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 64);
+    EXPECT_EQ(plan.prefillCostLookupChunkLength, 64);
+    EXPECT_EQ(plan.prefillShapeCandidatesEvaluated, 2);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 8.0F);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 1.0F);
+    EXPECT_NEAR(plan.predictedPrefillShapeScore, 256.0F / 9.0F, 1.0e-5F);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapeCanMaximizePrefillThroughput)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillShapeDecodePenaltyWeight = 0.0F;
+    config.decodeQueueWaitTargetUs = 50000.0;
+    config.prefillBatchCosts = {
+        {4, 64, 0, 1, true, 8.0F, 1.0F},
+        {4, 128, 0, 1, true, 12.0F, 8.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+    scheduler.enqueueDecode({10, 128, 4});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+    EXPECT_EQ(plan.prefillCostLookupChunkLength, 128);
+    EXPECT_NEAR(plan.predictedPrefillShapeScore, 512.0F / 12.0F, 1.0e-5F);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapeDrainsLargeBacklogWithMaximumProgress)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillShapeDrainBacklogTokens = 512;
+    config.prefillBatchCosts = {
+        {4, 64, 0, 0, true, 4.0F, 0.0F},
+        {4, 128, 0, 0, true, 20.0F, 0.0F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+    EXPECT_TRUE(plan.prefillShapeDrainMode);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapePreservesUnsplitCompletion)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 8.0F, 0.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 100, 0, 0, 100});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 100);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapePreservesProductiveCompletionBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillBatchCosts = {
+        {2, 128, 0, 0, true, 4.0F, 0.0F},
+        {4, 128, 0, 0, true, 20.0F, 0.0F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueuePrefill({2, 256, 1, 0, 256});
+    for (uint64_t requestId = 3; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 117, static_cast<int32_t>(requestId - 1), 0, 117});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 117);
+    EXPECT_EQ(plan.prefillCostLookupChunkLength, 117);
+    EXPECT_EQ(plan.prefillShapeCandidatesEvaluated, 0);
+}
+
+TEST(PhaseQueueSchedulerTest, RejectsIncompleteJointPrefillShapeConfiguration)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableCostAwarePrefillShapeSelection = true;
+    EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
+}
+
 TEST(PhaseQueueSchedulerTest, KeepsNonChunkableMultimodalPrefillAtomic)
 {
     PhaseQueueSchedulerConfig config;

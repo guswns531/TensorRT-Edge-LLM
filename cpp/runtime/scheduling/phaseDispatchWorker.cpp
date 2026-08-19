@@ -163,6 +163,9 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.prefillCostLookupRows = mInFlight.prefillCostLookupRows;
     mCurrentMetrics.prefillCostLookupChunkLength = mInFlight.prefillCostLookupChunkLength;
     mCurrentMetrics.prefillCostLookupMaxPastKVLength = mInFlight.prefillCostLookupMaxPastKVLength;
+    mCurrentMetrics.prefillShapeCandidatesEvaluated = mInFlight.prefillShapeCandidatesEvaluated;
+    mCurrentMetrics.predictedPrefillShapeScore = mInFlight.predictedPrefillShapeScore;
+    mCurrentMetrics.prefillShapeDrainMode = mInFlight.prefillShapeDrainMode;
     mCurrentMetrics.adaptiveChunkDecodeQueuePressure = mInFlight.adaptiveChunkDecodeQueuePressure;
     mCurrentMetrics.adaptiveChunkObservedTpotPressure = mInFlight.adaptiveChunkObservedTpotPressure;
     mCurrentMetrics.adaptiveChunkCombinedPressure = mInFlight.adaptiveChunkCombinedPressure;

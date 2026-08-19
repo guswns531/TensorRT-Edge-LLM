@@ -125,6 +125,10 @@ struct Args
     std::vector<int32_t> adaptiveChunkCandidates;
     float adaptiveChunkDecodePressureThreshold{0.8F};
     bool adaptiveChunkSplitCompletion{};
+    bool costAwarePrefillShapes{};
+    float prefillShapeDecodePenaltyWeight{1.0F};
+    float prefillShapeEnqueueCostMs{};
+    int64_t prefillShapeDrainBacklogTokens{};
     bool cudaGraph{};
     int32_t maxCudaGraphs{128};
     int32_t maxPrefillCudaGraphs{-1};
@@ -385,7 +389,9 @@ void printUsage(char const* program)
         "[--slotCount N] "
         "[--contextAdapter] [--adaptiveScheduler] [--adaptiveChunking "
         "--adaptiveChunkCandidates 64,128 --adaptiveChunkDecodePressureThreshold F "
-        "--adaptiveChunkSplitCompletion] [--prefillTokenBudget N] "
+        "--adaptiveChunkSplitCompletion --costAwarePrefillShapes "
+        "--prefillShapeDecodePenaltyWeight F --prefillShapeEnqueueCostMs F "
+        "--prefillShapeDrainBacklogTokens N] [--prefillTokenBudget N] "
         "[--raggedPrefillBatching --packedPrefillTokenLayout --prefillCompletionBonusTokens N] "
         "[--dynamicDecodeBatching --dynamicPrefillBatching --wavefrontPrefillBatching "
         "--minDynamicPrefillBatchSize N --prefillSloRecovery --prefillCohortSize N --prefillCohortTurns N "
@@ -434,6 +440,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         kAdaptiveChunkCandidates,
         kAdaptiveChunkDecodePressureThreshold,
         kAdaptiveChunkSplitCompletion,
+        kCostAwarePrefillShapes,
+        kPrefillShapeDecodePenaltyWeight,
+        kPrefillShapeEnqueueCostMs,
+        kPrefillShapeDrainBacklogTokens,
         kCudaGraph,
         kMaxCudaGraphs,
         kMaxPrefillCudaGraphs,
@@ -516,6 +526,10 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"adaptiveChunkCandidates", required_argument, nullptr, kAdaptiveChunkCandidates},
         {"adaptiveChunkDecodePressureThreshold", required_argument, nullptr, kAdaptiveChunkDecodePressureThreshold},
         {"adaptiveChunkSplitCompletion", no_argument, nullptr, kAdaptiveChunkSplitCompletion},
+        {"costAwarePrefillShapes", no_argument, nullptr, kCostAwarePrefillShapes},
+        {"prefillShapeDecodePenaltyWeight", required_argument, nullptr, kPrefillShapeDecodePenaltyWeight},
+        {"prefillShapeEnqueueCostMs", required_argument, nullptr, kPrefillShapeEnqueueCostMs},
+        {"prefillShapeDrainBacklogTokens", required_argument, nullptr, kPrefillShapeDrainBacklogTokens},
         {"cudaGraph", no_argument, nullptr, kCudaGraph}, {"maxCudaGraphs", required_argument, nullptr, kMaxCudaGraphs},
         {"maxPrefillCudaGraphs", required_argument, nullptr, kMaxPrefillCudaGraphs},
         {"maxDecodeCudaGraphs", required_argument, nullptr, kMaxDecodeCudaGraphs},
@@ -647,6 +661,10 @@ bool parseArgs(Args& args, int argc, char** argv)
             args.adaptiveChunkDecodePressureThreshold = std::stof(optarg);
             break;
         case kAdaptiveChunkSplitCompletion: args.adaptiveChunkSplitCompletion = true; break;
+        case kCostAwarePrefillShapes: args.costAwarePrefillShapes = true; break;
+        case kPrefillShapeDecodePenaltyWeight: args.prefillShapeDecodePenaltyWeight = std::stof(optarg); break;
+        case kPrefillShapeEnqueueCostMs: args.prefillShapeEnqueueCostMs = std::stof(optarg); break;
+        case kPrefillShapeDrainBacklogTokens: args.prefillShapeDrainBacklogTokens = std::stoll(optarg); break;
         case kCudaGraph: args.cudaGraph = true; break;
         case kMaxCudaGraphs: args.maxCudaGraphs = std::stoi(optarg); break;
         case kMaxPrefillCudaGraphs: args.maxPrefillCudaGraphs = std::stoi(optarg); break;
@@ -772,11 +790,17 @@ bool parseArgs(Args& args, int argc, char** argv)
         && std::isfinite(args.adaptiveChunkDecodePressureThreshold) && args.adaptiveChunkDecodePressureThreshold > 0.0F
         && args.adaptiveChunkDecodePressureThreshold <= 1.0F
         && (!args.adaptiveChunkSplitCompletion || (args.adaptiveChunking && !args.adaptiveChunkCandidates.empty()))
+        && (!args.costAwarePrefillShapes
+            || (args.dynamicPrefillBatching && args.adaptiveChunking && !args.adaptiveChunkCandidates.empty()))
+        && std::isfinite(args.prefillShapeDecodePenaltyWeight) && args.prefillShapeDecodePenaltyWeight >= 0.0F
+        && std::isfinite(args.prefillShapeEnqueueCostMs) && args.prefillShapeEnqueueCostMs >= 0.0F
+        && args.prefillShapeDrainBacklogTokens >= 0
         && (args.schedulerProfile == "custom" || args.schedulerProfile == "latency-safe"
             || args.schedulerProfile == "balanced" || args.schedulerProfile == "throughput-balanced"
             || args.schedulerProfile == "long-prefill" || args.schedulerProfile == "auto")
-        && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.tpotHardGuard
-                || args.costAwareOverlapAdmission || args.requireDirectOverlapCost || args.schedulerProfile != "custom")
+        && (!(args.dynamicDecodeBatching || args.dynamicPrefillBatching || args.costAwarePrefillShapes
+                || args.tpotHardGuard || args.costAwareOverlapAdmission || args.requireDirectOverlapCost
+                || args.schedulerProfile != "custom")
             || !args.schedulerCostJson.empty())
         && (args.inputFile.empty() || !args.traceCsv.empty()) && (args.tokenTraceCsv.empty() || !args.inputFile.empty())
         && (args.phaseTimelineCsv.empty()
@@ -1014,6 +1038,7 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
            "prefill_deferred_for_tpot,prefill_cost_coverage_miss,overlap_evaluated_by_cost,"
            "latency_safe_fallback,prefill_cost_lookup_rows,prefill_cost_lookup_chunk_length,"
            "prefill_cost_lookup_max_past_kv_length,"
+           "prefill_shape_candidates_evaluated,predicted_prefill_shape_score,prefill_shape_drain_mode,"
            "adaptive_chunk_decode_queue_pressure,adaptive_chunk_observed_tpot_pressure,"
            "adaptive_chunk_combined_pressure,"
            "planned_decode_batch,planned_decode_context_tokens,planned_decode_max_context_length,prefill_cohort_size,"
@@ -1036,13 +1061,15 @@ void writeDispatchMetrics(std::filesystem::path const& path, std::vector<rt::Pha
                << (sample.prefillCostCoverageMiss ? 1 : 0) << ',' << (sample.overlapEvaluatedByCost ? 1 : 0) << ','
                << (sample.latencySafeFallback ? 1 : 0) << ',' << sample.prefillCostLookupRows << ','
                << sample.prefillCostLookupChunkLength << ',' << sample.prefillCostLookupMaxPastKVLength << ','
-               << sample.adaptiveChunkDecodeQueuePressure << ',' << sample.adaptiveChunkObservedTpotPressure << ','
-               << sample.adaptiveChunkCombinedPressure << ',' << sample.plannedDecodeBatchSize << ','
-               << sample.plannedDecodeContextTokens << ',' << sample.plannedDecodeMaxContextLength << ','
-               << sample.prefillCohortSize << ',' << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ','
-               << sample.prefillGpuMs << ',' << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ','
-               << sample.overlapRatio << ',' << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles
-               << ',' << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
+               << sample.prefillShapeCandidatesEvaluated << ',' << sample.predictedPrefillShapeScore << ','
+               << (sample.prefillShapeDrainMode ? 1 : 0) << ',' << sample.adaptiveChunkDecodeQueuePressure << ','
+               << sample.adaptiveChunkObservedTpotPressure << ',' << sample.adaptiveChunkCombinedPressure << ','
+               << sample.plannedDecodeBatchSize << ',' << sample.plannedDecodeContextTokens << ','
+               << sample.plannedDecodeMaxContextLength << ',' << sample.prefillCohortSize << ','
+               << sample.prefillQueueWaitUs << ',' << sample.decodeQueueWaitUs << ',' << sample.prefillGpuMs << ','
+               << sample.decodeGpuMs << ',' << sample.makespanGpuMs << ',' << sample.overlapRatio << ','
+               << sample.pagePoolTotalBundles << ',' << sample.pagePoolAllocatedBundles << ','
+               << sample.pagePoolAvailableBundles << ',' << sample.pageGrowthRequestLimit << ','
                << sample.pageGrowthRequestOwners << ',' << sample.pageGrowthTpotPressure << '\n';
     }
 }
@@ -1825,6 +1852,10 @@ int main(int argc, char** argv)
         facadeSchedulerConfig.enablePriorityBatching = args.loadPriorityClasses > 1 || traceHasPriority;
         facadeSchedulerConfig.enableAdaptivePrefillChunking = args.adaptiveChunking && configuredChunkSize > 0;
         facadeSchedulerConfig.adaptivePrefillChunkCandidates = args.adaptiveChunkCandidates;
+        facadeSchedulerConfig.enableCostAwarePrefillShapeSelection = args.costAwarePrefillShapes;
+        facadeSchedulerConfig.prefillShapeDecodePenaltyWeight = args.prefillShapeDecodePenaltyWeight;
+        facadeSchedulerConfig.prefillShapeEnqueueCostMs = args.prefillShapeEnqueueCostMs;
+        facadeSchedulerConfig.prefillShapeDrainBacklogTokens = args.prefillShapeDrainBacklogTokens;
         if (!args.adaptiveChunkCandidates.empty())
         {
             facadeSchedulerConfig.adaptivePrefillChunkDecodePressureThreshold
@@ -2631,8 +2662,11 @@ int main(int argc, char** argv)
         }
         LOG_INFO("Serving facade scheduler policy: %s", args.adaptiveScheduler ? "adaptive_metrics" : "queue_default");
         LOG_INFO("Serving facade prefill chunk policy: %s candidates=%zu decode_pressure=%.3f split_completion=%d",
-            args.adaptiveChunking ? (args.adaptiveChunkCandidates.empty() ? "adaptive_cuda_cost" : "adaptive_bounded")
-                                  : "fixed",
+            args.costAwarePrefillShapes
+                ? "joint_cost_aware"
+                : (args.adaptiveChunking
+                          ? (args.adaptiveChunkCandidates.empty() ? "adaptive_cuda_cost" : "adaptive_bounded")
+                          : "fixed"),
             args.adaptiveChunkCandidates.size(), facadeSchedulerConfig.adaptivePrefillChunkDecodePressureThreshold,
             facadeSchedulerConfig.allowAdaptivePrefillCompletionSplit ? 1 : 0);
         LOG_INFO(

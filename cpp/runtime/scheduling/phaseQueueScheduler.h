@@ -112,6 +112,9 @@ struct PhaseDispatchMetrics
     int32_t prefillCostLookupRows{};
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
+    int32_t prefillShapeCandidatesEvaluated{};
+    float predictedPrefillShapeScore{};
+    bool prefillShapeDrainMode{};
     float adaptiveChunkDecodeQueuePressure{};
     float adaptiveChunkObservedTpotPressure{};
     float adaptiveChunkCombinedPressure{};
@@ -346,6 +349,20 @@ struct PhaseQueueSchedulerConfig
     //! An empty vector preserves the legacy aligned continuous selection.
     //! A request's final tail may be smaller than the first candidate.
     std::vector<int32_t> adaptivePrefillChunkCandidates;
+    //! Jointly select a profiled (prefill batch, chunk) shape instead of
+    //! choosing the chunk from queue pressure before dynamic batching. This
+    //! requires bounded chunk candidates and profiled prefill costs.
+    bool enableCostAwarePrefillShapeSelection{};
+    //! Weight applied to predicted decode slowdown, scaled by live decode
+    //! queue occupancy, when comparing feasible prefill shapes. Zero
+    //! maximizes prefill throughput only.
+    float prefillShapeDecodePenaltyWeight{1.0F};
+    //! Optional host/enqueue cost charged once per candidate dispatch.
+    float prefillShapeEnqueueCostMs{};
+    //! Prefer maximum productive tokens among feasible profiled shapes once
+    //! the queued prefill backlog reaches this size. Zero disables the drain
+    //! regime.
+    int64_t prefillShapeDrainBacklogTokens{};
     //! Select the smallest bounded candidate once decode queue occupancy
     //! multiplied by observed TPOT pressure reaches this ratio. Requiring
     //! both signals avoids shrinking chunks merely because a healthy decode
@@ -410,6 +427,9 @@ struct PhaseDispatchPlan
     int32_t prefillCostLookupRows{};
     int32_t prefillCostLookupChunkLength{};
     int32_t prefillCostLookupMaxPastKVLength{};
+    int32_t prefillShapeCandidatesEvaluated{};
+    float predictedPrefillShapeScore{};
+    bool prefillShapeDrainMode{};
     float adaptiveChunkDecodeQueuePressure{};
     float adaptiveChunkObservedTpotPressure{};
     float adaptiveChunkCombinedPressure{};
@@ -468,10 +488,11 @@ private:
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,
         bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize, int32_t plannedDecodeMaxContextLength,
-        PhaseQueueSnapshot const& snapshot, float& predictedGpuMs, float& predictedDecodeSlowdownMs,
-        bool& costCoverageMiss) const noexcept;
+        PhaseQueueSnapshot const& snapshot, bool preferMaximumProgress, float& predictedGpuMs,
+        float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept;
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
+    int32_t costAwarePrefillTokens(PhaseWorkItem const& item, int32_t chunkLimit) const noexcept;
     bool isPrefillBatchCompatible(
         PhaseWorkItem const& item, int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept;
     bool isEligible(PhaseWorkItem const& item, bool prefill) const;

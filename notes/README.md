@@ -97,6 +97,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 75. [Cosmos 다섯 workload Current, vLLM, clean upstream 비교](99-cosmos-five-workload-current-vllm-upstream-20260814.md)
 76. [Cosmos vLLM attention/scheduler 옵션 sweep](100-cosmos-vllm-attention-scheduler-option-sweep-20260814.md)
 77. [Cosmos bounded dynamic prefill chunk controller](101-cosmos-bounded-dynamic-prefill-20260814.md)
+78. [Cosmos joint prefill batch/chunk scheduler](102-cosmos-joint-prefill-shape-scheduler-20260819.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.

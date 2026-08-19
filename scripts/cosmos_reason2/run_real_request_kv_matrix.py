@@ -344,6 +344,15 @@ def command_for(args: argparse.Namespace, engine: Engine, case: Case,
             ])
         if args.adaptive_chunk_split_completion:
             command.append("--adaptiveChunkSplitCompletion")
+    if args.cost_aware_prefill_shapes:
+        command.extend([
+            "--costAwarePrefillShapes", "--prefillShapeDecodePenaltyWeight",
+            str(args.prefill_shape_decode_penalty_weight),
+            "--prefillShapeEnqueueCostMs",
+            str(args.prefill_shape_enqueue_cost_ms),
+            "--prefillShapeDrainBacklogTokens",
+            str(args.prefill_shape_drain_backlog_tokens)
+        ])
     return command
 
 
@@ -461,6 +470,55 @@ def summarize_kernel(path: Path, engine: Engine,
         "gpu_mean_ms": statistics.mean(values),
         "gpu_max_ms": max(values),
     } for group, values in sorted(grouped.items())]
+
+
+def summarize_prefill_shapes(path: Path, engine: Engine,
+                             case: Case) -> list[dict[str, object]]:
+    """Summarize cost-aware joint prefill-shape decisions."""
+    rows = [
+        row for row in read_csv(path)
+        if int(row.get("prefill_shape_candidates_evaluated") or 0) > 0
+        and int(row["prefill_batch"]) > 0
+    ]
+    grouped: dict[tuple[int, int, int], list[dict[str, str]]] = {}
+    for row in rows:
+        key = (int(row["prefill_batch"]),
+               int(row["prefill_cost_lookup_chunk_length"]),
+               int(row["decode_batch"]))
+        grouped.setdefault(key, []).append(row)
+    return [{
+        "engine":
+        engine.name,
+        "context_mode":
+        case.context_mode,
+        "case":
+        case.name,
+        "selected_prefill_batch":
+        prefill_batch,
+        "selected_chunk":
+        chunk,
+        "concurrent_decode_batch":
+        decode_batch,
+        "dispatches":
+        len(samples),
+        "candidate_count_median":
+        statistics.median(
+            int(row["prefill_shape_candidates_evaluated"]) for row in samples),
+        "predicted_score_median":
+        statistics.median(
+            float(row["predicted_prefill_shape_score"]) for row in samples),
+        "predicted_prefill_p95_ms_median":
+        statistics.median(
+            float(row["predicted_prefill_gpu_ms"]) for row in samples),
+        "predicted_decode_slowdown_p95_ms_median":
+        statistics.median(
+            float(row["predicted_decode_slowdown_ms"]) for row in samples),
+        "cost_coverage_misses":
+        sum(int(row["prefill_cost_coverage_miss"]) for row in samples),
+        "drain_mode_dispatches":
+        sum(int(row["prefill_shape_drain_mode"]) for row in samples),
+    } for (prefill_batch, chunk,
+           decode_batch), samples in sorted(grouped.items())]
 
 
 def summarize_prefill_chunks(path: Path, engine: Engine,
@@ -829,6 +887,19 @@ def main() -> None:
         action="store_true",
         help=
         "allow pressure to split a row that could finish in one maximum chunk")
+    parser.add_argument(
+        "--cost-aware-prefill-shapes",
+        action="store_true",
+        help="jointly select a profiled prefill batch and bounded chunk")
+    parser.add_argument("--prefill-shape-decode-penalty-weight",
+                        type=float,
+                        default=1.0)
+    parser.add_argument("--prefill-shape-enqueue-cost-ms",
+                        type=float,
+                        default=0.0)
+    parser.add_argument("--prefill-shape-drain-backlog-tokens",
+                        type=int,
+                        default=0)
     parser.add_argument("--page-reservation-mode",
                         choices=("full", "headroom", "bounded-overcommit"),
                         default="full",
@@ -898,6 +969,18 @@ def main() -> None:
         parser.error(
             "adaptive-chunk-split-completion requires bounded chunk candidates"
         )
+    if args.cost_aware_prefill_shapes and not (args.dynamic_prefill_batching
+                                               and args.adaptive_chunking and
+                                               args.adaptive_chunk_candidates):
+        parser.error(
+            "cost-aware-prefill-shapes requires dynamic prefill batching and bounded adaptive chunks"
+        )
+    if (not math.isfinite(args.prefill_shape_decode_penalty_weight)
+            or args.prefill_shape_decode_penalty_weight < 0.0
+            or not math.isfinite(args.prefill_shape_enqueue_cost_ms)
+            or args.prefill_shape_enqueue_cost_ms < 0.0
+            or args.prefill_shape_drain_backlog_tokens < 0):
+        parser.error("prefill shape penalties must be finite and non-negative")
     if not 0.0 < args.adaptive_chunk_decode_pressure_threshold <= 1.0:
         parser.error(
             "adaptive chunk decode pressure threshold must be in (0, 1]")
@@ -986,6 +1069,7 @@ def main() -> None:
     summaries = []
     dispatches = []
     kernels = []
+    shapes = []
     chunks = []
     pressure = []
     statuses = []
@@ -1127,6 +1211,14 @@ def main() -> None:
                 args.adaptive_chunk_decode_pressure_threshold,
                 "adaptive_chunk_split_completion":
                 args.adaptive_chunk_split_completion,
+                "cost_aware_prefill_shapes":
+                args.cost_aware_prefill_shapes,
+                "prefill_shape_decode_penalty_weight":
+                args.prefill_shape_decode_penalty_weight,
+                "prefill_shape_enqueue_cost_ms":
+                args.prefill_shape_enqueue_cost_ms,
+                "prefill_shape_drain_backlog_tokens":
+                args.prefill_shape_drain_backlog_tokens,
                 "page_reservation_mode":
                 args.page_reservation_mode,
                 "page_reservation_headroom_tokens":
@@ -1163,6 +1255,8 @@ def main() -> None:
                 dispatches.extend(
                     summarize_dispatch(dispatch_csv, engine, case))
                 kernels.extend(summarize_kernel(kernel_csv, engine, case))
+                shapes.extend(
+                    summarize_prefill_shapes(dispatch_csv, engine, case))
                 chunks.extend(
                     summarize_prefill_chunks(prefill_timeline_csv, engine,
                                              case))
@@ -1181,6 +1275,7 @@ def main() -> None:
     write_csv(args.output_dir / "request-summary.csv", summaries)
     write_csv(args.output_dir / "dispatch-cost-table.csv", dispatches)
     write_csv(args.output_dir / "kernel-cost-table.csv", kernels)
+    write_csv(args.output_dir / "prefill-shape-table.csv", shapes)
     write_csv(args.output_dir / "prefill-chunk-table.csv", chunks)
     write_csv(args.output_dir / "page-pressure-model.csv", pressure)
     print(f"wrote matrix artifacts to {args.output_dir}")

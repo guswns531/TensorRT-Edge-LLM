@@ -166,6 +166,16 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
         "Adaptive minimum prefill chunk exceeds the maximum");
     check::check(mConfig.adaptivePrefillChunkCandidates.empty() || mConfig.enableAdaptivePrefillChunking,
         "Adaptive prefill chunk candidates require adaptive prefill chunking");
+    check::check(!mConfig.enableCostAwarePrefillShapeSelection
+            || (mConfig.enableDynamicPrefillBatching && mConfig.enableAdaptivePrefillChunking
+                && !mConfig.adaptivePrefillChunkCandidates.empty()),
+        "Cost-aware prefill shape selection requires dynamic batching and bounded adaptive chunks");
+    check::check(std::isfinite(mConfig.prefillShapeDecodePenaltyWeight)
+            && mConfig.prefillShapeDecodePenaltyWeight >= 0.0F && std::isfinite(mConfig.prefillShapeEnqueueCostMs)
+            && mConfig.prefillShapeEnqueueCostMs >= 0.0F,
+        "Cost-aware prefill shape penalties must be finite and non-negative");
+    check::check(
+        mConfig.prefillShapeDrainBacklogTokens >= 0, "Cost-aware prefill shape drain backlog must be non-negative");
     check::check(!mConfig.allowAdaptivePrefillCompletionSplit
             || (mConfig.enableAdaptivePrefillChunking && !mConfig.adaptivePrefillChunkCandidates.empty()),
         "Adaptive prefill completion splitting requires bounded adaptive prefill chunking");
@@ -485,7 +495,7 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
     {
         maximum = std::min(maximum, mConfig.decodeActivePrefillChunkTokens);
     }
-    if (!mConfig.enableAdaptivePrefillChunking || mDecodeQueue.empty())
+    if (!mConfig.enableAdaptivePrefillChunking || mDecodeQueue.empty() || mConfig.enableCostAwarePrefillShapeSelection)
     {
         return maximum;
     }
@@ -561,6 +571,27 @@ int32_t PhaseQueueScheduler::dispatchedPrefillTokens(PhaseWorkItem const& item) 
     return std::max(minimum, aligned);
 }
 
+int32_t PhaseQueueScheduler::costAwarePrefillTokens(PhaseWorkItem const& item, int32_t chunkLimit) const noexcept
+{
+    if (!item.allowChunkedPrefill || !mConfig.supportsChunkedPrefill || mConfig.maxPrefillChunkTokens == 0)
+    {
+        return item.tokenCount;
+    }
+
+    int32_t maximum = std::min(item.tokenCount, mConfig.maxPrefillChunkTokens);
+    bool const largePrefillBacklog = mConfig.largePrefillChunkQueueThreshold > 0
+        && mPrefillQueue.size() >= mConfig.largePrefillChunkQueueThreshold;
+    if (!mDecodeQueue.empty() && !largePrefillBacklog && mConfig.decodeActivePrefillChunkTokens > 0)
+    {
+        maximum = std::min(maximum, mConfig.decodeActivePrefillChunkTokens);
+    }
+    if (maximum == item.tokenCount && !mConfig.allowAdaptivePrefillCompletionSplit)
+    {
+        return maximum;
+    }
+    return std::min(maximum, chunkLimit);
+}
+
 bool PhaseQueueScheduler::isPrefillBatchCompatible(
     PhaseWorkItem const& item, int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept
 {
@@ -578,8 +609,8 @@ bool PhaseQueueScheduler::isPrefillBatchCompatible(
 
 int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates,
     int32_t chunkLength, bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize,
-    int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, float& predictedGpuMs,
-    float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept
+    int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, bool preferMaximumProgress,
+    float& predictedGpuMs, float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept
 {
     int32_t const available = std::min<int32_t>(mConfig.maxPrefillBatchSize, candidates.size());
     bool const evaluateOversizedOverlap = overlap && mConfig.enableCostAwareOverlapAdmission && !mLatencySafeFallback
@@ -655,7 +686,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
             int32_t usefulTokens{};
             for (int32_t index{}; index < batchSize; ++index)
             {
-                usefulTokens += dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]);
+                usefulTokens += std::min(dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]), chunkLength);
             }
             float const gpuMs = selectedOverlap != nullptr ? selectedOverlap->prefillP95GpuMs : selected->p95GpuMs;
             float const interference = selectedOverlap != nullptr
@@ -698,8 +729,12 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         double const efficiency = static_cast<double>(candidate.usefulTokens) / candidate.gpuMs;
         double const selectedEfficiency
             = selected == nullptr ? 0.0 : static_cast<double>(selected->usefulTokens) / selected->gpuMs;
-        if (selected == nullptr || efficiency > selectedEfficiency
-            || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
+        if (selected == nullptr || (preferMaximumProgress && candidate.usefulTokens > selected->usefulTokens)
+            || (preferMaximumProgress && candidate.usefulTokens == selected->usefulTokens
+                && efficiency > selectedEfficiency)
+            || (!preferMaximumProgress && efficiency > selectedEfficiency)
+            || (!preferMaximumProgress && efficiency == selectedEfficiency
+                && candidate.batchSize > selected->batchSize))
         {
             selected = &candidate;
         }
@@ -937,7 +972,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             }
         }
     }
-    int32_t const bucketTokens = dispatchedPrefillTokens(*bucketSeed);
+    int32_t bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
     bool const allowRaggedBatch = bucketSeed->allowChunkedPrefill;
     if (mConfig.enableWavefrontPrefillBatching && mPrefillCohortIds.empty())
@@ -960,46 +995,193 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             mPrefillCohortIds.insert(compatible[static_cast<size_t>(index)]->requestId);
         }
     }
-    std::vector<PhaseWorkItem const*> compatible;
-    for (PhaseWorkItem const& item : queue)
-    {
-        bool const cohortEligible = !mConfig.enableWavefrontPrefillBatching
-            || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
-        if (cohortEligible && isEligible(item, true)
-            && isPrefillBatchCompatible(item, bucketTokens, bucketInitial, allowRaggedBatch))
+    auto collectCompatible = [&](int32_t paddedChunkLength, bool costAwareShape) {
+        std::vector<PhaseWorkItem const*> rows;
+        for (PhaseWorkItem const& item : queue)
         {
-            compatible.push_back(&item);
+            bool const cohortEligible = !mConfig.enableWavefrontPrefillBatching
+                || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
+            if (!cohortEligible || !isEligible(item, true) || (item.tokenOffset == 0) != bucketInitial)
+            {
+                continue;
+            }
+            int32_t const itemTokens
+                = costAwareShape ? costAwarePrefillTokens(item, paddedChunkLength) : dispatchedPrefillTokens(item);
+            bool const compatibleShape = itemTokens == paddedChunkLength
+                || (itemTokens < paddedChunkLength && mConfig.enableRaggedPrefillBatching && allowRaggedBatch
+                    && item.allowChunkedPrefill);
+            if (compatibleShape)
+            {
+                rows.push_back(&item);
+            }
         }
+        auto orderRows = [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
+            if (!costAwareShape)
+            {
+                return orderPrefillRow(lhs, rhs, paddedChunkLength);
+            }
+            int32_t const lhsTokens = costAwarePrefillTokens(*lhs, paddedChunkLength);
+            int32_t const rhsTokens = costAwarePrefillTokens(*rhs, paddedChunkLength);
+            bool const lhsExact = lhsTokens == paddedChunkLength;
+            bool const rhsExact = rhsTokens == paddedChunkLength;
+            if (lhsExact != rhsExact)
+            {
+                return lhsExact;
+            }
+            if (!lhsExact && lhsTokens != rhsTokens)
+            {
+                return lhsTokens > rhsTokens;
+            }
+            return moreUrgentPrefill(*lhs, *rhs);
+        };
+        std::stable_sort(rows.begin(), rows.end(), orderRows);
+        return rows;
+    };
+    auto batchLimitFor = [&](int32_t paddedChunkLength, size_t compatibleRows) {
+        int32_t const tokenBudget = mConfig.maxPrefillBatchTokens > 0
+            ? std::max(mConfig.maxPrefillBatchTokens, paddedChunkLength)
+            : std::numeric_limits<int32_t>::max();
+        int32_t const budgetRows = std::max(1, tokenBudget / std::max(1, paddedChunkLength));
+        return std::min({maxBatchSize, budgetRows, static_cast<int32_t>(compatibleRows)});
+    };
+    std::vector<PhaseWorkItem const*> compatible = collectCompatible(bucketTokens, false);
+    int32_t batchLimit = batchLimitFor(bucketTokens, compatible.size());
+    int32_t costLookupRows = std::min<int32_t>(mConfig.maxPrefillBatchSize, compatible.size());
+    int32_t costLookupMaxPastKVLength{};
+    for (int32_t index = 0; index < costLookupRows; ++index)
+    {
+        costLookupMaxPastKVLength
+            = std::max(costLookupMaxPastKVLength, compatible[static_cast<size_t>(index)]->tokenOffset);
     }
-    std::stable_sort(compatible.begin(), compatible.end(),
-        [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) { return orderPrefillRow(lhs, rhs, bucketTokens); });
-    int32_t const tokenBudget = mConfig.maxPrefillBatchTokens > 0
-        ? std::max(mConfig.maxPrefillBatchTokens, bucketTokens)
-        : std::numeric_limits<int32_t>::max();
-    int32_t const budgetRows = std::max(1, tokenBudget / std::max(1, bucketTokens));
-    int32_t batchLimit = std::min({maxBatchSize, budgetRows, static_cast<int32_t>(compatible.size())});
     float predictedGpuMs{};
     float predictedDecodeSlowdownMs{};
-    plan.prefillCostLookupRows = std::min<int32_t>(mConfig.maxPrefillBatchSize, compatible.size());
+    bool shapeSelected{};
+    bool shapeRejectedForTpot{};
+    bool const selectedProductiveChunk = !mConfig.adaptivePrefillChunkCandidates.empty()
+        && bucketTokens == mConfig.adaptivePrefillChunkCandidates.back();
+    bool const drainPrefillBacklog = mConfig.prefillShapeDrainBacklogTokens > 0
+        && state.prefillRemainingTokens >= mConfig.prefillShapeDrainBacklogTokens;
+    plan.prefillShapeDrainMode
+        = mConfig.enableCostAwarePrefillShapeSelection && selectedProductiveChunk && drainPrefillBacklog;
+    if (mConfig.enableCostAwarePrefillShapeSelection && selectedProductiveChunk)
+    {
+        struct JointShape
+        {
+            int32_t chunkLength{};
+            int32_t batchSize{};
+            float gpuMs{};
+            float decodeSlowdownMs{};
+            float score{};
+            int32_t usefulTokens{};
+            int32_t costLookupRows{};
+            int32_t costLookupMaxPastKVLength{};
+            std::vector<PhaseWorkItem const*> rows;
+        };
+        std::optional<JointShape> selectedShape;
+        for (int32_t const candidateChunk : mConfig.adaptivePrefillChunkCandidates)
+        {
+            std::vector<PhaseWorkItem const*> candidateRows = collectCompatible(candidateChunk, true);
+            int32_t const candidateBatchLimit = batchLimitFor(candidateChunk, candidateRows.size());
+            if (candidateBatchLimit < mConfig.minDynamicPrefillBatchSize)
+            {
+                continue;
+            }
+            candidateRows.resize(static_cast<size_t>(candidateBatchLimit));
+            int32_t candidateMaxPastKVLength{};
+            for (PhaseWorkItem const* row : candidateRows)
+            {
+                candidateMaxPastKVLength = std::max(candidateMaxPastKVLength, row->tokenOffset);
+            }
+            float candidateGpuMs{};
+            float candidateDecodeSlowdownMs{};
+            bool candidateCoverageMiss{};
+            int32_t const candidateBatch = selectPrefillBatchSize(candidateRows, candidateChunk, bucketInitial,
+                plan.kind == PhaseDispatchKind::kOverlap, plan.plannedDecodeBatchSize,
+                plan.plannedDecodeMaxContextLength, state, drainPrefillBacklog, candidateGpuMs,
+                candidateDecodeSlowdownMs, candidateCoverageMiss);
+            plan.prefillCostCoverageMiss = plan.prefillCostCoverageMiss || candidateCoverageMiss;
+            ++plan.prefillShapeCandidatesEvaluated;
+            if (candidateBatch < 0)
+            {
+                shapeRejectedForTpot = true;
+                continue;
+            }
+            if (candidateBatch == 0)
+            {
+                continue;
+            }
+            int32_t usefulTokens{};
+            for (int32_t index{}; index < candidateBatch; ++index)
+            {
+                usefulTokens += costAwarePrefillTokens(*candidateRows[static_cast<size_t>(index)], candidateChunk);
+            }
+            float const decodeQueuePressure = std::min(
+                1.0F, static_cast<float>(state.decodeQueued) / static_cast<float>(mConfig.maxDecodeBatchSize));
+            float const effectiveMs = candidateGpuMs
+                + mConfig.prefillShapeDecodePenaltyWeight * decodeQueuePressure * candidateDecodeSlowdownMs
+                + mConfig.prefillShapeEnqueueCostMs;
+            float const score = static_cast<float>(usefulTokens) / effectiveMs;
+            if (!selectedShape.has_value() || (drainPrefillBacklog && usefulTokens > selectedShape->usefulTokens)
+                || (drainPrefillBacklog && usefulTokens == selectedShape->usefulTokens && score > selectedShape->score)
+                || (!drainPrefillBacklog && score > selectedShape->score)
+                || (!drainPrefillBacklog && score == selectedShape->score && usefulTokens > selectedShape->usefulTokens)
+                || (score == selectedShape->score && usefulTokens == selectedShape->usefulTokens
+                    && candidateChunk > selectedShape->chunkLength))
+            {
+                candidateRows.resize(static_cast<size_t>(candidateBatch));
+                selectedShape = JointShape{candidateChunk, candidateBatch, candidateGpuMs, candidateDecodeSlowdownMs,
+                    score, usefulTokens, candidateBatchLimit, candidateMaxPastKVLength, std::move(candidateRows)};
+            }
+        }
+        if (selectedShape.has_value())
+        {
+            bucketTokens = selectedShape->chunkLength;
+            batchLimit = selectedShape->batchSize;
+            predictedGpuMs = selectedShape->gpuMs;
+            predictedDecodeSlowdownMs = selectedShape->decodeSlowdownMs;
+            costLookupRows = selectedShape->costLookupRows;
+            costLookupMaxPastKVLength = selectedShape->costLookupMaxPastKVLength;
+            compatible = std::move(selectedShape->rows);
+            plan.predictedPrefillShapeScore = selectedShape->score;
+            shapeSelected = true;
+        }
+    }
+    if (!shapeSelected)
+    {
+        if (shapeRejectedForTpot && plan.kind == PhaseDispatchKind::kOverlap && mConfig.enableTpotHardGuard)
+        {
+            plan.prefillDeferredForTpot = true;
+            plan.predictedDecodeDebtUs = mPredictedDecodeDebtUs;
+            plan.consecutiveOverlapBatches = mConsecutiveOverlapBatches;
+            return batch;
+        }
+        int32_t dynamicLimit{};
+        if (!mConfig.enableCostAwarePrefillShapeSelection || selectedProductiveChunk)
+        {
+            std::vector<PhaseWorkItem const*> costCandidates = compatible;
+            costCandidates.resize(static_cast<size_t>(batchLimit));
+            dynamicLimit = selectPrefillBatchSize(costCandidates, bucketTokens, bucketInitial,
+                plan.kind == PhaseDispatchKind::kOverlap, plan.plannedDecodeBatchSize,
+                plan.plannedDecodeMaxContextLength, state, false, predictedGpuMs, predictedDecodeSlowdownMs,
+                plan.prefillCostCoverageMiss);
+        }
+        if (dynamicLimit < 0)
+        {
+            plan.prefillDeferredForTpot = true;
+            plan.predictedDecodeDebtUs = mPredictedDecodeDebtUs;
+            plan.consecutiveOverlapBatches = mConsecutiveOverlapBatches;
+            return batch;
+        }
+        if (dynamicLimit > 0)
+        {
+            batchLimit = std::min(batchLimit, dynamicLimit);
+        }
+    }
+    plan.prefillCostLookupRows = costLookupRows;
     plan.prefillCostLookupChunkLength = bucketTokens;
-    for (int32_t index = 0; index < plan.prefillCostLookupRows; ++index)
+    plan.prefillCostLookupMaxPastKVLength = costLookupMaxPastKVLength;
+    if (shapeSelected || predictedGpuMs > 0.0F)
     {
-        plan.prefillCostLookupMaxPastKVLength
-            = std::max(plan.prefillCostLookupMaxPastKVLength, compatible[static_cast<size_t>(index)]->tokenOffset);
-    }
-    int32_t const dynamicLimit = selectPrefillBatchSize(compatible, bucketTokens, bucketInitial,
-        plan.kind == PhaseDispatchKind::kOverlap, plan.plannedDecodeBatchSize, plan.plannedDecodeMaxContextLength,
-        state, predictedGpuMs, predictedDecodeSlowdownMs, plan.prefillCostCoverageMiss);
-    if (dynamicLimit < 0)
-    {
-        plan.prefillDeferredForTpot = true;
-        plan.predictedDecodeDebtUs = mPredictedDecodeDebtUs;
-        plan.consecutiveOverlapBatches = mConsecutiveOverlapBatches;
-        return batch;
-    }
-    if (dynamicLimit > 0)
-    {
-        batchLimit = std::min(batchLimit, dynamicLimit);
         plan.predictedPrefillGpuMs = predictedGpuMs;
         plan.predictedDecodeSlowdownMs = predictedDecodeSlowdownMs;
     }
