@@ -34,6 +34,7 @@
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
+#include "runtime/scheduling/packedPrefillActiveView.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 #include "runtime/state/contextCache/contextCacheMetrics.h"
 #include "runtime/state/decodingInferenceContext.h"
@@ -267,9 +268,10 @@ private:
     LogitBias mLogitBias;                      //!< Runtime-owned resources that outlive decoding objects borrowing them
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
-    std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
-    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre;    //!< Embedding-lookup preprocessor
-    std::unique_ptr<Gemma4EmbeddingPreprocessor> mGemma4Ple; //!< Gemma4 PLE token-identity preprocessor
+    std::unique_ptr<StepPreparer> mStepPreparer;                       //!< Per-step sequence preprocessor
+    std::unique_ptr<PackedPrefillActiveView> mPackedPrefillActiveView; //!< Phase-local active-row bindings
+    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre;              //!< Embedding-lookup preprocessor
+    std::unique_ptr<Gemma4EmbeddingPreprocessor> mGemma4Ple;           //!< Gemma4 PLE token-identity preprocessor
     //! Base-engine deepstack binding (nullptr when the base engine was built
     //! without deepstack features). Swaps between `io.deepstackEmbeds[i]`
     //! (prefill) and the shared `zeroDeepstackBroadcast` (all other phases).
@@ -340,7 +342,7 @@ private:
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
     bool runBaseModelPrefill(DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest = nullptr,
-        bool sampleOutput = true);
+        bool sampleOutput = true, bool commitCacheLengths = true);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);

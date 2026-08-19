@@ -314,6 +314,11 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // -----------------------------------------------------------------------
     mStepPreparer = std::make_unique<StepPreparer>(mDeployment.base);
     mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base);
+    if (mDeployment.base.packedPrefill)
+    {
+        mPackedPrefillActiveView = std::make_unique<PackedPrefillActiveView>(mDeployment.base,
+            *mSharedResources->kvPageTables[0], *mSharedResources->cacheManagers[0], mBaseTensorMap, *mPipelineIO);
+    }
     if (!mDeployment.base.isDiffusionBackbone && mDeployment.base.numDeepstackFeatures > 0)
     {
         mDeepstack = std::make_unique<DeepstackBinding>(mPipelineIO->deepstackEmbeds, mSharedResources->zeroBuffer);
@@ -1633,49 +1638,117 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
     return true;
 }
 
-bool LLMInferenceRuntime::runBaseModelPrefill(
-    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest, bool sampleOutput)
+bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context,
+    ContextCacheRequest* contextCacheRequest, bool sampleOutput, bool commitCacheLengths)
 {
-    if (sampleOutput && mDeployment.base.packedPrefill && context.activeBatchSize == 1
-        && context.effectivePrefillLengths[0] > mDeployment.base.maxPackedPrefillChunkTokens)
+    bool const needsPackedWavefront = sampleOutput && mDeployment.base.packedPrefill
+        && std::any_of(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end(),
+            [this](int32_t length) { return length > mDeployment.base.maxPackedPrefillChunkTokens; });
+    if (needsPackedWavefront)
     {
-        ELLM_CHECK(context.layerDebugger == nullptr, "Packed multi-pass prefill does not support the layer debugger");
-        std::vector<int32_t> const fullInputTokens = context.tokenIds[0];
-        int32_t const fullInputLength = context.effectivePrefillLengths[0];
-        ELLM_CHECK(static_cast<int32_t>(fullInputTokens.size()) == fullInputLength,
-            "Packed multi-pass prefill requires one complete input suffix");
+        ELLM_CHECK(mPackedPrefillActiveView != nullptr && context.layerDebugger == nullptr,
+            "Packed wavefront prefill requires its active view and does not support the layer debugger");
+        int32_t const originalBatchSize = context.activeBatchSize;
+        std::vector<std::vector<int32_t>> const fullInputTokens = context.tokenIds;
+        std::vector<int32_t> const fullInputLengths = context.effectivePrefillLengths;
+        ELLM_CHECK(static_cast<int32_t>(fullInputTokens.size()) == originalBatchSize
+                && static_cast<int32_t>(fullInputLengths.size()) >= originalBatchSize,
+            "Packed wavefront prefill input batch is incomplete");
 
-        int32_t tokenOffset{};
-        int32_t finalChunkLength{};
-        while (tokenOffset < fullInputLength)
+        std::vector<int32_t> tokenOffsets(static_cast<size_t>(originalBatchSize), 0);
+        std::vector<int32_t> remainingLengths(fullInputLengths.begin(), fullInputLengths.begin() + originalBatchSize);
+        std::vector<int32_t> residentLengths(static_cast<size_t>(originalBatchSize), 0);
+        for (int32_t row = 0; row < originalBatchSize; ++row)
         {
-            int32_t const chunkLength
-                = std::min(mDeployment.base.maxPackedPrefillChunkTokens, fullInputLength - tokenOffset);
-            bool const finalChunk = tokenOffset + chunkLength == fullInputLength;
-            finalChunkLength = finalChunk ? chunkLength : finalChunkLength;
-            context.tokenIds[0].assign(
-                fullInputTokens.begin() + tokenOffset, fullInputTokens.begin() + tokenOffset + chunkLength);
-            context.effectivePrefillLengths[0] = chunkLength;
-            if (!runBaseModelPrefill(context, finalChunk ? contextCacheRequest : nullptr, finalChunk))
+            ELLM_CHECK(static_cast<int32_t>(fullInputTokens[static_cast<size_t>(row)].size())
+                    == remainingLengths[static_cast<size_t>(row)],
+                "Packed wavefront prefill requires one complete executable suffix per row");
+            residentLengths[static_cast<size_t>(row)]
+                = static_cast<int32_t>(context.rawBatchedInputIds[static_cast<size_t>(row)].size())
+                - remainingLengths[static_cast<size_t>(row)];
+            ELLM_CHECK(residentLengths[static_cast<size_t>(row)] >= 0,
+                "Packed wavefront prefill has a negative resident prefix length");
+        }
+
+        while (std::any_of(remainingLengths.begin(), remainingLengths.end(),
+            [this](int32_t length) { return length > mDeployment.base.maxPackedPrefillChunkTokens; }))
+        {
+            std::vector<int32_t> activeRows;
+            std::vector<int32_t> activeStartLengths;
+            std::vector<int32_t> activeChunkLengths;
+            std::vector<std::vector<int32_t>> activeTokens;
+            for (int32_t row = 0; row < originalBatchSize; ++row)
             {
-                context.tokenIds[0] = fullInputTokens;
-                context.effectivePrefillLengths[0] = fullInputLength;
+                if (remainingLengths[static_cast<size_t>(row)] <= mDeployment.base.maxPackedPrefillChunkTokens)
+                {
+                    continue;
+                }
+                int32_t const offset = tokenOffsets[static_cast<size_t>(row)];
+                int32_t const chunkLength = mDeployment.base.maxPackedPrefillChunkTokens;
+                activeRows.push_back(row);
+                activeStartLengths.push_back(residentLengths[static_cast<size_t>(row)]);
+                activeChunkLengths.push_back(chunkLength);
+                activeTokens.emplace_back(fullInputTokens[static_cast<size_t>(row)].begin() + offset,
+                    fullInputTokens[static_cast<size_t>(row)].begin() + offset + chunkLength);
+            }
+
+            mPackedPrefillActiveView->prepare(activeRows, activeStartLengths, context.stream);
+            context.activeBatchSize = static_cast<int32_t>(activeRows.size());
+            context.tokenIds = std::move(activeTokens);
+            context.effectivePrefillLengths = activeChunkLengths;
+            if (!runBaseModelPrefill(context, nullptr, false, false))
+            {
+                mPackedPrefillActiveView->complete();
+                context.activeBatchSize = originalBatchSize;
+                context.tokenIds = fullInputTokens;
+                context.effectivePrefillLengths = fullInputLengths;
                 return false;
             }
-            tokenOffset += chunkLength;
+            mPackedPrefillActiveView->commitChunkLengths(activeChunkLengths, context.stream);
+            mPackedPrefillActiveView->complete();
+            for (int32_t const row : activeRows)
+            {
+                tokenOffsets[static_cast<size_t>(row)] += mDeployment.base.maxPackedPrefillChunkTokens;
+                remainingLengths[static_cast<size_t>(row)] -= mDeployment.base.maxPackedPrefillChunkTokens;
+                residentLengths[static_cast<size_t>(row)] += mDeployment.base.maxPackedPrefillChunkTokens;
+            }
         }
 
-        std::optional<int32_t> sampledToken;
-        if (context.tokenIds[0].size() == static_cast<size_t>(finalChunkLength + 1))
+        context.activeBatchSize = originalBatchSize;
+        context.tokenIds.clear();
+        context.tokenIds.reserve(static_cast<size_t>(originalBatchSize));
+        context.effectivePrefillLengths = remainingLengths;
+        for (int32_t row = 0; row < originalBatchSize; ++row)
         {
-            sampledToken = context.tokenIds[0].back();
+            int32_t const offset = tokenOffsets[static_cast<size_t>(row)];
+            context.tokenIds.emplace_back(fullInputTokens[static_cast<size_t>(row)].begin() + offset,
+                fullInputTokens[static_cast<size_t>(row)].end());
         }
-        context.tokenIds[0] = fullInputTokens;
-        if (sampledToken.has_value())
+        if (!runBaseModelPrefill(context, contextCacheRequest, true, true))
         {
-            context.tokenIds[0].push_back(*sampledToken);
+            context.tokenIds = fullInputTokens;
+            context.effectivePrefillLengths = fullInputLengths;
+            return false;
         }
-        context.effectivePrefillLengths[0] = fullInputLength;
+
+        std::vector<std::optional<int32_t>> sampledTokens(static_cast<size_t>(originalBatchSize));
+        for (int32_t row = 0; row < originalBatchSize; ++row)
+        {
+            size_t const expectedSize = static_cast<size_t>(remainingLengths[static_cast<size_t>(row)] + 1);
+            if (context.tokenIds[static_cast<size_t>(row)].size() == expectedSize)
+            {
+                sampledTokens[static_cast<size_t>(row)] = context.tokenIds[static_cast<size_t>(row)].back();
+            }
+        }
+        context.tokenIds = fullInputTokens;
+        for (int32_t row = 0; row < originalBatchSize; ++row)
+        {
+            if (sampledTokens[static_cast<size_t>(row)].has_value())
+            {
+                context.tokenIds[static_cast<size_t>(row)].push_back(*sampledTokens[static_cast<size_t>(row)]);
+            }
+        }
+        context.effectivePrefillLengths = fullInputLengths;
         emitTokenCallbacks(context);
         return true;
     }
@@ -1825,7 +1898,10 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
-    mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
+    if (commitCacheLengths)
+    {
+        mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
+    }
     if (contextCacheRequest != nullptr && !contextCacheRequest->enqueuePrefillCaptures())
     {
         return false;
