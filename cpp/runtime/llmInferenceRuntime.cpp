@@ -1634,8 +1634,52 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
 }
 
 bool LLMInferenceRuntime::runBaseModelPrefill(
-    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest)
+    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest, bool sampleOutput)
 {
+    if (sampleOutput && mDeployment.base.packedPrefill && context.activeBatchSize == 1
+        && context.effectivePrefillLengths[0] > mDeployment.base.maxPackedPrefillChunkTokens)
+    {
+        ELLM_CHECK(context.layerDebugger == nullptr, "Packed multi-pass prefill does not support the layer debugger");
+        std::vector<int32_t> const fullInputTokens = context.tokenIds[0];
+        int32_t const fullInputLength = context.effectivePrefillLengths[0];
+        ELLM_CHECK(static_cast<int32_t>(fullInputTokens.size()) == fullInputLength,
+            "Packed multi-pass prefill requires one complete input suffix");
+
+        int32_t tokenOffset{};
+        int32_t finalChunkLength{};
+        while (tokenOffset < fullInputLength)
+        {
+            int32_t const chunkLength
+                = std::min(mDeployment.base.maxPackedPrefillChunkTokens, fullInputLength - tokenOffset);
+            bool const finalChunk = tokenOffset + chunkLength == fullInputLength;
+            finalChunkLength = finalChunk ? chunkLength : finalChunkLength;
+            context.tokenIds[0].assign(
+                fullInputTokens.begin() + tokenOffset, fullInputTokens.begin() + tokenOffset + chunkLength);
+            context.effectivePrefillLengths[0] = chunkLength;
+            if (!runBaseModelPrefill(context, finalChunk ? contextCacheRequest : nullptr, finalChunk))
+            {
+                context.tokenIds[0] = fullInputTokens;
+                context.effectivePrefillLengths[0] = fullInputLength;
+                return false;
+            }
+            tokenOffset += chunkLength;
+        }
+
+        std::optional<int32_t> sampledToken;
+        if (context.tokenIds[0].size() == static_cast<size_t>(finalChunkLength + 1))
+        {
+            sampledToken = context.tokenIds[0].back();
+        }
+        context.tokenIds[0] = fullInputTokens;
+        if (sampledToken.has_value())
+        {
+            context.tokenIds[0].push_back(*sampledToken);
+        }
+        context.effectivePrefillLengths[0] = fullInputLength;
+        emitTokenCallbacks(context);
+        return true;
+    }
+
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_base_prefill,
         ("SPEC_DECODE_BASE_PREFILL[" + std::to_string(context.activeBatchSize) + "]").c_str(), nvtx_colors::BLUE);
@@ -1789,6 +1833,13 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
 
     if (mDeployment.base.isDiffusionBackbone)
     {
+        return true;
+    }
+    if (!sampleOutput)
+    {
+        // The next chunk reuses pinned host token/length staging buffers. Make
+        // the current H2D and engine read terminal before the host overwrites them.
+        CUDA_CHECK(cudaStreamSynchronize(context.stream));
         return true;
     }
 
