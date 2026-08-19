@@ -89,6 +89,16 @@ def _simulate_draft_dtype_write(draft_config):
     return draft_config
 
 
+def test_packed_prefill_metadata_defaults_and_sidecar_write_are_present():
+    config_source = _load_config_source()
+    export_source = _load_source()
+    assert re.search(r"packed_prefill:\s*bool\s*=\s*False", config_source)
+    assert re.search(r"packed_prefill_max_chunk_tokens:\s*int\s*=\s*128",
+                     config_source)
+    assert 'out["packed_prefill"] = bool(config.packed_prefill)' in export_source
+    assert 'out["packed_prefill_max_chunk_tokens"]' in export_source
+
+
 # ---------------------------------------------------------------------------
 # Base / standard engine dtype writes — behavior contract
 # ---------------------------------------------------------------------------

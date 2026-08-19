@@ -131,6 +131,35 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
 }
 
+TEST_F(LLMEngineConfigTest, ParsesPackedPrefillContractAndDims)
+{
+    Json json = makeMinimalConfig();
+    json["head_dim"] = 128;
+    json["packed_prefill"] = true;
+    json["packed_prefill_max_chunk_tokens"] = 128;
+    json["builder_config"]["max_prefill_chunk_tokens"] = 64;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const config = parseEngineConfig(path);
+    EXPECT_TRUE(config.packedPrefill);
+    EXPECT_EQ(config.maxPackedPrefillChunkTokens, 64);
+    InferenceDims const dims = config.packedPrefillDims(2, 96);
+    EXPECT_EQ(dims.batch, 2);
+    EXPECT_EQ(dims.tokenBatch, 1);
+    EXPECT_EQ(dims.seqLen, 96);
+    EXPECT_EQ(dims.selectLen, 2);
+    EXPECT_EQ(dims.startIndexLen, 2);
+}
+
+TEST_F(LLMEngineConfigTest, RejectsUnsupportedPackedPrefillHeadDimension)
+{
+    Json json = makeMinimalConfig();
+    json["packed_prefill"] = true;
+    json["packed_prefill_max_chunk_tokens"] = 128;
+    auto const path = writeJsonToTempFile(json);
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
 TEST_F(LLMEngineConfigTest, ParseEagleBaseConditioningMetadata)
 {
     Json json = makeMinimalConfig();

@@ -423,6 +423,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{
         /*.batch=*/activeBatchSize,
+        /*.tokenBatch=*/activeBatchSize,
         /*.seqLen=*/BS,
         /*.kvLen=*/draftKVCapacity,
         /*.selectLen=*/static_cast<int64_t>(maxDeltaLen),
@@ -616,6 +617,7 @@ bool DFlashDecoder::captureDraftCudaGraphs(cudaStream_t stream)
 
             InferenceDims const draftDims{
                 /*.batch=*/batchSize,
+                /*.tokenBatch=*/batchSize,
                 /*.seqLen=*/BS,
                 /*.kvLen=*/draftKVCapacity,
                 /*.selectLen=*/static_cast<int64_t>(simDeltaLen),
@@ -1091,6 +1093,7 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{
         /*.batch=*/activeBatchSize,
+        /*.tokenBatch=*/activeBatchSize,
         /*.seqLen=*/BS,
         /*.kvLen=*/draftKVCapacity,
         /*.selectLen=*/prefillLen,

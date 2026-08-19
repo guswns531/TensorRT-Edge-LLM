@@ -92,6 +92,8 @@ struct LLMEngineConfig
     bool isDiffusionBackbone{false};          //!< DiffusionGemma phase-aware transformer backbone engine
     bool diffusionUnifiedConditioning{false}; //!< Backbone engine owns DiffusionGemma self-conditioning inputs
     bool contextMaskSelectorEnabled{false};   //!< Engine exposes context_mask_selector binding
+    bool packedPrefill{false};                //!< Pack logical prefill rows into one token carrier
+    int32_t maxPackedPrefillChunkTokens{};    //!< Maximum logical packed-prefill row length
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
@@ -241,6 +243,10 @@ struct LLMEngineConfig
     //! DiffusionGemma keeps `kvcache_start_index` at `[batch]` and uses
     //! `context_mask_selector` as its attention-mask sentinel.
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
+
+    //! Packed text prefill dims. Tokens use a [1,totalTokens,*] carrier while
+    //! context lengths, page-table rows, and KV starts retain logicalBatch rows.
+    InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const;
 
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).

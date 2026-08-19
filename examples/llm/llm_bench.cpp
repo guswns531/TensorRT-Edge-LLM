@@ -1451,13 +1451,17 @@ int main(int argc, char** argv)
 
         rt::InferenceDims const dims{
             /*.batch=*/B,
+            /*.tokenBatch=*/B,
             /*.seqLen=*/args.blockSize,
             /*.kvLen=*/deployment.draft->maxKVCacheCapacity,
             /*.selectLen=*/args.draftDeltaLen,
             /*.attnMaskSeqLen=*/args.blockSize,
             /*.ropeBatch=*/1,
             /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
+            /*.contextMaskSelectorLen=*/0,
             /*.startIndexLen=*/B,
+            /*.specVerifyPhaseLen=*/0,
+            /*.skipSoftmaxScaleLen=*/0,
         };
 
         resetState = [&]() {
@@ -1505,13 +1509,17 @@ int main(int argc, char** argv)
 
         rt::InferenceDims const dims{
             /*.batch=*/B,
+            /*.tokenBatch=*/B,
             /*.seqLen=*/args.blockSize,
             /*.kvLen=*/deployment.draft->maxKVCacheCapacity,
             /*.selectLen=*/args.inputLen,
             /*.attnMaskSeqLen=*/args.blockSize,
             /*.ropeBatch=*/1,
             /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
+            /*.contextMaskSelectorLen=*/0,
             /*.startIndexLen=*/B,
+            /*.specVerifyPhaseLen=*/0,
+            /*.skipSoftmaxScaleLen=*/0,
         };
 
         resetState = [&]() {

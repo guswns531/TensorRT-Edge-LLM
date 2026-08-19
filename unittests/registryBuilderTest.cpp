@@ -757,6 +757,28 @@ TEST(RegistryBuilderTest, SymbolicDimsCanBeResolved)
     EXPECT_EQ(resolved.d[2], 4096);
 }
 
+TEST(RegistryBuilderTest, PackedPrefillSeparatesLogicalAndTokenCarrierBatch)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.packedPrefill = true;
+    cfg.maxPackedPrefillChunkTokens = 128;
+    auto reg = buildRegistryForLLM(cfg);
+    auto const specs = reg.allExpandedSpecs();
+    auto const inputs
+        = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& spec) { return spec.name == "inputs_embeds"; });
+    auto const contexts = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& spec) { return spec.name == "context_lengths"; });
+    ASSERT_NE(inputs, specs.end());
+    ASSERT_NE(contexts, specs.end());
+
+    InferenceDims const dims = cfg.packedPrefillDims(/*logicalBatch=*/4, /*totalTokens=*/384);
+    nvinfer1::Dims const inputShape = reg.resolveShape(inputs->shape, dims);
+    nvinfer1::Dims const contextShape = reg.resolveShape(contexts->shape, dims);
+    EXPECT_EQ(inputShape.d[0], 1);
+    EXPECT_EQ(inputShape.d[1], 384);
+    EXPECT_EQ(contextShape.d[0], 4);
+}
+
 // =====================================================================
 // Tier-1 #9: FP8 KV cache regression test — cycle {kHALF, kFP8, kBF16}
 // and assert the registry emits past_key_values_* bindings whose dtype

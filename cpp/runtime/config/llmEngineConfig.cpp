@@ -595,6 +595,13 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
     parseCoreFields(configJson, cfg);
+    cfg.packedPrefill = configJson.value("packed_prefill", false);
+    constexpr int32_t kDEFAULT_PACKED_PREFILL_CHUNK_TOKENS = 128;
+    int32_t const exportedPackedPrefillChunkTokens
+        = configJson.value("packed_prefill_max_chunk_tokens", kDEFAULT_PACKED_PREFILL_CHUNK_TOKENS);
+    auto const& builderConfig = configJson["builder_config"];
+    cfg.maxPackedPrefillChunkTokens
+        = cfg.packedPrefill ? builderConfig.value("max_prefill_chunk_tokens", exportedPackedPrefillChunkTokens) : 0;
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
@@ -705,6 +712,18 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // Populate per-layer type routing from canonical fields or scalar fallback.
     populateLayerTypes(configJson, cfg);
     parseDualRopeFields(configJson, cfg);
+    if (cfg.packedPrefill)
+    {
+        ELLM_CHECK(!cfg.isSpecDecodeBase && !cfg.isDiffusionBackbone,
+            "packed_prefill v1 supports vanilla autoregressive engines only.");
+        ELLM_CHECK(cfg.numLinearAttnLayers == 0, "packed_prefill v1 does not support recurrent layers.");
+        ELLM_CHECK(cfg.headDim == 128, "packed_prefill v1 requires attention head dimension 128.");
+        ELLM_CHECK(cfg.kvCacheDtype == nvinfer1::DataType::kHALF, "packed_prefill v1 requires FP16 KV cache.");
+        ELLM_CHECK(cfg.maxPackedPrefillChunkTokens > 0
+                && cfg.maxPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
+                && cfg.maxPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
+            "packed_prefill max chunk must be positive and no greater than the export and input limits.");
+    }
 
     // KV sharing donors: optional array of per-attention-layer donor indices.
     // Each entry is -1 (owns its own KV) or >= 0 (shares donor's KV cache).
@@ -853,9 +872,11 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " kvPoolPages=" << cfg.kvPoolPages << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
-       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " kvPoolPages=" << cfg.kvPoolPages << " packedPrefill=" << cfg.packedPrefill
+       << " maxPackedPrefillChunk=" << cfg.maxPackedPrefillChunkTokens << " pleEnabled=" << cfg.pleEnabled
+       << " numPleInputs=" << cfg.numPleInputs << " pleHiddenSize=" << cfg.pleHiddenSize
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
@@ -950,6 +971,7 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     int64_t const kvLen = maxKVCacheCapacity;
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/seqLen,
         /*.kvLen=*/kvLen,
         /*.selectLen=*/1,
@@ -963,10 +985,34 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     };
 }
 
+InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const
+{
+    ELLM_CHECK(packedPrefill, "packedPrefillDims requires a packed-prefill engine");
+    ELLM_CHECK(
+        logicalBatch > 0 && logicalBatch <= maxSupportedBatchSize, "packedPrefillDims logical batch is out of range");
+    ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * maxPackedPrefillChunkTokens,
+        "packedPrefillDims token carrier exceeds the configured packed-prefill limit");
+    return InferenceDims{
+        /*.batch=*/logicalBatch,
+        /*.tokenBatch=*/1,
+        /*.seqLen=*/totalTokens,
+        /*.kvLen=*/maxKVCacheCapacity,
+        /*.selectLen=*/logicalBatch,
+        /*.attnMaskSeqLen=*/1,
+        /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? logicalBatch : 1,
+        /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
+        /*.startIndexLen=*/logicalBatch,
+        /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
+    };
+}
+
 InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
 {
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/1,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/1,
@@ -984,6 +1030,7 @@ InferenceDims LLMEngineConfig::denoiseDims(int64_t batch, int64_t canvasLen) con
 {
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/canvasLen,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/canvasLen,
@@ -1001,6 +1048,7 @@ InferenceDims LLMEngineConfig::diffusionCommitDims(int64_t batch, int64_t commit
 {
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/commitLen,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/commitLen,
@@ -1021,6 +1069,7 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
     // This is the only recipe where selectLen != 1.
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/verifySize,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/verifySize,
@@ -1043,6 +1092,7 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
     // [batch, draftTopK]).
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/proposalSize,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/draftTopK,
@@ -1064,6 +1114,7 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
     // acceptLen fans out to: seqLen, attnMaskSeqLen, and packedMaskLen.
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/acceptLen,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/1,
@@ -1404,6 +1455,7 @@ InferenceDims LLMEngineConfig::resetDims() const
     // real initial-prefill (which would need shape [0]).
     return InferenceDims{
         /*.batch=*/1,
+        /*.tokenBatch=*/1,
         /*.seqLen=*/1,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/1,

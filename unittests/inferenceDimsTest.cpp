@@ -29,6 +29,7 @@ InferenceDims makeValid()
 {
     return InferenceDims{
         /*.batch=*/2,
+        /*.tokenBatch=*/2,
         /*.seqLen=*/128,
         /*.kvLen=*/4096,
         /*.selectLen=*/1,
@@ -46,6 +47,7 @@ std::vector<int64_t InferenceDims::*> allReferenced()
 {
     return {
         &InferenceDims::batch,
+        &InferenceDims::tokenBatch,
         &InferenceDims::seqLen,
         &InferenceDims::kvLen,
         &InferenceDims::selectLen,
@@ -68,6 +70,7 @@ std::vector<int64_t InferenceDims::*> allReferenced()
 TEST(InferenceDimsTest, DimNameKnownMembers)
 {
     EXPECT_EQ(dimName(&InferenceDims::batch), "batch");
+    EXPECT_EQ(dimName(&InferenceDims::tokenBatch), "token_batch");
     EXPECT_EQ(dimName(&InferenceDims::seqLen), "seq_len");
     EXPECT_EQ(dimName(&InferenceDims::kvLen), "kv_len");
     EXPECT_EQ(dimName(&InferenceDims::selectLen), "select_len");
@@ -95,6 +98,7 @@ TEST(InferenceDimsTest, ToStringContainsAllFields)
     InferenceDims const d = makeValid();
     std::string const s = toString(d);
     EXPECT_NE(s.find("batch=2"), std::string::npos) << s;
+    EXPECT_NE(s.find("token_batch=2"), std::string::npos) << s;
     EXPECT_NE(s.find("seq_len=128"), std::string::npos) << s;
     EXPECT_NE(s.find("kv_len=4096"), std::string::npos) << s;
     EXPECT_NE(s.find("select_len=1"), std::string::npos) << s;
@@ -125,8 +129,8 @@ TEST(InferenceDimsTest, FirstInvalidMemberPartialSet)
     InferenceDims d{};
     d.batch = 4;
     auto const refs = allReferenced();
-    // First *invalid* is seqLen (next referenced member that's still zero).
-    EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::seqLen);
+    // First *invalid* is tokenBatch (next referenced member that's still zero).
+    EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::tokenBatch);
 }
 
 TEST(InferenceDimsTest, FirstInvalidMemberUnreferencedFieldZero)
@@ -137,6 +141,7 @@ TEST(InferenceDimsTest, FirstInvalidMemberUnreferencedFieldZero)
     d.packedMaskLen = 0;
     std::vector<int64_t InferenceDims::*> const refs{
         &InferenceDims::batch,
+        &InferenceDims::tokenBatch,
         &InferenceDims::seqLen,
         &InferenceDims::kvLen,
         &InferenceDims::selectLen,

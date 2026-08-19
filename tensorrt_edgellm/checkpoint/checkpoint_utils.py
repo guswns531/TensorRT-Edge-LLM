@@ -769,6 +769,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     # Mirrors llm_export.py: "fp8" when KV cache is quantised, otherwise "fp16".
     out["kv_cache_dtype"] = ("fp8" if config.quant.kv_cache_quant == "fp8" else
                              "fp16")
+    out["packed_prefill"] = bool(config.packed_prefill)
+    if config.packed_prefill:
+        out["packed_prefill_max_chunk_tokens"] = int(
+            config.packed_prefill_max_chunk_tokens)
 
     # Hybrid models (Mamba / GDN / Nemotron-H) bake in recurrent-state and
     # conv-state dtypes at export time. The authoritative source is the

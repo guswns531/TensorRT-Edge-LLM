@@ -642,6 +642,10 @@ class ModelConfig:
     # attention during prefill (bidirectional inside each contiguous vision
     # run, causal everywhere else).  Audio placeholders remain causal.
     use_vision_bidirectional_attention: bool = False
+    # Pack variable-length logical prefill rows into one token carrier.
+    packed_prefill: bool = False
+    # Maximum logical row length compiled into packed-prefill attention.
+    packed_prefill_max_chunk_tokens: int = 128
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)

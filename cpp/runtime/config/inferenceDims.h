@@ -34,18 +34,19 @@ namespace rt
 //!
 //! Fields have NO in-class defaults — every construction site must set every
 //! field explicitly. The canonical construction path is an `LLMEngineConfig`
-//! recipe method (`prefillDims`, `decodeDims`, `specVerifyDims`,
+//! recipe method (`prefillDims`, `packedPrefillDims`, `decodeDims`, `specVerifyDims`,
 //! `proposalDims`, `acceptDims`, `resetDims`). Direct construction (aggregate
 //! or designated initializers) is supported for unit tests.
 //!
-//! The ten fields are the complete set of symbolic dims used by LLM, DiffusionGemma, and SpecDecode
+//! The twelve fields are the complete set of symbolic dims used by LLM, DiffusionGemma, and SpecDecode
 //! draft engines. Fixed-shape tensor dims do not appear here.
 struct InferenceDims
 {
-    int64_t batch;     //!< Active batch size
-    int64_t seqLen;    //!< Work-unit length for this step (prompt / proposal / accept / 1)
-    int64_t kvLen;     //!< KV cache capacity (usually LLMEngineConfig::maxKVCacheCapacity)
-    int64_t selectLen; //!< last_token_ids select count (1 except for SpecDecode verification)
+    int64_t batch;      //!< Active logical request batch size
+    int64_t tokenBatch; //!< Token-carrier batch; packed prefill uses one carrier
+    int64_t seqLen;     //!< Work-unit length for this step (prompt / proposal / accept / 1)
+    int64_t kvLen;      //!< KV cache capacity (usually LLMEngineConfig::maxKVCacheCapacity)
+    int64_t selectLen;  //!< last_token_ids select count (1 except for SpecDecode verification)
     //! Effective sequence length for the SpecDecode attention_mask / attention_pos_id
     //! tensors. This is decoupled from `seqLen` because the base engine's
     //! attention plugin treats a "small" mask shape ([B, 1, 1]) as a signal to
@@ -85,24 +86,25 @@ struct InferenceDims
 //! change the meaning of every positional aggregate init). Note: these do NOT catch
 //! "short" aggregate inits (omitting trailing fields) — the policy is that production
 //! construction goes through recipe methods, which always set every field.
-static_assert(sizeof(InferenceDims) == 11 * sizeof(int64_t),
+static_assert(sizeof(InferenceDims) == 12 * sizeof(int64_t),
     "InferenceDims layout changed: update kDimNames, toString(), kZeroAllowedMembers, and every recipe "
-    "method in LLMEngineConfig (prefillDims / decodeDims / denoiseDims / diffusionCommitDims / "
+    "method in LLMEngineConfig (prefillDims / packedPrefillDims / decodeDims / denoiseDims / diffusionCommitDims / "
     "specVerifyDims / proposalDims / acceptDims / resetDims).");
 static_assert(offsetof(InferenceDims, batch) == 0 * sizeof(int64_t), "InferenceDims::batch reordered");
-static_assert(offsetof(InferenceDims, seqLen) == 1 * sizeof(int64_t), "InferenceDims::seqLen reordered");
-static_assert(offsetof(InferenceDims, kvLen) == 2 * sizeof(int64_t), "InferenceDims::kvLen reordered");
-static_assert(offsetof(InferenceDims, selectLen) == 3 * sizeof(int64_t), "InferenceDims::selectLen reordered");
+static_assert(offsetof(InferenceDims, tokenBatch) == 1 * sizeof(int64_t), "InferenceDims::tokenBatch reordered");
+static_assert(offsetof(InferenceDims, seqLen) == 2 * sizeof(int64_t), "InferenceDims::seqLen reordered");
+static_assert(offsetof(InferenceDims, kvLen) == 3 * sizeof(int64_t), "InferenceDims::kvLen reordered");
+static_assert(offsetof(InferenceDims, selectLen) == 4 * sizeof(int64_t), "InferenceDims::selectLen reordered");
 static_assert(
-    offsetof(InferenceDims, attnMaskSeqLen) == 4 * sizeof(int64_t), "InferenceDims::attnMaskSeqLen reordered");
-static_assert(offsetof(InferenceDims, ropeBatch) == 5 * sizeof(int64_t), "InferenceDims::ropeBatch reordered");
-static_assert(offsetof(InferenceDims, packedMaskLen) == 6 * sizeof(int64_t), "InferenceDims::packedMaskLen reordered");
-static_assert(offsetof(InferenceDims, contextMaskSelectorLen) == 7 * sizeof(int64_t),
+    offsetof(InferenceDims, attnMaskSeqLen) == 5 * sizeof(int64_t), "InferenceDims::attnMaskSeqLen reordered");
+static_assert(offsetof(InferenceDims, ropeBatch) == 6 * sizeof(int64_t), "InferenceDims::ropeBatch reordered");
+static_assert(offsetof(InferenceDims, packedMaskLen) == 7 * sizeof(int64_t), "InferenceDims::packedMaskLen reordered");
+static_assert(offsetof(InferenceDims, contextMaskSelectorLen) == 8 * sizeof(int64_t),
     "InferenceDims::contextMaskSelectorLen reordered");
-static_assert(offsetof(InferenceDims, startIndexLen) == 8 * sizeof(int64_t), "InferenceDims::startIndexLen reordered");
+static_assert(offsetof(InferenceDims, startIndexLen) == 9 * sizeof(int64_t), "InferenceDims::startIndexLen reordered");
 static_assert(
-    offsetof(InferenceDims, specVerifyPhaseLen) == 9 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
-static_assert(offsetof(InferenceDims, skipSoftmaxScaleLen) == 10 * sizeof(int64_t),
+    offsetof(InferenceDims, specVerifyPhaseLen) == 10 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
+static_assert(offsetof(InferenceDims, skipSoftmaxScaleLen) == 11 * sizeof(int64_t),
     "InferenceDims::skipSoftmaxScaleLen reordered");
 
 namespace detail
@@ -119,6 +121,7 @@ inline constexpr std::array<std::pair<int64_t InferenceDims::*, std::string_view
     sizeof(InferenceDims) / sizeof(int64_t)>
     kDimNames = {{
         {&InferenceDims::batch, "batch"},
+        {&InferenceDims::tokenBatch, "token_batch"},
         {&InferenceDims::seqLen, "seq_len"},
         {&InferenceDims::kvLen, "kv_len"},
         {&InferenceDims::selectLen, "select_len"},
