@@ -50,6 +50,7 @@ StableKVPageManager::StableKVPageManager(Config const& config)
     mLeased.assign(static_cast<size_t>(mConfig.maxStableSlots), 0U);
     mLengths.assign(static_cast<size_t>(mConfig.maxStableSlots), 0);
     mSlotPages.resize(static_cast<size_t>(mConfig.maxStableSlots));
+    mPageRefCounts.assign(static_cast<size_t>(mConfig.numPages), 0);
 }
 
 int32_t StableKVPageManager::reserve()
@@ -69,8 +70,14 @@ void StableKVPageManager::release(int32_t stableSlot)
     auto& ownedPages = mSlotPages[static_cast<size_t>(stableSlot)];
     for (int32_t const page : ownedPages)
     {
-        bool const inserted = mFreePages.insert(page).second;
-        ELLM_CHECK(inserted, "Stable KV page has duplicate ownership");
+        int32_t& refCount = mPageRefCounts[static_cast<size_t>(page)];
+        ELLM_CHECK(refCount > 0, "Stable KV page has invalid reference count");
+        --refCount;
+        if (refCount == 0)
+        {
+            bool const inserted = mFreePages.insert(page).second;
+            ELLM_CHECK(inserted, "Stable KV page has duplicate ownership");
+        }
     }
     ownedPages.clear();
     mLengths[static_cast<size_t>(stableSlot)] = 0;
@@ -102,8 +109,33 @@ void StableKVPageManager::ensureCapacity(int32_t stableSlot, int32_t sequenceLen
     for (int32_t const page : reserved)
     {
         mFreePages.erase(page);
+        ++mPageRefCounts[static_cast<size_t>(page)];
         ownedPages.push_back(page);
     }
+}
+
+void StableKVPageManager::sharePrefix(int32_t sourceSlot, int32_t targetSlot, int32_t prefixLength)
+{
+    validateLease(sourceSlot);
+    validateLease(targetSlot);
+    ELLM_CHECK(sourceSlot != targetSlot, "Stable KV prefix source and target must differ");
+    ELLM_CHECK(prefixLength >= 0 && prefixLength <= mLengths[static_cast<size_t>(sourceSlot)],
+        "Stable KV shared prefix exceeds the source length");
+    ELLM_CHECK(
+        prefixLength % mConfig.tokensPerPage == 0, "Stable KV shared prefix must end on a physical page boundary");
+    auto& targetPages = mSlotPages[static_cast<size_t>(targetSlot)];
+    ELLM_CHECK(targetPages.empty(), "Stable KV prefix target must not own pages");
+    int32_t const sharedPages = pagesForLength(prefixLength);
+    auto const& sourcePages = mSlotPages[static_cast<size_t>(sourceSlot)];
+    ELLM_CHECK(sharedPages <= static_cast<int32_t>(sourcePages.size()),
+        "Stable KV source does not contain enough pages for the shared prefix");
+    targetPages.assign(sourcePages.begin(), sourcePages.begin() + sharedPages);
+    for (int32_t const page : targetPages)
+    {
+        ELLM_CHECK(mPageRefCounts[static_cast<size_t>(page)] > 0, "Stable KV source page is not referenced");
+        ++mPageRefCounts[static_cast<size_t>(page)];
+    }
+    mLengths[static_cast<size_t>(targetSlot)] = prefixLength;
 }
 
 void StableKVPageManager::setLength(int32_t stableSlot, int32_t length)

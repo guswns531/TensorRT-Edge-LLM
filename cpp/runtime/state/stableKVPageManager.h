@@ -59,6 +59,11 @@ public:
     //! Transactionally grow one stable slot to cover sequenceLength tokens.
     void ensureCapacity(int32_t stableSlot, int32_t sequenceLength);
 
+    //! Share complete physical pages from sourceSlot into an empty target slot.
+    //! The prefix must be page aligned so subsequent suffix writes cannot
+    //! mutate a page still referenced by the source request.
+    void sharePrefix(int32_t sourceSlot, int32_t targetSlot, int32_t prefixLength);
+
     //! Set and query the committed global length of one stable slot.
     void setLength(int32_t stableSlot, int32_t length);
     int32_t length(int32_t stableSlot) const;
@@ -90,6 +95,7 @@ private:
     std::vector<uint8_t> mLeased;
     std::vector<int32_t> mLengths;
     std::vector<std::vector<int32_t>> mSlotPages;
+    std::vector<int32_t> mPageRefCounts;
 };
 
 } // namespace rt

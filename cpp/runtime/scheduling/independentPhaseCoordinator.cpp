@@ -66,6 +66,14 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
         PhaseTensorRTContextMode::kIndependentConcurrent, safety);
 }
 
+void IndependentPhaseCoordinator::setCallbacks(IndependentPhaseCoordinatorCallbacks callbacks)
+{
+    ELLM_CHECK(!busy(), "Independent phase callbacks cannot change while work is in flight");
+    ELLM_CHECK(static_cast<bool>(callbacks.isDecodeFinished),
+        "Independent phase coordinator requires a decode termination callback");
+    mCallbacks = std::move(callbacks);
+}
+
 PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
 {
     PhaseDispatchWorkerCallbacks callbacks;
@@ -220,6 +228,16 @@ bool IndependentPhaseCoordinator::empty() const noexcept
 bool IndependentPhaseCoordinator::busy() const noexcept
 {
     return mWorker->busy();
+}
+
+TensorMap& IndependentPhaseCoordinator::prefillTensorMap() noexcept
+{
+    return mPrefillMap;
+}
+
+TensorMap& IndependentPhaseCoordinator::decodeTensorMap() noexcept
+{
+    return mDecodeMap;
 }
 
 PhaseQueueScheduler& IndependentPhaseCoordinator::scheduler() noexcept

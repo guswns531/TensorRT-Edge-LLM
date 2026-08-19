@@ -24,6 +24,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
+#include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
@@ -458,8 +459,8 @@ int main(int argc, char** argv)
                 totalLatencyMs / static_cast<double>(traceLatenciesMs.size()), traceLatenciesMs[p95Index]);
         }
 
-        // Real text payload path: tokenizer -> compact token staging -> embedding
-        // lookup -> TensorRT prefill/decode -> greedy sampling feedback.
+        // Real text payload path: tokenizer -> independent async server adapter ->
+        // compact token staging -> embedding lookup -> TensorRT prefill/decode.
         rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
         CUDA_CHECK(cudaStreamSynchronize(setupStream));
         rt::EmbeddingPreprocessor embeddingPreprocessor(embedding, config);
@@ -473,8 +474,6 @@ int main(int argc, char** argv)
             "memory transfers, and synchronization.",
         };
         std::unordered_map<uint64_t, std::vector<int32_t>> semanticPrompts;
-        std::unordered_map<uint64_t, std::vector<int32_t>> semanticOutputs;
-        std::unordered_map<uint64_t, int32_t> semanticSlots;
         constexpr int32_t kSEMANTIC_OUTPUT_TOKENS = 8;
         for (size_t index = 0; index < prompts.size(); ++index)
         {
@@ -486,11 +485,6 @@ int main(int argc, char** argv)
                 "Failed to format semantic phase request");
             semanticPrompts[requestId] = tokenizer.encode(formatted.formattedCompleteRequest, false);
             ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
-            int32_t const slot = ownership.reserve();
-            ownership.ensureCapacity(
-                slot, static_cast<int32_t>(semanticPrompts[requestId].size()) + kSEMANTIC_OUTPUT_TOKENS);
-            ownership.setLength(slot, 0);
-            semanticSlots[requestId] = slot;
         }
 
         rt::Tensor hostSemanticPrefillIds({config.maxSupportedBatchSize, config.maxPackedPrefillChunkTokens},
@@ -503,44 +497,46 @@ int main(int argc, char** argv)
             nvinfer1::DataType::kINT32, "semantic_phase_decode_ids");
         size_t const samplingWorkspaceBytes
             = getSelectAllTopKWorkspaceSize(config.maxSupportedBatchSize, config.outputVocabSize, 1);
-        rt::Tensor samplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT8, "semantic_phase_sampling_workspace");
-        rt::Tensor selectedTokenIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
-            "semantic_phase_selected_ids");
-        rt::Tensor hostSelectedTokenIds({config.maxSupportedBatchSize}, rt::DeviceType::kCPU,
-            nvinfer1::DataType::kINT32, "semantic_phase_host_selected_ids");
+        rt::Tensor prefillSamplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT8, "semantic_phase_prefill_sampling_workspace");
+        rt::Tensor decodeSamplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT8, "semantic_phase_decode_sampling_workspace");
+        rt::Tensor prefillSelectedIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
+        rt::Tensor decodeSelectedIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
+        rt::Tensor hostPrefillSelectedIds({config.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_selected_ids");
+        rt::Tensor hostDecodeSelectedIds({config.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_host_decode_selected_ids");
 
-        auto stageTokenIds = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io, cudaStream_t stream,
-                                 bool prefill) {
-            int32_t totalTokens = prefill ? 0 : static_cast<int32_t>(batch.size());
-            if (prefill)
+        auto stageTokens = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
+                               rt::TensorMap& map, cudaStream_t stream, bool prefill) {
+            int32_t totalTokens{};
+            for (rt::IndependentPhaseRequestView const& view : views)
             {
-                for (rt::PhaseWorkItem const& item : batch)
-                {
-                    totalTokens += item.tokenCount;
-                }
+                totalTokens += prefill ? view.work.tokenCount : 1;
             }
             rt::Coords const tokenShape
-                = prefill ? rt::Coords{1, totalTokens} : rt::Coords{static_cast<int64_t>(batch.size()), 1};
+                = prefill ? rt::Coords{1, totalTokens} : rt::Coords{static_cast<int64_t>(views.size()), 1};
             rt::Tensor& hostIds = prefill ? hostSemanticPrefillIds : hostSemanticDecodeIds;
             rt::Tensor& deviceIds = prefill ? deviceSemanticPrefillIds : deviceSemanticDecodeIds;
             ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
                 "Semantic phase token staging reshape failed");
             int32_t* destination = hostIds.dataPointer<int32_t>();
             int32_t destinationOffset{};
-            for (rt::PhaseWorkItem const& item : batch)
+            for (rt::IndependentPhaseRequestView const& view : views)
             {
                 if (prefill)
                 {
-                    std::vector<int32_t> const& prompt = semanticPrompts.at(item.requestId);
-                    std::copy_n(prompt.begin() + item.tokenOffset, item.tokenCount, destination + destinationOffset);
-                    destinationOffset += item.tokenCount;
+                    std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
+                        destination + destinationOffset);
+                    destinationOffset += view.work.tokenCount;
                 }
                 else
                 {
-                    ELLM_CHECK(!semanticOutputs.at(item.requestId).empty(),
-                        "Semantic decode request has no sampled input token");
-                    destination[destinationOffset++] = semanticOutputs.at(item.requestId).back();
+                    ELLM_CHECK(!view.generatedTokens->empty(), "Semantic decode request has no sampled input token");
+                    destination[destinationOffset++] = view.generatedTokens->back();
                 }
             }
             CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
@@ -551,52 +547,52 @@ int main(int argc, char** argv)
             {
                 for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
                 {
-                    prefillMap.set(binding_names::formatDeepstackEmbedsName(index), io.deepstackEmbeds[index]);
+                    map.set(binding_names::formatDeepstackEmbedsName(index), io.deepstackEmbeds[index]);
                 }
             }
         };
-        auto sampleBatch
-            = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io, cudaStream_t stream, bool prefill) {
-                  int32_t const batchSize = static_cast<int32_t>(batch.size());
-                  ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
-                          && selectedTokenIds.reshape({batchSize, 1}) && hostSelectedTokenIds.reshape({batchSize}),
-                      "Semantic phase sampling reshape failed");
-                  selectAllTopK(io.outputLogits, std::nullopt, selectedTokenIds, 1, samplingWorkspace, stream);
-                  CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIds.rawPointer(), selectedTokenIds.rawPointer(),
-                      static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-                  CUDA_CHECK(cudaStreamSynchronize(stream));
-                  int32_t const* selected = hostSelectedTokenIds.dataPointer<int32_t>();
-                  for (int32_t row = 0; row < batchSize; ++row)
-                  {
-                      rt::PhaseWorkItem const& item = batch[static_cast<size_t>(row)];
-                      bool const finalPrefill = item.tokenOffset + item.tokenCount == item.promptTokenCount;
-                      if (!prefill || finalPrefill)
-                      {
-                          semanticOutputs[item.requestId].push_back(selected[row]);
-                      }
-                  }
-              };
 
-        rt::IndependentPhaseCoordinatorCallbacks semanticCallbacks;
-        semanticCallbacks.stagePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
-                                             cudaStream_t stream) { stageTokenIds(batch, io, stream, true); };
-        semanticCallbacks.stageDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
-                                            cudaStream_t stream) { stageTokenIds(batch, io, stream, false); };
-        semanticCallbacks.completePrefillBatch = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
-                                                     cudaStream_t stream) { sampleBatch(batch, io, stream, true); };
-        semanticCallbacks.completeDecodeBatch = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
-                                                    cudaStream_t stream) { sampleBatch(batch, io, stream, false); };
-        auto semanticFinished = [&](rt::PhaseWorkItem const& item, int32_t) {
-            bool const finished
-                = semanticOutputs[item.requestId].size() >= static_cast<size_t>(kSEMANTIC_OUTPUT_TOKENS);
-            if (finished && ownership.leased(item.kvSlotId))
+        auto submitSampling = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
+                                  cudaStream_t stream, bool prefill) {
+            int32_t const batchSize = static_cast<int32_t>(views.size());
+            rt::Tensor& selectedIds = prefill ? prefillSelectedIds : decodeSelectedIds;
+            rt::Tensor& hostSelectedIds = prefill ? hostPrefillSelectedIds : hostDecodeSelectedIds;
+            rt::Tensor& workspace = prefill ? prefillSamplingWorkspace : decodeSamplingWorkspace;
+            ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
+                    && selectedIds.reshape({batchSize, 1}) && hostSelectedIds.reshape({batchSize}),
+                "Semantic phase sampling reshape failed");
+            selectAllTopK(io.outputLogits, std::nullopt, selectedIds, 1, workspace, stream);
+            CUDA_CHECK(cudaMemcpyAsync(hostSelectedIds.rawPointer(), selectedIds.rawPointer(),
+                static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            cudaEvent_t ready{};
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(ready, stream));
+            rt::Tensor* const hostSelectedIdsPtr = &hostSelectedIds;
+            auto ticket = std::make_unique<rt::IndependentPhaseSampleTicket>();
+            ticket->ready = ready;
+            ticket->fromPrefill = prefill;
+            for (rt::IndependentPhaseRequestView const& view : views)
             {
-                ownership.release(item.kvSlotId);
+                ticket->requestIds.push_back(view.requestId);
             }
-            return finished;
+            ticket->collect = [hostSelectedIdsPtr, batchSize]() {
+                int32_t const* selected = hostSelectedIdsPtr->dataPointer<int32_t>();
+                return std::vector<int32_t>(selected, selected + batchSize);
+            };
+            return ticket;
         };
-        semanticCallbacks.isPrefillFinished = semanticFinished;
-        semanticCallbacks.isDecodeFinished = semanticFinished;
+
+        rt::IndependentPhaseRequestAdapter semanticAdapter;
+        semanticAdapter.stagePrefill
+            = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io, rt::TensorMap& map,
+                  cudaStream_t stream) { stageTokens(views, io, map, stream, true); };
+        semanticAdapter.stageDecode
+            = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io, rt::TensorMap& map,
+                  cudaStream_t stream) { stageTokens(views, io, map, stream, false); };
+        semanticAdapter.submitSampling = submitSampling;
+
+        rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
+        seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
         semanticSchedulerConfig.maxPrefillBatchSize = 2;
         semanticSchedulerConfig.maxDecodeBatchSize = 3;
@@ -604,34 +600,37 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
-            *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(semanticCallbacks));
+            *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
+        rt::IndependentPhaseServerConfig serverConfig;
+        serverConfig.maxInFlightRequests = prompts.size();
+        serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
+        serverConfig.eosTokenIds = config.eosTokenIds;
+        rt::IndependentPhaseAsyncServer semanticServer(
+            serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter));
         for (size_t index = 0; index < prompts.size(); ++index)
         {
             uint64_t const requestId = 20000 + index;
-            std::vector<int32_t> const& prompt = semanticPrompts.at(requestId);
-            semanticCoordinator.enqueuePrefill({requestId, static_cast<int32_t>(prompt.size()),
-                semanticSlots.at(requestId), 0, static_cast<int32_t>(prompt.size())});
+            auto const submission = semanticServer.submit(requestId, semanticPrompts.at(requestId));
+            ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
+                "Semantic phase request admission failed");
         }
-        semanticCoordinator.runUntilIdle(64);
+        semanticServer.runUntilIdle(100000);
 
-        std::vector<std::string> semanticTexts;
-        semanticTexts.reserve(prompts.size());
-        for (size_t index = 0; index < prompts.size(); ++index)
+        std::unordered_map<uint64_t, std::string> semanticTexts;
+        while (auto completion = semanticServer.tryPopCompletion())
         {
-            uint64_t const requestId = 20000 + index;
-            std::vector<int32_t> const& outputIds = semanticOutputs.at(requestId);
-            semanticTexts.push_back(tokenizer.decode(outputIds, false));
+            semanticTexts[completion->requestId] = tokenizer.decode(completion->generatedTokens, false);
         }
-        LOG_INFO("Semantic phase outputs: output0='%s' output1='%s' output2='%s'", semanticTexts[0].c_str(),
-            semanticTexts[1].c_str(), semanticTexts[2].c_str());
-        ELLM_CHECK(semanticTexts[0].find("asynchronous") != std::string::npos
-                && semanticTexts[1].find("Dynamic batching") != std::string::npos
-                && semanticTexts[2].find("Kernel") != std::string::npos,
+        ELLM_CHECK(semanticTexts.size() == prompts.size(), "Semantic phase completion count mismatch");
+        LOG_INFO("Semantic phase outputs: output0='%s' output1='%s' output2='%s'", semanticTexts.at(20000).c_str(),
+            semanticTexts.at(20001).c_str(), semanticTexts.at(20002).c_str());
+        ELLM_CHECK(semanticTexts.at(20000).find("asynchronous") != std::string::npos
+                && semanticTexts.at(20001).find("Dynamic batching") != std::string::npos
+                && semanticTexts.at(20002).find("Kernel") != std::string::npos,
             "Semantic phase outputs do not match the expected Cosmos responses");
-        ELLM_CHECK(semanticCoordinator.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+        ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
             "Semantic phase requests did not drain and release every slot");
-        LOG_INFO("Semantic phase requests passed: output0='%s' output1='%s' output2='%s'", semanticTexts[0].c_str(),
-            semanticTexts[1].c_str(), semanticTexts[2].c_str());
+        LOG_INFO("Semantic phase requests passed through IndependentPhaseAsyncServer");
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));

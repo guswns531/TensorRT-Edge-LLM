@@ -67,6 +67,9 @@ public:
     IndependentPhaseCoordinator(IndependentPhaseCoordinator const&) = delete;
     IndependentPhaseCoordinator& operator=(IndependentPhaseCoordinator const&) = delete;
 
+    //! Replace request payload/completion hooks before the first dispatch.
+    void setCallbacks(IndependentPhaseCoordinatorCallbacks callbacks);
+
     void enqueuePrefill(PhaseWorkItem item);
     void enqueueDecode(PhaseWorkItem item);
     bool dispatchNext();
@@ -76,6 +79,8 @@ public:
 
     bool empty() const noexcept;
     bool busy() const noexcept;
+    TensorMap& prefillTensorMap() noexcept;
+    TensorMap& decodeTensorMap() noexcept;
     PhaseQueueScheduler& scheduler() noexcept;
     std::vector<PhaseDispatchMetrics> const& metrics() const noexcept;
     CUcontext cudaContext() const noexcept;
