@@ -119,6 +119,8 @@ public:
     IndependentPhaseServerSubmission submit(uint64_t requestId, std::vector<int32_t> promptTokens,
         int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
     bool cancel(uint64_t requestId);
+    //! Capture the currently prepared phase shapes for later execute() replay.
+    bool capturePreparedGraphs();
     bool poll();
     void runUntilIdle(size_t maxPolls);
 

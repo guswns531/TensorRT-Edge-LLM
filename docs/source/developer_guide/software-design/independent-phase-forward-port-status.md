@@ -1,0 +1,66 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Independent phase forward-port status
+
+The v0.10 forward-port now has a production-oriented C++ phase facade over one
+CUDA primary context and independent TensorRT prefill/decode execution
+contexts.
+
+## Implemented
+
+- `IndependentPhaseRequestAdapter` owns model-specific token, embedding,
+  deepstack, M-RoPE, and sampling callbacks.
+- `IndependentPhaseAsyncServer` owns continuous admission, stable leases,
+  queue cancellation, asynchronous sampling tickets, and completion delivery.
+- `StableKVPageManager` retains page reference counts and can share complete
+  page-aligned prefixes without a KV device-to-device copy.
+- `PhasePrefixReuseCache` retains prefix records by stable source slot and
+  evicts them with reference-counted page release.
+- `EngineExecutor::captureGraph()` is exposed through the phase coordinator for
+  prepared prefill/decode shapes.
+- Adaptive chunk candidates and dynamic prefill batch cost points are enabled
+  in the Cosmos semantic smoke path.
+
+## Validation
+
+The TensorRT 11.0 / CUDA 13.3 SM86 container validated:
+
+- 68 scheduler, phase-shell, and prefix-ownership tests.
+- Cosmos semantic async server output identity.
+- Prepared prefill/decode CUDA graph capture and replay.
+- Continuous trace: 16 requests, 46 dispatches, 22 overlap dispatches.
+- Non-graph overlap: `1.183x`; graph-enabled overlap: `1.145x` for the
+  prepared shape on the RTX 3080 test host.
+
+## Explicit capability gate
+
+Cosmos uses M-RoPE. Prefix reuse requires the adapter to provide absolute
+position metadata for the suffix after a shared page boundary. The generic
+stable-page cache is implemented and unit-tested, but the Cosmos adapter keeps
+`supportsPageAlignedPrefixReuse` disabled until that position contract is
+implemented. This avoids silently changing greedy output.
+
+## HTTP comparison boundary
+
+The v0.10 Python OpenAI/SSE server currently calls `LLMInferenceRuntime`
+directly. It does not yet construct `IndependentPhaseAsyncServer`, so the
+existing clean-v0.10/Current/vLLM HTTP comparison remains a transport baseline,
+while the new facade is validated at the C++ engine level. A transport adapter
+must be added before claiming a same-HTTP comparison for this forward-port.
+
+The preserved same-client HTTP baseline (Cosmos FP16, three-run median, from
+the existing trace artifact) is:
+
+| backend | generated token/s | TTFT median | TPOT median | E2E median | peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current | 4573.3 | 1870.1 ms | 13.71 ms | 2995.7 ms | 9185 |
+| vLLM | 4102.7 | 1825.6 ms | 17.35 ms | 3363.6 ms | 8154 |
+| clean upstream oracle | 1167.4 | 6874.5 ms | 6.20 ms | 7460.0 ms | 7348 |
+
+The clean upstream row is an optimistic fixed-batch replay oracle, not an
+OpenAI/SSE continuous server. These values therefore remain the comparison
+baseline, not a claim that the new C++ facade has already replaced the HTTP
+runtime.

@@ -77,6 +77,10 @@ public:
     void wait();
     void runUntilIdle(size_t maxDispatches);
 
+    //! Capture graphs for the currently prepared phase bindings. Callers must
+    //! prepare both phase views with stable shapes before invoking this method.
+    bool capturePreparedGraphs();
+
     bool empty() const noexcept;
     bool busy() const noexcept;
     TensorMap& prefillTensorMap() noexcept;

@@ -274,6 +274,13 @@ int main(int argc, char** argv)
                 "Failed to bind the stable paged-KV prefill view");
             ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
                 "Failed to bind the stable paged-KV decode view");
+            if (std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr)
+            {
+                bool const prefillGraph = pair->prefillExecutor().captureGraph(prefillStream);
+                bool const decodeGraph = pair->decodeExecutor().captureGraph(decodeStream);
+                LOG_INFO("Prepared phase CUDA graphs: prefill=%s decode=%s", prefillGraph ? "yes" : "no",
+                    decodeGraph ? "yes" : "no");
+            }
             constexpr int32_t kWARMUP = 20;
             constexpr int32_t kITERATIONS = 100;
             PhaseTiming const sequential = measureSequential(
@@ -599,6 +606,30 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.maxPrefillChunkTokens = 128;
         semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
+        semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
+        semanticSchedulerConfig.minPrefillChunkTokens = 32;
+        semanticSchedulerConfig.prefillChunkAlignment = 8;
+        semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
+        semanticSchedulerConfig.enableDynamicPrefillBatching = true;
+        semanticSchedulerConfig.minDynamicPrefillBatchSize = 1;
+        semanticSchedulerConfig.prefillBatchCosts = {
+            {1, 32, 2048, 3, true, 7.0F, 1.0F},
+            {2, 32, 2048, 3, true, 8.5F, 1.5F},
+            {1, 64, 2048, 3, true, 8.5F, 1.2F},
+            {2, 64, 2048, 3, true, 10.0F, 1.8F},
+            {1, 128, 2048, 3, true, 13.7F, 2.5F},
+            {2, 128, 2048, 3, true, 15.5F, 3.0F},
+            {1, 32, 2048, 3, false, 7.0F, 1.0F},
+            {2, 32, 2048, 3, false, 8.5F, 1.5F},
+            {1, 64, 2048, 3, false, 8.5F, 1.2F},
+            {2, 64, 2048, 3, false, 10.0F, 1.8F},
+            {1, 128, 2048, 3, false, 13.7F, 2.5F},
+            {2, 128, 2048, 3, false, 15.5F, 3.0F},
+        };
+        semanticSchedulerConfig.enableMetricsPolicy = true;
+        semanticSchedulerConfig.minMetricsSamples = 2;
+        semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
+        semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
         rt::IndependentPhaseServerConfig serverConfig;

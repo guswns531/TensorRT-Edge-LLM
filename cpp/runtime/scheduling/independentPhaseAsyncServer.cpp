@@ -117,6 +117,13 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
     return true;
 }
 
+bool IndependentPhaseAsyncServer::capturePreparedGraphs()
+{
+    ELLM_CHECK(
+        mRequests.empty() && mSamplingTickets.empty(), "Phase graphs cannot be captured while requests are active");
+    return mCoordinator.capturePreparedGraphs();
+}
+
 bool IndependentPhaseAsyncServer::poll()
 {
     bool progressed = mCoordinator.poll();

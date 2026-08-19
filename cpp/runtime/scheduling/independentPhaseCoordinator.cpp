@@ -220,6 +220,14 @@ void IndependentPhaseCoordinator::runUntilIdle(size_t maxDispatches)
     mWorker->runUntilIdle(maxDispatches);
 }
 
+bool IndependentPhaseCoordinator::capturePreparedGraphs()
+{
+    ELLM_CHECK(!busy(), "Independent phase graphs cannot be captured while work is in flight");
+    bool const prefillCaptured = mExecutors.prefillExecutor().captureGraph(mPrefillStream);
+    bool const decodeCaptured = mExecutors.decodeExecutor().captureGraph(mDecodeStream);
+    return prefillCaptured && decodeCaptured;
+}
+
 bool IndependentPhaseCoordinator::empty() const noexcept
 {
     return mScheduler.empty() && !mWorker->busy();
