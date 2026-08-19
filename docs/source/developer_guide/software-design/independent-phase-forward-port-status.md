@@ -43,13 +43,19 @@ stable-page cache is implemented and unit-tested, but the Cosmos adapter keeps
 `supportsPageAlignedPrefixReuse` disabled until that position contract is
 implemented. This avoids silently changing greedy output.
 
-## HTTP comparison boundary
+## HTTP transport
 
-The v0.10 Python OpenAI/SSE server currently calls `LLMInferenceRuntime`
-directly. It does not yet construct `IndependentPhaseAsyncServer`, so the
-existing clean-v0.10/Current/vLLM HTTP comparison remains a transport baseline,
-while the new facade is validated at the C++ engine level. A transport adapter
-must be added before claiming a same-HTTP comparison for this forward-port.
+`TRT_EDGELLM_PHASE_IPC=1` enables a JSON-lines process mode in the phase smoke
+backend. `scripts/phase_openai_gateway.py` forwards complete OpenAI request
+payloads to this backend and emits OpenAI-compatible SSE events. This path
+uses `IndependentPhaseAsyncServer`, including continuous admission and
+event-based completion.
+The gateway sends a cancel control message when an SSE client disconnects;
+queued requests release their stable lease immediately, while in-flight work
+keeps the lease until its CUDA event boundary.
+
+The v0.10 Python OpenAI/SSE server still calls `LLMInferenceRuntime` directly;
+the IPC gateway is the transport adapter for the new forward-port facade.
 
 The preserved same-client HTTP baseline (Cosmos FP16, three-run median, from
 the existing trace artifact) is:
@@ -62,5 +68,6 @@ the existing trace artifact) is:
 
 The clean upstream row is an optimistic fixed-batch replay oracle, not an
 OpenAI/SSE continuous server. These values therefore remain the comparison
-baseline, not a claim that the new C++ facade has already replaced the HTTP
-runtime.
+baseline. A fresh 12-request IPC HTTP trace (same OpenAI/SSE client) measured
+`905` generated tokens, `362.4 token/s`, TTFT median/p95
+`1872.1/2430.1 ms`, and E2E median/p95 `1874.8/2432.8 ms`.

@@ -34,13 +34,18 @@
 #include "sampler/sampling.h"
 #include "tokenizer/tokenizer.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -633,35 +638,169 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
         rt::IndependentPhaseServerConfig serverConfig;
-        serverConfig.maxInFlightRequests = prompts.size();
+        serverConfig.maxInFlightRequests = config.maxSupportedBatchSize;
         serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
         serverConfig.eosTokenIds = config.eosTokenIds;
         rt::IndependentPhaseAsyncServer semanticServer(
             serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter));
-        for (size_t index = 0; index < prompts.size(); ++index)
+        bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
+        if (ipcMode)
         {
-            uint64_t const requestId = 20000 + index;
-            auto const submission = semanticServer.submit(requestId, semanticPrompts.at(requestId));
-            ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
-                "Semantic phase request admission failed");
+            std::deque<std::string> pendingLines;
+            std::mutex pendingMutex;
+            bool inputClosed{};
+            std::thread inputReader([&]() {
+                std::string line;
+                while (std::getline(std::cin, line))
+                {
+                    if (!line.empty())
+                    {
+                        std::lock_guard<std::mutex> lock(pendingMutex);
+                        pendingLines.push_back(std::move(line));
+                    }
+                }
+                std::lock_guard<std::mutex> lock(pendingMutex);
+                inputClosed = true;
+            });
+            std::cout << "PHASE_EVENT\t{\"type\":\"ready\"}" << std::endl;
+            std::unordered_map<uint64_t, int32_t> promptLengths;
+            while (true)
+            {
+                std::deque<std::string> lines;
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    lines.swap(pendingLines);
+                }
+                while (!lines.empty())
+                {
+                    nlohmann::json const payload = nlohmann::json::parse(lines.front());
+                    uint64_t const requestId = payload.value("request_index", uint64_t{});
+                    if (payload.value("type", "submit") == "cancel")
+                    {
+                        bool const cancelled = semanticServer.cancel(requestId);
+                        nlohmann::json const cancelEvent{
+                            {"type", "cancelled"}, {"request_index", requestId}, {"cancelled", cancelled}};
+                        std::cout << "PHASE_EVENT\t" << cancelEvent.dump() << std::endl;
+                        lines.pop_front();
+                        continue;
+                    }
+                    nlohmann::json const requestPayload = payload.contains("request") ? payload.at("request") : payload;
+                    rt::LLMGenerationRequest::Request request;
+                    if (requestPayload.contains("messages") && requestPayload.at("messages").is_array())
+                    {
+                        for (auto const& message : requestPayload.at("messages"))
+                        {
+                            std::string content;
+                            if (message.contains("content") && message.at("content").is_string())
+                            {
+                                content = message.at("content").get<std::string>();
+                            }
+                            std::string const role = message.value("role", "user");
+                            request.messages.push_back({role, {{"text", content}}});
+                        }
+                    }
+                    rt::LLMGenerationRequest::FormattedRequest formatted;
+                    ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
+                        "Failed to format IPC phase request");
+                    std::vector<int32_t> const tokenIds = tokenizer.encode(formatted.formattedCompleteRequest, false);
+                    int32_t maxOutputTokens = serverConfig.defaultMaxOutputTokens;
+                    if (requestPayload.contains("max_output_tokens"))
+                    {
+                        maxOutputTokens = requestPayload.at("max_output_tokens").get<int32_t>();
+                    }
+                    else if (requestPayload.contains("max_tokens"))
+                    {
+                        maxOutputTokens = requestPayload.at("max_tokens").get<int32_t>();
+                    }
+                    else if (requestPayload.contains("max_generate_length"))
+                    {
+                        maxOutputTokens = requestPayload.at("max_generate_length").get<int32_t>();
+                    }
+                    auto const submission = semanticServer.submit(requestId, tokenIds, maxOutputTokens);
+                    if (submission.status == rt::IndependentPhaseServerStatus::kAdmitted)
+                    {
+                        promptLengths[requestId] = static_cast<int32_t>(tokenIds.size());
+                        lines.pop_front();
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                static_cast<void>(semanticServer.poll());
+                while (auto completion = semanticServer.tryPopCompletion())
+                {
+                    int32_t const promptLength = promptLengths[completion->requestId];
+                    for (size_t tokenIndex{}; tokenIndex < completion->generatedTokens.size(); ++tokenIndex)
+                    {
+                        nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", completion->requestId},
+                            {"token_id", completion->generatedTokens[tokenIndex]},
+                            {"text",
+                                tokenizer.decode(
+                                    std::vector<int32_t>{completion->generatedTokens[tokenIndex]}, false)}};
+                        std::cout << "PHASE_EVENT\t" << tokenEvent.dump() << std::endl;
+                    }
+                    nlohmann::json const completionEvent{{"type", "completion"},
+                        {"request_index", completion->requestId}, {"finish_reason", "length"},
+                        {"prompt_tokens", promptLength}, {"output_tokens", completion->generatedTokens.size()},
+                        {"latency_ms", completion->latencyMs}};
+                    std::cout << "PHASE_EVENT\t" << completionEvent.dump() << std::endl;
+                    promptLengths.erase(completion->requestId);
+                }
+                bool closed{};
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    closed = inputClosed;
+                }
+                bool noPendingLines{};
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    noPendingLines = pendingLines.empty();
+                }
+                if (closed && lines.empty() && noPendingLines && semanticServer.empty())
+                {
+                    break;
+                }
+                if (!lines.empty())
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    while (!lines.empty())
+                    {
+                        pendingLines.push_front(std::move(lines.back()));
+                        lines.pop_back();
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            inputReader.join();
         }
-        semanticServer.runUntilIdle(100000);
+        else
+        {
+            for (size_t index = 0; index < prompts.size(); ++index)
+            {
+                uint64_t const requestId = 20000 + index;
+                auto const submission = semanticServer.submit(requestId, semanticPrompts.at(requestId));
+                ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
+                    "Semantic phase request admission failed");
+            }
+            semanticServer.runUntilIdle(100000);
 
-        std::unordered_map<uint64_t, std::string> semanticTexts;
-        while (auto completion = semanticServer.tryPopCompletion())
-        {
-            semanticTexts[completion->requestId] = tokenizer.decode(completion->generatedTokens, false);
+            std::unordered_map<uint64_t, std::string> semanticTexts;
+            while (auto completion = semanticServer.tryPopCompletion())
+            {
+                semanticTexts[completion->requestId] = tokenizer.decode(completion->generatedTokens, false);
+            }
+            ELLM_CHECK(semanticTexts.size() == prompts.size(), "Semantic phase completion count mismatch");
+            LOG_INFO("Semantic phase outputs: output0='%s' output1='%s' output2='%s'", semanticTexts.at(20000).c_str(),
+                semanticTexts.at(20001).c_str(), semanticTexts.at(20002).c_str());
+            ELLM_CHECK(semanticTexts.at(20000).find("asynchronous") != std::string::npos
+                    && semanticTexts.at(20001).find("Dynamic batching") != std::string::npos
+                    && semanticTexts.at(20002).find("Kernel") != std::string::npos,
+                "Semantic phase outputs do not match the expected Cosmos responses");
+            ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+                "Semantic phase requests did not drain and release every slot");
+            LOG_INFO("Semantic phase requests passed through IndependentPhaseAsyncServer");
         }
-        ELLM_CHECK(semanticTexts.size() == prompts.size(), "Semantic phase completion count mismatch");
-        LOG_INFO("Semantic phase outputs: output0='%s' output1='%s' output2='%s'", semanticTexts.at(20000).c_str(),
-            semanticTexts.at(20001).c_str(), semanticTexts.at(20002).c_str());
-        ELLM_CHECK(semanticTexts.at(20000).find("asynchronous") != std::string::npos
-                && semanticTexts.at(20001).find("Dynamic batching") != std::string::npos
-                && semanticTexts.at(20002).find("Kernel") != std::string::npos,
-            "Semantic phase outputs do not match the expected Cosmos responses");
-        ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
-            "Semantic phase requests did not drain and release every slot");
-        LOG_INFO("Semantic phase requests passed through IndependentPhaseAsyncServer");
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));
