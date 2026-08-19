@@ -77,3 +77,11 @@ OpenAI/SSE continuous server. These values therefore remain the comparison
 baseline. A fresh 12-request IPC HTTP trace (same OpenAI/SSE client) measured
 `905` generated tokens, `362.4 token/s`, TTFT median/p95
 `1872.1/2430.1 ms`, and E2E median/p95 `1874.8/2432.8 ms`.
+
+The same trace against the local vLLM container measured `988` generated
+tokens, `1010.9 token/s`, TTFT median/p95 `87.4/93.7 ms`, and E2E median/p95
+`643.4/967.8 ms`. The IPC backend emits sampled tokens after a completion
+ticket, so its TPOT and token count are not directly comparable to vLLM's
+per-token streaming path. The clean v0.10 public runtime still has no
+continuous HTTP endpoint; its fixed-batch replay remains the clean oracle
+until a matching HTTP adapter is added.
