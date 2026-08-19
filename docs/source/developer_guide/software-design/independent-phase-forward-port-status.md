@@ -35,19 +35,14 @@ The TensorRT 11.0 / CUDA 13.3 SM86 container validated:
 - Non-graph overlap: `1.183x`; graph-enabled overlap: `1.145x` for the
   prepared shape on the RTX 3080 test host.
 
-## Explicit capability gate
+## Prefix reuse gate
 
-Cosmos uses M-RoPE. Prefix reuse requires the adapter to provide absolute
-position metadata for the suffix after a shared page boundary. The generic
-stable-page cache is implemented and unit-tested, but the Cosmos adapter keeps
-`supportsPageAlignedPrefixReuse` disabled until that position contract is
-implemented. This avoids silently changing greedy output.
-
-The current correctness-safe policy also admits at most one active reader of a
-published source prefix. This prevents a packed dispatch from mixing a shared
-suffix row with another row that aliases the same physical page. Sequential
-prefix reuse is deterministic; multi-reader page sharing remains a future
-optimization after a plugin-level aliasing contract is added.
+Earlier IPC measurements accidentally enabled the capability flag without
+passing a `PhasePrefixReuseCache` to the server. They did not exercise reuse
+and must not be used as evidence. The corrected gate passes a real cache,
+executes one cold request, verifies that the second request reuses 128 tokens,
+and compares greedy token IDs. This off/on gate passes for Cosmos M-RoPE.
+Prefix reuse remains opt-in through `TRT_EDGELLM_ENABLE_PREFIX_REUSE`.
 
 ## HTTP transport
 
@@ -74,14 +69,16 @@ the existing trace artifact) is:
 
 The clean upstream row is an optimistic fixed-batch replay oracle, not an
 OpenAI/SSE continuous server. These values therefore remain the comparison
-baseline. A fresh 12-request IPC HTTP trace (same OpenAI/SSE client) measured
-`905` generated tokens, `362.4 token/s`, TTFT median/p95
-`1872.1/2430.1 ms`, and E2E median/p95 `1874.8/2432.8 ms`.
+baseline. The corrected IPC backend emits each token after its sampling event
+rather than replaying every token at final completion. A fresh 12-request HTTP
+trace measured `905` generated tokens, `364.4 token/s`, TTFT median/p95
+`207.5/1409.9 ms`, TPOT median/p95 `17.83/21.66 ms`, and E2E median/p95
+`1852.7/2417.9 ms`.
 
 The same trace against the local vLLM container measured `988` generated
 tokens, `1010.9 token/s`, TTFT median/p95 `87.4/93.7 ms`, and E2E median/p95
-`643.4/967.8 ms`. The IPC backend emits sampled tokens after a completion
-ticket, so its TPOT and token count are not directly comparable to vLLM's
-per-token streaming path. The clean v0.10 public runtime still has no
+`643.4/967.8 ms`, with TPOT median/p95 `7.07/8.23 ms`. The token counts differ
+(`905` versus `988`), so this is a serving-path comparison, not a fixed-output
+kernel comparison. The clean v0.10 public runtime still has no
 continuous HTTP endpoint; its fixed-batch replay remains the clean oracle
 until a matching HTTP adapter is added.

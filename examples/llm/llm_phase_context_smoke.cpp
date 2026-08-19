@@ -617,22 +617,6 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.minPrefillChunkTokens = 32;
         semanticSchedulerConfig.prefillChunkAlignment = 8;
         semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
-        semanticSchedulerConfig.enableDynamicPrefillBatching = true;
-        semanticSchedulerConfig.minDynamicPrefillBatchSize = 1;
-        semanticSchedulerConfig.prefillBatchCosts = {
-            {1, 32, 2048, 3, true, 7.0F, 1.0F},
-            {2, 32, 2048, 3, true, 8.5F, 1.5F},
-            {1, 64, 2048, 3, true, 8.5F, 1.2F},
-            {2, 64, 2048, 3, true, 10.0F, 1.8F},
-            {1, 128, 2048, 3, true, 13.7F, 2.5F},
-            {2, 128, 2048, 3, true, 15.5F, 3.0F},
-            {1, 32, 2048, 3, false, 7.0F, 1.0F},
-            {2, 32, 2048, 3, false, 8.5F, 1.5F},
-            {1, 64, 2048, 3, false, 8.5F, 1.2F},
-            {2, 64, 2048, 3, false, 10.0F, 1.8F},
-            {1, 128, 2048, 3, false, 13.7F, 2.5F},
-            {2, 128, 2048, 3, false, 15.5F, 3.0F},
-        };
         semanticSchedulerConfig.enableMetricsPolicy = true;
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
@@ -644,10 +628,57 @@ int main(int argc, char** argv)
         serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
         serverConfig.eosTokenIds = config.eosTokenIds;
         serverConfig.enablePrefixReuse = enablePrefixReuse;
+        std::unique_ptr<rt::PhasePrefixReuseCache> semanticPrefixCache;
+        if (enablePrefixReuse)
+        {
+            semanticPrefixCache = std::make_unique<rt::PhasePrefixReuseCache>(ownership, 1);
+        }
         rt::IndependentPhaseAsyncServer semanticServer(
-            serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter));
+            serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter), semanticPrefixCache.get());
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
-        if (ipcMode)
+        bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
+        if (prefixReuseGate)
+        {
+            ELLM_CHECK(enablePrefixReuse && semanticPrefixCache != nullptr,
+                "Prefix reuse gate requires TRT_EDGELLM_ENABLE_PREFIX_REUSE=1");
+            std::string longPrompt;
+            for (int32_t index{}; index < 160; ++index)
+            {
+                longPrompt += " reusable";
+            }
+            longPrompt += " Explain how stable prefixes reduce latency.";
+            rt::LLMGenerationRequest::Request request;
+            request.messages.push_back({"user", {{"text", longPrompt}}});
+            rt::LLMGenerationRequest::FormattedRequest formatted;
+            ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
+                "Failed to format prefix reuse gate request");
+            std::vector<int32_t> const tokenIds = tokenizer.encode(formatted.formattedCompleteRequest, false);
+            auto const sourceSubmission = semanticServer.submit(22000, tokenIds, kSEMANTIC_OUTPUT_TOKENS);
+            ELLM_CHECK(sourceSubmission.status == rt::IndependentPhaseServerStatus::kAdmitted
+                    && sourceSubmission.reusedPrefixTokens == 0,
+                "Prefix reuse gate source admission failed");
+            semanticServer.runUntilIdle(100000);
+            auto sourceCompletion = semanticServer.tryPopCompletion();
+            ELLM_CHECK(sourceCompletion.has_value(), "Prefix reuse gate source did not complete");
+            while (semanticServer.tryPopToken().has_value())
+            {
+            }
+            auto const targetSubmission = semanticServer.submit(22001, tokenIds, kSEMANTIC_OUTPUT_TOKENS);
+            ELLM_CHECK(targetSubmission.status == rt::IndependentPhaseServerStatus::kAdmitted
+                    && targetSubmission.reusedPrefixTokens >= 128,
+                "Prefix reuse gate target did not reuse a complete page");
+            semanticServer.runUntilIdle(100000);
+            auto targetCompletion = semanticServer.tryPopCompletion();
+            ELLM_CHECK(
+                targetCompletion.has_value() && targetCompletion->generatedTokens == sourceCompletion->generatedTokens,
+                "Prefix reuse changed greedy output");
+            semanticPrefixCache->clear();
+            ELLM_CHECK(ownership.availableSlots() == config.maxSupportedBatchSize,
+                "Prefix reuse gate did not release every stable slot");
+            LOG_INFO(
+                "Prefix reuse off/on greedy output gate passed: reused_tokens=%d", targetSubmission.reusedPrefixTokens);
+        }
+        else if (ipcMode)
         {
             std::deque<std::string> pendingLines;
             std::mutex pendingMutex;
@@ -698,6 +729,16 @@ int main(int argc, char** argv)
                             {
                                 content = message.at("content").get<std::string>();
                             }
+                            else if (message.contains("content") && message.at("content").is_array())
+                            {
+                                for (auto const& part : message.at("content"))
+                                {
+                                    if (part.value("type", "") == "text" && part.contains("text"))
+                                    {
+                                        content += part.at("text").get<std::string>();
+                                    }
+                                }
+                            }
                             std::string const role = message.value("role", "user");
                             request.messages.push_back({role, {{"text", content}}});
                         }
@@ -731,20 +772,20 @@ int main(int argc, char** argv)
                     }
                 }
                 static_cast<void>(semanticServer.poll());
+                while (auto token = semanticServer.tryPopToken())
+                {
+                    nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", token->requestId},
+                        {"token_id", token->tokenId},
+                        {"text", tokenizer.decode(std::vector<int32_t>{token->tokenId}, false)},
+                        {"output_index", token->outputIndex}, {"elapsed_ms", token->elapsedMs}};
+                    std::cout << "PHASE_EVENT\t" << tokenEvent.dump() << std::endl;
+                }
                 while (auto completion = semanticServer.tryPopCompletion())
                 {
                     int32_t const promptLength = promptLengths[completion->requestId];
-                    for (size_t tokenIndex{}; tokenIndex < completion->generatedTokens.size(); ++tokenIndex)
-                    {
-                        nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", completion->requestId},
-                            {"token_id", completion->generatedTokens[tokenIndex]},
-                            {"text",
-                                tokenizer.decode(
-                                    std::vector<int32_t>{completion->generatedTokens[tokenIndex]}, false)}};
-                        std::cout << "PHASE_EVENT\t" << tokenEvent.dump() << std::endl;
-                    }
                     nlohmann::json const completionEvent{{"type", "completion"},
-                        {"request_index", completion->requestId}, {"finish_reason", "length"},
+                        {"request_index", completion->requestId},
+                        {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
                         {"prompt_tokens", promptLength}, {"output_tokens", completion->generatedTokens.size()},
                         {"latency_ms", completion->latencyMs}};
                     std::cout << "PHASE_EVENT\t" << completionEvent.dump() << std::endl;

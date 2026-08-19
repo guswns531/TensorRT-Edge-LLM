@@ -63,39 +63,24 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     {
         return result;
     }
-    if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && !mActiveSharedPrefixSources.empty())
-    {
-        // A v1 packed-prefill engine must not mix a suffix that reads a
-        // shared page with an unrelated initial row in the same dispatch.
-        // Keep admission queued until the active shared-prefix reader retires.
-        return result;
-    }
     maxOutputTokens = maxOutputTokens > 0 ? maxOutputTokens : mConfig.defaultMaxOutputTokens;
 
     int32_t const slot = mOwnership.reserve();
     int32_t reusedPrefixTokens{};
-    int32_t sharedPrefixSourceSlot{-1};
     try
     {
         if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && mPrefixCache != nullptr)
         {
-            if (auto const match = mPrefixCache->lookup(promptTokens); match.has_value()
-                && mActiveSharedPrefixSources.find(match->sourceSlot) == mActiveSharedPrefixSources.end())
+            if (auto const match = mPrefixCache->lookup(promptTokens); match.has_value())
             {
                 mOwnership.sharePrefix(match->sourceSlot, slot, match->matchedTokens);
                 reusedPrefixTokens = match->matchedTokens;
-                sharedPrefixSourceSlot = match->sourceSlot;
-                mActiveSharedPrefixSources.insert(match->sourceSlot);
             }
         }
         mOwnership.ensureCapacity(slot, static_cast<int32_t>(promptTokens.size()) + maxOutputTokens);
     }
     catch (std::runtime_error const&)
     {
-        if (sharedPrefixSourceSlot >= 0)
-        {
-            mActiveSharedPrefixSources.erase(sharedPrefixSourceSlot);
-        }
         mOwnership.release(slot);
         return result;
     }
@@ -104,7 +89,6 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     state.promptTokens = std::move(promptTokens);
     state.maxOutputTokens = maxOutputTokens;
     state.kvSlotId = slot;
-    state.sharedPrefixSourceSlot = sharedPrefixSourceSlot;
     state.scheduling = scheduling;
     state.submittedAt = std::chrono::steady_clock::now();
     mRequests.emplace(requestId, std::move(state));
@@ -127,10 +111,6 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
     if (!mCoordinator.scheduler().cancel(requestId))
     {
         return false;
-    }
-    if (it->second.sharedPrefixSourceSlot >= 0)
-    {
-        mActiveSharedPrefixSources.erase(it->second.sharedPrefixSourceSlot);
     }
     mOwnership.release(it->second.kvSlotId);
     mRequests.erase(it);
@@ -175,6 +155,17 @@ std::optional<IndependentPhaseServerCompletion> IndependentPhaseAsyncServer::try
     }
     IndependentPhaseServerCompletion result = std::move(mCompletions.front());
     mCompletions.pop_front();
+    return result;
+}
+
+std::optional<IndependentPhaseServerToken> IndependentPhaseAsyncServer::tryPopToken()
+{
+    if (mTokenEvents.empty())
+    {
+        return std::nullopt;
+    }
+    IndependentPhaseServerToken result = std::move(mTokenEvents.front());
+    mTokenEvents.pop_front();
     return result;
 }
 
@@ -286,9 +277,14 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         }
         RequestState& state = it->second;
         state.generatedTokens.push_back(tokens[index]);
-        if (isEos(tokens[index]) || static_cast<int32_t>(state.generatedTokens.size()) >= state.maxOutputTokens)
+        bool const eos = isEos(tokens[index]);
+        double const elapsedMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
+        mTokenEvents.push_back(
+            {requestId, tokens[index], static_cast<int32_t>(state.generatedTokens.size() - 1U), eos, elapsedMs});
+        if (eos || static_cast<int32_t>(state.generatedTokens.size()) >= state.maxOutputTokens)
         {
-            finishRequest(requestId);
+            finishRequest(requestId, eos);
         }
         else
         {
@@ -299,7 +295,7 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
     destroyTicketEvent(*ticket);
 }
 
-void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId)
+void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stoppedByEos)
 {
     auto it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Finished phase request is missing");
@@ -313,13 +309,9 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId)
     {
         mOwnership.release(state.kvSlotId);
     }
-    if (state.sharedPrefixSourceSlot >= 0)
-    {
-        mActiveSharedPrefixSources.erase(state.sharedPrefixSourceSlot);
-    }
     double const latencyMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
-    mCompletions.push_back({requestId, std::move(state.generatedTokens), latencyMs});
+    mCompletions.push_back({requestId, std::move(state.generatedTokens), latencyMs, stoppedByEos});
     mRequests.erase(it);
 }
 

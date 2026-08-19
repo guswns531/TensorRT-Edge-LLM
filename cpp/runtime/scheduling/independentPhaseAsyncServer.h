@@ -30,7 +30,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm::rt
@@ -100,6 +99,16 @@ struct IndependentPhaseServerCompletion
     uint64_t requestId{};
     std::vector<int32_t> generatedTokens;
     double latencyMs{};
+    bool stoppedByEos{};
+};
+
+struct IndependentPhaseServerToken
+{
+    uint64_t requestId{};
+    int32_t tokenId{};
+    int32_t outputIndex{};
+    bool isEos{};
+    double elapsedMs{};
 };
 
 //! Production-facing event-loop facade over independent prefill/decode contexts.
@@ -125,6 +134,7 @@ public:
     bool poll();
     void runUntilIdle(size_t maxPolls);
 
+    std::optional<IndependentPhaseServerToken> tryPopToken();
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
     size_t inFlightCount() const noexcept;
     bool empty() const noexcept;
@@ -136,7 +146,6 @@ private:
         std::vector<int32_t> generatedTokens;
         int32_t maxOutputTokens{};
         int32_t kvSlotId{-1};
-        int32_t sharedPrefixSourceSlot{-1};
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
     };
@@ -146,7 +155,7 @@ private:
     bool isEos(int32_t tokenId) const noexcept;
     void processSamplingTickets();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
-    void finishRequest(uint64_t requestId);
+    void finishRequest(uint64_t requestId, bool stoppedByEos);
     void destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept;
 
     IndependentPhaseServerConfig mConfig;
@@ -155,8 +164,8 @@ private:
     IndependentPhaseRequestAdapter mAdapter;
     PhasePrefixReuseCache* mPrefixCache{};
     std::unordered_map<uint64_t, RequestState> mRequests;
-    std::unordered_set<int32_t> mActiveSharedPrefixSources;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
+    std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
 };
 
