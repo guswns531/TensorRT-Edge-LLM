@@ -84,6 +84,7 @@ struct IndependentPhaseServerConfig
     int32_t defaultMaxOutputTokens{128};
     std::vector<int32_t> eosTokenIds;
     bool enablePrefixReuse{};
+    bool enableCudaGraphs{};
 };
 
 struct IndependentPhaseServerSubmission

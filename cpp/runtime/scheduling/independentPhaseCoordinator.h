@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm::rt
@@ -80,6 +82,8 @@ public:
     //! Capture graphs for the currently prepared phase bindings. Callers must
     //! prepare both phase views with stable shapes before invoking this method.
     bool capturePreparedGraphs();
+    //! Capture a graph the first time each production phase shape is observed.
+    void setGraphCaptureEnabled(bool enabled) noexcept;
 
     bool empty() const noexcept;
     bool busy() const noexcept;
@@ -111,6 +115,9 @@ private:
     PhaseQueueScheduler mScheduler;
     std::unique_ptr<PhaseDispatchWorker> mWorker;
     std::vector<PhaseDispatchMetrics> mMetrics;
+    std::unordered_set<std::string> mCapturedPrefillShapes;
+    std::unordered_set<std::string> mCapturedDecodeShapes;
+    bool mGraphCaptureEnabled{};
 };
 
 } // namespace trt_edgellm::rt

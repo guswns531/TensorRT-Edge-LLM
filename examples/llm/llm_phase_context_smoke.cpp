@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -53,6 +54,9 @@ using namespace trt_edgellm;
 
 namespace
 {
+
+constexpr int32_t kDEFAULT_STABLE_SLOTS = 80;
+constexpr size_t kDEFAULT_MAX_INFLIGHT_REQUESTS = 16U;
 
 struct PhaseTiming
 {
@@ -226,8 +230,15 @@ int main(int argc, char** argv)
         resources->externalWeightManager->registerTensorMapEntries(prefillMap);
         resources->externalWeightManager->registerTensorMapEntries(decodeMap);
 
-        rt::StableKVPageManager ownership({config.maxSupportedBatchSize, config.maxSupportedBatchSize,
-            config.kvPoolPages, config.maxKVCacheCapacity, 128});
+        int32_t maxStableSlots = std::max(kDEFAULT_STABLE_SLOTS, config.maxSupportedBatchSize);
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_STABLE_SLOTS"))
+        {
+            maxStableSlots = std::stoi(value);
+        }
+        ELLM_CHECK(maxStableSlots >= config.maxSupportedBatchSize,
+            "Stable slot capacity must be at least the engine active batch size");
+        rt::StableKVPageManager ownership(
+            {maxStableSlots, config.maxSupportedBatchSize, config.kvPoolPages, config.maxKVCacheCapacity, 128});
         bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
         if (!semanticOnly)
         {
@@ -461,7 +472,7 @@ int main(int argc, char** argv)
                 traceCoordinator.metrics().end(), [](rt::PhaseDispatchMetrics const& metrics) {
                     return metrics.kind == rt::PhaseDispatchKind::kOverlap;
                 }));
-            ELLM_CHECK(traceCoordinator.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+            ELLM_CHECK(traceCoordinator.empty() && ownership.availableSlots() == maxStableSlots,
                 "Continuous phase load did not release every request and stable slot");
             LOG_INFO(
                 "Continuous phase load passed: requests=%zu dispatches=%zu overlaps=%zu throughput=%.2f req/s "
@@ -608,8 +619,8 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
-        semanticSchedulerConfig.maxPrefillBatchSize = 2;
-        semanticSchedulerConfig.maxDecodeBatchSize = 3;
+        semanticSchedulerConfig.maxPrefillBatchSize = std::min(8, config.maxSupportedBatchSize);
+        semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedBatchSize;
         semanticSchedulerConfig.maxPrefillChunkTokens = 128;
         semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
@@ -621,13 +632,32 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
         semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
+        semanticSchedulerConfig.enableDynamicDecodeBatching = true;
+        semanticSchedulerConfig.decodeBatchCosts = {
+            {1, 2048, 5.877F},
+            {2, 2048, 5.901F},
+            {3, 2048, 5.931F},
+            {4, 2048, 5.957F},
+            {5, 2048, 5.972F},
+            {6, 2048, 6.048F},
+            {7, 2048, 6.080F},
+            {8, 2048, 6.107F},
+        };
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
         rt::IndependentPhaseServerConfig serverConfig;
-        serverConfig.maxInFlightRequests = config.maxSupportedBatchSize;
+        size_t maxInFlightRequests = std::min(kDEFAULT_MAX_INFLIGHT_REQUESTS, static_cast<size_t>(maxStableSlots));
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_INFLIGHT"))
+        {
+            maxInFlightRequests = static_cast<size_t>(std::stoul(value));
+        }
+        ELLM_CHECK(maxInFlightRequests > 0 && maxInFlightRequests <= static_cast<size_t>(maxStableSlots),
+            "Phase server in-flight capacity must be in the stable slot range");
+        serverConfig.maxInFlightRequests = maxInFlightRequests;
         serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
         serverConfig.eosTokenIds = config.eosTokenIds;
         serverConfig.enablePrefixReuse = enablePrefixReuse;
+        serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
         std::unique_ptr<rt::PhasePrefixReuseCache> semanticPrefixCache;
         if (enablePrefixReuse)
         {
@@ -673,8 +703,8 @@ int main(int argc, char** argv)
                 targetCompletion.has_value() && targetCompletion->generatedTokens == sourceCompletion->generatedTokens,
                 "Prefix reuse changed greedy output");
             semanticPrefixCache->clear();
-            ELLM_CHECK(ownership.availableSlots() == config.maxSupportedBatchSize,
-                "Prefix reuse gate did not release every stable slot");
+            ELLM_CHECK(
+                ownership.availableSlots() == maxStableSlots, "Prefix reuse gate did not release every stable slot");
             LOG_INFO(
                 "Prefix reuse off/on greedy output gate passed: reused_tokens=%d", targetSubmission.reusedPrefixTokens);
         }
@@ -683,6 +713,37 @@ int main(int argc, char** argv)
             std::deque<std::string> pendingLines;
             std::mutex pendingMutex;
             bool inputClosed{};
+            std::deque<std::string> outputLines;
+            std::mutex outputMutex;
+            std::condition_variable outputReady;
+            bool outputClosed{};
+            std::thread outputWriter([&]() {
+                while (true)
+                {
+                    std::unique_lock<std::mutex> lock(outputMutex);
+                    outputReady.wait(lock, [&]() { return outputClosed || !outputLines.empty(); });
+                    while (!outputLines.empty())
+                    {
+                        std::string line = std::move(outputLines.front());
+                        outputLines.pop_front();
+                        lock.unlock();
+                        std::cout << line << std::endl;
+                        lock.lock();
+                    }
+                    if (outputClosed)
+                    {
+                        break;
+                    }
+                }
+            });
+            auto emitRecord = [&](std::string const& prefix, nlohmann::json const& event) {
+                {
+                    std::lock_guard<std::mutex> lock(outputMutex);
+                    outputLines.push_back(prefix + event.dump());
+                }
+                outputReady.notify_one();
+            };
+            auto emitEvent = [&](nlohmann::json const& event) { emitRecord("PHASE_EVENT\t", event); };
             std::thread inputReader([&]() {
                 std::string line;
                 while (std::getline(std::cin, line))
@@ -696,8 +757,9 @@ int main(int argc, char** argv)
                 std::lock_guard<std::mutex> lock(pendingMutex);
                 inputClosed = true;
             });
-            std::cout << "PHASE_EVENT\t{\"type\":\"ready\"}" << std::endl;
+            emitEvent({{"type", "ready"}});
             std::unordered_map<uint64_t, int32_t> promptLengths;
+            size_t emittedMetrics{};
             while (true)
             {
                 std::deque<std::string> lines;
@@ -714,7 +776,7 @@ int main(int argc, char** argv)
                         bool const cancelled = semanticServer.cancel(requestId);
                         nlohmann::json const cancelEvent{
                             {"type", "cancelled"}, {"request_index", requestId}, {"cancelled", cancelled}};
-                        std::cout << "PHASE_EVENT\t" << cancelEvent.dump() << std::endl;
+                        emitEvent(cancelEvent);
                         lines.pop_front();
                         continue;
                     }
@@ -772,13 +834,24 @@ int main(int argc, char** argv)
                     }
                 }
                 static_cast<void>(semanticServer.poll());
+                while (emittedMetrics < semanticCoordinator.metrics().size())
+                {
+                    rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
+                    nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
+                        {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
+                        {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
+                        {"decode_tokens", metrics.decodeTokens}, {"prefill_gpu_ms", metrics.prefillGpuMs},
+                        {"decode_gpu_ms", metrics.decodeGpuMs}, {"makespan_gpu_ms", metrics.makespanGpuMs},
+                        {"overlap_ratio", metrics.overlapRatio}};
+                    emitRecord("PHASE_METRIC\t", metricEvent);
+                }
                 while (auto token = semanticServer.tryPopToken())
                 {
                     nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", token->requestId},
                         {"token_id", token->tokenId},
                         {"text", tokenizer.decode(std::vector<int32_t>{token->tokenId}, false)},
                         {"output_index", token->outputIndex}, {"elapsed_ms", token->elapsedMs}};
-                    std::cout << "PHASE_EVENT\t" << tokenEvent.dump() << std::endl;
+                    emitEvent(tokenEvent);
                 }
                 while (auto completion = semanticServer.tryPopCompletion())
                 {
@@ -788,7 +861,7 @@ int main(int argc, char** argv)
                         {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
                         {"prompt_tokens", promptLength}, {"output_tokens", completion->generatedTokens.size()},
                         {"latency_ms", completion->latencyMs}};
-                    std::cout << "PHASE_EVENT\t" << completionEvent.dump() << std::endl;
+                    emitEvent(completionEvent);
                     promptLengths.erase(completion->requestId);
                 }
                 bool closed{};
@@ -817,6 +890,12 @@ int main(int argc, char** argv)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             inputReader.join();
+            {
+                std::lock_guard<std::mutex> lock(outputMutex);
+                outputClosed = true;
+            }
+            outputReady.notify_one();
+            outputWriter.join();
         }
         else
         {
@@ -841,7 +920,7 @@ int main(int argc, char** argv)
                     && semanticTexts.at(20001).find("Dynamic batching") != std::string::npos
                     && semanticTexts.at(20002).find("Kernel") != std::string::npos,
                 "Semantic phase outputs do not match the expected Cosmos responses");
-            ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+            ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Semantic phase requests did not drain and release every slot");
             LOG_INFO("Semantic phase requests passed through IndependentPhaseAsyncServer");
         }

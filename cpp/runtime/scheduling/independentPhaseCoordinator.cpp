@@ -130,6 +130,12 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
     ELLM_CHECK(mExecutors.prefillExecutor().prepare(mExecutors.config().prefillProfile,
                    mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens), mPrefillMap, stream),
         "Independent packed prefill prepare failed");
+    std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(totalTokens);
+    if (mGraphCaptureEnabled && mCapturedPrefillShapes.insert(graphShape).second)
+    {
+        ELLM_CHECK(
+            mExecutors.prefillExecutor().captureGraph(stream), "Independent packed prefill graph capture failed");
+    }
     ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent packed prefill execute failed");
 }
 
@@ -157,6 +163,11 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
     ELLM_CHECK(mExecutors.decodeExecutor().prepare(mExecutors.config().decodeProfile,
                    mConfig.decodeDims(static_cast<int64_t>(batch.size())), mDecodeMap, stream),
         "Independent decode prepare failed");
+    std::string const graphShape = std::to_string(batch.size());
+    if (mGraphCaptureEnabled && mCapturedDecodeShapes.insert(graphShape).second)
+    {
+        ELLM_CHECK(mExecutors.decodeExecutor().captureGraph(stream), "Independent decode graph capture failed");
+    }
     ELLM_CHECK(mExecutors.decodeExecutor().execute(stream), "Independent decode execute failed");
 }
 
@@ -226,6 +237,11 @@ bool IndependentPhaseCoordinator::capturePreparedGraphs()
     bool const prefillCaptured = mExecutors.prefillExecutor().captureGraph(mPrefillStream);
     bool const decodeCaptured = mExecutors.decodeExecutor().captureGraph(mDecodeStream);
     return prefillCaptured && decodeCaptured;
+}
+
+void IndependentPhaseCoordinator::setGraphCaptureEnabled(bool enabled) noexcept
+{
+    mGraphCaptureEnabled = enabled;
 }
 
 bool IndependentPhaseCoordinator::empty() const noexcept
