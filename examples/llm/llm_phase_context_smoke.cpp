@@ -802,6 +802,20 @@ int main(int argc, char** argv)
         }
         else if (ipcMode)
         {
+            cudaStream_t ipcEncoderStream{};
+            std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
+            std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
+            std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
+            if (visionEngineDir != nullptr)
+            {
+                CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
+                ipcVisionRunner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
+                    config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
+                ipcVisionRunner->allocateContextMemory();
+                ipcVisionAdapter
+                    = std::make_unique<rt::PhaseVisionAdapter>(*ipcVisionRunner, tokenizer, config, ipcEncoderStream);
+                ipcThreePhase = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer);
+            }
             std::deque<std::string> pendingLines;
             std::mutex pendingMutex;
             bool inputClosed{};
@@ -850,7 +864,6 @@ int main(int argc, char** argv)
                 inputClosed = true;
             });
             emitEvent({{"type", "ready"}});
-            std::unordered_map<uint64_t, int32_t> promptLengths;
             size_t emittedMetrics{};
             while (true)
             {
@@ -865,7 +878,8 @@ int main(int argc, char** argv)
                     uint64_t const requestId = payload.value("request_index", uint64_t{});
                     if (payload.value("type", "submit") == "cancel")
                     {
-                        bool const cancelled = semanticServer.cancel(requestId);
+                        bool const cancelled = ipcThreePhase != nullptr ? ipcThreePhase->cancel(requestId)
+                                                                        : semanticServer.cancel(requestId);
                         nlohmann::json const cancelEvent{
                             {"type", "cancelled"}, {"request_index", requestId}, {"cancelled", cancelled}};
                         emitEvent(cancelEvent);
@@ -874,14 +888,16 @@ int main(int argc, char** argv)
                     }
                     nlohmann::json const requestPayload = payload.contains("request") ? payload.at("request") : payload;
                     rt::LLMGenerationRequest::Request request;
+                    bool validRequest{true};
                     if (requestPayload.contains("messages") && requestPayload.at("messages").is_array())
                     {
                         for (auto const& message : requestPayload.at("messages"))
                         {
-                            std::string content;
+                            rt::Message parsedMessage;
+                            parsedMessage.role = message.value("role", "user");
                             if (message.contains("content") && message.at("content").is_string())
                             {
-                                content = message.at("content").get<std::string>();
+                                parsedMessage.contents.push_back({"text", message.at("content").get<std::string>()});
                             }
                             else if (message.contains("content") && message.at("content").is_array())
                             {
@@ -889,18 +905,42 @@ int main(int argc, char** argv)
                                 {
                                     if (part.value("type", "") == "text" && part.contains("text"))
                                     {
-                                        content += part.at("text").get<std::string>();
+                                        parsedMessage.contents.push_back({"text", part.at("text").get<std::string>()});
+                                    }
+                                    else if (part.value("type", "") == "image_url" && part.contains("image_url"))
+                                    {
+                                        nlohmann::json const& imageUrl = part.at("image_url");
+                                        std::string path = imageUrl.is_string() ? imageUrl.get<std::string>()
+                                                                                : imageUrl.value("url", std::string{});
+                                        std::string const fileScheme = "file://";
+                                        if (path.compare(0, fileScheme.size(), fileScheme) == 0)
+                                        {
+                                            path.erase(0, fileScheme.size());
+                                        }
+                                        if (path.empty() || path.find("://") != std::string::npos)
+                                        {
+                                            validRequest = false;
+                                            emitEvent({{"type", "error"}, {"request_index", requestId},
+                                                {"message", "phase backend accepts local file image_url paths"}});
+                                            break;
+                                        }
+                                        parsedMessage.contents.push_back({"image", ""});
+                                        request.imageBuffers.push_back(rt::imageUtils::loadImageFromFile(path));
                                     }
                                 }
                             }
-                            std::string const role = message.value("role", "user");
-                            request.messages.push_back({role, {{"text", content}}});
+                            request.messages.push_back(std::move(parsedMessage));
+                            if (!validRequest)
+                            {
+                                break;
+                            }
                         }
                     }
-                    rt::LLMGenerationRequest::FormattedRequest formatted;
-                    ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
-                        "Failed to format IPC phase request");
-                    std::vector<int32_t> const tokenIds = tokenizer.encode(formatted.formattedCompleteRequest, false);
+                    if (!validRequest)
+                    {
+                        lines.pop_front();
+                        continue;
+                    }
                     int32_t maxOutputTokens = serverConfig.defaultMaxOutputTokens;
                     if (requestPayload.contains("max_output_tokens"))
                     {
@@ -914,19 +954,50 @@ int main(int argc, char** argv)
                     {
                         maxOutputTokens = requestPayload.at("max_generate_length").get<int32_t>();
                     }
-                    auto const submission = semanticServer.submitOrQueue(requestId, tokenIds, maxOutputTokens);
-                    if (submission.status == rt::IndependentPhaseServerStatus::kAdmitted
-                        || submission.status == rt::IndependentPhaseServerStatus::kQueued)
+                    bool accepted{};
+                    if (!request.imageBuffers.empty())
                     {
-                        promptLengths[requestId] = static_cast<int32_t>(tokenIds.size());
-                        lines.pop_front();
+                        if (ipcThreePhase == nullptr)
+                        {
+                            emitEvent({{"type", "error"}, {"request_index", requestId},
+                                {"message", "vision engine is not configured"}});
+                            accepted = true;
+                        }
+                        else
+                        {
+                            rt::LLMGenerationRequest generation{};
+                            generation.requests.push_back(std::move(request));
+                            generation.temperature = 0.0F;
+                            generation.topP = 1.0F;
+                            generation.topK = 1;
+                            generation.maxGenerateLength = maxOutputTokens;
+                            generation.applyChatTemplate = true;
+                            generation.addGenerationPrompt = true;
+                            generation.disableSpecDecode = true;
+                            rt::PhaseThreeSubmissionStatus const submission
+                                = ipcThreePhase->submit(requestId, std::move(generation), maxOutputTokens);
+                            accepted = submission == rt::PhaseThreeSubmissionStatus::kEncoding
+                                || submission == rt::PhaseThreeSubmissionStatus::kQueued;
+                        }
                     }
                     else
                     {
+                        rt::LLMGenerationRequest::FormattedRequest formatted;
+                        ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
+                            "Failed to format IPC phase request");
+                        std::vector<int32_t> const tokenIds
+                            = tokenizer.encode(formatted.formattedCompleteRequest, false);
+                        auto const submission = semanticServer.submitOrQueue(requestId, tokenIds, maxOutputTokens);
+                        accepted = submission.status == rt::IndependentPhaseServerStatus::kAdmitted
+                            || submission.status == rt::IndependentPhaseServerStatus::kQueued;
+                    }
+                    if (!accepted)
+                    {
                         break;
                     }
+                    lines.pop_front();
                 }
-                static_cast<void>(semanticServer.poll());
+                static_cast<void>(ipcThreePhase != nullptr ? ipcThreePhase->poll() : semanticServer.poll());
                 while (emittedMetrics < semanticCoordinator.metrics().size())
                 {
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
@@ -948,14 +1019,12 @@ int main(int argc, char** argv)
                 }
                 while (auto completion = semanticServer.tryPopCompletion())
                 {
-                    int32_t const promptLength = promptLengths[completion->requestId];
                     nlohmann::json const completionEvent{{"type", "completion"},
                         {"request_index", completion->requestId},
                         {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
-                        {"prompt_tokens", promptLength}, {"output_tokens", completion->generatedTokens.size()},
-                        {"latency_ms", completion->latencyMs}};
+                        {"prompt_tokens", completion->promptTokens},
+                        {"output_tokens", completion->generatedTokens.size()}, {"latency_ms", completion->latencyMs}};
                     emitEvent(completionEvent);
-                    promptLengths.erase(completion->requestId);
                 }
                 bool closed{};
                 {
@@ -967,7 +1036,8 @@ int main(int argc, char** argv)
                     std::lock_guard<std::mutex> lock(pendingMutex);
                     noPendingLines = pendingLines.empty();
                 }
-                if (closed && lines.empty() && noPendingLines && semanticServer.empty())
+                bool const serverEmpty = ipcThreePhase != nullptr ? ipcThreePhase->empty() : semanticServer.empty();
+                if (closed && lines.empty() && noPendingLines && serverEmpty)
                 {
                     break;
                 }
@@ -989,6 +1059,13 @@ int main(int argc, char** argv)
             }
             outputReady.notify_one();
             outputWriter.join();
+            ipcThreePhase.reset();
+            ipcVisionAdapter.reset();
+            ipcVisionRunner.reset();
+            if (ipcEncoderStream != nullptr)
+            {
+                CUDA_CHECK(cudaStreamDestroy(ipcEncoderStream));
+            }
         }
         else
         {

@@ -465,7 +465,8 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     }
     double const latencyMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
-    mCompletions.push_back({requestId, std::move(state.generatedTokens), latencyMs, stoppedByEos});
+    mCompletions.push_back({requestId, std::move(state.generatedTokens),
+        static_cast<int32_t>(state.promptTokens.size()), latencyMs, stoppedByEos});
     mRequests.erase(it);
 }
 

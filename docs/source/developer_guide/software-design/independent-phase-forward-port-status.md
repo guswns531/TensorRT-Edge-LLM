@@ -43,7 +43,7 @@ contexts.
 | first-shape CUDA graph capture | complete, bounded to P4/D8 graph shapes |
 | prefix sharing and greedy identity gate | complete |
 | model capability contract | complete |
-| request-owned Gemma/Cosmos encoder outputs | complete for the C++ three-phase submission path |
+| request-owned Gemma/Cosmos encoder outputs | complete for C++ and OpenAI-style HTTP image submission |
 | page reservation/growth leases | complete: full/headroom modes and decode growth wait queue |
 | tied embedding/LM-head reuse | complete as experimental opt-in; exact cross-engine greedy identity remains open |
 | complete three-phase encoder queue coordinator | complete, including queued cancel and one encoder in flight |
@@ -84,12 +84,21 @@ backend. `scripts/phase_openai_gateway.py` forwards complete OpenAI request
 payloads to this backend and emits OpenAI-compatible SSE events. This path
 uses `IndependentPhaseAsyncServer`, including continuous admission and
 event-based completion.
+When `TRT_EDGELLM_VISION_ENGINE_DIR` is set, OpenAI `image_url` content with a
+local path or `file://` URL is decoded into an image buffer and submitted to
+`PhaseThreeCoordinator`; remote/data URLs are rejected with a structured SSE
+error. The request retains the same cancellation and completion path as text.
 The gateway sends a cancel control message when an SSE client disconnects;
 queued requests release their stable lease immediately, while in-flight work
 keeps the lease until its CUDA event boundary.
 
 The v0.10 Python OpenAI/SSE server still calls `LLMInferenceRuntime` directly;
 the IPC gateway is the transport adapter for the new forward-port facade.
+
+The fresh HTTP image gate emitted eight token deltas followed by `[DONE]`,
+reported `prompt_tokens=501`, and showed four prefill chunks
+(`128/128/128/117`) before decode. This verifies actual JSON parsing, encoder
+handoff, chunk-offset image embedding placement, and SSE usage accounting.
 
 The preserved same-client HTTP baseline (Cosmos FP16, three-run median, from
 the existing trace artifact) is:

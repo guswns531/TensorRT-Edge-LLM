@@ -165,6 +165,16 @@ def make_handler(broker: EventBroker, model: str,
                     event = events.get(timeout=timeout)
                     if event["type"] == "cancelled":
                         break
+                    if event["type"] == "error":
+                        self._send_sse({
+                            "error": {
+                                "message": event["message"],
+                                "type": "invalid_request_error",
+                            }
+                        })
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        break
                     if event["type"] == "token":
                         completion_tokens += 1
                         self._send_sse({

@@ -115,6 +115,7 @@ struct IndependentPhaseServerCompletion
 {
     uint64_t requestId{};
     std::vector<int32_t> generatedTokens;
+    int32_t promptTokens{};
     double latencyMs{};
     bool stoppedByEos{};
 };
