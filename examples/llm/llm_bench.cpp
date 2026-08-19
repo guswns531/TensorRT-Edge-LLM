@@ -33,6 +33,7 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "runtime/preprocess/stepPreparer.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
@@ -46,6 +47,7 @@
 #include <getopt.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -760,6 +762,7 @@ int main(int argc, char** argv)
     rt::TensorMap tensorMap;
     std::unique_ptr<rt::StepPreparer> stepPreparer;
     std::unique_ptr<rt::DeepstackBinding> deepstack;
+    std::optional<rt::EmbeddingData> tiedEmbedding;
     rt::DeploymentConfig deployment;
     rt::Tensor contextMemory;
     rt::Tensor diffusionCanvasIds;
@@ -1102,7 +1105,12 @@ int main(int argc, char** argv)
 
             // --- Load externalized model weights ---
             std::filesystem::path const& activeConfigPath = useDraftEngine ? *draftConfigPath : baseConfigPath;
-            resources->externalWeightManager->load(dir, activeConfigPath, stream, args.checkpointDir);
+            if (rt::ExternalWeightManager::requiresTiedEmbedding(activeConfigPath))
+            {
+                tiedEmbedding.emplace(rt::loadEmbeddingTable(dir / "embedding.safetensors", stream));
+            }
+            resources->externalWeightManager->load(dir, activeConfigPath, stream, args.checkpointDir, {},
+                tiedEmbedding.has_value() ? &tiedEmbedding->table : nullptr);
             resources->externalWeightManager->validateAgainstEngine(*executor, useDraftEngine ? "draft" : "base");
             resources->externalWeightManager->registerTensorMapEntries(tensorMap);
 

@@ -33,6 +33,7 @@ EXTERNAL_WEIGHT_KINDS = (
     EXTERNAL_WEIGHT_LM_HEAD,
 )
 EXTERNAL_WEIGHT_CHOICES = (*EXTERNAL_WEIGHT_KINDS, EXTERNAL_WEIGHT_ALL)
+TIED_EMBEDDING_SOURCE = "embedding"
 
 
 def resolve_externalize_weights(externalize_weights) -> "list[str]":
@@ -324,6 +325,50 @@ def _find_lm_head_weight_initializer(onnx_model, model) -> "str | None":
     return None
 
 
+def _canonicalize_tied_lm_head_input(onnx_model, tensor_name: str,
+                                     model) -> None:
+    """Expose a tied head in LM-head layout without a runtime transpose."""
+    initializer = next(init for init in onnx_model.graph.initializer
+                       if init.name == tensor_name)
+    vocab_size = int(model.config.vocab_size)
+    hidden_size = int(model.config.hidden_size)
+    current_shape = tuple(int(dim) for dim in initializer.dims)
+    head_shape = (hidden_size, vocab_size)
+    if current_shape == head_shape:
+        return
+    if current_shape != (vocab_size, hidden_size):
+        raise ValueError(
+            f"Tied LM-head initializer {tensor_name!r} has shape "
+            f"{current_shape}, expected {head_shape} or its transpose")
+
+    transpose_nodes = [
+        node for node in onnx_model.graph.node if tensor_name in node.input
+    ]
+    for node in transpose_nodes:
+        perm = next((list(attr.ints)
+                     for attr in node.attribute if attr.name == "perm"), [])
+        if node.op_type != "Transpose" or perm != [1, 0] or len(
+                node.output) != 1:
+            raise ValueError(
+                f"Tied LM-head initializer {tensor_name!r} in embedding "
+                "layout must only feed 2D transpose nodes")
+    if not transpose_nodes:
+        raise ValueError(
+            f"Tied LM-head initializer {tensor_name!r} in embedding layout "
+            "has no removable transpose consumer")
+
+    for transpose in transpose_nodes:
+        transpose_output = transpose.output[0]
+        for consumer in onnx_model.graph.node:
+            for input_index, input_name in enumerate(consumer.input):
+                if input_name == transpose_output:
+                    consumer.input[input_index] = tensor_name
+        onnx_model.graph.node.remove(transpose)
+
+    del initializer.dims[:]
+    initializer.dims.extend(head_shape)
+
+
 def _external_data_value(init, key: str) -> "str | None":
     for entry in init.external_data:
         if entry.key == key:
@@ -521,7 +566,8 @@ def _save_externalized_onnx_model(onnx_path: str, onnx_model) -> None:
 def externalize_model_weights(
         onnx_path: str,
         model,
-        externalize_weights=None) -> "list[dict[str, object]]":
+        externalize_weights=None,
+        reuse_tied_lm_head: bool = False) -> "list[dict[str, object]]":
     """Move requested ONNX initializer weights into external weight files."""
     import onnx
 
@@ -600,9 +646,26 @@ def externalize_model_weights(
                     "External lm_head weight requested, but no unique "
                     "LM-head initializer was found")
                 continue
-            add_external_weight_file("LM-head weight",
-                                     "external_lm_head_weight.safetensors",
-                                     [tensor_name], "lm_head_weight")
+            if reuse_tied_lm_head:
+                if not getattr(model.config, "tie_word_embeddings", False):
+                    raise ValueError("--reuse-tied-lm-head requires "
+                                     "tie_word_embeddings=True")
+                _canonicalize_tied_lm_head_input(onnx_model, tensor_name,
+                                                 model)
+                external_names.append(tensor_name)
+                external_name_set.add(tensor_name)
+                manifest.append({
+                    "source": TIED_EMBEDDING_SOURCE,
+                    "kind": "tied_lm_head_weight",
+                    "tensors": [tensor_name],
+                })
+                logger.info(
+                    "Exposed tied LM-head tensor %s for runtime embedding "
+                    "buffer reuse", tensor_name)
+            else:
+                add_external_weight_file(
+                    "LM-head weight", "external_lm_head_weight.safetensors",
+                    [tensor_name], "lm_head_weight")
 
     if not external_names:
         return []

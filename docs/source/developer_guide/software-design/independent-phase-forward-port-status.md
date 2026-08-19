@@ -45,7 +45,7 @@ contexts.
 | model capability contract | complete |
 | request-owned Gemma/Cosmos encoder outputs | complete for the C++ three-phase submission path |
 | page reservation/growth leases | complete: full/headroom modes and decode growth wait queue |
-| tied embedding/LM-head reuse | pending exact-identity gate |
+| tied embedding/LM-head reuse | complete as experimental opt-in; exact cross-engine greedy identity remains open |
 | complete three-phase encoder queue coordinator | complete, including queued cancel and one encoder in flight |
 
 ## Validation
@@ -153,3 +153,28 @@ Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the
 latency-safe default remains full reservation with in-flight 16.
+
+## Tied embedding and LM-head reuse
+
+`--reuse-tied-lm-head` has been forward-ported as an experimental opt-in. The
+exporter stores one FP16 `[hidden, vocab]` table, removes the LM-head transpose,
+and exposes the head weight as a fixed engine input. The runtime embedding
+loader uses a strided gather while `ExternalWeightManager` publishes a
+non-owning alias of the same GPU allocation to TensorRT. FP8 embeddings,
+reduced vocabularies, tensor parallelism, and speculative decoding are
+rejected by the v1 export contract.
+
+The v0.10 validation exercised the required sequence end to end:
+
+1. exported a Cosmos packed-prefill ONNX with the tied source manifest;
+2. built a TensorRT 11 B8/KV2048/page128 engine;
+3. ran semantic requests through independent prefill/decode contexts.
+
+The CUDA transposed-lookup reference test and seven ONNX externalization tests
+also pass. The fresh tied engine contains no LM-head sidecar and the runtime
+logs `layout=hidden_vocab` plus one zero-copy external binding. Its total
+engine-plus-weight artifacts are about 370 MiB smaller than the preserved
+baseline build, but those engines were produced in different builder runs and
+their serialized engine sizes differ. A fresh paired build is required before
+treating that number as a fair GPU-memory result. The original matched-build
+result was a 574--576 MiB reduction with sub-1% real-trace regression.

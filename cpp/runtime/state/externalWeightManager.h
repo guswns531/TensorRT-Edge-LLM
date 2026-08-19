@@ -60,8 +60,11 @@ public:
     //! The stream is synchronized before this method returns, leaving only
     //! engine-input tensors in their final plugin layouts.
     void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream,
-        std::filesystem::path const& componentCheckpointDir = {},
-        std::filesystem::path const& targetCheckpointDir = {});
+        std::filesystem::path const& componentCheckpointDir = {}, std::filesystem::path const& targetCheckpointDir = {},
+        Tensor* tiedEmbedding = nullptr);
+
+    //! Return true when the sidecar manifest aliases an engine input to the runtime embedding table.
+    static bool requiresTiedEmbedding(std::filesystem::path const& configPath);
 
     void validateAgainstEngine(EngineExecutor const& executor, std::string_view engineLabel);
 

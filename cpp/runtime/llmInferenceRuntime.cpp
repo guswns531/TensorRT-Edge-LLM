@@ -184,12 +184,18 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
     // Finish checkpoint reads and weight conversion before any engine can run.
     ExternalWeightManager preparedWeights;
-    preparedWeights.load(engineDirPath, baseConfigPath, stream, mCheckpointDir);
+    bool const reuseTiedEmbedding = ExternalWeightManager::requiresTiedEmbedding(baseConfigPath);
+    if (reuseTiedEmbedding)
+    {
+        mEmbedding = loadEmbeddingTable(engineDirPath / "embedding.safetensors", stream);
+    }
+    preparedWeights.load(
+        engineDirPath, baseConfigPath, stream, mCheckpointDir, {}, reuseTiedEmbedding ? &mEmbedding.table : nullptr);
     if (auto embedding = preparedWeights.takeEmbedding())
     {
         mEmbedding.table = std::move(*embedding);
     }
-    else
+    else if (!reuseTiedEmbedding)
     {
         mEmbedding = loadEmbeddingTable(engineDirPath / "embedding.safetensors", stream);
     }

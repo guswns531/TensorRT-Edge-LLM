@@ -77,6 +77,7 @@ def export_onnx(
     fp8_embedding: bool = False,
     reduced_vocab_dir: str = "",
     externalize_weights=None,
+    reuse_tied_lm_head: bool = False,
     config_filename: str = "config.json",
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
@@ -99,6 +100,9 @@ def export_onnx(
                              weight files.
                              Supported kinds: ``int4_ffn``, ``int4_moe``,
                              ``nvfp4_moe``, ``lm_head``, and ``all``.
+        reuse_tied_lm_head: Expose a tied FP16 LM-head as an engine input whose
+                            storage is the runtime embedding table instead of a
+                            separately loaded external-weight file.
         config_filename: Filename for the runtime config beside the ONNX.
                          Use ``"config.json"`` for single-device exports
                          or ``"config_tp{N}_rank{R}.json"`` for per-rank
@@ -110,6 +114,26 @@ def export_onnx(
 
     requested_external_weights = resolve_externalize_weights(
         externalize_weights)
+    if reuse_tied_lm_head:
+        if "lm_head" not in requested_external_weights:
+            requested_external_weights.append("lm_head")
+        if fp8_embedding:
+            raise ValueError(
+                "--reuse-tied-lm-head requires an FP16 embedding; disable "
+                "--fp8-embedding")
+        if not model.config.tie_word_embeddings:
+            raise ValueError("--reuse-tied-lm-head requires "
+                             "tie_word_embeddings=True")
+        embedding_scale_value = getattr(model.config, "embedding_scale", 1.0)
+        if embedding_scale_value is None:
+            model_type = str(getattr(model.config, "model_type", ""))
+            embedding_scale_value = (model.config.hidden_size**0.5 if
+                                     model_type.startswith("gemma4") else 1.0)
+        embedding_scale = float(embedding_scale_value)
+        if embedding_scale != 1.0:
+            raise ValueError(
+                "--reuse-tied-lm-head requires embedding_scale=1.0 because "
+                "the runtime embedding buffer is bound directly to the head")
     reject_quantized_lm_head_externalization(model, model_dir,
                                              requested_external_weights)
 
@@ -117,11 +141,13 @@ def export_onnx(
         model,
         output_path,
         externalize_weights=requested_external_weights,
+        reuse_tied_lm_head=reuse_tied_lm_head,
     )
     write_runtime_artifacts(model,
                             model_dir,
                             out_dir,
                             fp8_embedding=fp8_embedding,
+                            transpose_embedding=reuse_tied_lm_head,
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename)
     if external_weight_files:
@@ -1008,6 +1034,7 @@ def _export_model(
     output_path: str,
     optimize: bool = True,
     externalize_weights=None,
+    reuse_tied_lm_head: bool = False,
 ) -> "list[dict[str, object]]":
     _setup_fp8kv_scales_for_export(model)
     _capture_qk_norm_gammas_for_export(model)
@@ -1061,6 +1088,9 @@ def _export_model(
     # (which can re-materialize stray payloads on zero-volume tensors).
     _fix_zero_volume_initializers(output_path)
     external_weight_files = externalize_model_weights(
-        output_path, model, externalize_weights=externalize_weights)
+        output_path,
+        model,
+        externalize_weights=externalize_weights,
+        reuse_tied_lm_head=reuse_tied_lm_head)
     logger.info("Export complete: %s", output_path)
     return external_weight_files

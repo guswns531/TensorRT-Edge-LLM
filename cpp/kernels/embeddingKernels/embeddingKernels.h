@@ -37,7 +37,8 @@ namespace kernel
 //! per-group dequantization.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] embeddingTable Text table in [vocabSize, hiddenSize], or FP16 [hiddenSize, vocabSize] when named
+//!                           ``embedding_transposed``
 //! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize];
 //!                   required when embeddingTable is FP8, std::nullopt for FP16
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]

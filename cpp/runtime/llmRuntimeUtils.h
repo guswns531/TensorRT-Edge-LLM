@@ -340,7 +340,7 @@ inline constexpr int64_t kFP8EmbeddingBlockSize = 128;
  */
 struct EmbeddingData
 {
-    rt::Tensor table;              //!< Embedding table [vocabSize, hiddenSize] (FP16 or FP8)
+    rt::Tensor table; //!< Table [vocabSize, hiddenSize], or ``embedding_transposed`` [hiddenSize, vocabSize]
     rt::Tensor tableScalingFactor; //!< FP32 per-group scales [vocabSize, hiddenSize/128] (only if FP8)
 
     //! \brief Returns scales as OptionalInputTensor (std::nullopt when FP16, reference when FP8)

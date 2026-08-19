@@ -942,6 +942,7 @@ def _export_llm(model_dir: str,
                 dspark_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
+                reuse_tied_lm_head: bool = False,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
                 skip_softmax_scale_factor: "float | None" = None,
@@ -1093,6 +1094,7 @@ def _export_llm(model_dir: str,
                         fp8_embedding=fp8_embedding,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
+                        reuse_tied_lm_head=reuse_tied_lm_head,
                         config_filename=config_filename)
         except (OSError, ValueError, RuntimeError) as exc:
             logger.exception("[LLM] ONNX export failed")
@@ -3811,6 +3813,12 @@ def main() -> None:
               "int4_moe, nvfp4_moe, lm_head, all."),
     )
     p.add_argument(
+        "--reuse-tied-lm-head",
+        action="store_true",
+        help=("Expose a tied FP16 LM head as an engine input and bind the "
+              "existing runtime embedding buffer to it."),
+    )
+    p.add_argument(
         "--packed-prefill",
         action="store_true",
         help=(
@@ -3976,6 +3984,18 @@ def main() -> None:
     gemma4_mtp_assistant_dir = ""
     gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
+
+    if args.reuse_tied_lm_head:
+        if args.fp8_embedding:
+            p.error("--reuse-tied-lm-head cannot be combined with "
+                    "--fp8-embedding")
+        if args.reduced_vocab_dir:
+            p.error("--reuse-tied-lm-head cannot be combined with "
+                    "--reduced-vocab-dir")
+        if args.tp_size != 1:
+            p.error("--reuse-tied-lm-head currently requires --tp-size 1")
+        if args.mtp or args.eagle_base or args.dflash_base or args.dflash_draft:
+            p.error("--reuse-tied-lm-head v1 supports vanilla decoding only")
 
     if (model_type == "qwen3_tts" and config.get("tts_model_type")
             not in ("custom_voice", "voice_design", "base")):
@@ -4248,6 +4268,7 @@ def main() -> None:
                      fp8_embedding=args.fp8_embedding,
                      reduced_vocab_dir=args.reduced_vocab_dir,
                      externalize_weights=externalize_weights,
+                     reuse_tied_lm_head=args.reuse_tied_lm_head,
                      tp_size=args.tp_size,
                      num_decoder_layers=args.num_decoder_layer,
                      skip_softmax_scale_factor=args.skip_softmax_scale_factor,

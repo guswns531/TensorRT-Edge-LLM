@@ -222,13 +222,15 @@ int main(int argc, char** argv)
 
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
+        rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
         auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(config, setupStream));
         auto decodeIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(config, 1, setupStream));
         rt::TensorMap prefillMap;
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
         rt::buildTensorMap(decodeMap, *decodeIO, *resources, config, 0);
-        resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream, checkpointDir);
+        resources->externalWeightManager->load(
+            engineDir, engineDir / "config.json", setupStream, checkpointDir, {}, &embedding.table);
         resources->externalWeightManager->validateAgainstEngine(pair->prefillExecutor(), "base");
         resources->externalWeightManager->registerTensorMapEntries(prefillMap);
         resources->externalWeightManager->registerTensorMapEntries(decodeMap);
@@ -487,7 +489,6 @@ int main(int argc, char** argv)
 
         // Real text payload path: tokenizer -> independent async server adapter ->
         // compact token staging -> embedding lookup -> TensorRT prefill/decode.
-        rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
         CUDA_CHECK(cudaStreamSynchronize(setupStream));
         rt::EmbeddingPreprocessor embeddingPreprocessor(embedding, config);
         tokenizer::Tokenizer tokenizer;
