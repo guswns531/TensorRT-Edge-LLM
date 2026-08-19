@@ -34,12 +34,16 @@ namespace trt_edgellm::rt
 {
 
 using IndependentPhaseInputCallback = std::function<void(std::vector<PhaseWorkItem> const&, PipelineIO&, cudaStream_t)>;
+using IndependentPhaseBatchCompletionCallback
+    = std::function<void(std::vector<PhaseWorkItem> const&, PipelineIO&, cudaStream_t)>;
 using IndependentPhaseFinishedCallback = std::function<bool(PhaseWorkItem const&, int32_t resultingKVLength)>;
 
 struct IndependentPhaseCoordinatorCallbacks
 {
     IndependentPhaseInputCallback stagePrefill;
     IndependentPhaseInputCallback stageDecode;
+    IndependentPhaseBatchCompletionCallback completePrefillBatch;
+    IndependentPhaseBatchCompletionCallback completeDecodeBatch;
     IndependentPhaseFinishedCallback isPrefillFinished;
     IndependentPhaseFinishedCallback isDecodeFinished;
     std::function<void(PhaseDispatchMetrics const&)> onMetrics;

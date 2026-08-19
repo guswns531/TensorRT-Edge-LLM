@@ -161,6 +161,10 @@ void IndependentPhaseCoordinator::completePrefillBatch(std::vector<PhaseWorkItem
     }
     mPrefillKV.commitLengths(resultingLengths);
     mPrefillKV.complete();
+    if (mCallbacks.completePrefillBatch)
+    {
+        mCallbacks.completePrefillBatch(batch, mPrefillIO, mPrefillStream);
+    }
 }
 
 void IndependentPhaseCoordinator::completeDecodeBatch(std::vector<PhaseWorkItem> const& batch)
@@ -172,6 +176,10 @@ void IndependentPhaseCoordinator::completeDecodeBatch(std::vector<PhaseWorkItem>
     }
     mDecodeKV.commitLengths(resultingLengths);
     mDecodeKV.complete();
+    if (mCallbacks.completeDecodeBatch)
+    {
+        mCallbacks.completeDecodeBatch(batch, mDecodeIO, mDecodeStream);
+    }
 }
 
 void IndependentPhaseCoordinator::enqueuePrefill(PhaseWorkItem item)

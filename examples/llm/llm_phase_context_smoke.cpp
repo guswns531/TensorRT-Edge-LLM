@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/llmRuntimeUtils.h"
+#include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phaseContinuousLoadGenerator.h"
@@ -27,6 +30,8 @@
 #include "runtime/scheduling/phaseKVActiveView.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
+#include "sampler/sampling.h"
+#include "tokenizer/tokenizer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -217,232 +222,416 @@ int main(int argc, char** argv)
 
         rt::StableKVPageManager ownership({config.maxSupportedBatchSize, config.maxSupportedBatchSize,
             config.kvPoolPages, config.maxKVCacheCapacity, 128});
-        int32_t const prefillSlot0 = ownership.reserve();
-        int32_t const prefillSlot1 = config.packedPrefill ? ownership.reserve() : -1;
-        int32_t const decodeSlot = ownership.reserve();
-        ownership.ensureCapacity(prefillSlot0, 128);
-        if (config.packedPrefill)
+        bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
+        if (!semanticOnly)
         {
-            ownership.ensureCapacity(prefillSlot1, 128);
-        }
-        ownership.ensureCapacity(decodeSlot, 129);
-        ownership.setLength(prefillSlot0, 0);
-        if (config.packedPrefill)
-        {
-            ownership.setLength(prefillSlot1, 0);
-        }
-        ownership.setLength(decodeSlot, 128);
-        rt::PhaseKVActiveView prefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "prefill");
-        rt::PhaseKVActiveView decodeKV(config.maxSupportedBatchSize, ownership, decodeMap, "decode");
-        std::vector<int32_t> const prefillSlots = config.packedPrefill
-            ? std::vector<int32_t>{prefillSlot0, prefillSlot1}
-            : std::vector<int32_t>{prefillSlot0};
-        std::vector<int32_t> const prefillChunkLengths
-            = config.packedPrefill ? std::vector<int32_t>{96, 32} : std::vector<int32_t>{128};
-        prefillKV.prepare(prefillSlots, prefillStream);
-        decodeKV.prepare({decodeSlot}, decodeStream);
-
-        int32_t const prefillTotalTokens = 128;
-        ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, prefillTotalTokens, config.hiddenSize}),
-            "Failed to reshape prefill input embeddings");
-        ELLM_CHECK(
-            decodeIO->inputsEmbeds.reshape({1, 1, config.hiddenSize}), "Failed to reshape decode input embeddings");
-        CUDA_CHECK(cudaMemsetAsync(
-            prefillIO->inputsEmbeds.rawPointer(), 0, prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
-        CUDA_CHECK(cudaMemsetAsync(
-            decodeIO->inputsEmbeds.rawPointer(), 0, decodeIO->inputsEmbeds.getMemoryCapacity(), decodeStream));
-        for (rt::Tensor& deepstack : prefillIO->deepstackEmbeds)
-        {
-            CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), prefillStream));
-        }
-        prefillKV.preparePrefillMetadata(*prefillIO, prefillChunkLengths, prefillStream, config.packedPrefill);
-        decodeKV.prepareDecodeMetadata(*decodeIO, decodeStream);
-
-        rt::InferenceDims const prefillDims = config.packedPrefill
-            ? config.packedPrefillDims(static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens)
-            : config.prefillDims(1, prefillTotalTokens, false);
-        ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
-            "Failed to bind the stable paged-KV prefill view");
-        ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
-            "Failed to bind the stable paged-KV decode view");
-        constexpr int32_t kWARMUP = 20;
-        constexpr int32_t kITERATIONS = 100;
-        PhaseTiming const sequential = measureSequential(
-            pair->prefillExecutor(), pair->decodeExecutor(), prefillStream, decodeStream, kWARMUP, kITERATIONS);
-        PhaseTiming const overlap = measureOverlap(pair->prefillExecutor(), pair->decodeExecutor(), setupStream,
-            prefillStream, decodeStream, kWARMUP, kITERATIONS);
-        float const speedup = sequential.makespanMs / overlap.makespanMs;
-        float const overlapRatio = (overlap.prefillMs + overlap.decodeMs - overlap.makespanMs)
-            / std::min(overlap.prefillMs, overlap.decodeMs);
-        prefillKV.commitLengths(prefillChunkLengths);
-        decodeKV.commitLengths({129});
-        prefillKV.complete();
-        decodeKV.complete();
-
-        LOG_INFO("Independent phase context smoke passed: prefill_workspace=%zu decode_workspace=%zu stable_pages=%d",
-            pair->prefillContextMemory().getMemoryCapacity(), pair->decodeContextMemory().getMemoryCapacity(),
-            config.kvPoolPages - ownership.availablePages());
-        LOG_INFO(
-            "Independent phase timing (mean of %d): sequential=%.4f ms overlap=%.4f ms speedup=%.3fx "
-            "overlap_ratio=%.3f prefill_seq=%.4f ms decode_seq=%.4f ms prefill_overlap=%.4f ms "
-            "decode_overlap=%.4f ms",
-            kITERATIONS, sequential.makespanMs, overlap.makespanMs, speedup, overlapRatio, sequential.prefillMs,
-            sequential.decodeMs, overlap.prefillMs, overlap.decodeMs);
-
-        // Exercise the real queue scheduler -> dispatch worker -> independent
-        // TensorRT context path. Two 256-token requests advance in fixed-128
-        // waves while one request is already decoding.
-        ownership.ensureCapacity(prefillSlot0, 258);
-        ownership.ensureCapacity(prefillSlot1, 258);
-        ownership.ensureCapacity(decodeSlot, 132);
-        ownership.setLength(prefillSlot0, 0);
-        ownership.setLength(prefillSlot1, 0);
-        ownership.setLength(decodeSlot, 128);
-        for (rt::Tensor& deepstack : decodeIO->deepstackEmbeds)
-        {
-            CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), decodeStream));
-        }
-
-        rt::PhaseQueueSchedulerConfig schedulerConfig;
-        schedulerConfig.maxPrefillBatchSize = 2;
-        schedulerConfig.maxDecodeBatchSize = 3;
-        schedulerConfig.maxPrefillChunkTokens = 128;
-        schedulerConfig.maxOverlapPrefillTokens = 64;
-        schedulerConfig.enablePackedPrefillTokenLayout = true;
-        schedulerConfig.enableTpotHardGuard = true;
-        schedulerConfig.requireDirectOverlapCost = true;
-        schedulerConfig.enableCostAwareOverlapAdmission = true;
-        schedulerConfig.decodeQueueWaitTargetUs = 50000.0;
-        schedulerConfig.decodeSlackSafetyFactor = 0.8F;
-        schedulerConfig.maxConsecutiveOverlapBatches = 2;
-        schedulerConfig.maxPredictedDecodeDebtUs = 10000.0;
-        schedulerConfig.prefillBatchCosts = {
-            {1, 128, 2048, 3, true, 13.7F, 2.5F},
-            {2, 128, 2048, 3, true, 13.7F, 2.5F},
-            {1, 128, 2048, 3, false, 13.7F, 2.5F},
-            {2, 128, 2048, 3, false, 13.7F, 2.5F},
-        };
-        schedulerConfig.overlapBatchCosts = {
-            {1, 3, 128, 2048, 2048, true, 13.7F, 8.1F, 13.7F, 2.5F},
-            {2, 3, 128, 2048, 2048, true, 13.7F, 8.1F, 13.7F, 2.5F},
-            {1, 3, 128, 2048, 2048, false, 13.7F, 8.1F, 13.7F, 2.5F},
-            {2, 3, 128, 2048, 2048, false, 13.7F, 8.1F, 13.7F, 2.5F},
-        };
-        std::unordered_map<uint64_t, int32_t> decodeSteps;
-        rt::IndependentPhaseCoordinatorCallbacks coordinatorCallbacks;
-        coordinatorCallbacks.isDecodeFinished
-            = [&](rt::PhaseWorkItem const& item, int32_t) { return ++decodeSteps[item.requestId] >= 2; };
-        rt::IndependentPhaseCoordinator coordinator(config, schedulerConfig, *pair, ownership, *prefillIO, *decodeIO,
-            prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks));
-
-        rt::PhaseSchedulingHints decodeHints;
-        decodeHints.tpotTargetUs = 50000.0;
-        coordinator.enqueuePrefill({101, 256, prefillSlot0, 0, 256});
-        coordinator.enqueuePrefill({102, 256, prefillSlot1, 0, 256});
-        coordinator.enqueueDecode({103, 128, decodeSlot, 0, 0, true, decodeHints});
-        coordinator.runUntilIdle(32);
-        std::vector<rt::PhaseDispatchMetrics> const& dispatchMetrics = coordinator.metrics();
-        size_t const overlapDispatches = static_cast<size_t>(std::count_if(dispatchMetrics.begin(),
-            dispatchMetrics.end(),
-            [](rt::PhaseDispatchMetrics const& metrics) { return metrics.kind == rt::PhaseDispatchKind::kOverlap; }));
-        double totalMakespanMs{};
-        for (rt::PhaseDispatchMetrics const& metrics : dispatchMetrics)
-        {
-            totalMakespanMs += metrics.makespanGpuMs;
-        }
-        ELLM_CHECK(coordinator.empty() && overlapDispatches > 0, "Cost-aware phase queue did not drain with overlap");
-        LOG_INFO(
-            "Cost-aware phase queue passed: dispatches=%zu overlap_dispatches=%zu total_makespan=%.4f ms "
-            "request101_kv=%d request102_kv=%d request103_kv=%d",
-            dispatchMetrics.size(), overlapDispatches, totalMakespanMs, ownership.length(prefillSlot0),
-            ownership.length(prefillSlot1), ownership.length(decodeSlot));
-
-        ownership.release(prefillSlot0);
-        ownership.release(prefillSlot1);
-        ownership.release(decodeSlot);
-
-        rt::PhaseContinuousLoadGenerator load({16, 1000.0, 128, 512, 2, 6, 20260819, 10000});
-        std::deque<rt::PhaseLoadRequest> pendingAdmissions;
-        std::unordered_map<uint64_t, int32_t> traceSlots;
-        std::unordered_map<uint64_t, int32_t> traceOutputTargets;
-        std::unordered_map<uint64_t, int32_t> traceDecodeSteps;
-        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> traceSubmittedAt;
-        std::vector<double> traceLatenciesMs;
-        size_t completedRequests{};
-        rt::IndependentPhaseCoordinatorCallbacks traceCallbacks;
-        traceCallbacks.isDecodeFinished = [&](rt::PhaseWorkItem const& item, int32_t) {
-            int32_t const steps = ++traceDecodeSteps[item.requestId];
-            bool const finished = steps >= traceOutputTargets.at(item.requestId);
-            if (finished)
+            int32_t const prefillSlot0 = ownership.reserve();
+            int32_t const prefillSlot1 = config.packedPrefill ? ownership.reserve() : -1;
+            int32_t const decodeSlot = ownership.reserve();
+            ownership.ensureCapacity(prefillSlot0, 128);
+            if (config.packedPrefill)
             {
-                auto const now = std::chrono::steady_clock::now();
-                traceLatenciesMs.push_back(
-                    std::chrono::duration<double, std::milli>(now - traceSubmittedAt.at(item.requestId)).count());
-                ownership.release(traceSlots.at(item.requestId));
-                ++completedRequests;
+                ownership.ensureCapacity(prefillSlot1, 128);
             }
-            return finished;
-        };
-        rt::IndependentPhaseCoordinator traceCoordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
-            *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
-
-        auto const traceStart = std::chrono::steady_clock::now();
-        size_t loopIterations{};
-        while (completedRequests < load.schedule().size())
-        {
-            int64_t const elapsedUs
-                = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - traceStart)
-                      .count();
-            std::vector<rt::PhaseLoadRequest> ready = load.popReady(elapsedUs);
-            pendingAdmissions.insert(pendingAdmissions.end(), ready.begin(), ready.end());
-            while (!pendingAdmissions.empty() && ownership.availableSlots() > 0)
+            ownership.ensureCapacity(decodeSlot, 129);
+            ownership.setLength(prefillSlot0, 0);
+            if (config.packedPrefill)
             {
-                rt::PhaseLoadRequest const request = pendingAdmissions.front();
-                int32_t const slot = ownership.reserve();
-                ownership.ensureCapacity(slot, request.promptTokenCount + request.maxOutputTokens);
-                ownership.setLength(slot, 0);
-                traceSlots[request.requestId] = slot;
-                traceOutputTargets[request.requestId] = request.maxOutputTokens;
-                traceSubmittedAt[request.requestId] = traceStart + std::chrono::microseconds(request.arrivalOffsetUs);
-                traceCoordinator.enqueuePrefill(
-                    {request.requestId, request.promptTokenCount, slot, 0, request.promptTokenCount});
-                pendingAdmissions.pop_front();
+                ownership.setLength(prefillSlot1, 0);
+            }
+            ownership.setLength(decodeSlot, 128);
+            rt::PhaseKVActiveView prefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "prefill");
+            rt::PhaseKVActiveView decodeKV(config.maxSupportedBatchSize, ownership, decodeMap, "decode");
+            std::vector<int32_t> const prefillSlots = config.packedPrefill
+                ? std::vector<int32_t>{prefillSlot0, prefillSlot1}
+                : std::vector<int32_t>{prefillSlot0};
+            std::vector<int32_t> const prefillChunkLengths
+                = config.packedPrefill ? std::vector<int32_t>{96, 32} : std::vector<int32_t>{128};
+            prefillKV.prepare(prefillSlots, prefillStream);
+            decodeKV.prepare({decodeSlot}, decodeStream);
+
+            int32_t const prefillTotalTokens = 128;
+            ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, prefillTotalTokens, config.hiddenSize}),
+                "Failed to reshape prefill input embeddings");
+            ELLM_CHECK(
+                decodeIO->inputsEmbeds.reshape({1, 1, config.hiddenSize}), "Failed to reshape decode input embeddings");
+            CUDA_CHECK(cudaMemsetAsync(
+                prefillIO->inputsEmbeds.rawPointer(), 0, prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
+            CUDA_CHECK(cudaMemsetAsync(
+                decodeIO->inputsEmbeds.rawPointer(), 0, decodeIO->inputsEmbeds.getMemoryCapacity(), decodeStream));
+            for (rt::Tensor& deepstack : prefillIO->deepstackEmbeds)
+            {
+                CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), prefillStream));
+            }
+            prefillKV.preparePrefillMetadata(*prefillIO, prefillChunkLengths, prefillStream, config.packedPrefill);
+            decodeKV.prepareDecodeMetadata(*decodeIO, decodeStream);
+
+            rt::InferenceDims const prefillDims = config.packedPrefill
+                ? config.packedPrefillDims(static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens)
+                : config.prefillDims(1, prefillTotalTokens, false);
+            ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
+                "Failed to bind the stable paged-KV prefill view");
+            ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
+                "Failed to bind the stable paged-KV decode view");
+            constexpr int32_t kWARMUP = 20;
+            constexpr int32_t kITERATIONS = 100;
+            PhaseTiming const sequential = measureSequential(
+                pair->prefillExecutor(), pair->decodeExecutor(), prefillStream, decodeStream, kWARMUP, kITERATIONS);
+            PhaseTiming const overlap = measureOverlap(pair->prefillExecutor(), pair->decodeExecutor(), setupStream,
+                prefillStream, decodeStream, kWARMUP, kITERATIONS);
+            float const speedup = sequential.makespanMs / overlap.makespanMs;
+            float const overlapRatio = (overlap.prefillMs + overlap.decodeMs - overlap.makespanMs)
+                / std::min(overlap.prefillMs, overlap.decodeMs);
+            prefillKV.commitLengths(prefillChunkLengths);
+            decodeKV.commitLengths({129});
+            prefillKV.complete();
+            decodeKV.complete();
+
+            LOG_INFO(
+                "Independent phase context smoke passed: prefill_workspace=%zu decode_workspace=%zu stable_pages=%d",
+                pair->prefillContextMemory().getMemoryCapacity(), pair->decodeContextMemory().getMemoryCapacity(),
+                config.kvPoolPages - ownership.availablePages());
+            LOG_INFO(
+                "Independent phase timing (mean of %d): sequential=%.4f ms overlap=%.4f ms speedup=%.3fx "
+                "overlap_ratio=%.3f prefill_seq=%.4f ms decode_seq=%.4f ms prefill_overlap=%.4f ms "
+                "decode_overlap=%.4f ms",
+                kITERATIONS, sequential.makespanMs, overlap.makespanMs, speedup, overlapRatio, sequential.prefillMs,
+                sequential.decodeMs, overlap.prefillMs, overlap.decodeMs);
+
+            // Exercise the real queue scheduler -> dispatch worker -> independent
+            // TensorRT context path. Two 256-token requests advance in fixed-128
+            // waves while one request is already decoding.
+            ownership.ensureCapacity(prefillSlot0, 258);
+            ownership.ensureCapacity(prefillSlot1, 258);
+            ownership.ensureCapacity(decodeSlot, 132);
+            ownership.setLength(prefillSlot0, 0);
+            ownership.setLength(prefillSlot1, 0);
+            ownership.setLength(decodeSlot, 128);
+            for (rt::Tensor& deepstack : decodeIO->deepstackEmbeds)
+            {
+                CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), decodeStream));
+            }
+
+            rt::PhaseQueueSchedulerConfig schedulerConfig;
+            schedulerConfig.maxPrefillBatchSize = 2;
+            schedulerConfig.maxDecodeBatchSize = 3;
+            schedulerConfig.maxPrefillChunkTokens = 128;
+            schedulerConfig.maxOverlapPrefillTokens = 64;
+            schedulerConfig.enablePackedPrefillTokenLayout = true;
+            schedulerConfig.enableTpotHardGuard = true;
+            schedulerConfig.requireDirectOverlapCost = true;
+            schedulerConfig.enableCostAwareOverlapAdmission = true;
+            schedulerConfig.decodeQueueWaitTargetUs = 50000.0;
+            schedulerConfig.decodeSlackSafetyFactor = 0.8F;
+            schedulerConfig.maxConsecutiveOverlapBatches = 2;
+            schedulerConfig.maxPredictedDecodeDebtUs = 10000.0;
+            schedulerConfig.prefillBatchCosts = {
+                {1, 128, 2048, 3, true, 13.7F, 2.5F},
+                {2, 128, 2048, 3, true, 13.7F, 2.5F},
+                {1, 128, 2048, 3, false, 13.7F, 2.5F},
+                {2, 128, 2048, 3, false, 13.7F, 2.5F},
+            };
+            schedulerConfig.overlapBatchCosts = {
+                {1, 3, 128, 2048, 2048, true, 13.7F, 8.1F, 13.7F, 2.5F},
+                {2, 3, 128, 2048, 2048, true, 13.7F, 8.1F, 13.7F, 2.5F},
+                {1, 3, 128, 2048, 2048, false, 13.7F, 8.1F, 13.7F, 2.5F},
+                {2, 3, 128, 2048, 2048, false, 13.7F, 8.1F, 13.7F, 2.5F},
+            };
+            std::unordered_map<uint64_t, int32_t> decodeSteps;
+            rt::IndependentPhaseCoordinatorCallbacks coordinatorCallbacks;
+            coordinatorCallbacks.isDecodeFinished
+                = [&](rt::PhaseWorkItem const& item, int32_t) { return ++decodeSteps[item.requestId] >= 2; };
+            rt::IndependentPhaseCoordinator coordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
+                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks));
+
+            rt::PhaseSchedulingHints decodeHints;
+            decodeHints.tpotTargetUs = 50000.0;
+            coordinator.enqueuePrefill({101, 256, prefillSlot0, 0, 256});
+            coordinator.enqueuePrefill({102, 256, prefillSlot1, 0, 256});
+            coordinator.enqueueDecode({103, 128, decodeSlot, 0, 0, true, decodeHints});
+            coordinator.runUntilIdle(32);
+            std::vector<rt::PhaseDispatchMetrics> const& dispatchMetrics = coordinator.metrics();
+            size_t const overlapDispatches = static_cast<size_t>(std::count_if(
+                dispatchMetrics.begin(), dispatchMetrics.end(), [](rt::PhaseDispatchMetrics const& metrics) {
+                    return metrics.kind == rt::PhaseDispatchKind::kOverlap;
+                }));
+            double totalMakespanMs{};
+            for (rt::PhaseDispatchMetrics const& metrics : dispatchMetrics)
+            {
+                totalMakespanMs += metrics.makespanGpuMs;
+            }
+            ELLM_CHECK(
+                coordinator.empty() && overlapDispatches > 0, "Cost-aware phase queue did not drain with overlap");
+            LOG_INFO(
+                "Cost-aware phase queue passed: dispatches=%zu overlap_dispatches=%zu total_makespan=%.4f ms "
+                "request101_kv=%d request102_kv=%d request103_kv=%d",
+                dispatchMetrics.size(), overlapDispatches, totalMakespanMs, ownership.length(prefillSlot0),
+                ownership.length(prefillSlot1), ownership.length(decodeSlot));
+
+            ownership.release(prefillSlot0);
+            ownership.release(prefillSlot1);
+            ownership.release(decodeSlot);
+
+            rt::PhaseContinuousLoadGenerator load({16, 1000.0, 128, 512, 2, 6, 20260819, 10000});
+            std::deque<rt::PhaseLoadRequest> pendingAdmissions;
+            std::unordered_map<uint64_t, int32_t> traceSlots;
+            std::unordered_map<uint64_t, int32_t> traceOutputTargets;
+            std::unordered_map<uint64_t, int32_t> traceDecodeSteps;
+            std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> traceSubmittedAt;
+            std::vector<double> traceLatenciesMs;
+            size_t completedRequests{};
+            rt::IndependentPhaseCoordinatorCallbacks traceCallbacks;
+            traceCallbacks.isDecodeFinished = [&](rt::PhaseWorkItem const& item, int32_t) {
+                int32_t const steps = ++traceDecodeSteps[item.requestId];
+                bool const finished = steps >= traceOutputTargets.at(item.requestId);
+                if (finished)
+                {
+                    auto const now = std::chrono::steady_clock::now();
+                    traceLatenciesMs.push_back(
+                        std::chrono::duration<double, std::milli>(now - traceSubmittedAt.at(item.requestId)).count());
+                    ownership.release(traceSlots.at(item.requestId));
+                    ++completedRequests;
+                }
+                return finished;
+            };
+            rt::IndependentPhaseCoordinator traceCoordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
+                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
+
+            auto const traceStart = std::chrono::steady_clock::now();
+            size_t loopIterations{};
+            while (completedRequests < load.schedule().size())
+            {
+                int64_t const elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - traceStart)
+                                              .count();
+                std::vector<rt::PhaseLoadRequest> ready = load.popReady(elapsedUs);
+                pendingAdmissions.insert(pendingAdmissions.end(), ready.begin(), ready.end());
+                while (!pendingAdmissions.empty() && ownership.availableSlots() > 0)
+                {
+                    rt::PhaseLoadRequest const request = pendingAdmissions.front();
+                    int32_t const slot = ownership.reserve();
+                    ownership.ensureCapacity(slot, request.promptTokenCount + request.maxOutputTokens);
+                    ownership.setLength(slot, 0);
+                    traceSlots[request.requestId] = slot;
+                    traceOutputTargets[request.requestId] = request.maxOutputTokens;
+                    traceSubmittedAt[request.requestId]
+                        = traceStart + std::chrono::microseconds(request.arrivalOffsetUs);
+                    traceCoordinator.enqueuePrefill(
+                        {request.requestId, request.promptTokenCount, slot, 0, request.promptTokenCount});
+                    pendingAdmissions.pop_front();
+                }
+                if (traceCoordinator.busy())
+                {
+                    static_cast<void>(traceCoordinator.poll());
+                }
+                else if (!traceCoordinator.empty())
+                {
+                    static_cast<void>(traceCoordinator.dispatchNext());
+                }
+                ELLM_CHECK(++loopIterations < 10000000, "Continuous phase load loop exceeded its runaway guard");
             }
             if (traceCoordinator.busy())
             {
-                static_cast<void>(traceCoordinator.poll());
+                traceCoordinator.wait();
             }
-            else if (!traceCoordinator.empty())
+            auto const traceEnd = std::chrono::steady_clock::now();
+            std::sort(traceLatenciesMs.begin(), traceLatenciesMs.end());
+            size_t const p95Index = std::min(
+                traceLatenciesMs.size() - 1, static_cast<size_t>(0.95 * static_cast<double>(traceLatenciesMs.size())));
+            double totalLatencyMs{};
+            for (double const latency : traceLatenciesMs)
             {
-                static_cast<void>(traceCoordinator.dispatchNext());
+                totalLatencyMs += latency;
             }
-            ELLM_CHECK(++loopIterations < 10000000, "Continuous phase load loop exceeded its runaway guard");
+            double const elapsedSeconds = std::chrono::duration<double>(traceEnd - traceStart).count();
+            size_t const traceOverlapDispatches = static_cast<size_t>(std::count_if(traceCoordinator.metrics().begin(),
+                traceCoordinator.metrics().end(), [](rt::PhaseDispatchMetrics const& metrics) {
+                    return metrics.kind == rt::PhaseDispatchKind::kOverlap;
+                }));
+            ELLM_CHECK(traceCoordinator.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+                "Continuous phase load did not release every request and stable slot");
+            LOG_INFO(
+                "Continuous phase load passed: requests=%zu dispatches=%zu overlaps=%zu throughput=%.2f req/s "
+                "mean_latency=%.3f ms p95_latency=%.3f ms",
+                completedRequests, traceCoordinator.metrics().size(), traceOverlapDispatches,
+                static_cast<double>(completedRequests) / elapsedSeconds,
+                totalLatencyMs / static_cast<double>(traceLatenciesMs.size()), traceLatenciesMs[p95Index]);
         }
-        if (traceCoordinator.busy())
+
+        // Real text payload path: tokenizer -> compact token staging -> embedding
+        // lookup -> TensorRT prefill/decode -> greedy sampling feedback.
+        rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
+        CUDA_CHECK(cudaStreamSynchronize(setupStream));
+        rt::EmbeddingPreprocessor embeddingPreprocessor(embedding, config);
+        tokenizer::Tokenizer tokenizer;
+        ELLM_CHECK(tokenizer.loadFromHF(engineDir), "Failed to load tokenizer for semantic phase requests");
+
+        std::vector<std::string> const prompts{
+            "Give one practical tip for reducing latency in an online inference service.",
+            "In two short sentences, explain why dynamic batching can improve GPU utilization.",
+            "List three concise checks for diagnosing a slow CUDA inference pipeline, focusing on kernel timing, "
+            "memory transfers, and synchronization.",
+        };
+        std::unordered_map<uint64_t, std::vector<int32_t>> semanticPrompts;
+        std::unordered_map<uint64_t, std::vector<int32_t>> semanticOutputs;
+        std::unordered_map<uint64_t, int32_t> semanticSlots;
+        constexpr int32_t kSEMANTIC_OUTPUT_TOKENS = 8;
+        for (size_t index = 0; index < prompts.size(); ++index)
         {
-            traceCoordinator.wait();
+            uint64_t const requestId = 20000 + index;
+            rt::LLMGenerationRequest::Request request;
+            request.messages.push_back({"user", {{"text", prompts[index]}}});
+            rt::LLMGenerationRequest::FormattedRequest formatted;
+            ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
+                "Failed to format semantic phase request");
+            semanticPrompts[requestId] = tokenizer.encode(formatted.formattedCompleteRequest, false);
+            ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
+            int32_t const slot = ownership.reserve();
+            ownership.ensureCapacity(
+                slot, static_cast<int32_t>(semanticPrompts[requestId].size()) + kSEMANTIC_OUTPUT_TOKENS);
+            ownership.setLength(slot, 0);
+            semanticSlots[requestId] = slot;
         }
-        auto const traceEnd = std::chrono::steady_clock::now();
-        std::sort(traceLatenciesMs.begin(), traceLatenciesMs.end());
-        size_t const p95Index = std::min(
-            traceLatenciesMs.size() - 1, static_cast<size_t>(0.95 * static_cast<double>(traceLatenciesMs.size())));
-        double totalLatencyMs{};
-        for (double const latency : traceLatenciesMs)
+
+        rt::Tensor hostSemanticPrefillIds({config.maxSupportedBatchSize, config.maxPackedPrefillChunkTokens},
+            rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_ids");
+        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedBatchSize, config.maxPackedPrefillChunkTokens},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "semantic_phase_prefill_ids");
+        rt::Tensor hostSemanticDecodeIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_host_decode_ids");
+        rt::Tensor deviceSemanticDecodeIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_decode_ids");
+        size_t const samplingWorkspaceBytes
+            = getSelectAllTopKWorkspaceSize(config.maxSupportedBatchSize, config.outputVocabSize, 1);
+        rt::Tensor samplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT8, "semantic_phase_sampling_workspace");
+        rt::Tensor selectedTokenIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "semantic_phase_selected_ids");
+        rt::Tensor hostSelectedTokenIds({config.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "semantic_phase_host_selected_ids");
+
+        auto stageTokenIds = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io, cudaStream_t stream,
+                                 bool prefill) {
+            int32_t totalTokens = prefill ? 0 : static_cast<int32_t>(batch.size());
+            if (prefill)
+            {
+                for (rt::PhaseWorkItem const& item : batch)
+                {
+                    totalTokens += item.tokenCount;
+                }
+            }
+            rt::Coords const tokenShape
+                = prefill ? rt::Coords{1, totalTokens} : rt::Coords{static_cast<int64_t>(batch.size()), 1};
+            rt::Tensor& hostIds = prefill ? hostSemanticPrefillIds : hostSemanticDecodeIds;
+            rt::Tensor& deviceIds = prefill ? deviceSemanticPrefillIds : deviceSemanticDecodeIds;
+            ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
+                "Semantic phase token staging reshape failed");
+            int32_t* destination = hostIds.dataPointer<int32_t>();
+            int32_t destinationOffset{};
+            for (rt::PhaseWorkItem const& item : batch)
+            {
+                if (prefill)
+                {
+                    std::vector<int32_t> const& prompt = semanticPrompts.at(item.requestId);
+                    std::copy_n(prompt.begin() + item.tokenOffset, item.tokenCount, destination + destinationOffset);
+                    destinationOffset += item.tokenCount;
+                }
+                else
+                {
+                    ELLM_CHECK(!semanticOutputs.at(item.requestId).empty(),
+                        "Semantic decode request has no sampled input token");
+                    destination[destinationOffset++] = semanticOutputs.at(item.requestId).back();
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
+                static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            embeddingPreprocessor.embed(deviceIds, std::nullopt, std::nullopt, io, stream);
+            embeddingPreprocessor.prepareDeepstack(deviceIds, rt::OptionalInputTensors{}, io, stream);
+            if (prefill)
+            {
+                for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
+                {
+                    prefillMap.set(binding_names::formatDeepstackEmbedsName(index), io.deepstackEmbeds[index]);
+                }
+            }
+        };
+        auto sampleBatch
+            = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io, cudaStream_t stream, bool prefill) {
+                  int32_t const batchSize = static_cast<int32_t>(batch.size());
+                  ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
+                          && selectedTokenIds.reshape({batchSize, 1}) && hostSelectedTokenIds.reshape({batchSize}),
+                      "Semantic phase sampling reshape failed");
+                  selectAllTopK(io.outputLogits, std::nullopt, selectedTokenIds, 1, samplingWorkspace, stream);
+                  CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIds.rawPointer(), selectedTokenIds.rawPointer(),
+                      static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                  CUDA_CHECK(cudaStreamSynchronize(stream));
+                  int32_t const* selected = hostSelectedTokenIds.dataPointer<int32_t>();
+                  for (int32_t row = 0; row < batchSize; ++row)
+                  {
+                      rt::PhaseWorkItem const& item = batch[static_cast<size_t>(row)];
+                      bool const finalPrefill = item.tokenOffset + item.tokenCount == item.promptTokenCount;
+                      if (!prefill || finalPrefill)
+                      {
+                          semanticOutputs[item.requestId].push_back(selected[row]);
+                      }
+                  }
+              };
+
+        rt::IndependentPhaseCoordinatorCallbacks semanticCallbacks;
+        semanticCallbacks.stagePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
+                                             cudaStream_t stream) { stageTokenIds(batch, io, stream, true); };
+        semanticCallbacks.stageDecode = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
+                                            cudaStream_t stream) { stageTokenIds(batch, io, stream, false); };
+        semanticCallbacks.completePrefillBatch = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
+                                                     cudaStream_t stream) { sampleBatch(batch, io, stream, true); };
+        semanticCallbacks.completeDecodeBatch = [&](std::vector<rt::PhaseWorkItem> const& batch, rt::PipelineIO& io,
+                                                    cudaStream_t stream) { sampleBatch(batch, io, stream, false); };
+        auto semanticFinished = [&](rt::PhaseWorkItem const& item, int32_t) {
+            bool const finished
+                = semanticOutputs[item.requestId].size() >= static_cast<size_t>(kSEMANTIC_OUTPUT_TOKENS);
+            if (finished && ownership.leased(item.kvSlotId))
+            {
+                ownership.release(item.kvSlotId);
+            }
+            return finished;
+        };
+        semanticCallbacks.isPrefillFinished = semanticFinished;
+        semanticCallbacks.isDecodeFinished = semanticFinished;
+        rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
+        semanticSchedulerConfig.maxPrefillBatchSize = 2;
+        semanticSchedulerConfig.maxDecodeBatchSize = 3;
+        semanticSchedulerConfig.maxPrefillChunkTokens = 128;
+        semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
+        semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
+        rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
+            *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(semanticCallbacks));
+        for (size_t index = 0; index < prompts.size(); ++index)
         {
-            totalLatencyMs += latency;
+            uint64_t const requestId = 20000 + index;
+            std::vector<int32_t> const& prompt = semanticPrompts.at(requestId);
+            semanticCoordinator.enqueuePrefill({requestId, static_cast<int32_t>(prompt.size()),
+                semanticSlots.at(requestId), 0, static_cast<int32_t>(prompt.size())});
         }
-        double const elapsedSeconds = std::chrono::duration<double>(traceEnd - traceStart).count();
-        size_t const traceOverlapDispatches = static_cast<size_t>(std::count_if(traceCoordinator.metrics().begin(),
-            traceCoordinator.metrics().end(),
-            [](rt::PhaseDispatchMetrics const& metrics) { return metrics.kind == rt::PhaseDispatchKind::kOverlap; }));
-        ELLM_CHECK(traceCoordinator.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
-            "Continuous phase load did not release every request and stable slot");
-        LOG_INFO(
-            "Continuous phase load passed: requests=%zu dispatches=%zu overlaps=%zu throughput=%.2f req/s "
-            "mean_latency=%.3f ms p95_latency=%.3f ms",
-            completedRequests, traceCoordinator.metrics().size(), traceOverlapDispatches,
-            static_cast<double>(completedRequests) / elapsedSeconds,
-            totalLatencyMs / static_cast<double>(traceLatenciesMs.size()), traceLatenciesMs[p95Index]);
+        semanticCoordinator.runUntilIdle(64);
+
+        std::vector<std::string> semanticTexts;
+        semanticTexts.reserve(prompts.size());
+        for (size_t index = 0; index < prompts.size(); ++index)
+        {
+            uint64_t const requestId = 20000 + index;
+            std::vector<int32_t> const& outputIds = semanticOutputs.at(requestId);
+            semanticTexts.push_back(tokenizer.decode(outputIds, false));
+        }
+        LOG_INFO("Semantic phase outputs: output0='%s' output1='%s' output2='%s'", semanticTexts[0].c_str(),
+            semanticTexts[1].c_str(), semanticTexts[2].c_str());
+        ELLM_CHECK(semanticTexts[0].find("asynchronous") != std::string::npos
+                && semanticTexts[1].find("Dynamic batching") != std::string::npos
+                && semanticTexts[2].find("Kernel") != std::string::npos,
+            "Semantic phase outputs do not match the expected Cosmos responses");
+        ELLM_CHECK(semanticCoordinator.empty() && ownership.availableSlots() == config.maxSupportedBatchSize,
+            "Semantic phase requests did not drain and release every slot");
+        LOG_INFO("Semantic phase requests passed: output0='%s' output1='%s' output2='%s'", semanticTexts[0].c_str(),
+            semanticTexts[1].c_str(), semanticTexts[2].c_str());
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));
