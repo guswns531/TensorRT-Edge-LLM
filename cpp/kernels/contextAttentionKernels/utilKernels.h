@@ -63,11 +63,14 @@ void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* 
 //!                                out valid KV positions, breaking attention.
 //! \param[in]  runtimeSeqLen     Runtime sequence length (equals to the maximum of inputSeqLen).
 //! \param[in]  stream            CUDA stream used to launch the kernel.
+//! \param[in]  packedPrefill     When true, QKV rows are compact and each cache end advances by inputSeqLen[i]
+//!                                instead of the physical token-carrier length.
 //! \note kvCacheStartIndices is optional. If it is not provided, kvStartIndices will be assumed to be 0.
 //! \throws std::runtime_error if tensor shapes are invalid
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
-    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream,
+    bool packedPrefill = false);
 
 //! \brief Converts KV cache layout from [B, 2, H, S, D] into separate K and V tensors of shape [B, S, H, D].
 //!

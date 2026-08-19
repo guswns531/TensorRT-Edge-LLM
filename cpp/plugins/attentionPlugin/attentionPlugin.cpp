@@ -318,7 +318,8 @@ bool canImplementPaddingFMHA(ContextFMHABackend backend, int32_t numQHeads, int3
 //
 // Total allocation is the sum of all conditional slots (safe upper bound).
 size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCacheCapacity, int32_t numQHeads,
-    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache, bool enableVisionBlockAttention)
+    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache, bool enableVisionBlockAttention,
+    bool enablePackedPrefill)
 {
     size_t workspaceSize = 0;
 
@@ -330,6 +331,15 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
+
+    // The packed v1 route is FP16 causal native-paged FMHA. It consumes no
+    // split-K/V, dense K/V, FP8-Q, or vision workspace: Q is the one compact
+    // [1,totalTokens,Hq,D] carrier following the four logical-batch arrays.
+    if (enablePackedPrefill)
+    {
+        return accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
+    }
+
     workspaceSize = accumulateWorkspaceSize(
         workspaceSize, rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
 
@@ -455,7 +465,7 @@ void AttentionPlugin::enforceVisionBlockKernelSupport() const
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
     int32_t enableContextMaskSelector, int32_t slidingWindowSize, std::vector<float> const& qkvScales,
-    std::optional<float> attentionScale)
+    std::optional<float> attentionScale, int32_t enablePackedPrefill, int32_t packedPrefillMaxChunkTokens)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
@@ -463,6 +473,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mAttentionScale(resolveAttentionScale(attentionScale, headSize))
     , mEnableTreeAttention(enableTreeAttention)
     , mEnableVisionBlockAttention(enableVisionBlockAttention)
+    , mEnablePackedPrefill(enablePackedPrefill)
+    , mPackedPrefillMaxChunkTokens(packedPrefillMaxChunkTokens)
     , mEnableFp8KVCache(enableFp8KVCache)
     , mEnableContextMaskSelector(enableContextMaskSelector)
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
@@ -477,6 +489,14 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
+    ELLM_CHECK(!mEnablePackedPrefill || (!mEnableTreeAttention && !mEnableVisionBlockAttention),
+        "Packed prefill v1 is mutually exclusive with tree and vision-block attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || !mEnableFp8KVCache, "Packed prefill v1 requires an FP16 KV cache.");
+    ELLM_CHECK(!mEnablePackedPrefill || mHeadSize == 128, "Packed prefill v1 supports head size 128 only.");
+    ELLM_CHECK(!mEnablePackedPrefill || mSlidingWindowSize <= 0,
+        "Packed prefill v1 does not support sliding-window attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
+        "Packed prefill maximum chunk length must be positive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
         "Vision block attention does not support an FP8 KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || mQkvScales.size() == 3,
@@ -565,6 +585,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mEnableTreeAttention(parsePluginScalarField<int32_t>("enable_tree_attention", fc).value_or(0))
     , mEnableQKNorm(parsePluginScalarField<int32_t>("enable_qk_norm", fc).value_or(0))
     , mEnableKVShared(parsePluginScalarField<int32_t>("enable_kv_shared", fc).value_or(0))
+    , mEnablePackedPrefill(parsePluginScalarField<int32_t>("enable_packed_prefill", fc).value_or(0))
+    , mPackedPrefillMaxChunkTokens(parsePluginScalarField<int32_t>("packed_prefill_max_chunk_tokens", fc).value_or(128))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
     , mSkipSoftmaxScaleFactor(parsePluginScalarField<float>("skip_softmax_scale_factor", fc).value_or(0.f))
@@ -580,6 +602,14 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
+    ELLM_CHECK(!mEnablePackedPrefill || (!mEnableTreeAttention && !mEnableVisionBlockAttention && !mEnableKVShared),
+        "Packed prefill v1 requires owned KV and is mutually exclusive with tree and vision-block attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || !mEnableFp8KVCache, "Packed prefill v1 requires an FP16 KV cache.");
+    ELLM_CHECK(!mEnablePackedPrefill || mHeadSize == 128, "Packed prefill v1 supports head size 128 only.");
+    ELLM_CHECK(!mEnablePackedPrefill || mSlidingWindowSize <= 0,
+        "Packed prefill v1 does not support sliding-window attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
+        "Packed prefill maximum chunk length must be positive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
         "Vision block attention does not support an FP8 KV cache.");
 
@@ -698,7 +728,7 @@ IPluginV3* AttentionPlugin::clone() noexcept
         // by construction.
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
             mEnableFp8KVCache, mEnableVisionBlockAttention, mEnableContextMaskSelector, mSlidingWindowSize, mQkvScales,
-            mAttentionScale);
+            mAttentionScale, mEnablePackedPrefill, mPackedPrefillMaxChunkTokens);
         p->mEnableQKNorm = mEnableQKNorm;
         p->mEnableKVShared = mEnableKVShared;
         p->mRmsNormEps = mRmsNormEps;
@@ -1049,14 +1079,15 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     }
 
     // Packed QKV: max batch/seq derived from packed input's first two dims (same as Q).
-    int64_t const maxBatchSize = inputs[kIN_QKV_IDX].max.d[0];
+    int64_t const maxBatchSize
+        = mEnablePackedPrefill ? inputs[kIN_CONTEXT_LENGTH_IDX].max.d[0] : inputs[kIN_QKV_IDX].max.d[0];
     int64_t const maxSeqLen = inputs[kIN_QKV_IDX].max.d[1];
     // KV binding is the paged pool [2, numPages, 128, Hkv, D]; the per-slot padded capacity is the
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
     size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
         mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
-        mEnableVisionBlockAttention != 0);
+        mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0);
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
     return workspaceSize;
@@ -1121,7 +1152,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     //   0: [B, S, (Hq+2*Hkv)*D] — Q+K+V; K/V are written to the KV cache.
     //   1: [B, S, Hq*D] — Q only; K/V come from a donated cache and are not written.
     PluginTensorDesc const& packedQKVInputDesc = inputDesc[kIN_QKV_IDX];
-    int32_t const runtimeBatchSize = static_cast<int32_t>(packedQKVInputDesc.dims.d[0]);
+    int32_t const physicalBatchSize = static_cast<int32_t>(packedQKVInputDesc.dims.d[0]);
     int32_t const runtimeSeqLen = static_cast<int32_t>(packedQKVInputDesc.dims.d[1]);
     int32_t const actualChannels = static_cast<int32_t>(packedQKVInputDesc.dims.d[2]);
     bool const sharedKV = (mEnableKVShared != 0);
@@ -1131,8 +1162,13 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         "(enable_kv_shared=0) or Hq*head_dim (enable_kv_shared=1).");
     int32_t const combinedHeads = sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads);
 
+    PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
+    bool const packedPrefill = mEnablePackedPrefill && physicalBatchSize == 1 && runtimeSeqLen > 1 && !sharedKV;
+    int32_t const runtimeBatchSize
+        = packedPrefill ? static_cast<int32_t>(contextLengthInputDesc.dims.d[0]) : physicalBatchSize;
+
     rt::Tensor packedQKVTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, combinedHeads, mHeadSize}, rt::DeviceType::kGPU,
+        rt::Coords{physicalBatchSize, runtimeSeqLen, combinedHeads, mHeadSize}, rt::DeviceType::kGPU,
         packedQKVInputDesc.type);
 
     // qInputTensor / kInputTensor / vInputTensor are assigned from workspace below and
@@ -1145,13 +1181,20 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     // qInputTensor so the Q-only RoPE kernels run in-place.
     auto aliasPackedAsQInput = [&]() {
         return rt::Tensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
-            rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU,
+            rt::Coords{physicalBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU,
             packedQKVInputDesc.type);
     };
 
-    PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
     rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[kIN_CONTEXT_LENGTH_IDX]),
         rt::Coords{contextLengthInputDesc.dims}, rt::DeviceType::kGPU, contextLengthInputDesc.type);
+    check::check(contextLengthInputDesc.dims.d[0] == runtimeBatchSize,
+        "Context length count must equal the logical runtime batch size.");
+    if (packedPrefill)
+    {
+        check::check(physicalBatchSize == 1, "Packed prefill QKV must have shape [1,totalTokens,C].");
+        check::check(runtimeSeqLen <= runtimeBatchSize * mPackedPrefillMaxChunkTokens,
+            "Packed prefill total tokens exceed logical batch times the configured maximum chunk length.");
+    }
 
     PluginTensorDesc const& posEncodingCosSinDesc = inputDesc[kIN_ROPE_COS_SIN_IDX];
     rt::Tensor const ropeCosSinTensor(const_cast<void*>(inputs[kIN_ROPE_COS_SIN_IDX]),
@@ -1278,7 +1321,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     // Determine the attention execution mode based on the input tensors.
     // deduceMode* only reads seq_len (.getShape()[1]), which equals Q's seq_len.
     AttentionExecutionMode executionMode{};
-    if (!mEnableTreeAttention)
+    if (packedPrefill)
+    {
+        executionMode = AttentionExecutionMode::kNORMAL_PREFILL;
+    }
+    else if (!mEnableTreeAttention)
     {
         if (isPaddingContextMask(runtimeContextMaskMode) && kvCacheStartIdxTensor.getShape()[0] != 0)
         {
@@ -1325,6 +1372,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
     {
         bool const usePaddingContextMask = isPaddingContextMask(runtimeContextMaskMode);
+        if (packedPrefill && (usePaddingContextMask || mContextFMHABackend != ContextFMHABackend::kCUTE_DSL_FMHA_V2))
+        {
+            LOG_ERROR("AttentionPlugin: packed prefill v1 requires causal FMHA-v2 paged attention.");
+            return 1;
+        }
         // Shared layers do not own the donor cache's K/V quantization scales, so they cannot safely dequantize an
         // FP8 donor cache during prefill.
         if (mEnableFp8KVCache && sharedKV)
@@ -1518,8 +1570,10 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             bool const useNativePagedFMHA = !usePaddingContextMask && !mEnableFp8KVCache;
             int32_t const preflightKVSeqLen
                 = useNativePagedFMHA ? kvCacheCapacity : (useSmallD64 ? runtimeSeqLen : kvCacheCapacity);
+            int32_t const runnerSeqLen
+                = packedPrefill ? std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens) : runtimeSeqLen;
             CuteDslFMHAV2Runner runner(
-                mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, preflightKVSeqLen, useSmallD64);
+                mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runnerSeqLen, preflightKVSeqLen, useSmallD64);
             int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
             bool const preflightSucceeded = usePaddingContextMask ? runner.preflightPadding(stream)
                 : useNativePagedFMHA                              ? runner.preflightPaged(stream, slidingWindow)
@@ -1549,7 +1603,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         rt::Tensor paddedCuKVSeqLensTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-            cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
+            cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream, packedPrefill);
 
         auto splitLenForFallback = [&]() {
             // It is only safe to compact the split-KV workspace to runtimeSeqLen
@@ -1678,7 +1732,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             // qScratch: roped Q [B, S, Hq, D], always allocated. On the FP8 path the
             // kernel writes the quantized Q to fp8QTensor instead and qScratch is unused.
             qInputTensor = assignTensorFromWorkspace(
-                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                alignedWorkspacePtr, {physicalBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             if (mEnableFp8KVCache)
             {
                 // FP8 Q workspace: packed RoPE kernel quantizes roped Q to FP8 using calibrated qScale.
@@ -1735,7 +1789,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
             // FMHA-v2 always reads the RoPE-transformed Q from scratch.
             qInputTensor = assignTensorFromWorkspace(
-                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                alignedWorkspacePtr, {physicalBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
 
             if (!mEnableFp8KVCache && !usePaddingContextMask)
             {
@@ -1751,8 +1805,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     "(B=%d, Sq=%d, capacity=%d, Hq=%d, Hkv=%d, D=%d)",
                     executionMode == AttentionExecutionMode::kCHUNKED_PREFILL ? "chunked" : "normal", runtimeBatchSize,
                     runtimeSeqLen, kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize);
-                CuteDslFMHAV2Runner runner(
-                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize,
+                    packedPrefill ? std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens) : runtimeSeqLen,
+                    kvCacheCapacity);
                 if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
                         attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
                         cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
@@ -1934,6 +1989,9 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("enable_tree_attention", &mEnableTreeAttention, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_qk_norm", &mEnableQKNorm, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_kv_shared", &mEnableKVShared, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_packed_prefill", &mEnablePackedPrefill, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back(
+        "packed_prefill_max_chunk_tokens", &mPackedPrefillMaxChunkTokens, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "enable_vision_block_attention", &mEnableVisionBlockAttention, PluginFieldType::kINT32, 1);
@@ -1971,6 +2029,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_qk_norm", nullptr, PluginFieldType::kINT32, 0));
     // Optional (default 0). Shared-KV layer: packed input is Q only; no KV-cache write.
     mPluginAttributes.emplace_back(PluginField("enable_kv_shared", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("enable_packed_prefill", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("packed_prefill_max_chunk_tokens", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_vision_block_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_context_mask_selector", nullptr, PluginFieldType::kINT32, 0));

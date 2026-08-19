@@ -906,6 +906,79 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
     }
 }
 
+TEST(RopePackedCompactPrefill, MapsCompactTokensToLogicalPageRows)
+{
+    cudaStream_t stream{nullptr};
+    int32_t constexpr logicalBatchSize = 3;
+    int32_t constexpr totalTokens = 9;
+    int32_t constexpr numQHeads = 2;
+    int32_t constexpr numKVHeads = 1;
+    int32_t constexpr headDim = 128;
+    int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
+    int32_t constexpr kvCacheCapacity = rt::kTOKENS_PER_PAGE;
+    int32_t constexpr numFlatPages = 2 * logicalBatchSize;
+
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, kvCacheCapacity, stream);
+
+    std::vector<half> packedInput(static_cast<size_t>(totalTokens) * combinedHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    for (int32_t token = 0; token < totalTokens; ++token)
+    {
+        int64_t const vBase = (static_cast<int64_t>(token) * combinedHeads + numQHeads + numKVHeads) * headDim;
+        for (int32_t dim = 0; dim < headDim; ++dim)
+        {
+            packedInput[vBase + dim] = __float2half(static_cast<float>(token + 1));
+        }
+    }
+    rt::Tensor packedTensor(
+        rt::Coords{1, totalTokens, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packedInput);
+    rt::Tensor qScratchTensor(
+        rt::Coords{1, totalTokens, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    half const sentinel = __float2half(777.0F);
+    std::vector<half> kvCacheInit(
+        static_cast<size_t>(numFlatPages) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
+    rt::Tensor kvCacheTensor(rt::Coords{logicalBatchSize, 2, numKVHeads, kvCacheCapacity, headDim},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(kvCacheTensor, kvCacheInit);
+
+    rt::Tensor kvCacheEndLensTensor({logicalBatchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(kvCacheEndLensTensor, std::vector<int32_t>{3, 2, 4});
+    rt::Tensor cuQSeqLensTensor({logicalBatchSize + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    std::vector<int32_t> const cuSeqLens{0, 3, 5, 9};
+    copyHostToDevice(cuQSeqLensTensor, cuSeqLens);
+    rt::Tensor pageTableTensor(rt::Coords{logicalBatchSize, 2, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableTensor, std::vector<int32_t>{0, 3, 1, 4, 2, 5});
+
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, rt::OptionalInputTensor{kvCacheEndLensTensor},
+        rt::OptionalInputTensor{}, packedTensor, qScratchTensor, kvCacheTensor, 1.0F, 1.0F, stream,
+        pageTableTensor.dataPointer<int32_t>(), 1, nullptr, nullptr, nullptr, 1.0F, nullptr, nullptr, 1e-6F,
+        rt::OptionalInputTensor{cuQSeqLensTensor});
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    auto const kvOut = copyDeviceToHost<half>(kvCacheTensor);
+    size_t const pageElements = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * numKVHeads * headDim;
+    for (int32_t batch = 0; batch < logicalBatchSize; ++batch)
+    {
+        int32_t const rowLength = cuSeqLens[batch + 1] - cuSeqLens[batch];
+        for (int32_t row = 0; row < rt::kTOKENS_PER_PAGE; ++row)
+        {
+            float const expected = row < rowLength ? static_cast<float>(cuSeqLens[batch] + row + 1) : 777.0F;
+            size_t const vPageBase = static_cast<size_t>(logicalBatchSize + batch) * pageElements;
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                EXPECT_EQ(__half2float(kvOut[vPageBase + static_cast<size_t>(row) * headDim + dim]), expected)
+                    << "V cache mismatch at logical batch " << batch << ", row " << row << ", dim " << dim;
+            }
+        }
+    }
+}
+
 TEST(RopePackedFusedNorm, Accuracy)
 {
     // Power-of-2 lane count baseline (headDim=128 -> 16 lanes, no ghosts); odd seq len for

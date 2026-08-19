@@ -428,6 +428,8 @@ class AttentionPluginRunner:
                  enable_kv_shared: int = 0,
                  enable_context_mask_selector: bool = False,
                  enable_vision_block_attention: bool = False,
+                 enable_packed_prefill: bool = False,
+                 packed_prefill_max_chunk_tokens: int = 128,
                  expect_unsupported: bool = False,
                  shuffle_pages: bool = False):
         self.p = p
@@ -438,6 +440,8 @@ class AttentionPluginRunner:
         self.attention_scale = attention_scale
         self.kv_shared = enable_kv_shared
         self.context_mask_selector = enable_context_mask_selector
+        self.packed_prefill = enable_packed_prefill
+        self.packed_prefill_max_chunk_tokens = packed_prefill_max_chunk_tokens
         self.expect_unsupported = expect_unsupported
         # shuffle_pages: give each slot non-contiguous physical pages so the
         # page table stops being identity -- proves the kernel follows it.
@@ -473,9 +477,15 @@ class AttentionPluginRunner:
         # Channel width is fixed by the mode: Q-only (q_hidden) for shared-KV
         # engines, the full packed width otherwise.
         qkv_c = qh if self.kv_shared else p.qkv_hidden_size
+        qkv_profile = ((1, 1, qkv_c),
+                       (1, p.batch_size * p.seq_len, qkv_c),
+                       (1, mb * self.packed_prefill_max_chunk_tokens, qkv_c)) \
+            if self.packed_prefill else \
+            ((1, 1, qkv_c), (p.batch_size, p.seq_len, qkv_c),
+             (mb, ms, qkv_c))
         profiles = {
             "qkv":
-            ((1, 1, qkv_c), (p.batch_size, p.seq_len, qkv_c), (mb, ms, qkv_c)),
+            qkv_profile,
             "kv_cache": (pool_shape, pool_shape, pool_shape),
             "context_lengths": ((1, ), (p.batch_size, ), (mb, )),
             "rope_cos_sin": ((1, mpe, D), (1, mpe, D), (1, mpe, D)),
@@ -534,6 +544,9 @@ class AttentionPluginRunner:
             pf_int32("enable_kv_shared", int(self.kv_shared)),
             pf_int32("enable_context_mask_selector",
                      int(self.context_mask_selector)),
+            pf_int32("enable_packed_prefill", int(self.packed_prefill)),
+            pf_int32("packed_prefill_max_chunk_tokens",
+                     self.packed_prefill_max_chunk_tokens),
             pf_int32("enable_fp8_kv_cache", int(p.enable_fp8_kv_cache)),
             pf_int32("sliding_window_size", p.sliding_window_size),
         ]
@@ -1644,6 +1657,46 @@ def _run_normal_prefill_then_decode(p: AttentionParams,
 def test_normal_prefill():
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **BASE)
     _run_normal_prefill_then_decode(p, decode_rounds=1)
+
+
+def test_packed_prefill_matches_padded_batch():
+    """A [1,B*S,C] carrier must preserve the B independent attention rows."""
+    p = AttentionParams(batch_size=3, seq_len=8, is_prefill=True, **BASE)
+    gen = torch.Generator().manual_seed(20260819)
+    packed_runner = AttentionPluginRunner(
+        p,
+        enable_packed_prefill=True,
+        packed_prefill_max_chunk_tokens=p.max_seq_len)
+    cos, sin, combined = _make_rope(p, gen)
+    ref_k, ref_v, plugin_kv = _empty_caches(p)
+    qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV)
+    position_ids = torch.arange(p.seq_len, dtype=torch.int32,
+                                device=DEV)[None].repeat(p.batch_size, 1)
+    cache_indices = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    context_lengths = torch.full((p.batch_size, ),
+                                 p.seq_len,
+                                 dtype=torch.int32,
+                                 device=DEV)
+    mask = sliding_window_mask(p.seq_len, p.seq_len, -1, DEV)
+    ref_out, ref_k, ref_v = compute_attention(qkv, ref_k, ref_v, cos, sin,
+                                              position_ids, cache_indices, p,
+                                              mask)
+    empty_indices, prefill_shapes = _empty_cache_indices(p)
+    packed_qkv = qkv.to(torch.float16).reshape(1, -1, p.qkv_hidden_size)
+    packed_out, plugin_kv = packed_runner.run(packed_qkv,
+                                              plugin_kv,
+                                              context_lengths,
+                                              combined,
+                                              empty_indices,
+                                              input_shapes=prefill_shapes)
+    plugin_k, plugin_v = _plugin_kv_to_ref(plugin_kv, p)
+
+    assert_close("packed-prefill-output", ref_out.reshape_as(packed_out),
+                 packed_out)
+    assert_close("packed-prefill-k-cache", ref_k, plugin_k)
+    assert_close("packed-prefill-v-cache", ref_v, plugin_v)
 
 
 # FP8 KV cache + normal prefill: the fresh-prefill kernel never READS the FP8

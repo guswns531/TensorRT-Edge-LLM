@@ -74,7 +74,8 @@ public:
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
         int32_t enableContextMaskSelector, int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
-        std::optional<float> attentionScale = std::nullopt);
+        std::optional<float> attentionScale = std::nullopt, int32_t enablePackedPrefill = 0,
+        int32_t packedPrefillMaxChunkTokens = 128);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -171,6 +172,10 @@ protected:
     //! Whether this layer reads K/V from a donated (shared) cache: the packed input carries
     //! Q only [B, S, Hq*D] and the plugin skips the KV-cache write.
     int32_t mEnableKVShared{};
+    //! Whether prefill QKV uses one compact token carrier [1, totalTokens, C] for a logical request batch.
+    int32_t mEnablePackedPrefill{};
+    //! Maximum per-request chunk represented by a packed prefill engine profile.
+    int32_t mPackedPrefillMaxChunkTokens{128};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

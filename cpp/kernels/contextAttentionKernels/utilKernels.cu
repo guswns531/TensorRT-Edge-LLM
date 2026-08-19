@@ -26,7 +26,7 @@ namespace kernel
 
 __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, int32_t const* kvCacheStartIndices,
     int32_t* cuQSeqlen, int32_t* cuKVSeqLens, int32_t* kvCacheEndIndices, int32_t* paddedCuKVSeqLens,
-    int32_t runtimeSeqLen, int32_t batchSize)
+    int32_t runtimeSeqLen, int32_t batchSize, bool packedPrefill)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
@@ -54,7 +54,8 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
             runningCuKvCacheLen += (kvCacheStartIdx + inputSeqLen[i]);
             cuKVSeqLens[i + 1] = runningCuKvCacheLen;
             // To keep semantic consistency with the packed QKV layout for RoPE, use runtimeSeqLen here.
-            int32_t const kvEndIdx = kvCacheStartIdx + runtimeSeqLen;
+            int32_t const physicalRowLen = packedPrefill ? inputSeqLen[i] : runtimeSeqLen;
+            int32_t const kvEndIdx = kvCacheStartIdx + physicalRowLen;
             kvCacheEndIndices[i] = kvEndIdx;
 
             if (paddedCuKVSeqLens != nullptr)
@@ -68,7 +69,7 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
-    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream)
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream, bool packedPrefill)
 {
     int32_t const runtimeBatchSize = static_cast<int32_t>(inputSeqLen.getShape()[0]);
 
@@ -100,7 +101,7 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     calCuQCuKVSeqLensAndKVEndIdxsKernel<<<1, 1, 0, stream>>>(inputSeqLen.dataPointer<int32_t>(),
         kvCacheStartIndices.dataPointer<int32_t>(), cuQSeqLens.dataPointer<int32_t>(),
         cuKVSeqLens.dataPointer<int32_t>(), kvCacheEndIdxs.dataPointer<int32_t>(), paddedPtr, runtimeSeqLen,
-        runtimeBatchSize);
+        runtimeBatchSize, packedPrefill);
 }
 
 namespace

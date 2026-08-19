@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +29,7 @@ struct SeqLensTestCase
     std::vector<int32_t> inputSeqLen;
     std::vector<int32_t> kvCacheStartIndices; // empty = normal prefill (all zeros)
     int32_t runtimeSeqLen;
+    bool packedPrefill{false};
 
     // Expected outputs
     std::vector<int32_t> expectedCuQSeqLens;
@@ -62,7 +63,7 @@ static void verifyCalCuQCuKVSeqLensAndKVEndIdxs(SeqLensTestCase const& tc)
 
     cudaStream_t stream{nullptr};
     kernel::calCuQCuKVSeqLensAndKVEndIdxs(inputSeqLenTensor, kvCacheStartIdxTensor, cuQSeqLensTensor, cuKVSeqLensTensor,
-        kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, tc.runtimeSeqLen, stream);
+        kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, tc.runtimeSeqLen, stream, tc.packedPrefill);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Read back and verify all outputs
@@ -162,6 +163,22 @@ TEST(UtilKernelTest, seqLens_chunkedPrefillVaryingLengths)
         .expectedCuKVSeqLens = {0, 150, 180},
         .expectedKvCacheEndIdxs = {150, 50},
         .expectedPaddedCuKVSeqLens = {0, 150, 200},
+    });
+}
+
+// Packed prefill uses one physical [1,totalTokens,*] carrier. Each logical
+// request advances only by its own compact row length.
+TEST(UtilKernelTest, seqLens_packedPrefillVaryingLengths)
+{
+    verifyCalCuQCuKVSeqLensAndKVEndIdxs({
+        .inputSeqLen = {96, 32, 64},
+        .kvCacheStartIndices = {128, 256, 0},
+        .runtimeSeqLen = 192,
+        .packedPrefill = true,
+        .expectedCuQSeqLens = {0, 96, 128, 192},
+        .expectedCuKVSeqLens = {0, 224, 512, 576},
+        .expectedKvCacheEndIdxs = {224, 288, 64},
+        .expectedPaddedCuKVSeqLens = {0, 224, 512, 576},
     });
 }
 
