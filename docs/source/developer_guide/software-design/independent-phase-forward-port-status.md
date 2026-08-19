@@ -43,6 +43,12 @@ stable-page cache is implemented and unit-tested, but the Cosmos adapter keeps
 `supportsPageAlignedPrefixReuse` disabled until that position contract is
 implemented. This avoids silently changing greedy output.
 
+The current correctness-safe policy also admits at most one active reader of a
+published source prefix. This prevents a packed dispatch from mixing a shared
+suffix row with another row that aliases the same physical page. Sequential
+prefix reuse is deterministic; multi-reader page sharing remains a future
+optimization after a plugin-level aliasing contract is added.
+
 ## HTTP transport
 
 `TRT_EDGELLM_PHASE_IPC=1` enables a JSON-lines process mode in the phase smoke
