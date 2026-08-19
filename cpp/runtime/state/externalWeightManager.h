@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm
@@ -94,7 +95,8 @@ private:
     std::optional<Tensor> mPleEmbedding{};
     bool mLoaded{false};
     bool mValidated{false};
-    bool mRegistered{false};
+    std::unordered_set<TensorMap*> mRegisteredMaps;
+    bool mBoundToContext{false};
 };
 
 } // namespace rt

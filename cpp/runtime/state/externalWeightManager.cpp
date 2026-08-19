@@ -759,7 +759,7 @@ void ExternalWeightManager::bindToContext(
             "Failed to bind external weight " + tensor.getName());
     }
     mValidated = true;
-    mRegistered = true;
+    mBoundToContext = true;
     if (!mWeights.empty())
     {
         LOG_INFO("Bound %d external weight tensor(s) to %.*s", static_cast<int32_t>(mWeights.size()),
@@ -770,12 +770,12 @@ void ExternalWeightManager::bindToContext(
 void ExternalWeightManager::registerTensorMapEntries(TensorMap& map)
 {
     ELLM_CHECK(mValidated, "registerTensorMapEntries called before weight validation");
-    ELLM_CHECK(!mRegistered, "registerTensorMapEntries called more than once");
+    ELLM_CHECK(!mBoundToContext, "registerTensorMapEntries cannot follow direct context binding");
+    ELLM_CHECK(mRegisteredMaps.insert(&map).second, "registerTensorMapEntries called twice for the same TensorMap");
     for (auto& tensor : mWeights)
     {
         map.set(tensor.getName(), tensor);
     }
-    mRegistered = true;
 }
 
 } // namespace rt

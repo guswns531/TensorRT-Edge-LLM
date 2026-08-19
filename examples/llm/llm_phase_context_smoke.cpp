@@ -21,19 +21,25 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
+#include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/state/pipelineIO.h"
+#include "runtime/state/sharedResources.h"
 
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 using namespace trt_edgellm;
 
 int main(int argc, char** argv)
 {
-    constexpr int32_t kEXPECTED_ARGUMENTS = 2;
-    if (argc != kEXPECTED_ARGUMENTS)
+    constexpr int32_t kMIN_ARGUMENTS = 2;
+    constexpr int32_t kMAX_ARGUMENTS = 3;
+    if (argc < kMIN_ARGUMENTS || argc > kMAX_ARGUMENTS)
     {
-        LOG_ERROR("Usage: %s <engine-dir>", argv[0]);
+        LOG_ERROR("Usage: %s <engine-dir> [checkpoint-dir]", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -44,6 +50,7 @@ int main(int argc, char** argv)
     }
 
     std::filesystem::path const engineDir{argv[1]};
+    std::string const checkpointDir = argc == kMAX_ARGUMENTS ? argv[2] : "";
     rt::LLMEngineConfig const config = rt::parseEngineConfig(engineDir / "config.json");
 
     cudaStream_t setupStream{};
@@ -69,8 +76,42 @@ int main(int argc, char** argv)
         ELLM_CHECK(pair->prefillContextMemory().rawPointer() != pair->decodeContextMemory().rawPointer(),
             "Independent phase executors must own different workspaces");
 
-        LOG_INFO("Independent phase context smoke passed: prefill_workspace=%zu decode_workspace=%zu",
-            pair->prefillContextMemory().getMemoryCapacity(), pair->decodeContextMemory().getMemoryCapacity());
+        std::unordered_map<std::string, std::string> const emptyLoraMap;
+        auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
+        auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(config, setupStream));
+        auto decodeIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(config, setupStream));
+        rt::TensorMap prefillMap;
+        rt::TensorMap decodeMap;
+        rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
+        rt::buildTensorMap(decodeMap, *decodeIO, *resources, config, 0);
+        resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream, checkpointDir);
+        resources->externalWeightManager->validateAgainstEngine(pair->prefillExecutor(), "base");
+        resources->externalWeightManager->registerTensorMapEntries(prefillMap);
+        resources->externalWeightManager->registerTensorMapEntries(decodeMap);
+
+        rt::StableKVPageManager ownership({config.maxSupportedBatchSize, config.maxSupportedBatchSize,
+            config.kvPoolPages, config.maxKVCacheCapacity, 128});
+        int32_t const prefillSlot = ownership.reserve();
+        int32_t const decodeSlot = ownership.reserve();
+        ownership.ensureCapacity(prefillSlot, 128);
+        ownership.ensureCapacity(decodeSlot, 128);
+        ownership.setLength(prefillSlot, 0);
+        ownership.setLength(decodeSlot, 128);
+        rt::PhaseKVActiveView prefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "prefill");
+        rt::PhaseKVActiveView decodeKV(config.maxSupportedBatchSize, ownership, decodeMap, "decode");
+        prefillKV.prepare({prefillSlot}, prefillStream);
+        decodeKV.prepare({decodeSlot}, decodeStream);
+
+        ELLM_CHECK(pair->prefillExecutor().prepare(0, config.prefillDims(1, 128, false), prefillMap, prefillStream),
+            "Failed to bind the stable paged-KV prefill view");
+        ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
+            "Failed to bind the stable paged-KV decode view");
+        prefillKV.complete();
+        decodeKV.complete();
+
+        LOG_INFO("Independent phase context smoke passed: prefill_workspace=%zu decode_workspace=%zu stable_pages=%d",
+            pair->prefillContextMemory().getMemoryCapacity(), pair->decodeContextMemory().getMemoryCapacity(),
+            config.kvPoolPages - ownership.availablePages());
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));
