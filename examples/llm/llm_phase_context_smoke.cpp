@@ -25,13 +25,134 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 using namespace trt_edgellm;
+
+namespace
+{
+
+struct PhaseTiming
+{
+    float prefillMs{};
+    float decodeMs{};
+    float makespanMs{};
+};
+
+PhaseTiming measureOverlap(rt::EngineExecutor& prefillExecutor, rt::EngineExecutor& decodeExecutor,
+    cudaStream_t setupStream, cudaStream_t prefillStream, cudaStream_t decodeStream, int32_t warmup, int32_t iterations)
+{
+    cudaEvent_t gate{};
+    cudaEvent_t prefillStart{};
+    cudaEvent_t prefillEnd{};
+    cudaEvent_t decodeStart{};
+    cudaEvent_t decodeEnd{};
+    cudaEvent_t done{};
+    CUDA_CHECK(cudaEventCreate(&gate));
+    CUDA_CHECK(cudaEventCreate(&prefillStart));
+    CUDA_CHECK(cudaEventCreate(&prefillEnd));
+    CUDA_CHECK(cudaEventCreate(&decodeStart));
+    CUDA_CHECK(cudaEventCreate(&decodeEnd));
+    CUDA_CHECK(cudaEventCreate(&done));
+
+    PhaseTiming total;
+    int32_t const totalIterations = warmup + iterations;
+    for (int32_t iteration = 0; iteration < totalIterations; ++iteration)
+    {
+        CUDA_CHECK(cudaEventRecord(gate, setupStream));
+        CUDA_CHECK(cudaStreamWaitEvent(prefillStream, gate));
+        CUDA_CHECK(cudaStreamWaitEvent(decodeStream, gate));
+        CUDA_CHECK(cudaEventRecord(prefillStart, prefillStream));
+        ELLM_CHECK(prefillExecutor.execute(prefillStream), "Packed overlap prefill execution failed");
+        CUDA_CHECK(cudaEventRecord(prefillEnd, prefillStream));
+        CUDA_CHECK(cudaEventRecord(decodeStart, decodeStream));
+        ELLM_CHECK(decodeExecutor.execute(decodeStream), "Packed overlap decode execution failed");
+        CUDA_CHECK(cudaEventRecord(decodeEnd, decodeStream));
+        CUDA_CHECK(cudaStreamWaitEvent(setupStream, prefillEnd));
+        CUDA_CHECK(cudaStreamWaitEvent(setupStream, decodeEnd));
+        CUDA_CHECK(cudaEventRecord(done, setupStream));
+        CUDA_CHECK(cudaEventSynchronize(done));
+        if (iteration >= warmup)
+        {
+            float prefillMs{};
+            float decodeMs{};
+            float makespanMs{};
+            CUDA_CHECK(cudaEventElapsedTime(&prefillMs, prefillStart, prefillEnd));
+            CUDA_CHECK(cudaEventElapsedTime(&decodeMs, decodeStart, decodeEnd));
+            CUDA_CHECK(cudaEventElapsedTime(&makespanMs, gate, done));
+            total.prefillMs += prefillMs;
+            total.decodeMs += decodeMs;
+            total.makespanMs += makespanMs;
+        }
+    }
+
+    CUDA_CHECK(cudaEventDestroy(gate));
+    CUDA_CHECK(cudaEventDestroy(prefillStart));
+    CUDA_CHECK(cudaEventDestroy(prefillEnd));
+    CUDA_CHECK(cudaEventDestroy(decodeStart));
+    CUDA_CHECK(cudaEventDestroy(decodeEnd));
+    CUDA_CHECK(cudaEventDestroy(done));
+    float const scale = 1.0F / static_cast<float>(iterations);
+    total.prefillMs *= scale;
+    total.decodeMs *= scale;
+    total.makespanMs *= scale;
+    return total;
+}
+
+PhaseTiming measureSequential(rt::EngineExecutor& prefillExecutor, rt::EngineExecutor& decodeExecutor,
+    cudaStream_t prefillStream, cudaStream_t decodeStream, int32_t warmup, int32_t iterations)
+{
+    cudaEvent_t prefillStart{};
+    cudaEvent_t prefillEnd{};
+    cudaEvent_t decodeStart{};
+    cudaEvent_t decodeEnd{};
+    CUDA_CHECK(cudaEventCreate(&prefillStart));
+    CUDA_CHECK(cudaEventCreate(&prefillEnd));
+    CUDA_CHECK(cudaEventCreate(&decodeStart));
+    CUDA_CHECK(cudaEventCreate(&decodeEnd));
+
+    PhaseTiming total;
+    int32_t const totalIterations = warmup + iterations;
+    for (int32_t iteration = 0; iteration < totalIterations; ++iteration)
+    {
+        CUDA_CHECK(cudaEventRecord(prefillStart, prefillStream));
+        ELLM_CHECK(prefillExecutor.execute(prefillStream), "Packed sequential prefill execution failed");
+        CUDA_CHECK(cudaEventRecord(prefillEnd, prefillStream));
+        CUDA_CHECK(cudaEventSynchronize(prefillEnd));
+        CUDA_CHECK(cudaEventRecord(decodeStart, decodeStream));
+        ELLM_CHECK(decodeExecutor.execute(decodeStream), "Packed sequential decode execution failed");
+        CUDA_CHECK(cudaEventRecord(decodeEnd, decodeStream));
+        CUDA_CHECK(cudaEventSynchronize(decodeEnd));
+        if (iteration >= warmup)
+        {
+            float prefillMs{};
+            float decodeMs{};
+            CUDA_CHECK(cudaEventElapsedTime(&prefillMs, prefillStart, prefillEnd));
+            CUDA_CHECK(cudaEventElapsedTime(&decodeMs, decodeStart, decodeEnd));
+            total.prefillMs += prefillMs;
+            total.decodeMs += decodeMs;
+            total.makespanMs += prefillMs + decodeMs;
+        }
+    }
+
+    CUDA_CHECK(cudaEventDestroy(prefillStart));
+    CUDA_CHECK(cudaEventDestroy(prefillEnd));
+    CUDA_CHECK(cudaEventDestroy(decodeStart));
+    CUDA_CHECK(cudaEventDestroy(decodeEnd));
+    float const scale = 1.0F / static_cast<float>(iterations);
+    total.prefillMs *= scale;
+    total.decodeMs *= scale;
+    total.makespanMs *= scale;
+    return total;
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -139,10 +260,15 @@ int main(int argc, char** argv)
             "Failed to bind the stable paged-KV prefill view");
         ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
             "Failed to bind the stable paged-KV decode view");
-        ELLM_CHECK(pair->prefillExecutor().execute(prefillStream), "Failed to execute stable paged-KV prefill");
-        ELLM_CHECK(pair->decodeExecutor().execute(decodeStream), "Failed to execute stable paged-KV decode");
-        CUDA_CHECK(cudaStreamSynchronize(prefillStream));
-        CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+        constexpr int32_t kWARMUP = 20;
+        constexpr int32_t kITERATIONS = 100;
+        PhaseTiming const sequential = measureSequential(
+            pair->prefillExecutor(), pair->decodeExecutor(), prefillStream, decodeStream, kWARMUP, kITERATIONS);
+        PhaseTiming const overlap = measureOverlap(pair->prefillExecutor(), pair->decodeExecutor(), setupStream,
+            prefillStream, decodeStream, kWARMUP, kITERATIONS);
+        float const speedup = sequential.makespanMs / overlap.makespanMs;
+        float const overlapRatio = (overlap.prefillMs + overlap.decodeMs - overlap.makespanMs)
+            / std::min(overlap.prefillMs, overlap.decodeMs);
         prefillKV.commitLengths(prefillChunkLengths);
         decodeKV.commitLengths({129});
         prefillKV.complete();
@@ -151,6 +277,12 @@ int main(int argc, char** argv)
         LOG_INFO("Independent phase context smoke passed: prefill_workspace=%zu decode_workspace=%zu stable_pages=%d",
             pair->prefillContextMemory().getMemoryCapacity(), pair->decodeContextMemory().getMemoryCapacity(),
             config.kvPoolPages - ownership.availablePages());
+        LOG_INFO(
+            "Independent phase timing (mean of %d): sequential=%.4f ms overlap=%.4f ms speedup=%.3fx "
+            "overlap_ratio=%.3f prefill_seq=%.4f ms decode_seq=%.4f ms prefill_overlap=%.4f ms "
+            "decode_overlap=%.4f ms",
+            kITERATIONS, sequential.makespanMs, overlap.makespanMs, speedup, overlapRatio, sequential.prefillMs,
+            sequential.decodeMs, overlap.prefillMs, overlap.decodeMs);
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));
