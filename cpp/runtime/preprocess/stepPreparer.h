@@ -53,7 +53,8 @@ public:
     //! `contextLengths`) for the given phase. Does not modify `tensorMap`.
     //!
     //! Fills PipelineIO:
-    //!   - selectTokenIndices: prefill = ctxLen-1, decode = 0
+    //!   - selectTokenIndices: prefill = row-local ctxLen-1, or cumulative compact offsets for packed prefill;
+    //!                         decode = 0
     //!   - contextLengths: prefill = H2D copy from hostContextLengths,
     //!                     decode  = KV lengths (plugin) or zeros (native) + 1
     //!

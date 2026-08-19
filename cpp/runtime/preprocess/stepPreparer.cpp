@@ -38,18 +38,22 @@ void StepPreparer::prepare(
     InferencePhase phase, int32_t batchSize, HybridCacheManager& kvCache, PipelineIO& io, cudaStream_t stream)
 {
     // --- Reshape IO tensors for the current batch ---
-    check::check(io.selectTokenIndices.reshape({batchSize, 1}), "selectTokenIndices reshape failed");
+    Coords const selectShape
+        = (phase == InferencePhase::kPrefill && mConfig.packedPrefill) ? Coords{1, batchSize} : Coords{batchSize, 1};
+    check::check(io.selectTokenIndices.reshape(selectShape), "selectTokenIndices reshape failed");
     check::check(io.contextLengths.reshape({batchSize}), "contextLengths reshape failed");
 
     if (phase == InferencePhase::kPrefill)
     {
         // -- selectTokenIndices: last real token position for each batch element --
-        check::check(mHostSelectTokenIndices.reshape({batchSize, 1}), "hostSelectTokenIndices reshape failed");
+        check::check(mHostSelectTokenIndices.reshape(selectShape), "hostSelectTokenIndices reshape failed");
         int64_t* selectData = mHostSelectTokenIndices.dataPointer<int64_t>();
         int32_t const* ctxData = io.hostContextLengths.dataPointer<int32_t>();
+        int64_t packedTokenOffset{};
         for (int32_t i = 0; i < batchSize; ++i)
         {
-            selectData[i] = static_cast<int64_t>(ctxData[i] - 1);
+            selectData[i] = mConfig.packedPrefill ? packedTokenOffset + ctxData[i] - 1 : ctxData[i] - 1;
+            packedTokenOffset += ctxData[i];
         }
         CUDA_CHECK(cudaMemcpyAsync(io.selectTokenIndices.rawPointer(), mHostSelectTokenIndices.rawPointer(),
             batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));

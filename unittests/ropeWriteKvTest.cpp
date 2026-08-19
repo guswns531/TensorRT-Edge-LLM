@@ -937,7 +937,7 @@ TEST(RopePackedCompactPrefill, MapsCompactTokensToLogicalPageRows)
         rt::Coords{1, totalTokens, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     copyHostToDevice(packedTensor, packedInput);
     rt::Tensor qScratchTensor(
-        rt::Coords{1, totalTokens, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Coords{logicalBatchSize, 4, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     half const sentinel = __float2half(777.0F);
     std::vector<half> kvCacheInit(

@@ -47,6 +47,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1642,13 +1643,28 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const inputIdsLength
         = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
+    bool const packedPrefill = mDeployment.base.packedPrefill;
+    int32_t const totalInputTokens
+        = std::accumulate(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end(), int32_t{0});
+    if (packedPrefill)
+    {
+        ELLM_CHECK(!context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value()
+                && context.deepstackFeatures.empty(),
+            "Packed prefill v1 supports text-only requests without runtime deepstack features");
+        ELLM_CHECK(std::all_of(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end(),
+                       [this](int32_t length) {
+                           return length > 0 && length <= mDeployment.base.maxPackedPrefillChunkTokens;
+                       }),
+            "Packed prefill row exceeds the configured maximum chunk length");
+    }
+    Coords const tokenShape = packedPrefill ? Coords{1, totalInputTokens} : Coords{activeBatchSize, inputIdsLength};
     int32_t const baseOutputHiddenDim
         = mDeployment.specConfig.has_value() ? mDeployment.specConfig->baseOutputHiddenDim : 0;
 
     // Reshape IO tensors for this step.
-    check::check(mIdsInput.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+    check::check(mIdsInput.reshape(tokenShape), "Tensor reshape failed");
     check::check(mPipelineIO->hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    check::check(mPipelineIO->inputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDeployment.base.hiddenSize}),
+    check::check(mPipelineIO->inputsEmbeds.reshape({tokenShape[0], tokenShape[1], mDeployment.base.hiddenSize}),
         "Tensor reshape failed");
     if (mDeployment.base.isDiffusionBackbone)
     {
@@ -1694,24 +1710,28 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
 
     // Populate host-side context lengths with effective (unpadded) prefill lengths and pack tokens.
     int32_t* hostCtxLenData = mPipelineIO->hostContextLengths.dataPointer<int32_t>();
-    check::check(mHostPackedTokenIds.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+    check::check(mHostPackedTokenIds.reshape(tokenShape), "Tensor reshape failed");
     int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
 
     // Clear the entire pinned buffer first so trailing pad slots from prior batches don't leak into the
     // multimodal-indices walk, which scans all inputIdsLength positions per row, not just up to context_length.
-    std::fill(hostPackedTokenIdsData, hostPackedTokenIdsData + activeBatchSize * inputIdsLength, 0);
+    int32_t const stagedTokenCount = packedPrefill ? totalInputTokens : activeBatchSize * inputIdsLength;
+    std::fill(hostPackedTokenIdsData, hostPackedTokenIdsData + stagedTokenCount, 0);
 
+    int32_t packedTokenOffset{};
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         int32_t const requestedSeqLen = context.effectivePrefillLengths[i];
         ELLM_CHECK(requestedSeqLen >= 0 && requestedSeqLen <= inputIdsLength,
             "Effective prefill length must be within the current input sequence");
         hostCtxLenData[i] = requestedSeqLen;
-        std::copy(context.tokenIds[i].begin(), context.tokenIds[i].end(), hostPackedTokenIdsData + i * inputIdsLength);
+        int32_t const destinationOffset = packedPrefill ? packedTokenOffset : i * inputIdsLength;
+        std::copy(context.tokenIds[i].begin(), context.tokenIds[i].end(), hostPackedTokenIdsData + destinationOffset);
+        packedTokenOffset += requestedSeqLen;
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), hostPackedTokenIdsData,
-        activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), hostPackedTokenIdsData, stagedTokenCount * sizeof(int32_t),
+        cudaMemcpyHostToDevice, context.stream));
 
     bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
     if (mDeployment.base.useVisionBidirectionalAttention)
@@ -1754,7 +1774,9 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
     // Execute base prefill through the EngineExecutor. Empty-cache is
     // runtime-dynamic; prefillDims uses it to set InferenceDims::startIndexLen
     // (0 for the "initial prefill" sentinel, else batch).
-    auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
+    auto const prefillDims = packedPrefill
+        ? mDeployment.base.packedPrefillDims(activeBatchSize, totalInputTokens)
+        : mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
 
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
         "Failed to prepare base model for prefill step.");

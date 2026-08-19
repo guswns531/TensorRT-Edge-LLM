@@ -72,6 +72,11 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream,
     bool packedPrefill = false);
 
+//! Gather valid rows from dense [B, Smax, H, D] attention output into
+//! compact [1, totalTokens, H, D] token-carrier order.
+void gatherDenseRowsToPacked(
+    rt::Tensor const& dense, rt::Tensor const& cuSeqLens, rt::Tensor& packed, cudaStream_t stream);
+
 //! \brief Converts KV cache layout from [B, 2, H, S, D] into separate K and V tensors of shape [B, S, H, D].
 //!
 //! Splits the interleaved KV source into two independent FP16 output tensors, applying FP8 dequantization when

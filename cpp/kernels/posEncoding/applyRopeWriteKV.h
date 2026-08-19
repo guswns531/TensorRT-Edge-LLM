@@ -157,8 +157,9 @@ void launchApplyRopeQOnlyTreeDecoding(
 //! @param[in]  tokenPosIds  Optional INT32 tensor [batchSize, runtimeSeqLen] for tree decoding.
 //!             Position -1 marks padding tokens whose Q is zeroed and K/V writes are skipped.
 //! @param[in]  packedQKV    FP16 tensor [batchSize, runtimeSeqLen, Hq+2*Hkv, headDim], read-only.
-//! @param[out] qScratch     FP16 tensor [batchSize, runtimeSeqLen, Hq, headDim] — roped Q output
-//!             (unless @p fp8QOut is non-null, in which case this is unused).
+//! @param[out] qScratch     FP16 dense tensor [logicalBatch, denseSeqLen, Hq, headDim] — roped Q output.
+//!             Compact prefill tokens are scattered to their logical row; ordinary execution keeps the input shape.
+//!             Unused padding rows must be zero-initialized by the caller.
 //! @param[out] kvCache      FP16/FP8 tensor [batchSize, 2, Hkv, kvCacheCapacity, headDim] — K/V written here.
 //! @param[in]  kScale       K dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in]  vScale       V dequant scale (quant→orig). Use 1.0f for FP16 KV cache.

@@ -742,7 +742,8 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     T const* __restrict__ kNormGamma, float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig,
     float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
     uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq, int32_t logicalBatchSize, bool packedPrefill)
+    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq, int32_t logicalBatchSize, int32_t qScratchSeqLen,
+    bool packedPrefill)
 {
     // Thread mapping (same as existing kernels for proven memory coalescing):
     //   blockDim.x = headDim / vec_size  (threads per token, cover head vector)
@@ -836,7 +837,9 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         //     write to qScratch (or fp8QOut) ---
         uint32_t const qHeadIdx = headIdx;
         int64_t const packedQOffset = tokenBaseInPacked + static_cast<int64_t>(qHeadIdx) * headDim;
-        int32_t const scratchQOffset = clampedTokenIdx * numQHead * headDim + qHeadIdx * headDim;
+        int64_t const scratchToken = packedPrefill ? static_cast<int64_t>(batchIdx) * qScratchSeqLen + rowInBatch
+                                                   : static_cast<int64_t>(clampedTokenIdx);
+        int64_t const scratchQOffset = scratchToken * numQHead * headDim + qHeadIdx * headDim;
 
         DVec<T> qRoped;
         if (qNormGamma != nullptr)
@@ -996,9 +999,10 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     int64_t const logicalBatchSize = packedPrefill ? cuQSeqLens.value().get().getShape()[0] - 1 : physicalBatchSize;
 
     check::check(numQHeads > 0, "Packed QKV combined heads must exceed 2x KV heads.");
-    check::check(qScratch.getShape()[0] == physicalBatchSize && qScratch.getShape()[1] == runtimeSeqLen
+    check::check(qScratch.getShape()[0] == logicalBatchSize && (!packedPrefill || qScratch.getShape()[1] > 0)
+            && (!packedPrefill || physicalBatchSize == 1) && (packedPrefill || qScratch.getShape()[1] == runtimeSeqLen)
             && qScratch.getShape()[2] == numQHeads && qScratch.getShape()[3] == headDim,
-        "qScratch shape shall be [B, S, Hq, D].");
+        "qScratch shape shall be dense [logicalBatch, S, Hq, D].");
     check::check(kvCache.getShape()[0] == logicalBatchSize,
         "KVCache write view shall have the same batch size as the logical QKV batch.");
     check::check(
@@ -1071,7 +1075,8 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             static_cast<int32_t>(kvCacheCapacity), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
             static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
             static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
-            maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize), packedPrefill);
+            maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize), static_cast<int32_t>(qScratch.getShape()[1]),
+            packedPrefill);
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -1084,7 +1089,8 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             static_cast<int32_t>(kvCacheCapacity), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
             static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
             static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
-            maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize), packedPrefill);
+            maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize), static_cast<int32_t>(qScratch.getShape()[1]),
+            packedPrefill);
     }
 #endif
     else

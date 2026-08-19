@@ -332,11 +332,13 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
 
-    // The packed v1 route is FP16 causal native-paged FMHA. It consumes no
-    // split-K/V, dense K/V, FP8-Q, or vision workspace: Q is the one compact
-    // [1,totalTokens,Hq,D] carrier following the four logical-batch arrays.
+    // The packed v1 route is FP16 causal native-paged FMHA. Transformer layers
+    // stay compact, while the current AOT attention boundary uses dense Q/O
+    // scratch because its tensor descriptor retains a [B,S] stride.
     if (enablePackedPrefill)
     {
+        workspaceSize
+            = accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
         return accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
     }
 
@@ -1788,8 +1790,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
 
             // FMHA-v2 always reads the RoPE-transformed Q from scratch.
+            int32_t const denseSeqLen
+                = packedPrefill ? std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens) : runtimeSeqLen;
             qInputTensor = assignTensorFromWorkspace(
-                alignedWorkspacePtr, {physicalBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                alignedWorkspacePtr, {runtimeBatchSize, denseSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+            if (packedPrefill)
+            {
+                CUDA_CHECK(cudaMemsetAsync(qInputTensor.rawPointer(), 0, qInputTensor.getMemoryCapacity(), stream));
+            }
 
             if (!mEnableFp8KVCache && !usePaddingContextMask)
             {
@@ -1805,15 +1813,26 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     "(B=%d, Sq=%d, capacity=%d, Hq=%d, Hkv=%d, D=%d)",
                     executionMode == AttentionExecutionMode::kCHUNKED_PREFILL ? "chunked" : "normal", runtimeBatchSize,
                     runtimeSeqLen, kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize);
-                CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize,
-                    packedPrefill ? std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens) : runtimeSeqLen,
-                    kvCacheCapacity);
+                CuteDslFMHAV2Runner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, denseSeqLen, kvCacheCapacity);
+                rt::Tensor denseAttentionOutput;
+                void* fmhaOutput = attentionOutputTensor.rawPointer();
+                if (packedPrefill)
+                {
+                    denseAttentionOutput = assignTensorFromWorkspace(
+                        alignedWorkspacePtr, {runtimeBatchSize, denseSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                    fmhaOutput = denseAttentionOutput.rawPointer();
+                }
                 if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
-                        attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
-                        cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
-                        stream, mAttentionScale, slidingWindow))
+                        fmhaOutput, cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
+                        2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, stream, mAttentionScale, slidingWindow))
                 {
                     return -1;
+                }
+                if (packedPrefill)
+                {
+                    kernel::gatherDenseRowsToPacked(
+                        denseAttentionOutput, cuQSeqLensTensor, attentionOutputTensor, stream);
                 }
             }
             else

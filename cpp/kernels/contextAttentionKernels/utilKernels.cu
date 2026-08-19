@@ -106,6 +106,54 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 
 namespace
 {
+
+__global__ void gatherDenseRowsToPackedKernel(half const* dense, int32_t const* cuSeqLens, half* packed,
+    int32_t batchSize, int32_t denseSeqLen, int32_t featuresPerToken, int32_t totalTokens)
+{
+    int32_t const token = static_cast<int32_t>(blockIdx.x);
+    if (token >= totalTokens)
+    {
+        return;
+    }
+    int32_t batch{};
+    while (batch + 1 < batchSize && token >= cuSeqLens[batch + 1])
+    {
+        ++batch;
+    }
+    int32_t const row = token - cuSeqLens[batch];
+    int64_t const denseBase = (static_cast<int64_t>(batch) * denseSeqLen + row) * featuresPerToken;
+    int64_t const packedBase = static_cast<int64_t>(token) * featuresPerToken;
+    for (int32_t feature = static_cast<int32_t>(threadIdx.x); feature < featuresPerToken;
+        feature += static_cast<int32_t>(blockDim.x))
+    {
+        packed[packedBase + feature] = dense[denseBase + feature];
+    }
+}
+
+} // namespace
+
+void gatherDenseRowsToPacked(
+    rt::Tensor const& dense, rt::Tensor const& cuSeqLens, rt::Tensor& packed, cudaStream_t stream)
+{
+    check::check(dense.getDataType() == nvinfer1::DataType::kHALF && packed.getDataType() == nvinfer1::DataType::kHALF,
+        "Dense/packed attention tensors must be FP16");
+    check::check(dense.getShape().getNumDims() == 4 && packed.getShape().getNumDims() == 4 && packed.getShape()[0] == 1
+            && dense.getShape()[2] == packed.getShape()[2] && dense.getShape()[3] == packed.getShape()[3],
+        "Dense/packed attention tensor shapes are incompatible");
+    int32_t const batchSize = static_cast<int32_t>(dense.getShape()[0]);
+    int32_t const totalTokens = static_cast<int32_t>(packed.getShape()[1]);
+    check::check(cuSeqLens.getDataType() == nvinfer1::DataType::kINT32 && cuSeqLens.getShape().getNumDims() == 1
+            && cuSeqLens.getShape()[0] == batchSize + 1,
+        "Packed attention cumulative sequence lengths must have shape [B+1]");
+    int32_t const featuresPerToken = static_cast<int32_t>(dense.getShape()[2] * dense.getShape()[3]);
+    constexpr int32_t kTHREADS = 256;
+    gatherDenseRowsToPackedKernel<<<totalTokens, kTHREADS, 0, stream>>>(dense.dataPointer<half>(),
+        cuSeqLens.dataPointer<int32_t>(), packed.dataPointer<half>(), batchSize,
+        static_cast<int32_t>(dense.getShape()[1]), featuresPerToken, totalTokens);
+}
+
+namespace
+{
 //! One thread per (batch, position): expand vision-block IDs into per-position
 //! [blockBegin, blockEnd] intervals for the vision-block overlay prefill.
 __global__ void buildVisionBlockRangesKernel(int32_t const* visionBlockIds, int32_t const* contextLengths,
