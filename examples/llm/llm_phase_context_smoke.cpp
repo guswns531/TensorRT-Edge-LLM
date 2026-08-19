@@ -659,6 +659,11 @@ int main(int argc, char** argv)
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
         serverConfig.maxPendingRequests = 1024;
+        if (char const* reservation = std::getenv("TRT_EDGELLM_PAGE_RESERVATION");
+            reservation != nullptr && std::string(reservation) == "headroom")
+        {
+            serverConfig.pageReservationMode = rt::IndependentPhasePageReservationMode::kHeadroom;
+        }
         std::unique_ptr<rt::PhasePrefixReuseCache> semanticPrefixCache;
         if (enablePrefixReuse)
         {

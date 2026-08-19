@@ -38,6 +38,7 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
 {
     ELLM_CHECK(mConfig.maxInFlightRequests > 0, "Independent phase server request capacity must be positive");
     ELLM_CHECK(mConfig.defaultMaxOutputTokens > 0, "Independent phase server output capacity must be positive");
+    ELLM_CHECK(mConfig.outputHeadroomTokens > 0, "Independent phase server output headroom must be positive");
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
     mCoordinator.setGraphCaptureEnabled(mConfig.enableCudaGraphs);
@@ -80,7 +81,10 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
                 reusedPrefixTokens = match->matchedTokens;
             }
         }
-        mOwnership.ensureCapacity(slot, static_cast<int32_t>(promptTokens.size()) + maxOutputTokens);
+        int32_t const reservedOutput = mConfig.pageReservationMode == IndependentPhasePageReservationMode::kFull
+            ? maxOutputTokens
+            : std::min(maxOutputTokens, mConfig.outputHeadroomTokens);
+        mOwnership.ensureCapacity(slot, static_cast<int32_t>(promptTokens.size()) + reservedOutput);
     }
     catch (std::runtime_error const&)
     {
@@ -139,7 +143,13 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
         mPendingRequests.erase(pending);
         return true;
     }
-    if (!mCoordinator.scheduler().cancel(requestId))
+    if (mPendingDecodeRequestIds.erase(requestId) > 0)
+    {
+        auto const waiting = std::find(mPendingDecodeRequests.begin(), mPendingDecodeRequests.end(), requestId);
+        ELLM_CHECK(waiting != mPendingDecodeRequests.end(), "Pending decode request index is inconsistent");
+        mPendingDecodeRequests.erase(waiting);
+    }
+    else if (!mCoordinator.scheduler().cancel(requestId))
     {
         return false;
     }
@@ -158,8 +168,10 @@ bool IndependentPhaseAsyncServer::capturePreparedGraphs()
 bool IndependentPhaseAsyncServer::poll()
 {
     bool progressed = admitPendingRequests();
+    progressed = resumePendingDecodeRequests() || progressed;
     progressed = mCoordinator.poll() || progressed;
     processSamplingTickets();
+    progressed = resumePendingDecodeRequests() || progressed;
     progressed = admitPendingRequests() || progressed;
     if (!mCoordinator.busy() && !mCoordinator.empty())
     {
@@ -214,7 +226,8 @@ size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
 
 bool IndependentPhaseAsyncServer::empty() const noexcept
 {
-    return mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty() && mCoordinator.empty();
+    return mRequests.empty() && mPendingRequests.empty() && mPendingDecodeRequests.empty() && mSamplingTickets.empty()
+        && mCoordinator.empty();
 }
 
 bool IndependentPhaseAsyncServer::admitPendingRequests()
@@ -239,6 +252,44 @@ bool IndependentPhaseAsyncServer::admitPendingRequests()
         break;
     }
     return admitted;
+}
+
+bool IndependentPhaseAsyncServer::resumePendingDecodeRequests()
+{
+    bool resumed{};
+    while (!mPendingDecodeRequests.empty())
+    {
+        uint64_t const requestId = mPendingDecodeRequests.front();
+        auto it = mRequests.find(requestId);
+        ELLM_CHECK(it != mRequests.end(), "Pending decode request is missing");
+        if (!enqueueDecodeOrWait(requestId, it->second))
+        {
+            break;
+        }
+        mPendingDecodeRequests.pop_front();
+        mPendingDecodeRequestIds.erase(requestId);
+        resumed = true;
+    }
+    return resumed;
+}
+
+bool IndependentPhaseAsyncServer::enqueueDecodeOrWait(uint64_t requestId, RequestState& state)
+{
+    try
+    {
+        mOwnership.ensureCapacity(state.kvSlotId, mOwnership.length(state.kvSlotId) + 1);
+    }
+    catch (std::runtime_error const&)
+    {
+        if (mPendingDecodeRequestIds.insert(requestId).second)
+        {
+            mPendingDecodeRequests.push_back(requestId);
+        }
+        return false;
+    }
+    mCoordinator.enqueueDecode(
+        {requestId, mOwnership.length(state.kvSlotId), state.kvSlotId, 0, 0, true, state.scheduling});
+    return true;
 }
 
 IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks()
@@ -350,8 +401,7 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         }
         else
         {
-            mCoordinator.enqueueDecode(
-                {requestId, mOwnership.length(state.kvSlotId), state.kvSlotId, 0, 0, true, state.scheduling});
+            static_cast<void>(enqueueDecodeOrWait(requestId, state));
         }
     }
     destroyTicketEvent(*ticket);

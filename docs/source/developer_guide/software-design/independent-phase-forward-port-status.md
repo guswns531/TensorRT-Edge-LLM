@@ -40,7 +40,7 @@ contexts.
 | prefix sharing and greedy identity gate | complete |
 | model capability contract | complete |
 | request-owned Gemma/Cosmos encoder outputs | adapter complete; HTTP image submission pending |
-| page reservation/growth leases | pending |
+| page reservation/growth leases | complete: full/headroom modes and decode growth wait queue |
 | tied embedding/LM-head reuse | pending exact-identity gate |
 | complete three-phase encoder queue coordinator | pending |
 
@@ -135,3 +135,8 @@ Decode is already concentrated at D8; the remaining throughput gap cannot be
 closed by scheduler tuning alone. It requires a larger decode-capable engine
 profile or an export whose packed `last_token_ids` axis remains dynamic beyond
 B8.
+
+Headroom reservation is available through
+`TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
+without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the
+latency-safe default remains full reservation with in-flight 16.

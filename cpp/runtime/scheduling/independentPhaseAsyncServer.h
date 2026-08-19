@@ -80,6 +80,12 @@ enum class IndependentPhaseServerStatus
     kCancelled,
 };
 
+enum class IndependentPhasePageReservationMode
+{
+    kFull,
+    kHeadroom,
+};
+
 struct IndependentPhaseServerConfig
 {
     size_t maxInFlightRequests{};
@@ -90,6 +96,8 @@ struct IndependentPhaseServerConfig
     size_t maxPendingRequests{};
     size_t maxPrefillGraphs{4U};
     size_t maxDecodeGraphs{8U};
+    IndependentPhasePageReservationMode pageReservationMode{IndependentPhasePageReservationMode::kFull};
+    int32_t outputHeadroomTokens{128};
 };
 
 struct IndependentPhaseServerSubmission
@@ -172,6 +180,8 @@ private:
     std::vector<IndependentPhaseRequestView> makeViews(std::vector<PhaseWorkItem> const& batch) const;
     bool isEos(int32_t tokenId) const noexcept;
     bool admitPendingRequests();
+    bool resumePendingDecodeRequests();
+    bool enqueueDecodeOrWait(uint64_t requestId, RequestState& state);
     void processSamplingTickets();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
@@ -185,6 +195,8 @@ private:
     std::unordered_map<uint64_t, RequestState> mRequests;
     std::deque<PendingRequest> mPendingRequests;
     std::unordered_set<uint64_t> mPendingRequestIds;
+    std::deque<uint64_t> mPendingDecodeRequests;
+    std::unordered_set<uint64_t> mPendingDecodeRequestIds;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
