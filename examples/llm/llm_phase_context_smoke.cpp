@@ -699,7 +699,10 @@ int main(int argc, char** argv)
             "Phase server in-flight capacity must be in the stable slot range");
         serverConfig.maxInFlightRequests = maxInFlightRequests;
         serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
-        serverConfig.eosTokenIds = config.eosTokenIds;
+        if (std::getenv("TRT_EDGELLM_IGNORE_EOS") == nullptr)
+        {
+            serverConfig.eosTokenIds = config.eosTokenIds;
+        }
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
         serverConfig.maxPendingRequests = 1024;

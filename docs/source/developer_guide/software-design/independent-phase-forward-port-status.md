@@ -45,7 +45,7 @@ contexts.
 | model capability contract | complete |
 | request-owned Gemma/Cosmos encoder outputs | complete for C++ and OpenAI-style HTTP image submission |
 | page reservation/growth leases | complete: full/headroom modes and decode growth wait queue |
-| tied embedding/LM-head reuse | complete as experimental opt-in; exact cross-engine greedy identity remains open |
+| tied embedding/LM-head reuse | complete; controlled BS1 greedy identity and 3% performance gates pass |
 | complete three-phase encoder queue coordinator | complete, including queued cancel and one encoder in flight |
 
 ## Validation
@@ -180,10 +180,21 @@ The v0.10 validation exercised the required sequence end to end:
 3. ran semantic requests through independent prefill/decode contexts.
 
 The CUDA transposed-lookup reference test and seven ONNX externalization tests
-also pass. The fresh tied engine contains no LM-head sidecar and the runtime
-logs `layout=hidden_vocab` plus one zero-copy external binding. Its total
-engine-plus-weight artifacts are about 370 MiB smaller than the preserved
-baseline build, but those engines were produced in different builder runs and
-their serialized engine sizes differ. A fresh paired build is required before
-treating that number as a fair GPU-memory result. The original matched-build
-result was a 574--576 MiB reduction with sub-1% real-trace regression.
+also pass. The final paired gate uses byte-identical baseline/tied ONNX model
+files and one shared serialized TensorRT engine, so tactic selection and engine
+bytes cannot confound the comparison. Only the runtime weight manifest and
+embedding sidecar differ.
+
+On the 48-request controlled BS1 greedy gate, all 4,160 output token IDs match
+and both variants produce token-trace SHA-256
+`b14d1c789b567b4dc231444871c6c7a1b8fa3d05e879c4cc8a97a4afdc7d9480`.
+The full baseline embedding transpose, baseline LM-head sidecar, and tied
+embedding are also byte-exact equal.
+
+On the 288-request fixed-output HTTP trace, three fresh process lifecycles per
+variant give a 594 MiB ready/peak memory reduction. Tied throughput is 0.192%
+higher; TTFT median/p95 changes by -0.549%/-0.378%, TPOT by
++0.140%/+0.058%, and E2E by +0.020%/-0.115%. All performance dimensions are
+inside the 3% gate. EOS is disabled only for this performance gate because an
+EOS-enabled online trace produces different batch evolution even across
+repeated runs of the same engine.
