@@ -104,6 +104,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 82. [Cosmos v0.10 B16/B32 확장과 production gate](106-cosmos-v010-batch-scaling-production-gates-20260820.md)
 83. [Cosmos v0.10 asymmetric P8/D64 성능 복구](107-cosmos-v010-asymmetric-p8-d64-recovery-20260820.md)
 84. [Cosmos v0.10 sampling-aware D64 refill](108-cosmos-v010-sampling-aware-d64-refill-20260820.md)
+85. [Cosmos v0.10 adaptive admission profile](109-cosmos-v010-adaptive-admission-profiles-20260820.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.
