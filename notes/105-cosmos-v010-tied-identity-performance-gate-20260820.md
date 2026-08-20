@@ -15,7 +15,9 @@
 
 ## 공정성 계약
 
-- source commit: `17e2da16849bf6a626bfae3f6217a063449dd936`
+- engine/export source commit: `17e2da16849bf6a626bfae3f6217a063449dd936`
+- fixed-output gate runtime commit: `a243c57`
+- benchmark/identity harness commit: `06b70c6`
 - TensorRT 11.0.0 / CUDA 13.3 / RTX 3080 10GB
 - model: `nvidia/Cosmos-Reason2-2B`
 - engine: B8, max input 1,024, max KV 2,048, 128 KV-pool pages, packed-prefill chunk 128
