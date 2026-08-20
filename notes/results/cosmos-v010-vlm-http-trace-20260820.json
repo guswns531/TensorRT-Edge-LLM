@@ -1,0 +1,46 @@
+{
+  "requests": [
+    {
+      "arrival_offset_us": 0,
+      "max_generate_length": 16,
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "file:///workspace/examples/multimodal/pics/woman_and_dog.jpeg"
+              }
+            },
+            {
+              "type": "text",
+              "text": "Describe the main subjects in one sentence."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "arrival_offset_us": 1000,
+      "max_generate_length": 16,
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "file:///workspace/examples/multimodal/pics/red_panda.jpeg"
+              }
+            },
+            {
+              "type": "text",
+              "text": "Identify the animal in one short sentence."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

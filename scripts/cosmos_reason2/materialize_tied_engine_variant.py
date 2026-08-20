@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import shutil
+import zlib
 from typing import Any
 
 
@@ -32,6 +33,23 @@ def sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def sample_crc32(path: pathlib.Path, sample_bytes: int = 1024 * 1024) -> str:
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError(f"cannot fingerprint an empty file: {path}")
+    sample_bytes = min(sample_bytes, size)
+    offsets = sorted(
+        {0, size // 3, (size * 2) // 3,
+         max(0, size - sample_bytes)})
+    value = 0
+    with path.open("rb") as stream:
+        for offset in offsets:
+            stream.seek(offset)
+            chunk = stream.read(min(sample_bytes, size - offset))
+            value = zlib.crc32(chunk, value)
+    return f"{value:08x}"
+
+
 def link_or_copy(source: pathlib.Path, destination: pathlib.Path) -> None:
     try:
         os.link(source, destination)
@@ -41,6 +59,15 @@ def link_or_copy(source: pathlib.Path, destination: pathlib.Path) -> None:
 
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def safetensors_data_bytes(path: pathlib.Path) -> int:
+    with path.open("rb") as stream:
+        header_bytes = int.from_bytes(stream.read(8), byteorder="little")
+        header = json.loads(stream.read(header_bytes))
+    return max(
+        int(metadata["data_offsets"][1]) for name, metadata in header.items()
+        if name != "__metadata__")
 
 
 def main() -> None:
@@ -76,12 +103,24 @@ def main() -> None:
     if len(tied_weights) != 1 or tied_weights[0].get("source") != "embedding":
         raise RuntimeError(
             "tied ONNX does not contain one embedding-source weight alias")
-    baseline_config["external_weight_files"] = tied_weights
-
     engine_source = args.baseline_engine_dir / "llm.engine"
+    tied_embedding = args.tied_onnx_dir / "embedding.safetensors"
+    engine_sha256 = sha256(engine_source)
+    engine_sample_bytes = min(1024 * 1024, engine_source.stat().st_size)
+    engine_sample_crc32 = sample_crc32(engine_source, engine_sample_bytes)
+    baseline_config["external_weight_files"] = tied_weights
+    baseline_config["tied_engine_contract"] = {
+        "version": 1,
+        "engine_file": "llm.engine",
+        "engine_bytes": engine_source.stat().st_size,
+        "engine_sample_bytes": engine_sample_bytes,
+        "engine_sample_crc32": engine_sample_crc32,
+        "embedding_bytes": safetensors_data_bytes(tied_embedding),
+        "onnx_sha256": onnx_hashes,
+    }
+
     link_or_copy(engine_source, args.output_dir / "llm.engine")
-    link_or_copy(args.tied_onnx_dir / "embedding.safetensors",
-                 args.output_dir / "embedding.safetensors")
+    link_or_copy(tied_embedding, args.output_dir / "embedding.safetensors")
     for filename in ("tokenizer.json", "tokenizer_config.json",
                      "processed_chat_template.json"):
         source = args.baseline_engine_dir / filename
@@ -100,7 +139,9 @@ def main() -> None:
         "onnx_sha256":
         onnx_hashes,
         "engine_sha256":
-        sha256(engine_source),
+        engine_sha256,
+        "engine_sample_crc32":
+        engine_sample_crc32,
         "engine_inode_shared":
         ((args.output_dir /
           "llm.engine").stat().st_ino == engine_source.stat().st_ino),

@@ -137,8 +137,11 @@ def main() -> None:
     parser.add_argument("--ready-timeout", type=float, default=120.0)
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--max-workers", type=int, default=512)
+    parser.add_argument("--warmup-requests", type=int, default=0)
+    parser.add_argument("--warmup-max-tokens", type=int, default=32)
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--request-limit", type=int, default=0)
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("backend_command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     backend_command = args.backend_command
@@ -146,10 +149,10 @@ def main() -> None:
         backend_command = backend_command[1:]
     if not backend_command:
         parser.error("backend command is required after --")
-    if args.repeats <= 0 or args.port <= 0 or args.request_limit < 0:
-        parser.error(
-            "repeats and port must be positive; request-limit must be non-negative"
-        )
+    if (args.repeats <= 0 or args.port <= 0 or args.request_limit < 0
+            or args.warmup_requests < 0 or args.warmup_max_tokens <= 0):
+        parser.error("repeats, port, and warmup-max-tokens must be positive; "
+                     "request-limit and warmup-requests must be non-negative")
     for path in (args.gateway_script, args.client_script, args.trace):
         if not path.is_file():
             parser.error(f"required file does not exist: {path}")
@@ -197,7 +200,9 @@ def main() -> None:
                     "--repeats",
                     "1",
                     "--warmup-requests",
-                    "0",
+                    str(args.warmup_requests),
+                    "--warmup-max-tokens",
+                    str(args.warmup_max_tokens),
                     "--max-workers",
                     str(args.max_workers),
                     "--timeout",
@@ -206,6 +211,8 @@ def main() -> None:
                 ]
                 if args.sequential:
                     client_command.append("--sequential")
+                if args.ignore_eos:
+                    client_command.append("--ignore-eos")
                 if args.request_limit > 0:
                     client_command.extend(
                         ["--request-limit",

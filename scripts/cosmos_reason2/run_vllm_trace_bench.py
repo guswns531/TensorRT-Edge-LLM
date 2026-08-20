@@ -81,7 +81,8 @@ def stream_request(endpoint: str,
                    start_gate: threading.Event,
                    timeout: float,
                    max_tokens_override: int = 0,
-                   include_request_index: bool = False) -> dict[str, Any]:
+                   include_request_index: bool = False,
+                   ignore_eos: bool = False) -> dict[str, Any]:
     start_gate.wait()
     scheduled_arrival_us = int(request.get("arrival_offset_us", 0))
     wait_until(epoch_ns + scheduled_arrival_us * 1000)
@@ -101,6 +102,8 @@ def stream_request(endpoint: str,
     }
     if include_request_index:
         payload["metadata"] = {"request_index": request_id}
+    if ignore_eos:
+        payload["ignore_eos"] = True
     host, port, base_path = endpoint_parts(endpoint)
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
     first_token_ns = 0
@@ -212,6 +215,7 @@ def execute_requests(
     max_workers: int,
     max_tokens_override: int = 0,
     include_request_index: bool = False,
+    ignore_eos: bool = False,
     sequential: bool = False,
 ) -> tuple[list[dict[str, Any]], float]:
     start_gate = threading.Event()
@@ -221,7 +225,7 @@ def execute_requests(
         rows = [
             stream_request(endpoint, model, request_id, request, epoch_ns,
                            start_gate, timeout, max_tokens_override,
-                           include_request_index)
+                           include_request_index, ignore_eos)
             for request_id, request in enumerate(requests)
         ]
         terminal_us = max(float(row["completed_us"]) for row in rows)
@@ -235,7 +239,8 @@ def execute_requests(
         futures = [
             executor.submit(stream_request, endpoint, model, request_id,
                             request, epoch_ns, start_gate, timeout,
-                            max_tokens_override, include_request_index)
+                            max_tokens_override, include_request_index,
+                            ignore_eos)
             for request_id, request in enumerate(requests)
         ]
         start_gate.set()
@@ -337,6 +342,7 @@ def main() -> None:
     parser.add_argument("--max-workers", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--include-request-index", action="store_true")
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--request-limit", type=int, default=0)
     args = parser.parse_args()
@@ -377,6 +383,7 @@ def main() -> None:
                          args.timeout,
                          args.max_workers,
                          args.warmup_max_tokens,
+                         ignore_eos=args.ignore_eos,
                          sequential=args.sequential)
 
     summaries = []
@@ -393,6 +400,7 @@ def main() -> None:
             args.timeout,
             args.max_workers,
             include_request_index=args.include_request_index,
+            ignore_eos=args.ignore_eos,
             sequential=args.sequential)
         summary = summarize(rows, duration_ms, run_index)
         write_csv(run_dir / "requests.csv", rows)
@@ -425,6 +433,8 @@ def main() -> None:
         args.warmup_max_tokens,
         "sequential":
         args.sequential,
+        "ignore_eos":
+        args.ignore_eos,
         "captured_token_ids_per_run":
         [int(row["captured_token_ids"]) for row in summaries],
         "token_trace_sha256_per_run":
