@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "engine_sha256": "b9f87df79357b3b15868c3c7d3798b4ff82b1f5e442e9a2837dcbb1709d4c5cf",
+  "model": "nvidia/Cosmos-Reason2-2B",
+  "engine_contract": {
+    "max_batch_size": 80,
+    "max_prefill_batch_size": 8,
+    "max_decode_batch_size": 64,
+    "max_kv_cache_capacity": 2048,
+    "kv_pool_pages": 256,
+    "prefill_chunk_tokens": 128
+  },
+  "sample_scope": "decode-only CUDA-event samples from fixed-output balanced, decode-heavy, and forced-D64 traces",
+  "decode": [
+    {"batch_size": 1, "samples": 19, "median_gpu_ms": 6.2181, "p95_gpu_ms": 6.5041},
+    {"batch_size": 4, "samples": 18, "median_gpu_ms": 6.1828, "p95_gpu_ms": 6.4911},
+    {"batch_size": 5, "samples": 148, "median_gpu_ms": 6.4587, "p95_gpu_ms": 6.5682},
+    {"batch_size": 6, "samples": 61, "median_gpu_ms": 6.3436, "p95_gpu_ms": 6.4264},
+    {"batch_size": 10, "samples": 12, "median_gpu_ms": 6.3884, "p95_gpu_ms": 6.5067},
+    {"batch_size": 16, "samples": 237, "median_gpu_ms": 6.5660, "p95_gpu_ms": 6.7178},
+    {"batch_size": 18, "samples": 55, "median_gpu_ms": 6.9946, "p95_gpu_ms": 7.0819},
+    {"batch_size": 20, "samples": 51, "median_gpu_ms": 7.4715, "p95_gpu_ms": 7.6135},
+    {"batch_size": 22, "samples": 51, "median_gpu_ms": 7.1047, "p95_gpu_ms": 7.2384},
+    {"batch_size": 36, "samples": 47, "median_gpu_ms": 8.4820, "p95_gpu_ms": 8.6503},
+    {"batch_size": 40, "samples": 52, "median_gpu_ms": 7.8399, "p95_gpu_ms": 7.9487},
+    {"batch_size": 42, "samples": 45, "median_gpu_ms": 8.5759, "p95_gpu_ms": 8.6967},
+    {"batch_size": 47, "samples": 52, "median_gpu_ms": 8.0201, "p95_gpu_ms": 8.1263},
+    {"batch_size": 63, "samples": 16, "median_gpu_ms": 8.5273, "p95_gpu_ms": 9.8605},
+    {"batch_size": 64, "samples": 2351, "median_gpu_ms": 8.6412, "p95_gpu_ms": 9.7641}
+  ]
+}
