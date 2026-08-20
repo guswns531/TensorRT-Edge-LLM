@@ -794,7 +794,7 @@ int main(int argc, char** argv)
         {
             // P8/D64 undercommitted-pool profile, measured from decode-only CUDA-event samples.
             semanticSchedulerConfig.decodeBatchCosts.insert(semanticSchedulerConfig.decodeBatchCosts.end(),
-                {{40, 2048, 7.968F}, {47, 2048, 8.049F}, {63, 2048, 8.851F}, {64, 2048, 8.884F}});
+                {{40, 2048, 7.949F}, {47, 2048, 8.126F}, {63, 2048, 9.861F}, {64, 2048, 9.764F}});
         }
         if (char const* value = std::getenv("TRT_EDGELLM_SCHEDULER_COST_JSON"))
         {
@@ -819,6 +819,10 @@ int main(int argc, char** argv)
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
         serverConfig.maxPendingRequests = 1024;
+        if (char const* value = std::getenv("TRT_EDGELLM_DECODE_REFILL_BATCH"))
+        {
+            serverConfig.decodeRefillBatchSize = static_cast<size_t>(std::stoul(value));
+        }
         if (char const* reservation = std::getenv("TRT_EDGELLM_PAGE_RESERVATION");
             reservation != nullptr && std::string(reservation) == "headroom")
         {
@@ -1169,6 +1173,7 @@ int main(int argc, char** argv)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             inputReader.join();
+            LOG_INFO("Sampling-aware decode refill waits: %zu", semanticServer.decodeRefillWaitCount());
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;

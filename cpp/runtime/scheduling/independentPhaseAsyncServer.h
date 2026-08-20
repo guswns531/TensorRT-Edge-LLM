@@ -38,6 +38,10 @@ namespace trt_edgellm::rt
 
 struct PhaseVisionPayload;
 
+//! Pure decision helper for sampling-aware decode-tail refill.
+bool shouldDeferDecodeForSamplingRefill(
+    size_t targetRows, size_t prefillRows, size_t decodeRows, size_t pendingDecodeSamplingRows) noexcept;
+
 //! Request view passed to a model-specific text or multimodal adapter.
 struct IndependentPhaseRequestView
 {
@@ -101,6 +105,8 @@ struct IndependentPhaseServerConfig
     size_t maxDecodeGraphs{8U};
     IndependentPhasePageReservationMode pageReservationMode{IndependentPhasePageReservationMode::kFull};
     int32_t outputHeadroomTokens{128};
+    //! Defer a partial decode tail while completed decode sampling tickets can refill this many rows.
+    size_t decodeRefillBatchSize{};
 };
 
 struct IndependentPhaseServerSubmission
@@ -165,6 +171,7 @@ public:
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
+    size_t decodeRefillWaitCount() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -199,6 +206,7 @@ private:
     bool admitPendingRequests();
     bool resumePendingDecodeRequests();
     bool enqueueDecodeOrWait(uint64_t requestId, RequestState& state);
+    bool shouldWaitForDecodeRefill() const noexcept;
     void processSamplingTickets();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
@@ -217,6 +225,7 @@ private:
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
+    size_t mDecodeRefillWaitCount{};
 };
 
 } // namespace trt_edgellm::rt

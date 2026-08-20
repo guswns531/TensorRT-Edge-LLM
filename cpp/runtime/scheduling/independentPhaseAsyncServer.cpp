@@ -29,6 +29,13 @@
 namespace trt_edgellm::rt
 {
 
+bool shouldDeferDecodeForSamplingRefill(
+    size_t targetRows, size_t prefillRows, size_t decodeRows, size_t pendingDecodeSamplingRows) noexcept
+{
+    return targetRows > 0 && prefillRows == 0 && decodeRows > 0 && decodeRows < targetRows
+        && decodeRows + pendingDecodeSamplingRows >= targetRows;
+}
+
 IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerConfig config,
     IndependentPhaseCoordinator& coordinator, StableKVPageManager& ownership, IndependentPhaseRequestAdapter adapter,
     PhasePrefixReuseCache* prefixCache)
@@ -41,6 +48,8 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
     ELLM_CHECK(mConfig.maxInFlightRequests > 0, "Independent phase server request capacity must be positive");
     ELLM_CHECK(mConfig.defaultMaxOutputTokens > 0, "Independent phase server output capacity must be positive");
     ELLM_CHECK(mConfig.outputHeadroomTokens > 0, "Independent phase server output headroom must be positive");
+    ELLM_CHECK(mConfig.decodeRefillBatchSize <= mConfig.maxInFlightRequests,
+        "Decode refill batch cannot exceed the server in-flight capacity");
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
     mCoordinator.setGraphCaptureEnabled(mConfig.enableCudaGraphs);
@@ -211,11 +220,31 @@ bool IndependentPhaseAsyncServer::poll()
     processSamplingTickets();
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = admitPendingRequests() || progressed;
-    if (!mCoordinator.busy() && !mCoordinator.empty())
+    bool const waitForDecodeRefill = shouldWaitForDecodeRefill();
+    if (waitForDecodeRefill)
+    {
+        ++mDecodeRefillWaitCount;
+    }
+    if (!mCoordinator.busy() && !mCoordinator.empty() && !waitForDecodeRefill)
     {
         progressed = mCoordinator.dispatchNext() || progressed;
     }
     return progressed;
+}
+
+bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
+{
+    size_t const queuedDecode = mCoordinator.scheduler().decodeQueueSize();
+    size_t pendingDecodeRows{};
+    for (auto const& ticket : mSamplingTickets)
+    {
+        if (!ticket->fromPrefill)
+        {
+            pendingDecodeRows += ticket->requestIds.size();
+        }
+    }
+    return shouldDeferDecodeForSamplingRefill(
+        mConfig.decodeRefillBatchSize, mCoordinator.scheduler().prefillQueueSize(), queuedDecode, pendingDecodeRows);
 }
 
 void IndependentPhaseAsyncServer::runUntilIdle(size_t maxPolls)
@@ -260,6 +289,11 @@ size_t IndependentPhaseAsyncServer::inFlightCount() const noexcept
 size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
 {
     return mPendingRequests.size();
+}
+
+size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept
+{
+    return mDecodeRefillWaitCount;
 }
 
 bool IndependentPhaseAsyncServer::empty() const noexcept

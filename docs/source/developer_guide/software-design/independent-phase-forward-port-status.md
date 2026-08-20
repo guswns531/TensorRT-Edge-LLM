@@ -204,6 +204,19 @@ throughput. An opt-in stable decode cohort is implemented and tested, but is
 not selected yet because rolling prefill admission must be coordinated with
 cohort replacement.
 
+Sampling-aware decode refill now closes the async-completion seam that caused a
+steady D64/D16 alternation. When a partial decode tail plus completed decode
+sampling tickets can reconstruct the configured target, the server defers only
+that tail dispatch until the CUDA event is collected. The default target is
+zero, preserving prior behavior.
+
+With target 64 and in-flight capacity 80, balanced fixed-output throughput is
+3,889.9 token/s across three fresh lifecycles. The D16 steady-state bucket is
+eliminated, TTFT median falls to 2,035.8 ms, and peak memory remains 8,087 MiB.
+The tradeoff is median TPOT rising from the in-flight64 latency profile's
+15.29 ms to 18.23 ms. Short and decode-heavy smoke results are 1,698.5 and
+4,476.6 token/s respectively.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the
