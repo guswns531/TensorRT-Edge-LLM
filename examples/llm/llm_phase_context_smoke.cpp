@@ -105,6 +105,72 @@ struct PhaseTiming
     float makespanMs{};
 };
 
+class SamplingSlotPool
+{
+public:
+    struct Slot
+    {
+        explicit Slot(int32_t maxRows)
+            : hostIds({maxRows}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_sampling_host_ids")
+        {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        }
+
+        ~Slot() noexcept
+        {
+            if (ready != nullptr)
+            {
+                static_cast<void>(cudaEventDestroy(ready));
+            }
+        }
+
+        rt::Tensor hostIds;
+        cudaEvent_t ready{};
+        bool busy{};
+    };
+
+    explicit SamplingSlotPool(int32_t maxRows)
+        : mMaxRows(maxRows)
+    {
+    }
+
+    Slot& acquire()
+    {
+        for (auto& slot : mSlots)
+        {
+            if (!slot->busy)
+            {
+                slot->busy = true;
+                ++mReuseCount;
+                return *slot;
+            }
+        }
+        mSlots.push_back(std::make_unique<Slot>(mMaxRows));
+        mSlots.back()->busy = true;
+        return *mSlots.back();
+    }
+
+    void release(Slot& slot) noexcept
+    {
+        slot.busy = false;
+    }
+
+    size_t size() const noexcept
+    {
+        return mSlots.size();
+    }
+
+    size_t reuseCount() const noexcept
+    {
+        return mReuseCount;
+    }
+
+private:
+    int32_t mMaxRows{};
+    std::vector<std::unique_ptr<Slot>> mSlots;
+    size_t mReuseCount{};
+};
+
 PhaseTiming measureOverlap(rt::EngineExecutor& prefillExecutor, rt::EngineExecutor& decodeExecutor,
     cudaStream_t setupStream, cudaStream_t prefillStream, cudaStream_t decodeStream, int32_t warmup, int32_t iterations)
 {
@@ -570,10 +636,7 @@ int main(int argc, char** argv)
             nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
         rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
-        rt::Tensor hostPrefillSelectedIds({config.maxSupportedPrefillBatchSize}, rt::DeviceType::kCPU,
-            nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_selected_ids");
-        rt::Tensor hostDecodeSelectedIds({config.maxSupportedDecodeBatchSize}, rt::DeviceType::kCPU,
-            nvinfer1::DataType::kINT32, "semantic_phase_host_decode_selected_ids");
+        SamplingSlotPool samplingSlotPool(maxPhaseBatch);
 
         auto stageTokens = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
                                rt::TensorMap& map, cudaStream_t stream, bool prefill) {
@@ -661,29 +724,27 @@ int main(int argc, char** argv)
                                   cudaStream_t stream, bool prefill) {
             int32_t const batchSize = static_cast<int32_t>(views.size());
             rt::Tensor& selectedIds = prefill ? prefillSelectedIds : decodeSelectedIds;
-            rt::Tensor& hostSelectedIds = prefill ? hostPrefillSelectedIds : hostDecodeSelectedIds;
             rt::Tensor& workspace = prefill ? prefillSamplingWorkspace : decodeSamplingWorkspace;
+            SamplingSlotPool::Slot& slot = samplingSlotPool.acquire();
             ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
-                    && selectedIds.reshape({batchSize, 1}) && hostSelectedIds.reshape({batchSize}),
+                    && selectedIds.reshape({batchSize, 1}) && slot.hostIds.reshape({batchSize}),
                 "Semantic phase sampling reshape failed");
             selectAllTopK(io.outputLogits, std::nullopt, selectedIds, 1, workspace, stream);
-            CUDA_CHECK(cudaMemcpyAsync(hostSelectedIds.rawPointer(), selectedIds.rawPointer(),
+            CUDA_CHECK(cudaMemcpyAsync(slot.hostIds.rawPointer(), selectedIds.rawPointer(),
                 static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-            cudaEvent_t ready{};
-            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventRecord(ready, stream));
-            rt::Tensor* const hostSelectedIdsPtr = &hostSelectedIds;
+            CUDA_CHECK(cudaEventRecord(slot.ready, stream));
             auto ticket = std::make_unique<rt::IndependentPhaseSampleTicket>();
-            ticket->ready = ready;
+            ticket->ready = slot.ready;
             ticket->fromPrefill = prefill;
             for (rt::IndependentPhaseRequestView const& view : views)
             {
                 ticket->requestIds.push_back(view.requestId);
             }
-            ticket->collect = [hostSelectedIdsPtr, batchSize]() {
-                int32_t const* selected = hostSelectedIdsPtr->dataPointer<int32_t>();
+            ticket->collect = [&slot, batchSize]() {
+                int32_t const* selected = slot.hostIds.dataPointer<int32_t>();
                 return std::vector<int32_t>(selected, selected + batchSize);
             };
+            ticket->release = [&samplingSlotPool, &slot]() { samplingSlotPool.release(slot); };
             return ticket;
         };
 
@@ -997,6 +1058,7 @@ int main(int argc, char** argv)
                     std::lock_guard<std::mutex> lock(pendingMutex);
                     lines.swap(pendingLines);
                 }
+                bool madeProgress = !lines.empty();
                 while (!lines.empty())
                 {
                     nlohmann::json const payload = nlohmann::json::parse(lines.front());
@@ -1122,23 +1184,34 @@ int main(int argc, char** argv)
                     }
                     lines.pop_front();
                 }
-                static_cast<void>(ipcThreePhase != nullptr ? ipcThreePhase->poll() : semanticServer.poll());
+                madeProgress
+                    = (ipcThreePhase != nullptr ? ipcThreePhase->poll() : semanticServer.poll()) || madeProgress;
                 while (emittedMetrics < semanticCoordinator.metrics().size())
                 {
+                    madeProgress = true;
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
                         {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
-                        {"decode_tokens", metrics.decodeTokens}, {"prefill_gpu_ms", metrics.prefillGpuMs},
+                        {"prefill_chunk_length", metrics.prefillCostLookupChunkLength},
+                        {"prefill_initial_rows", metrics.prefillInitialRows},
+                        {"prefill_continuation_rows", metrics.prefillContinuationRows},
+                        {"prefill_past_kv_max", metrics.prefillPastKVMax}, {"decode_tokens", metrics.decodeTokens},
+                        {"prefill_gpu_ms", metrics.prefillGpuMs},
+                        {"decode_context_tokens", metrics.decodeContextTokens},
+                        {"decode_context_max", metrics.plannedDecodeMaxContextLength},
                         {"decode_gpu_ms", metrics.decodeGpuMs}, {"makespan_gpu_ms", metrics.makespanGpuMs},
                         {"overlap_ratio", metrics.overlapRatio},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
-                        {"decode_refill_waits", semanticServer.decodeRefillWaitCount()}};
+                        {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
+                        {"sampling_event_slots", samplingSlotPool.size()},
+                        {"sampling_event_reuses", samplingSlotPool.reuseCount()}};
                     emitRecord("PHASE_METRIC\t", metricEvent);
                 }
                 while (auto token = semanticServer.tryPopToken())
                 {
+                    madeProgress = true;
                     nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", token->requestId},
                         {"token_id", token->tokenId},
                         {"text", tokenizer.decode(std::vector<int32_t>{token->tokenId}, false)},
@@ -1147,6 +1220,7 @@ int main(int argc, char** argv)
                 }
                 while (auto completion = semanticServer.tryPopCompletion())
                 {
+                    madeProgress = true;
                     nlohmann::json const completionEvent{{"type", "completion"},
                         {"request_index", completion->requestId},
                         {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
@@ -1178,12 +1252,17 @@ int main(int argc, char** argv)
                         lines.pop_back();
                     }
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!madeProgress)
+                {
+                    std::this_thread::yield();
+                }
             }
             inputReader.join();
             LOG_INFO("Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s",
                 semanticServer.decodeRefillWaitCount(), semanticServer.throughputModeTransitionCount(),
                 semanticServer.throughputMode() ? "yes" : "no");
+            LOG_INFO(
+                "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;

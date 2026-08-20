@@ -226,6 +226,19 @@ throughput mode and returns to latency mode for its final 337 dispatches.
 Mode, transition count, and sampling-refill wait count are emitted with every
 phase metric.
 
+The IPC event loop no longer sleeps for a fixed millisecond after every poll.
+It yields only when input, server polling, metrics, tokens, and completions all
+make no progress. Sampling uses ticket-owned pinned host buffers and a reusable
+CUDA-event slot pool; all ready tickets are collected in one pass rather than
+being blocked behind the queue front.
+
+Balanced fixed-output throughput rises from 3,905.7 to 4,346.8 token/s. A
+fresh engine-specific cost model gives 4,364.3 token/s and 17.57 ms TPOT p95.
+The host gap falls from about 1.00 seconds to 0.28--0.32 seconds, with two
+sampling events reused roughly 560 times per run. Fresh native v0.9.1 reaches
+4,468.1 token/s under the same fixed-output HTTP trace, leaving v0.10 within
+2.32% throughput while using 332 MiB less peak memory.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the

@@ -232,7 +232,7 @@ bool IndependentPhaseAsyncServer::poll()
     bool progressed = admitPendingRequests();
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = mCoordinator.poll() || progressed;
-    processSamplingTickets();
+    progressed = processSamplingTickets() || progressed;
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = admitPendingRequests() || progressed;
     updateAdaptiveAdmissionMode();
@@ -486,21 +486,26 @@ bool IndependentPhaseAsyncServer::isEos(int32_t tokenId) const noexcept
     return std::find(mConfig.eosTokenIds.begin(), mConfig.eosTokenIds.end(), tokenId) != mConfig.eosTokenIds.end();
 }
 
-void IndependentPhaseAsyncServer::processSamplingTickets()
+bool IndependentPhaseAsyncServer::processSamplingTickets()
 {
-    while (!mSamplingTickets.empty())
+    std::vector<std::unique_ptr<IndependentPhaseSampleTicket>> readyTickets;
+    for (auto ticket = mSamplingTickets.begin(); ticket != mSamplingTickets.end();)
     {
-        std::unique_ptr<IndependentPhaseSampleTicket>& ticket = mSamplingTickets.front();
-        cudaError_t const status = cudaEventQuery(ticket->ready);
+        cudaError_t const status = cudaEventQuery((*ticket)->ready);
         if (status == cudaErrorNotReady)
         {
-            break;
+            ++ticket;
+            continue;
         }
         CUDA_CHECK(status);
-        std::unique_ptr<IndependentPhaseSampleTicket> ready = std::move(ticket);
-        mSamplingTickets.pop_front();
-        processTicket(std::move(ready));
+        readyTickets.push_back(std::move(*ticket));
+        ticket = mSamplingTickets.erase(ticket);
     }
+    for (auto& ticket : readyTickets)
+    {
+        processTicket(std::move(ticket));
+    }
+    return !readyTickets.empty();
 }
 
 void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket)
@@ -557,6 +562,13 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
 
 void IndependentPhaseAsyncServer::destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept
 {
+    if (ticket.release)
+    {
+        ticket.release();
+        ticket.release = {};
+        ticket.ready = nullptr;
+        return;
+    }
     if (ticket.ready != nullptr)
     {
         static_cast<void>(cudaEventDestroy(ticket.ready));

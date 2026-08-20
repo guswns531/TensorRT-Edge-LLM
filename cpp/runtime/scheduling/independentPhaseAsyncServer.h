@@ -63,6 +63,8 @@ struct IndependentPhaseSampleTicket
     bool fromPrefill{};
     std::vector<uint64_t> requestIds;
     std::function<std::vector<int32_t>()> collect;
+    //! Return adapter-owned event/host staging resources after collection or shutdown.
+    std::function<void()> release;
 };
 
 //! Model-specific seam for token staging, embeddings, deepstack/M-RoPE binding, and sampling.
@@ -218,7 +220,7 @@ private:
     bool shouldWaitForDecodeRefill() const noexcept;
     size_t admissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
-    void processSamplingTickets();
+    bool processSamplingTickets();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
     void destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept;
