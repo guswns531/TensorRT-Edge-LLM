@@ -100,6 +100,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 78. [Cosmos joint prefill batch/chunk scheduler](102-cosmos-joint-prefill-shape-scheduler-20260819.md)
 79. [Cosmos controlled prefill shape cost sweep](103-cosmos-controlled-prefill-cost-sweep-20260819.md)
 80. [TensorRT Edge-LLM v0.10.0 Cosmos 비교](104-tensorrt-edge-llm-v010-comparison-20260819.md)
+81. [Cosmos v0.10 tied LM-head 동일성·메모리·성능 gate](105-cosmos-v010-tied-identity-performance-gate-20260820.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.

@@ -108,6 +108,7 @@ def stream_request(endpoint: str,
     output_tokens = 0
     finish_reason = ""
     output_parts = []
+    output_token_ids: list[int] = []
     status = 0
     error = ""
     try:
@@ -147,6 +148,8 @@ def stream_request(endpoint: str,
                 token_text = delta.get("content") or delta.get(
                     "reasoning_content") or ""
                 token_ids = delta.get("token_ids") or []
+                output_token_ids.extend(
+                    int(token_id) for token_id in token_ids)
                 if (token_text or token_ids) and first_token_ns == 0:
                     first_token_ns = time.monotonic_ns()
                 if token_text:
@@ -164,41 +167,69 @@ def stream_request(endpoint: str,
     tpot_ms = ((done_ns - first_token_ns) / 1_000_000.0 /
                (output_tokens - 1) if output_tokens > 1 else 0.0)
     return {
-        "request_id": request_id,
-        "scheduled_arrival_us": scheduled_arrival_us,
-        "send_us": round((send_ns - epoch_ns) / 1000),
-        "first_token_us": round((first_token_ns - epoch_ns) / 1000),
-        "completed_us": round((done_ns - epoch_ns) / 1000),
-        "client_dispatch_delay_us": round(
-            (send_ns - epoch_ns) / 1000) - scheduled_arrival_us,
-        "max_output_tokens": max_tokens,
-        "prompt_tokens": prompt_tokens,
-        "output_tokens": output_tokens,
-        "http_status": status,
-        "finish_reason": finish_reason,
-        "ttft_ms": ttft_ms,
-        "tpot_ms": tpot_ms,
-        "e2e_ms": e2e_ms,
-        "output_prefix": "".join(output_parts)[:160].replace("\n", "\\n"),
-        "error": error,
+        "request_id":
+        request_id,
+        "scheduled_arrival_us":
+        scheduled_arrival_us,
+        "send_us":
+        round((send_ns - epoch_ns) / 1000),
+        "first_token_us":
+        round((first_token_ns - epoch_ns) / 1000),
+        "completed_us":
+        round((done_ns - epoch_ns) / 1000),
+        "client_dispatch_delay_us":
+        round((send_ns - epoch_ns) / 1000) - scheduled_arrival_us,
+        "max_output_tokens":
+        max_tokens,
+        "prompt_tokens":
+        prompt_tokens,
+        "output_tokens":
+        output_tokens,
+        "http_status":
+        status,
+        "finish_reason":
+        finish_reason,
+        "ttft_ms":
+        ttft_ms,
+        "tpot_ms":
+        tpot_ms,
+        "e2e_ms":
+        e2e_ms,
+        "output_prefix":
+        "".join(output_parts)[:160].replace("\n", "\\n"),
+        "output_token_ids":
+        " ".join(str(token_id) for token_id in output_token_ids),
+        "error":
+        error,
     }
 
 
 def execute_requests(
-        endpoint: str,
-        model: str,
-        requests: list[dict[str, Any]],
-        timeout: float,
-        max_workers: int,
-        max_tokens_override: int = 0,
-        include_request_index: bool = False
+    endpoint: str,
+    model: str,
+    requests: list[dict[str, Any]],
+    timeout: float,
+    max_workers: int,
+    max_tokens_override: int = 0,
+    include_request_index: bool = False,
+    sequential: bool = False,
 ) -> tuple[list[dict[str, Any]], float]:
+    start_gate = threading.Event()
+    epoch_ns = time.monotonic_ns() + 500_000_000
+    if sequential:
+        start_gate.set()
+        rows = [
+            stream_request(endpoint, model, request_id, request, epoch_ns,
+                           start_gate, timeout, max_tokens_override,
+                           include_request_index)
+            for request_id, request in enumerate(requests)
+        ]
+        terminal_us = max(float(row["completed_us"]) for row in rows)
+        return rows, terminal_us / 1000.0
     if max_workers < len(requests):
         raise ValueError(
             "max-workers must be at least the request count to preserve burst arrivals"
         )
-    start_gate = threading.Event()
-    epoch_ns = time.monotonic_ns() + 500_000_000
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers) as executor:
         futures = [
@@ -236,25 +267,52 @@ def summarize(rows: list[dict[str, Any]], duration_ms: float,
     generated_tokens = sum(int(row["output_tokens"]) for row in successful)
     prompt_tokens = sum(int(row["prompt_tokens"]) for row in successful)
     requested_tokens = sum(int(row["max_output_tokens"]) for row in successful)
+    token_trace = [[
+        int(token_id) for token_id in str(row["output_token_ids"]).split()
+    ] for row in successful]
     return {
-        "run": run_index,
-        "requests": len(successful),
-        "prompt_tokens": prompt_tokens,
-        "requested_output_tokens": requested_tokens,
-        "generated_tokens": generated_tokens,
-        "duration_ms": duration_ms,
-        "achieved_req_s": len(successful) * 1000.0 / duration_ms,
-        "generated_token_s": generated_tokens * 1000.0 / duration_ms,
-        "ttft_median_ms": statistics.median(ttft),
-        "ttft_p95_ms": percentile(ttft, 0.95),
-        "ttft_p99_ms": percentile(ttft, 0.99),
-        "tpot_median_ms": statistics.median(tpot) if tpot else 0.0,
-        "tpot_p95_ms": percentile(tpot, 0.95),
-        "tpot_p99_ms": percentile(tpot, 0.99),
-        "e2e_median_ms": statistics.median(e2e),
-        "e2e_p95_ms": percentile(e2e, 0.95),
-        "e2e_p99_ms": percentile(e2e, 0.99),
-        "client_dispatch_delay_p95_ms": percentile(dispatch_delay, 0.95),
+        "run":
+        run_index,
+        "requests":
+        len(successful),
+        "prompt_tokens":
+        prompt_tokens,
+        "requested_output_tokens":
+        requested_tokens,
+        "generated_tokens":
+        generated_tokens,
+        "captured_token_ids":
+        sum(len(tokens) for tokens in token_trace),
+        "token_trace_sha256":
+        hashlib.sha256(
+            json.dumps(token_trace,
+                       separators=(",", ":")).encode()).hexdigest(),
+        "duration_ms":
+        duration_ms,
+        "achieved_req_s":
+        len(successful) * 1000.0 / duration_ms,
+        "generated_token_s":
+        generated_tokens * 1000.0 / duration_ms,
+        "ttft_median_ms":
+        statistics.median(ttft),
+        "ttft_p95_ms":
+        percentile(ttft, 0.95),
+        "ttft_p99_ms":
+        percentile(ttft, 0.99),
+        "tpot_median_ms":
+        statistics.median(tpot) if tpot else 0.0,
+        "tpot_p95_ms":
+        percentile(tpot, 0.95),
+        "tpot_p99_ms":
+        percentile(tpot, 0.99),
+        "e2e_median_ms":
+        statistics.median(e2e),
+        "e2e_p95_ms":
+        percentile(e2e, 0.95),
+        "e2e_p99_ms":
+        percentile(e2e, 0.99),
+        "client_dispatch_delay_p95_ms":
+        percentile(dispatch_delay, 0.95),
     }
 
 
@@ -279,15 +337,20 @@ def main() -> None:
     parser.add_argument("--max-workers", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--include-request-index", action="store_true")
+    parser.add_argument("--sequential", action="store_true")
+    parser.add_argument("--request-limit", type=int, default=0)
     args = parser.parse_args()
-    if args.repeats <= 0 or args.warmup_requests < 0:
+    if (args.repeats <= 0 or args.warmup_requests < 0
+            or args.request_limit < 0):
         parser.error(
-            "repeats must be positive and warmup-requests must be non-negative"
-        )
+            "repeats must be positive; warmup-requests and request-limit "
+            "must be non-negative")
 
     trace_bytes = args.trace.read_bytes()
     trace = json.loads(trace_bytes)
     requests = list(trace.get("requests", []))
+    if args.request_limit > 0:
+        requests = requests[:args.request_limit]
     if not requests:
         raise RuntimeError(f"trace contains no requests: {args.trace}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -308,8 +371,13 @@ def main() -> None:
         print(
             f"warmup: {len(warmup)} requests x {args.warmup_max_tokens} max tokens",
             flush=True)
-        execute_requests(args.endpoint, args.model, warmup, args.timeout,
-                         args.max_workers, args.warmup_max_tokens)
+        execute_requests(args.endpoint,
+                         args.model,
+                         warmup,
+                         args.timeout,
+                         args.max_workers,
+                         args.warmup_max_tokens,
+                         sequential=args.sequential)
 
     summaries = []
     for run_index in range(1, args.repeats + 1):
@@ -324,7 +392,8 @@ def main() -> None:
             requests,
             args.timeout,
             args.max_workers,
-            include_request_index=args.include_request_index)
+            include_request_index=args.include_request_index,
+            sequential=args.sequential)
         summary = summarize(rows, duration_ms, run_index)
         write_csv(run_dir / "requests.csv", rows)
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) +
@@ -354,6 +423,15 @@ def main() -> None:
         args.warmup_requests,
         "warmup_max_tokens":
         args.warmup_max_tokens,
+        "sequential":
+        args.sequential,
+        "captured_token_ids_per_run":
+        [int(row["captured_token_ids"]) for row in summaries],
+        "token_trace_sha256_per_run":
+        [str(row["token_trace_sha256"]) for row in summaries],
+        "token_trace_deterministic":
+        len({str(row["token_trace_sha256"])
+             for row in summaries}) == 1,
         "generated_token_s_median":
         statistics.median(
             float(row["generated_token_s"]) for row in summaries),
