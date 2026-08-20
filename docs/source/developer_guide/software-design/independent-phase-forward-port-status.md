@@ -217,6 +217,15 @@ The tradeoff is median TPOT rising from the in-flight64 latency profile's
 15.29 ms to 18.23 ms. Short and decode-heavy smoke results are 1,698.5 and
 4,476.6 token/s respectively.
 
+An additional adaptive-admission opt-in starts with the latency profile,
+enters throughput mode when pending backlog appears, and exits only after the
+pending queue is empty and active requests fall to 64 or fewer. Balanced gives
+3,905.7 token/s across three fresh lifecycles, with exactly two transitions per
+run. Short remains in latency mode; decode-heavy spends 1,132 dispatches in
+throughput mode and returns to latency mode for its final 337 dispatches.
+Mode, transition count, and sampling-refill wait count are emitted with every
+phase metric.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the

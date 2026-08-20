@@ -36,6 +36,16 @@ bool shouldDeferDecodeForSamplingRefill(
         && decodeRows + pendingDecodeSamplingRows >= targetRows;
 }
 
+bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
+    size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept
+{
+    if (!currentThroughputMode)
+    {
+        return pendingRequests >= backlogEnterThreshold;
+    }
+    return pendingRequests > 0 || activeRequests > latencyInFlightLimit;
+}
+
 IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerConfig config,
     IndependentPhaseCoordinator& coordinator, StableKVPageManager& ownership, IndependentPhaseRequestAdapter adapter,
     PhasePrefixReuseCache* prefixCache)
@@ -50,6 +60,10 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
     ELLM_CHECK(mConfig.outputHeadroomTokens > 0, "Independent phase server output headroom must be positive");
     ELLM_CHECK(mConfig.decodeRefillBatchSize <= mConfig.maxInFlightRequests,
         "Decode refill batch cannot exceed the server in-flight capacity");
+    ELLM_CHECK(!mConfig.enableAdaptiveAdmission
+            || (mConfig.latencyInFlightRequests > 0 && mConfig.latencyInFlightRequests <= mConfig.maxInFlightRequests
+                && mConfig.adaptiveBacklogEnterRequests > 0),
+        "Adaptive admission requires valid latency and backlog thresholds");
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
     mCoordinator.setGraphCaptureEnabled(mConfig.enableCudaGraphs);
@@ -91,7 +105,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
         result.status = IndependentPhaseServerStatus::kDuplicateRequest;
         return result;
     }
-    if (mRequests.size() >= mConfig.maxInFlightRequests || mOwnership.availableSlots() == 0)
+    if (mRequests.size() >= admissionLimit() || mOwnership.availableSlots() == 0)
     {
         return result;
     }
@@ -214,12 +228,14 @@ bool IndependentPhaseAsyncServer::capturePreparedGraphs()
 
 bool IndependentPhaseAsyncServer::poll()
 {
+    updateAdaptiveAdmissionMode();
     bool progressed = admitPendingRequests();
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = mCoordinator.poll() || progressed;
     processSamplingTickets();
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = admitPendingRequests() || progressed;
+    updateAdaptiveAdmissionMode();
     bool const waitForDecodeRefill = shouldWaitForDecodeRefill();
     if (waitForDecodeRefill)
     {
@@ -243,8 +259,31 @@ bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
             pendingDecodeRows += ticket->requestIds.size();
         }
     }
+    size_t const refillTarget
+        = !mConfig.enableAdaptiveAdmission || mThroughputMode ? mConfig.decodeRefillBatchSize : 0U;
     return shouldDeferDecodeForSamplingRefill(
-        mConfig.decodeRefillBatchSize, mCoordinator.scheduler().prefillQueueSize(), queuedDecode, pendingDecodeRows);
+        refillTarget, mCoordinator.scheduler().prefillQueueSize(), queuedDecode, pendingDecodeRows);
+}
+
+size_t IndependentPhaseAsyncServer::admissionLimit() const noexcept
+{
+    return !mConfig.enableAdaptiveAdmission || mThroughputMode ? mConfig.maxInFlightRequests
+                                                               : mConfig.latencyInFlightRequests;
+}
+
+void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
+{
+    if (!mConfig.enableAdaptiveAdmission)
+    {
+        return;
+    }
+    bool const next = nextAdaptiveThroughputMode(mThroughputMode, mPendingRequests.size(), mRequests.size(),
+        mConfig.latencyInFlightRequests, mConfig.adaptiveBacklogEnterRequests);
+    if (next != mThroughputMode)
+    {
+        mThroughputMode = next;
+        ++mThroughputModeTransitionCount;
+    }
 }
 
 void IndependentPhaseAsyncServer::runUntilIdle(size_t maxPolls)
@@ -294,6 +333,16 @@ size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
 size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept
 {
     return mDecodeRefillWaitCount;
+}
+
+bool IndependentPhaseAsyncServer::throughputMode() const noexcept
+{
+    return mThroughputMode;
+}
+
+size_t IndependentPhaseAsyncServer::throughputModeTransitionCount() const noexcept
+{
+    return mThroughputModeTransitionCount;
 }
 
 bool IndependentPhaseAsyncServer::empty() const noexcept

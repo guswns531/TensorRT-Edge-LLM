@@ -41,6 +41,9 @@ struct PhaseVisionPayload;
 //! Pure decision helper for sampling-aware decode-tail refill.
 bool shouldDeferDecodeForSamplingRefill(
     size_t targetRows, size_t prefillRows, size_t decodeRows, size_t pendingDecodeSamplingRows) noexcept;
+//! Hysteretic queue-pressure transition for adaptive admission.
+bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
+    size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept;
 
 //! Request view passed to a model-specific text or multimodal adapter.
 struct IndependentPhaseRequestView
@@ -107,6 +110,10 @@ struct IndependentPhaseServerConfig
     int32_t outputHeadroomTokens{128};
     //! Defer a partial decode tail while completed decode sampling tickets can refill this many rows.
     size_t decodeRefillBatchSize{};
+    //! Switch between latencyInFlightRequests/refill-off and maxInFlightRequests/refill-on from pending backlog.
+    bool enableAdaptiveAdmission{};
+    size_t latencyInFlightRequests{};
+    size_t adaptiveBacklogEnterRequests{1U};
 };
 
 struct IndependentPhaseServerSubmission
@@ -172,6 +179,8 @@ public:
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
     size_t decodeRefillWaitCount() const noexcept;
+    bool throughputMode() const noexcept;
+    size_t throughputModeTransitionCount() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -207,6 +216,8 @@ private:
     bool resumePendingDecodeRequests();
     bool enqueueDecodeOrWait(uint64_t requestId, RequestState& state);
     bool shouldWaitForDecodeRefill() const noexcept;
+    size_t admissionLimit() const noexcept;
+    void updateAdaptiveAdmissionMode() noexcept;
     void processSamplingTickets();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
@@ -226,6 +237,8 @@ private:
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
     size_t mDecodeRefillWaitCount{};
+    bool mThroughputMode{};
+    size_t mThroughputModeTransitionCount{};
 };
 
 } // namespace trt_edgellm::rt

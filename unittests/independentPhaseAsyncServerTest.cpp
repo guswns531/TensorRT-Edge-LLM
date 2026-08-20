@@ -33,4 +33,13 @@ TEST(IndependentPhaseAsyncServerTest, DefersOnlyARefillableDecodeTail)
     EXPECT_FALSE(shouldDeferDecodeForSamplingRefill(64, 0, 16, 47));
 }
 
+TEST(IndependentPhaseAsyncServerTest, AdaptiveAdmissionUsesBacklogHysteresis)
+{
+    EXPECT_FALSE(nextAdaptiveThroughputMode(false, 0, 64, 64, 1));
+    EXPECT_TRUE(nextAdaptiveThroughputMode(false, 1, 64, 64, 1));
+    EXPECT_TRUE(nextAdaptiveThroughputMode(true, 0, 80, 64, 1));
+    EXPECT_TRUE(nextAdaptiveThroughputMode(true, 1, 64, 64, 1));
+    EXPECT_FALSE(nextAdaptiveThroughputMode(true, 0, 64, 64, 1));
+}
+
 } // namespace trt_edgellm::rt

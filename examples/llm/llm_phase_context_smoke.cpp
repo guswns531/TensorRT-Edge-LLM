@@ -823,6 +823,11 @@ int main(int argc, char** argv)
         {
             serverConfig.decodeRefillBatchSize = static_cast<size_t>(std::stoul(value));
         }
+        serverConfig.enableAdaptiveAdmission = std::getenv("TRT_EDGELLM_ADAPTIVE_ADMISSION") != nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_LATENCY_INFLIGHT"))
+        {
+            serverConfig.latencyInFlightRequests = static_cast<size_t>(std::stoul(value));
+        }
         if (char const* reservation = std::getenv("TRT_EDGELLM_PAGE_RESERVATION");
             reservation != nullptr && std::string(reservation) == "headroom")
         {
@@ -1126,7 +1131,10 @@ int main(int argc, char** argv)
                         {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
                         {"decode_tokens", metrics.decodeTokens}, {"prefill_gpu_ms", metrics.prefillGpuMs},
                         {"decode_gpu_ms", metrics.decodeGpuMs}, {"makespan_gpu_ms", metrics.makespanGpuMs},
-                        {"overlap_ratio", metrics.overlapRatio}};
+                        {"overlap_ratio", metrics.overlapRatio},
+                        {"adaptive_throughput_mode", semanticServer.throughputMode()},
+                        {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
+                        {"decode_refill_waits", semanticServer.decodeRefillWaitCount()}};
                     emitRecord("PHASE_METRIC\t", metricEvent);
                 }
                 while (auto token = semanticServer.tryPopToken())
@@ -1173,7 +1181,9 @@ int main(int argc, char** argv)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             inputReader.join();
-            LOG_INFO("Sampling-aware decode refill waits: %zu", semanticServer.decodeRefillWaitCount());
+            LOG_INFO("Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s",
+                semanticServer.decodeRefillWaitCount(), semanticServer.throughputModeTransitionCount(),
+                semanticServer.throughputMode() ? "yes" : "no");
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;
