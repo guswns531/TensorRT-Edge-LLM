@@ -1011,6 +1011,37 @@ TEST(PhaseQueueSchedulerTest, KeepsNonChunkableMultimodalPrefillAtomic)
     EXPECT_EQ(plan.prefillBatch.front().tokenCount, 300);
 }
 
+TEST(PhaseQueueSchedulerTest, ChunksExclusiveMultimodalPrefillWithoutBatchingRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem first{1, 300, 0, 0, 300};
+    PhaseWorkItem second{2, 300, 1, 0, 300};
+    first.exclusivePrefill = true;
+    second.exclusivePrefill = true;
+    scheduler.enqueuePrefill(first);
+    scheduler.enqueuePrefill(second);
+
+    int32_t dispatches{};
+    while (!scheduler.empty())
+    {
+        PhaseDispatchPlan const plan = scheduler.next();
+        ASSERT_EQ(plan.prefillBatch.size(), 1U);
+        EXPECT_TRUE(plan.prefillBatch.front().exclusivePrefill);
+        EXPECT_LE(plan.prefillBatch.front().tokenCount, 128);
+        PhaseWorkItem const& item = plan.prefillBatch.front();
+        int32_t const length = item.tokenOffset + item.tokenCount;
+        scheduler.completePrefill(item, length, length == item.promptTokenCount);
+        ++dispatches;
+    }
+    EXPECT_EQ(dispatches, 6);
+}
+
 TEST(PhaseQueueSchedulerTest, DoesNotFragmentEfficientChunkForDecodeQueueWait)
 {
     PhaseQueueSchedulerConfig config;

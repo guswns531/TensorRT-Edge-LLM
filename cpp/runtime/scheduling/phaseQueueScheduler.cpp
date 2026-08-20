@@ -309,7 +309,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         for (PhaseWorkItem const& item : mPrefillQueue)
         {
             if (isEligible(item, true) && bucketRows < mConfig.maxPrefillBatchSize
-                && isPrefillBatchCompatible(item, bucketTokens, bucketInitial, allowRaggedBatch))
+                && isPrefillBatchCompatible(item, *prefillSeed, bucketTokens, bucketInitial, allowRaggedBatch))
             {
                 ++bucketRows;
             }
@@ -592,9 +592,13 @@ int32_t PhaseQueueScheduler::costAwarePrefillTokens(PhaseWorkItem const& item, i
     return std::min(maximum, chunkLimit);
 }
 
-bool PhaseQueueScheduler::isPrefillBatchCompatible(
-    PhaseWorkItem const& item, int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept
+bool PhaseQueueScheduler::isPrefillBatchCompatible(PhaseWorkItem const& item, PhaseWorkItem const& seed,
+    int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept
 {
+    if (seed.exclusivePrefill || item.exclusivePrefill)
+    {
+        return seed.exclusivePrefill && item.requestId == seed.requestId;
+    }
     int32_t const itemTokens = dispatchedPrefillTokens(item);
     if ((item.tokenOffset == 0) != initialChunk || itemTokens > paddedChunkLength)
     {
@@ -899,7 +903,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             for (PhaseWorkItem const& item : queue)
             {
                 if (isEligible(item, true)
-                    && isPrefillBatchCompatible(item, candidateTokens, candidateInitial, candidate.allowChunkedPrefill))
+                    && isPrefillBatchCompatible(
+                        item, candidate, candidateTokens, candidateInitial, candidate.allowChunkedPrefill))
                 {
                     candidateRows.push_back(&item);
                 }
@@ -980,7 +985,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         std::vector<PhaseWorkItem const*> compatible;
         for (PhaseWorkItem const& item : queue)
         {
-            if (isEligible(item, true) && isPrefillBatchCompatible(item, bucketTokens, bucketInitial, allowRaggedBatch))
+            if (isEligible(item, true)
+                && isPrefillBatchCompatible(item, *bucketSeed, bucketTokens, bucketInitial, allowRaggedBatch))
             {
                 compatible.push_back(&item);
             }
@@ -1002,6 +1008,11 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             bool const cohortEligible = !mConfig.enableWavefrontPrefillBatching
                 || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
             if (!cohortEligible || !isEligible(item, true) || (item.tokenOffset == 0) != bucketInitial)
+            {
+                continue;
+            }
+            if ((bucketSeed->exclusivePrefill || item.exclusivePrefill)
+                && !(bucketSeed->exclusivePrefill && item.requestId == bucketSeed->requestId))
             {
                 continue;
             }

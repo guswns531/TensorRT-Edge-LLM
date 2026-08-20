@@ -52,7 +52,8 @@ contexts.
 
 The TensorRT 11.0 / CUDA 13.3 SM86 container validated:
 
-- 72 scheduler, stable-KV, and prefix-ownership tests.
+- 67 phase-scheduler tests in the latest focused gate, including exclusive
+  multimodal chunking; the broader scheduler/stable-KV/prefix suites also pass.
 - Cosmos semantic async server output identity.
 - Prepared prefill/decode CUDA graph capture and replay.
 - Continuous trace: 16 requests, 46 dispatches, 22 overlap dispatches.
@@ -113,18 +114,19 @@ The clean upstream row is an optimistic fixed-batch replay oracle, not an
 OpenAI/SSE continuous server. The clean v0.10 public runtime still has no
 continuous HTTP endpoint, so it remains a separate kernel/correctness oracle.
 
-## P8/D8 forward-port measurements
+## B8 to B32 forward-port measurements
 
-The builder exposes one common `maxBatchSize`; it cannot build separate P8 and
-D32/D64 profiles. A B16 attempt failed because the exported ONNX
-`last_token_ids` second axis is static 1 while the builder requested profile
-max 16. The validated engine therefore remains B8, with scheduler caps P8/D8.
+The builder still exposes one common `maxBatchSize`, while the scheduler can
+independently cap prefill and decode rows. A fresh export corrected an obsolete
+artifact problem: `last_token_ids` now has dynamic `token_batch` and
+`num_selected` axes. The graph did not require a source change. This enabled
+B16/KV2048 and B32/KV1024 engines and P/D caps of P8/D16 and P8/D32.
 
 Stable ownership is decoupled from active engine rows. The default is 80
 stable slots, 8 active engine rows, and an in-flight admission cap of 16.
 Environment variables can override the stable-slot and in-flight limits.
 
-Fresh single-run HTTP/SSE results on the same client are:
+The earlier B8 results below are retained as the scaling baseline:
 
 | workload | backend | generated token/s | TTFT med/p95 | TPOT med/p95 | E2E med/p95 |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -154,9 +156,28 @@ observed phase cost table is:
 | D8 | 2448 | 6.051 ms | 6.107 ms |
 
 Decode is already concentrated at D8; the remaining throughput gap cannot be
-closed by scheduler tuning alone. It requires a larger decode-capable engine
-profile or an export whose packed `last_token_ids` axis remains dynamic beyond
-B8.
+closed by scheduler tuning alone. The larger profiles validate that diagnosis.
+
+The fixed-output balanced trace contains 288 requests, 25,872 prompt tokens,
+and 24,960 generated tokens per run. Three fresh process lifecycles give:
+
+| configuration | generated token/s | TTFT med/p95 | TPOT med/p95 | E2E med/p95 | ready/peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B16 P8/D8 | 869.8 | 13246/25685 ms | 17.55/18.46 ms | 14760/27233 ms | 9293/9299 |
+| B16 P4/D16 | 1297.8 | 8802/17136 ms | 11.78/12.58 ms | 9874/18126 ms | 9293/9299 |
+| B16 P8/D16 | 1300.4 | 8841/17092 ms | 11.77/12.57 ms | 9861/18161 ms | 9293/9299 |
+| B32 P8/D32 | 1921.4 | 5612/11112 ms | 15.66/16.88 ms | 6842/12188 ms | 8459/8465 |
+
+P8/D16 is the B16 throughput winner; P4/D16 trades 0.2% throughput for a
+slightly lower median TTFT. B32 increases throughput by 47.8% over B16
+P8/D16. Its smaller KV capacity and a smaller TensorRT tactic also leave about
+1.78 GiB of 10 GiB device headroom.
+
+The scheduler cost table now covers D1-D16 at the 2,048-token context contract
+and D17-D32 at the 1,024-token contract. CUDA-event p95 grows from 6.238 ms at
+D1 to 6.862 ms at D16, then from 6.927 ms at D17 to 7.484 ms at D32. A
+50,000-us decode queue target is selected for the saturated fixed-output
+traces so the scheduler can form the efficient upper decode bucket.
 
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
@@ -198,3 +219,30 @@ higher; TTFT median/p95 changes by -0.549%/-0.378%, TPOT by
 inside the 3% gate. EOS is disabled only for this performance gate because an
 EOS-enabled online trace produces different batch evolution even across
 repeated runs of the same engine.
+
+## Production tied-engine contract
+
+The materialization helper now writes `tied_engine_contract` into
+`config.json`. It requires byte-identical baseline/tied ONNX files and records
+the serialized engine SHA-256 in the audit manifest. Runtime startup checks the
+engine byte count, a four-position 1 MiB CRC32 fingerprint, and the tied
+embedding allocation byte count before publishing the non-owning LM-head
+alias. This catches stale or mixed engine directories without adding a full
+multi-gigabyte hash pass to every process startup.
+
+The new contract loaded the B8 tied engine and completed semantic inference in
+4.11 seconds wall time. An older tied directory without the contract is
+rejected with a specific materialization error. The helper's contract and ONNX
+mismatch behavior have Python unit coverage.
+
+## Multimodal row ownership
+
+Cosmos vision payloads remain chunkable, but each image request is now marked
+`exclusivePrefill`. Chunks from different image requests cannot occupy one
+packed prefill batch because their request-owned embedding/deepstack/M-RoPE
+views are not yet represented by a multi-row placement descriptor. Decode no
+longer binds the vision payload after the final prefill chunk.
+
+A real two-image OpenAI-style HTTP trace completes 2/2 requests with 1,017
+prompt tokens and 32 generated tokens. The one-run smoke result is 70.4
+token/s, 315.5 ms median TTFT, 9.23 ms median TPOT, and 453.9 ms median E2E.

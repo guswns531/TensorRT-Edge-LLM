@@ -543,7 +543,7 @@ int main(int argc, char** argv)
             rt::OptionalInputTensors deepstackFeatures;
             rt::Tensor visionEmbeddingView;
             std::vector<rt::Tensor> deepstackFeatureViews;
-            if (!views.empty() && views.front().visionPayload != nullptr)
+            if (prefill && !views.empty() && views.front().visionPayload != nullptr)
             {
                 ELLM_CHECK(views.size() == 1U, "Multimodal phase v1 requires an atomic single-row prefill");
                 rt::PhaseVisionPayload& payload = *views.front().visionPayload;
@@ -665,27 +665,86 @@ int main(int argc, char** argv)
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
         semanticSchedulerConfig.maxPrefillBatchSize = std::min(8, config.maxSupportedBatchSize);
         semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedBatchSize;
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_PREFILL_BATCH"))
+        {
+            semanticSchedulerConfig.maxPrefillBatchSize = std::stoi(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_DECODE_BATCH"))
+        {
+            semanticSchedulerConfig.maxDecodeBatchSize = std::stoi(value);
+        }
+        ELLM_CHECK(semanticSchedulerConfig.maxPrefillBatchSize > 0
+                && semanticSchedulerConfig.maxPrefillBatchSize <= config.maxSupportedBatchSize,
+            "Semantic prefill batch cap is outside the engine profile");
+        ELLM_CHECK(semanticSchedulerConfig.maxDecodeBatchSize > 0
+                && semanticSchedulerConfig.maxDecodeBatchSize <= config.maxSupportedBatchSize,
+            "Semantic decode batch cap is outside the engine profile");
         semanticSchedulerConfig.maxPrefillChunkTokens = 128;
         semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
+        semanticSchedulerConfig.maxPrefillBatchTokens = semanticSchedulerConfig.maxPrefillBatchSize * 128;
+        semanticSchedulerConfig.enableRaggedPrefillBatching = true;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
+        semanticSchedulerConfig.prefillCompletionBonusTokens = 128;
+        semanticSchedulerConfig.enableWavefrontPrefillBatching = true;
+        semanticSchedulerConfig.maxPrefillCohortSize = semanticSchedulerConfig.maxPrefillBatchSize;
+        semanticSchedulerConfig.maxPrefillCohortTurns = 8;
         semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
         semanticSchedulerConfig.minPrefillChunkTokens = 32;
         semanticSchedulerConfig.prefillChunkAlignment = 8;
         semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
+        if (char const* value = std::getenv("TRT_EDGELLM_FIXED_PREFILL_CHUNK"))
+        {
+            int32_t const fixedChunk = std::stoi(value);
+            ELLM_CHECK(fixedChunk > 0 && fixedChunk <= 128, "Fixed prefill chunk is outside the engine profile");
+            semanticSchedulerConfig.maxPrefillChunkTokens = fixedChunk;
+            semanticSchedulerConfig.minPrefillChunkTokens = fixedChunk;
+            semanticSchedulerConfig.enableAdaptivePrefillChunking = false;
+            semanticSchedulerConfig.adaptivePrefillChunkCandidates.clear();
+            semanticSchedulerConfig.maxPrefillBatchTokens = semanticSchedulerConfig.maxPrefillBatchSize * fixedChunk;
+        }
         semanticSchedulerConfig.enableMetricsPolicy = true;
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
         semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
-        semanticSchedulerConfig.enableDynamicDecodeBatching = true;
+        if (char const* value = std::getenv("TRT_EDGELLM_DECODE_QUEUE_TARGET_US"))
+        {
+            semanticSchedulerConfig.decodeQueueWaitTargetUs = std::stod(value);
+        }
+        semanticSchedulerConfig.enableDynamicDecodeBatching
+            = std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr;
         semanticSchedulerConfig.decodeBatchCosts = {
-            {1, 2048, 5.877F},
-            {2, 2048, 5.901F},
-            {3, 2048, 5.931F},
-            {4, 2048, 5.957F},
-            {5, 2048, 5.972F},
-            {6, 2048, 6.048F},
-            {7, 2048, 6.080F},
-            {8, 2048, 6.107F},
+            {1, 2048, 6.238F},
+            {2, 2048, 6.294F},
+            {3, 2048, 6.370F},
+            {4, 2048, 6.321F},
+            {5, 2048, 6.402F},
+            {6, 2048, 6.360F},
+            {7, 2048, 6.467F},
+            {8, 2048, 6.467F},
+            {9, 2048, 6.680F},
+            {10, 2048, 6.617F},
+            {11, 2048, 6.767F},
+            {12, 2048, 6.712F},
+            {13, 2048, 6.924F},
+            {14, 2048, 6.790F},
+            {15, 2048, 6.904F},
+            {16, 2048, 6.862F},
+            {17, 1024, 6.927F},
+            {18, 1024, 6.988F},
+            {19, 1024, 7.016F},
+            {20, 1024, 7.129F},
+            {21, 1024, 7.105F},
+            {22, 1024, 7.082F},
+            {23, 1024, 7.106F},
+            {24, 1024, 7.178F},
+            {25, 1024, 7.291F},
+            {26, 1024, 7.278F},
+            {27, 1024, 7.341F},
+            {28, 1024, 7.264F},
+            {29, 1024, 7.374F},
+            {30, 1024, 7.435F},
+            {31, 1024, 7.523F},
+            {32, 1024, 7.484F},
         };
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));

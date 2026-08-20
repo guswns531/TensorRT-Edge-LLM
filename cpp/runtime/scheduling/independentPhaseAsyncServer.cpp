@@ -74,6 +74,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     PhaseSchedulingHints scheduling)
 {
     bool const allowChunkedPrefill = true;
+    bool const exclusivePrefill = visionPayload != nullptr;
     IndependentPhaseServerSubmission result{requestId};
     if (mRequests.find(requestId) != mRequests.end() || mPendingRequestIds.find(requestId) != mPendingRequestIds.end()
         || promptTokens.empty())
@@ -120,7 +121,8 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     mRequests.emplace(requestId, std::move(state));
     int32_t const remaining = static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()) - reusedPrefixTokens;
     mCoordinator.enqueuePrefill({requestId, remaining, slot, reusedPrefixTokens,
-        static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()), allowChunkedPrefill, scheduling});
+        static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()), allowChunkedPrefill, scheduling,
+        exclusivePrefill});
     result.status = IndependentPhaseServerStatus::kAdmitted;
     result.kvSlotId = slot;
     result.reusedPrefixTokens = reusedPrefixTokens;

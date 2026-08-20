@@ -51,7 +51,8 @@ struct PhaseWorkItem
 {
     PhaseWorkItem() = default;
     PhaseWorkItem(uint64_t requestId, int32_t tokenCount, int32_t kvSlotId = -1, int32_t tokenOffset = 0,
-        int32_t promptTokenCount = 0, bool allowChunkedPrefill = true, PhaseSchedulingHints scheduling = {})
+        int32_t promptTokenCount = 0, bool allowChunkedPrefill = true, PhaseSchedulingHints scheduling = {},
+        bool exclusivePrefill = false)
         : requestId(requestId)
         , tokenCount(tokenCount)
         , kvSlotId(kvSlotId)
@@ -59,6 +60,7 @@ struct PhaseWorkItem
         , promptTokenCount(promptTokenCount)
         , allowChunkedPrefill(allowChunkedPrefill)
         , scheduling(scheduling)
+        , exclusivePrefill(exclusivePrefill)
     {
     }
 
@@ -70,6 +72,8 @@ struct PhaseWorkItem
     //! Gemma4 vision-block attention currently requires one atomic prefill.
     bool allowChunkedPrefill{true};
     PhaseSchedulingHints scheduling;
+    //! Keep this request in a one-row prefill batch while still permitting chunking.
+    bool exclusivePrefill{};
 };
 
 enum class PhaseDispatchKind
@@ -493,8 +497,8 @@ private:
     PhaseQueueSnapshot snapshot() const;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     int32_t costAwarePrefillTokens(PhaseWorkItem const& item, int32_t chunkLimit) const noexcept;
-    bool isPrefillBatchCompatible(
-        PhaseWorkItem const& item, int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept;
+    bool isPrefillBatchCompatible(PhaseWorkItem const& item, PhaseWorkItem const& seed, int32_t paddedChunkLength,
+        bool initialChunk, bool allowRaggedBatch) const noexcept;
     bool isEligible(PhaseWorkItem const& item, bool prefill) const;
     std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill,
         PhaseQueueSnapshot const& snapshot, PhaseDispatchPlan& plan);

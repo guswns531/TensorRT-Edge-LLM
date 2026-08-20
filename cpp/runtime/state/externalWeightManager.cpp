@@ -28,13 +28,16 @@
 
 #include <NvInferRuntime.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -53,6 +56,76 @@ using Json = nlohmann::json;
 constexpr size_t kWeightAlignment = 256;
 constexpr char const* kStorageAliasField = "storage_alias_of";
 constexpr char const* kTiedEmbeddingSource = "embedding";
+size_t nonnegativeSize(Json const& value, std::string const& label);
+
+std::string sampleCrc32File(std::filesystem::path const& path, size_t sampleBytes)
+{
+    static std::array<uint32_t, 256> const table = []() {
+        std::array<uint32_t, 256> result{};
+        for (uint32_t index = 0; index < result.size(); ++index)
+        {
+            uint32_t value = index;
+            for (int32_t bit = 0; bit < 8; ++bit)
+            {
+                value = (value >> 1U) ^ ((value & 1U) != 0U ? 0xEDB88320U : 0U);
+            }
+            result[index] = value;
+        }
+        return result;
+    }();
+    size_t const fileBytes = static_cast<size_t>(std::filesystem::file_size(path));
+    ELLM_CHECK(sampleBytes > 0 && sampleBytes <= 16U * 1024U * 1024U && sampleBytes <= fileBytes,
+        "Tied engine fingerprint sample size is invalid");
+    std::array<size_t, 4> offsets{0, fileBytes / 3U, (fileBytes * 2U) / 3U, fileBytes - sampleBytes};
+    std::sort(offsets.begin(), offsets.end());
+    std::ifstream stream(path, std::ios::binary);
+    ELLM_CHECK(stream.is_open(), "Failed to open tied engine for fingerprint validation: " + path.string());
+    std::vector<char> buffer(sampleBytes);
+    uint32_t value = 0xFFFFFFFFU;
+    size_t previousOffset = std::numeric_limits<size_t>::max();
+    for (size_t const offset : offsets)
+    {
+        if (offset == previousOffset)
+        {
+            continue;
+        }
+        previousOffset = offset;
+        stream.seekg(static_cast<std::streamoff>(offset));
+        stream.read(buffer.data(), static_cast<std::streamsize>(std::min(sampleBytes, fileBytes - offset)));
+        std::streamsize const bytes = stream.gcount();
+        for (std::streamsize index = 0; index < bytes; ++index)
+        {
+            uint8_t const byte = static_cast<uint8_t>(buffer[static_cast<size_t>(index)]);
+            value = table[(value ^ byte) & 0xFFU] ^ (value >> 8U);
+        }
+    }
+    std::ostringstream encoded;
+    encoded << std::hex << std::setfill('0') << std::setw(8) << (value ^ 0xFFFFFFFFU);
+    return encoded.str();
+}
+
+void validateTiedEngineContract(std::filesystem::path const& engineDir, Json const& config, Tensor const& tiedEmbedding)
+{
+    ELLM_CHECK(config.contains("tied_engine_contract") && config["tied_engine_contract"].is_object(),
+        "Tied LM-head runtime requires a tied_engine_contract; materialize the variant with the official helper");
+    Json const& contract = config["tied_engine_contract"];
+    ELLM_CHECK(contract.value("version", 0) == 1, "Unsupported tied_engine_contract version");
+    std::filesystem::path const engineFile = contract.value("engine_file", std::string{});
+    ELLM_CHECK(!engineFile.empty() && !engineFile.is_absolute() && engineFile.filename() == engineFile,
+        "tied_engine_contract engine_file must be one local filename");
+    std::filesystem::path const enginePath = engineDir / engineFile;
+    size_t const expectedEngineBytes = nonnegativeSize(contract.at("engine_bytes"), "tied engine byte count");
+    ELLM_CHECK(std::filesystem::file_size(enginePath) == expectedEngineBytes,
+        "Tied engine size differs from its materialized contract");
+    size_t const sampleBytes
+        = nonnegativeSize(contract.at("engine_sample_bytes"), "tied engine fingerprint sample size");
+    ELLM_CHECK(contract.contains("engine_sample_crc32") && contract["engine_sample_crc32"].is_string()
+            && sampleCrc32File(enginePath, sampleBytes) == contract["engine_sample_crc32"].get<std::string>(),
+        "Tied engine fingerprint differs from its materialized contract");
+    size_t const expectedEmbeddingBytes = nonnegativeSize(contract.at("embedding_bytes"), "tied embedding byte count");
+    ELLM_CHECK(static_cast<size_t>(tiedEmbedding.getMemoryCapacity()) == expectedEmbeddingBytes,
+        "Tied embedding allocation differs from its materialized contract");
+}
 
 size_t alignWeightBytes(size_t bytes)
 {
@@ -90,8 +163,6 @@ bool isPleEmbeddingBinding(Json const& binding)
 {
     return binding.value("role", "") == "ple_embedding" || binding.value("engine_name", "") == "__ple_embedding__";
 }
-
-size_t nonnegativeSize(Json const& value, std::string const& label);
 
 uint8_t hexNibble(char value)
 {
@@ -342,6 +413,15 @@ void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path 
 {
     Json const files = config.value("external_weight_files", Json::array());
     ELLM_CHECK(files.is_array(), "external_weight_files must be an array in " + configPath.string());
+
+    bool const usesTiedEmbedding = std::any_of(files.begin(), files.end(),
+        [](Json const& entry) { return entry.is_object() && entry.value("source", "") == kTiedEmbeddingSource; });
+    if (usesTiedEmbedding)
+    {
+        ELLM_CHECK(tiedEmbedding != nullptr,
+            "External tied LM-head requires the runtime embedding tensor: " + configPath.string());
+        validateTiedEngineContract(engineDir, config, *tiedEmbedding);
+    }
 
     for (auto const& entry : files)
     {
