@@ -39,8 +39,8 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mPrefillStream(prefillStream)
     , mDecodeStream(decodeStream)
     , mCallbacks(std::move(callbacks))
-    , mPrefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "independent_coordinator_prefill")
-    , mDecodeKV(config.maxSupportedBatchSize, ownership, decodeMap, "independent_coordinator_decode")
+    , mPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "independent_coordinator_prefill")
+    , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
     , mScheduler(std::move(schedulerConfig))
 {
     ELLM_CHECK(config.packedPrefill, "Independent phase coordinator currently requires a packed-prefill engine");

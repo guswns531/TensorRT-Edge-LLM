@@ -75,12 +75,17 @@ void allocateZeroBuffer(SharedResources& res, int64_t bytes)
     CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
 }
 
-//! Build the initially identity-mapped page table sized from `kv`.
+//! Build the initial page table sized from `kv`. Undercommitted pools start empty.
 std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cudaStream_t stream)
 {
     auto table
         = std::make_unique<KVPageTable>(kv.getConfig().maxBatchSize, pagesPerSlot(kv.maxCapPadded()), kv.numPages());
-    table->setIdentity();
+    int64_t const identityPages
+        = computeMinimumKvPoolPages(kv.getConfig().maxBatchSize, kv.getConfig().maxSequenceLength);
+    if (kv.numPages() >= identityPages)
+    {
+        table->setIdentity();
+    }
     table->upload(stream);
     return table;
 }
@@ -100,6 +105,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
         /*.numPages=*/cfg.kvPoolPages,
+        /*.allowUndercommit=*/cfg.allowKVPoolUndercommit,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,

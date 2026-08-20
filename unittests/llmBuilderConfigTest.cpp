@@ -66,6 +66,23 @@ TEST(LLMBuilderConfigTest, PoolPagesBelowMinimumActivePagesAreRejected)
     EXPECT_THROW(config.toJson(), std::runtime_error);
 }
 
+TEST(LLMBuilderConfigTest, UndercommittedPoolAndAsymmetricProfilesRoundTrip)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxBatchSize = 80;
+    config.maxPrefillBatchSize = 8;
+    config.maxDecodeBatchSize = 64;
+    config.maxKVCacheCapacity = 2048;
+    config.maxKVPoolPages = 256;
+    config.allowKVPoolUndercommit = true;
+
+    LLMBuilderConfig const parsed = LLMBuilderConfig::fromJson(config.toJson());
+    EXPECT_EQ(parsed.getMaxPrefillBatchSize(), 8);
+    EXPECT_EQ(parsed.getMaxDecodeBatchSize(), 64);
+    EXPECT_EQ(parsed.resolvedKVPoolPages(), 256);
+    EXPECT_TRUE(parsed.allowKVPoolUndercommit);
+}
+
 TEST(LLMBuilderConfigTest, PoolPagesRoundTripThroughJson)
 {
     LLMBuilderConfig config = makeConfig();

@@ -121,6 +121,8 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.outputVocabSize, 32000);
     EXPECT_EQ(cfg.reducedVocabSize, 0);
     EXPECT_EQ(cfg.maxSupportedBatchSize, 2);
+    EXPECT_EQ(cfg.maxSupportedPrefillBatchSize, 2);
+    EXPECT_EQ(cfg.maxSupportedDecodeBatchSize, 2);
     EXPECT_EQ(cfg.maxSupportedInputLength, 128);
     EXPECT_EQ(cfg.maxKVCacheCapacity, 256);
     EXPECT_EQ(cfg.kvPoolPages, 4);
@@ -129,6 +131,25 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
+}
+
+TEST_F(LLMEngineConfigTest, ParsesAsymmetricPhaseLimitsAndUndercommittedPool)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_batch_size"] = 80;
+    json["builder_config"]["max_prefill_batch_size"] = 8;
+    json["builder_config"]["max_decode_batch_size"] = 64;
+    json["builder_config"]["max_kv_cache_capacity"] = 2048;
+    json["builder_config"]["max_kv_pool_pages"] = 256;
+    json["builder_config"]["allow_kv_pool_undercommit"] = true;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const config = parseEngineConfig(path);
+    EXPECT_EQ(config.maxSupportedBatchSize, 80);
+    EXPECT_EQ(config.maxSupportedPrefillBatchSize, 8);
+    EXPECT_EQ(config.maxSupportedDecodeBatchSize, 64);
+    EXPECT_EQ(config.kvPoolPages, 256);
+    EXPECT_TRUE(config.allowKVPoolUndercommit);
 }
 
 TEST_F(LLMEngineConfigTest, ParsesPackedPrefillContractAndDims)

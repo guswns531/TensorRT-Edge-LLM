@@ -104,3 +104,17 @@ TEST(StableKVPageManagerTest, RejectsInvalidLeaseAndDuplicateActiveRows)
     EXPECT_THROW(manager.release(slot), std::runtime_error);
     EXPECT_THROW(manager.ensureCapacity(slot, 1), std::runtime_error);
 }
+
+TEST(StableKVPageManagerTest, BindsPhaseLocalPageTableCapacity)
+{
+    auto manager = makeManager();
+    int32_t const slot = manager.reserve();
+    manager.ensureCapacity(slot, 128);
+    rt::KVPageTable phaseTable(2, 4, 12);
+
+    EXPECT_TRUE(manager.bindActiveRows({slot}, phaseTable, nullptr));
+    EXPECT_EQ(
+        std::vector<int32_t>(phaseTable.hostRow(0), phaseTable.hostRow(0) + 4), (std::vector<int32_t>{0, -1, -1, -1}));
+    EXPECT_EQ(
+        std::vector<int32_t>(phaseTable.hostRow(1), phaseTable.hostRow(1) + 4), (std::vector<int32_t>{-1, -1, -1, -1}));
+}

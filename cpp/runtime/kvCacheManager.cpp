@@ -52,9 +52,12 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     int64_t const minimumActivePages = computeMinimumKvPoolPages(mConfig.maxBatchSize, mConfig.maxSequenceLength);
     check::check(minimumActivePages <= kMAX_KV_POOL_PAGES,
         "KVCacheManager: minimum active pages exceed the largest int32-addressable paged-KV pool.");
-    check::check(mConfig.numPages == 0 || static_cast<int64_t>(mConfig.numPages) >= minimumActivePages,
+    check::check(mConfig.numPages == 0 || mConfig.allowUndercommit
+            || static_cast<int64_t>(mConfig.numPages) >= minimumActivePages,
         "KVCacheManager: Config::numPages (" + std::to_string(mConfig.numPages)
             + ") must be >= the minimum active pages (" + std::to_string(minimumActivePages) + ") when non-zero.");
+    check::check(!mConfig.allowUndercommit || mConfig.numPages > 0,
+        "KVCacheManager: undercommitted mode requires an explicit positive page count.");
     check::check(mConfig.numPages <= kMAX_KV_POOL_PAGES,
         "KVCacheManager: Config::numPages exceeds the largest supported paged-KV pool.");
     mNumPages = (mConfig.numPages == 0) ? static_cast<int32_t>(minimumActivePages) : mConfig.numPages;
@@ -156,7 +159,7 @@ rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx)
 {
     int64_t const minimumActivePages = computeMinimumKvPoolPages(mConfig.maxBatchSize, mConfig.maxSequenceLength);
     ELLM_CHECK(mNumPages == minimumActivePages,
-        "KVCacheManager::getCombinedKVCache: slot-shaped combined view is invalid with extra retained pages; use a "
+        "KVCacheManager::getCombinedKVCache: slot-shaped combined view requires an exact worst-case pool; use a "
         "pool-shaped or separate K/V view.");
     return mLayerCaches[attnLayerIdx];
 }

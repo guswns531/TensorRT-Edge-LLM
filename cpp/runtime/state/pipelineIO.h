@@ -124,6 +124,9 @@ struct PipelineIO
     //! Build phase-sized vanilla I/O. Decode uses maxSeqLen=1 to avoid
     //! allocating prefill-sized embedding/hidden/deepstack buffers twice.
     static PipelineIO createForLLMPhase(LLMEngineConfig const& cfg, int32_t maxSeqLen, cudaStream_t stream);
+    //! Build phase-sized vanilla I/O with an independent batch bound.
+    static PipelineIO createForLLMPhase(
+        LLMEngineConfig const& cfg, int32_t maxBatchSize, int32_t maxSeqLen, cudaStream_t stream);
 
     //! Build PipelineIO for a two-engine speculative-decoding runtime
     //! (basic I/O, hidden states, deepstack embeds, MRope cos/sin cache).

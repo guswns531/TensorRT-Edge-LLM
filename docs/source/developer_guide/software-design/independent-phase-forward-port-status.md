@@ -179,6 +179,31 @@ D1 to 6.862 ms at D16, then from 6.927 ms at D17 to 7.484 ms at D32. A
 50,000-us decode queue target is selected for the saturated fixed-output
 traces so the scheduler can form the efficient upper decode bucket.
 
+## Asymmetric P8/D64 recovery
+
+The builder and runtime now preserve separate prefill/decode profile limits.
+The validated Cosmos engine uses global batch 80, P8, D64, KV capacity 2,048,
+and 256 physical page bundles. An explicit `allow_kv_pool_undercommit`
+contract decouples worst-case profile address space from physical pool size.
+Inactive global page-table rows start empty, stable allocator leases are the
+only source of live page IDs, and the public `handleRequest()` runtime rejects
+this phase-server-only engine mode.
+
+Phase-local I/O allocates P8 prefill and D64 decode buffers rather than two B80
+maximum-shape sets. The tied engine reports 8,081/8,087 MiB ready/peak usage.
+On the 288-request fixed-output balanced trace, graph-off P8/D64 with 64
+in-flight requests gives a three-run median of 3,693.3 generated token/s,
+2,337/5,066 ms TTFT, 15.29/16.64 ms TPOT, and 3,617/6,114 ms E2E. Relative to
+the prior B32 P8/D32 gate, throughput improves 92.2% and peak memory falls
+378 MiB.
+
+Cold first-shape CUDA Graph capture regresses the single-run result by 2.7%, so
+graph-off remains selected until shapes are primed before measurement. Raising
+in-flight admission from 64 to 80 creates a recurring D64+D16 round and lowers
+throughput. An opt-in stable decode cohort is implemented and tested, but is
+not selected yet because rolling prefill admission must be coordinated with
+cohort replacement.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the

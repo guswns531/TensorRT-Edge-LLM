@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <set>
 
 namespace trt_edgellm
 {
@@ -502,6 +503,41 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
     scheduler.enqueueDecode({4, 256});
 
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+
+    auto ids = [](std::vector<PhaseWorkItem> const& batch) {
+        std::set<uint64_t> result;
+        for (PhaseWorkItem const& item : batch)
+        {
+            result.insert(item.requestId);
+        }
+        return result;
+    };
+    PhaseDispatchPlan first = scheduler.next();
+    EXPECT_EQ(ids(first.decodeBatch), (std::set<uint64_t>{1, 2, 3, 4}));
+    for (PhaseWorkItem const& item : first.decodeBatch)
+    {
+        scheduler.completeDecode(item, 129, false);
+    }
+    PhaseDispatchPlan second = scheduler.next();
+    EXPECT_EQ(ids(second.decodeBatch), (std::set<uint64_t>{1, 2, 3, 4}));
+    for (PhaseWorkItem const& item : second.decodeBatch)
+    {
+        scheduler.completeDecode(item, 130, item.requestId == 1);
+    }
+    PhaseDispatchPlan third = scheduler.next();
+    EXPECT_EQ(ids(third.decodeBatch), (std::set<uint64_t>{2, 3, 4, 5}));
 }
 
 TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchToRecoverAfterDeadline)

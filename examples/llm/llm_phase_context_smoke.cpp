@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -60,6 +61,42 @@ namespace
 
 constexpr int32_t kDEFAULT_STABLE_SLOTS = 80;
 constexpr size_t kDEFAULT_MAX_INFLIGHT_REQUESTS = 16U;
+
+void loadSchedulerCostModel(std::filesystem::path const& path, rt::PhaseQueueSchedulerConfig& config)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open phase scheduler cost model: " + path.string());
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(root.value("prefill_layout", std::string{}) == "packed",
+        "Phase scheduler cost model must use packed prefill layout");
+    config.decodeBatchCosts.clear();
+    for (nlohmann::json const& point : root.at("decode"))
+    {
+        config.decodeBatchCosts.push_back(
+            {point.at("batch_size").get<int32_t>(), point.at("max_context_length").get<int32_t>(),
+                point.at("p95_gpu_ms").get<float>(), point.value("max_total_context_tokens", int64_t{})});
+    }
+    for (nlohmann::json const& point : root.at("prefill"))
+    {
+        config.prefillBatchCosts.push_back({point.at("batch_size").get<int32_t>(),
+            point.at("chunk_length").get<int32_t>(), point.at("max_past_kv_length").get<int32_t>(),
+            point.at("max_concurrent_decode_batch_size").get<int32_t>(), point.at("initial_chunk").get<bool>(),
+            point.at("p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>()});
+    }
+    for (nlohmann::json const& point : root.at("overlap"))
+    {
+        config.overlapBatchCosts.push_back(
+            {point.at("prefill_batch_size").get<int32_t>(), point.at("decode_batch_size").get<int32_t>(),
+                point.at("chunk_length").get<int32_t>(), point.at("max_prefill_past_kv_length").get<int32_t>(),
+                point.at("max_decode_context_length").get<int32_t>(), point.at("initial_chunk").get<bool>(),
+                point.at("prefill_p95_gpu_ms").get<float>(), point.at("decode_p95_gpu_ms").get<float>(),
+                point.at("makespan_p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>()});
+    }
+    ELLM_CHECK(
+        !config.decodeBatchCosts.empty() && !config.prefillBatchCosts.empty() && !config.overlapBatchCosts.empty(),
+        "Phase scheduler cost model is incomplete");
+    config.profile = rt::PhaseSchedulerProfile::kThroughputBalanced;
+}
 
 struct PhaseTiming
 {
@@ -223,8 +260,10 @@ int main(int argc, char** argv)
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
         rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
-        auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(config, setupStream));
-        auto decodeIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(config, 1, setupStream));
+        auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(
+            config, config.maxSupportedPrefillBatchSize, config.maxSupportedInputLength, setupStream));
+        auto decodeIO = std::make_unique<rt::PipelineIO>(
+            rt::PipelineIO::createForLLMPhase(config, config.maxSupportedDecodeBatchSize, 1, setupStream));
         rt::TensorMap prefillMap;
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
@@ -240,10 +279,10 @@ int main(int argc, char** argv)
         {
             maxStableSlots = std::stoi(value);
         }
-        ELLM_CHECK(maxStableSlots >= config.maxSupportedBatchSize,
-            "Stable slot capacity must be at least the engine active batch size");
+        int32_t const maxPhaseBatch = std::max(config.maxSupportedPrefillBatchSize, config.maxSupportedDecodeBatchSize);
+        ELLM_CHECK(maxStableSlots >= maxPhaseBatch, "Stable slot capacity must cover the largest phase batch");
         rt::StableKVPageManager ownership(
-            {maxStableSlots, config.maxSupportedBatchSize, config.kvPoolPages, config.maxKVCacheCapacity, 128});
+            {maxStableSlots, maxPhaseBatch, config.kvPoolPages, config.maxKVCacheCapacity, 128});
         bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
         if (!semanticOnly)
         {
@@ -262,8 +301,8 @@ int main(int argc, char** argv)
                 ownership.setLength(prefillSlot1, 0);
             }
             ownership.setLength(decodeSlot, 128);
-            rt::PhaseKVActiveView prefillKV(config.maxSupportedBatchSize, ownership, prefillMap, "prefill");
-            rt::PhaseKVActiveView decodeKV(config.maxSupportedBatchSize, ownership, decodeMap, "decode");
+            rt::PhaseKVActiveView prefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "prefill");
+            rt::PhaseKVActiveView decodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "decode");
             std::vector<int32_t> const prefillSlots = config.packedPrefill
                 ? std::vector<int32_t>{prefillSlot0, prefillSlot1}
                 : std::vector<int32_t>{prefillSlot0};
@@ -514,27 +553,26 @@ int main(int argc, char** argv)
             ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
         }
 
-        rt::Tensor hostSemanticPrefillIds({config.maxSupportedBatchSize, config.maxPackedPrefillChunkTokens},
+        rt::Tensor hostSemanticPrefillIds({config.maxSupportedPrefillBatchSize, config.maxPackedPrefillChunkTokens},
             rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_ids");
-        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedBatchSize, config.maxPackedPrefillChunkTokens},
+        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedPrefillBatchSize, config.maxPackedPrefillChunkTokens},
             rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "semantic_phase_prefill_ids");
-        rt::Tensor hostSemanticDecodeIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
+        rt::Tensor hostSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kCPU,
             nvinfer1::DataType::kINT32, "semantic_phase_host_decode_ids");
-        rt::Tensor deviceSemanticDecodeIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+        rt::Tensor deviceSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_ids");
-        size_t const samplingWorkspaceBytes
-            = getSelectAllTopKWorkspaceSize(config.maxSupportedBatchSize, config.outputVocabSize, 1);
+        size_t const samplingWorkspaceBytes = getSelectAllTopKWorkspaceSize(maxPhaseBatch, config.outputVocabSize, 1);
         rt::Tensor prefillSamplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT8, "semantic_phase_prefill_sampling_workspace");
         rt::Tensor decodeSamplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT8, "semantic_phase_decode_sampling_workspace");
-        rt::Tensor prefillSelectedIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+        rt::Tensor prefillSelectedIds({config.maxSupportedPrefillBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
-        rt::Tensor decodeSelectedIds({config.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+        rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
-        rt::Tensor hostPrefillSelectedIds({config.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+        rt::Tensor hostPrefillSelectedIds({config.maxSupportedPrefillBatchSize}, rt::DeviceType::kCPU,
             nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_selected_ids");
-        rt::Tensor hostDecodeSelectedIds({config.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+        rt::Tensor hostDecodeSelectedIds({config.maxSupportedDecodeBatchSize}, rt::DeviceType::kCPU,
             nvinfer1::DataType::kINT32, "semantic_phase_host_decode_selected_ids");
 
         auto stageTokens = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
@@ -663,8 +701,8 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
-        semanticSchedulerConfig.maxPrefillBatchSize = std::min(8, config.maxSupportedBatchSize);
-        semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedBatchSize;
+        semanticSchedulerConfig.maxPrefillBatchSize = config.maxSupportedPrefillBatchSize;
+        semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedDecodeBatchSize;
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_PREFILL_BATCH"))
         {
             semanticSchedulerConfig.maxPrefillBatchSize = std::stoi(value);
@@ -674,18 +712,23 @@ int main(int argc, char** argv)
             semanticSchedulerConfig.maxDecodeBatchSize = std::stoi(value);
         }
         ELLM_CHECK(semanticSchedulerConfig.maxPrefillBatchSize > 0
-                && semanticSchedulerConfig.maxPrefillBatchSize <= config.maxSupportedBatchSize,
+                && semanticSchedulerConfig.maxPrefillBatchSize <= config.maxSupportedPrefillBatchSize,
             "Semantic prefill batch cap is outside the engine profile");
         ELLM_CHECK(semanticSchedulerConfig.maxDecodeBatchSize > 0
-                && semanticSchedulerConfig.maxDecodeBatchSize <= config.maxSupportedBatchSize,
+                && semanticSchedulerConfig.maxDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
             "Semantic decode batch cap is outside the engine profile");
         semanticSchedulerConfig.maxPrefillChunkTokens = 128;
         semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_OVERLAP_PREFILL_TOKENS"))
+        {
+            semanticSchedulerConfig.maxOverlapPrefillTokens = std::stoi(value);
+        }
         semanticSchedulerConfig.maxPrefillBatchTokens = semanticSchedulerConfig.maxPrefillBatchSize * 128;
         semanticSchedulerConfig.enableRaggedPrefillBatching = true;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
         semanticSchedulerConfig.prefillCompletionBonusTokens = 128;
-        semanticSchedulerConfig.enableWavefrontPrefillBatching = true;
+        semanticSchedulerConfig.enableWavefrontPrefillBatching
+            = std::getenv("TRT_EDGELLM_DISABLE_WAVEFRONT_PREFILL") == nullptr;
         semanticSchedulerConfig.maxPrefillCohortSize = semanticSchedulerConfig.maxPrefillBatchSize;
         semanticSchedulerConfig.maxPrefillCohortTurns = 8;
         semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
@@ -702,7 +745,7 @@ int main(int argc, char** argv)
             semanticSchedulerConfig.adaptivePrefillChunkCandidates.clear();
             semanticSchedulerConfig.maxPrefillBatchTokens = semanticSchedulerConfig.maxPrefillBatchSize * fixedChunk;
         }
-        semanticSchedulerConfig.enableMetricsPolicy = true;
+        semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
         semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
@@ -712,6 +755,7 @@ int main(int argc, char** argv)
         }
         semanticSchedulerConfig.enableDynamicDecodeBatching
             = std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr;
+        semanticSchedulerConfig.enableDecodeCohortBatching = std::getenv("TRT_EDGELLM_ENABLE_DECODE_COHORT") != nullptr;
         semanticSchedulerConfig.decodeBatchCosts = {
             {1, 2048, 6.238F},
             {2, 2048, 6.294F},
@@ -746,6 +790,16 @@ int main(int argc, char** argv)
             {31, 1024, 7.523F},
             {32, 1024, 7.484F},
         };
+        if (config.maxSupportedDecodeBatchSize > 32)
+        {
+            // P8/D64 undercommitted-pool profile, measured from decode-only CUDA-event samples.
+            semanticSchedulerConfig.decodeBatchCosts.insert(semanticSchedulerConfig.decodeBatchCosts.end(),
+                {{40, 2048, 7.968F}, {47, 2048, 8.049F}, {63, 2048, 8.851F}, {64, 2048, 8.884F}});
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_SCHEDULER_COST_JSON"))
+        {
+            loadSchedulerCostModel(value, semanticSchedulerConfig);
+        }
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
         rt::IndependentPhaseServerConfig serverConfig;

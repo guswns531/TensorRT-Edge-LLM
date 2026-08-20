@@ -210,6 +210,9 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         : std::nullopt;
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
+    ELLM_CHECK(!mDeployment.base.allowKVPoolUndercommit,
+        "Undercommitted KV-pool engines require allocator-backed independent phase serving; handleRequest() is not "
+        "supported.");
     if (draftingConfig.has_value() && mDeployment.specDecodeMode() == SpecDecodeMode::kMTP)
     {
         ELLM_CHECK(mDraftCheckpointDir.empty(),

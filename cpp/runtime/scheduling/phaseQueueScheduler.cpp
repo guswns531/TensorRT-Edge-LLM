@@ -271,6 +271,7 @@ bool PhaseQueueScheduler::cancel(uint64_t requestId)
         check::check(mActiveRequestIds.erase(requestId) == 1, "Cancelled request is not active");
         check::check(mQueuedSince.erase(requestId) == 1, "Cancelled request has no queue timestamp");
         mPrefillCohortIds.erase(requestId);
+        mDecodeCohortIds.erase(requestId);
     }
     return erased;
 }
@@ -826,16 +827,36 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     batch.reserve(count);
     if (!chunkPrefill)
     {
+        if (mConfig.enableDecodeCohortBatching)
+        {
+            for (PhaseWorkItem const& item : queue)
+            {
+                if (static_cast<int32_t>(mDecodeCohortIds.size()) >= mConfig.maxDecodeBatchSize)
+                {
+                    break;
+                }
+                if (isEligible(item, false))
+                {
+                    mDecodeCohortIds.insert(item.requestId);
+                }
+            }
+        }
         for (int32_t i = 0; i < count; ++i)
         {
-            auto selected = std::find_if(
-                queue.begin(), queue.end(), [this](PhaseWorkItem const& item) { return isEligible(item, false); });
+            auto selected = std::find_if(queue.begin(), queue.end(), [this](PhaseWorkItem const& item) {
+                return isEligible(item, false)
+                    && (!mConfig.enableDecodeCohortBatching
+                        || mDecodeCohortIds.find(item.requestId) != mDecodeCohortIds.end());
+            });
             check::check(selected != queue.end(), "Eligible decode work disappeared during batch selection");
             if (mConfig.enablePriorityBatching)
             {
                 for (auto it = std::next(selected); it != queue.end(); ++it)
                 {
-                    if (isEligible(*it, false) && higherPriority(*selected, *it))
+                    if (isEligible(*it, false)
+                        && (!mConfig.enableDecodeCohortBatching
+                            || mDecodeCohortIds.find(it->requestId) != mDecodeCohortIds.end())
+                        && higherPriority(*selected, *it))
                     {
                         selected = it;
                     }
@@ -1500,6 +1521,7 @@ void PhaseQueueScheduler::completeDecode(PhaseWorkItem item, int32_t resultingKV
     if (finished)
     {
         check::check(mActiveRequestIds.erase(item.requestId) == 1, "Finished decode request is not active");
+        mDecodeCohortIds.erase(item.requestId);
         return;
     }
     item.tokenCount = resultingKVLength;

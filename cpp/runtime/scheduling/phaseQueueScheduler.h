@@ -297,6 +297,8 @@ struct PhaseQueueSchedulerConfig
     //! Select a decode batch cap from measured p95 costs and current TPOT
     //! pressure. Empty costs preserve the legacy largest-available behavior.
     bool enableDynamicDecodeBatching{};
+    //! Retain one stable decode cohort and replace rows only as requests finish.
+    bool enableDecodeCohortBatching{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
     //! Switch from deadline fitting to throughput-efficient backlog recovery
     //! before the TPOT deadline is fully exhausted.
@@ -519,6 +521,7 @@ private:
     double mPredictedDecodeDebtUs{};
     std::unordered_set<uint64_t> mPrefillCohortIds;
     int32_t mPrefillCohortTurns{};
+    std::unordered_set<uint64_t> mDecodeCohortIds;
 };
 
 } // namespace rt

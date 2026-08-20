@@ -376,8 +376,11 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(configJson.contains("builder_config"), "parseEngineConfig: missing required 'builder_config' section");
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedBatchSize = getRequired<int32_t>(bc, "max_batch_size");
+    cfg.maxSupportedPrefillBatchSize = bc.value("max_prefill_batch_size", cfg.maxSupportedBatchSize);
+    cfg.maxSupportedDecodeBatchSize = bc.value("max_decode_batch_size", cfg.maxSupportedBatchSize);
     cfg.maxSupportedInputLength = getRequired<int32_t>(bc, "max_input_len");
     cfg.maxKVCacheCapacity = getRequired<int32_t>(bc, "max_kv_cache_capacity");
+    cfg.allowKVPoolUndercommit = bc.value("allow_kv_pool_undercommit", false);
     cfg.skipSoftmaxScaleOverride = configJson.value("skip_softmax_scale_override", int64_t{0});
 
     // RoPE configuration (top-level, derived from full config).
@@ -389,6 +392,12 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     requirePositive(cfg.headDim, "head_dim");
     requirePositive(cfg.hiddenSize, "hidden_size");
     requirePositive(cfg.maxSupportedBatchSize, "max_batch_size");
+    requirePositive(cfg.maxSupportedPrefillBatchSize, "max_prefill_batch_size");
+    requirePositive(cfg.maxSupportedDecodeBatchSize, "max_decode_batch_size");
+    ELLM_CHECK(cfg.maxSupportedPrefillBatchSize <= cfg.maxSupportedBatchSize,
+        "parseEngineConfig: max_prefill_batch_size cannot exceed max_batch_size");
+    ELLM_CHECK(cfg.maxSupportedDecodeBatchSize <= cfg.maxSupportedBatchSize,
+        "parseEngineConfig: max_decode_batch_size cannot exceed max_batch_size");
     requirePositive(cfg.maxSupportedInputLength, "max_input_len");
     requirePositive(cfg.maxKVCacheCapacity, "max_kv_cache_capacity");
     ELLM_CHECK(cfg.maxKVCacheCapacity <= kMAX_KV_CACHE_CAPACITY,
@@ -400,9 +409,11 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES,
         "parseEngineConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
             + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(kMAX_KV_POOL_PAGES) + ".");
-    ELLM_CHECK(serializedKvPoolPages >= minimumActivePages,
+    ELLM_CHECK(cfg.allowKVPoolUndercommit || serializedKvPoolPages >= minimumActivePages,
         "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
             + ") cannot be smaller than the minimum active pages (" + std::to_string(minimumActivePages) + ")");
+    ELLM_CHECK(!cfg.allowKVPoolUndercommit || serializedKvPoolPages > 0,
+        "parseEngineConfig: an undercommitted KV pool must contain at least one page");
     ELLM_CHECK(serializedKvPoolPages <= kMAX_KV_POOL_PAGES,
         "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
             + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(kMAX_KV_POOL_PAGES) + ")");
@@ -871,12 +882,13 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " outputVocabSize=" << cfg.outputVocabSize << " numDecoderLayers=" << cfg.numDecoderLayers
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
-       << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " kvPoolPages=" << cfg.kvPoolPages << " packedPrefill=" << cfg.packedPrefill
-       << " maxPackedPrefillChunk=" << cfg.maxPackedPrefillChunkTokens << " pleEnabled=" << cfg.pleEnabled
-       << " numPleInputs=" << cfg.numPleInputs << " pleHiddenSize=" << cfg.pleHiddenSize
-       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
-       << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " maxPrefillBatch=" << cfg.maxSupportedPrefillBatchSize
+       << " maxDecodeBatch=" << cfg.maxSupportedDecodeBatchSize << " maxInputLen=" << cfg.maxSupportedInputLength
+       << " maxKVCapacity=" << cfg.maxKVCacheCapacity << " kvPoolPages=" << cfg.kvPoolPages
+       << " packedPrefill=" << cfg.packedPrefill << " maxPackedPrefillChunk=" << cfg.maxPackedPrefillChunkTokens
+       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
+       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
+       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
@@ -988,8 +1000,10 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
 InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const
 {
     ELLM_CHECK(packedPrefill, "packedPrefillDims requires a packed-prefill engine");
+    int32_t const prefillBatchLimit
+        = maxSupportedPrefillBatchSize > 0 ? maxSupportedPrefillBatchSize : maxSupportedBatchSize;
     ELLM_CHECK(
-        logicalBatch > 0 && logicalBatch <= maxSupportedBatchSize, "packedPrefillDims logical batch is out of range");
+        logicalBatch > 0 && logicalBatch <= prefillBatchLimit, "packedPrefillDims logical batch is out of range");
     ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * maxPackedPrefillChunkTokens,
         "packedPrefillDims token carrier exceeds the configured packed-prefill limit");
     return InferenceDims{
@@ -1010,6 +1024,9 @@ InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t t
 
 InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
 {
+    int32_t const decodeBatchLimit
+        = maxSupportedDecodeBatchSize > 0 ? maxSupportedDecodeBatchSize : maxSupportedBatchSize;
+    ELLM_CHECK(batch > 0 && batch <= decodeBatchLimit, "decodeDims batch is out of range");
     return InferenceDims{
         /*.batch=*/batch,
         /*.tokenBatch=*/batch,

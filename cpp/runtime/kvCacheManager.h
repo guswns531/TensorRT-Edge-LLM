@@ -59,9 +59,10 @@ public:
         std::vector<KVLayerConfig> layerConfigs; //!< Per-layer head config (size == numAttentionLayers)
         nvinfer1::DataType kvCacheType{};        //!< Storage dtype for KV cache (kHALF or kFP8)
         //! Optional override of the pool's total page count. 0 (default) selects the minimum active pages
-        //! (`maxBatchSize * ceil(maxSequenceLength / kTOKENS_PER_PAGE)`). A non-zero value must be at least
-        //! that count; any extra pages are retained for cross-request reuse (see numPages()/getCombinedKVCache()).
+        //! (`maxBatchSize * ceil(maxSequenceLength / kTOKENS_PER_PAGE)`). Extra pages support cross-request reuse.
         int32_t numPages{0};
+        //! Permit an explicit pool below the worst-case profile occupancy for allocator-backed phase serving.
+        bool allowUndercommit{false};
     };
     //! \endcond
 

@@ -39,9 +39,9 @@ constexpr int32_t kTokensPerPage = rt::kTOKENS_PER_PAGE;
 static int32_t computeNumPages(LLMEngineConfig const& cfg)
 {
     int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
-    ELLM_CHECK(cfg.kvPoolPages >= minimumActivePages && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
-        "KV pool page count (" + std::to_string(cfg.kvPoolPages) + ") is outside [" + std::to_string(minimumActivePages)
-            + ", " + std::to_string(rt::kMAX_KV_POOL_PAGES) + "].");
+    ELLM_CHECK((cfg.allowKVPoolUndercommit || cfg.kvPoolPages >= minimumActivePages) && cfg.kvPoolPages > 0
+            && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
+        "KV pool page count is outside the engine's configured paging contract.");
     return cfg.kvPoolPages;
 }
 

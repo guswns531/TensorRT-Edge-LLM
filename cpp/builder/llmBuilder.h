@@ -44,6 +44,8 @@ struct LLMBuilderConfig
     bool specDraft{false};            //!< Whether this is a speculative-decoding draft model
     bool specBase{false};             //!< Whether this is a speculative-decoding base model
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
+    int64_t maxPrefillBatchSize{};    //!< Maximum prefill batch size (0 inherits maxBatchSize)
+    int64_t maxDecodeBatchSize{};     //!< Maximum decode batch size (0 inherits maxBatchSize)
     int64_t maxLoraRank{0};           //!< Maximum LoRA rank (0 = no LoRA support)
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
     int64_t maxVerifyTreeSize{60};    //!< Maximum length of input_ids passed into spec base model for verification
@@ -52,6 +54,9 @@ struct LLMBuilderConfig
     //! Exact physical K-page count for the engine's KV pool. Zero selects the minimum active pages.
     //! Kept after the original aggregate fields so existing positional initializers remain source-compatible.
     int64_t maxKVPoolPages{0};
+    //! Permit an explicitly sized pool below maxBatchSize * pagesPerSequence.
+    //! This mode requires a runtime allocator that leaves inactive page-table rows empty.
+    bool allowKVPoolUndercommit{false};
     int64_t maxPrefillChunkTokens{128}; //!< Maximum logical row length for packed prefill
 
     //! Resolve the exact physical K-page count serialized into the engine binding shape.
@@ -69,7 +74,7 @@ struct LLMBuilderConfig
             "LLMBuilderConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
                 + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(rt::kMAX_KV_POOL_PAGES)
                 + ".");
-        ELLM_CHECK(maxKVPoolPages == 0 || maxKVPoolPages >= minimumActivePages,
+        ELLM_CHECK(maxKVPoolPages == 0 || allowKVPoolUndercommit || maxKVPoolPages >= minimumActivePages,
             "LLMBuilderConfig: maxKVPoolPages (" + std::to_string(maxKVPoolPages)
                 + ") must be zero or at least the minimum active pages (" + std::to_string(minimumActivePages) + ").");
         ELLM_CHECK(maxKVPoolPages <= rt::kMAX_KV_POOL_PAGES,
@@ -88,9 +93,21 @@ struct LLMBuilderConfig
         json["spec_draft"] = specDraft;
         json["spec_base"] = specBase;
         json["max_batch_size"] = maxBatchSize;
+        if (maxPrefillBatchSize > 0)
+        {
+            json["max_prefill_batch_size"] = maxPrefillBatchSize;
+        }
+        if (maxDecodeBatchSize > 0)
+        {
+            json["max_decode_batch_size"] = maxDecodeBatchSize;
+        }
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
+        if (allowKVPoolUndercommit)
+        {
+            json["allow_kv_pool_undercommit"] = true;
+        }
         json["max_prefill_chunk_tokens"] = maxPrefillChunkTokens;
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
@@ -135,6 +152,14 @@ struct LLMBuilderConfig
         {
             config.maxBatchSize = json["max_batch_size"];
         }
+        if (json.contains("max_prefill_batch_size"))
+        {
+            config.maxPrefillBatchSize = json["max_prefill_batch_size"];
+        }
+        if (json.contains("max_decode_batch_size"))
+        {
+            config.maxDecodeBatchSize = json["max_decode_batch_size"];
+        }
         if (json.contains("max_lora_rank"))
         {
             config.maxLoraRank = json["max_lora_rank"];
@@ -146,6 +171,10 @@ struct LLMBuilderConfig
         if (json.contains("max_kv_pool_pages"))
         {
             config.maxKVPoolPages = json["max_kv_pool_pages"];
+        }
+        if (json.contains("allow_kv_pool_undercommit"))
+        {
+            config.allowKVPoolUndercommit = json["allow_kv_pool_undercommit"];
         }
         if (json.contains("max_prefill_chunk_tokens"))
         {
@@ -172,9 +201,12 @@ struct LLMBuilderConfig
         oss << "  specDraft: " << (specDraft ? "true" : "false") << "\n";
         oss << "  specBase: " << (specBase ? "true" : "false") << "\n";
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
+        oss << "  maxPrefillBatchSize: " << getMaxPrefillBatchSize() << "\n";
+        oss << "  maxDecodeBatchSize: " << getMaxDecodeBatchSize() << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
         oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
+        oss << "  allowKVPoolUndercommit: " << (allowKVPoolUndercommit ? "true" : "false") << "\n";
         oss << "  maxPrefillChunkTokens: " << maxPrefillChunkTokens << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
@@ -186,6 +218,16 @@ struct LLMBuilderConfig
             oss << "  maxDraftTreeSize: " << maxDraftTreeSize << "\n";
         }
         return oss.str();
+    }
+
+    int64_t getMaxPrefillBatchSize() const noexcept
+    {
+        return maxPrefillBatchSize > 0 ? maxPrefillBatchSize : maxBatchSize;
+    }
+
+    int64_t getMaxDecodeBatchSize() const noexcept
+    {
+        return maxDecodeBatchSize > 0 ? maxDecodeBatchSize : maxBatchSize;
     }
 };
 

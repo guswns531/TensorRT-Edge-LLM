@@ -158,16 +158,17 @@ bool StableKVPageManager::bindActiveRows(
 {
     ELLM_CHECK(static_cast<int32_t>(activeStableSlots.size()) <= mConfig.maxActiveRows,
         "Stable KV active batch exceeds its configured row capacity");
-    ELLM_CHECK(pageTable.kernelView().getShape()[0] == mConfig.maxActiveRows,
-        "Stable KV page table active-row capacity does not match");
+    int32_t const tableRows = static_cast<int32_t>(pageTable.kernelView().getShape()[0]);
+    ELLM_CHECK(static_cast<int32_t>(activeStableSlots.size()) <= tableRows && tableRows <= mConfig.maxActiveRows,
+        "Stable KV page table does not cover this phase's active rows");
     ELLM_CHECK(
         pageTable.maxPagesPerSeq() == mMaxPagesPerSequence, "Stable KV page table sequence capacity does not match");
     ELLM_CHECK(pageTable.numPages() == mConfig.numPages, "Stable KV page table pool size does not match");
 
     std::unordered_set<int32_t> uniqueSlots;
     std::vector<KVPageTableRowUpdate> updates;
-    updates.reserve(static_cast<size_t>(mConfig.maxActiveRows));
-    for (int32_t row = 0; row < mConfig.maxActiveRows; ++row)
+    updates.reserve(static_cast<size_t>(tableRows));
+    for (int32_t row = 0; row < tableRows; ++row)
     {
         if (row >= static_cast<int32_t>(activeStableSlots.size()))
         {

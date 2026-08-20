@@ -46,6 +46,9 @@ enum LLMBuildOptionId : int
     PROFILING_DETAILED = 713,
     MAX_KV_POOL_PAGES = 714,
     MAX_PREFILL_CHUNK_TOKENS = 715,
+    MAX_PREFILL_BATCH_SIZE = 716,
+    MAX_DECODE_BATCH_SIZE = 717,
+    ALLOW_KV_POOL_UNDERCOMMIT = 718,
 };
 
 struct LLMBuildArgs
@@ -59,20 +62,25 @@ struct LLMBuildArgs
     int64_t maxPrefillChunkTokens{128};
     bool debug{false};
     int64_t maxBatchSize{4};
+    int64_t maxPrefillBatchSize{};
+    int64_t maxDecodeBatchSize{};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
     bool specDraft{false};
     bool specBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
+    bool allowKVPoolUndercommit{false};
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
-                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
+                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--maxPrefillBatchSize <int>] "
+                 "[--maxDecodeBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  " [--maxKVPoolPages <int>]"
+                 " [--allowKVPoolUndercommit]"
                  " [--maxPrefillChunkTokens <int>]"
                  " [--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed]"
@@ -91,6 +99,10 @@ void printUsage(char const* programName)
                  "(minimum active pages)"
               << std::endl;
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
+    std::cerr << "  --maxPrefillBatchSize     Maximum prefill profile batch size. Default = maxBatchSize" << std::endl;
+    std::cerr << "  --maxDecodeBatchSize      Maximum decode profile batch size. Default = maxBatchSize" << std::endl;
+    std::cerr << "  --allowKVPoolUndercommit  Allow an explicit page pool below worst-case profile capacity"
+              << std::endl;
     std::cerr << "  --maxPrefillChunkTokens   Maximum logical packed-prefill row length. Default = 128" << std::endl;
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
@@ -119,6 +131,9 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"maxPrefillChunkTokens", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
+        {"maxPrefillBatchSize", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE},
+        {"maxDecodeBatchSize", required_argument, 0, LLMBuildOptionId::MAX_DECODE_BATCH_SIZE},
+        {"allowKVPoolUndercommit", no_argument, 0, LLMBuildOptionId::ALLOW_KV_POOL_UNDERCOMMIT},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
         {"specDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT},
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT}, // deprecated alias
@@ -192,6 +207,19 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxBatchSize = std::stoi(optarg);
             }
             break;
+        case LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxPrefillBatchSize = std::stoi(optarg);
+            }
+            break;
+        case LLMBuildOptionId::MAX_DECODE_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxDecodeBatchSize = std::stoi(optarg);
+            }
+            break;
+        case LLMBuildOptionId::ALLOW_KV_POOL_UNDERCOMMIT: args.allowKVPoolUndercommit = true; break;
         case LLMBuildOptionId::MAX_LORA_RANK:
             if (optarg)
             {
@@ -233,6 +261,24 @@ int main(int argc, char** argv)
         printUsage(argv[0]);
         return EXIT_SUCCESS;
     }
+    int64_t const maxPrefillBatchSize = args.maxPrefillBatchSize > 0 ? args.maxPrefillBatchSize : args.maxBatchSize;
+    int64_t const maxDecodeBatchSize = args.maxDecodeBatchSize > 0 ? args.maxDecodeBatchSize : args.maxBatchSize;
+    if (args.maxBatchSize <= 0 || maxPrefillBatchSize <= 0 || maxDecodeBatchSize <= 0
+        || maxPrefillBatchSize > args.maxBatchSize || maxDecodeBatchSize > args.maxBatchSize)
+    {
+        LOG_ERROR("Phase batch limits must be positive and no greater than --maxBatchSize.");
+        return EXIT_FAILURE;
+    }
+    if ((args.specBase || args.specDraft) && (args.maxPrefillBatchSize > 0 || args.maxDecodeBatchSize > 0))
+    {
+        LOG_ERROR("Asymmetric phase batch limits currently support vanilla engines only.");
+        return EXIT_FAILURE;
+    }
+    if (args.allowKVPoolUndercommit && args.maxKVPoolPages <= 0)
+    {
+        LOG_ERROR("--allowKVPoolUndercommit requires an explicit positive --maxKVPoolPages.");
+        return EXIT_FAILURE;
+    }
 
     if (args.debug)
     {
@@ -260,6 +306,9 @@ int main(int argc, char** argv)
     config.maxKVPoolPages = args.maxKVPoolPages;
     config.maxPrefillChunkTokens = args.maxPrefillChunkTokens;
     config.maxBatchSize = args.maxBatchSize;
+    config.maxPrefillBatchSize = args.maxPrefillBatchSize;
+    config.maxDecodeBatchSize = args.maxDecodeBatchSize;
+    config.allowKVPoolUndercommit = args.allowKVPoolUndercommit;
     config.maxLoraRank = args.maxLoraRank;
     config.specDraft = args.specDraft;
     config.specBase = args.specBase;
