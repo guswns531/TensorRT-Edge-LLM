@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_IMAGE=tensorrt-edge-llm:qwen38-phase
+FROM ${BASE_IMAGE}
+
+ARG MAX_JOBS=12
+
+COPY cpp/builder/llmBuilder.cpp cpp/builder/llmBuilder.cpp
+COPY cpp/runtime/config/llmEngineConfig.cpp cpp/runtime/config/llmEngineConfig.cpp
+
+RUN cmake --build build \
+        --target llm_build llm_bench llm_inference unitTest \
+        --parallel ${MAX_JOBS} && \
+    if cmake --build build --target help | grep -q llm_phase_context_smoke; then \
+        cmake --build build --target llm_phase_context_smoke --parallel ${MAX_JOBS}; \
+    fi

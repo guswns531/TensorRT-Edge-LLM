@@ -140,10 +140,9 @@ bool LLMBuilder::build()
 
     bool const asymmetricPhaseProfiles = mBuilderConfig.getMaxPrefillBatchSize() != mBuilderConfig.maxBatchSize
         || mBuilderConfig.getMaxDecodeBatchSize() != mBuilderConfig.maxBatchSize;
-    if (asymmetricPhaseProfiles
-        && (mBuilderConfig.specBase || mBuilderConfig.specDraft || mIsDiffusionBackbone || mNumLinearAttnLayers > 0))
+    if (asymmetricPhaseProfiles && (mBuilderConfig.specBase || mBuilderConfig.specDraft || mIsDiffusionBackbone))
     {
-        LOG_ERROR("Asymmetric phase profiles currently support vanilla attention engines only.");
+        LOG_ERROR("Asymmetric phase profiles currently support non-speculative autoregressive engines only.");
         return false;
     }
 

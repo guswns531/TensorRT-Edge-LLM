@@ -1217,8 +1217,9 @@ void validatePageTableBinding(LLMEngineConfig const& config, EngineExecutor cons
         for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
                  nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
         {
-            int32_t const expectedBatch
-                = selector == nvinfer1::OptProfileSelector::kMIN ? 1 : config.maxSupportedBatchSize;
+            int32_t const profileBatchLimit
+                = profileIdx == 0 ? config.maxSupportedPrefillBatchSize : config.maxSupportedDecodeBatchSize;
+            int32_t const expectedBatch = selector == nvinfer1::OptProfileSelector::kMIN ? 1 : profileBatchLimit;
             nvinfer1::Dims const shape = executor.getProfileShape(bindingName, profileIdx, selector);
             ELLM_CHECK(shape.nbDims == 3 && shape.d[0] == expectedBatch && shape.d[1] == 2
                     && shape.d[2] == maxPagesPerSequence,
