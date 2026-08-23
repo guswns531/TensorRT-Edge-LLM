@@ -275,6 +275,18 @@ bounded comma-separated shape profile. An eight-shape frequency experiment
 used 22 MiB more GPU memory and reduced short throughput from 2,406 to 2,360
 token/s, so the default D8/D16/D32/D48/D64 profile remains selected.
 
+The remaining decoder headroom can host the existing Cosmos visual engine and
+its 806 MiB external-weight arena. Decoder plus vision uses 9,305 MiB at ready.
+Repeated two-image HTTP traces now release request IDs through
+`PhaseThreeCoordinator` and pass three times with an identical token trace.
+Unbounded image bursts exhausted memory because request-owned encoded payloads
+accumulated behind the LLM. The coordinator therefore keeps at most two encoded
+GPU payloads downstream by default and leaves additional requests in the CPU
+encoder queue. A 16-image burst then completes all 256 requested tokens at
+92.3 token/s with a 9,481 MiB peak. The remaining 394 MiB is below the text-only
+512 MiB safety gate but completed without OOM; vision serving should retain
+this stricter encoded-payload backpressure.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the

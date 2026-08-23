@@ -20,6 +20,7 @@
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -35,11 +36,18 @@ enum class PhaseThreeSubmissionStatus
     kDuplicateRequest,
 };
 
+struct PhaseThreeCoordinatorConfig
+{
+    //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
+    size_t maxEncodedInFlight{2U};
+};
+
 //! Encoder -> prefill -> decode coordinator over three independent contexts.
 class PhaseThreeCoordinator
 {
 public:
-    PhaseThreeCoordinator(PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server);
+    PhaseThreeCoordinator(
+        PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server, PhaseThreeCoordinatorConfig config = {});
 
     PhaseThreeSubmissionStatus submit(uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens,
         PhaseSchedulingHints scheduling = {});
@@ -64,9 +72,11 @@ private:
 
     PhaseVisionAdapter& mVision;
     IndependentPhaseAsyncServer& mServer;
+    PhaseThreeCoordinatorConfig mConfig;
     std::deque<PendingVisionRequest> mPending;
     std::optional<PendingVisionRequest> mEncoding;
     std::unordered_set<uint64_t> mRequestIds;
+    std::unordered_set<uint64_t> mDownstreamRequestIds;
     std::unordered_set<uint64_t> mCancelRequested;
 };
 

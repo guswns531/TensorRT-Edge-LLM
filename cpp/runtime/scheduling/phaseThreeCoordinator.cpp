@@ -26,10 +26,13 @@
 namespace trt_edgellm::rt
 {
 
-PhaseThreeCoordinator::PhaseThreeCoordinator(PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server)
+PhaseThreeCoordinator::PhaseThreeCoordinator(
+    PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server, PhaseThreeCoordinatorConfig config)
     : mVision(vision)
     , mServer(server)
+    , mConfig(config)
 {
+    ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
     ELLM_CHECK(mVision.cudaContext() == mServer.cudaContext(),
         "Encoder and LLM phase server must share one CUDA primary context");
 }
@@ -42,7 +45,7 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
         return PhaseThreeSubmissionStatus::kDuplicateRequest;
     }
     PendingVisionRequest pending{requestId, std::move(request), maxOutputTokens, scheduling};
-    if (!mEncoding.has_value() && !mVision.busy())
+    if (!mEncoding.has_value() && !mVision.busy() && mDownstreamRequestIds.size() < mConfig.maxEncodedInFlight)
     {
         mEncoding = std::move(pending);
         ELLM_CHECK(mVision.submit(requestId, mEncoding->request), "Failed to submit phase encoder request");
@@ -77,6 +80,7 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
     if (cancelled)
     {
         mRequestIds.erase(requestId);
+        mDownstreamRequestIds.erase(requestId);
     }
     return cancelled;
 }
@@ -105,13 +109,14 @@ std::optional<IndependentPhaseServerCompletion> PhaseThreeCoordinator::tryPopCom
     if (completion.has_value())
     {
         mRequestIds.erase(completion->requestId);
+        mDownstreamRequestIds.erase(completion->requestId);
     }
     return completion;
 }
 
 bool PhaseThreeCoordinator::startNextEncoder()
 {
-    if (mEncoding.has_value() || mPending.empty())
+    if (mEncoding.has_value() || mPending.empty() || mDownstreamRequestIds.size() >= mConfig.maxEncodedInFlight)
     {
         return false;
     }
@@ -144,6 +149,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     ELLM_CHECK(submitted.status == IndependentPhaseServerStatus::kAdmitted
             || submitted.status == IndependentPhaseServerStatus::kQueued,
         "Encoded phase request could not enter the LLM admission queue");
+    ELLM_CHECK(mDownstreamRequestIds.insert(requestId).second, "Encoded phase request is already downstream");
     mEncoding.reset();
     return true;
 }

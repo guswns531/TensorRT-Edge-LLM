@@ -1077,7 +1077,13 @@ int main(int argc, char** argv)
                 ipcVisionRunner->allocateContextMemory();
                 ipcVisionAdapter
                     = std::make_unique<rt::PhaseVisionAdapter>(*ipcVisionRunner, tokenizer, config, ipcEncoderStream);
-                ipcThreePhase = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer);
+                rt::PhaseThreeCoordinatorConfig threePhaseConfig;
+                if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION"))
+                {
+                    threePhaseConfig.maxEncodedInFlight = static_cast<size_t>(std::stoul(value));
+                }
+                ipcThreePhase
+                    = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
             }
             std::deque<std::string> pendingLines;
             std::mutex pendingMutex;
@@ -1156,7 +1162,7 @@ int main(int argc, char** argv)
             auto popTokenEvent = [&]() -> std::optional<rt::IndependentPhaseServerToken> {
                 if (!nativeEventCallbacks)
                 {
-                    return semanticServer.tryPopToken();
+                    return ipcThreePhase != nullptr ? ipcThreePhase->tryPopToken() : semanticServer.tryPopToken();
                 }
                 if (nativeTokenEvents.empty())
                 {
@@ -1169,7 +1175,8 @@ int main(int argc, char** argv)
             auto popCompletionEvent = [&]() -> std::optional<rt::IndependentPhaseServerCompletion> {
                 if (!nativeEventCallbacks)
                 {
-                    return semanticServer.tryPopCompletion();
+                    return ipcThreePhase != nullptr ? ipcThreePhase->tryPopCompletion()
+                                                    : semanticServer.tryPopCompletion();
                 }
                 if (nativeCompletionEvents.empty())
                 {
