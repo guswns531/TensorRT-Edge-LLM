@@ -12,6 +12,7 @@ __pycache__
 build
 build_*
 dist
+data
 docs/build
 docs/source/_build
 htmlcov
