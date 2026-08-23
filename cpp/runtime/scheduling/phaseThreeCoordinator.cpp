@@ -20,11 +20,41 @@
 #include "common/checkMacros.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <memory>
 #include <utility>
 
 namespace trt_edgellm::rt
 {
+
+PhaseSchedulingHints phaseVisionSchedulingHints(
+    PhaseSchedulingHints scheduling, double defaultTtftTargetUs, std::chrono::steady_clock::time_point now)
+{
+    if (scheduling.submittedAt == std::chrono::steady_clock::time_point{})
+    {
+        scheduling.submittedAt = now;
+    }
+    if (scheduling.ttftTargetUs == 0.0)
+    {
+        scheduling.ttftTargetUs = defaultTtftTargetUs;
+    }
+    return scheduling;
+}
+
+bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDownstreamRequests,
+    size_t downstreamBytes, size_t maxDownstreamBytes, size_t estimatedPayloadBytes) noexcept
+{
+    if (downstreamRequests >= maxDownstreamRequests)
+    {
+        return false;
+    }
+    if (maxDownstreamBytes == 0 || downstreamRequests == 0 || estimatedPayloadBytes == 0)
+    {
+        return true;
+    }
+    return downstreamBytes <= maxDownstreamBytes && estimatedPayloadBytes <= maxDownstreamBytes - downstreamBytes;
+}
 
 PhaseThreeCoordinator::PhaseThreeCoordinator(
     PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server, PhaseThreeCoordinatorConfig config)
@@ -33,6 +63,8 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mConfig(config)
 {
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
+    ELLM_CHECK(std::isfinite(mConfig.visionTtftTargetUs) && mConfig.visionTtftTargetUs >= 0.0,
+        "Three-phase vision TTFT target must be finite and non-negative");
     ELLM_CHECK(mVision.cudaContext() == mServer.cudaContext(),
         "Encoder and LLM phase server must share one CUDA primary context");
 }
@@ -44,11 +76,17 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     {
         return PhaseThreeSubmissionStatus::kDuplicateRequest;
     }
+    scheduling = phaseVisionSchedulingHints(scheduling, mConfig.visionTtftTargetUs);
     PendingVisionRequest pending{requestId, std::move(request), maxOutputTokens, scheduling};
-    if (!mEncoding.has_value() && !mVision.busy() && mDownstreamRequestIds.size() < mConfig.maxEncodedInFlight)
+    if (!mEncoding.has_value() && !mVision.busy() && encoderCapacityAvailable())
     {
         mEncoding = std::move(pending);
+        mLastEncoderQueueWaitUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - mEncoding->scheduling.submittedAt)
+                                      .count();
+        mMaxEncoderQueueWaitUs = std::max(mMaxEncoderQueueWaitUs, mLastEncoderQueueWaitUs);
         ELLM_CHECK(mVision.submit(requestId, mEncoding->request), "Failed to submit phase encoder request");
+        ++mEncoderStarts;
         return PhaseThreeSubmissionStatus::kEncoding;
     }
     mPending.push_back(std::move(pending));
@@ -80,7 +118,12 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
     if (cancelled)
     {
         mRequestIds.erase(requestId);
-        mDownstreamRequestIds.erase(requestId);
+        auto const downstream = mDownstreamRequestBytes.find(requestId);
+        if (downstream != mDownstreamRequestBytes.end())
+        {
+            mDownstreamEncodedBytes -= downstream->second;
+            mDownstreamRequestBytes.erase(downstream);
+        }
     }
     return cancelled;
 }
@@ -98,6 +141,27 @@ bool PhaseThreeCoordinator::empty() const noexcept
     return mPending.empty() && !mEncoding.has_value() && mServer.empty();
 }
 
+PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
+{
+    PhaseThreeCoordinatorMetrics result;
+    result.pendingVisionRequests = mPending.size();
+    result.downstreamEncodedRequests = mDownstreamRequestBytes.size();
+    result.downstreamEncodedBytes = mDownstreamEncodedBytes;
+    result.encoderStarts = mEncoderStarts;
+    result.encoderCompletions = mEncoderCompletions;
+    result.lastEncoderQueueWaitUs = mLastEncoderQueueWaitUs;
+    result.maxEncoderQueueWaitUs = mMaxEncoderQueueWaitUs;
+    result.lastEncoderGpuMs = mLastEncoderGpuMs;
+    result.maxEncoderGpuMs = mMaxEncoderGpuMs;
+    if (!mPending.empty())
+    {
+        result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - mPending.front().scheduling.submittedAt)
+                                        .count();
+    }
+    return result;
+}
+
 std::optional<IndependentPhaseServerToken> PhaseThreeCoordinator::tryPopToken()
 {
     return mServer.tryPopToken();
@@ -109,20 +173,30 @@ std::optional<IndependentPhaseServerCompletion> PhaseThreeCoordinator::tryPopCom
     if (completion.has_value())
     {
         mRequestIds.erase(completion->requestId);
-        mDownstreamRequestIds.erase(completion->requestId);
+        auto const downstream = mDownstreamRequestBytes.find(completion->requestId);
+        if (downstream != mDownstreamRequestBytes.end())
+        {
+            mDownstreamEncodedBytes -= downstream->second;
+            mDownstreamRequestBytes.erase(downstream);
+        }
     }
     return completion;
 }
 
 bool PhaseThreeCoordinator::startNextEncoder()
 {
-    if (mEncoding.has_value() || mPending.empty() || mDownstreamRequestIds.size() >= mConfig.maxEncodedInFlight)
+    if (mEncoding.has_value() || mPending.empty() || !encoderCapacityAvailable())
     {
         return false;
     }
     mEncoding = std::move(mPending.front());
     mPending.pop_front();
+    mLastEncoderQueueWaitUs = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - mEncoding->scheduling.submittedAt)
+                                  .count();
+    mMaxEncoderQueueWaitUs = std::max(mMaxEncoderQueueWaitUs, mLastEncoderQueueWaitUs);
     ELLM_CHECK(mVision.submit(mEncoding->requestId, mEncoding->request), "Failed to start queued encoder request");
+    ++mEncoderStarts;
     return true;
 }
 
@@ -134,6 +208,9 @@ bool PhaseThreeCoordinator::completeEncoder()
     }
     uint64_t const requestId = mEncoding->requestId;
     std::unique_ptr<PhaseVisionPayload> encoded = mVision.take(requestId);
+    ++mEncoderCompletions;
+    mLastEncoderGpuMs = encoded->encoderGpuMs;
+    mMaxEncoderGpuMs = std::max(mMaxEncoderGpuMs, mLastEncoderGpuMs);
     if (mCancelRequested.erase(requestId) > 0)
     {
         mRequestIds.erase(requestId);
@@ -143,15 +220,25 @@ bool PhaseThreeCoordinator::completeEncoder()
     ELLM_CHECK(encoded->tokenIds.size() == 1U && !encoded->tokenIds.front().empty(),
         "Phase encoder must produce one non-empty token row per logical request");
     auto sharedPayload = std::shared_ptr<PhaseVisionPayload>(std::move(encoded));
+    size_t const encodedBytes = sharedPayload->byteSize();
     std::vector<int32_t> promptTokens = sharedPayload->tokenIds.front();
     IndependentPhaseServerSubmission const submitted = mServer.submitOrQueueWithVision(requestId,
         std::move(promptTokens), std::move(sharedPayload), mEncoding->maxOutputTokens, mEncoding->scheduling);
     ELLM_CHECK(submitted.status == IndependentPhaseServerStatus::kAdmitted
             || submitted.status == IndependentPhaseServerStatus::kQueued,
         "Encoded phase request could not enter the LLM admission queue");
-    ELLM_CHECK(mDownstreamRequestIds.insert(requestId).second, "Encoded phase request is already downstream");
+    ELLM_CHECK(
+        mDownstreamRequestBytes.emplace(requestId, encodedBytes).second, "Encoded phase request is already downstream");
+    mDownstreamEncodedBytes += encodedBytes;
+    mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
     mEncoding.reset();
     return true;
+}
+
+bool PhaseThreeCoordinator::encoderCapacityAvailable() const noexcept
+{
+    return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), mConfig.maxEncodedInFlight,
+        mDownstreamEncodedBytes, mConfig.maxEncodedBytes, mEstimatedEncodedBytes);
 }
 
 } // namespace trt_edgellm::rt

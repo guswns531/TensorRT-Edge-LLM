@@ -22,6 +22,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -35,10 +36,14 @@ struct PhaseVisionPayload
 {
     ~PhaseVisionPayload() noexcept;
 
+    size_t byteSize() const noexcept;
+
     std::vector<std::vector<int32_t>> tokenIds;
     Tensor outputEmbedding;
     std::vector<Tensor> deepstackFeatures;
     Tensor mropeCosSin;
+    float encoderGpuMs{};
+    cudaEvent_t startEvent{};
     cudaEvent_t readyEvent{};
 };
 

@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/imageUtils.h"
@@ -620,9 +621,11 @@ int main(int argc, char** argv)
             ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
         }
 
-        rt::Tensor hostSemanticPrefillIds({config.maxSupportedPrefillBatchSize, config.maxPackedPrefillChunkTokens},
+        int32_t const prefillTokenCapacity
+            = config.packedPrefill ? config.maxPackedPrefillChunkTokens : config.maxSupportedInputLength;
+        rt::Tensor hostSemanticPrefillIds({config.maxSupportedPrefillBatchSize, prefillTokenCapacity},
             rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_ids");
-        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedPrefillBatchSize, config.maxPackedPrefillChunkTokens},
+        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedPrefillBatchSize, prefillTokenCapacity},
             rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "semantic_phase_prefill_ids");
         rt::Tensor hostSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kCPU,
             nvinfer1::DataType::kINT32, "semantic_phase_host_decode_ids");
@@ -638,6 +641,17 @@ int main(int argc, char** argv)
         rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
         SamplingSlotPool samplingSlotPool(maxPhaseBatch);
+        rt::Tensor textOnlyMropeTemplate;
+        std::vector<std::optional<uint64_t>> prefillMropeOwners(
+            static_cast<size_t>(config.maxSupportedPrefillBatchSize));
+        std::vector<std::optional<uint64_t>> decodeMropeOwners(static_cast<size_t>(config.maxSupportedDecodeBatchSize));
+        if (config.ropeConfig.type == rt::RopeType::kMRope)
+        {
+            textOnlyMropeTemplate = rt::Tensor({1, config.maxKVCacheCapacity, config.rotaryDim}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kFLOAT, "semantic_phase_text_mrope_template");
+            kernel::initializeTextOnlyMRopeCosSin(textOnlyMropeTemplate.dataPointer<float>(),
+                config.ropeConfig.rotaryTheta, config.rotaryDim, config.maxKVCacheCapacity, 1, setupStream);
+        }
 
         auto stageTokens = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
                                rt::TensorMap& map, cudaStream_t stream, bool prefill) {
@@ -676,18 +690,39 @@ int main(int argc, char** argv)
                         deepstackFeatures.push_back(std::cref(deepstackFeatureViews.back()));
                     }
                 }
-                if (!payload.mropeCosSin.isEmpty())
+            }
+            if (config.ropeConfig.type == rt::RopeType::kMRope)
+            {
+                std::vector<std::optional<uint64_t>>& owners = prefill ? prefillMropeOwners : decodeMropeOwners;
+                size_t const rowBytes = static_cast<size_t>(config.maxKVCacheCapacity) * config.rotaryDim
+                    * rt::utils::getTypeSize(nvinfer1::DataType::kFLOAT);
+                for (size_t row{}; row < views.size(); ++row)
                 {
-                    map.set(binding_names::kRopeCosSin, payload.mropeCosSin);
+                    rt::PhaseVisionPayload* const payload = views[row].visionPayload;
+                    std::optional<uint64_t> const desiredOwner = payload != nullptr && !payload->mropeCosSin.isEmpty()
+                        ? std::optional<uint64_t>{views[row].work.requestId}
+                        : std::nullopt;
+                    if (owners[row] == desiredOwner)
+                    {
+                        continue;
+                    }
+                    rt::Tensor const& source = desiredOwner.has_value() ? payload->mropeCosSin : textOnlyMropeTemplate;
+                    auto* const destination = static_cast<std::byte*>(io.mropeCosSin.rawPointer()) + row * rowBytes;
+                    CUDA_CHECK(
+                        cudaMemcpyAsync(destination, source.rawPointer(), rowBytes, cudaMemcpyDeviceToDevice, stream));
+                    owners[row] = desiredOwner;
                 }
+                map.set(binding_names::kRopeCosSin, io.mropeCosSin);
             }
             int32_t totalTokens{};
             for (rt::IndependentPhaseRequestView const& view : views)
             {
                 totalTokens += prefill ? view.work.tokenCount : 1;
             }
-            rt::Coords const tokenShape
-                = prefill ? rt::Coords{1, totalTokens} : rt::Coords{static_cast<int64_t>(views.size()), 1};
+            rt::Coords const tokenShape = prefill
+                ? (config.packedPrefill ? rt::Coords{1, totalTokens}
+                                        : rt::Coords{static_cast<int64_t>(views.size()), views.front().work.tokenCount})
+                : rt::Coords{static_cast<int64_t>(views.size()), 1};
             rt::Tensor& hostIds = prefill ? hostSemanticPrefillIds : hostSemanticDecodeIds;
             rt::Tensor& deviceIds = prefill ? deviceSemanticPrefillIds : deviceSemanticDecodeIds;
             ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
@@ -786,8 +821,8 @@ int main(int argc, char** argv)
             semanticSchedulerConfig.maxOverlapPrefillTokens = std::stoi(value);
         }
         semanticSchedulerConfig.maxPrefillBatchTokens = semanticSchedulerConfig.maxPrefillBatchSize * 128;
-        semanticSchedulerConfig.enableRaggedPrefillBatching = true;
-        semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
+        semanticSchedulerConfig.enableRaggedPrefillBatching = config.packedPrefill;
+        semanticSchedulerConfig.enablePackedPrefillTokenLayout = config.packedPrefill;
         semanticSchedulerConfig.prefillCompletionBonusTokens = 128;
         semanticSchedulerConfig.enableWavefrontPrefillBatching
             = std::getenv("TRT_EDGELLM_DISABLE_WAVEFRONT_PREFILL") == nullptr;
@@ -1071,6 +1106,8 @@ int main(int argc, char** argv)
             std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
             if (visionEngineDir != nullptr)
             {
+                ELLM_CHECK(!config.packedPrefill,
+                    "Three-phase vision requires a dense prefill profile; packed-prefill v1 is text-only");
                 CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
                 ipcVisionRunner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
@@ -1081,6 +1118,14 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION"))
                 {
                     threePhaseConfig.maxEncodedInFlight = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION_BYTES"))
+                {
+                    threePhaseConfig.maxEncodedBytes = static_cast<size_t>(std::stoull(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_TTFT_TARGET_MS"))
+                {
+                    threePhaseConfig.visionTtftTargetUs = std::stod(value) * 1000.0;
                 }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
@@ -1299,6 +1344,16 @@ int main(int argc, char** argv)
                     {
                         maxOutputTokens = requestPayload.at("max_generate_length").get<int32_t>();
                     }
+                    rt::PhaseSchedulingHints scheduling;
+                    if (requestPayload.contains("metadata") && requestPayload.at("metadata").is_object())
+                    {
+                        nlohmann::json const& metadata = requestPayload.at("metadata");
+                        nlohmann::json const& phaseScheduling
+                            = metadata.contains("phase_scheduling") ? metadata.at("phase_scheduling") : metadata;
+                        scheduling.priority = phaseScheduling.value("priority", 0);
+                        scheduling.ttftTargetUs = phaseScheduling.value("ttft_target_ms", 0.0) * 1000.0;
+                        scheduling.tpotTargetUs = phaseScheduling.value("tpot_target_ms", 0.0) * 1000.0;
+                    }
                     bool accepted{};
                     if (!request.imageBuffers.empty())
                     {
@@ -1320,7 +1375,7 @@ int main(int argc, char** argv)
                             generation.addGenerationPrompt = true;
                             generation.disableSpecDecode = true;
                             rt::PhaseThreeSubmissionStatus const submission
-                                = ipcThreePhase->submit(requestId, std::move(generation), maxOutputTokens);
+                                = ipcThreePhase->submit(requestId, std::move(generation), maxOutputTokens, scheduling);
                             accepted = submission == rt::PhaseThreeSubmissionStatus::kEncoding
                                 || submission == rt::PhaseThreeSubmissionStatus::kQueued;
                         }
@@ -1332,7 +1387,8 @@ int main(int argc, char** argv)
                             "Failed to format IPC phase request");
                         std::vector<int32_t> const tokenIds
                             = tokenizer.encode(formatted.formattedCompleteRequest, false);
-                        auto const submission = semanticServer.submitOrQueue(requestId, tokenIds, maxOutputTokens);
+                        auto const submission
+                            = semanticServer.submitOrQueue(requestId, tokenIds, maxOutputTokens, scheduling);
                         accepted = submission.status == rt::IndependentPhaseServerStatus::kAdmitted
                             || submission.status == rt::IndependentPhaseServerStatus::kQueued;
                     }
@@ -1364,6 +1420,8 @@ int main(int argc, char** argv)
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
                     auto const prefillGraphs = semanticCoordinator.prefillGraphCacheStats();
                     auto const decodeGraphs = semanticCoordinator.decodeGraphCacheStats();
+                    rt::PhaseThreeCoordinatorMetrics const visionMetrics
+                        = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
                         {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
@@ -1386,7 +1444,17 @@ int main(int argc, char** argv)
                         {"prefill_graph_hits", prefillGraphs.hits}, {"prefill_graph_misses", prefillGraphs.misses},
                         {"decode_graph_hits", decodeGraphs.hits}, {"decode_graph_misses", decodeGraphs.misses},
                         {"sampling_event_slots", samplingSlotPool.size()},
-                        {"sampling_event_reuses", samplingSlotPool.reuseCount()}};
+                        {"sampling_event_reuses", samplingSlotPool.reuseCount()},
+                        {"vision_pending", visionMetrics.pendingVisionRequests},
+                        {"vision_downstream", visionMetrics.downstreamEncodedRequests},
+                        {"vision_downstream_bytes", visionMetrics.downstreamEncodedBytes},
+                        {"vision_encoder_starts", visionMetrics.encoderStarts},
+                        {"vision_encoder_completions", visionMetrics.encoderCompletions},
+                        {"vision_oldest_pending_ms", visionMetrics.oldestPendingAgeUs / 1000.0},
+                        {"vision_encoder_queue_wait_ms", visionMetrics.lastEncoderQueueWaitUs / 1000.0},
+                        {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
+                        {"vision_encoder_gpu_ms", visionMetrics.lastEncoderGpuMs},
+                        {"vision_encoder_gpu_max_ms", visionMetrics.maxEncoderGpuMs}};
                     serializedRecords.push_back("PHASE_METRIC\t" + metricEvent.dump());
                 }
                 while (auto token = popTokenEvent())
@@ -1450,6 +1518,17 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
                 emitPhaseMetrics ? "yes" : "no");
             LOG_INFO("Phase IPC response path: %s", nativeEventCallbacks ? "native_callback" : "polling_queue");
+            if (ipcThreePhase != nullptr)
+            {
+                rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
+                LOG_INFO(
+                    "Phase vision cost: starts=%zu completions=%zu pending=%zu downstream=%zu bytes=%zu "
+                    "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms",
+                    visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.pendingVisionRequests,
+                    visionMetrics.downstreamEncodedRequests, visionMetrics.downstreamEncodedBytes,
+                    visionMetrics.lastEncoderQueueWaitUs / 1000.0, visionMetrics.maxEncoderQueueWaitUs / 1000.0,
+                    visionMetrics.lastEncoderGpuMs, visionMetrics.maxEncoderGpuMs);
+            }
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;

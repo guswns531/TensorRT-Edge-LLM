@@ -16,6 +16,7 @@
  */
 
 #include "runtime/scheduling/phaseQueueScheduler.h"
+#include "runtime/scheduling/phaseThreeCoordinator.h"
 
 #include <gtest/gtest.h>
 
@@ -1616,6 +1617,31 @@ TEST(PhaseQueueSchedulerTest, TpotHardGuardBoundsConsecutiveOverlapTurns)
     EXPECT_EQ(second.kind, PhaseDispatchKind::kDecode);
     EXPECT_TRUE(second.prefillBatch.empty());
     EXPECT_TRUE(second.prefillDeferredForTpot);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, PreservesArrivalAndAppliesVisionTtftDefault)
+{
+    auto const arrival = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
+    PhaseSchedulingHints scheduling;
+    scheduling = phaseVisionSchedulingHints(scheduling, 2500000.0, arrival);
+    EXPECT_EQ(scheduling.submittedAt, arrival);
+    EXPECT_DOUBLE_EQ(scheduling.ttftTargetUs, 2500000.0);
+
+    auto const originalArrival = arrival - std::chrono::milliseconds(10);
+    scheduling.submittedAt = originalArrival;
+    scheduling.ttftTargetUs = 500000.0;
+    scheduling = phaseVisionSchedulingHints(scheduling, 2500000.0, arrival);
+    EXPECT_EQ(scheduling.submittedAt, originalArrival);
+    EXPECT_DOUBLE_EQ(scheduling.ttftTargetUs, 500000.0);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadBytes)
+{
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 2, 0, 100, 0));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(1, 2, 40, 100, 50));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(2, 2, 80, 100, 20));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(1, 2, 60, 100, 50));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(1, 2, 60, 0, 500));
 }
 
 } // namespace

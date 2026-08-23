@@ -116,7 +116,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens,
     PhaseSchedulingHints scheduling)
 {
-    bool const allowChunkedPrefill = true;
+    bool const allowChunkedPrefill = visionPayload == nullptr || mConfig.allowChunkedVisionPrefill;
     bool const exclusivePrefill = visionPayload != nullptr;
     IndependentPhaseServerSubmission result{requestId};
     if (mRequests.find(requestId) != mRequests.end() || mPendingRequestIds.find(requestId) != mPendingRequestIds.end()

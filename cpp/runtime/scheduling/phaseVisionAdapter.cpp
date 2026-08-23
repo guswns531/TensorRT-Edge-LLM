@@ -27,10 +27,29 @@ namespace trt_edgellm::rt
 
 PhaseVisionPayload::~PhaseVisionPayload() noexcept
 {
+    if (startEvent != nullptr)
+    {
+        static_cast<void>(cudaEventDestroy(startEvent));
+    }
     if (readyEvent != nullptr)
     {
         static_cast<void>(cudaEventDestroy(readyEvent));
     }
+}
+
+size_t PhaseVisionPayload::byteSize() const noexcept
+{
+    auto tensorBytes = [](Tensor const& tensor) {
+        return tensor.isEmpty()
+            ? size_t{}
+            : static_cast<size_t>(tensor.getShape().volume()) * utils::getTypeSize(tensor.getDataType());
+    };
+    size_t result = tensorBytes(outputEmbedding) + tensorBytes(mropeCosSin);
+    for (Tensor const& feature : deepstackFeatures)
+    {
+        result += tensorBytes(feature);
+    }
+    return result;
 }
 
 PhaseVisionAdapter::PhaseVisionAdapter(
@@ -66,6 +85,9 @@ bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& 
             "Failed to format phase vision request");
     }
     auto payload = std::make_unique<PhaseVisionPayload>();
+    CUDA_CHECK(cudaEventCreate(&payload->startEvent));
+    CUDA_CHECK(cudaEventCreate(&payload->readyEvent));
+    CUDA_CHECK(cudaEventRecord(payload->startEvent, mStream));
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         payload->mropeCosSin = Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
@@ -81,7 +103,6 @@ bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& 
     {
         payload->deepstackFeatures.push_back(copyTensor(feature, "phase_vision_deepstack", mStream));
     }
-    CUDA_CHECK(cudaEventCreateWithFlags(&payload->readyEvent, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(payload->readyEvent, mStream));
     return mRequests.emplace(requestId, std::move(payload)).second;
 }
@@ -104,6 +125,7 @@ std::unique_ptr<PhaseVisionPayload> PhaseVisionAdapter::take(uint64_t requestId)
     auto it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Unknown phase vision request");
     ELLM_CHECK(ready(requestId), "Phase vision request is not complete");
+    CUDA_CHECK(cudaEventElapsedTime(&it->second->encoderGpuMs, it->second->startEvent, it->second->readyEvent));
     std::unique_ptr<PhaseVisionPayload> result = std::move(it->second);
     mRequests.erase(it);
     return result;

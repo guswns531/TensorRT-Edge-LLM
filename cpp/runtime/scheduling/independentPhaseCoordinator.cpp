@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -43,7 +44,7 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
     , mScheduler(std::move(schedulerConfig))
 {
-    ELLM_CHECK(config.packedPrefill, "Independent phase coordinator currently requires a packed-prefill engine");
+    ELLM_CHECK(config.kvPoolPages > 0, "Independent phase coordinator requires a paged-KV engine");
     ELLM_CHECK(mPrefillStream != nullptr && mDecodeStream != nullptr && mPrefillStream != mDecodeStream,
         "Independent phase coordinator requires distinct explicit CUDA streams");
     ELLM_CHECK(static_cast<bool>(mCallbacks.isDecodeFinished),
@@ -118,8 +119,17 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         mOwnership.ensureCapacity(item.kvSlotId, mOwnership.length(item.kvSlotId) + item.tokenCount);
     }
     mPrefillKV.prepare(slots, stream);
-    ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape({1, totalTokens, mConfig.hiddenSize}),
-        "Independent packed prefill embedding reshape failed");
+    int32_t const chunkLength = chunks.front();
+    if (!mConfig.packedPrefill)
+    {
+        ELLM_CHECK(
+            std::all_of(chunks.begin(), chunks.end(), [chunkLength](int32_t value) { return value == chunkLength; }),
+            "Independent dense prefill batch requires one uniform chunk length");
+    }
+    Coords const inputShape = mConfig.packedPrefill
+        ? Coords{1, totalTokens, mConfig.hiddenSize}
+        : Coords{static_cast<int64_t>(batch.size()), chunkLength, mConfig.hiddenSize};
+    ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape(inputShape), "Independent prefill embedding reshape failed");
     if (mCallbacks.stagePrefill)
     {
         mCallbacks.stagePrefill(batch, mPrefillIO, stream);
@@ -129,11 +139,16 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         CUDA_CHECK(cudaMemsetAsync(
             mPrefillIO.inputsEmbeds.rawPointer(), 0, mPrefillIO.inputsEmbeds.getMemoryCapacity(), stream));
     }
-    mPrefillKV.preparePrefillMetadata(mPrefillIO, chunks, stream, true);
-    ELLM_CHECK(mExecutors.prefillExecutor().prepare(mExecutors.config().prefillProfile,
-                   mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens), mPrefillMap, stream),
-        "Independent packed prefill prepare failed");
-    std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(totalTokens);
+    mPrefillKV.preparePrefillMetadata(mPrefillIO, chunks, stream, mConfig.packedPrefill);
+    bool const initialPrefill
+        = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
+    InferenceDims const dims = mConfig.packedPrefill
+        ? mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
+        : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);
+    ELLM_CHECK(mExecutors.prefillExecutor().prepare(mExecutors.config().prefillProfile, dims, mPrefillMap, stream),
+        "Independent prefill prepare failed");
+    int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;
+    std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(graphTokens);
     if (mGraphCaptureEnabled && mCapturedPrefillShapes.find(graphShape) == mCapturedPrefillShapes.end()
         && mCapturedPrefillShapes.size() < mMaxPrefillGraphs)
     {

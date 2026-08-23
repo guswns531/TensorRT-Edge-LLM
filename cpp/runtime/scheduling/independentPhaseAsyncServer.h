@@ -119,6 +119,8 @@ struct IndependentPhaseServerConfig
     bool enableAdaptiveAdmission{};
     size_t latencyInFlightRequests{};
     size_t adaptiveBacklogEnterRequests{1U};
+    //! Multimodal prefill remains atomic unless an engine contract explicitly proves chunk correctness.
+    bool allowChunkedVisionPrefill{};
 };
 
 struct IndependentPhaseServerSubmission
