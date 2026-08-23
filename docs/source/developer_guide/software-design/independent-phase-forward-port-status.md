@@ -259,6 +259,22 @@ better. A P16/D64 experiment selected a slower TensorRT tactic and reduced
 balanced throughput to 4,278 token/s, so it was rejected and its engine was
 removed.
 
+The next serving pass batches native token/completion records after the next
+GPU dispatch has been enqueued, retains a D64 cohort while the other 16 stable
+slots stage P8 prefills, and refines static decode costs from confident
+decode-only observations. Online correction is active only in adaptive
+throughput mode, uses a 32-sample window in 512-token context buckets, requires
+eight samples, and is bounded to +/-25% of the static prior. Short throughput
+improves from 2,362.2 to 2,410.4 token/s and median TPOT from 11.91 to 11.26 ms.
+Balanced/decode-heavy throughput remains within 1% of the previous selected
+median, while representative TTFT/TPOT smokes improve.
+
+`EngineExecutor` now reports CUDA Graph hits, misses, captures, failures, and
+frequency/LRU evictions. `TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES` accepts a
+bounded comma-separated shape profile. An eight-shape frequency experiment
+used 22 MiB more GPU memory and reduced short throughput from 2,406 to 2,360
+token/s, so the default D8/D16/D32/D48/D64 profile remains selected.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the

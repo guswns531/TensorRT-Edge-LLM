@@ -23,6 +23,7 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "runtime/exec/registryBuilder.h"
+#include <algorithm>
 #include <stdexcept>
 #include <string_view>
 
@@ -261,6 +262,7 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
 
 bool EngineExecutor::execute(cudaStream_t stream)
 {
+    ++mGraphCacheStats.executeCalls;
     size_t const hash = computeBindingHash();
     auto it = mGraphs.find(hash);
     if (it != mGraphs.end())
@@ -271,12 +273,17 @@ bool EngineExecutor::execute(cudaStream_t stream)
             cudaError_t const err = cudaGraphLaunch(it->second.exec, stream);
             if (err == cudaSuccess)
             {
+                ++mGraphCacheStats.hits;
+                ++it->second.hits;
+                it->second.lastUsed = ++mGraphUseSequence;
                 return true;
             }
+            ++mGraphCacheStats.launchFailures;
             LOG_WARNING("cudaGraphLaunch failed (%s), falling back to enqueueV3", cudaGetErrorString(err));
         }
     }
 
+    ++mGraphCacheStats.misses;
     return mContext->enqueueV3(stream);
 }
 
@@ -318,10 +325,43 @@ bool EngineExecutor::captureGraph(cudaStream_t stream)
     cg.graph = result->first;
     cg.exec = result->second;
     cg.snapshot = snap;
+    cg.lastUsed = ++mGraphUseSequence;
     mGraphs[hash] = cg;
+    ++mGraphCacheStats.captures;
 
     LOG_INFO("captured graph (hash=0x%zx)", hash);
     return true;
+}
+
+EngineExecutor::GraphCacheStats EngineExecutor::graphCacheStats() const noexcept
+{
+    GraphCacheStats result = mGraphCacheStats;
+    result.entries = mGraphs.size();
+    return result;
+}
+
+size_t EngineExecutor::trimGraphCache(size_t maxEntries) noexcept
+{
+    size_t evicted{};
+    while (mGraphs.size() > maxEntries)
+    {
+        auto selected = std::min_element(mGraphs.begin(), mGraphs.end(), [](auto const& lhs, auto const& rhs) {
+            return lhs.second.hits < rhs.second.hits
+                || (lhs.second.hits == rhs.second.hits && lhs.second.lastUsed < rhs.second.lastUsed);
+        });
+        if (selected->second.exec != nullptr)
+        {
+            static_cast<void>(cudaGraphExecDestroy(selected->second.exec));
+        }
+        if (selected->second.graph != nullptr)
+        {
+            static_cast<void>(cudaGraphDestroy(selected->second.graph));
+        }
+        mGraphs.erase(selected);
+        ++evicted;
+    }
+    mGraphCacheStats.evictions += evicted;
+    return evicted;
 }
 
 int64_t EngineExecutor::getRequiredContextMemorySize() const

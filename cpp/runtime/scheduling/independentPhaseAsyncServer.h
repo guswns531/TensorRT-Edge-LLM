@@ -45,7 +45,8 @@ bool shouldDeferDecodeForSamplingRefill(
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept;
 //! Representative decode buckets to prime before opening a persistent serving endpoint.
-std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize);
+std::vector<int32_t> phaseServingWarmupBatchSizes(
+    int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes = {});
 
 //! Request view passed to a model-specific text or multimodal adapter.
 struct IndependentPhaseRequestView
@@ -175,6 +176,10 @@ public:
     bool cancel(uint64_t requestId);
     //! Capture the currently prepared phase shapes for later execute() replay.
     bool capturePreparedGraphs();
+    //! Deliver ready events directly after the next GPU dispatch is enqueued.
+    //! Empty callbacks preserve the polling queues.
+    void setEventCallbacks(std::function<void(IndependentPhaseServerToken&&)> tokenCallback,
+        std::function<void(IndependentPhaseServerCompletion&&)> completionCallback);
     bool poll();
     void runUntilIdle(size_t maxPolls);
 
@@ -223,6 +228,7 @@ private:
     size_t admissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
+    bool flushEventCallbacks();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
     void destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept;
@@ -240,6 +246,8 @@ private:
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
+    std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
+    std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
     size_t mDecodeRefillWaitCount{};
     bool mThroughputMode{};
     size_t mThroughputModeTransitionCount{};

@@ -46,14 +46,23 @@ bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingReques
     return pendingRequests > 0 || activeRequests > latencyInFlightLimit;
 }
 
-std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize)
+std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes)
 {
     ELLM_CHECK(maxDecodeBatchSize > 0, "Phase serving warmup requires a positive decode batch limit");
-    std::vector<int32_t> result{std::max(1, maxDecodeBatchSize / 8), std::max(1, maxDecodeBatchSize / 4),
-        std::max(1, maxDecodeBatchSize / 2), std::max(1, 3 * maxDecodeBatchSize / 4), maxDecodeBatchSize};
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    return result;
+    if (requestedBatchSizes.empty())
+    {
+        requestedBatchSizes = {std::max(1, maxDecodeBatchSize / 8), std::max(1, maxDecodeBatchSize / 4),
+            std::max(1, maxDecodeBatchSize / 2), std::max(1, 3 * maxDecodeBatchSize / 4), maxDecodeBatchSize};
+    }
+    for (int32_t const batchSize : requestedBatchSizes)
+    {
+        ELLM_CHECK(batchSize > 0 && batchSize <= maxDecodeBatchSize,
+            "Phase serving warmup batch is outside the decode profile");
+    }
+    std::sort(requestedBatchSizes.begin(), requestedBatchSizes.end());
+    requestedBatchSizes.erase(
+        std::unique(requestedBatchSizes.begin(), requestedBatchSizes.end()), requestedBatchSizes.end());
+    return requestedBatchSizes;
 }
 
 IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerConfig config,
@@ -77,6 +86,7 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
     mCoordinator.setGraphCaptureEnabled(mConfig.enableCudaGraphs);
+    mCoordinator.scheduler().setOnlineDecodeCostLearningActive(!mConfig.enableAdaptiveAdmission);
     mCoordinator.setCallbacks(makeCallbacks());
 }
 
@@ -236,6 +246,16 @@ bool IndependentPhaseAsyncServer::capturePreparedGraphs()
     return mCoordinator.capturePreparedGraphs();
 }
 
+void IndependentPhaseAsyncServer::setEventCallbacks(std::function<void(IndependentPhaseServerToken&&)> tokenCallback,
+    std::function<void(IndependentPhaseServerCompletion&&)> completionCallback)
+{
+    ELLM_CHECK(mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty(),
+        "Phase event callbacks can only change while the server is idle");
+    mTokenCallback = std::move(tokenCallback);
+    mCompletionCallback = std::move(completionCallback);
+    static_cast<void>(flushEventCallbacks());
+}
+
 bool IndependentPhaseAsyncServer::poll()
 {
     updateAdaptiveAdmissionMode();
@@ -255,6 +275,7 @@ bool IndependentPhaseAsyncServer::poll()
     {
         progressed = mCoordinator.dispatchNext() || progressed;
     }
+    progressed = flushEventCallbacks() || progressed;
     return progressed;
 }
 
@@ -294,6 +315,7 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
         mThroughputMode = next;
         ++mThroughputModeTransitionCount;
     }
+    mCoordinator.scheduler().setOnlineDecodeCostLearningActive(mThroughputMode);
 }
 
 void IndependentPhaseAsyncServer::runUntilIdle(size_t maxPolls)
@@ -516,6 +538,32 @@ bool IndependentPhaseAsyncServer::processSamplingTickets()
         processTicket(std::move(ticket));
     }
     return !readyTickets.empty();
+}
+
+bool IndependentPhaseAsyncServer::flushEventCallbacks()
+{
+    bool delivered{};
+    if (mTokenCallback)
+    {
+        while (!mTokenEvents.empty())
+        {
+            IndependentPhaseServerToken event = std::move(mTokenEvents.front());
+            mTokenEvents.pop_front();
+            mTokenCallback(std::move(event));
+            delivered = true;
+        }
+    }
+    if (mCompletionCallback)
+    {
+        while (!mCompletions.empty())
+        {
+            IndependentPhaseServerCompletion event = std::move(mCompletions.front());
+            mCompletions.pop_front();
+            mCompletionCallback(std::move(event));
+            delivered = true;
+        }
+    }
+    return delivered;
 }
 
 void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket)

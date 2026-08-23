@@ -505,6 +505,37 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
+TEST(PhaseQueueSchedulerTest, ConfidentOnlineDecodeCostRefinesStaticPrior)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableOnlineDecodeCostLearning = true;
+    config.onlineDecodeCostMinSamples = 2;
+    config.onlineDecodeCostWindow = 4;
+    config.onlineDecodeCostMaxAdjustmentRatio = 0.5F;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 10.0F}, {2, 512, 9.0F}, {4, 512, 20.0F}};
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kDecode;
+    sample.decodeBatchSize = 4;
+    sample.decodeContextTokens = 1024;
+    sample.plannedDecodeMaxContextLength = 256;
+    sample.decodeGpuMs = 5.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.observeMetrics(sample);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+    EXPECT_EQ(scheduler.telemetry().onlineDecodeCostSampleCount, 2U);
+    EXPECT_EQ(scheduler.telemetry().onlineDecodeCostBucketCount, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
 {
     PhaseQueueSchedulerConfig config;
@@ -526,6 +557,7 @@ TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
     };
     PhaseDispatchPlan first = scheduler.next();
     EXPECT_EQ(ids(first.decodeBatch), (std::set<uint64_t>{1, 2, 3, 4}));
+    EXPECT_EQ(scheduler.decodeCohortSize(), 4U);
     for (PhaseWorkItem const& item : first.decodeBatch)
     {
         scheduler.completeDecode(item, 129, false);
@@ -538,6 +570,7 @@ TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
     }
     PhaseDispatchPlan third = scheduler.next();
     EXPECT_EQ(ids(third.decodeBatch), (std::set<uint64_t>{2, 3, 4, 5}));
+    EXPECT_EQ(scheduler.decodeCohortSize(), 4U);
 }
 
 TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchToRecoverAfterDeadline)

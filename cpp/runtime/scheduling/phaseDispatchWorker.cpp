@@ -173,6 +173,7 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.plannedDecodeContextTokens = mInFlight.plannedDecodeContextTokens;
     mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
+    mCurrentMetrics.decodeCohortSize = static_cast<int32_t>(mScheduler.decodeCohortSize());
     int64_t prefillPastKVSum{};
     mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();
     mCurrentMetrics.prefillMinTtftSlackUs = mInFlight.prefillBatch.empty() ? 0.0 : std::numeric_limits<double>::max();

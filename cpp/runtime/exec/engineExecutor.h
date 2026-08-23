@@ -163,6 +163,22 @@ public:
     //! @brief Return the owned TensorRT execution context identity.
     nvinfer1::IExecutionContext const* getExecutionContextIdentity() const noexcept;
 
+    struct GraphCacheStats
+    {
+        size_t executeCalls{};
+        size_t hits{};
+        size_t misses{};
+        size_t captures{};
+        size_t evictions{};
+        size_t launchFailures{};
+        size_t entries{};
+    };
+
+    //! Frequency/LRU statistics for the executor-local CUDA Graph cache.
+    GraphCacheStats graphCacheStats() const noexcept;
+    //! Keep the most frequently used, most recently replayed graph entries.
+    size_t trimGraphCache(size_t maxEntries) noexcept;
+
     //! @brief Snapshot of binding addresses and shapes — used for graph-cache verification.
     struct BindingSnapshot
     {
@@ -203,10 +219,14 @@ private:
         cudaGraph_t graph{nullptr};
         cudaGraphExec_t exec{nullptr};
         BindingSnapshot snapshot;
+        size_t hits{};
+        uint64_t lastUsed{};
     };
 
     //! Graph cache keyed by a hash of all binding addresses + shapes.
     std::unordered_map<size_t, CapturedGraph> mGraphs;
+    GraphCacheStats mGraphCacheStats;
+    uint64_t mGraphUseSequence{};
 
     //! Hash the current binding addresses and shapes into a single key.
     size_t computeBindingHash() const;

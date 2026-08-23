@@ -126,6 +126,7 @@ struct PhaseDispatchMetrics
     int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
     int32_t prefillCohortSize{};
+    int32_t decodeCohortSize{};
     int32_t decodeTokens{};
     int32_t decodeContextTokens{};
     double prefillQueueWaitUs{};
@@ -149,6 +150,8 @@ struct PhaseSchedulerTelemetry
     size_t sampleCount{};
     size_t overlapSampleCount{};
     size_t decodeTpotSampleCount{};
+    size_t onlineDecodeCostSampleCount{};
+    size_t onlineDecodeCostBucketCount{};
     float prefillGpuMsPerToken{};
     float decodeGpuMsPerContextToken{};
     float overlapRatio{};
@@ -300,6 +303,13 @@ struct PhaseQueueSchedulerConfig
     //! Retain one stable decode cohort and replace rows only as requests finish.
     bool enableDecodeCohortBatching{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
+    //! Refine static decode costs from confident, context-bucketed decode-only observations.
+    bool enableOnlineDecodeCostLearning{};
+    size_t onlineDecodeCostMinSamples{8U};
+    size_t onlineDecodeCostWindow{32U};
+    int32_t onlineDecodeContextBucketTokens{512};
+    //! Bound an online p95 correction relative to its static prior.
+    float onlineDecodeCostMaxAdjustmentRatio{0.25F};
     //! Switch from deadline fitting to throughput-efficient backlog recovery
     //! before the TPOT deadline is fully exhausted.
     float decodeRecoveryPressureThreshold{1.0F};
@@ -472,12 +482,15 @@ public:
 
     size_t prefillQueueSize() const noexcept;
     size_t decodeQueueSize() const noexcept;
+    size_t decodeCohortSize() const noexcept;
     bool empty() const noexcept;
     bool hasRequest(uint64_t requestId) const noexcept;
 
     //! Update scheduling telemetry after one CUDA-complete dispatch.
     void observeMetrics(PhaseDispatchMetrics const& metrics);
     PhaseSchedulerTelemetry const& telemetry() const noexcept;
+    //! Keep online decode refinement out of latency mode while retaining learned samples.
+    void setOnlineDecodeCostLearningActive(bool active) noexcept;
     //! Reset learned scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
@@ -488,7 +501,9 @@ private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
-    int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const noexcept;
+    int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const;
+    uint64_t onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept;
+    std::optional<float> onlineDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
     std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const noexcept;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
@@ -515,6 +530,8 @@ private:
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     PhaseSchedulerTelemetry mTelemetry;
     std::deque<double> mRecentDecodeTpotUs;
+    std::unordered_map<uint64_t, std::deque<float>> mOnlineDecodeGpuMs;
+    bool mOnlineDecodeCostLearningActive{};
     bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};
     int32_t mConsecutiveOverlapBatches{};

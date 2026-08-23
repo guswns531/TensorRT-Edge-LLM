@@ -86,6 +86,8 @@ public:
     void setGraphCaptureEnabled(bool enabled) noexcept;
     //! Bound production graph-cache shape counts per phase.
     void setGraphCaptureLimits(size_t maxPrefillGraphs, size_t maxDecodeGraphs) noexcept;
+    EngineExecutor::GraphCacheStats prefillGraphCacheStats() const noexcept;
+    EngineExecutor::GraphCacheStats decodeGraphCacheStats() const noexcept;
 
     bool empty() const noexcept;
     bool busy() const noexcept;

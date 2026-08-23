@@ -80,6 +80,7 @@ void applySchedulerProfile(PhaseQueueSchedulerConfig& config)
 
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
+    , mOnlineDecodeCostLearningActive(mConfig.enableOnlineDecodeCostLearning)
 {
     applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
@@ -143,6 +144,13 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
             && mConfig.minTpotHysteresisSamples <= mConfig.tpotHysteresisWindow,
         "TPOT hysteresis sample bounds are invalid");
     check::check(mConfig.maxConsecutiveOverlapBatches > 0, "Maximum consecutive overlap batches must be positive");
+    check::check(
+        mConfig.onlineDecodeCostMinSamples > 0 && mConfig.onlineDecodeCostMinSamples <= mConfig.onlineDecodeCostWindow,
+        "Online decode cost sample bounds are invalid");
+    check::check(mConfig.onlineDecodeContextBucketTokens > 0, "Online decode context bucket must be positive");
+    check::check(std::isfinite(mConfig.onlineDecodeCostMaxAdjustmentRatio)
+            && mConfig.onlineDecodeCostMaxAdjustmentRatio >= 0.0F && mConfig.onlineDecodeCostMaxAdjustmentRatio < 1.0F,
+        "Online decode cost adjustment ratio must be finite and in [0, 1)");
     check::check(std::isfinite(mConfig.maxPredictedDecodeDebtUs) && mConfig.maxPredictedDecodeDebtUs >= 0.0,
         "Maximum predicted decode debt must be finite and non-negative");
     check::check(mConfig.autoLongPrefillBacklogTokens > 0, "Auto-profile prefill backlog threshold must be positive");
@@ -1324,7 +1332,7 @@ std::pair<int64_t, int32_t> PhaseQueueScheduler::decodeCandidateShape(int32_t ma
     return {total, maximum};
 }
 
-int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const noexcept
+int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const
 {
     int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued));
     if (available <= 1 || !mConfig.enableDynamicDecodeBatching || mConfig.decodeBatchCosts.empty())
@@ -1437,6 +1445,22 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         candidate.p95GpuMs = lower->p95GpuMs + fraction * (candidate.p95GpuMs - lower->p95GpuMs);
     }
 
+    if (mOnlineDecodeCostLearningActive)
+    {
+        for (Candidate& candidate : candidates)
+        {
+            std::optional<float> const observed
+                = onlineDecodeP95(candidate.batchSize, maxContextLengths[static_cast<size_t>(candidate.batchSize)]);
+            if (!observed.has_value())
+            {
+                continue;
+            }
+            float const lower = candidate.p95GpuMs * (1.0F - mConfig.onlineDecodeCostMaxAdjustmentRatio);
+            float const upper = candidate.p95GpuMs * (1.0F + mConfig.onlineDecodeCostMaxAdjustmentRatio);
+            candidate.p95GpuMs = std::clamp(*observed, lower, upper);
+        }
+    }
+
     bool const urgent = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold;
     double const remainingUs = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
     Candidate const* selected{};
@@ -1481,6 +1505,26 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
               return lhs.p95GpuMs < rhs.p95GpuMs || (lhs.p95GpuMs == rhs.p95GpuMs && lhs.batchSize > rhs.batchSize);
           });
     return fastest->batchSize;
+}
+
+uint64_t PhaseQueueScheduler::onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept
+{
+    int32_t const contextBucket = std::max(
+        1, (maxContextLength + mConfig.onlineDecodeContextBucketTokens - 1) / mConfig.onlineDecodeContextBucketTokens);
+    return (static_cast<uint64_t>(static_cast<uint32_t>(batchSize)) << 32U) | static_cast<uint32_t>(contextBucket);
+}
+
+std::optional<float> PhaseQueueScheduler::onlineDecodeP95(int32_t batchSize, int32_t maxContextLength) const
+{
+    auto const found = mOnlineDecodeGpuMs.find(onlineDecodeCostKey(batchSize, maxContextLength));
+    if (found == mOnlineDecodeGpuMs.end() || found->second.size() < mConfig.onlineDecodeCostMinSamples)
+    {
+        return std::nullopt;
+    }
+    std::vector<float> ordered(found->second.begin(), found->second.end());
+    std::sort(ordered.begin(), ordered.end());
+    size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1U;
+    return ordered[p95Index];
 }
 
 void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
@@ -1538,6 +1582,11 @@ size_t PhaseQueueScheduler::decodeQueueSize() const noexcept
     return mDecodeQueue.size();
 }
 
+size_t PhaseQueueScheduler::decodeCohortSize() const noexcept
+{
+    return mDecodeCohortIds.size();
+}
+
 bool PhaseQueueScheduler::empty() const noexcept
 {
     return mPrefillQueue.empty() && mDecodeQueue.empty();
@@ -1563,6 +1612,19 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     {
         updateEwma(mTelemetry.decodeGpuMsPerContextToken,
             metrics.decodeGpuMs / static_cast<float>(metrics.decodeContextTokens));
+    }
+    if (mOnlineDecodeCostLearningActive && metrics.kind == PhaseDispatchKind::kDecode && metrics.decodeBatchSize > 0
+        && metrics.decodeGpuMs > 0.0F && metrics.plannedDecodeMaxContextLength > 0)
+    {
+        auto& samples
+            = mOnlineDecodeGpuMs[onlineDecodeCostKey(metrics.decodeBatchSize, metrics.plannedDecodeMaxContextLength)];
+        samples.push_back(metrics.decodeGpuMs);
+        if (samples.size() > mConfig.onlineDecodeCostWindow)
+        {
+            samples.pop_front();
+        }
+        ++mTelemetry.onlineDecodeCostSampleCount;
+        mTelemetry.onlineDecodeCostBucketCount = mOnlineDecodeGpuMs.size();
     }
     if (metrics.kind == PhaseDispatchKind::kOverlap && metrics.prefillBatchSize > 0 && metrics.decodeBatchSize > 0)
     {
@@ -1616,18 +1678,25 @@ PhaseSchedulerTelemetry const& PhaseQueueScheduler::telemetry() const noexcept
     return mTelemetry;
 }
 
+void PhaseQueueScheduler::setOnlineDecodeCostLearningActive(bool active) noexcept
+{
+    mOnlineDecodeCostLearningActive = mConfig.enableOnlineDecodeCostLearning && active;
+}
+
 void PhaseQueueScheduler::resetHistory()
 {
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Scheduling history can only be reset while the scheduler is idle");
     mTelemetry = {};
     mRecentDecodeTpotUs.clear();
+    mOnlineDecodeGpuMs.clear();
     mLatencySafeFallback = false;
     mConsecutiveDecodeBatches = 0;
     mConsecutiveOverlapBatches = 0;
     mPredictedDecodeDebtUs = 0.0;
     mPrefillCohortIds.clear();
     mPrefillCohortTurns = 0;
+    mDecodeCohortIds.clear();
 }
 
 } // namespace rt

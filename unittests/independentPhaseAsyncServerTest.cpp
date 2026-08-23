@@ -47,7 +47,9 @@ TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuc
     EXPECT_EQ(phaseServingWarmupBatchSizes(64), (std::vector<int32_t>{8, 16, 32, 48, 64}));
     EXPECT_EQ(phaseServingWarmupBatchSizes(8), (std::vector<int32_t>{1, 2, 4, 6, 8}));
     EXPECT_EQ(phaseServingWarmupBatchSizes(1), (std::vector<int32_t>{1}));
+    EXPECT_EQ(phaseServingWarmupBatchSizes(64, {48, 12, 48, 64}), (std::vector<int32_t>{12, 48, 64}));
     EXPECT_THROW(phaseServingWarmupBatchSizes(0), std::runtime_error);
+    EXPECT_THROW(phaseServingWarmupBatchSizes(64, {65}), std::runtime_error);
 }
 
 } // namespace trt_edgellm::rt

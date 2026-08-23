@@ -49,6 +49,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -820,7 +821,16 @@ int main(int argc, char** argv)
         }
         semanticSchedulerConfig.enableDynamicDecodeBatching
             = std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr;
-        semanticSchedulerConfig.enableDecodeCohortBatching = std::getenv("TRT_EDGELLM_ENABLE_DECODE_COHORT") != nullptr;
+        semanticSchedulerConfig.enableOnlineDecodeCostLearning
+            = std::getenv("TRT_EDGELLM_DISABLE_ONLINE_COST") == nullptr;
+        bool const asymmetricDecodeStaging = maxStableSlots > semanticSchedulerConfig.maxDecodeBatchSize
+            && semanticSchedulerConfig.maxDecodeBatchSize > semanticSchedulerConfig.maxPrefillBatchSize;
+        semanticSchedulerConfig.enableDecodeCohortBatching
+            = asymmetricDecodeStaging && std::getenv("TRT_EDGELLM_DISABLE_DECODE_COHORT") == nullptr;
+        if (std::getenv("TRT_EDGELLM_ENABLE_DECODE_COHORT") != nullptr)
+        {
+            semanticSchedulerConfig.enableDecodeCohortBatching = true;
+        }
         semanticSchedulerConfig.decodeBatchCosts = {
             {1, 2048, 6.238F},
             {2, 2048, 6.294F},
@@ -1005,8 +1015,19 @@ int main(int argc, char** argv)
                 : serverConfig.maxInFlightRequests;
             int32_t const warmupBatchLimit
                 = std::min(semanticSchedulerConfig.maxDecodeBatchSize, static_cast<int32_t>(warmupAdmissionLimit));
+            std::vector<int32_t> requestedWarmupBatchSizes;
+            if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"))
+            {
+                std::stringstream stream(value);
+                std::string batchSize;
+                while (std::getline(stream, batchSize, ','))
+                {
+                    ELLM_CHECK(!batchSize.empty(), "Phase IPC warmup batch list contains an empty entry");
+                    requestedWarmupBatchSizes.push_back(std::stoi(batchSize));
+                }
+            }
             std::vector<int32_t> const warmupBatchSizes = std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr
-                ? rt::phaseServingWarmupBatchSizes(warmupBatchLimit)
+                ? rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes))
                 : std::vector<int32_t>{};
             uint64_t warmupRequestId = 1000000;
             size_t warmedRequests{};
@@ -1065,33 +1086,99 @@ int main(int argc, char** argv)
             std::mutex outputMutex;
             std::condition_variable outputReady;
             bool outputClosed{};
+            size_t outputWriteBatches{};
+            size_t outputWriteRecords{};
+            size_t outputWriteBytes{};
             std::thread outputWriter([&]() {
                 while (true)
                 {
                     std::unique_lock<std::mutex> lock(outputMutex);
                     outputReady.wait(lock, [&]() { return outputClosed || !outputLines.empty(); });
-                    while (!outputLines.empty())
+                    std::deque<std::string> readyLines;
+                    readyLines.swap(outputLines);
+                    bool const closed = outputClosed;
+                    lock.unlock();
+                    if (!readyLines.empty())
                     {
-                        std::string line = std::move(outputLines.front());
-                        outputLines.pop_front();
-                        lock.unlock();
-                        std::cout << line << std::endl;
-                        lock.lock();
+                        size_t bytes{};
+                        for (std::string const& line : readyLines)
+                        {
+                            bytes += line.size() + 1U;
+                        }
+                        std::string payload;
+                        payload.reserve(bytes);
+                        for (std::string& line : readyLines)
+                        {
+                            payload.append(line);
+                            payload.push_back('\n');
+                        }
+                        std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                        std::cout.flush();
+                        ++outputWriteBatches;
+                        outputWriteRecords += readyLines.size();
+                        outputWriteBytes += payload.size();
                     }
-                    if (outputClosed)
+                    if (closed)
                     {
                         break;
                     }
                 }
             });
-            auto emitRecord = [&](std::string const& prefix, nlohmann::json const& event) {
+            auto emitSerializedRecords = [&](std::vector<std::string> records) {
+                if (records.empty())
+                {
+                    return;
+                }
                 {
                     std::lock_guard<std::mutex> lock(outputMutex);
-                    outputLines.push_back(prefix + event.dump());
+                    for (std::string& record : records)
+                    {
+                        outputLines.push_back(std::move(record));
+                    }
                 }
                 outputReady.notify_one();
             };
+            auto emitRecord = [&](std::string const& prefix, nlohmann::json const& event) {
+                emitSerializedRecords({prefix + event.dump()});
+            };
             auto emitEvent = [&](nlohmann::json const& event) { emitRecord("PHASE_EVENT\t", event); };
+            std::deque<rt::IndependentPhaseServerToken> nativeTokenEvents;
+            std::deque<rt::IndependentPhaseServerCompletion> nativeCompletionEvents;
+            bool const nativeEventCallbacks = ipcThreePhase == nullptr;
+            if (nativeEventCallbacks)
+            {
+                semanticServer.setEventCallbacks(
+                    [&](rt::IndependentPhaseServerToken&& event) { nativeTokenEvents.push_back(std::move(event)); },
+                    [&](rt::IndependentPhaseServerCompletion&& event) {
+                        nativeCompletionEvents.push_back(std::move(event));
+                    });
+            }
+            auto popTokenEvent = [&]() -> std::optional<rt::IndependentPhaseServerToken> {
+                if (!nativeEventCallbacks)
+                {
+                    return semanticServer.tryPopToken();
+                }
+                if (nativeTokenEvents.empty())
+                {
+                    return std::nullopt;
+                }
+                rt::IndependentPhaseServerToken event = std::move(nativeTokenEvents.front());
+                nativeTokenEvents.pop_front();
+                return event;
+            };
+            auto popCompletionEvent = [&]() -> std::optional<rt::IndependentPhaseServerCompletion> {
+                if (!nativeEventCallbacks)
+                {
+                    return semanticServer.tryPopCompletion();
+                }
+                if (nativeCompletionEvents.empty())
+                {
+                    return std::nullopt;
+                }
+                rt::IndependentPhaseServerCompletion event = std::move(nativeCompletionEvents.front());
+                nativeCompletionEvents.pop_front();
+                return event;
+            };
             std::thread inputReader([&]() {
                 std::string line;
                 while (std::getline(std::cin, line))
@@ -1107,6 +1194,10 @@ int main(int argc, char** argv)
             });
             emitEvent({{"type", "ready"}});
             size_t emittedMetrics = semanticCoordinator.metrics().size();
+            double ipcIngressUs{};
+            double ipcPollUs{};
+            double ipcSerializationUs{};
+            size_t ipcPollCalls{};
             while (true)
             {
                 std::deque<std::string> lines;
@@ -1115,6 +1206,7 @@ int main(int argc, char** argv)
                     lines.swap(pendingLines);
                 }
                 bool madeProgress = !lines.empty();
+                auto const ingressStart = std::chrono::steady_clock::now();
                 size_t ingestedLines{};
                 while (!lines.empty() && ingestedLines < ipcIngressQuantum)
                 {
@@ -1244,8 +1336,17 @@ int main(int argc, char** argv)
                     lines.pop_front();
                     ++ingestedLines;
                 }
+                ipcIngressUs
+                    += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ingressStart)
+                           .count();
+                auto const pollStart = std::chrono::steady_clock::now();
                 madeProgress
                     = (ipcThreePhase != nullptr ? ipcThreePhase->poll() : semanticServer.poll()) || madeProgress;
+                ipcPollUs
+                    += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - pollStart).count();
+                ++ipcPollCalls;
+                auto const serializationStart = std::chrono::steady_clock::now();
+                std::vector<std::string> serializedRecords;
                 if (!emitPhaseMetrics)
                 {
                     emittedMetrics = semanticCoordinator.metrics().size();
@@ -1254,6 +1355,8 @@ int main(int argc, char** argv)
                 {
                     madeProgress = true;
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
+                    auto const prefillGraphs = semanticCoordinator.prefillGraphCacheStats();
+                    auto const decodeGraphs = semanticCoordinator.decodeGraphCacheStats();
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
                         {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
@@ -1264,25 +1367,31 @@ int main(int argc, char** argv)
                         {"prefill_gpu_ms", metrics.prefillGpuMs},
                         {"decode_context_tokens", metrics.decodeContextTokens},
                         {"decode_context_max", metrics.plannedDecodeMaxContextLength},
-                        {"decode_gpu_ms", metrics.decodeGpuMs}, {"makespan_gpu_ms", metrics.makespanGpuMs},
-                        {"overlap_ratio", metrics.overlapRatio},
+                        {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
+                        {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
+                        {"online_decode_cost_samples",
+                            semanticCoordinator.scheduler().telemetry().onlineDecodeCostSampleCount},
+                        {"online_decode_cost_buckets",
+                            semanticCoordinator.scheduler().telemetry().onlineDecodeCostBucketCount},
+                        {"prefill_graph_hits", prefillGraphs.hits}, {"prefill_graph_misses", prefillGraphs.misses},
+                        {"decode_graph_hits", decodeGraphs.hits}, {"decode_graph_misses", decodeGraphs.misses},
                         {"sampling_event_slots", samplingSlotPool.size()},
                         {"sampling_event_reuses", samplingSlotPool.reuseCount()}};
-                    emitRecord("PHASE_METRIC\t", metricEvent);
+                    serializedRecords.push_back("PHASE_METRIC\t" + metricEvent.dump());
                 }
-                while (auto token = semanticServer.tryPopToken())
+                while (auto token = popTokenEvent())
                 {
                     madeProgress = true;
                     nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", token->requestId},
                         {"token_id", token->tokenId},
                         {"text", tokenizer.decode(std::vector<int32_t>{token->tokenId}, false)},
                         {"output_index", token->outputIndex}, {"elapsed_ms", token->elapsedMs}};
-                    emitEvent(tokenEvent);
+                    serializedRecords.push_back("PHASE_EVENT\t" + tokenEvent.dump());
                 }
-                while (auto completion = semanticServer.tryPopCompletion())
+                while (auto completion = popCompletionEvent())
                 {
                     madeProgress = true;
                     nlohmann::json const completionEvent{{"type", "completion"},
@@ -1290,8 +1399,12 @@ int main(int argc, char** argv)
                         {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
                         {"prompt_tokens", completion->promptTokens},
                         {"output_tokens", completion->generatedTokens.size()}, {"latency_ms", completion->latencyMs}};
-                    emitEvent(completionEvent);
+                    serializedRecords.push_back("PHASE_EVENT\t" + completionEvent.dump());
                 }
+                emitSerializedRecords(std::move(serializedRecords));
+                ipcSerializationUs
+                    += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - serializationStart)
+                           .count();
                 bool closed{};
                 {
                     std::lock_guard<std::mutex> lock(pendingMutex);
@@ -1329,12 +1442,26 @@ int main(int argc, char** argv)
                 "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
             LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
                 emitPhaseMetrics ? "yes" : "no");
+            LOG_INFO("Phase IPC response path: %s", nativeEventCallbacks ? "native_callback" : "polling_queue");
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;
             }
             outputReady.notify_one();
             outputWriter.join();
+            LOG_INFO(
+                "Phase IPC host cost: polls=%zu ingress=%.3f ms poll=%.3f ms serialize=%.3f ms output_batches=%zu "
+                "output_records=%zu output_bytes=%zu",
+                ipcPollCalls, ipcIngressUs / 1000.0, ipcPollUs / 1000.0, ipcSerializationUs / 1000.0,
+                outputWriteBatches, outputWriteRecords, outputWriteBytes);
+            auto const prefillGraphStats = semanticCoordinator.prefillGraphCacheStats();
+            auto const decodeGraphStats = semanticCoordinator.decodeGraphCacheStats();
+            LOG_INFO(
+                "Phase CUDA graph cache: prefill entries=%zu hits=%zu misses=%zu captures=%zu evictions=%zu; "
+                "decode entries=%zu hits=%zu misses=%zu captures=%zu evictions=%zu",
+                prefillGraphStats.entries, prefillGraphStats.hits, prefillGraphStats.misses, prefillGraphStats.captures,
+                prefillGraphStats.evictions, decodeGraphStats.entries, decodeGraphStats.hits, decodeGraphStats.misses,
+                decodeGraphStats.captures, decodeGraphStats.evictions);
             ipcThreePhase.reset();
             ipcVisionAdapter.reset();
             ipcVisionRunner.reset();

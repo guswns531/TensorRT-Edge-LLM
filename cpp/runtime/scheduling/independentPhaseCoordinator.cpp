@@ -255,6 +255,18 @@ void IndependentPhaseCoordinator::setGraphCaptureLimits(size_t maxPrefillGraphs,
 {
     mMaxPrefillGraphs = maxPrefillGraphs;
     mMaxDecodeGraphs = maxDecodeGraphs;
+    static_cast<void>(mExecutors.prefillExecutor().trimGraphCache(maxPrefillGraphs));
+    static_cast<void>(mExecutors.decodeExecutor().trimGraphCache(maxDecodeGraphs));
+}
+
+EngineExecutor::GraphCacheStats IndependentPhaseCoordinator::prefillGraphCacheStats() const noexcept
+{
+    return mExecutors.prefillExecutor().graphCacheStats();
+}
+
+EngineExecutor::GraphCacheStats IndependentPhaseCoordinator::decodeGraphCacheStats() const noexcept
+{
+    return mExecutors.decodeExecutor().graphCacheStats();
 }
 
 bool IndependentPhaseCoordinator::empty() const noexcept
