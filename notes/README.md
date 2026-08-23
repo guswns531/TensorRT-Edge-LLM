@@ -107,6 +107,7 @@ phase를 pipeline처럼 겹치는 것이다. 예를 들면 요청 A의 decode와
 85. [Cosmos v0.10 adaptive admission profile](109-cosmos-v010-adaptive-admission-profiles-20260820.md)
 86. [Cosmos v0.10 host-gap 제거와 v0.9.1 fresh parity](110-cosmos-v010-host-gap-v091-fresh-parity-20260820.md)
 87. [Cosmos 모든 workload 처리량 우위와 production shape priming](111-cosmos-all-workload-win-shape-priming-20260823.md)
+88. [Cosmos serving 개선 우선순위 1~4 구현과 단계별 성능](112-cosmos-serving-priority1-4-20260823.md)
 
 - 기본 KV cache와 indexed-linear는 attention layer별로
   `[maxBatch, 2, numKVHeads, maxSequenceLength, headDim]` 크기의 연속 GPU tensor를 미리 할당한다.
