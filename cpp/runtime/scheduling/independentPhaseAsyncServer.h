@@ -44,6 +44,8 @@ bool shouldDeferDecodeForSamplingRefill(
 //! Hysteretic queue-pressure transition for adaptive admission.
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept;
+//! Representative decode buckets to prime before opening a persistent serving endpoint.
+std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize);
 
 //! Request view passed to a model-specific text or multimodal adapter.
 struct IndependentPhaseRequestView

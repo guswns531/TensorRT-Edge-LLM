@@ -239,6 +239,26 @@ sampling events reused roughly 560 times per run. Fresh native v0.9.1 reaches
 4,468.1 token/s under the same fixed-output HTTP trace, leaving v0.10 within
 2.32% throughput while using 332 MiB less peak memory.
 
+The production IPC path now primes representative decode buckets before it
+announces readiness. For D64 the buckets are D8/D16/D32/D48/D64. When CUDA
+Graphs are enabled, the warmup captures only these prepared shapes and then
+freezes runtime capture; an unseen production shape uses `enqueueV3` instead
+of synchronously capturing on its latency-critical first request. Per-dispatch
+metric serialization and retention are disabled by default and remain
+available with `TRT_EDGELLM_EMIT_PHASE_METRICS=1`. Scheduler CUDA-event
+telemetry remains active when external retention is disabled.
+
+On fresh HTTP traces with the P8/D64 engine, startup priming and graph freezing
+produce 2,362.2/4,531.2/5,275.5 generated token/s for short, balanced, and
+decode-heavy workloads. The corresponding memory-matched vLLM 0.27.1 results
+are 1,976.6/4,283.7/4,831.0 token/s, and fresh native v0.9.1 results are
+1,353.4/4,468.1/4,911.5 token/s. Current therefore wins throughput in all
+three workload classes. Decode-heavy median TTFT remains 0.8% behind v0.9.1
+and 8.7% behind vLLM, while its TTFT p95, TPOT, E2E, and throughput are all
+better. A P16/D64 experiment selected a slower TensorRT tactic and reduced
+balanced throughput to 4,278 token/s, so it was rejected and its engine was
+removed.
+
 Headroom reservation is available through
 `TRT_EDGELLM_PAGE_RESERVATION=headroom`. A 96-request pressure run completed
 without OOM or lost requests at `993.7 token/s`; TPOT rose to `56.9 ms`, so the

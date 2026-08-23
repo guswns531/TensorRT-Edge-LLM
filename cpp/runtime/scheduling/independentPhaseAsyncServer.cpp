@@ -46,6 +46,16 @@ bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingReques
     return pendingRequests > 0 || activeRequests > latencyInFlightLimit;
 }
 
+std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize)
+{
+    ELLM_CHECK(maxDecodeBatchSize > 0, "Phase serving warmup requires a positive decode batch limit");
+    std::vector<int32_t> result{std::max(1, maxDecodeBatchSize / 8), std::max(1, maxDecodeBatchSize / 4),
+        std::max(1, maxDecodeBatchSize / 2), std::max(1, 3 * maxDecodeBatchSize / 4), maxDecodeBatchSize};
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerConfig config,
     IndependentPhaseCoordinator& coordinator, StableKVPageManager& ownership, IndependentPhaseRequestAdapter adapter,
     PhasePrefixReuseCache* prefixCache)

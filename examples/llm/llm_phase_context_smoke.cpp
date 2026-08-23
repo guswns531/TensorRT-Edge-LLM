@@ -810,6 +810,10 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
         semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_QUEUE_TARGET_US"))
+        {
+            semanticSchedulerConfig.prefillQueueWaitTargetUs = std::stod(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_QUEUE_TARGET_US"))
         {
             semanticSchedulerConfig.decodeQueueWaitTargetUs = std::stod(value);
@@ -988,6 +992,58 @@ int main(int argc, char** argv)
         }
         else if (ipcMode)
         {
+            size_t ipcIngressQuantum = serverConfig.maxPendingRequests;
+            if (char const* value = std::getenv("TRT_EDGELLM_IPC_INGRESS_QUANTUM"))
+            {
+                ipcIngressQuantum = static_cast<size_t>(std::stoul(value));
+            }
+            ELLM_CHECK(ipcIngressQuantum > 0, "Phase IPC ingress quantum must be positive");
+            bool const emitPhaseMetrics = std::getenv("TRT_EDGELLM_EMIT_PHASE_METRICS") != nullptr;
+            semanticCoordinator.setMetricsCollectionEnabled(emitPhaseMetrics);
+            size_t const warmupAdmissionLimit = serverConfig.enableAdaptiveAdmission
+                ? serverConfig.latencyInFlightRequests
+                : serverConfig.maxInFlightRequests;
+            int32_t const warmupBatchLimit
+                = std::min(semanticSchedulerConfig.maxDecodeBatchSize, static_cast<int32_t>(warmupAdmissionLimit));
+            std::vector<int32_t> const warmupBatchSizes = std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr
+                ? rt::phaseServingWarmupBatchSizes(warmupBatchLimit)
+                : std::vector<int32_t>{};
+            uint64_t warmupRequestId = 1000000;
+            size_t warmedRequests{};
+            for (int32_t const batchSize : warmupBatchSizes)
+            {
+                for (int32_t row{}; row < batchSize; ++row)
+                {
+                    auto const submission = semanticServer.submit(warmupRequestId++, semanticPrompts.at(20000), 2);
+                    ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
+                        "Phase IPC shape warmup request was not admitted");
+                }
+                semanticServer.runUntilIdle(1000000);
+                size_t completed{};
+                while (semanticServer.tryPopCompletion().has_value())
+                {
+                    ++completed;
+                }
+                while (semanticServer.tryPopToken().has_value())
+                {
+                }
+                if (semanticPrefixCache != nullptr)
+                {
+                    semanticPrefixCache->clear();
+                }
+                ELLM_CHECK(completed == static_cast<size_t>(batchSize),
+                    "Phase IPC shape warmup did not complete every request");
+                warmedRequests += completed;
+            }
+            ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
+                "Phase IPC shape warmup did not release every stable slot");
+            if (serverConfig.enableCudaGraphs)
+            {
+                // Retain the primed graph cache, but do not synchronously capture
+                // unseen production shapes on their latency-critical first request.
+                semanticCoordinator.setGraphCaptureEnabled(false);
+            }
+            LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu", warmupBatchSizes.size(), warmedRequests);
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
             std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
@@ -1050,7 +1106,7 @@ int main(int argc, char** argv)
                 inputClosed = true;
             });
             emitEvent({{"type", "ready"}});
-            size_t emittedMetrics{};
+            size_t emittedMetrics = semanticCoordinator.metrics().size();
             while (true)
             {
                 std::deque<std::string> lines;
@@ -1059,7 +1115,8 @@ int main(int argc, char** argv)
                     lines.swap(pendingLines);
                 }
                 bool madeProgress = !lines.empty();
-                while (!lines.empty())
+                size_t ingestedLines{};
+                while (!lines.empty() && ingestedLines < ipcIngressQuantum)
                 {
                     nlohmann::json const payload = nlohmann::json::parse(lines.front());
                     uint64_t const requestId = payload.value("request_index", uint64_t{});
@@ -1071,6 +1128,7 @@ int main(int argc, char** argv)
                             {"type", "cancelled"}, {"request_index", requestId}, {"cancelled", cancelled}};
                         emitEvent(cancelEvent);
                         lines.pop_front();
+                        ++ingestedLines;
                         continue;
                     }
                     nlohmann::json const requestPayload = payload.contains("request") ? payload.at("request") : payload;
@@ -1126,6 +1184,7 @@ int main(int argc, char** argv)
                     if (!validRequest)
                     {
                         lines.pop_front();
+                        ++ingestedLines;
                         continue;
                     }
                     int32_t maxOutputTokens = serverConfig.defaultMaxOutputTokens;
@@ -1183,10 +1242,15 @@ int main(int argc, char** argv)
                         break;
                     }
                     lines.pop_front();
+                    ++ingestedLines;
                 }
                 madeProgress
                     = (ipcThreePhase != nullptr ? ipcThreePhase->poll() : semanticServer.poll()) || madeProgress;
-                while (emittedMetrics < semanticCoordinator.metrics().size())
+                if (!emitPhaseMetrics)
+                {
+                    emittedMetrics = semanticCoordinator.metrics().size();
+                }
+                while (emitPhaseMetrics && emittedMetrics < semanticCoordinator.metrics().size())
                 {
                     madeProgress = true;
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
@@ -1263,6 +1327,8 @@ int main(int argc, char** argv)
                 semanticServer.throughputMode() ? "yes" : "no");
             LOG_INFO(
                 "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
+            LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
+                emitPhaseMetrics ? "yes" : "no");
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;

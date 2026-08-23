@@ -93,6 +93,8 @@ public:
     TensorMap& decodeTensorMap() noexcept;
     PhaseQueueScheduler& scheduler() noexcept;
     std::vector<PhaseDispatchMetrics> const& metrics() const noexcept;
+    //! Enable external metric retention; scheduler telemetry remains active either way.
+    void setMetricsCollectionEnabled(bool enabled) noexcept;
     CUcontext cudaContext() const noexcept;
 
 private:
@@ -117,6 +119,7 @@ private:
     PhaseQueueScheduler mScheduler;
     std::unique_ptr<PhaseDispatchWorker> mWorker;
     std::vector<PhaseDispatchMetrics> mMetrics;
+    bool mMetricsCollectionEnabled{true};
     std::unordered_set<std::string> mCapturedPrefillShapes;
     std::unordered_set<std::string> mCapturedDecodeShapes;
     bool mGraphCaptureEnabled{};

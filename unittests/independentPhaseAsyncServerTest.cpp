@@ -42,4 +42,12 @@ TEST(IndependentPhaseAsyncServerTest, AdaptiveAdmissionUsesBacklogHysteresis)
     EXPECT_FALSE(nextAdaptiveThroughputMode(true, 0, 64, 64, 1));
 }
 
+TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuckets)
+{
+    EXPECT_EQ(phaseServingWarmupBatchSizes(64), (std::vector<int32_t>{8, 16, 32, 48, 64}));
+    EXPECT_EQ(phaseServingWarmupBatchSizes(8), (std::vector<int32_t>{1, 2, 4, 6, 8}));
+    EXPECT_EQ(phaseServingWarmupBatchSizes(1), (std::vector<int32_t>{1}));
+    EXPECT_THROW(phaseServingWarmupBatchSizes(0), std::runtime_error);
+}
+
 } // namespace trt_edgellm::rt

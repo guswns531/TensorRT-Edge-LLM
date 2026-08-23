@@ -93,7 +93,10 @@ PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
         return PhaseDecodeCompletion{resultingLength, mCallbacks.isDecodeFinished(item, resultingLength)};
     };
     callbacks.onMetrics = [this](PhaseDispatchMetrics const& metrics) {
-        mMetrics.push_back(metrics);
+        if (mMetricsCollectionEnabled)
+        {
+            mMetrics.push_back(metrics);
+        }
         if (mCallbacks.onMetrics)
         {
             mCallbacks.onMetrics(metrics);
@@ -282,6 +285,15 @@ PhaseQueueScheduler& IndependentPhaseCoordinator::scheduler() noexcept
 std::vector<PhaseDispatchMetrics> const& IndependentPhaseCoordinator::metrics() const noexcept
 {
     return mMetrics;
+}
+
+void IndependentPhaseCoordinator::setMetricsCollectionEnabled(bool enabled) noexcept
+{
+    mMetricsCollectionEnabled = enabled;
+    if (!enabled)
+    {
+        mMetrics.clear();
+    }
 }
 
 CUcontext IndependentPhaseCoordinator::cudaContext() const noexcept
