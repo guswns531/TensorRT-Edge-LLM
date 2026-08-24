@@ -1638,10 +1638,21 @@ TEST(PhaseThreeCoordinatorPolicyTest, PreservesArrivalAndAppliesVisionTtftDefaul
 TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadBytes)
 {
     EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 2, 0, 100, 0));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 2, 0, 100, 500));
     EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(1, 2, 40, 100, 50));
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(2, 2, 80, 100, 20));
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(1, 2, 60, 100, 50));
     EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(1, 2, 60, 0, 500));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 100, 40, 2));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 30, 100, 40, 2));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(3, 4, 0, 0, 0, 2));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 0, 0, 0));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, CountsPerRequestVisionEmbeddingRows)
+{
+    std::vector<std::vector<int32_t>> const tokenIds{{1, 7, 7, 2}, {7, 3}, {4, 5}};
+    EXPECT_EQ(phaseVisionEmbeddingRows(tokenIds, 7), (std::vector<int64_t>{2, 1, 0}));
 }
 
 } // namespace

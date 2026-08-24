@@ -1136,6 +1136,18 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.maxEncodedBytes = static_cast<size_t>(std::stoull(value));
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE"))
+                {
+                    threePhaseConfig.maxEncoderBatchSize = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA"))
+                {
+                    threePhaseConfig.maxEncoderMediaItems = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US"))
+                {
+                    threePhaseConfig.encoderBatchWaitUs = std::stod(value);
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_TTFT_TARGET_MS"))
                 {
                     threePhaseConfig.visionTtftTargetUs = std::stod(value) * 1000.0;
@@ -1463,6 +1475,9 @@ int main(int argc, char** argv)
                         {"vision_downstream_bytes", visionMetrics.downstreamEncodedBytes},
                         {"vision_encoder_starts", visionMetrics.encoderStarts},
                         {"vision_encoder_completions", visionMetrics.encoderCompletions},
+                        {"vision_encoder_batches", visionMetrics.encoderBatches},
+                        {"vision_encoder_batch", visionMetrics.lastEncoderBatchSize},
+                        {"vision_encoder_batch_max", visionMetrics.maxEncoderBatchSize},
                         {"vision_oldest_pending_ms", visionMetrics.oldestPendingAgeUs / 1000.0},
                         {"vision_encoder_queue_wait_ms", visionMetrics.lastEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
@@ -1535,12 +1550,15 @@ int main(int argc, char** argv)
             {
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
                 LOG_INFO(
-                    "Phase vision cost: starts=%zu completions=%zu pending=%zu downstream=%zu bytes=%zu "
+                    "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
+                    "pending=%zu downstream=%zu bytes=%zu "
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms",
-                    visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.pendingVisionRequests,
-                    visionMetrics.downstreamEncodedRequests, visionMetrics.downstreamEncodedBytes,
-                    visionMetrics.lastEncoderQueueWaitUs / 1000.0, visionMetrics.maxEncoderQueueWaitUs / 1000.0,
-                    visionMetrics.lastEncoderGpuMs, visionMetrics.maxEncoderGpuMs);
+                    visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
+                    visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
+                    visionMetrics.pendingVisionRequests, visionMetrics.downstreamEncodedRequests,
+                    visionMetrics.downstreamEncodedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
+                    visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
+                    visionMetrics.maxEncoderGpuMs);
             }
             {
                 std::lock_guard<std::mutex> lock(outputMutex);

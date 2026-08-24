@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -47,11 +48,21 @@ struct PhaseVisionPayload
     cudaEvent_t readyEvent{};
 };
 
+//! One logical request submitted as part of a shared vision-encoder batch.
+struct PhaseVisionSubmission
+{
+    uint64_t requestId{};
+    LLMGenerationRequest request;
+};
+
+//! Return the contiguous vision-embedding row count for every expanded token row.
+std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> const& tokenIds, int32_t imageTokenId);
+
 //! Model-neutral wrapper around a v0.10 MultimodalRunner execution context.
 //!
-//! One encoder request is in flight at a time because the borrowed runner owns
-//! reusable output buffers. Results are copied to request-owned GPU tensors on
-//! the encoder stream before readyEvent is recorded.
+//! One encoder batch is in flight at a time because the borrowed runner owns
+//! reusable output buffers. Concatenated results are sliced and copied to
+//! request-owned GPU tensors on the encoder stream before readyEvent is recorded.
 class PhaseVisionAdapter
 {
 public:
@@ -62,6 +73,7 @@ public:
     PhaseVisionAdapter& operator=(PhaseVisionAdapter const&) = delete;
 
     bool submit(uint64_t requestId, LLMGenerationRequest const& request);
+    bool submit(std::vector<PhaseVisionSubmission> submissions);
     bool ready(uint64_t requestId) const;
     std::unique_ptr<PhaseVisionPayload> take(uint64_t requestId);
     bool cancel(uint64_t requestId);
@@ -69,7 +81,9 @@ public:
     CUcontext cudaContext() const noexcept;
 
 private:
-    static Tensor copyTensor(Tensor const& source, std::string const& name, cudaStream_t stream);
+    static Tensor copyTensorRows(
+        Tensor const& source, int64_t rowOffset, int64_t rowCount, std::string const& name, cudaStream_t stream);
+    void releaseBatchStorageIfIdle();
 
     MultimodalRunner& mRunner;
     tokenizer::Tokenizer const& mTokenizer;
@@ -77,6 +91,8 @@ private:
     cudaStream_t mStream{};
     CUcontext mCudaContext{};
     std::unordered_map<uint64_t, std::unique_ptr<PhaseVisionPayload>> mRequests;
+    std::optional<LLMGenerationRequest> mBatchedRequest;
+    Tensor mBatchedMrope;
 };
 
 } // namespace trt_edgellm::rt

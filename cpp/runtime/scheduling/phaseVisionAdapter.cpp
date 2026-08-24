@@ -20,6 +20,9 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <algorithm>
+#include <numeric>
+#include <unordered_set>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -52,6 +55,18 @@ size_t PhaseVisionPayload::byteSize() const noexcept
     return result;
 }
 
+std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> const& tokenIds, int32_t imageTokenId)
+{
+    ELLM_CHECK(imageTokenId >= 0, "Phase vision batching requires a configured image token ID");
+    std::vector<int64_t> result;
+    result.reserve(tokenIds.size());
+    for (auto const& row : tokenIds)
+    {
+        result.push_back(static_cast<int64_t>(std::count(row.begin(), row.end(), imageTokenId)));
+    }
+    return result;
+}
+
 PhaseVisionAdapter::PhaseVisionAdapter(
     MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer, LLMEngineConfig const& config, cudaStream_t stream)
     : mRunner(runner)
@@ -64,50 +79,151 @@ PhaseVisionAdapter::PhaseVisionAdapter(
     ELLM_CHECK(mCudaContext != nullptr, "Phase vision stream has no CUDA context");
 }
 
-Tensor PhaseVisionAdapter::copyTensor(Tensor const& source, std::string const& name, cudaStream_t stream)
+Tensor PhaseVisionAdapter::copyTensorRows(
+    Tensor const& source, int64_t rowOffset, int64_t rowCount, std::string const& name, cudaStream_t stream)
 {
     ELLM_CHECK(!source.isEmpty() && source.getDeviceType() == DeviceType::kGPU,
         "Phase vision output must be a non-empty GPU tensor");
-    Tensor result(source.getShape(), DeviceType::kGPU, source.getDataType(), name);
-    size_t const bytes = static_cast<size_t>(source.getShape().volume()) * utils::getTypeSize(source.getDataType());
-    CUDA_CHECK(cudaMemcpyAsync(result.rawPointer(), source.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+    Coords const sourceShape = source.getShape();
+    ELLM_CHECK(sourceShape.getNumDims() > 0 && rowOffset >= 0 && rowCount > 0 && rowOffset + rowCount <= sourceShape[0],
+        "Phase vision row slice is outside the source tensor");
+    std::vector<int64_t> resultShape;
+    resultShape.reserve(static_cast<size_t>(sourceShape.getNumDims()));
+    resultShape.push_back(rowCount);
+    for (int32_t dim = 1; dim < sourceShape.getNumDims(); ++dim)
+    {
+        resultShape.push_back(sourceShape[dim]);
+    }
+    int64_t const elementsPerRow = sourceShape.volume() / sourceShape[0];
+    size_t const elementBytes = utils::getTypeSize(source.getDataType());
+    size_t const offsetBytes = static_cast<size_t>(rowOffset * elementsPerRow) * elementBytes;
+    size_t const copyBytes = static_cast<size_t>(rowCount * elementsPerRow) * elementBytes;
+    Tensor result(Coords(resultShape), DeviceType::kGPU, source.getDataType(), name);
+    auto const* sourceBytes = static_cast<std::byte const*>(source.rawPointer());
+    CUDA_CHECK(
+        cudaMemcpyAsync(result.rawPointer(), sourceBytes + offsetBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
     return result;
 }
 
 bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& request)
 {
-    ELLM_CHECK(mRequests.empty(), "Phase vision adapter currently permits one in-flight encoder request");
-    request.formattedRequests.resize(request.requests.size());
-    for (size_t index = 0; index < request.requests.size(); ++index)
+    return submit(std::vector<PhaseVisionSubmission>{{requestId, request}});
+}
+
+bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
+{
+    ELLM_CHECK(mRequests.empty(), "Phase vision adapter currently permits one in-flight encoder batch");
+    ELLM_CHECK(!submissions.empty(), "Phase vision encoder batch cannot be empty");
+    std::unordered_set<uint64_t> requestIds;
+    requestIds.reserve(submissions.size());
+    for (auto const& submission : submissions)
     {
-        ELLM_CHECK(mTokenizer.applyChatTemplate(request.requests[index], request.formattedRequests[index],
-                       request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
+        ELLM_CHECK(requestIds.insert(submission.requestId).second, "Duplicate request ID in phase vision batch");
+        ELLM_CHECK(submission.request.requests.size() == 1U,
+            "Each phase vision submission must contain exactly one logical request");
+    }
+
+    LLMGenerationRequest batchedRequest = std::move(submissions.front().request);
+    for (size_t index = 1; index < submissions.size(); ++index)
+    {
+        LLMGenerationRequest& request = submissions[index].request;
+        ELLM_CHECK(request.applyChatTemplate == batchedRequest.applyChatTemplate
+                && request.addGenerationPrompt == batchedRequest.addGenerationPrompt
+                && request.enableThinking == batchedRequest.enableThinking,
+            "Phase vision encoder batch requires identical chat formatting options");
+        batchedRequest.requests.push_back(std::move(request.requests.front()));
+    }
+    batchedRequest.formattedRequests.resize(batchedRequest.requests.size());
+    batchedRequest.streamChannels.clear();
+    for (size_t index = 0; index < batchedRequest.requests.size(); ++index)
+    {
+        ELLM_CHECK(
+            mTokenizer.applyChatTemplate(batchedRequest.requests[index], batchedRequest.formattedRequests[index],
+                batchedRequest.applyChatTemplate, batchedRequest.addGenerationPrompt, batchedRequest.enableThinking),
             "Failed to format phase vision request");
     }
-    auto payload = std::make_unique<PhaseVisionPayload>();
-    CUDA_CHECK(cudaEventCreate(&payload->startEvent));
-    CUDA_CHECK(cudaEventCreate(&payload->readyEvent));
-    CUDA_CHECK(cudaEventRecord(payload->startEvent, mStream));
-    if (mConfig.ropeConfig.type == RopeType::kMRope)
+    mBatchedRequest.emplace(std::move(batchedRequest));
+
+    std::vector<std::unique_ptr<PhaseVisionPayload>> payloads;
+    payloads.reserve(submissions.size());
+    try
     {
-        int64_t const activeBatchSize = static_cast<int64_t>(request.requests.size());
-        ELLM_CHECK(activeBatchSize > 0 && activeBatchSize <= mConfig.maxSupportedBatchSize,
-            "Phase vision M-RoPE batch is outside the engine profile");
-        payload->mropeCosSin = Tensor({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
-            DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_vision_mrope");
+        for (size_t index = 0; index < submissions.size(); ++index)
+        {
+            auto payload = std::make_unique<PhaseVisionPayload>();
+            CUDA_CHECK(cudaEventCreate(&payload->startEvent));
+            CUDA_CHECK(cudaEventCreate(&payload->readyEvent));
+            CUDA_CHECK(cudaEventRecord(payload->startEvent, mStream));
+            payloads.push_back(std::move(payload));
+        }
+
+        if (mConfig.ropeConfig.type == RopeType::kMRope)
+        {
+            int64_t const activeBatchSize = static_cast<int64_t>(submissions.size());
+            ELLM_CHECK(activeBatchSize <= mConfig.maxSupportedBatchSize,
+                "Phase vision M-RoPE batch is outside the engine profile");
+            mBatchedMrope = Tensor({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, DeviceType::kGPU,
+                nvinfer1::DataType::kFLOAT, "phase_vision_batched_mrope");
+        }
+        OptionalOutputTensor mrope
+            = mBatchedMrope.isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(mBatchedMrope)};
+        std::vector<std::vector<int32_t>> batchedTokenIds;
+        ELLM_CHECK(mRunner.preprocess(*mBatchedRequest, batchedTokenIds, &mTokenizer, mrope, mStream),
+            "Phase vision preprocessing failed");
+        ELLM_CHECK(mRunner.infer(mStream), "Phase vision inference failed");
+        ELLM_CHECK(batchedTokenIds.size() == submissions.size(),
+            "Phase vision preprocessing returned the wrong logical batch size");
+
+        std::vector<int64_t> const embeddingRows = phaseVisionEmbeddingRows(batchedTokenIds, mConfig.imageTokenId);
+        int64_t const totalEmbeddingRows = std::accumulate(embeddingRows.begin(), embeddingRows.end(), int64_t{});
+        Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
+        ELLM_CHECK(outputEmbedding.getShape().getNumDims() > 0 && outputEmbedding.getShape()[0] == totalEmbeddingRows,
+            "Phase vision embedding rows do not match expanded image-token rows");
+        OptionalInputTensors const deepstackFeatures = mRunner.getDeepstackFeatures();
+        for (Tensor const& feature : deepstackFeatures)
+        {
+            ELLM_CHECK(feature.getShape().getNumDims() > 0 && feature.getShape()[0] == totalEmbeddingRows,
+                "Phase vision deepstack rows do not match expanded image-token rows");
+        }
+
+        int64_t embeddingOffset{};
+        for (size_t index = 0; index < submissions.size(); ++index)
+        {
+            int64_t const rowCount = embeddingRows[index];
+            ELLM_CHECK(rowCount > 0, "Phase vision logical request produced no image embedding rows");
+            PhaseVisionPayload& payload = *payloads[index];
+            payload.tokenIds.push_back(std::move(batchedTokenIds[index]));
+            payload.outputEmbedding
+                = copyTensorRows(outputEmbedding, embeddingOffset, rowCount, "phase_vision_output", mStream);
+            for (Tensor const& feature : deepstackFeatures)
+            {
+                payload.deepstackFeatures.push_back(
+                    copyTensorRows(feature, embeddingOffset, rowCount, "phase_vision_deepstack", mStream));
+            }
+            if (!mBatchedMrope.isEmpty())
+            {
+                payload.mropeCosSin
+                    = copyTensorRows(mBatchedMrope, static_cast<int64_t>(index), 1, "phase_vision_mrope", mStream);
+            }
+            embeddingOffset += rowCount;
+            CUDA_CHECK(cudaEventRecord(payload.readyEvent, mStream));
+        }
+        ELLM_CHECK(embeddingOffset == totalEmbeddingRows, "Phase vision embedding slicing did not consume all rows");
     }
-    OptionalOutputTensor mrope
-        = payload->mropeCosSin.isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(payload->mropeCosSin)};
-    ELLM_CHECK(mRunner.preprocess(request, payload->tokenIds, &mTokenizer, mrope, mStream),
-        "Phase vision preprocessing failed");
-    ELLM_CHECK(mRunner.infer(mStream), "Phase vision inference failed");
-    payload->outputEmbedding = copyTensor(mRunner.getOutputEmbedding(), "phase_vision_output", mStream);
-    for (Tensor const& feature : mRunner.getDeepstackFeatures())
+    catch (...)
     {
-        payload->deepstackFeatures.push_back(copyTensor(feature, "phase_vision_deepstack", mStream));
+        static_cast<void>(cudaStreamSynchronize(mStream));
+        mBatchedMrope = Tensor{};
+        mBatchedRequest.reset();
+        throw;
     }
-    CUDA_CHECK(cudaEventRecord(payload->readyEvent, mStream));
-    return mRequests.emplace(requestId, std::move(payload)).second;
+
+    for (size_t index = 0; index < submissions.size(); ++index)
+    {
+        ELLM_CHECK(mRequests.emplace(submissions[index].requestId, std::move(payloads[index])).second,
+            "Failed to register phase vision batch request");
+    }
+    return true;
 }
 
 bool PhaseVisionAdapter::ready(uint64_t requestId) const
@@ -131,6 +247,7 @@ std::unique_ptr<PhaseVisionPayload> PhaseVisionAdapter::take(uint64_t requestId)
     CUDA_CHECK(cudaEventElapsedTime(&it->second->encoderGpuMs, it->second->startEvent, it->second->readyEvent));
     std::unique_ptr<PhaseVisionPayload> result = std::move(it->second);
     mRequests.erase(it);
+    releaseBatchStorageIfIdle();
     return result;
 }
 
@@ -142,6 +259,7 @@ bool PhaseVisionAdapter::cancel(uint64_t requestId)
         return false;
     }
     mRequests.erase(it);
+    releaseBatchStorageIfIdle();
     return true;
 }
 
@@ -153,6 +271,16 @@ bool PhaseVisionAdapter::busy() const noexcept
 CUcontext PhaseVisionAdapter::cudaContext() const noexcept
 {
     return mCudaContext;
+}
+
+void PhaseVisionAdapter::releaseBatchStorageIfIdle()
+{
+    if (!mRequests.empty())
+    {
+        return;
+    }
+    mBatchedMrope = Tensor{};
+    mBatchedRequest.reset();
 }
 
 } // namespace trt_edgellm::rt
