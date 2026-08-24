@@ -367,6 +367,11 @@ size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept
     return mDecodeRefillWaitCount;
 }
 
+float IndependentPhaseAsyncServer::decodeTpotPressure() const noexcept
+{
+    return mCoordinator.scheduler().telemetry().recentDecodeTpotPressure;
+}
+
 bool IndependentPhaseAsyncServer::throughputMode() const noexcept
 {
     return mThroughputMode;

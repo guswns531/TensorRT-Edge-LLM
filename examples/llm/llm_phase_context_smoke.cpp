@@ -107,6 +107,73 @@ struct PhaseTiming
     float makespanMs{};
 };
 
+class CudaEventAccumulator
+{
+public:
+    explicit CudaEventAccumulator(bool enabled)
+        : mEnabled(enabled)
+    {
+    }
+
+    ~CudaEventAccumulator() noexcept
+    {
+        for (Interval const& interval : mIntervals)
+        {
+            static_cast<void>(cudaEventDestroy(interval.start));
+            static_cast<void>(cudaEventDestroy(interval.end));
+        }
+    }
+
+    void begin(cudaStream_t stream)
+    {
+        if (!mEnabled)
+        {
+            return;
+        }
+        Interval interval;
+        CUDA_CHECK(cudaEventCreate(&interval.start));
+        CUDA_CHECK(cudaEventCreate(&interval.end));
+        CUDA_CHECK(cudaEventRecord(interval.start, stream));
+        mIntervals.push_back(interval);
+    }
+
+    void end(cudaStream_t stream)
+    {
+        if (mEnabled)
+        {
+            CUDA_CHECK(cudaEventRecord(mIntervals.back().end, stream));
+        }
+    }
+
+    float milliseconds()
+    {
+        float result{};
+        for (Interval const& interval : mIntervals)
+        {
+            CUDA_CHECK(cudaEventSynchronize(interval.end));
+            float elapsed{};
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed, interval.start, interval.end));
+            result += elapsed;
+        }
+        return result;
+    }
+
+    size_t size() const noexcept
+    {
+        return mIntervals.size();
+    }
+
+private:
+    struct Interval
+    {
+        cudaEvent_t start{};
+        cudaEvent_t end{};
+    };
+
+    bool mEnabled{};
+    std::vector<Interval> mIntervals;
+};
+
 class SamplingSlotPool
 {
 public:
@@ -675,10 +742,23 @@ int main(int argc, char** argv)
         size_t segmentedVisionBytes{};
         size_t mropeD2DOperations{};
         size_t mropeD2DBytes{};
+        size_t mropeFullRowD2DBytes{};
+        int32_t mropeCopyGranularity = std::min(512, config.maxKVCacheCapacity);
+        if (char const* value = std::getenv("TRT_EDGELLM_MROPE_COPY_GRANULARITY"))
+        {
+            mropeCopyGranularity = std::stoi(value);
+        }
+        ELLM_CHECK(mropeCopyGranularity > 0 && mropeCopyGranularity <= config.maxKVCacheCapacity,
+            "M-RoPE copy granularity is outside the cache capacity");
+        CudaEventAccumulator mropeCopyTiming(std::getenv("TRT_EDGELLM_PROFILE_MROPE_D2D") != nullptr);
         rt::Tensor textOnlyMropeTemplate;
         std::vector<std::optional<uint64_t>> prefillMropeOwners(
             static_cast<size_t>(config.maxSupportedPrefillBatchSize));
         std::vector<std::optional<uint64_t>> decodeMropeOwners(static_cast<size_t>(config.maxSupportedDecodeBatchSize));
+        std::vector<int32_t> prefillMropeValid(
+            static_cast<size_t>(config.maxSupportedPrefillBatchSize), config.maxKVCacheCapacity);
+        std::vector<int32_t> decodeMropeValid(
+            static_cast<size_t>(config.maxSupportedDecodeBatchSize), config.maxKVCacheCapacity);
         if (config.ropeConfig.type == rt::RopeType::kMRope)
         {
             textOnlyMropeTemplate = rt::Tensor({1, config.maxKVCacheCapacity, config.rotaryDim}, rt::DeviceType::kGPU,
@@ -798,25 +878,52 @@ int main(int argc, char** argv)
             if (config.ropeConfig.type == rt::RopeType::kMRope)
             {
                 std::vector<std::optional<uint64_t>>& owners = prefill ? prefillMropeOwners : decodeMropeOwners;
+                std::vector<int32_t>& validPositions = prefill ? prefillMropeValid : decodeMropeValid;
+                size_t const positionBytes
+                    = static_cast<size_t>(config.rotaryDim) * rt::utils::getTypeSize(nvinfer1::DataType::kFLOAT);
                 size_t const rowBytes = static_cast<size_t>(config.maxKVCacheCapacity) * config.rotaryDim
                     * rt::utils::getTypeSize(nvinfer1::DataType::kFLOAT);
+                bool timingStarted{};
                 for (size_t row{}; row < views.size(); ++row)
                 {
                     rt::PhaseVisionPayload* const payload = views[row].visionPayload;
                     std::optional<uint64_t> const desiredOwner = payload != nullptr && !payload->mropeCosSin.isEmpty()
                         ? std::optional<uint64_t>{views[row].work.requestId}
                         : std::nullopt;
-                    if (owners[row] == desiredOwner)
+                    bool const ownerChanged = owners[row] != desiredOwner;
+                    int32_t const requiredPositions = prefill ? views[row].work.tokenOffset + views[row].work.tokenCount
+                                                              : views[row].work.tokenCount + 1;
+                    rt::PhaseMropeStagingRange const range = rt::phaseMropeStagingRange(ownerChanged,
+                        validPositions[row], requiredPositions, config.maxKVCacheCapacity, mropeCopyGranularity);
+                    if (ownerChanged)
                     {
-                        continue;
+                        mropeFullRowD2DBytes += rowBytes;
                     }
-                    rt::Tensor const& source = desiredOwner.has_value() ? payload->mropeCosSin : textOnlyMropeTemplate;
-                    auto* const destination = static_cast<std::byte*>(io.mropeCosSin.rawPointer()) + row * rowBytes;
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(destination, source.rawPointer(), rowBytes, cudaMemcpyDeviceToDevice, stream));
-                    ++mropeD2DOperations;
-                    mropeD2DBytes += rowBytes;
                     owners[row] = desiredOwner;
+                    validPositions[row] = range.validPositions;
+                    if (range.countPositions > 0)
+                    {
+                        if (!timingStarted)
+                        {
+                            mropeCopyTiming.begin(stream);
+                            timingStarted = true;
+                        }
+                        rt::Tensor const& source
+                            = desiredOwner.has_value() ? payload->mropeCosSin : textOnlyMropeTemplate;
+                        size_t const copyOffset = static_cast<size_t>(range.offsetPositions) * positionBytes;
+                        size_t const copyBytes = static_cast<size_t>(range.countPositions) * positionBytes;
+                        auto* const destination
+                            = static_cast<std::byte*>(io.mropeCosSin.rawPointer()) + row * rowBytes + copyOffset;
+                        auto const* const sourceBytes = static_cast<std::byte const*>(source.rawPointer()) + copyOffset;
+                        CUDA_CHECK(
+                            cudaMemcpyAsync(destination, sourceBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
+                        ++mropeD2DOperations;
+                        mropeD2DBytes += copyBytes;
+                    }
+                }
+                if (timingStarted)
+                {
+                    mropeCopyTiming.end(stream);
                 }
                 map.set(binding_names::kRopeCosSin, io.mropeCosSin);
             }
@@ -978,6 +1085,8 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.maxPrefillCohortSize = semanticSchedulerConfig.maxPrefillBatchSize;
         semanticSchedulerConfig.maxPrefillCohortTurns = 8;
         semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
+        semanticSchedulerConfig.enableDecodeTpotTelemetry
+            = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr;
         semanticSchedulerConfig.minPrefillChunkTokens = 32;
         semanticSchedulerConfig.prefillChunkAlignment = 8;
         semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
@@ -1295,6 +1404,10 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.maxEncodedInFlight = static_cast<size_t>(std::stoul(value));
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION"))
+                {
+                    threePhaseConfig.throughputMaxEncodedInFlight = static_cast<size_t>(std::stoul(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION_BYTES"))
                 {
                     threePhaseConfig.maxEncodedBytes = static_cast<size_t>(std::stoull(value));
@@ -1314,6 +1427,14 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_TTFT_TARGET_MS"))
                 {
                     threePhaseConfig.visionTtftTargetUs = std::stod(value) * 1000.0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_LOOKAHEAD_ESCALATION_RATIO"))
+                {
+                    threePhaseConfig.lookaheadEscalationRatio = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_LOOKAHEAD_TPOT_PRESSURE_LIMIT"))
+                {
+                    threePhaseConfig.lookaheadDecodeTpotPressureLimit = std::stof(value);
                 }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
@@ -1714,9 +1835,10 @@ int main(int argc, char** argv)
             LOG_INFO(
                 "Phase staging memory ops: segmented_vision_batches=%zu segmented_vision_sources=%zu "
                 "segmented_vision_bytes=%zu vision_pack_d2d_operations=0 vision_pack_d2d_bytes=0 "
-                "mrope_d2d_operations=%zu mrope_d2d_bytes=%zu",
-                segmentedVisionBatches, segmentedVisionSources, segmentedVisionBytes, mropeD2DOperations,
-                mropeD2DBytes);
+                "mrope_d2d_operations=%zu mrope_d2d_bytes=%zu mrope_full_row_d2d_bytes=%zu "
+                "mrope_copy_granularity=%d mrope_timed_batches=%zu mrope_gpu_ms=%.3f",
+                segmentedVisionBatches, segmentedVisionSources, segmentedVisionBytes, mropeD2DOperations, mropeD2DBytes,
+                mropeFullRowD2DBytes, mropeCopyGranularity, mropeCopyTiming.size(), mropeCopyTiming.milliseconds());
             auto logKVMemoryOps = [](char const* phase, rt::PhaseKVMemoryStats const& memory,
                                       rt::KVPageTableUploadStats const& pageTable) {
                 LOG_INFO(
@@ -1743,13 +1865,17 @@ int main(int argc, char** argv)
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
                     "pending=%zu downstream=%zu bytes=%zu "
-                    "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms",
+                    "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
+                    "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
+                    "decode_tpot_pressure=%.3f",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
                     visionMetrics.pendingVisionRequests, visionMetrics.downstreamEncodedRequests,
                     visionMetrics.downstreamEncodedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
                     visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
-                    visionMetrics.maxEncoderGpuMs);
+                    visionMetrics.maxEncoderGpuMs, visionMetrics.effectiveEncodedCapacity,
+                    visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
+                    visionMetrics.decodeTpotPressure);
                 rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();
                 LOG_INFO(
                     "Phase vision memory ops: slab_allocations=%zu slab_reuses=%zu slab_reclaims=%zu "

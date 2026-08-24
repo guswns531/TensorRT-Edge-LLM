@@ -1740,7 +1740,7 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         updateEwma(mTelemetry.overlapRatio, metrics.overlapRatio);
         ++mTelemetry.overlapSampleCount;
     }
-    bool const collectDecodeTpot = mConfig.enableTpotHysteresis
+    bool const collectDecodeTpot = mConfig.enableTpotHysteresis || mConfig.enableDecodeTpotTelemetry
         || (mConfig.enableAdaptivePrefillChunking && !mConfig.adaptivePrefillChunkCandidates.empty());
     if (collectDecodeTpot && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F)
     {

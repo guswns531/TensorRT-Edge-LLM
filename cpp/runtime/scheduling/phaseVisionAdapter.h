@@ -56,6 +56,18 @@ struct PhaseVisionMemoryStats
     size_t idleStorageBytes{};
 };
 
+//! Incremental row interval required when staging request-owned M-RoPE data.
+struct PhaseMropeStagingRange
+{
+    int32_t offsetPositions{};
+    int32_t countPositions{};
+    int32_t validPositions{};
+};
+
+//! Compute the newly required M-RoPE prefix, rounded to a bounded copy granularity.
+PhaseMropeStagingRange phaseMropeStagingRange(
+    bool ownerChanged, int32_t validPositions, int32_t requiredPositions, int32_t capacity, int32_t granularity);
+
 //! Request-owned encoder output retained until the corresponding prefill completes.
 struct PhaseVisionPayload
 {

@@ -66,6 +66,21 @@ bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDo
     return estimatedPayloadBytes <= remainingBytes / additionalRequests;
 }
 
+size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
+    double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio, float decodeTpotPressure,
+    float decodeTpotPressureLimit) noexcept
+{
+    size_t const highCapacity = std::max(latencyCapacity, throughputCapacity);
+    if (highCapacity == latencyCapacity)
+    {
+        return latencyCapacity;
+    }
+    bool const decodeProtected = decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit;
+    bool const visionLate = escalationRatio > 0.0 && visionTtftTargetUs > 0.0
+        && oldestVisionAgeUs >= visionTtftTargetUs * escalationRatio;
+    return !decodeProtected && (throughputMode || visionLate) ? highCapacity : latencyCapacity;
+}
+
 PhaseThreeCoordinator::PhaseThreeCoordinator(
     PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server, PhaseThreeCoordinatorConfig config)
     : mVision(vision)
@@ -73,6 +88,9 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mConfig(config)
 {
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
+    ELLM_CHECK(
+        mConfig.throughputMaxEncodedInFlight == 0 || mConfig.throughputMaxEncodedInFlight >= mConfig.maxEncodedInFlight,
+        "Three-phase throughput encoded capacity cannot be below the latency capacity");
     ELLM_CHECK(mConfig.maxEncoderBatchSize > 0, "Three-phase encoder batch size must be positive");
     ELLM_CHECK(mConfig.maxEncoderBatchSize <= mConfig.maxEncodedInFlight,
         "Three-phase encoder batch size cannot exceed downstream encoded capacity");
@@ -80,6 +98,11 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Three-phase encoder batch wait must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.visionTtftTargetUs) && mConfig.visionTtftTargetUs >= 0.0,
         "Three-phase vision TTFT target must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.lookaheadEscalationRatio) && mConfig.lookaheadEscalationRatio >= 0.0,
+        "Three-phase lookahead escalation ratio must be finite and non-negative");
+    ELLM_CHECK(
+        std::isfinite(mConfig.lookaheadDecodeTpotPressureLimit) && mConfig.lookaheadDecodeTpotPressureLimit >= 0.0F,
+        "Three-phase lookahead decode pressure limit must be finite and non-negative");
     ELLM_CHECK(mVision.cudaContext() == mServer.cudaContext(),
         "Encoder and LLM phase server must share one CUDA primary context");
 }
@@ -160,6 +183,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.maxEncoderQueueWaitUs = mMaxEncoderQueueWaitUs;
     result.lastEncoderGpuMs = mLastEncoderGpuMs;
     result.maxEncoderGpuMs = mMaxEncoderGpuMs;
+    result.effectiveEncodedCapacity = effectiveEncodedCapacity();
+    result.maxEffectiveEncodedCapacity = mMaxEffectiveEncodedCapacity;
+    result.lookaheadEscalations = mLookaheadEscalations;
+    result.decodeTpotPressure = mServer.decodeTpotPressure();
     if (!mPending.empty())
     {
         result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
@@ -201,6 +228,14 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         return false;
     }
+
+    size_t const encodedCapacity = effectiveEncodedCapacity();
+    if (encodedCapacity > mLastEffectiveEncodedCapacity && mLastEffectiveEncodedCapacity > 0)
+    {
+        ++mLookaheadEscalations;
+    }
+    mLastEffectiveEncodedCapacity = encodedCapacity;
+    mMaxEffectiveEncodedCapacity = std::max(mMaxEffectiveEncodedCapacity, encodedCapacity);
 
     std::vector<PhaseVisionSubmission> submissions;
     submissions.reserve(batchSize);
@@ -304,8 +339,28 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
 
 bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) const noexcept
 {
-    return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), mConfig.maxEncodedInFlight,
+    return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), effectiveEncodedCapacity(),
         mDownstreamEncodedBytes, mConfig.maxEncodedBytes, mEstimatedEncodedBytes, additionalRequests);
+}
+
+size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept
+{
+    double oldestVisionAgeUs{};
+    double visionTtftTargetUs = mConfig.visionTtftTargetUs;
+    if (!mPending.empty())
+    {
+        PendingVisionRequest const& oldest = mPending.front();
+        oldestVisionAgeUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - oldest.scheduling.submittedAt)
+                                .count();
+        if (oldest.scheduling.ttftTargetUs > 0.0)
+        {
+            visionTtftTargetUs = oldest.scheduling.ttftTargetUs;
+        }
+    }
+    return phaseVisionEffectiveEncodedCapacity(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight,
+        mServer.throughputMode(), oldestVisionAgeUs, visionTtftTargetUs, mConfig.lookaheadEscalationRatio,
+        mServer.decodeTpotPressure(), mConfig.lookaheadDecodeTpotPressureLimit);
 }
 
 size_t PhaseThreeCoordinator::mediaItemCount(PendingVisionRequest const& pending) noexcept

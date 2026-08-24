@@ -1760,10 +1760,62 @@ TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadByte
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 0, 0, 0));
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGuard)
+{
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, false, 900000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, false, 1000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 4);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, true, 0.0, 2500000.0, 0.4, 0.2F, 0.8F), 4);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, true, 2000000.0, 2500000.0, 0.4, 0.8F, 0.8F), 2);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 0, true, 2000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
+}
+
+TEST(PhaseQueueSchedulerTest, CollectsDecodeTpotForExternalPolicyWithoutHysteresis)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableDecodeTpotTelemetry = true;
+    config.tpotHysteresisWindow = 2;
+    config.minTpotHysteresisSamples = 2;
+    config.decodeQueueWaitTargetUs = 2000.0;
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kDecode;
+    metrics.decodeBatchSize = 4;
+    metrics.decodeGpuMs = 4.0F;
+    scheduler.observeMetrics(metrics);
+    scheduler.observeMetrics(metrics);
+
+    EXPECT_EQ(scheduler.telemetry().decodeTpotSampleCount, 2);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().recentDecodeTpotPressure, 2.0F);
+    EXPECT_FALSE(scheduler.telemetry().latencySafeFallback);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, CountsPerRequestVisionEmbeddingRows)
 {
     std::vector<std::vector<int32_t>> const tokenIds{{1, 7, 7, 2}, {7, 3}, {4, 5}};
     EXPECT_EQ(phaseVisionEmbeddingRows(tokenIds, 7), (std::vector<int64_t>{2, 1, 0}));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, StagesOnlyNewMropePrefix)
+{
+    PhaseMropeStagingRange range = phaseMropeStagingRange(true, 2048, 257, 2048, 128);
+    EXPECT_EQ(range.offsetPositions, 0);
+    EXPECT_EQ(range.countPositions, 384);
+    EXPECT_EQ(range.validPositions, 384);
+
+    range = phaseMropeStagingRange(false, range.validPositions, 385, 2048, 128);
+    EXPECT_EQ(range.offsetPositions, 384);
+    EXPECT_EQ(range.countPositions, 128);
+    EXPECT_EQ(range.validPositions, 512);
+
+    range = phaseMropeStagingRange(false, range.validPositions, 500, 2048, 128);
+    EXPECT_EQ(range.countPositions, 0);
+    EXPECT_EQ(range.validPositions, 512);
+
+    range = phaseMropeStagingRange(true, range.validPositions, 2048, 2048, 128);
+    EXPECT_EQ(range.offsetPositions, 0);
+    EXPECT_EQ(range.countPositions, 2048);
+    EXPECT_EQ(range.validPositions, 2048);
 }
 
 } // namespace

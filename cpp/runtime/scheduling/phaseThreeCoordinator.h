@@ -42,6 +42,8 @@ struct PhaseThreeCoordinatorConfig
 {
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
+    //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
+    size_t throughputMaxEncodedInFlight{};
     //! Optional byte budget for downstream request-owned vision payloads. Zero disables the byte gate.
     size_t maxEncodedBytes{};
     //! Maximum logical requests coalesced into one vision encoder execution. One preserves legacy behavior.
@@ -52,6 +54,10 @@ struct PhaseThreeCoordinatorConfig
     double encoderBatchWaitUs{};
     //! Default end-to-end image TTFT SLO, including encoder queue and execution. Zero inherits the LLM default.
     double visionTtftTargetUs{2500000.0};
+    //! Escalate lookahead after this fraction of the oldest vision request's TTFT target. Zero disables age escalation.
+    double lookaheadEscalationRatio{0.4};
+    //! Do not escalate lookahead at or above this observed decode TPOT pressure. Zero disables the guard.
+    float lookaheadDecodeTpotPressureLimit{0.8F};
 };
 
 struct PhaseThreeCoordinatorMetrics
@@ -69,7 +75,16 @@ struct PhaseThreeCoordinatorMetrics
     double maxEncoderQueueWaitUs{};
     float lastEncoderGpuMs{};
     float maxEncoderGpuMs{};
+    size_t effectiveEncodedCapacity{};
+    size_t maxEffectiveEncodedCapacity{};
+    size_t lookaheadEscalations{};
+    float decodeTpotPressure{};
 };
+
+//! Select latency or throughput vision lookahead from queue age and observed decode pressure.
+size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
+    double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio, float decodeTpotPressure,
+    float decodeTpotPressureLimit) noexcept;
 
 //! Normalize image scheduling at HTTP arrival so encoder time remains part of TTFT age.
 PhaseSchedulingHints phaseVisionSchedulingHints(PhaseSchedulingHints scheduling, double defaultTtftTargetUs,
@@ -110,6 +125,7 @@ private:
     bool completeEncoder();
     size_t nextEncoderBatchSize() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
+    size_t effectiveEncodedCapacity() const noexcept;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
 
     PhaseVisionAdapter& mVision;
@@ -131,6 +147,9 @@ private:
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};
     float mMaxEncoderGpuMs{};
+    size_t mMaxEffectiveEncodedCapacity{};
+    size_t mLookaheadEscalations{};
+    size_t mLastEffectiveEncodedCapacity{};
 };
 
 } // namespace trt_edgellm::rt

@@ -348,6 +348,8 @@ struct PhaseQueueSchedulerConfig
     //! Disable cap-exceeding cost-aware overlap when recent decode TPOT p95
     //! reaches the enter ratio, and restore it only below the exit ratio.
     bool enableTpotHysteresis{};
+    //! Collect decode TPOT pressure for external admission policies without changing phase decisions.
+    bool enableDecodeTpotTelemetry{};
     float tpotHysteresisEnterRatio{0.8F};
     float tpotHysteresisExitRatio{0.6F};
     size_t tpotHysteresisWindow{32};

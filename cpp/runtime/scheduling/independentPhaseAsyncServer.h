@@ -192,6 +192,7 @@ public:
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
     size_t decodeRefillWaitCount() const noexcept;
+    float decodeTpotPressure() const noexcept;
     bool throughputMode() const noexcept;
     size_t throughputModeTransitionCount() const noexcept;
     bool empty() const noexcept;

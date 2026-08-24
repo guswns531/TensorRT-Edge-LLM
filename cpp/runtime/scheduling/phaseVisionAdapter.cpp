@@ -104,6 +104,24 @@ std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> 
     return result;
 }
 
+PhaseMropeStagingRange phaseMropeStagingRange(
+    bool ownerChanged, int32_t validPositions, int32_t requiredPositions, int32_t capacity, int32_t granularity)
+{
+    ELLM_CHECK(capacity > 0 && granularity > 0, "M-RoPE staging capacity and granularity must be positive");
+    ELLM_CHECK(requiredPositions >= 0 && requiredPositions <= capacity,
+        "M-RoPE staging requirement is outside the cache capacity");
+    ELLM_CHECK(
+        validPositions >= 0 && validPositions <= capacity, "M-RoPE staging valid prefix is outside the cache capacity");
+    int32_t const copyOffset = ownerChanged ? 0 : validPositions;
+    if (requiredPositions <= copyOffset)
+    {
+        return {copyOffset, 0, copyOffset};
+    }
+    int64_t const rounded = (static_cast<int64_t>(requiredPositions) + granularity - 1) / granularity * granularity;
+    int32_t const copyEnd = static_cast<int32_t>(std::min<int64_t>(capacity, rounded));
+    return {copyOffset, copyEnd - copyOffset, copyEnd};
+}
+
 PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
     LLMEngineConfig const& config, cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy)
     : mRunner(runner)
