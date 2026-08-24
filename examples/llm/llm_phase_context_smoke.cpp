@@ -1119,8 +1119,9 @@ int main(int argc, char** argv)
             std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
             if (visionEngineDir != nullptr)
             {
-                ELLM_CHECK(!config.packedPrefill,
-                    "Three-phase vision requires a dense prefill profile; packed-prefill v1 is text-only");
+                ELLM_CHECK(
+                    !config.packedPrefill || config.maxPackedPrefillChunkTokens >= config.maxSupportedInputLength,
+                    "Three-phase packed vision requires an atomic packed-prefill chunk covering maxInputLength");
                 CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
                 ipcVisionRunner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
