@@ -18,6 +18,7 @@ COPY cpp/runtime/state/stableKVPageManager.cpp cpp/runtime/state/stableKVPageMan
 COPY cpp/runtime/state/stableKVPageManager.h cpp/runtime/state/stableKVPageManager.h
 COPY examples/llm/llm_phase_context_smoke.cpp examples/llm/llm_phase_context_smoke.cpp
 COPY scripts/phase_openai_gateway.py scripts/phase_openai_gateway.py
+COPY experiments/qwen38_thor/run_phase_server.sh experiments/qwen38_thor/run_phase_server.sh
 COPY unittests/phaseRecurrentStateActiveViewTest.cpp unittests/phaseRecurrentStateActiveViewTest.cpp
 COPY unittests/phaseQueueSchedulerTest.cpp unittests/phaseQueueSchedulerTest.cpp
 COPY unittests/stableKVPageManagerTest.cpp unittests/stableKVPageManagerTest.cpp

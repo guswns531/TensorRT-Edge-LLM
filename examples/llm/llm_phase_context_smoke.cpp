@@ -857,6 +857,22 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
         semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
+        std::string const servingPreset
+            = std::getenv("TRT_EDGELLM_SERVING_PRESET") != nullptr ? std::getenv("TRT_EDGELLM_SERVING_PRESET") : "";
+        bool const thorThroughputPreset = servingPreset == "thor-throughput";
+        bool const thorLatencyPreset = servingPreset == "thor-latency";
+        ELLM_CHECK(servingPreset.empty() || thorThroughputPreset || thorLatencyPreset,
+            "TRT_EDGELLM_SERVING_PRESET must be thor-throughput or thor-latency");
+        if (thorThroughputPreset)
+        {
+            semanticSchedulerConfig.prefillQueueWaitTargetUs = 150000.0;
+            semanticSchedulerConfig.decodeQueueWaitTargetUs = 300000.0;
+        }
+        else if (thorLatencyPreset)
+        {
+            semanticSchedulerConfig.prefillQueueWaitTargetUs = 300000.0;
+            semanticSchedulerConfig.decodeQueueWaitTargetUs = 250000.0;
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_QUEUE_TARGET_US"))
         {
             semanticSchedulerConfig.prefillQueueWaitTargetUs = std::stod(value);
@@ -946,6 +962,10 @@ int main(int argc, char** argv)
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
         serverConfig.maxPendingRequests = 1024;
+        if (thorThroughputPreset || thorLatencyPreset)
+        {
+            serverConfig.decodeRefillBatchSize = static_cast<size_t>(semanticSchedulerConfig.maxDecodeBatchSize);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_REFILL_BATCH"))
         {
             serverConfig.decodeRefillBatchSize = static_cast<size_t>(std::stoul(value));
@@ -967,6 +987,9 @@ int main(int argc, char** argv)
         }
         rt::IndependentPhaseAsyncServer semanticServer(
             serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter), semanticPrefixCache.get());
+        LOG_INFO("Phase serving preset: %s prefill_target_us=%.0f decode_target_us=%.0f refill=%zu",
+            servingPreset.empty() ? "custom" : servingPreset.c_str(), semanticSchedulerConfig.prefillQueueWaitTargetUs,
+            semanticSchedulerConfig.decodeQueueWaitTargetUs, serverConfig.decodeRefillBatchSize);
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
         char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");

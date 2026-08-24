@@ -1491,18 +1491,18 @@ bool LLMBuilder::setupRecurrentStateProfiles(
     // Recurrent state shape: [batch, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
     nvinfer1::Dims minRecurrentShape
         = createDims({1, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims optRecurrentShape = createDims(
-        {mBuilderConfig.maxBatchSize, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims maxRecurrentShape = createDims(
-        {mBuilderConfig.maxBatchSize, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims contextRecurrentShape = createDims({mBuilderConfig.getMaxPrefillBatchSize(), mRecurrentStateNumHeads,
+        mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims generationRecurrentShape = createDims(
+        {mBuilderConfig.getMaxDecodeBatchSize(), mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
 
     for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const recurrentStateName = binding_names::formatRecurrentStateName(i, /*isPast=*/true);
-        result &= setOptimizationProfile(
-            contextProfile, recurrentStateName.c_str(), minRecurrentShape, optRecurrentShape, maxRecurrentShape);
-        result &= setOptimizationProfile(
-            generationProfile, recurrentStateName.c_str(), minRecurrentShape, optRecurrentShape, maxRecurrentShape);
+        result &= setOptimizationProfile(contextProfile, recurrentStateName.c_str(), minRecurrentShape,
+            contextRecurrentShape, contextRecurrentShape);
+        result &= setOptimizationProfile(generationProfile, recurrentStateName.c_str(), minRecurrentShape,
+            generationRecurrentShape, generationRecurrentShape);
     }
 
     LOG_DEBUG("Set up recurrent state optimization profiles for %d recurrent layers", mNumLinearAttnLayers);
@@ -1521,16 +1521,16 @@ bool LLMBuilder::setupConvStateProfiles(
 
     // Conv state shape: [batch, conv_dim, conv_kernel]
     nvinfer1::Dims minConvShape = createDims({1, mConvDim, mConvKernel});
-    nvinfer1::Dims optConvShape = createDims({mBuilderConfig.maxBatchSize, mConvDim, mConvKernel});
-    nvinfer1::Dims maxConvShape = createDims({mBuilderConfig.maxBatchSize, mConvDim, mConvKernel});
+    nvinfer1::Dims contextConvShape = createDims({mBuilderConfig.getMaxPrefillBatchSize(), mConvDim, mConvKernel});
+    nvinfer1::Dims generationConvShape = createDims({mBuilderConfig.getMaxDecodeBatchSize(), mConvDim, mConvKernel});
 
     for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const convStateName = binding_names::formatConvStateName(i, /*isPast=*/true);
-        result
-            &= setOptimizationProfile(contextProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
         result &= setOptimizationProfile(
-            generationProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
+            contextProfile, convStateName.c_str(), minConvShape, contextConvShape, contextConvShape);
+        result &= setOptimizationProfile(
+            generationProfile, convStateName.c_str(), minConvShape, generationConvShape, generationConvShape);
     }
 
     LOG_DEBUG("Set up conv state optimization profiles for %d recurrent layers", mNumLinearAttnLayers);
