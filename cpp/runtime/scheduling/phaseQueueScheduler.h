@@ -125,6 +125,7 @@ struct PhaseDispatchMetrics
     int32_t plannedDecodeBatchSize{};
     int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
+    int32_t predictedDecodeReplacementRows{};
     int32_t prefillCohortSize{};
     int32_t decodeCohortSize{};
     int32_t decodeTokens{};
@@ -196,6 +197,10 @@ using PhaseSchedulingPolicy = std::function<PhaseDispatchKind(PhaseQueueSnapshot
 using PhaseMetricsSchedulingPolicy
     = std::function<PhaseDispatchKind(PhaseQueueSnapshot const&, PhaseSchedulerTelemetry const&)>;
 using PhaseWorkEligibilityPolicy = std::function<bool(PhaseWorkItem const&, bool prefill)>;
+
+//! Count selected decode rows whose request was absent from the prior batch.
+size_t phaseDecodeReplacementRows(
+    std::vector<uint64_t> const& selectedRequestIds, std::vector<uint64_t> const& previousRequestIds);
 
 //! Conservative decode cost point loaded from offline CUDA-event profiling.
 //! maxContextLength is the largest per-request KV length covered by the point.
@@ -306,6 +311,9 @@ struct PhaseQueueSchedulerConfig
     bool enableDynamicDecodeBatching{};
     //! Retain one stable decode cohort and replace rows only as requests finish.
     bool enableDecodeCohortBatching{};
+    //! One-shot GPU metadata/cache movement cost charged for each newly introduced decode row.
+    //! Zero preserves the kernel-only decode cost model.
+    float decodeRowReplacementCostMs{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
     //! Refine static decode costs from confident, context-bucketed decode-only observations.
     bool enableOnlineDecodeCostLearning{};
@@ -440,6 +448,7 @@ struct PhaseDispatchPlan
     int32_t plannedDecodeBatchSize{};
     int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
+    int32_t predictedDecodeReplacementRows{};
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
@@ -508,7 +517,9 @@ private:
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const;
     uint64_t onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept;
     std::optional<float> onlineDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
-    std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const noexcept;
+    std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const;
+    std::vector<PhaseWorkItem const*> decodeCandidateRows(int32_t maxRows) const;
+    int32_t decodeCandidateReplacementRows(int32_t maxRows) const;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,
@@ -543,6 +554,7 @@ private:
     std::unordered_set<uint64_t> mPrefillCohortIds;
     int32_t mPrefillCohortTurns{};
     std::unordered_set<uint64_t> mDecodeCohortIds;
+    std::vector<uint64_t> mPreviousDecodeSelectionIds;
 };
 
 } // namespace rt

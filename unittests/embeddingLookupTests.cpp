@@ -1039,6 +1039,54 @@ TEST_F(EmbeddingLookupTest, MultimodalAccuracy)
     }
 }
 
+TEST_F(EmbeddingLookupTest, SegmentedVisionAndDeepstackMatchContiguousSources)
+{
+    constexpr int64_t batchSize = 1;
+    constexpr int64_t seqLen = 8;
+    constexpr int32_t vocabSize = 100;
+    constexpr int64_t hiddenSize = 128;
+    constexpr int32_t imageTokenId = 99;
+    std::vector<int32_t> const inputIds{1, imageTokenId, 2, imageTokenId, imageTokenId, 3, imageTokenId, 4};
+    std::vector<int32_t> const multimodalIndices{0, 0, 0, 1, 2, 0, 3, 0};
+    std::vector<half> embeddingTable(vocabSize * hiddenSize);
+    std::vector<half> imageEmbeds(4 * hiddenSize);
+    uniformFloatInitialization<half>(embeddingTable, -1.0F, 1.0F);
+    uniformFloatInitialization<half>(imageEmbeds, -1.0F, 1.0F);
+
+    rt::Tensor ids({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor indices({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor table({vocabSize, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor contiguous({4, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor first({1, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor second({3, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor contiguousOutput({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor segmentedOutput({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor contiguousDeepstack({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor segmentedDeepstack({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    copyHostToDevice(ids, inputIds);
+    copyHostToDevice(indices, multimodalIndices);
+    copyHostToDevice(table, embeddingTable);
+    copyHostToDevice(contiguous, imageEmbeds);
+    copyHostToDevice(first, std::vector<half>(imageEmbeds.begin(), imageEmbeds.begin() + hiddenSize));
+    copyHostToDevice(second, std::vector<half>(imageEmbeds.begin() + hiddenSize, imageEmbeds.end()));
+
+    kernel::embeddingLookup(ids, table, std::nullopt, contiguousOutput, stream, std::optional{std::cref(indices)},
+        imageTokenId, std::optional{std::cref(contiguous)});
+    rt::OptionalInputTensors const segments{std::cref(first), std::cref(second)};
+    kernel::embeddingLookupSegmentedVision(
+        ids, table, std::nullopt, segmentedOutput, stream, std::optional{std::cref(indices)}, imageTokenId, segments);
+    kernel::assembleDeepstackEmbedding(
+        ids, contiguous, contiguousDeepstack, stream, imageTokenId, std::optional{std::cref(indices)});
+    kernel::assembleDeepstackEmbeddingSegmented(
+        ids, segments, segmentedDeepstack, stream, imageTokenId, std::optional{std::cref(indices)});
+
+    EXPECT_TRUE(compareResults(copyDeviceToHost<half>(contiguousOutput), copyDeviceToHost<half>(segmentedOutput),
+        "Segmented vision embedding"));
+    EXPECT_TRUE(compareResults(copyDeviceToHost<half>(contiguousDeepstack), copyDeviceToHost<half>(segmentedDeepstack),
+        "Segmented deepstack embedding"));
+}
+
 // Test Qwen3-Omni embedding lookup with out-of-bounds handling
 TEST_F(EmbeddingLookupTest, MultimodalOutOfBounds)
 {

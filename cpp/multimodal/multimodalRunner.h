@@ -159,6 +159,14 @@ public:
     //! @return Optional deepstack features vector (raw features before embedding lookup)
     virtual rt::OptionalInputTensors getDeepstackFeatures();
 
+    //! Bind caller-owned encoder output storage for the next inference.
+    //!
+    //! Runners that support this contract write TensorRT outputs directly into
+    //! storage whose lifetime is managed by a downstream phase coordinator.
+    //! Unsupported runners return false without changing their bindings.
+    virtual bool bindExternalOutputStorage(
+        rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures);
+
     /*!
      * @brief Validate and fill configuration from file
      * @param engineDir Path to engine directory

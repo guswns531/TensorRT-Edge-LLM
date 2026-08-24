@@ -34,6 +34,54 @@ namespace kernel
 namespace
 {
 
+constexpr int32_t kMAX_EMBEDDING_SEGMENTS = 64;
+
+struct Fp16EmbeddingSegments
+{
+    half const* pointers[kMAX_EMBEDDING_SEGMENTS]{};
+    int32_t rowEnds[kMAX_EMBEDDING_SEGMENTS]{};
+    int32_t count{};
+
+    __device__ __forceinline__ half const* row(int32_t globalRow, int64_t hiddenSize) const
+    {
+        int32_t rowBegin{};
+        for (int32_t segment{}; segment < count; ++segment)
+        {
+            if (globalRow < rowEnds[segment])
+            {
+                return pointers[segment] + static_cast<int64_t>(globalRow - rowBegin) * hiddenSize;
+            }
+            rowBegin = rowEnds[segment];
+        }
+        return nullptr;
+    }
+};
+
+Fp16EmbeddingSegments makeFp16EmbeddingSegments(
+    rt::OptionalInputTensors const& segments, int64_t hiddenSize, char const* label)
+{
+    check::check(static_cast<int32_t>(segments.size()) <= kMAX_EMBEDDING_SEGMENTS,
+        format::fmtstr("%s has more than %d segments", label, kMAX_EMBEDDING_SEGMENTS));
+    Fp16EmbeddingSegments result;
+    int64_t rowEnd{};
+    for (rt::Tensor const& segment : segments)
+    {
+        rt::Coords const shape = segment.getShape();
+        check::check(shape.getNumDims() == 2, format::fmtstr("%s segments must be 2D", label));
+        check::check(shape[0] > 0 && shape[1] == hiddenSize,
+            format::fmtstr("%s segment shape does not match hidden size", label));
+        check::check(
+            segment.getDataType() == nvinfer1::DataType::kHALF, format::fmtstr("%s segments must be FP16", label));
+        rowEnd += shape[0];
+        check::check(rowEnd <= std::numeric_limits<int32_t>::max(),
+            format::fmtstr("%s segment rows exceed INT32 capacity", label));
+        result.pointers[result.count] = segment.dataPointer<half>();
+        result.rowEnds[result.count] = static_cast<int32_t>(rowEnd);
+        ++result.count;
+    }
+    return result;
+}
+
 //! \brief FP16 embedding loader for template-based kernel
 struct Fp16EmbeddingLoader
 {
@@ -94,8 +142,8 @@ struct Fp8EmbeddingLoader
 // CUDA kernel for assembling deepstack embeddings (FP16 only)
 // Extracts image-token embeddings from deepstack features. Positions whose token id == imageTokenId
 // are mapped to a deepstack feature row via multimodalIndices; all other positions get zero embeddings.
-__global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half const* deepstackFeatures, half* output,
-    int64_t batchSize, int64_t seqLen, int32_t imageTokenId, int64_t hiddenSize, int64_t numImageTokens,
+__global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, Fp16EmbeddingSegments deepstackFeatures,
+    half* output, int64_t batchSize, int64_t seqLen, int32_t imageTokenId, int64_t hiddenSize,
     int32_t const* multimodalIndices)
 {
     // Each warp handles one hidden state (one token's embedding)
@@ -134,11 +182,11 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
             int32_t const deepstackIdx = multimodalIndices[pos];
 
             // Validate that deepstackIdx is within bounds
-            if (deepstackIdx >= 0 && deepstackIdx < numImageTokens)
+            half const* featureRow = deepstackFeatures.row(deepstackIdx, hiddenSize);
+            if (featureRow != nullptr)
             {
                 // Load embedding data from deepstack features
-                uint32_t const embeddingOffset = deepstackIdx * hiddenSize + offset;
-                embeddingVec.load(deepstackFeatures + embeddingOffset);
+                embeddingVec.load(featureRow + offset);
             }
             else
             {
@@ -171,7 +219,7 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
 //! \tparam TLoader Embedding loader type (Fp16EmbeddingLoader or Fp8EmbeddingLoader)
 template <typename TLoader>
 __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loader, int32_t const* multimodalIndices,
-    int32_t imageTokenId, half const* imageEmbeds, int64_t imageTokenLen, int32_t audioTokenId, half const* audioEmbeds,
+    int32_t imageTokenId, Fp16EmbeddingSegments imageEmbeds, int32_t audioTokenId, half const* audioEmbeds,
     int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize)
 {
     // Each warp handles one hidden state (one token's embedding)
@@ -196,7 +244,7 @@ __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loade
     int32_t const tokenId = inputIds[linearIdx];
 
     // Determine token type
-    bool isImageToken = (imageEmbeds != nullptr && tokenId == imageTokenId);
+    bool isImageToken = (imageEmbeds.count > 0 && tokenId == imageTokenId);
     bool isAudioToken = (audioEmbeds != nullptr && tokenId == audioTokenId);
     bool isValidTextToken = false;
     bool isValidImageToken = false;
@@ -206,7 +254,7 @@ __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loade
     if (isImageToken)
     {
         multimodalIdx = multimodalIndices[linearIdx];
-        isValidImageToken = (multimodalIdx >= 0 && multimodalIdx < imageTokenLen);
+        isValidImageToken = imageEmbeds.row(multimodalIdx, hiddenSize) != nullptr;
     }
     else if (isAudioToken)
     {
@@ -233,8 +281,7 @@ __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loade
         else if (isValidImageToken)
         {
             // Load from FP16 imageEmbeds directly
-            uint32_t const embeddingOffset = multimodalIdx * hiddenSize + offset;
-            embeddingVec.load(imageEmbeds + embeddingOffset);
+            embeddingVec.load(imageEmbeds.row(multimodalIdx, hiddenSize) + offset);
         }
         else if (isValidAudioToken)
         {
@@ -261,7 +308,7 @@ __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loade
 // Template helper function to launch multimodal embedding lookup kernel
 template <typename TLoader>
 void launchEmbeddingLookupKernel(int32_t const* inputIds, TLoader const& loader, int32_t const* multimodalIndices,
-    int32_t imageTokenId, half const* imageEmbeds, int64_t imageTokenLen, int32_t audioTokenId, half const* audioEmbeds,
+    int32_t imageTokenId, Fp16EmbeddingSegments const& imageEmbeds, int32_t audioTokenId, half const* audioEmbeds,
     int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
     cudaStream_t stream)
 {
@@ -277,8 +324,8 @@ void launchEmbeddingLookupKernel(int32_t const* inputIds, TLoader const& loader,
     uint32_t const gridSize = (totalTokens + 3) / 4; // 4 warps per block
 
     embeddingLookupKernelImpl<<<gridSize, threadsPerBlock, 0, stream>>>(inputIds, loader, multimodalIndices,
-        imageTokenId, imageEmbeds, imageTokenLen, audioTokenId, audioEmbeds, audioTokenLen, output, batchSize, seqLen,
-        vocabSize, hiddenSize);
+        imageTokenId, imageEmbeds, audioTokenId, audioEmbeds, audioTokenLen, output, batchSize, seqLen, vocabSize,
+        hiddenSize);
 }
 
 } // namespace
@@ -391,19 +438,27 @@ void generateMultimodalIndices(rt::Tensor const& inputIds, rt::Tensor& multimoda
 void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures,
     rt::Tensor& deepstackEmbeds, cudaStream_t stream, int32_t imageTokenId, rt::OptionalInputTensor multimodalIndices)
 {
+    rt::OptionalInputTensors segments{std::cref(deepstackFeatures)};
+    assembleDeepstackEmbeddingSegmented(inputIds, segments, deepstackEmbeds, stream, imageTokenId, multimodalIndices);
+}
+
+void assembleDeepstackEmbeddingSegmented(rt::Tensor const& inputIds,
+    rt::OptionalInputTensors const& deepstackFeatureSegments, rt::Tensor& deepstackEmbeds, cudaStream_t stream,
+    int32_t imageTokenId, rt::OptionalInputTensor multimodalIndices)
+{
     // Validate input shapes
     auto const inputShape = inputIds.getShape();
-    auto const featuresShape = deepstackFeatures.getShape();
     auto const outputShape = deepstackEmbeds.getShape();
 
     check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
-    check::check(featuresShape.getNumDims() == 2, "deepstackFeatures must be 2D tensor [numImageTokens, hiddenSize]");
+    check::check(!deepstackFeatureSegments.empty(), "deepstackFeatureSegments cannot be empty");
     check::check(outputShape.getNumDims() == 3, "deepstackEmbeds must be 3D tensor [batchSize, seqLen, hiddenSize]");
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
-    int64_t const numImageTokens = featuresShape[0];
-    int64_t const hiddenSize = featuresShape[1];
+    int64_t const hiddenSize = outputShape[2];
+    Fp16EmbeddingSegments const deepstackFeatures
+        = makeFp16EmbeddingSegments(deepstackFeatureSegments, hiddenSize, "deepstackFeatures");
 
     check::check(outputShape[0] == batchSize, "Output batch size mismatch");
     check::check(outputShape[1] == seqLen, "Output sequence length mismatch");
@@ -411,12 +466,10 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
 
     // Validate data types
     check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
-    check::check(deepstackFeatures.getDataType() == nvinfer1::DataType::kHALF, "deepstackFeatures must be FP16");
     check::check(deepstackEmbeds.getDataType() == nvinfer1::DataType::kHALF, "deepstackEmbeds must be FP16");
 
     // Get device pointers
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
-    half const* deepstackFeaturesPtr = deepstackFeatures.dataPointer<half>();
     half* outputPtr = deepstackEmbeds.dataPointer<half>();
 
     // Launch kernel
@@ -435,14 +488,28 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
     dim3 const threadsPerBlock(32, 4);               // (32, 4) = 128 threads total
     uint32_t const gridSize = (totalTokens + 3) / 4; // 4 warps per block
 
-    assembleDeepstackEmbeddingKernel<<<gridSize, threadsPerBlock, 0, stream>>>(inputIdsPtr, deepstackFeaturesPtr,
-        outputPtr, batchSize, seqLen, imageTokenId, hiddenSize, numImageTokens, multimodalIndicesPtr);
+    assembleDeepstackEmbeddingKernel<<<gridSize, threadsPerBlock, 0, stream>>>(
+        inputIdsPtr, deepstackFeatures, outputPtr, batchSize, seqLen, imageTokenId, hiddenSize, multimodalIndicesPtr);
 }
 
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
     rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
     std::optional<int32_t> imageTokenId, rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId,
     rt::OptionalInputTensor audioEmbeds)
+{
+    rt::OptionalInputTensors imageEmbedSegments;
+    if (imageEmbeds.has_value())
+    {
+        imageEmbedSegments.push_back(std::cref(imageEmbeds->get()));
+    }
+    embeddingLookupSegmentedVision(inputIds, embeddingTable, scales, output, stream, multimodalIndices, imageTokenId,
+        imageEmbedSegments, audioTokenId, audioEmbeds);
+}
+
+void embeddingLookupSegmentedVision(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
+    rt::OptionalInputTensor scales, rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
+    std::optional<int32_t> imageTokenId, rt::OptionalInputTensors const& imageEmbedSegments,
+    std::optional<int32_t> audioTokenId, rt::OptionalInputTensor audioEmbeds)
 {
     // Validate input shapes
     auto const inputShape = inputIds.getShape();
@@ -469,13 +536,11 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
     check::check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
 
     // Handle optional image parameters
-    bool const hasImage = imageTokenId.has_value() && imageEmbeds.has_value();
+    bool const hasImage = imageTokenId.has_value() && !imageEmbedSegments.empty();
+    Fp16EmbeddingSegments imageEmbeds;
     if (hasImage)
     {
-        auto const imageShape = imageEmbeds->get().getShape();
-        check::check(imageShape.getNumDims() == 2, "imageEmbeds must be 2D tensor [imageTokenLen, hiddenSize]");
-        check::check(imageShape[1] == hiddenSize, "Hidden size mismatch between embeddingTable and imageEmbeds");
-        check::check(imageEmbeds->get().getDataType() == nvinfer1::DataType::kHALF, "imageEmbeds must be FP16");
+        imageEmbeds = makeFp16EmbeddingSegments(imageEmbedSegments, hiddenSize, "imageEmbeds");
     }
 
     // Handle optional audio parameters
@@ -511,9 +576,6 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
 
     // Extract values for kernel - use safe defaults when modalities are absent
     int32_t const imageTokenIdValue = hasImage ? *imageTokenId : -1;
-    half const* imageEmbedsPtr = hasImage ? imageEmbeds->get().dataPointer<half>() : nullptr;
-    int64_t const imageTokenLen = hasImage ? imageEmbeds->get().getShape()[0] : 0;
-
     int32_t const audioTokenIdValue = hasAudio ? *audioTokenId : -1;
     half const* audioEmbedsPtr = hasAudio ? audioEmbeds->get().dataPointer<half>() : nullptr;
     int64_t const audioTokenLen = hasAudio ? audioEmbeds->get().getShape()[0] : 0;
@@ -550,9 +612,9 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
         float const* scalePtr = scalesTensor.dataPointer<float>();
 
         Fp8EmbeddingLoader loader{tablePtr, scalePtr, blockSize, nGroups};
-        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
-            imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
+        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbeds,
+            audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize, hiddenSize,
+            stream);
 #else
         check::check(
             false, "FP8 multimodal embedding lookup is unavailable: build does not support FP8 (SUPPORTS_FP8=0)");
@@ -565,16 +627,16 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
         if (transposedEmbedding)
         {
             Fp16TransposedEmbeddingLoader loader{embeddingTablePtr, vocabSize};
-            launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
-                imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen,
-                vocabSize, hiddenSize, stream);
+            launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbeds,
+                audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize, hiddenSize,
+                stream);
         }
         else
         {
             Fp16EmbeddingLoader loader{embeddingTablePtr};
-            launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
-                imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen,
-                vocabSize, hiddenSize, stream);
+            launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbeds,
+                audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize, hiddenSize,
+                stream);
         }
     }
 }

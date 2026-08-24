@@ -271,6 +271,12 @@ rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
     return {};
 }
 
+bool MultimodalRunner::bindExternalOutputStorage(
+    rt::Tensor& /*outputEmbedding*/, std::vector<std::reference_wrapper<rt::Tensor>> const& /*deepstackFeatures*/)
+{
+    return false;
+}
+
 bool MultimodalRunner::preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,
     [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
     [[maybe_unused]] cudaStream_t stream)

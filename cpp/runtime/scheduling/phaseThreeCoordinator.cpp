@@ -136,6 +136,7 @@ bool PhaseThreeCoordinator::poll()
     bool progressed = completeEncoder();
     progressed = startNextEncoder() || progressed;
     progressed = mServer.poll() || progressed;
+    mVision.reclaimIdleStorage();
     return progressed;
 }
 

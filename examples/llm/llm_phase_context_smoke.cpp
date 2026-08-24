@@ -670,28 +670,15 @@ int main(int argc, char** argv)
         size_t tokenH2DBytes{};
         size_t decodeDeviceTokenReuseBatches{};
         size_t decodeDeviceTokenReuseRows{};
-        size_t visionPackD2DOperations{};
-        size_t visionPackD2DBytes{};
+        size_t segmentedVisionBatches{};
+        size_t segmentedVisionSources{};
+        size_t segmentedVisionBytes{};
         size_t mropeD2DOperations{};
         size_t mropeD2DBytes{};
         rt::Tensor textOnlyMropeTemplate;
         std::vector<std::optional<uint64_t>> prefillMropeOwners(
             static_cast<size_t>(config.maxSupportedPrefillBatchSize));
         std::vector<std::optional<uint64_t>> decodeMropeOwners(static_cast<size_t>(config.maxSupportedDecodeBatchSize));
-        rt::Tensor batchedVisionEmbedding;
-        std::vector<rt::Tensor> batchedVisionDeepstack;
-        if (enableBatchedVisionPrefill)
-        {
-            int64_t const maxPackedTokens = prefillBatchTokenBudget;
-            batchedVisionEmbedding = rt::Tensor({maxPackedTokens, config.hiddenSize}, rt::DeviceType::kGPU,
-                nvinfer1::DataType::kHALF, "semantic_phase_batched_vision_embedding");
-            batchedVisionDeepstack.reserve(static_cast<size_t>(config.numDeepstackFeatures));
-            for (int32_t index{}; index < config.numDeepstackFeatures; ++index)
-            {
-                batchedVisionDeepstack.emplace_back(rt::Coords{maxPackedTokens, config.hiddenSize},
-                    rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "semantic_phase_batched_vision_deepstack");
-            }
-        }
         if (config.ropeConfig.type == rt::RopeType::kMRope)
         {
             textOnlyMropeTemplate = rt::Tensor({1, config.maxKVCacheCapacity, config.rotaryDim}, rt::DeviceType::kGPU,
@@ -706,6 +693,10 @@ int main(int argc, char** argv)
             rt::OptionalInputTensors deepstackFeatures;
             rt::Tensor visionEmbeddingView;
             std::vector<rt::Tensor> deepstackFeatureViews;
+            std::vector<rt::Tensor> segmentedVisionViews;
+            rt::OptionalInputTensors segmentedVisionSegments;
+            std::vector<std::vector<rt::Tensor>> segmentedDeepstackViews;
+            std::vector<rt::OptionalInputTensors> segmentedDeepstackSegments;
             std::vector<rt::IndependentPhaseRequestView const*> visionViews;
             if (prefill)
             {
@@ -758,21 +749,12 @@ int main(int argc, char** argv)
             {
                 ELLM_CHECK(enableBatchedVisionPrefill, "Multiple multimodal rows require batched vision prefill");
                 int64_t totalImageTokens{};
-                for (rt::IndependentPhaseRequestView const* view : visionViews)
+                segmentedVisionViews.reserve(visionViews.size());
+                segmentedDeepstackViews.resize(static_cast<size_t>(config.numDeepstackFeatures));
+                for (auto& features : segmentedDeepstackViews)
                 {
-                    totalImageTokens += imageRange(*view).second;
+                    features.reserve(visionViews.size());
                 }
-                ELLM_CHECK(
-                    totalImageTokens > 0 && batchedVisionEmbedding.reshape({totalImageTokens, config.hiddenSize}),
-                    "Batched vision embedding exceeds its packed-prefill buffer");
-                ELLM_CHECK(batchedVisionDeepstack.size() == static_cast<size_t>(config.numDeepstackFeatures),
-                    "Batched vision deepstack buffer count does not match the engine");
-                for (rt::Tensor& feature : batchedVisionDeepstack)
-                {
-                    ELLM_CHECK(feature.reshape({totalImageTokens, config.hiddenSize}),
-                        "Batched vision deepstack exceeds its packed-prefill buffer");
-                }
-                int64_t destinationOffset{};
                 for (rt::IndependentPhaseRequestView const* view : visionViews)
                 {
                     auto const [imageOffset, imageTokens] = imageRange(*view);
@@ -781,41 +763,37 @@ int main(int argc, char** argv)
                         continue;
                     }
                     rt::PhaseVisionPayload& payload = *view->visionPayload;
-                    auto copyRows = [&](rt::Tensor const& source, rt::Tensor& destination) {
-                        rt::Coords const shape = source.getShape();
-                        ELLM_CHECK(shape.getNumDims() == 2 && shape[1] == config.hiddenSize
-                                && source.getDataType() == destination.getDataType()
-                                && imageOffset + imageTokens <= shape[0],
-                            "Batched vision feature is incompatible with its packed buffer");
-                        size_t const rowBytes
-                            = static_cast<size_t>(shape[1]) * rt::utils::getTypeSize(source.getDataType());
-                        auto const* sourceBytes
-                            = static_cast<std::byte const*>(source.rawPointer()) + imageOffset * rowBytes;
-                        auto* const destinationBytes
-                            = static_cast<std::byte*>(destination.rawPointer()) + destinationOffset * rowBytes;
-                        size_t const copyBytes = static_cast<size_t>(imageTokens) * rowBytes;
-                        CUDA_CHECK(cudaMemcpyAsync(
-                            destinationBytes, sourceBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
-                        ++visionPackD2DOperations;
-                        visionPackD2DBytes += copyBytes;
-                    };
-                    copyRows(payload.outputEmbedding, batchedVisionEmbedding);
-                    ELLM_CHECK(payload.deepstackFeatures.size() == batchedVisionDeepstack.size(),
+                    segmentedVisionViews.push_back(
+                        makeFeatureView(payload.outputEmbedding, imageOffset, imageTokens, "phase_vision_segment"));
+                    ELLM_CHECK(payload.deepstackFeatures.size() == segmentedDeepstackViews.size(),
                         "Batched vision request has the wrong deepstack feature count");
                     for (size_t index{}; index < payload.deepstackFeatures.size(); ++index)
                     {
-                        copyRows(payload.deepstackFeatures[index], batchedVisionDeepstack[index]);
+                        segmentedDeepstackViews[index].push_back(makeFeatureView(
+                            payload.deepstackFeatures[index], imageOffset, imageTokens, "phase_deepstack_segment"));
                     }
-                    destinationOffset += imageTokens;
+                    totalImageTokens += imageTokens;
                 }
-                ELLM_CHECK(
-                    destinationOffset == totalImageTokens, "Batched vision copy did not consume every image row");
-                visionEmbedding = std::cref(batchedVisionEmbedding);
-                deepstackFeatures.reserve(batchedVisionDeepstack.size());
-                for (rt::Tensor const& feature : batchedVisionDeepstack)
+                ELLM_CHECK(totalImageTokens > 0, "Segmented vision batch contains no active image rows");
+                segmentedVisionSegments.reserve(segmentedVisionViews.size());
+                for (rt::Tensor const& segment : segmentedVisionViews)
                 {
-                    deepstackFeatures.push_back(std::cref(feature));
+                    segmentedVisionSegments.push_back(std::cref(segment));
+                    segmentedVisionBytes += static_cast<size_t>(segment.getShape().volume())
+                        * rt::utils::getTypeSize(segment.getDataType());
                 }
+                segmentedDeepstackSegments.resize(segmentedDeepstackViews.size());
+                for (size_t featureIndex{}; featureIndex < segmentedDeepstackViews.size(); ++featureIndex)
+                {
+                    for (rt::Tensor const& segment : segmentedDeepstackViews[featureIndex])
+                    {
+                        segmentedDeepstackSegments[featureIndex].push_back(std::cref(segment));
+                        segmentedVisionBytes += static_cast<size_t>(segment.getShape().volume())
+                            * rt::utils::getTypeSize(segment.getDataType());
+                    }
+                }
+                ++segmentedVisionBatches;
+                segmentedVisionSources += segmentedVisionViews.size();
             }
             if (config.ropeConfig.type == rt::RopeType::kMRope)
             {
@@ -896,8 +874,16 @@ int main(int argc, char** argv)
                 tokenH2DBytes += copyBytes;
                 stagedIds = &deviceIds;
             }
-            embeddingPreprocessor.embed(*stagedIds, visionEmbedding, std::nullopt, io, stream);
-            embeddingPreprocessor.prepareDeepstack(*stagedIds, deepstackFeatures, io, stream);
+            if (!segmentedVisionSegments.empty())
+            {
+                embeddingPreprocessor.embedSegmentedVision(*stagedIds, segmentedVisionSegments, io, stream);
+                embeddingPreprocessor.prepareSegmentedDeepstack(*stagedIds, segmentedDeepstackSegments, io, stream);
+            }
+            else
+            {
+                embeddingPreprocessor.embed(*stagedIds, visionEmbedding, std::nullopt, io, stream);
+                embeddingPreprocessor.prepareDeepstack(*stagedIds, deepstackFeatures, io, stream);
+            }
             if (prefill)
             {
                 for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
@@ -955,6 +941,10 @@ int main(int argc, char** argv)
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
         semanticSchedulerConfig.maxPrefillBatchSize = config.maxSupportedPrefillBatchSize;
         semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedDecodeBatchSize;
+        if (char const* value = std::getenv("TRT_EDGELLM_DECODE_ROW_REPLACEMENT_COST_MS"))
+        {
+            semanticSchedulerConfig.decodeRowReplacementCostMs = std::stof(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_PREFILL_BATCH"))
         {
             semanticSchedulerConfig.maxPrefillBatchSize = std::stoi(value);
@@ -1119,6 +1109,15 @@ int main(int argc, char** argv)
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
         char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
         char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
+        rt::PhaseVisionStoragePolicy visionStoragePolicy;
+        if (char const* value = std::getenv("TRT_EDGELLM_VISION_IDLE_SLABS"))
+        {
+            visionStoragePolicy.maxIdleBatches = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_VISION_IDLE_SLAB_BYTES"))
+        {
+            visionStoragePolicy.maxIdleBytes = static_cast<size_t>(std::stoull(value));
+        }
         auto configureVisionContextMemory = [&](rt::MultimodalRunner& runner) {
             int64_t const requiredBytes = runner.getRequiredContextMemorySize();
             LOG_INFO("Vision context workspace: required=%lld prefill_available=%zu bytes",
@@ -1133,7 +1132,7 @@ int main(int argc, char** argv)
                 auto runner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, encoderStream, checkpointDir);
                 configureVisionContextMemory(*runner);
-                rt::PhaseVisionAdapter visionAdapter(*runner, tokenizer, config, encoderStream);
+                rt::PhaseVisionAdapter visionAdapter(*runner, tokenizer, config, encoderStream, visionStoragePolicy);
                 rt::PhaseThreeCoordinator threePhase(visionAdapter, semanticServer);
 
                 rt::LLMGenerationRequest request{};
@@ -1289,8 +1288,8 @@ int main(int argc, char** argv)
                 ipcVisionRunner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
                 configureVisionContextMemory(*ipcVisionRunner);
-                ipcVisionAdapter
-                    = std::make_unique<rt::PhaseVisionAdapter>(*ipcVisionRunner, tokenizer, config, ipcEncoderStream);
+                ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
+                    *ipcVisionRunner, tokenizer, config, ipcEncoderStream, visionStoragePolicy);
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION"))
                 {
@@ -1621,6 +1620,7 @@ int main(int argc, char** argv)
                         {"prefill_gpu_ms", metrics.prefillGpuMs},
                         {"decode_context_tokens", metrics.decodeContextTokens},
                         {"decode_context_max", metrics.plannedDecodeMaxContextLength},
+                        {"decode_replacement_rows", metrics.predictedDecodeReplacementRows},
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
@@ -1712,9 +1712,11 @@ int main(int argc, char** argv)
                 "decode_device_reuse_rows=%zu",
                 tokenH2DOperations, tokenH2DBytes, decodeDeviceTokenReuseBatches, decodeDeviceTokenReuseRows);
             LOG_INFO(
-                "Phase staging memory ops: vision_pack_d2d_operations=%zu vision_pack_d2d_bytes=%zu "
+                "Phase staging memory ops: segmented_vision_batches=%zu segmented_vision_sources=%zu "
+                "segmented_vision_bytes=%zu vision_pack_d2d_operations=0 vision_pack_d2d_bytes=0 "
                 "mrope_d2d_operations=%zu mrope_d2d_bytes=%zu",
-                visionPackD2DOperations, visionPackD2DBytes, mropeD2DOperations, mropeD2DBytes);
+                segmentedVisionBatches, segmentedVisionSources, segmentedVisionBytes, mropeD2DOperations,
+                mropeD2DBytes);
             auto logKVMemoryOps = [](char const* phase, rt::PhaseKVMemoryStats const& memory,
                                       rt::KVPageTableUploadStats const& pageTable) {
                 LOG_INFO(
@@ -1750,9 +1752,13 @@ int main(int argc, char** argv)
                     visionMetrics.maxEncoderGpuMs);
                 rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();
                 LOG_INFO(
-                    "Phase vision memory ops: slab_allocations=%zu slab_reuses=%zu d2d_operations=%zu d2d_bytes=%zu",
+                    "Phase vision memory ops: slab_allocations=%zu slab_reuses=%zu slab_reclaims=%zu "
+                    "reclaimed_bytes=%zu direct_output_batches=%zu direct_output_bytes=%zu "
+                    "d2d_operations=%zu d2d_bytes=%zu idle_slabs=%zu idle_bytes=%zu",
                     memoryStats.batchStorageAllocations, memoryStats.batchStorageReuses,
-                    memoryStats.deviceCopyOperations, memoryStats.deviceCopyBytes);
+                    memoryStats.batchStorageReclaims, memoryStats.reclaimedBytes, memoryStats.directOutputBatches,
+                    memoryStats.directOutputBytes, memoryStats.deviceCopyOperations, memoryStats.deviceCopyBytes,
+                    memoryStats.idleStorageBatches, memoryStats.idleStorageBytes);
             }
             {
                 std::lock_guard<std::mutex> lock(outputMutex);

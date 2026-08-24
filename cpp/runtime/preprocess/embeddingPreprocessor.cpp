@@ -67,6 +67,18 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
     }
 }
 
+void EmbeddingPreprocessor::embedSegmentedVision(
+    Tensor const& tokenIds, OptionalInputTensors const& visionSegments, PipelineIO& io, cudaStream_t stream)
+{
+    check::check(!visionSegments.empty(), "Segmented vision embedding requires at least one segment");
+    check::check(mConfig.imageTokenId >= 0, "Segmented vision embedding requires an image token ID");
+    mMultimodalIndices = Tensor(tokenIds.getShape(), DeviceType::kGPU, tokenIds.getDataType());
+    kernel::generateMultimodalIndices(
+        tokenIds, mMultimodalIndices, std::optional{mConfig.imageTokenId}, std::nullopt, stream);
+    kernel::embeddingLookupSegmentedVision(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds,
+        stream, std::optional{std::cref(mMultimodalIndices)}, std::optional{mConfig.imageTokenId}, visionSegments);
+}
+
 OptionalInputTensors EmbeddingPreprocessor::assembleDeepstack(
     Tensor const& tokenIds, OptionalInputTensors const& features, PipelineIO& io, cudaStream_t stream)
 {
@@ -130,6 +142,28 @@ void EmbeddingPreprocessor::prepareDeepstack(
             io.deepstackEmbeds[idx].reshape({activeBatchSize, seqLen, mConfig.hiddenSize}), "Tensor reshape failed");
         CUDA_CHECK(cudaMemsetAsync(
             io.deepstackEmbeds[idx].rawPointer(), 0, io.deepstackEmbeds[idx].getMemoryCapacity(), stream));
+    }
+}
+
+void EmbeddingPreprocessor::prepareSegmentedDeepstack(Tensor const& tokenIds,
+    std::vector<OptionalInputTensors> const& featureSegments, PipelineIO& io, cudaStream_t stream)
+{
+    if (mConfig.numDeepstackFeatures == 0)
+    {
+        return;
+    }
+    check::check(featureSegments.size() == static_cast<size_t>(mConfig.numDeepstackFeatures),
+        "Segmented deepstack feature count does not match model configuration");
+    auto const inputShape = tokenIds.getShape();
+    check::check(mMultimodalIndices.getShape().volume() == inputShape.volume(),
+        "Segmented deepstack requires multimodal indices from the same tokens");
+    for (int32_t index{}; index < mConfig.numDeepstackFeatures; ++index)
+    {
+        check::check(!featureSegments[index].empty(), "Segmented deepstack feature has no source segments");
+        check::check(io.deepstackEmbeds[index].reshape({inputShape[0], inputShape[1], mConfig.hiddenSize}),
+            "Tensor reshape failed");
+        kernel::assembleDeepstackEmbeddingSegmented(tokenIds, featureSegments[index], io.deepstackEmbeds[index], stream,
+            mConfig.imageTokenId, std::optional{std::cref(mMultimodalIndices)});
     }
 }
 

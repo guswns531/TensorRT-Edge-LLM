@@ -56,6 +56,15 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
     std::optional<int32_t> imageTokenId = std::nullopt, rt::OptionalInputTensor imageEmbeds = std::nullopt,
     std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt);
 
+//! \brief Embedding lookup that reads image rows directly from multiple GPU-resident segments.
+//!
+//! Segment order defines the global image-row order selected by multimodalIndices.
+//! This avoids materializing a contiguous image tensor for packed prefill batches.
+void embeddingLookupSegmentedVision(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
+    rt::OptionalInputTensor scales, rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
+    std::optional<int32_t> imageTokenId, rt::OptionalInputTensors const& imageEmbedSegments,
+    std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt);
+
 //! \brief Assemble deepstack embeddings by extracting image token embeddings from deepstack features
 //!
 //! This function processes input token IDs and selectively extracts embeddings for image tokens from
@@ -72,6 +81,11 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
 void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures,
     rt::Tensor& deepstackEmbeds, cudaStream_t stream, int32_t imageTokenId = 0,
     rt::OptionalInputTensor multimodalIndices = std::nullopt);
+
+//! \brief Assemble deepstack embeddings directly from multiple ordered feature segments.
+void assembleDeepstackEmbeddingSegmented(rt::Tensor const& inputIds,
+    rt::OptionalInputTensors const& deepstackFeatureSegments, rt::Tensor& deepstackEmbeds, cudaStream_t stream,
+    int32_t imageTokenId, rt::OptionalInputTensor multimodalIndices);
 
 //! \brief Generate per-position multimodal indices on-device from GPU token IDs.
 //!

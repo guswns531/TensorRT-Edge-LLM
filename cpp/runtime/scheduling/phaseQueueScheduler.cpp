@@ -23,6 +23,7 @@
 #include <cmath>
 #include <limits>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace trt_edgellm
@@ -78,6 +79,14 @@ void applySchedulerProfile(PhaseQueueSchedulerConfig& config)
 
 } // namespace
 
+size_t phaseDecodeReplacementRows(
+    std::vector<uint64_t> const& selectedRequestIds, std::vector<uint64_t> const& previousRequestIds)
+{
+    std::unordered_set<uint64_t> const previous(previousRequestIds.begin(), previousRequestIds.end());
+    return static_cast<size_t>(std::count_if(selectedRequestIds.begin(), selectedRequestIds.end(),
+        [&](uint64_t requestId) { return previous.find(requestId) == previous.end(); }));
+}
+
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mOnlineDecodeCostLearningActive(mConfig.enableOnlineDecodeCostLearning)
@@ -85,8 +94,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
-    check::check(mConfig.maxOverlapPrefillBatchSize >= 0
-            && mConfig.maxOverlapPrefillBatchSize <= mConfig.maxPrefillBatchSize,
+    check::check(
+        mConfig.maxOverlapPrefillBatchSize >= 0 && mConfig.maxOverlapPrefillBatchSize <= mConfig.maxPrefillBatchSize,
         "maxOverlapPrefillBatchSize must be zero or no greater than maxPrefillBatchSize");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
@@ -98,6 +107,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
         "Packed prefill token layout requires a positive maximum chunk length");
     check::check(mConfig.maxPrefillBatchTokens >= 0, "maxPrefillBatchTokens must be non-negative");
     check::check(mConfig.prefillCompletionBonusTokens >= 0, "prefillCompletionBonusTokens must be non-negative");
+    check::check(std::isfinite(mConfig.decodeRowReplacementCostMs) && mConfig.decodeRowReplacementCostMs >= 0.0F,
+        "Decode row replacement cost must be finite and non-negative");
     for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
     {
         check::check(cost.batchSize > 0, "Decode cost batch size must be positive");
@@ -312,11 +323,9 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     result.consecutiveDecodeBatches = mConsecutiveDecodeBatches;
     bool const hasDecodeWork = std::any_of(mDecodeQueue.begin(), mDecodeQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, false); });
-    int32_t const overlapPrefillBatchSize = mConfig.maxOverlapPrefillBatchSize > 0
-        ? mConfig.maxOverlapPrefillBatchSize
-        : mConfig.maxPrefillBatchSize;
-    int32_t const candidatePrefillBatchSize
-        = hasDecodeWork ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
+    int32_t const overlapPrefillBatchSize
+        = mConfig.maxOverlapPrefillBatchSize > 0 ? mConfig.maxOverlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
+    int32_t const candidatePrefillBatchSize = hasDecodeWork ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
     auto const prefillSeed = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, true); });
     if (prefillSeed != mPrefillQueue.end())
@@ -887,6 +896,12 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             recordQueueWait(item.requestId);
             batch.push_back(item);
         }
+        mPreviousDecodeSelectionIds.clear();
+        mPreviousDecodeSelectionIds.reserve(batch.size());
+        for (PhaseWorkItem const& item : batch)
+        {
+            mPreviousDecodeSelectionIds.push_back(item.requestId);
+        }
         return batch;
     }
 
@@ -1304,12 +1319,12 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     {
         std::tie(plan.plannedDecodeContextTokens, plan.plannedDecodeMaxContextLength)
             = decodeCandidateShape(plan.plannedDecodeBatchSize);
+        plan.predictedDecodeReplacementRows = decodeCandidateReplacementRows(plan.plannedDecodeBatchSize);
     }
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
-        int32_t const overlapPrefillBatchSize = mConfig.maxOverlapPrefillBatchSize > 0
-            ? mConfig.maxOverlapPrefillBatchSize
-            : mConfig.maxPrefillBatchSize;
+        int32_t const overlapPrefillBatchSize
+            = mConfig.maxOverlapPrefillBatchSize > 0 ? mConfig.maxOverlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
         int32_t const prefillBatchSize
             = kind == PhaseDispatchKind::kOverlap ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
         plan.prefillBatch = popBatch(mPrefillQueue, prefillBatchSize, true, state, plan);
@@ -1345,21 +1360,80 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     return plan;
 }
 
-std::pair<int64_t, int32_t> PhaseQueueScheduler::decodeCandidateShape(int32_t maxRows) const noexcept
+std::pair<int64_t, int32_t> PhaseQueueScheduler::decodeCandidateShape(int32_t maxRows) const
 {
     int64_t total{};
     int32_t maximum{};
-    int32_t rows{};
-    for (PhaseWorkItem const& item : mDecodeQueue)
+    for (PhaseWorkItem const* item : decodeCandidateRows(maxRows))
     {
-        if (isEligible(item, false) && rows < maxRows)
-        {
-            total += item.tokenCount;
-            maximum = std::max(maximum, item.tokenCount);
-            ++rows;
-        }
+        total += item->tokenCount;
+        maximum = std::max(maximum, item->tokenCount);
     }
     return {total, maximum};
+}
+
+std::vector<PhaseWorkItem const*> PhaseQueueScheduler::decodeCandidateRows(int32_t maxRows) const
+{
+    std::unordered_set<uint64_t> cohort = mDecodeCohortIds;
+    if (mConfig.enableDecodeCohortBatching)
+    {
+        for (PhaseWorkItem const& item : mDecodeQueue)
+        {
+            if (static_cast<int32_t>(cohort.size()) >= mConfig.maxDecodeBatchSize)
+            {
+                break;
+            }
+            if (isEligible(item, false))
+            {
+                cohort.insert(item.requestId);
+            }
+        }
+    }
+
+    std::vector<PhaseWorkItem const*> selected;
+    selected.reserve(static_cast<size_t>(maxRows));
+    for (PhaseWorkItem const& item : mDecodeQueue)
+    {
+        bool const cohortEligible = !mConfig.enableDecodeCohortBatching || cohort.find(item.requestId) != cohort.end();
+        if (isEligible(item, false) && cohortEligible)
+        {
+            selected.push_back(&item);
+        }
+    }
+    if (mConfig.enablePriorityBatching)
+    {
+        auto const now = std::chrono::steady_clock::now();
+        auto priorityRank = [&](PhaseWorkItem const* item) {
+            auto const timestamp = mQueuedSince.find(item->requestId);
+            check::check(timestamp != mQueuedSince.end(), "Prioritized decode request has no queue timestamp");
+            double const waitUs = std::chrono::duration<double, std::micro>(now - timestamp->second).count();
+            return static_cast<double>(item->scheduling.priority) + waitUs / mConfig.priorityAgingUs;
+        };
+        std::stable_sort(selected.begin(), selected.end(), [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
+            double const lhsRank = priorityRank(lhs);
+            double const rhsRank = priorityRank(rhs);
+            if (lhsRank != rhsRank)
+            {
+                return lhsRank > rhsRank;
+            }
+            return mQueuedSince.at(lhs->requestId) < mQueuedSince.at(rhs->requestId);
+        });
+    }
+    if (static_cast<int32_t>(selected.size()) > maxRows)
+    {
+        selected.resize(static_cast<size_t>(maxRows));
+    }
+    return selected;
+}
+
+int32_t PhaseQueueScheduler::decodeCandidateReplacementRows(int32_t maxRows) const
+{
+    std::vector<uint64_t> selected;
+    for (PhaseWorkItem const* item : decodeCandidateRows(maxRows))
+    {
+        selected.push_back(item->requestId);
+    }
+    return static_cast<int32_t>(phaseDecodeReplacementRows(selected, mPreviousDecodeSelectionIds));
 }
 
 int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const
@@ -1381,17 +1455,13 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     std::vector<int64_t> contextTotals(static_cast<size_t>(available) + 1U);
     std::vector<int32_t> maxContextLengths(static_cast<size_t>(available) + 1U);
     int32_t runnableRows{};
-    for (PhaseWorkItem const& item : mDecodeQueue)
+    for (PhaseWorkItem const* item : decodeCandidateRows(available))
     {
-        if (!isEligible(item, false) || runnableRows >= available)
-        {
-            continue;
-        }
         ++runnableRows;
         contextTotals[static_cast<size_t>(runnableRows)]
-            = contextTotals[static_cast<size_t>(runnableRows - 1)] + item.tokenCount;
+            = contextTotals[static_cast<size_t>(runnableRows - 1)] + item->tokenCount;
         maxContextLengths[static_cast<size_t>(runnableRows)]
-            = std::max(maxContextLengths[static_cast<size_t>(runnableRows - 1)], item.tokenCount);
+            = std::max(maxContextLengths[static_cast<size_t>(runnableRows - 1)], item->tokenCount);
     }
     std::vector<Candidate> candidates;
     int32_t coveringConfiguredBatch{std::numeric_limits<int32_t>::max()};
@@ -1488,6 +1558,15 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
             float const lower = candidate.p95GpuMs * (1.0F - mConfig.onlineDecodeCostMaxAdjustmentRatio);
             float const upper = candidate.p95GpuMs * (1.0F + mConfig.onlineDecodeCostMaxAdjustmentRatio);
             candidate.p95GpuMs = std::clamp(*observed, lower, upper);
+        }
+    }
+
+    if (mConfig.decodeRowReplacementCostMs > 0.0F)
+    {
+        for (Candidate& candidate : candidates)
+        {
+            candidate.p95GpuMs += mConfig.decodeRowReplacementCostMs
+                * static_cast<float>(decodeCandidateReplacementRows(candidate.batchSize));
         }
     }
 
@@ -1727,6 +1806,7 @@ void PhaseQueueScheduler::resetHistory()
     mPrefillCohortIds.clear();
     mPrefillCohortTurns = 0;
     mDecodeCohortIds.clear();
+    mPreviousDecodeSelectionIds.clear();
 }
 
 } // namespace rt

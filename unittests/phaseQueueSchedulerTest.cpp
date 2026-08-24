@@ -50,6 +50,65 @@ TEST(PhaseQueueSchedulerTest, BatchesQueuesIndependently)
     EXPECT_EQ(plan.decodeBatch[0].requestId, 3U);
 }
 
+TEST(PhaseQueueSchedulerTest, DecodeReplacementCostPreservesWarmRowsWhenBatchGrowthIsTransientlyExpensive)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 2;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeBatchCosts = {{1, 4096, 1.0F}, {2, 4096, 1.5F}};
+    config.decodeRowReplacementCostMs = 10.0F;
+    rt::PhaseQueueScheduler scheduler(config);
+
+    scheduler.enqueueDecode({1, 128});
+    rt::PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 1U);
+    scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+    scheduler.enqueueDecode({2, 128});
+
+    rt::PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.decodeBatch.size(), 1U);
+    EXPECT_EQ(second.decodeBatch.front().requestId, 1U);
+    EXPECT_EQ(second.predictedDecodeReplacementRows, 0);
+    EXPECT_EQ(rt::phaseDecodeReplacementRows({1, 3, 4}, {1, 2, 3}), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeReplacementCostUsesTheActiveCohortInsteadOfQueueOrder)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeCohortBatching = true;
+    config.decodeBatchCosts = {{2, 4096, 1.0F}, {4, 4096, 1.0F}};
+    config.decodeRowReplacementCostMs = 1.0F;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    rt::PhaseQueueScheduler scheduler(config);
+
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    rt::PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    for (uint64_t requestId = 5; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    for (rt::PhaseWorkItem const& item : first.decodeBatch)
+    {
+        scheduler.completeDecode(item, 129, false);
+    }
+
+    rt::PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.decodeBatch.size(), 4U);
+    EXPECT_EQ(second.predictedDecodeReplacementRows, 0);
+    for (size_t index = 0; index < second.decodeBatch.size(); ++index)
+    {
+        EXPECT_EQ(second.decodeBatch[index].requestId, index + 1U);
+    }
+}
+
 TEST(PhaseQueueSchedulerTest, LimitsOnlyConcurrentPrefillRows)
 {
     PhaseQueueSchedulerConfig config;

@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -63,6 +64,10 @@ public:
     void embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds, OptionalInputTensor audioEmbeds,
         PipelineIO& io, cudaStream_t stream);
 
+    //! Embed tokens while reading image rows from ordered, non-contiguous GPU segments.
+    void embedSegmentedVision(
+        Tensor const& tokenIds, OptionalInputTensors const& visionSegments, PipelineIO& io, cudaStream_t stream);
+
     //! Assemble deepstack features at image placeholder positions.
     //!
     //! For each feature in @p features, calls `kernel::assembleDeepstackEmbedding`
@@ -91,6 +96,10 @@ public:
     //! @param stream     CUDA stream for execution.
     void prepareDeepstack(
         Tensor const& tokenIds, OptionalInputTensors const& features, PipelineIO& io, cudaStream_t stream);
+
+    //! Prepare each deepstack output from ordered, non-contiguous request segments.
+    void prepareSegmentedDeepstack(Tensor const& tokenIds, std::vector<OptionalInputTensors> const& featureSegments,
+        PipelineIO& io, cudaStream_t stream);
 
 private:
     EmbeddingData const& mEmbedding;

@@ -153,6 +153,9 @@ public:
     //! \return Optional input tensors vector containing deepstack features
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
+    bool bindExternalOutputStorage(
+        rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
+
     //! \brief Get MRoPE rope deltas for each batch from the last preprocess/infer run.
     //! \return Vector of length (batch size): delta = maxMropePositionId + 1 - inputIdSize per batch; empty if not yet
     //! set.
@@ -186,6 +189,9 @@ protected:
     //! \brief Bind the model-specific input shapes before enqueue.
     //! \return false on failure.
     virtual bool bindExtraInputShapes();
+
+    //! Bind model-specific outputs such as Qwen3-VL deepstack features.
+    virtual bool bindExtraOutputStorage(std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures);
 
     //! \brief Append this image buffer's vision spans. \see VisionSpan.
     //! \return {totalSeqLen, totalGridT} of the appended spans (Σ gridT*gridH*gridW, Σ gridT) for formatPatch.

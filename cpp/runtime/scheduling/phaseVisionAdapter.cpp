@@ -33,6 +33,7 @@ struct PhaseVisionBatchStorage
     Tensor outputEmbedding;
     std::vector<Tensor> deepstackFeatures;
     Tensor mropeCosSin;
+    size_t lastUseGeneration{};
 };
 
 namespace
@@ -48,6 +49,19 @@ void resizeTensor(Tensor& destination, Tensor const& source, std::string const& 
         return;
     }
     ELLM_CHECK(destination.reshape(source.getShape()), "Failed to reshape retained vision tensor");
+}
+
+size_t storageByteSize(PhaseVisionBatchStorage const& storage) noexcept
+{
+    auto capacity = [](Tensor const& tensor) {
+        return tensor.isEmpty() ? size_t{} : static_cast<size_t>(tensor.getMemoryCapacity());
+    };
+    size_t result = capacity(storage.outputEmbedding) + capacity(storage.mropeCosSin);
+    for (Tensor const& feature : storage.deepstackFeatures)
+    {
+        result += capacity(feature);
+    }
+    return result;
 }
 } // namespace
 
@@ -90,11 +104,12 @@ std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> 
     return result;
 }
 
-PhaseVisionAdapter::PhaseVisionAdapter(
-    MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer, LLMEngineConfig const& config, cudaStream_t stream)
+PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
+    LLMEngineConfig const& config, cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy)
     : mRunner(runner)
     , mTokenizer(tokenizer)
     , mConfig(config)
+    , mStoragePolicy(storagePolicy)
     , mStream(stream)
 {
     ELLM_CHECK(mStream != nullptr, "Phase vision adapter requires an explicit CUDA stream");
@@ -123,9 +138,9 @@ Tensor PhaseVisionAdapter::viewTensorRows(Tensor& source, int64_t rowOffset, int
     return Tensor(sourceBytes + offsetBytes, Coords(resultShape), DeviceType::kGPU, source.getDataType(), name);
 }
 
-std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::retainBatchOutputs(
-    Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures)
+std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::acquireBatchStorage()
 {
+    reclaimIdleStorage();
     std::shared_ptr<PhaseVisionBatchStorage> storage;
     for (auto const& candidate : mStoragePool)
     {
@@ -143,6 +158,14 @@ std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::retainBatchOutputs(
         ++mMemoryStats.batchStorageAllocations;
     }
 
+    storage->lastUseGeneration = ++mStorageGeneration;
+    refreshIdleStorageStats();
+    return storage;
+}
+
+void PhaseVisionAdapter::copyRunnerOutputs(
+    PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures)
+{
     auto retain = [&](Tensor const& source, Tensor& destination, std::string const& name) {
         resizeTensor(destination, source, name);
         size_t const copyBytes
@@ -152,21 +175,12 @@ std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::retainBatchOutputs(
         ++mMemoryStats.deviceCopyOperations;
         mMemoryStats.deviceCopyBytes += copyBytes;
     };
-    retain(outputEmbedding, storage->outputEmbedding, "phase_vision_batch_output");
-    storage->deepstackFeatures.resize(deepstackFeatures.size());
+    retain(outputEmbedding, storage.outputEmbedding, "phase_vision_batch_output");
+    storage.deepstackFeatures.resize(deepstackFeatures.size());
     for (size_t index{}; index < deepstackFeatures.size(); ++index)
     {
-        retain(deepstackFeatures[index], storage->deepstackFeatures[index], "phase_vision_batch_deepstack");
+        retain(deepstackFeatures[index], storage.deepstackFeatures[index], "phase_vision_batch_deepstack");
     }
-    if (!mBatchedMrope.isEmpty())
-    {
-        retain(mBatchedMrope, storage->mropeCosSin, "phase_vision_batch_mrope");
-    }
-    else
-    {
-        storage->mropeCosSin = Tensor{};
-    }
-    return storage;
 }
 
 bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& request)
@@ -210,6 +224,7 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
 
     std::vector<std::unique_ptr<PhaseVisionPayload>> payloads;
     payloads.reserve(submissions.size());
+    std::shared_ptr<PhaseVisionBatchStorage> const storage = acquireBatchStorage();
     try
     {
         for (size_t index = 0; index < submissions.size(); ++index)
@@ -229,22 +244,26 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             Coords const requiredShape{activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim};
             int64_t const requiredBytes
                 = requiredShape.volume() * static_cast<int64_t>(utils::getTypeSize(nvinfer1::DataType::kFLOAT));
-            if (mBatchedMrope.isEmpty() || mBatchedMrope.getMemoryCapacity() < requiredBytes)
+            if (storage->mropeCosSin.isEmpty() || storage->mropeCosSin.getMemoryCapacity() < requiredBytes)
             {
-                mBatchedMrope
+                storage->mropeCosSin
                     = Tensor(requiredShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_vision_batched_mrope");
             }
             else
             {
-                ELLM_CHECK(mBatchedMrope.reshape(requiredShape), "Failed to reshape batched vision M-RoPE storage");
+                ELLM_CHECK(
+                    storage->mropeCosSin.reshape(requiredShape), "Failed to reshape batched vision M-RoPE storage");
             }
         }
+        else
+        {
+            storage->mropeCosSin = Tensor{};
+        }
         OptionalOutputTensor mrope
-            = mBatchedMrope.isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(mBatchedMrope)};
+            = storage->mropeCosSin.isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(storage->mropeCosSin)};
         std::vector<std::vector<int32_t>> batchedTokenIds;
         ELLM_CHECK(mRunner.preprocess(*mBatchedRequest, batchedTokenIds, &mTokenizer, mrope, mStream),
             "Phase vision preprocessing failed");
-        ELLM_CHECK(mRunner.infer(mStream), "Phase vision inference failed");
         ELLM_CHECK(batchedTokenIds.size() == submissions.size(),
             "Phase vision preprocessing returned the wrong logical batch size");
 
@@ -259,7 +278,37 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             ELLM_CHECK(feature.getShape().getNumDims() > 0 && feature.getShape()[0] == totalEmbeddingRows,
                 "Phase vision deepstack rows do not match expanded image-token rows");
         }
-        std::shared_ptr<PhaseVisionBatchStorage> const storage = retainBatchOutputs(outputEmbedding, deepstackFeatures);
+        resizeTensor(storage->outputEmbedding, outputEmbedding, "phase_vision_batch_output");
+        storage->deepstackFeatures.resize(deepstackFeatures.size());
+        std::vector<std::reference_wrapper<Tensor>> externalDeepstack;
+        externalDeepstack.reserve(deepstackFeatures.size());
+        for (size_t index{}; index < deepstackFeatures.size(); ++index)
+        {
+            resizeTensor(storage->deepstackFeatures[index], deepstackFeatures[index], "phase_vision_batch_deepstack");
+            externalDeepstack.emplace_back(storage->deepstackFeatures[index]);
+        }
+        bool const directOutput = mRunner.bindExternalOutputStorage(storage->outputEmbedding, externalDeepstack);
+        ELLM_CHECK(mRunner.infer(mStream), "Phase vision inference failed");
+        if (directOutput)
+        {
+            auto activeBytes = [](Tensor const& tensor) {
+                return static_cast<size_t>(tensor.getShape().volume()) * utils::getTypeSize(tensor.getDataType());
+            };
+            ++mMemoryStats.directOutputBatches;
+            mMemoryStats.directOutputBytes += activeBytes(storage->outputEmbedding);
+            for (Tensor const& feature : storage->deepstackFeatures)
+            {
+                mMemoryStats.directOutputBytes += activeBytes(feature);
+            }
+            if (!storage->mropeCosSin.isEmpty())
+            {
+                mMemoryStats.directOutputBytes += activeBytes(storage->mropeCosSin);
+            }
+        }
+        else
+        {
+            copyRunnerOutputs(*storage, outputEmbedding, deepstackFeatures);
+        }
 
         int64_t embeddingOffset{};
         for (size_t index = 0; index < submissions.size(); ++index)
@@ -289,7 +338,6 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
     catch (...)
     {
         static_cast<void>(cudaStreamSynchronize(mStream));
-        mBatchedMrope = Tensor{};
         mBatchedRequest.reset();
         throw;
     }
@@ -354,6 +402,53 @@ PhaseVisionMemoryStats const& PhaseVisionAdapter::memoryStats() const noexcept
     return mMemoryStats;
 }
 
+void PhaseVisionAdapter::refreshIdleStorageStats() noexcept
+{
+    mMemoryStats.idleStorageBatches = 0;
+    mMemoryStats.idleStorageBytes = 0;
+    for (auto const& storage : mStoragePool)
+    {
+        if (storage.use_count() == 1)
+        {
+            ++mMemoryStats.idleStorageBatches;
+            mMemoryStats.idleStorageBytes += storageByteSize(*storage);
+        }
+    }
+}
+
+void PhaseVisionAdapter::reclaimIdleStorage()
+{
+    refreshIdleStorageStats();
+    auto overBudget = [&] {
+        return mMemoryStats.idleStorageBatches > mStoragePolicy.maxIdleBatches
+            || mMemoryStats.idleStorageBytes > mStoragePolicy.maxIdleBytes;
+    };
+    while (overBudget())
+    {
+        auto oldest = mStoragePool.end();
+        for (auto it = mStoragePool.begin(); it != mStoragePool.end(); ++it)
+        {
+            if (it->use_count() != 1)
+            {
+                continue;
+            }
+            if (oldest == mStoragePool.end() || (*it)->lastUseGeneration < (*oldest)->lastUseGeneration)
+            {
+                oldest = it;
+            }
+        }
+        if (oldest == mStoragePool.end())
+        {
+            break;
+        }
+        size_t const bytes = storageByteSize(**oldest);
+        mStoragePool.erase(oldest);
+        ++mMemoryStats.batchStorageReclaims;
+        mMemoryStats.reclaimedBytes += bytes;
+        refreshIdleStorageStats();
+    }
+}
+
 void PhaseVisionAdapter::releaseBatchStorageIfIdle()
 {
     if (!mRequests.empty())
@@ -361,6 +456,7 @@ void PhaseVisionAdapter::releaseBatchStorageIfIdle()
         return;
     }
     mBatchedRequest.reset();
+    reclaimIdleStorage();
 }
 
 } // namespace trt_edgellm::rt

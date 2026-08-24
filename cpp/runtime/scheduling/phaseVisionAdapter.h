@@ -34,13 +34,26 @@ namespace trt_edgellm::rt
 
 struct PhaseVisionBatchStorage;
 
+//! High-water policy for encoder-output slabs that are no longer request-owned.
+struct PhaseVisionStoragePolicy
+{
+    size_t maxIdleBatches{4U};
+    size_t maxIdleBytes{256U * 1024U * 1024U};
+};
+
 //! GPU-memory operations performed while retaining encoder output for downstream prefill.
 struct PhaseVisionMemoryStats
 {
     size_t batchStorageAllocations{};
     size_t batchStorageReuses{};
+    size_t batchStorageReclaims{};
+    size_t reclaimedBytes{};
+    size_t directOutputBatches{};
+    size_t directOutputBytes{};
     size_t deviceCopyOperations{};
     size_t deviceCopyBytes{};
+    size_t idleStorageBatches{};
+    size_t idleStorageBytes{};
 };
 
 //! Request-owned encoder output retained until the corresponding prefill completes.
@@ -73,13 +86,13 @@ std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> 
 //! Model-neutral wrapper around a v0.10 MultimodalRunner execution context.
 //!
 //! One encoder batch is in flight at a time because the borrowed runner owns
-//! reusable output buffers. Concatenated results are sliced and copied to
-//! request-owned GPU tensors on the encoder stream before readyEvent is recorded.
+//! reusable output buffers. Runners that implement external output binding write
+//! directly into retained slabs; other runners fall back to one batch-level copy.
 class PhaseVisionAdapter
 {
 public:
     PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer, LLMEngineConfig const& config,
-        cudaStream_t stream);
+        cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy = {});
 
     PhaseVisionAdapter(PhaseVisionAdapter const&) = delete;
     PhaseVisionAdapter& operator=(PhaseVisionAdapter const&) = delete;
@@ -92,22 +105,26 @@ public:
     bool busy() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;
+    void reclaimIdleStorage();
 
 private:
     static Tensor viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name);
-    std::shared_ptr<PhaseVisionBatchStorage> retainBatchOutputs(
-        Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures);
+    std::shared_ptr<PhaseVisionBatchStorage> acquireBatchStorage();
+    void copyRunnerOutputs(
+        PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures);
+    void refreshIdleStorageStats() noexcept;
     void releaseBatchStorageIfIdle();
 
     MultimodalRunner& mRunner;
     tokenizer::Tokenizer const& mTokenizer;
     LLMEngineConfig mConfig;
+    PhaseVisionStoragePolicy mStoragePolicy;
     cudaStream_t mStream{};
     CUcontext mCudaContext{};
     std::unordered_map<uint64_t, std::unique_ptr<PhaseVisionPayload>> mRequests;
     std::optional<LLMGenerationRequest> mBatchedRequest;
-    Tensor mBatchedMrope;
     std::vector<std::shared_ptr<PhaseVisionBatchStorage>> mStoragePool;
+    size_t mStorageGeneration{};
     PhaseVisionMemoryStats mMemoryStats;
 };
 

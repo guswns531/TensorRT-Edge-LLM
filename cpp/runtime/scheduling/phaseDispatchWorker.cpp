@@ -228,6 +228,7 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.plannedDecodeBatchSize = mInFlight.plannedDecodeBatchSize;
     mCurrentMetrics.plannedDecodeContextTokens = mInFlight.plannedDecodeContextTokens;
     mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
+    mCurrentMetrics.predictedDecodeReplacementRows = mInFlight.predictedDecodeReplacementRows;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     mCurrentMetrics.decodeCohortSize = static_cast<int32_t>(mScheduler.decodeCohortSize());
     int64_t prefillPastKVSum{};
