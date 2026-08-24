@@ -51,6 +51,7 @@ lm_head.weight                                             - output projection
 
 import itertools
 import logging
+import os
 from typing import List, Tuple
 
 import torch
@@ -63,7 +64,8 @@ from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear,
                       is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
                    causal_conv1d_with_intermediate, gated_delta_net,
-                   gated_delta_net_with_intermediate)
+                   gated_delta_net_with_intermediate, int4_gemm_plugin_version,
+                   int4_groupwise_gemm, int4_groupwise_gemm_v2)
 
 __all__ = ["Qwen3_5CausalLM"]
 
@@ -74,6 +76,25 @@ _GDN_PROJ_NAMES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 
 # NVFP4 scalar scale suffixes that must be identical for fusion.
 _NVFP4_SCALAR_SCALE_SUFFIXES = ("input_scale", "weight_scale_2")
+
+
+class GdnInt4RtnLinear(nn.Module):
+    """Token-major W4A16 projection whose buffers cannot be mistaken for NVFP4."""
+
+    def __init__(self, in_features: int, out_features: int, group_size: int) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.register_buffer("qweight", torch.empty(0, dtype=torch.int8))
+        self.register_buffer("scales", torch.empty(0, dtype=torch.float16))
+        self.register_buffer("pre_quant_scale", torch.ones(in_features, dtype=torch.float16))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states * self.pre_quant_scale
+        op = int4_groupwise_gemm_v2 if int4_gemm_plugin_version() == 2 else int4_groupwise_gemm
+        return op(hidden_states, self.qweight, self.scales,
+                  self.out_features, self.in_features, self.group_size)
 
 # ---------------------------------------------------------------------------
 # Qwen3.5 RMSNorm  (residual-weight convention: effective = 1 + weight)
@@ -214,7 +235,13 @@ class GdnMixer(nn.Module):
 
         # 1. Input projection(s) -> QKV, gate_z, beta, alpha
         if hasattr(self, "in_proj_fused"):
-            fused_out = self.in_proj_fused(hidden_states)
+            if isinstance(self.in_proj_fused, GdnInt4RtnLinear):
+                fused_out = self.in_proj_fused(hidden_states.reshape(1, -1, hidden_states.shape[-1]))
+                fused_out = fused_out.reshape(batch_size, seq_len, -1)
+            else:
+                fused_out = self.in_proj_fused(hidden_states)
+            if hasattr(self, "_fused_output_dim"):
+                fused_out = fused_out[..., :self._fused_output_dim]
             mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
         else:
             mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -844,6 +871,36 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
                     tensor, requires_grad=False)
             else:
                 setattr(fused_linear, attr, tensor)
+
+        if isinstance(fused_linear, FP16Linear) and os.getenv("TRT_EDGELLM_GDN_INT4_RTN") == "1":
+            from ...checkpoint.repacking import _pack_intweights, repack_to_cutedsl_fragment
+            import numpy as np
+
+            group_size = 128
+            padded_out_dim = ((fused_out_dim + 127) // 128) * 128
+            weight = torch.zeros((padded_out_dim, in_features), dtype=torch.float32,
+                                 device=fused_linear.weight.device)
+            weight[:fused_out_dim].copy_(fused_linear.weight.data.float())
+            grouped = weight.reshape(padded_out_dim, in_features // group_size, group_size)
+            scales = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / 7.0
+            nibbles = ((grouped / scales).round().clamp(-8, 7) + 8).to(torch.int16)
+            nibbles_np = nibbles.reshape(padded_out_dim, in_features).cpu().numpy().astype(np.int16)
+            if int4_gemm_plugin_version() == 2:
+                packed = repack_to_cutedsl_fragment(nibbles_np)
+            else:
+                packed_i16 = _pack_intweights(nibbles_np)
+                packed = packed_i16.view(np.int8).reshape(
+                    packed_i16.shape[0] * 2, packed_i16.shape[1])
+
+            int4_linear = GdnInt4RtnLinear(in_features, padded_out_dim, group_size)
+            int4_linear._buffers["qweight"] = torch.from_numpy(packed).to(
+                device=weight.device, dtype=torch.int8)
+            int4_linear._buffers["scales"] = scales.squeeze(-1).t().contiguous().to(
+                device=weight.device, dtype=torch.float16)
+            int4_linear._buffers["pre_quant_scale"] = torch.ones(
+                in_features, device=weight.device, dtype=torch.float16)
+            fused_linear = int4_linear
+            mixer._fused_output_dim = fused_out_dim
 
         # Replace: add fused, delete originals.
         mixer.in_proj_fused = fused_linear

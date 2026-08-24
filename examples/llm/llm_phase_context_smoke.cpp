@@ -314,10 +314,29 @@ int main(int argc, char** argv)
         pairConfig.setupStream = setupStream;
         pairConfig.prefillStream = prefillStream;
         pairConfig.decodeStream = decodeStream;
-        auto pair = rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
+        std::unique_ptr<rt::EngineExecutor> decodeExecutor;
+        bool const separatePhaseEngines = std::getenv("TRT_EDGELLM_DECODE_ENGINE_DIR") != nullptr;
+        if (separatePhaseEngines)
+        {
+            std::filesystem::path const decodeEngineDir{std::getenv("TRT_EDGELLM_DECODE_ENGINE_DIR")};
+            rt::LLMEngineConfig const decodeConfig = rt::parseEngineConfig(decodeEngineDir / "config.json");
+            ELLM_CHECK(decodeConfig.hiddenSize == config.hiddenSize
+                    && decodeConfig.outputVocabSize == config.outputVocabSize
+                    && decodeConfig.numDecoderLayers == config.numDecoderLayers
+                    && decodeConfig.maxSupportedDecodeBatchSize == config.maxSupportedDecodeBatchSize
+                    && decodeConfig.kvCacheDtype == config.kvCacheDtype
+                    && decodeConfig.recurrentStateDtype == config.recurrentStateDtype
+                    && decodeConfig.convStateDtype == config.convStateDtype,
+                "Separate phase engines have incompatible runtime contracts");
+            decodeExecutor = rt::EngineExecutor::createForLLM(decodeEngineDir / "llm.engine", decodeConfig);
+        }
+        auto pair = separatePhaseEngines
+            ? rt::IndependentEngineExecutorPair::create(std::move(executor), std::move(decodeExecutor), pairConfig)
+            : rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
 
-        ELLM_CHECK(&pair->prefillExecutor().getEngine() == &pair->decodeExecutor().getEngine(),
-            "Independent phase executors must share one TensorRT engine");
+        ELLM_CHECK(separatePhaseEngines
+                || &pair->prefillExecutor().getEngine() == &pair->decodeExecutor().getEngine(),
+            "Single-engine phase executors must share one TensorRT engine");
         ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
                 != pair->decodeExecutor().getExecutionContextIdentity(),
             "Independent phase executors must own different TensorRT contexts");
@@ -1134,7 +1153,8 @@ int main(int argc, char** argv)
             }
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
-            if (serverConfig.enableCudaGraphs)
+            if (serverConfig.enableCudaGraphs
+                && std::getenv("TRT_EDGELLM_CAPTURE_PRODUCTION_GRAPHS") == nullptr)
             {
                 // Retain the primed graph cache, but do not synchronously capture
                 // unseen production shapes on their latency-critical first request.
@@ -1220,6 +1240,10 @@ int main(int argc, char** argv)
             auto emitEvent = [&](nlohmann::json const& event) { emitRecord("PHASE_EVENT\t", event); };
             std::deque<rt::IndependentPhaseServerToken> nativeTokenEvents;
             std::deque<rt::IndependentPhaseServerCompletion> nativeCompletionEvents;
+            std::vector<std::string> ipcTokenTextCache(static_cast<size_t>(config.outputVocabSize));
+            std::vector<uint8_t> ipcTokenTextCached(static_cast<size_t>(config.outputVocabSize));
+            size_t ipcTokenTextCacheHits{};
+            size_t ipcTokenTextCacheMisses{};
             bool const nativeEventCallbacks = ipcThreePhase == nullptr;
             if (nativeEventCallbacks)
             {
@@ -1461,9 +1485,23 @@ int main(int argc, char** argv)
                 while (auto token = popTokenEvent())
                 {
                     madeProgress = true;
+                    ELLM_CHECK(token->tokenId >= 0 && token->tokenId < config.outputVocabSize,
+                        "Phase IPC sampled token is outside the output vocabulary");
+                    size_t const tokenIndex = static_cast<size_t>(token->tokenId);
+                    if (ipcTokenTextCached[tokenIndex] == 0U)
+                    {
+                        ipcTokenTextCache[tokenIndex]
+                            = tokenizer.decode(std::vector<int32_t>{token->tokenId}, false);
+                        ipcTokenTextCached[tokenIndex] = 1U;
+                        ++ipcTokenTextCacheMisses;
+                    }
+                    else
+                    {
+                        ++ipcTokenTextCacheHits;
+                    }
                     nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", token->requestId},
                         {"token_id", token->tokenId},
-                        {"text", tokenizer.decode(std::vector<int32_t>{token->tokenId}, false)},
+                        {"text", ipcTokenTextCache[tokenIndex]},
                         {"output_index", token->outputIndex}, {"elapsed_ms", token->elapsedMs}};
                     serializedRecords.push_back("PHASE_EVENT\t" + tokenEvent.dump());
                 }
@@ -1534,6 +1572,8 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
                 emitPhaseMetrics ? "yes" : "no");
             LOG_INFO("Phase IPC response path: %s", nativeEventCallbacks ? "native_callback" : "polling_queue");
+            LOG_INFO("Phase IPC token text cache: hits=%zu misses=%zu", ipcTokenTextCacheHits,
+                ipcTokenTextCacheMisses);
             {
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputClosed = true;

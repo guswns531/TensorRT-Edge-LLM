@@ -39,6 +39,10 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #endif
 #define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#if __has_include("gdn_decode_small.h")
+#include "gdn_decode_small.h"
+#define CUTE_DSL_GDN_DECODE_SMALL_ENABLED 1
+#endif
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstdint>
@@ -120,6 +124,9 @@ private:
     int runDecodeMTP(GDNParams const& params, cudaStream_t stream);
 
     static detail::LazyKernelModule<gdn_decode_Kernel_Module_t> sDecodeModule;
+#ifdef CUTE_DSL_GDN_DECODE_SMALL_ENABLED
+    static detail::LazyKernelModule<gdn_decode_small_Kernel_Module_t> sSmallDecodeModule;
+#endif
     static detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> sPrefillModule;
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
     static detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> sBlackwellPrefillModule;

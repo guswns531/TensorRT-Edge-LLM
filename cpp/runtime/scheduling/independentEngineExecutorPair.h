@@ -40,20 +40,24 @@ struct IndependentEngineExecutorPairConfig
     cudaStream_t decodeStream{};
 };
 
-//! @brief Two independent TensorRT contexts over one deserialized engine.
+//! @brief Two independent TensorRT contexts for compatible phase engines.
 //!
 //! The pair is deliberately model agnostic. Callers construct the first
-//! EngineExecutor with the model-specific registry/factory, then pass it here.
-//! The sibling shares immutable TRT weights and the ICudaEngine, but owns a
-//! different IExecutionContext, auxiliary streams, CUDA graph cache, and
-//! profile-sized workspace. This is the resource boundary required before
-//! prefill and decode can be enqueued concurrently.
+//! EngineExecutor with the model-specific registry/factory, then either let
+//! this class create a sibling over the same ICudaEngine or supply a separately
+//! deserialized, I/O-compatible decode executor. Both paths own distinct
+//! IExecutionContexts, auxiliary streams, CUDA graph caches, and profile-sized
+//! workspaces. This is the resource boundary required before prefill and decode
+//! can be enqueued concurrently.
 class IndependentEngineExecutorPair
 {
 public:
     //! Build a pair from an already configured executor.
     static std::unique_ptr<IndependentEngineExecutorPair> create(
         std::unique_ptr<EngineExecutor> prefillExecutor, IndependentEngineExecutorPairConfig config);
+    //! Build a pair from separately deserialized but I/O-compatible engines.
+    static std::unique_ptr<IndependentEngineExecutorPair> create(std::unique_ptr<EngineExecutor> prefillExecutor,
+        std::unique_ptr<EngineExecutor> decodeExecutor, IndependentEngineExecutorPairConfig config);
 
     IndependentEngineExecutorPair(IndependentEngineExecutorPair const&) = delete;
     IndependentEngineExecutorPair& operator=(IndependentEngineExecutorPair const&) = delete;
@@ -74,7 +78,8 @@ public:
 
 private:
     IndependentEngineExecutorPair(
-        std::unique_ptr<EngineExecutor> prefillExecutor, IndependentEngineExecutorPairConfig config);
+        std::unique_ptr<EngineExecutor> prefillExecutor, std::unique_ptr<EngineExecutor> decodeExecutor,
+        IndependentEngineExecutorPairConfig config);
 
     static CUcontext streamContext(cudaStream_t stream);
     static void validateStreams(IndependentEngineExecutorPairConfig const& config, CUcontext& context);

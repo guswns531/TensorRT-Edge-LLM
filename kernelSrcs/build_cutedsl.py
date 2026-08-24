@@ -138,6 +138,14 @@ KERNEL_VARIANTS = [
         script_args=["--export_only"],
     ),
     KernelVariant(
+        name="gdn_decode_small",
+        group="gdn",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="gdn_cutedsl/gdn_decode.py",
+        script_args=["--export_only", "--small_batch", "--file_name", "gdn_decode_small",
+                     "--function_prefix", "gdn_decode_small"],
+    ),
+    KernelVariant(
         name="gdn_prefill",
         group="gdn",
         supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],

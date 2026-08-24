@@ -1523,10 +1523,10 @@ def _decode_context_lengths_array(n, preset):
 def run_test_decode(n, h, hv, k, v, varlen=False,
                     skip_ref_check=False, tolerance=0.1,
                     warmup=3, iterations=100, gpu_arch="",
-                    context_lengths_preset="all_ones"):
+                    context_lengths_preset="all_ones", force_small_batch=None):
     dt = _cp_dtype_fp16()
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
-    use_small_batch = n < SMALL_BATCH_THRESHOLD
+    use_small_batch = n < SMALL_BATCH_THRESHOLD if force_small_batch is None else force_small_batch
 
     # Generate float32 data (used for both kernel and reference). h0 is batch-dense [n, hv, k, v].
     if varlen:
@@ -1656,6 +1656,7 @@ def main():
         iterations=args.iterations,
         gpu_arch=args.gpu_arch,
         context_lengths_preset=args.context_lengths_preset,
+        force_small_batch=args.small_batch,
     )
 
 

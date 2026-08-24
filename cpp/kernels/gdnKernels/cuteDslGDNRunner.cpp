@@ -24,6 +24,7 @@
 #include "common/logger.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace trt_edgellm
@@ -49,6 +50,9 @@ bool isBlackwellGeforceSm(int32_t smVersion)
 } // namespace
 
 detail::LazyKernelModule<gdn_decode_Kernel_Module_t> CuteDslGDNRunner::sDecodeModule{};
+#ifdef CUTE_DSL_GDN_DECODE_SMALL_ENABLED
+detail::LazyKernelModule<gdn_decode_small_Kernel_Module_t> CuteDslGDNRunner::sSmallDecodeModule{};
+#endif
 detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> CuteDslGDNRunner::sPrefillModule{};
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
 detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> CuteDslGDNRunner::sBlackwellPrefillModule{};
@@ -113,6 +117,13 @@ bool CuteDslGDNRunner::ensureKernelModules(GDNParams const& params, cudaStream_t
     }
     if (params.seq_len == 1)
     {
+#ifdef CUTE_DSL_GDN_DECODE_SMALL_ENABLED
+        if (params.n >= 16 && std::getenv("TRT_EDGELLM_GDN_SMALL_DECODE") != nullptr)
+        {
+            return detail::ensureModuleLoaded<gdn_decode_small_Kernel_Module_Load,
+                gdn_decode_small_Kernel_Module_Unload>(sSmallDecodeModule, "gdn_decode_small", stream);
+        }
+#endif
         return detail::ensureModuleLoaded<gdn_decode_Kernel_Module_Load, gdn_decode_Kernel_Module_Unload>(
             sDecodeModule, "gdn_decode", stream);
     }
@@ -212,6 +223,24 @@ int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)
 
     gdn_decode_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, 1, hv, v);
+
+#ifdef CUTE_DSL_GDN_DECODE_SMALL_ENABLED
+    if (n >= 16 && std::getenv("TRT_EDGELLM_GDN_SMALL_DECODE") != nullptr)
+    {
+        static_assert(sizeof(gdn_decode_Tensor_q_t) == sizeof(gdn_decode_small_Tensor_q_t));
+        return cute_dsl_gdn_decode_small_wrapper(&sSmallDecodeModule.module,
+            reinterpret_cast<gdn_decode_small_Tensor_q_t*>(&qTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_k_t*>(&kTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_v_t*>(&vTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_a_t*>(&aTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_b_t*>(&bTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_A_log_t*>(&A_logTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_dt_bias_t*>(&dt_biasTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_h0_source_t*>(&h0_sourceTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_context_lengths_t*>(&contextLengthsTensor),
+            reinterpret_cast<gdn_decode_small_Tensor_o_t*>(&oTensor), stream);
+    }
+#endif
 
     return cute_dsl_gdn_decode_wrapper(&sDecodeModule.module, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
         &A_logTensor, &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, stream);

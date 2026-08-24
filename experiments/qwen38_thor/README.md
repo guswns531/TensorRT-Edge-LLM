@@ -245,6 +245,20 @@ capacity 32K. Its 2,048-page undercommitted pool supports either 32 concurrent
 
 Machine-readable results are in results_2026-08-24_thor_next.json.
 
+## Final hybrid c64 result
+
+The final core-workload preset combines an input-256 FP8-KV prefill engine with a weight-only INT4-RTN GDN-projection
+decode engine, the N16 small-grid GDN crossover, and warmed production CUDA Graphs.
+
+| workload | Phase hybrid | vLLM vanilla | Phase advantage |
+| --- | ---: | ---: | ---: |
+| short burst c64 | 286.78 tok/s | 235.27 tok/s | +21.89% |
+| wave burst c64 | 275.04 tok/s | 256.56 tok/s | +7.20% |
+| decode heavy c64 | 341.33 tok/s | 333.19 tok/s | +2.45% |
+
+See `notes/102-thor-hybrid-int4-fp8kv-vllm-win-20260824.md` for the engine contract, accuracy caveats, rejected A/Bs,
+graph-cache statistics, and reproduction procedure.
+
 ## Validation
 
 - Focused phase/state/scheduler tests: 15/15 passed.

@@ -7,7 +7,14 @@ FROM ${BASE_IMAGE}
 ARG MAX_JOBS=12
 
 COPY cpp/builder/llmBuilder.cpp cpp/builder/llmBuilder.cpp
+COPY cpp/kernels/cuteDSLArtifact/aarch64/sm_110/libcutedsl_aarch64.a cpp/kernels/cuteDSLArtifact/aarch64/sm_110/libcutedsl_aarch64.a
+COPY cpp/kernels/cuteDSLArtifact/aarch64/sm_110/include/gdn_decode.h cpp/kernels/cuteDSLArtifact/aarch64/sm_110/include/gdn_decode.h
+COPY cpp/kernels/cuteDSLArtifact/aarch64/sm_110/include/gdn_decode_small.h cpp/kernels/cuteDSLArtifact/aarch64/sm_110/include/gdn_decode_small.h
+COPY cpp/kernels/gdnKernels/cuteDslGDNRunner.cpp cpp/kernels/gdnKernels/cuteDslGDNRunner.cpp
+COPY cpp/kernels/gdnKernels/cuteDslGDNRunner.h cpp/kernels/gdnKernels/cuteDslGDNRunner.h
 COPY cpp/runtime/config/llmEngineConfig.cpp cpp/runtime/config/llmEngineConfig.cpp
+COPY cpp/runtime/scheduling/independentEngineExecutorPair.cpp cpp/runtime/scheduling/independentEngineExecutorPair.cpp
+COPY cpp/runtime/scheduling/independentEngineExecutorPair.h cpp/runtime/scheduling/independentEngineExecutorPair.h
 COPY cpp/runtime/scheduling/independentPhaseCoordinator.cpp cpp/runtime/scheduling/independentPhaseCoordinator.cpp
 COPY cpp/runtime/scheduling/independentPhaseCoordinator.h cpp/runtime/scheduling/independentPhaseCoordinator.h
 COPY cpp/runtime/scheduling/independentPhaseAsyncServer.cpp cpp/runtime/scheduling/independentPhaseAsyncServer.cpp
@@ -19,6 +26,7 @@ COPY cpp/runtime/scheduling/phaseQueueScheduler.h cpp/runtime/scheduling/phaseQu
 COPY cpp/runtime/state/stableKVPageManager.cpp cpp/runtime/state/stableKVPageManager.cpp
 COPY cpp/runtime/state/stableKVPageManager.h cpp/runtime/state/stableKVPageManager.h
 COPY examples/llm/llm_phase_context_smoke.cpp examples/llm/llm_phase_context_smoke.cpp
+COPY tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py
 COPY scripts/phase_openai_gateway.py scripts/phase_openai_gateway.py
 COPY experiments/qwen38_thor/run_phase_server.sh experiments/qwen38_thor/run_phase_server.sh
 COPY unittests/phaseRecurrentStateActiveViewTest.cpp unittests/phaseRecurrentStateActiveViewTest.cpp

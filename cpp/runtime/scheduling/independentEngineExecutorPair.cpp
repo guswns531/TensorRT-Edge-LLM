@@ -30,24 +30,40 @@ std::unique_ptr<IndependentEngineExecutorPair> IndependentEngineExecutorPair::cr
     std::unique_ptr<EngineExecutor> prefillExecutor, IndependentEngineExecutorPairConfig config)
 {
     return std::unique_ptr<IndependentEngineExecutorPair>(
-        new IndependentEngineExecutorPair(std::move(prefillExecutor), config));
+        new IndependentEngineExecutorPair(std::move(prefillExecutor), nullptr, config));
+}
+
+std::unique_ptr<IndependentEngineExecutorPair> IndependentEngineExecutorPair::create(
+    std::unique_ptr<EngineExecutor> prefillExecutor, std::unique_ptr<EngineExecutor> decodeExecutor,
+    IndependentEngineExecutorPairConfig config)
+{
+    ELLM_CHECK(decodeExecutor != nullptr, "Independent phase execution requires a decode executor");
+    return std::unique_ptr<IndependentEngineExecutorPair>(
+        new IndependentEngineExecutorPair(std::move(prefillExecutor), std::move(decodeExecutor), config));
 }
 
 IndependentEngineExecutorPair::IndependentEngineExecutorPair(
-    std::unique_ptr<EngineExecutor> prefillExecutor, IndependentEngineExecutorPairConfig config)
+    std::unique_ptr<EngineExecutor> prefillExecutor, std::unique_ptr<EngineExecutor> decodeExecutor,
+    IndependentEngineExecutorPairConfig config)
     : mPrefillExecutor(std::move(prefillExecutor))
+    , mDecodeExecutor(std::move(decodeExecutor))
     , mConfig(config)
 {
     ELLM_CHECK(mPrefillExecutor != nullptr, "Independent phase execution requires a prefill executor");
     ELLM_CHECK(mConfig.prefillProfile >= 0 && mConfig.decodeProfile >= 0,
         "Independent phase profile indices must be non-negative");
-    int32_t const profileCount = mPrefillExecutor->getEngine().getNbOptimizationProfiles();
-    ELLM_CHECK(mConfig.prefillProfile < profileCount && mConfig.decodeProfile < profileCount,
-        "Independent phase profile index is not present in the TensorRT engine");
+    int32_t const prefillProfileCount = mPrefillExecutor->getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(mConfig.prefillProfile < prefillProfileCount,
+        "Independent prefill profile index is not present in the TensorRT engine");
     validateStreams(mConfig, mCudaContext);
 
-    mDecodeExecutor = mPrefillExecutor->createSibling();
+    if (mDecodeExecutor == nullptr)
+    {
+        mDecodeExecutor = mPrefillExecutor->createSibling();
+    }
     ELLM_CHECK(mDecodeExecutor != nullptr, "Failed to create the independent decode executor");
+    ELLM_CHECK(mConfig.decodeProfile < mDecodeExecutor->getEngine().getNbOptimizationProfiles(),
+        "Independent decode profile index is not present in the TensorRT engine");
     ELLM_CHECK(mPrefillExecutor->getExecutionContextIdentity() != mDecodeExecutor->getExecutionContextIdentity(),
         "Independent phase executors unexpectedly share a TensorRT execution context");
 
