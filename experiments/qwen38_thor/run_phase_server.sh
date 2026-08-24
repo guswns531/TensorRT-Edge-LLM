@@ -12,9 +12,16 @@ port="${PORT:-8001}"
 case "${preset}" in
     thor-throughput | thor-latency)
         engine_dir="/data/engines/phase-b32-p4-d32-kv4096"
+        max_stable_slots=32
+        serving_preset="${preset}"
+        ;;
+    thor-throughput-d64)
+        engine_dir="/data/engines/phase-b64-p4-d64-kv4096"
+        max_stable_slots=64
+        serving_preset="thor-throughput"
         ;;
     *)
-        echo "Usage: $0 [thor-throughput|thor-latency]" >&2
+        echo "Usage: $0 [thor-throughput|thor-latency|thor-throughput-d64]" >&2
         exit 2
         ;;
 esac
@@ -37,9 +44,9 @@ exec docker run "${docker_args[@]}" \
     -w /opt/TensorRT-Edge-LLM-v010 \
     -e TRT_EDGELLM_SEMANTIC_ONLY=1 \
     -e TRT_EDGELLM_PHASE_IPC=1 \
-    -e TRT_EDGELLM_MAX_STABLE_SLOTS=32 \
-    -e TRT_EDGELLM_MAX_INFLIGHT=32 \
-    -e TRT_EDGELLM_SERVING_PRESET="${preset}" \
+    -e TRT_EDGELLM_MAX_STABLE_SLOTS="${max_stable_slots}" \
+    -e TRT_EDGELLM_MAX_INFLIGHT="${max_stable_slots}" \
+    -e TRT_EDGELLM_SERVING_PRESET="${serving_preset}" \
     -e TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP=1 \
     --entrypoint python3 \
     "${image}" \
