@@ -1166,7 +1166,12 @@ int main(int argc, char** argv)
         }
         else if (ipcMode)
         {
-            size_t ipcIngressQuantum = serverConfig.maxPendingRequests;
+            // Bound synchronous request parsing before polling the GPU phases. In
+            // particular, image loading must not drain an entire burst while the
+            // device is idle. Half a prefill cohort leaves enough rows for useful
+            // batching while overlapping the remaining ingress work with CUDA.
+            size_t ipcIngressQuantum = std::min(serverConfig.maxPendingRequests,
+                std::max<size_t>(1U, static_cast<size_t>(semanticSchedulerConfig.maxPrefillBatchSize) / 2U));
             if (char const* value = std::getenv("TRT_EDGELLM_IPC_INGRESS_QUANTUM"))
             {
                 ipcIngressQuantum = static_cast<size_t>(std::stoul(value));
