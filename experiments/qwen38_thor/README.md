@@ -143,9 +143,114 @@ For this model, hardware, and natural-language workload, native MTP reduces
 throughput rather than raising it. MTP-3 position acceptance was 71.6%, 44.4%,
 and 24.8%, respectively.
 
+## Locked-clock Thor optimization
+
+The node was rebooted after the initial comparison. All subsequent measurements
+use a stricter hardware contract: MAXN, CPU 2.601 GHz, GPU GPC 1.575 GHz, GPU
+NVD 1.692 GHz, and EMC 4.266 GHz, with every minimum equal to its maximum.
+Results before and after the reboot are not mixed.
+
+Several RTX 3080 assumptions were rejected by direct Thor A/B:
+
+- Logical-vocabulary strided sampling was neutral and was reverted.
+- Phase CUDA Graph replay reduced throughput and remains disabled.
+- D16 and low-admission latency modes reduced both service rate and tail
+  latency.
+- Unprofiled prefill/decode overlap improved median TTFT but hurt throughput and
+  p95 TTFT.
+
+The asymmetric hybrid builder now gives recurrent and convolution states
+phase-specific batch profiles. This permits real P4/D32 and P8/D32 engines
+instead of relying on a global B32 state profile.
+
+| prefill shape | latency | aggregate input throughput |
+| --- | ---: | ---: |
+| P1 x 128 | 158.3 ms | 808.7 tok/s |
+| P4 x 128 | 212.1 ms | 2,413.6 tok/s |
+| P8 x 128 | 397.3 ms | 2,577.7 tok/s |
+| P1 x 2,048 | 585.3 ms | 3,498.9 tok/s |
+| P4 x 2,048 | 2,908.4 ms | 2,816.6 tok/s |
+
+P4 is the best short/balanced engine on Thor. P8 adds only 0.35% in the HTTP
+short burst while doubling prefill activation memory. P1 remains the correct
+long-prefill engine.
+
+Two SM110 presets are available through TRT_EDGELLM_SERVING_PRESET and the
+launcher:
+
+    IGNORE_EOS=1 experiments/qwen38_thor/run_phase_server.sh thor-throughput
+    experiments/qwen38_thor/run_phase_server.sh thor-latency
+
+- thor-throughput: P4/D32, prefill/decode queue targets 150/300 ms.
+- thor-latency: P4/D32, queue targets 300/250 ms.
+
+Both keep D32. Reducing the decode batch to D16 was counterproductive on Thor's
+20 SMs. The throughput preset reached 95.3% full-cohort residency and 97.0%
+row-level recurrent-state residency on short burst.
+
+### Locked-clock comparison
+
+The table below is the median of three warmed streaming HTTP runs collected
+after reboot under the locked-clock contract.
+
+| workload | phase P4/D32 throughput | vLLM vanilla | phase advantage |
+| --- | ---: | ---: | ---: |
+| short burst, 128->64, c32 | 187.43 tok/s | 97.21 tok/s | +92.82% |
+| decode heavy, 128->256, c32 | 213.11 tok/s | 101.23 tok/s | +110.53% |
+| balanced burst, 512->128, c32 | 169.04 tok/s | not repeated | n/a |
+
+### Full phase workload matrix
+
+Every configured workload completed with zero failed requests.
+
+| workload | output tok/s | TTFT median | TPOT median |
+| --- | ---: | ---: | ---: |
+| short burst | 153.09 | 1,209 ms | 193 ms |
+| short steady | 47.74 | 464 ms | 311 ms |
+| balanced burst | 140.17 | 3,408 ms | 203 ms |
+| balanced Poisson | 62.13 | 571 ms | 351 ms |
+| prefill heavy | 18.65 | 4,512 ms | 300 ms |
+| decode heavy | 212.37 | 1,119 ms | 147 ms |
+| bimodal burst | 107.06 | 4,174 ms | 215 ms |
+| wave burst | 177.15 | 748 ms | 168 ms |
+| shared prefix | 46.19 | 3,553 ms | 294 ms |
+| multi-turn | 49.30 | 872 ms | 291 ms |
+
+The full matrix collected 654 one-second telemetry samples. Mean/max GPU power
+was 37.5/80.2 W, mean/max board input power was 90.0/165.0 W, and maximum GPU
+temperature was 67.5 C.
+
+Run the reproducible matrix with:
+
+    python3 experiments/qwen38_thor/run_http_matrix.py \
+      --base-url http://127.0.0.1:8001 \
+      --backend phase-p4-d32-thor-throughput \
+      --results-dir data/qwen38/results/next/full-matrix-phase-throughput \
+      --repeats 3
+
+The runner refuses to start unless GPU and EMC clocks are locked.
+
+### Long context
+
+The phase-b32-p1-d32-input8192-kv32768-p2048 engine supports input 8K and KV
+capacity 32K. Its 2,048-page undercommitted pool supports either 32 concurrent
+8K contexts, 16 concurrent 16K contexts, or 8 concurrent 32K contexts.
+
+| component | latency | aggregate throughput |
+| --- | ---: | ---: |
+| P1 prefill 8K | 2,757.3 ms | 2,971.0 input tok/s |
+| D32, past 8K | 183.6 ms | 174.3 tok/s |
+| D16, past 16K | 153.6 ms | 104.2 tok/s |
+| D8, past 32K | 139.0 ms | 57.5 tok/s |
+
+Machine-readable results are in results_2026-08-24_thor_next.json.
+
 ## Validation
 
 - Focused phase/state/scheduler tests: 15/15 passed.
+- Locked-clock next-stage builder/profile/scheduler/state tests: 91/91 passed.
+- TensorRT integration builds succeeded for P4/D32, P8/D32, and
+  input-8K/KV-32K P1/D32 undercommitted profiles.
 - Pre-commit formatting and lint hooks: passed on all changed files.
 - Full C++ suite: 1,149 passed, 5 skipped, and 3 failed on the first run. The
   flaky `SigmoidGroupTopkTest.LargeScale` passed on rerun. The two reproducible
