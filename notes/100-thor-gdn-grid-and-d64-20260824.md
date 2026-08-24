@@ -73,8 +73,25 @@ register-limited L1TEX scoreboard stalls, not evidence of uncoalesced sectors. A
 bindings, prefill/decode compatibility, snapshot storage, and MTP state semantics without addressing the measured
 occupancy limit. It is deferred.
 
-## Remaining gate
+## D64 HTTP gate
 
-Run the D64 server with concurrency 64 on short, wave, and decode-heavy workloads, one warmup plus three repeats. Compare
-throughput, TTFT/TPOT, unified-memory peak, and D64 cohort residency. Then export the small GDN symbol only if its expected
-sub-1% whole-engine gain remains useful after HTTP validation.
+The D64 server ran one c64 warmup followed by three streaming HTTP repeats. Every run completed all 128 requests with the
+exact fixed output-token count. Median results:
+
+| workload | D32/c32 reference | D64/c64 | throughput change |
+| --- | ---: | ---: | ---: |
+| short burst | 156.76 tok/s | 203.40 tok/s | +29.75% |
+| wave burst | 177.02 tok/s | 245.56 tok/s | +38.72% |
+| decode heavy | 213.11 tok/s | 307.90 tok/s | +44.48% |
+
+D64 is a throughput preset, not a latency preset. Short TTFT/TPOT/E2E were 1,993/287/20,086 ms, versus the lower D32
+latencies obtained with half as many concurrent requests. Wave TTFT/TPOT/E2E were 1,949/234/24,691 ms. Decode-heavy was
+1,807/201/53,170 ms.
+
+The decode state view recorded 2,631 prepares and 2,557 residency hits (97.2%). All workloads had zero failed requests.
+Mean/max GPU power was 40.5/79.4 W, mean/max board power was 95.3/144.9 W, and maximum GPU temperature was 67.5 C.
+
+Machine-readable results are in `data/qwen38/results/next/phase-p4-d64-c64/summary.json`.
+
+The D64 HTTP throughput gate passes. Exporting the small GDN symbol remains optional because its expected whole-engine
+gain is below 1%; D64 itself supplies the material improvement.

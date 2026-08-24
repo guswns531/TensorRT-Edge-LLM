@@ -9,6 +9,13 @@
       "output_tokens": 64,
       "arrival": "burst"
     },
+    "short_burst_c64": {
+      "requests": 128,
+      "concurrency": 64,
+      "input_tokens": 128,
+      "output_tokens": 64,
+      "arrival": "burst"
+    },
     "short_steady": {
       "requests": 64,
       "concurrency": 16,
@@ -46,6 +53,13 @@
       "output_tokens": 256,
       "arrival": "burst"
     },
+    "decode_heavy_c64": {
+      "requests": 128,
+      "concurrency": 64,
+      "input_tokens": 128,
+      "output_tokens": 256,
+      "arrival": "burst"
+    },
     "bimodal_burst": {
       "requests": 64,
       "concurrency": 32,
@@ -62,6 +76,15 @@
       "output_tokens": 96,
       "arrival": "waves",
       "wave_size": 8,
+      "wave_interval_seconds": 1.0
+    },
+    "wave_burst_c64": {
+      "requests": 128,
+      "concurrency": 64,
+      "input_tokens": 256,
+      "output_tokens": 96,
+      "arrival": "waves",
+      "wave_size": 16,
       "wave_interval_seconds": 1.0
     },
     "shared_prefix": {
