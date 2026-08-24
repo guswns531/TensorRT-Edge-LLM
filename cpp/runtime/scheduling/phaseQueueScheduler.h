@@ -268,6 +268,10 @@ struct PhaseQueueSchedulerConfig
     PhaseSchedulerProfile profile{PhaseSchedulerProfile::kCustom};
     int32_t maxPrefillBatchSize{1};
     int32_t maxDecodeBatchSize{4};
+    //! Optional row cap used only when prefill and decode execute concurrently.
+    //! Zero inherits maxPrefillBatchSize. This lets a wide standalone prefill
+    //! profile coexist with a smaller, memory-safe overlap shape.
+    int32_t maxOverlapPrefillBatchSize{};
     //! Default policy only overlaps short prefills. The initial value comes from
     //! the Gemma4 E2B RTX 3080 crossover benchmark and remains configurable.
     int32_t maxOverlapPrefillTokens{128};

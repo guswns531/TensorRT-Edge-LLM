@@ -225,7 +225,13 @@ bool PhaseThreeCoordinator::startNextEncoder()
 
 bool PhaseThreeCoordinator::completeEncoder()
 {
-    if (mEncoding.empty() || !mVision.ready(mEncoding.front().requestId))
+    if (mEncoding.empty())
+    {
+        return false;
+    }
+    bool const batchReady = std::all_of(mEncoding.begin(), mEncoding.end(),
+        [&](PendingVisionRequest const& encoding) { return mVision.ready(encoding.requestId); });
+    if (!batchReady)
     {
         return false;
     }

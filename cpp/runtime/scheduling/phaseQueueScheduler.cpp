@@ -85,6 +85,9 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
+    check::check(mConfig.maxOverlapPrefillBatchSize >= 0
+            && mConfig.maxOverlapPrefillBatchSize <= mConfig.maxPrefillBatchSize,
+        "maxOverlapPrefillBatchSize must be zero or no greater than maxPrefillBatchSize");
     check::check(mConfig.maxOverlapPrefillTokens >= 0, "maxOverlapPrefillTokens must be non-negative");
     check::check(mConfig.maxPrefillChunkTokens >= 0, "maxPrefillChunkTokens must be non-negative");
     check::check(mConfig.decodeActivePrefillChunkTokens >= 0
@@ -307,6 +310,13 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
 {
     PhaseQueueSnapshot result{};
     result.consecutiveDecodeBatches = mConsecutiveDecodeBatches;
+    bool const hasDecodeWork = std::any_of(mDecodeQueue.begin(), mDecodeQueue.end(),
+        [this](PhaseWorkItem const& item) { return isEligible(item, false); });
+    int32_t const overlapPrefillBatchSize = mConfig.maxOverlapPrefillBatchSize > 0
+        ? mConfig.maxOverlapPrefillBatchSize
+        : mConfig.maxPrefillBatchSize;
+    int32_t const candidatePrefillBatchSize
+        = hasDecodeWork ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
     auto const prefillSeed = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, true); });
     if (prefillSeed != mPrefillQueue.end())
@@ -317,7 +327,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         int32_t bucketRows{};
         for (PhaseWorkItem const& item : mPrefillQueue)
         {
-            if (isEligible(item, true) && bucketRows < mConfig.maxPrefillBatchSize
+            if (isEligible(item, true) && bucketRows < candidatePrefillBatchSize
                 && isPrefillBatchCompatible(item, *prefillSeed, bucketTokens, bucketInitial, allowRaggedBatch))
             {
                 ++bucketRows;
@@ -617,7 +627,8 @@ bool PhaseQueueScheduler::isPrefillBatchCompatible(PhaseWorkItem const& item, Ph
     {
         return true;
     }
-    return mConfig.enableRaggedPrefillBatching && allowRaggedBatch && item.allowChunkedPrefill;
+    bool const bothAtomic = !seed.allowChunkedPrefill && !item.allowChunkedPrefill;
+    return mConfig.enableRaggedPrefillBatching && (bothAtomic || (allowRaggedBatch && item.allowChunkedPrefill));
 }
 
 int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates,
@@ -1006,6 +1017,19 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             }
         }
     }
+    if (mConfig.enableRaggedPrefillBatching && !bucketSeed->allowChunkedPrefill && !bucketSeed->exclusivePrefill)
+    {
+        bool const initialChunk = bucketSeed->tokenOffset == 0;
+        for (auto it = queue.cbegin(); it != queue.cend(); ++it)
+        {
+            bool const compatibleAtomic = isEligible(*it, true) && !it->allowChunkedPrefill && !it->exclusivePrefill
+                && (it->tokenOffset == 0) == initialChunk;
+            if (compatibleAtomic && dispatchedPrefillTokens(*it) > dispatchedPrefillTokens(*bucketSeed))
+            {
+                bucketSeed = it;
+            }
+        }
+    }
     int32_t bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
     bool const allowRaggedBatch = bucketSeed->allowChunkedPrefill;
@@ -1047,9 +1071,10 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             }
             int32_t const itemTokens
                 = costAwareShape ? costAwarePrefillTokens(item, paddedChunkLength) : dispatchedPrefillTokens(item);
+            bool const bothAtomic = !bucketSeed->allowChunkedPrefill && !item.allowChunkedPrefill;
             bool const compatibleShape = itemTokens == paddedChunkLength
-                || (itemTokens < paddedChunkLength && mConfig.enableRaggedPrefillBatching && allowRaggedBatch
-                    && item.allowChunkedPrefill);
+                || (itemTokens < paddedChunkLength && mConfig.enableRaggedPrefillBatching
+                    && (bothAtomic || (allowRaggedBatch && item.allowChunkedPrefill)));
             if (compatibleShape)
             {
                 rows.push_back(&item);
@@ -1282,7 +1307,12 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.prefillBatch = popBatch(mPrefillQueue, mConfig.maxPrefillBatchSize, true, state, plan);
+        int32_t const overlapPrefillBatchSize = mConfig.maxOverlapPrefillBatchSize > 0
+            ? mConfig.maxOverlapPrefillBatchSize
+            : mConfig.maxPrefillBatchSize;
+        int32_t const prefillBatchSize
+            = kind == PhaseDispatchKind::kOverlap ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
+        plan.prefillBatch = popBatch(mPrefillQueue, prefillBatchSize, true, state, plan);
     }
     if (kind == PhaseDispatchKind::kOverlap && plan.prefillDeferredForTpot)
     {

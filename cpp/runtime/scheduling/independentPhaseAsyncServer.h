@@ -121,6 +121,8 @@ struct IndependentPhaseServerConfig
     size_t adaptiveBacklogEnterRequests{1U};
     //! Multimodal prefill remains atomic unless an engine contract explicitly proves chunk correctness.
     bool allowChunkedVisionPrefill{};
+    //! Packed-prefill engines may batch multiple complete multimodal prompts without chunking them.
+    bool allowBatchedVisionPrefill{};
 };
 
 struct IndependentPhaseServerSubmission

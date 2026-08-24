@@ -50,6 +50,36 @@ TEST(PhaseQueueSchedulerTest, BatchesQueuesIndependently)
     EXPECT_EQ(plan.decodeBatch[0].requestId, 3U);
 }
 
+TEST(PhaseQueueSchedulerTest, LimitsOnlyConcurrentPrefillRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxDecodeBatchSize = 4;
+    config.maxOverlapPrefillBatchSize = 2;
+    config.maxOverlapPrefillTokens = 256;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128});
+    }
+    scheduler.enqueueDecode({9, 128});
+
+    PhaseDispatchPlan const overlap = scheduler.next();
+    EXPECT_EQ(overlap.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(overlap.prefillBatch.size(), 2U);
+    EXPECT_EQ(overlap.decodeBatch.size(), 1U);
+
+    PhaseQueueScheduler standalone(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        standalone.enqueuePrefill({requestId, 128});
+    }
+    PhaseDispatchPlan const prefill = standalone.next();
+    EXPECT_EQ(prefill.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(prefill.prefillBatch.size(), 8U);
+}
+
 TEST(PhaseQueueSchedulerTest, GivesLongPrefillDecodePriority)
 {
     PhaseQueueScheduler scheduler;
@@ -1079,6 +1109,28 @@ TEST(PhaseQueueSchedulerTest, KeepsNonChunkableMultimodalPrefillAtomic)
     PhaseDispatchPlan const plan = scheduler.next();
     ASSERT_EQ(plan.prefillBatch.size(), 1U);
     EXPECT_EQ(plan.prefillBatch.front().tokenCount, 300);
+}
+
+TEST(PhaseQueueSchedulerTest, BatchesRaggedAtomicMultimodalPrefills)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 2048;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem first{1, 509, 0, 0, 509};
+    PhaseWorkItem second{2, 1015, 1, 0, 1015};
+    first.allowChunkedPrefill = false;
+    second.allowChunkedPrefill = false;
+    scheduler.enqueuePrefill(first);
+    scheduler.enqueuePrefill(second);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].tokenCount, 1015);
+    EXPECT_EQ(plan.prefillBatch[1].tokenCount, 509);
 }
 
 TEST(PhaseQueueSchedulerTest, ChunksExclusiveMultimodalPrefillWithoutBatchingRows)
