@@ -42,6 +42,29 @@ TEST(IndependentPhaseAsyncServerTest, AdaptiveAdmissionUsesBacklogHysteresis)
     EXPECT_FALSE(nextAdaptiveThroughputMode(true, 0, 64, 64, 1));
 }
 
+TEST(IndependentPhaseAsyncServerTest, StepwiseAdmissionRequiresSaturatedBacklog)
+{
+    EXPECT_EQ(nextStepwiseAdmissionLimit(16, 16, 64, 16, 8, 16, 1, 128, 8, 2.0F, 3.3F, 3.0F), 32);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(32, 16, 64, 16, 8, 31, 1, 128, 8, 2.0F, 3.3F, 3.0F), 32);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(48, 16, 64, 16, 8, 48, 1, 128, 8, 2.0F, 3.3F, 3.0F), 64);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(64, 16, 64, 16, 8, 64, 1, 128, 8, 2.0F, 3.3F, 3.0F), 64);
+}
+
+TEST(IndependentPhaseAsyncServerTest, StepwiseAdmissionContractsForDecodeOrPagePressure)
+{
+    EXPECT_EQ(nextStepwiseAdmissionLimit(64, 16, 64, 16, 8, 64, 1, 128, 8, 3.3F, 3.3F, 3.0F), 48);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(48, 16, 64, 16, 8, 48, 1, 7, 8, 2.0F, 3.3F, 3.0F), 32);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(32, 16, 64, 16, 0, 16, 1, 128, 8, 2.0F, 3.3F, 3.0F), 16);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(16, 16, 64, 16, 8, 16, 1, 128, 8, 3.4F, 3.3F, 3.0F), 16);
+}
+
+TEST(IndependentPhaseAsyncServerTest, StepwiseAdmissionUsesTpotHysteresisForGrowth)
+{
+    EXPECT_EQ(nextStepwiseAdmissionLimit(32, 16, 64, 16, 8, 32, 1, 128, 8, 3.1F, 3.3F, 3.0F), 32);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(32, 16, 64, 16, 8, 32, 1, 128, 8, 3.0F, 3.3F, 3.0F), 48);
+    EXPECT_EQ(nextStepwiseAdmissionLimit(32, 16, 64, 16, 8, 32, 1, 128, 8, 0.0F, 3.3F, 3.0F), 48);
+}
+
 TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuckets)
 {
     EXPECT_EQ(phaseServingWarmupBatchSizes(64), (std::vector<int32_t>{8, 16, 32, 48, 64}));

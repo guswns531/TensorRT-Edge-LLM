@@ -44,6 +44,10 @@ bool shouldDeferDecodeForSamplingRefill(
 //! Hysteretic queue-pressure transition for adaptive admission.
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept;
+//! Move one admission step from backlog, saturation, decode pressure, and page headroom.
+size_t nextStepwiseAdmissionLimit(size_t currentLimit, size_t latencyLimit, size_t throughputLimit, size_t step,
+    size_t pendingRequests, size_t activeRequests, size_t backlogEnterThreshold, int32_t availablePages,
+    int32_t minFreePages, float decodeTpotPressure, float pressureEnterRatio, float pressureExitRatio) noexcept;
 //! Representative decode buckets to prime before opening a persistent serving endpoint.
 std::vector<int32_t> phaseServingWarmupBatchSizes(
     int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes = {});
@@ -142,6 +146,15 @@ struct IndependentPhaseServerConfig
     bool enableAdaptiveAdmission{};
     size_t latencyInFlightRequests{};
     size_t adaptiveBacklogEnterRequests{1U};
+    //! Replace the latency/throughput jump with bounded admission steps.
+    bool enableStepwiseAdaptiveAdmission{};
+    size_t adaptiveAdmissionStep{16U};
+    //! Minimum completed phase dispatches between admission-limit changes.
+    size_t adaptiveAdmissionDwellSamples{4U};
+    //! A zero enter ratio disables decode-pressure contraction.
+    float adaptiveAdmissionTpotPressureEnterRatio{};
+    float adaptiveAdmissionTpotPressureExitRatio{};
+    int32_t adaptiveAdmissionMinFreePages{};
     //! Multimodal prefill remains atomic unless an engine contract explicitly proves chunk correctness.
     bool allowChunkedVisionPrefill{};
     //! Packed-prefill engines may batch multiple complete multimodal prompts without chunking them.
@@ -216,6 +229,8 @@ public:
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
+    //! Include encoder and encoded-ready work that has not entered this server yet.
+    void setExternalPendingRequests(size_t pendingRequests) noexcept;
     //! Stable slots that can be admitted immediately under the current latency/throughput limit.
     size_t availableAdmissionSlots() const noexcept;
     //! Physical KV pages currently free in the shared stable page pool.
@@ -232,6 +247,9 @@ public:
     size_t visionPrefillReleasedBytes() const noexcept;
     bool throughputMode() const noexcept;
     size_t throughputModeTransitionCount() const noexcept;
+    size_t adaptiveAdmissionLimit() const noexcept;
+    size_t adaptiveAdmissionIncreaseCount() const noexcept;
+    size_t adaptiveAdmissionDecreaseCount() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -305,6 +323,11 @@ private:
     size_t mVisionPrefillReleasedBytes{};
     bool mThroughputMode{};
     size_t mThroughputModeTransitionCount{};
+    size_t mExternalPendingRequests{};
+    size_t mAdaptiveAdmissionLimit{};
+    size_t mAdaptiveAdmissionIncreaseCount{};
+    size_t mAdaptiveAdmissionDecreaseCount{};
+    size_t mLastAdmissionTransitionSample{};
 };
 
 } // namespace trt_edgellm::rt

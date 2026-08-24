@@ -479,3 +479,40 @@ immediate P1, while preserving all 160 greedy tokens and all five semantic
 checks. On the saturated 64-request mixed trace, the slot guard collapsed the
 policy back toward P1: throughput changed by -0.11%, TTFT p95 by +0.22%, TPOT
 p95 by +0.21%, and E2E p95 by +0.003%. The policy remains opt-in.
+
+## Stepwise in-flight admission
+
+An additional opt-in controller replaces the adaptive server's direct jump
+between its latency and throughput limits with bounded steps. It merges the
+server's text pending queue with encoder, encoding, and encoded-ready vision
+backlog. A step increase requires both backlog and saturation of the current
+limit. Decode TPOT pressure or insufficient free pages contracts one step,
+while an idle drain returns the limit toward the latency floor. Completed
+phase-dispatch dwell and separate TPOT enter/exit ratios prevent poll-loop
+jumps and boundary oscillation.
+
+```text
+TRT_EDGELLM_ADAPTIVE_ADMISSION=1
+TRT_EDGELLM_LATENCY_INFLIGHT=16
+TRT_EDGELLM_MAX_INFLIGHT=64
+TRT_EDGELLM_STEPWISE_ADMISSION=1
+TRT_EDGELLM_ADMISSION_STEP=16
+TRT_EDGELLM_ADMISSION_DWELL_SAMPLES=4
+TRT_EDGELLM_ADMISSION_TPOT_ENTER=3.3
+TRT_EDGELLM_ADMISSION_TPOT_EXIT=3.0
+TRT_EDGELLM_ADMISSION_MIN_FREE_PAGES=0
+```
+
+The 64-request mixed Poisson trace measured static 16/32/48/64 throughput at
+1044.6/1296.2/1495.7/1699.6 token/s. Corresponding TTFT p95 was
+3381.7/2241.1/1584.9/1521.8 ms and TPOT p95 was
+23.40/28.98/33.87/36.32 ms. The stepwise controller performed three increases
+and three decreases per run, delivering 1697.6 token/s, 1515.2 ms TTFT p95,
+36.27 ms TPOT p95, and 2444.7 ms E2E p95. It therefore retained the static-64
+burst operating point within 0.4% rather than improving its decode tail.
+
+A 20-request vision wave spread over 6.03 seconds stayed at limit 16 with no
+transitions. The five-request one/two-image exact gate retained all 160 tokens
+with hash `674ed0a3262f98fa9a3bf8043bd63037050a9eddd1d987c1b310abb0a00ea4cb`.
+The controller remains disabled by default until pre-admission TPOT cost
+prediction can bound saturated-burst tail latency.

@@ -280,6 +280,7 @@ bool PhaseThreeCoordinator::poll()
     bool progressed = completeEncoder();
     progressed = startNextEncoder() || progressed;
     progressed = dispatchReadyPrefill() || progressed;
+    mServer.setExternalPendingRequests(mPending.size() + mEncoding.size() + mReadyPrefill.size());
     progressed = mServer.poll() || progressed;
     mVision.reclaimIdleStorage();
     return progressed;

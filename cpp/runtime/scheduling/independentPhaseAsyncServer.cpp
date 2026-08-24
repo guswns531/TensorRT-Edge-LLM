@@ -50,6 +50,35 @@ bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingReques
     return pendingRequests > 0 || activeRequests > latencyInFlightLimit;
 }
 
+size_t nextStepwiseAdmissionLimit(size_t currentLimit, size_t latencyLimit, size_t throughputLimit, size_t step,
+    size_t pendingRequests, size_t activeRequests, size_t backlogEnterThreshold, int32_t availablePages,
+    int32_t minFreePages, float decodeTpotPressure, float pressureEnterRatio, float pressureExitRatio) noexcept
+{
+    currentLimit = std::clamp(currentLimit, latencyLimit, throughputLimit);
+    size_t const lowerLimit = currentLimit - latencyLimit > step ? currentLimit - step : latencyLimit;
+    size_t const upperLimit = throughputLimit - currentLimit > step ? currentLimit + step : throughputLimit;
+    bool const pagePressure = minFreePages > 0 && availablePages < minFreePages;
+    bool const decodePressure = pressureEnterRatio > 0.0F && decodeTpotPressure >= pressureEnterRatio;
+    if ((pagePressure || decodePressure) && currentLimit > latencyLimit)
+    {
+        return lowerLimit;
+    }
+
+    bool const decodeAllowsGrowth
+        = pressureExitRatio <= 0.0F || decodeTpotPressure <= pressureExitRatio || decodeTpotPressure == 0.0F;
+    bool const backlog = pendingRequests >= backlogEnterThreshold;
+    if (backlog && activeRequests >= currentLimit && !pagePressure && decodeAllowsGrowth
+        && currentLimit < throughputLimit)
+    {
+        return upperLimit;
+    }
+    if (!backlog && activeRequests <= lowerLimit && currentLimit > latencyLimit)
+    {
+        return lowerLimit;
+    }
+    return currentLimit;
+}
+
 std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes)
 {
     ELLM_CHECK(maxDecodeBatchSize > 0, "Phase serving warmup requires a positive decode batch limit");
@@ -185,11 +214,23 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
             || (mConfig.latencyInFlightRequests > 0 && mConfig.latencyInFlightRequests <= mConfig.maxInFlightRequests
                 && mConfig.adaptiveBacklogEnterRequests > 0),
         "Adaptive admission requires valid latency and backlog thresholds");
+    ELLM_CHECK(!mConfig.enableStepwiseAdaptiveAdmission || mConfig.enableAdaptiveAdmission,
+        "Stepwise admission requires adaptive admission");
+    ELLM_CHECK(!mConfig.enableStepwiseAdaptiveAdmission
+            || (mConfig.adaptiveAdmissionStep > 0 && mConfig.adaptiveAdmissionDwellSamples > 0
+                && mConfig.adaptiveAdmissionMinFreePages >= 0
+                && (mConfig.adaptiveAdmissionTpotPressureEnterRatio == 0.0F
+                    || (mConfig.adaptiveAdmissionTpotPressureExitRatio > 0.0F
+                        && mConfig.adaptiveAdmissionTpotPressureExitRatio
+                            <= mConfig.adaptiveAdmissionTpotPressureEnterRatio))),
+        "Stepwise admission requires valid step, dwell, page, and TPOT thresholds");
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
     mCoordinator.setGraphCaptureEnabled(mConfig.enableCudaGraphs);
     mCoordinator.scheduler().setOnlineDecodeCostLearningActive(!mConfig.enableAdaptiveAdmission);
     mCoordinator.setCallbacks(makeCallbacks());
+    mAdaptiveAdmissionLimit
+        = mConfig.enableAdaptiveAdmission ? mConfig.latencyInFlightRequests : mConfig.maxInFlightRequests;
 }
 
 IndependentPhaseAsyncServer::~IndependentPhaseAsyncServer() noexcept
@@ -423,6 +464,10 @@ bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
 
 size_t IndependentPhaseAsyncServer::admissionLimit() const noexcept
 {
+    if (mConfig.enableStepwiseAdaptiveAdmission)
+    {
+        return mAdaptiveAdmissionLimit;
+    }
     return !mConfig.enableAdaptiveAdmission || mThroughputMode ? mConfig.maxInFlightRequests
                                                                : mConfig.latencyInFlightRequests;
 }
@@ -431,6 +476,41 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
 {
     if (!mConfig.enableAdaptiveAdmission)
     {
+        return;
+    }
+    if (mConfig.enableStepwiseAdaptiveAdmission)
+    {
+        PhaseSchedulerTelemetry const& telemetry = mCoordinator.scheduler().telemetry();
+        if (telemetry.sampleCount < mLastAdmissionTransitionSample
+            || telemetry.sampleCount - mLastAdmissionTransitionSample >= mConfig.adaptiveAdmissionDwellSamples)
+        {
+            size_t const pendingRequests = mPendingRequests.size() + mExternalPendingRequests;
+            size_t const next = nextStepwiseAdmissionLimit(mAdaptiveAdmissionLimit, mConfig.latencyInFlightRequests,
+                mConfig.maxInFlightRequests, mConfig.adaptiveAdmissionStep, pendingRequests, mRequests.size(),
+                mConfig.adaptiveBacklogEnterRequests, mOwnership.availablePages(),
+                mConfig.adaptiveAdmissionMinFreePages, telemetry.recentDecodeTpotPressure,
+                mConfig.adaptiveAdmissionTpotPressureEnterRatio, mConfig.adaptiveAdmissionTpotPressureExitRatio);
+            if (next != mAdaptiveAdmissionLimit)
+            {
+                if (next > mAdaptiveAdmissionLimit)
+                {
+                    ++mAdaptiveAdmissionIncreaseCount;
+                }
+                else
+                {
+                    ++mAdaptiveAdmissionDecreaseCount;
+                }
+                bool const previousThroughputMode = mThroughputMode;
+                mAdaptiveAdmissionLimit = next;
+                mThroughputMode = next > mConfig.latencyInFlightRequests;
+                if (previousThroughputMode != mThroughputMode)
+                {
+                    ++mThroughputModeTransitionCount;
+                }
+                mLastAdmissionTransitionSample = telemetry.sampleCount;
+            }
+        }
+        mCoordinator.scheduler().setOnlineDecodeCostLearningActive(mThroughputMode);
         return;
     }
     bool const next = nextAdaptiveThroughputMode(mThroughputMode, mPendingRequests.size(), mRequests.size(),
@@ -485,6 +565,11 @@ size_t IndependentPhaseAsyncServer::inFlightCount() const noexcept
 size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
 {
     return mPendingRequests.size();
+}
+
+void IndependentPhaseAsyncServer::setExternalPendingRequests(size_t pendingRequests) noexcept
+{
+    mExternalPendingRequests = pendingRequests;
 }
 
 size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
@@ -583,6 +668,21 @@ bool IndependentPhaseAsyncServer::throughputMode() const noexcept
 size_t IndependentPhaseAsyncServer::throughputModeTransitionCount() const noexcept
 {
     return mThroughputModeTransitionCount;
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionLimit() const noexcept
+{
+    return admissionLimit();
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionIncreaseCount() const noexcept
+{
+    return mAdaptiveAdmissionIncreaseCount;
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionDecreaseCount() const noexcept
+{
+    return mAdaptiveAdmissionDecreaseCount;
 }
 
 bool IndependentPhaseAsyncServer::empty() const noexcept

@@ -1086,7 +1086,8 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.maxPrefillCohortTurns = 8;
         semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
         semanticSchedulerConfig.enableDecodeTpotTelemetry
-            = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr;
+            = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr
+            || std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr;
         semanticSchedulerConfig.minPrefillChunkTokens = 32;
         semanticSchedulerConfig.prefillChunkAlignment = 8;
         semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
@@ -1202,6 +1203,27 @@ int main(int argc, char** argv)
         if (char const* value = std::getenv("TRT_EDGELLM_LATENCY_INFLIGHT"))
         {
             serverConfig.latencyInFlightRequests = static_cast<size_t>(std::stoul(value));
+        }
+        serverConfig.enableStepwiseAdaptiveAdmission = std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_STEP"))
+        {
+            serverConfig.adaptiveAdmissionStep = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_DWELL_SAMPLES"))
+        {
+            serverConfig.adaptiveAdmissionDwellSamples = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_TPOT_ENTER"))
+        {
+            serverConfig.adaptiveAdmissionTpotPressureEnterRatio = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_TPOT_EXIT"))
+        {
+            serverConfig.adaptiveAdmissionTpotPressureExitRatio = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_MIN_FREE_PAGES"))
+        {
+            serverConfig.adaptiveAdmissionMinFreePages = std::stoi(value);
         }
         if (char const* reservation = std::getenv("TRT_EDGELLM_PAGE_RESERVATION");
             reservation != nullptr && std::string(reservation) == "headroom")
@@ -1787,6 +1809,9 @@ int main(int argc, char** argv)
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
+                        {"adaptive_admission_limit", semanticServer.adaptiveAdmissionLimit()},
+                        {"adaptive_admission_increases", semanticServer.adaptiveAdmissionIncreaseCount()},
+                        {"adaptive_admission_decreases", semanticServer.adaptiveAdmissionDecreaseCount()},
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
                         {"page_growth_waits", semanticServer.pageGrowthWaitCount()},
                         {"page_growth_pending", semanticServer.pendingPageGrowthCount()},
@@ -1888,9 +1913,12 @@ int main(int argc, char** argv)
                 }
             }
             inputReader.join();
-            LOG_INFO("Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s",
+            LOG_INFO(
+                "Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s "
+                "admission_limit=%zu admission_increases=%zu admission_decreases=%zu",
                 semanticServer.decodeRefillWaitCount(), semanticServer.throughputModeTransitionCount(),
-                semanticServer.throughputMode() ? "yes" : "no");
+                semanticServer.throughputMode() ? "yes" : "no", semanticServer.adaptiveAdmissionLimit(),
+                semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount());
             LOG_INFO(
                 "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
             LOG_INFO(
