@@ -38,6 +38,8 @@ struct IndependentEngineExecutorPairConfig
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
+    //! Reuse one TensorRT execution context/workspace and serialize phase enqueues.
+    bool sharedExecutionContext{};
 };
 
 //! @brief Two independent TensorRT contexts over one deserialized engine.
@@ -71,6 +73,7 @@ public:
     CUcontext cudaContext() const noexcept;
 
     IndependentEngineExecutorPairConfig const& config() const noexcept;
+    bool sharedExecutionContext() const noexcept;
 
 private:
     IndependentEngineExecutorPair(

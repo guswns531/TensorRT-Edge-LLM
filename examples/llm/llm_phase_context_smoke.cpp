@@ -315,15 +315,27 @@ int main(int argc, char** argv)
         pairConfig.setupStream = setupStream;
         pairConfig.prefillStream = prefillStream;
         pairConfig.decodeStream = decodeStream;
+        pairConfig.sharedExecutionContext = std::getenv("TRT_EDGELLM_SHARED_PHASE_CONTEXT") != nullptr;
         auto pair = rt::IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
 
         ELLM_CHECK(&pair->prefillExecutor().getEngine() == &pair->decodeExecutor().getEngine(),
-            "Independent phase executors must share one TensorRT engine");
-        ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
-                != pair->decodeExecutor().getExecutionContextIdentity(),
-            "Independent phase executors must own different TensorRT contexts");
-        ELLM_CHECK(pair->prefillContextMemory().rawPointer() != pair->decodeContextMemory().rawPointer(),
-            "Independent phase executors must own different workspaces");
+            "Phase executors must share one TensorRT engine");
+        if (pair->sharedExecutionContext())
+        {
+            ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
+                    == pair->decodeExecutor().getExecutionContextIdentity(),
+                "Shared phase mode must reuse one TensorRT context");
+            ELLM_CHECK(pair->prefillContextMemory().rawPointer() == pair->decodeContextMemory().rawPointer(),
+                "Shared phase mode must reuse one workspace");
+        }
+        else
+        {
+            ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
+                    != pair->decodeExecutor().getExecutionContextIdentity(),
+                "Independent phase executors must own different TensorRT contexts");
+            ELLM_CHECK(pair->prefillContextMemory().rawPointer() != pair->decodeContextMemory().rawPointer(),
+                "Independent phase executors must own different workspaces");
+        }
 
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
@@ -854,14 +866,15 @@ int main(int argc, char** argv)
         {
             semanticSchedulerConfig.decodeQueueWaitTargetUs = std::stod(value);
         }
-        semanticSchedulerConfig.enableDynamicDecodeBatching
-            = std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr;
-        semanticSchedulerConfig.enableOnlineDecodeCostLearning
-            = std::getenv("TRT_EDGELLM_DISABLE_ONLINE_COST") == nullptr;
+        bool const forceDynamicDecode = std::getenv("TRT_EDGELLM_ENABLE_DYNAMIC_DECODE") != nullptr;
+        semanticSchedulerConfig.enableDynamicDecodeBatching = forceDynamicDecode
+            || (config.packedPrefill && std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr);
+        semanticSchedulerConfig.enableOnlineDecodeCostLearning = semanticSchedulerConfig.enableDynamicDecodeBatching
+            && std::getenv("TRT_EDGELLM_DISABLE_ONLINE_COST") == nullptr;
         bool const asymmetricDecodeStaging = maxStableSlots > semanticSchedulerConfig.maxDecodeBatchSize
             && semanticSchedulerConfig.maxDecodeBatchSize > semanticSchedulerConfig.maxPrefillBatchSize;
-        semanticSchedulerConfig.enableDecodeCohortBatching
-            = asymmetricDecodeStaging && std::getenv("TRT_EDGELLM_DISABLE_DECODE_COHORT") == nullptr;
+        semanticSchedulerConfig.enableDecodeCohortBatching = semanticSchedulerConfig.enableDynamicDecodeBatching
+            && asymmetricDecodeStaging && std::getenv("TRT_EDGELLM_DISABLE_DECODE_COHORT") == nullptr;
         if (std::getenv("TRT_EDGELLM_ENABLE_DECODE_COHORT") != nullptr)
         {
             semanticSchedulerConfig.enableDecodeCohortBatching = true;

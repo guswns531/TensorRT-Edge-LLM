@@ -58,13 +58,16 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
         CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), mDecodeStream));
     }
 
-    PhaseExecutionSafetyContract const safety
-        = PhaseExecutionSafetyContract::independent({mExecutors.prefillExecutor().getExecutionContextIdentity(),
+    bool const sharedContext = mExecutors.sharedExecutionContext();
+    PhaseExecutionSafetyContract const safety = sharedContext
+        ? PhaseExecutionSafetyContract::shared(mExecutors.prefillExecutor().getExecutionContextIdentity())
+        : PhaseExecutionSafetyContract::independent({mExecutors.prefillExecutor().getExecutionContextIdentity(),
                                                         mExecutors.prefillContextMemory().rawPointer(), &mPrefillIO},
-            {mExecutors.decodeExecutor().getExecutionContextIdentity(), mExecutors.decodeContextMemory().rawPointer(),
-                &mDecodeIO});
+              {mExecutors.decodeExecutor().getExecutionContextIdentity(), mExecutors.decodeContextMemory().rawPointer(),
+                  &mDecodeIO});
     mWorker = std::make_unique<PhaseDispatchWorker>(mScheduler, makeWorkerCallbacks(), mPrefillStream, mDecodeStream,
-        PhaseTensorRTContextMode::kIndependentConcurrent, safety);
+        sharedContext ? PhaseTensorRTContextMode::kSharedSerialized : PhaseTensorRTContextMode::kIndependentConcurrent,
+        safety);
 }
 
 void IndependentPhaseCoordinator::setCallbacks(IndependentPhaseCoordinatorCallbacks callbacks)

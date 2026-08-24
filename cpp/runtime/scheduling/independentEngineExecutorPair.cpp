@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace trt_edgellm
@@ -46,15 +47,25 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
         "Independent phase profile index is not present in the TensorRT engine");
     validateStreams(mConfig, mCudaContext);
 
+    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    int64_t const decodeBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.decodeProfile);
+    ELLM_CHECK(prefillBytes > 0 && decodeBytes > 0, "TensorRT returned an empty profile workspace for phase execution");
+
+    if (mConfig.sharedExecutionContext)
+    {
+        int64_t const sharedBytes = std::max(prefillBytes, decodeBytes);
+        mPrefillContextMemory = Tensor({sharedBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+            "IndependentEngineExecutorPair::sharedContextMemory");
+        ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(
+                       mConfig.prefillProfile, mPrefillContextMemory, mConfig.setupStream),
+            "Failed to assign the shared TensorRT profile workspace");
+        return;
+    }
+
     mDecodeExecutor = mPrefillExecutor->createSibling();
     ELLM_CHECK(mDecodeExecutor != nullptr, "Failed to create the independent decode executor");
     ELLM_CHECK(mPrefillExecutor->getExecutionContextIdentity() != mDecodeExecutor->getExecutionContextIdentity(),
         "Independent phase executors unexpectedly share a TensorRT execution context");
-
-    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
-    int64_t const decodeBytes = mDecodeExecutor->getRequiredContextMemorySizeForProfile(mConfig.decodeProfile);
-    ELLM_CHECK(prefillBytes > 0 && decodeBytes > 0,
-        "TensorRT returned an empty profile workspace for independent phase execution");
 
     mPrefillContextMemory = Tensor({prefillBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "IndependentEngineExecutorPair::prefillContextMemory");
@@ -103,12 +114,12 @@ EngineExecutor const& IndependentEngineExecutorPair::prefillExecutor() const noe
 
 EngineExecutor& IndependentEngineExecutorPair::decodeExecutor() noexcept
 {
-    return *mDecodeExecutor;
+    return mConfig.sharedExecutionContext ? *mPrefillExecutor : *mDecodeExecutor;
 }
 
 EngineExecutor const& IndependentEngineExecutorPair::decodeExecutor() const noexcept
 {
-    return *mDecodeExecutor;
+    return mConfig.sharedExecutionContext ? *mPrefillExecutor : *mDecodeExecutor;
 }
 
 Tensor& IndependentEngineExecutorPair::prefillContextMemory() noexcept
@@ -118,7 +129,7 @@ Tensor& IndependentEngineExecutorPair::prefillContextMemory() noexcept
 
 Tensor& IndependentEngineExecutorPair::decodeContextMemory() noexcept
 {
-    return mDecodeContextMemory;
+    return mConfig.sharedExecutionContext ? mPrefillContextMemory : mDecodeContextMemory;
 }
 
 CUcontext IndependentEngineExecutorPair::cudaContext() const noexcept
@@ -129,6 +140,11 @@ CUcontext IndependentEngineExecutorPair::cudaContext() const noexcept
 IndependentEngineExecutorPairConfig const& IndependentEngineExecutorPair::config() const noexcept
 {
     return mConfig;
+}
+
+bool IndependentEngineExecutorPair::sharedExecutionContext() const noexcept
+{
+    return mConfig.sharedExecutionContext;
 }
 
 } // namespace rt
