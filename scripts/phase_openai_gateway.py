@@ -44,6 +44,8 @@ class EventBroker:
         self.write_lock = threading.Lock()
         self.queues: dict[int, queue.Queue[dict[str, Any]]] = {}
         self.queues_lock = threading.Lock()
+        self.metrics: dict[str, Any] = {}
+        self.metrics_lock = threading.Lock()
         self.reader = threading.Thread(target=self._read_events, daemon=True)
         self.reader.start()
 
@@ -57,6 +59,9 @@ class EventBroker:
             if event["type"] == "ready":
                 self.ready.set()
                 continue
+            if event["type"] == "completion" and "phase_timing" in event:
+                with self.metrics_lock:
+                    self.metrics = event["phase_timing"]
             request_index = int(event["request_index"])
             with self.queues_lock:
                 destination = self.queues.get(request_index)
@@ -107,6 +112,10 @@ class EventBroker:
             self.process.wait(timeout=30)
         self.reader.join(timeout=5)
 
+    def metrics_snapshot(self) -> dict[str, Any]:
+        with self.metrics_lock:
+            return dict(self.metrics)
+
 
 def make_handler(broker: EventBroker, model: str,
                  timeout: float) -> type[BaseHTTPRequestHandler]:
@@ -148,7 +157,7 @@ def make_handler(broker: EventBroker, model: str,
                 body = json.dumps({"backend": "TensorRT-Edge-LLM phase IPC"})
                 self.send_text(200, body)
             elif self.path == "/metrics":
-                self.send_text(200, "phase_gateway_ready 1\n")
+                self.send_json(200, broker.metrics_snapshot())
             else:
                 self.send_text(404, "not found\n")
 

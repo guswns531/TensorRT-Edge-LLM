@@ -154,6 +154,8 @@ struct PhaseSchedulerTelemetry
     size_t onlineDecodeCostBucketCount{};
     float prefillGpuMsPerToken{};
     float decodeGpuMsPerContextToken{};
+    double decodeGpuMsTotal{};
+    uint64_t decodeGpuSampleCount{};
     float overlapRatio{};
     double recentDecodeTpotP95Us{};
     float recentDecodeTpotPressure{};

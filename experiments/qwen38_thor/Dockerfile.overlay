@@ -11,9 +11,11 @@ COPY cpp/runtime/config/llmEngineConfig.cpp cpp/runtime/config/llmEngineConfig.c
 COPY cpp/runtime/scheduling/independentPhaseCoordinator.cpp cpp/runtime/scheduling/independentPhaseCoordinator.cpp
 COPY cpp/runtime/scheduling/independentPhaseCoordinator.h cpp/runtime/scheduling/independentPhaseCoordinator.h
 COPY cpp/runtime/scheduling/independentPhaseAsyncServer.cpp cpp/runtime/scheduling/independentPhaseAsyncServer.cpp
+COPY cpp/runtime/scheduling/independentPhaseAsyncServer.h cpp/runtime/scheduling/independentPhaseAsyncServer.h
 COPY cpp/runtime/scheduling/phaseRecurrentStateActiveView.cpp cpp/runtime/scheduling/phaseRecurrentStateActiveView.cpp
 COPY cpp/runtime/scheduling/phaseRecurrentStateActiveView.h cpp/runtime/scheduling/phaseRecurrentStateActiveView.h
 COPY cpp/runtime/scheduling/phaseQueueScheduler.cpp cpp/runtime/scheduling/phaseQueueScheduler.cpp
+COPY cpp/runtime/scheduling/phaseQueueScheduler.h cpp/runtime/scheduling/phaseQueueScheduler.h
 COPY cpp/runtime/state/stableKVPageManager.cpp cpp/runtime/state/stableKVPageManager.cpp
 COPY cpp/runtime/state/stableKVPageManager.h cpp/runtime/state/stableKVPageManager.h
 COPY examples/llm/llm_phase_context_smoke.cpp examples/llm/llm_phase_context_smoke.cpp

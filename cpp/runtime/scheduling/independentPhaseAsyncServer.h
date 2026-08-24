@@ -64,6 +64,7 @@ struct IndependentPhaseSampleTicket
 {
     cudaEvent_t ready{};
     bool fromPrefill{};
+    std::chrono::steady_clock::time_point submittedAt;
     std::vector<uint64_t> requestIds;
     std::function<std::vector<int32_t>()> collect;
     //! Return adapter-owned event/host staging resources after collection or shutdown.
@@ -119,6 +120,7 @@ struct IndependentPhaseServerConfig
     bool enableAdaptiveAdmission{};
     size_t latencyInFlightRequests{};
     size_t adaptiveBacklogEnterRequests{1U};
+    bool enableTimingMetrics{};
 };
 
 struct IndependentPhaseServerSubmission
@@ -145,6 +147,18 @@ struct IndependentPhaseServerToken
     int32_t outputIndex{};
     bool isEos{};
     double elapsedMs{};
+};
+
+//! Cumulative host-side timing around asynchronous sampling and decode refill.
+struct IndependentPhaseServerTimingStats
+{
+    uint64_t samplingTickets{};
+    double samplingReadyUsTotal{};
+    double samplingReadyUsMax{};
+    uint64_t decodeRowsDispatched{};
+    double readyToDispatchUsTotal{};
+    double readyToDispatchUsMax{};
+    std::vector<uint64_t> decodeBatchHistogram;
 };
 
 //! Production-facing event-loop facade over independent prefill/decode contexts.
@@ -190,6 +204,7 @@ public:
     size_t decodeRefillWaitCount() const noexcept;
     bool throughputMode() const noexcept;
     size_t throughputModeTransitionCount() const noexcept;
+    IndependentPhaseServerTimingStats const& timingStats() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -202,6 +217,8 @@ private:
         int32_t kvSlotId{-1};
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
+        std::chrono::steady_clock::time_point decodeReadyAt;
+        bool decodeReady{};
         std::shared_ptr<PhaseVisionPayload> visionPayload;
     };
 
@@ -251,6 +268,7 @@ private:
     size_t mDecodeRefillWaitCount{};
     bool mThroughputMode{};
     size_t mThroughputModeTransitionCount{};
+    IndependentPhaseServerTimingStats mTimingStats;
 };
 
 } // namespace trt_edgellm::rt

@@ -1612,6 +1612,8 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     {
         updateEwma(mTelemetry.decodeGpuMsPerContextToken,
             metrics.decodeGpuMs / static_cast<float>(metrics.decodeContextTokens));
+        mTelemetry.decodeGpuMsTotal += metrics.decodeGpuMs;
+        ++mTelemetry.decodeGpuSampleCount;
     }
     if (mOnlineDecodeCostLearningActive && metrics.kind == PhaseDispatchKind::kDecode && metrics.decodeBatchSize > 0
         && metrics.decodeGpuMs > 0.0F && metrics.plannedDecodeMaxContextLength > 0)

@@ -28,6 +28,9 @@ docker_args=(
 if [[ "${IGNORE_EOS:-0}" == "1" ]]; then
     docker_args+=(-e TRT_EDGELLM_IGNORE_EOS=1)
 fi
+if [[ "${PHASE_TIMING_METRICS:-0}" == "1" ]]; then
+    docker_args+=(-e TRT_EDGELLM_PHASE_TIMING_METRICS=1)
+fi
 
 exec docker run "${docker_args[@]}" \
     -v "${data_dir}:/data" \

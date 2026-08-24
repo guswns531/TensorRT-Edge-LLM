@@ -961,6 +961,7 @@ int main(int argc, char** argv)
         }
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
+        serverConfig.enableTimingMetrics = std::getenv("TRT_EDGELLM_PHASE_TIMING_METRICS") != nullptr;
         serverConfig.maxPendingRequests = 1024;
         if (thorThroughputPreset || thorLatencyPreset)
         {
@@ -1469,11 +1470,26 @@ int main(int argc, char** argv)
                 while (auto completion = popCompletionEvent())
                 {
                     madeProgress = true;
-                    nlohmann::json const completionEvent{{"type", "completion"},
+                    nlohmann::json completionEvent{{"type", "completion"},
                         {"request_index", completion->requestId},
                         {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
                         {"prompt_tokens", completion->promptTokens},
                         {"output_tokens", completion->generatedTokens.size()}, {"latency_ms", completion->latencyMs}};
+                    if (serverConfig.enableTimingMetrics)
+                    {
+                        rt::IndependentPhaseServerTimingStats const& timing = semanticServer.timingStats();
+                        rt::PhaseSchedulerTelemetry const& schedulerTiming
+                            = semanticCoordinator.scheduler().telemetry();
+                        completionEvent["phase_timing"] = {{"sampling_tickets", timing.samplingTickets},
+                                {"sampling_ready_us_total", timing.samplingReadyUsTotal},
+                                {"sampling_ready_us_max", timing.samplingReadyUsMax},
+                                {"decode_rows_dispatched", timing.decodeRowsDispatched},
+                                {"ready_to_dispatch_us_total", timing.readyToDispatchUsTotal},
+                                {"ready_to_dispatch_us_max", timing.readyToDispatchUsMax},
+                                {"decode_batch_histogram", timing.decodeBatchHistogram},
+                                {"decode_gpu_ms_total", schedulerTiming.decodeGpuMsTotal},
+                                {"decode_gpu_samples", schedulerTiming.decodeGpuSampleCount}};
+                    }
                     serializedRecords.push_back("PHASE_EVENT\t" + completionEvent.dump());
                 }
                 emitSerializedRecords(std::move(serializedRecords));

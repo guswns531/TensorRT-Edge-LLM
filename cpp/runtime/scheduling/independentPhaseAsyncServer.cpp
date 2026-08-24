@@ -377,6 +377,11 @@ size_t IndependentPhaseAsyncServer::throughputModeTransitionCount() const noexce
     return mThroughputModeTransitionCount;
 }
 
+IndependentPhaseServerTimingStats const& IndependentPhaseAsyncServer::timingStats() const noexcept
+{
+    return mTimingStats;
+}
+
 bool IndependentPhaseAsyncServer::empty() const noexcept
 {
     return mRequests.empty() && mPendingRequests.empty() && mPendingDecodeRequests.empty() && mSamplingTickets.empty()
@@ -460,6 +465,29 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
         }
     };
     callbacks.stageDecode = [this](std::vector<PhaseWorkItem> const& batch, PipelineIO& io, cudaStream_t stream) {
+        if (mConfig.enableTimingMetrics)
+        {
+            auto const dispatchedAt = std::chrono::steady_clock::now();
+            if (mTimingStats.decodeBatchHistogram.size() <= batch.size())
+            {
+                mTimingStats.decodeBatchHistogram.resize(batch.size() + 1U);
+            }
+            ++mTimingStats.decodeBatchHistogram[batch.size()];
+            for (PhaseWorkItem const& item : batch)
+            {
+                auto const request = mRequests.find(item.requestId);
+                ELLM_CHECK(request != mRequests.end(), "Decode timing requested an unknown request");
+                if (request->second.decodeReady)
+                {
+                    double const delayUs
+                        = std::chrono::duration<double, std::micro>(dispatchedAt - request->second.decodeReadyAt).count();
+                    mTimingStats.readyToDispatchUsTotal += delayUs;
+                    mTimingStats.readyToDispatchUsMax = std::max(mTimingStats.readyToDispatchUsMax, delayUs);
+                    ++mTimingStats.decodeRowsDispatched;
+                    request->second.decodeReady = false;
+                }
+            }
+        }
         if (mAdapter.stageDecode)
         {
             mAdapter.stageDecode(makeViews(batch), io, mCoordinator.decodeTensorMap(), stream);
@@ -481,6 +509,10 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
                   std::unique_ptr<IndependentPhaseSampleTicket> ticket
                       = mAdapter.submitSampling(finalViews, io, stream, true);
                   ELLM_CHECK(ticket != nullptr, "Prefill sampling adapter returned no completion ticket");
+                  if (mConfig.enableTimingMetrics)
+                  {
+                      ticket->submittedAt = std::chrono::steady_clock::now();
+                  }
                   mSamplingTickets.push_back(std::move(ticket));
               }
           };
@@ -489,6 +521,10 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
               std::unique_ptr<IndependentPhaseSampleTicket> ticket
                   = mAdapter.submitSampling(makeViews(batch), io, stream, false);
               ELLM_CHECK(ticket != nullptr, "Decode sampling adapter returned no completion ticket");
+              if (mConfig.enableTimingMetrics)
+              {
+                  ticket->submittedAt = std::chrono::steady_clock::now();
+              }
               mSamplingTickets.push_back(std::move(ticket));
           };
     callbacks.isPrefillFinished = [](PhaseWorkItem const& item, int32_t) {
@@ -530,6 +566,15 @@ bool IndependentPhaseAsyncServer::processSamplingTickets()
             continue;
         }
         CUDA_CHECK(status);
+        if (mConfig.enableTimingMetrics)
+        {
+            auto const readyAt = std::chrono::steady_clock::now();
+            double const delayUs
+                = std::chrono::duration<double, std::micro>(readyAt - (*ticket)->submittedAt).count();
+            mTimingStats.samplingReadyUsTotal += delayUs;
+            mTimingStats.samplingReadyUsMax = std::max(mTimingStats.samplingReadyUsMax, delayUs);
+            ++mTimingStats.samplingTickets;
+        }
         readyTickets.push_back(std::move(*ticket));
         ticket = mSamplingTickets.erase(ticket);
     }
@@ -591,6 +636,11 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         }
         else
         {
+            if (mConfig.enableTimingMetrics)
+            {
+                state.decodeReadyAt = std::chrono::steady_clock::now();
+                state.decodeReady = true;
+            }
             static_cast<void>(enqueueDecodeOrWait(requestId, state));
         }
     }
