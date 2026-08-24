@@ -259,6 +259,22 @@ decode engine, the N16 small-grid GDN crossover, and warmed production CUDA Grap
 See `notes/102-thor-hybrid-int4-fp8kv-vllm-win-20260824.md` for the engine contract, accuracy caveats, rejected A/Bs,
 graph-cache statistics, and reproduction procedure.
 
+### Optimized vLLM MTP-1 follow-up
+
+The separate warmed c64 MTP-1 comparison uses text-only throughput mode, a 16K scheduler budget, a 16 GiB explicit KV
+cache, FP8 KV, and the checkpoint's native one-token draft head. The cumulative draft acceptance rate was 72.01%.
+
+| workload | Phase hybrid | vLLM MTP-1 | Phase advantage |
+| --- | ---: | ---: | ---: |
+| short burst c64 | 286.78 tok/s | 302.88 tok/s | -5.32% |
+| wave burst c64 | 275.04 tok/s | 276.60 tok/s | -0.56% |
+| decode heavy c64 | 341.33 tok/s | 340.48 tok/s | +0.25% |
+
+The Phase hybrid still wins all three vanilla comparisons, but not the optimized MTP-1 short case. The eight-prompt
+FP16-projection versus INT4-RTN regression gate found no semantically incorrect answer in either engine. See
+`notes/103-thor-quality-and-vllm-mtp-c64-20260824.md` for the full server contract, UMA KV-cache sizing analysis, latency,
+power, quality outputs, and remaining accuracy caveats.
+
 ## Validation
 
 - Focused phase/state/scheduler tests: 15/15 passed.

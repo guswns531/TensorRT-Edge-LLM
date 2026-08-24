@@ -1,0 +1,75 @@
+{
+  "batch_size": 1,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "top_k": 1,
+  "max_generate_length": 96,
+  "apply_chat_template": true,
+  "enable_thinking": false,
+  "requests": [
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with exactly: THOR READY"
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Compute 137 * 29. Give only the integer."
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Which planet is known as the Red Planet? Answer with only its English name."
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "다음 문장을 자연스러운 영어로 번역하세요. 답만 쓰세요: 메모리 접근 순서가 커널 성능을 좌우한다."
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return a Python function named clamp(x, lo, hi) that limits x to the inclusive range [lo, hi]. Output code only."
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "A train travels 120 km in 1.5 hours and then 80 km in 1 hour. What is its average speed for the whole trip? Give the value and unit only."
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Summarize in one sentence: CUDA graphs reduce repeated launch overhead by capturing a sequence of GPU operations and replaying it, but their benefit depends on stable shapes and sufficient reuse."
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "If all tensors are arrays and some arrays are views, does it logically follow that all tensors are views? Answer yes or no, then give one short reason."
+        }
+      ]
+    }
+  ]
+}
