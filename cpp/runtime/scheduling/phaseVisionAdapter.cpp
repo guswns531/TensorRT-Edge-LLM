@@ -90,7 +90,10 @@ bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& 
     CUDA_CHECK(cudaEventRecord(payload->startEvent, mStream));
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        payload->mropeCosSin = Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+        int64_t const activeBatchSize = static_cast<int64_t>(request.requests.size());
+        ELLM_CHECK(activeBatchSize > 0 && activeBatchSize <= mConfig.maxSupportedBatchSize,
+            "Phase vision M-RoPE batch is outside the engine profile");
+        payload->mropeCosSin = Tensor({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
             DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_vision_mrope");
     }
     OptionalOutputTensor mrope
