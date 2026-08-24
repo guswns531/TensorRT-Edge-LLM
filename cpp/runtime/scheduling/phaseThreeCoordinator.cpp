@@ -66,6 +66,42 @@ bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDo
     return estimatedPayloadBytes <= remainingBytes / additionalRequests;
 }
 
+size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
+    size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept
+{
+    if (promptTokenCounts.empty() || maxBatchSize == 0)
+    {
+        return 0;
+    }
+
+    size_t batchSize{};
+    size_t batchTokens{};
+    size_t const countLimit = std::min(maxBatchSize, promptTokenCounts.size());
+    while (batchSize < countLimit)
+    {
+        int32_t const promptTokens = promptTokenCounts[batchSize];
+        if (promptTokens <= 0)
+        {
+            break;
+        }
+        size_t const candidateTokens = static_cast<size_t>(promptTokens);
+        if (maxBatchTokens > 0 && batchSize > 0
+            && candidateTokens > maxBatchTokens - std::min(batchTokens, maxBatchTokens))
+        {
+            break;
+        }
+        batchTokens += candidateTokens;
+        ++batchSize;
+    }
+    if (batchSize == 0)
+    {
+        return 0;
+    }
+    bool const batchFull = batchSize == maxBatchSize;
+    bool const tokenFull = batchSize < promptTokenCounts.size();
+    return batchFull || tokenFull || oldestWaitUs >= batchWaitUs ? batchSize : 0;
+}
+
 size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
     double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio, float decodeTpotPressure,
     float decodeTpotPressureLimit) noexcept
@@ -94,8 +130,17 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(mConfig.maxEncoderBatchSize > 0, "Three-phase encoder batch size must be positive");
     ELLM_CHECK(mConfig.maxEncoderBatchSize <= mConfig.maxEncodedInFlight,
         "Three-phase encoder batch size cannot exceed downstream encoded capacity");
+    if (mConfig.maxPrefillBatchSize == 0)
+    {
+        mConfig.maxPrefillBatchSize = mConfig.maxEncoderBatchSize;
+    }
+    size_t const maxEncodedCapacity = std::max(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight);
+    ELLM_CHECK(mConfig.maxPrefillBatchSize <= maxEncodedCapacity,
+        "Three-phase prefill batch size cannot exceed downstream encoded capacity");
     ELLM_CHECK(std::isfinite(mConfig.encoderBatchWaitUs) && mConfig.encoderBatchWaitUs >= 0.0,
         "Three-phase encoder batch wait must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.prefillBatchWaitUs) && mConfig.prefillBatchWaitUs >= 0.0,
+        "Three-phase prefill batch wait must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.visionTtftTargetUs) && mConfig.visionTtftTargetUs >= 0.0,
         "Three-phase vision TTFT target must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.lookaheadEscalationRatio) && mConfig.lookaheadEscalationRatio >= 0.0,
@@ -140,6 +185,17 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         mCancelRequested.insert(requestId);
         return true;
     }
+    auto const ready = std::find_if(mReadyPrefill.begin(), mReadyPrefill.end(),
+        [&](ReadyPrefillRequest const& request) { return request.requestId == requestId; });
+    if (ready != mReadyPrefill.end())
+    {
+        ELLM_CHECK(ready->payloadBytes <= mReadyPrefillBytes, "Ready prefill byte accounting underflow");
+        mReadyPrefillBytes -= ready->payloadBytes;
+        mReadyPrefill.erase(ready);
+        mDownstreamRequestBytes.erase(requestId);
+        mRequestIds.erase(requestId);
+        return true;
+    }
     bool const cancelled = mServer.cancel(requestId);
     if (cancelled)
     {
@@ -157,6 +213,7 @@ bool PhaseThreeCoordinator::poll()
 {
     bool progressed = completeEncoder();
     progressed = startNextEncoder() || progressed;
+    progressed = dispatchReadyPrefill() || progressed;
     progressed = mServer.poll() || progressed;
     mVision.reclaimIdleStorage();
     return progressed;
@@ -164,15 +221,17 @@ bool PhaseThreeCoordinator::poll()
 
 bool PhaseThreeCoordinator::empty() const noexcept
 {
-    return mPending.empty() && mEncoding.empty() && mServer.empty();
+    return mPending.empty() && mEncoding.empty() && mReadyPrefill.empty() && mServer.empty();
 }
 
 PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
 {
     PhaseThreeCoordinatorMetrics result;
     result.pendingVisionRequests = mPending.size();
+    result.pendingPrefillReadyRequests = mReadyPrefill.size();
+    result.pendingPrefillReadyBytes = mReadyPrefillBytes;
     result.downstreamEncodedRequests = mDownstreamRequestBytes.size();
-    result.downstreamEncodedBytes = mServer.visionPayloadBytes();
+    result.downstreamEncodedBytes = mReadyPrefillBytes + mServer.visionPayloadBytes();
     result.prefillStorageReleases = mServer.visionPrefillReleaseCount();
     result.prefillStorageReleasedBytes = mServer.visionPrefillReleasedBytes();
     result.encoderStarts = mEncoderStarts;
@@ -184,6 +243,11 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.maxEncoderQueueWaitUs = mMaxEncoderQueueWaitUs;
     result.lastEncoderGpuMs = mLastEncoderGpuMs;
     result.maxEncoderGpuMs = mMaxEncoderGpuMs;
+    result.prefillAdmissionBatches = mPrefillAdmissionBatches;
+    result.lastPrefillAdmissionBatchSize = mLastPrefillAdmissionBatchSize;
+    result.maxPrefillAdmissionBatchSize = mMaxPrefillAdmissionBatchSize;
+    result.lastPrefillReadyQueueWaitUs = mLastPrefillReadyQueueWaitUs;
+    result.maxPrefillReadyQueueWaitUs = mMaxPrefillReadyQueueWaitUs;
     result.effectiveEncodedCapacity = effectiveEncodedCapacity();
     result.maxEffectiveEncodedCapacity = mMaxEffectiveEncodedCapacity;
     result.lookaheadEscalations = mLookaheadEscalations;
@@ -288,17 +352,54 @@ bool PhaseThreeCoordinator::completeEncoder()
         auto sharedPayload = std::shared_ptr<PhaseVisionPayload>(std::move(encoded));
         size_t const encodedBytes = sharedPayload->byteSize();
         std::vector<int32_t> promptTokens = sharedPayload->tokenIds.front();
-        IndependentPhaseServerSubmission const submitted = mServer.submitOrQueueWithVision(requestId,
-            std::move(promptTokens), std::move(sharedPayload), encoding.maxOutputTokens, encoding.scheduling);
-        ELLM_CHECK(submitted.status == IndependentPhaseServerStatus::kAdmitted
-                || submitted.status == IndependentPhaseServerStatus::kQueued,
-            "Encoded phase request could not enter the LLM admission queue");
         ELLM_CHECK(mDownstreamRequestBytes.emplace(requestId, encodedBytes).second,
             "Encoded phase request is already downstream");
+        mReadyPrefill.push_back({requestId, std::move(promptTokens), std::move(sharedPayload), encoding.maxOutputTokens,
+            encoding.scheduling, encodedBytes, std::chrono::steady_clock::now()});
+        mReadyPrefillBytes += encodedBytes;
         mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
     }
     mEncoding.clear();
     return true;
+}
+
+bool PhaseThreeCoordinator::dispatchReadyPrefill()
+{
+    size_t const batchSize = nextReadyPrefillBatchSize();
+    if (batchSize == 0)
+    {
+        return false;
+    }
+
+    size_t submitted{};
+    auto const now = std::chrono::steady_clock::now();
+    while (submitted < batchSize && !mReadyPrefill.empty())
+    {
+        ReadyPrefillRequest& ready = mReadyPrefill.front();
+        IndependentPhaseServerSubmission const result = mServer.submitWithVision(
+            ready.requestId, ready.promptTokens, ready.payload, ready.maxOutputTokens, ready.scheduling);
+        if (result.status == IndependentPhaseServerStatus::kBackpressure)
+        {
+            break;
+        }
+        ELLM_CHECK(result.status == IndependentPhaseServerStatus::kAdmitted
+                || result.status == IndependentPhaseServerStatus::kQueued,
+            "Ready vision request could not enter the LLM admission queue");
+        double const queueWaitUs = std::chrono::duration<double, std::micro>(now - ready.encodedAt).count();
+        mLastPrefillReadyQueueWaitUs = queueWaitUs;
+        mMaxPrefillReadyQueueWaitUs = std::max(mMaxPrefillReadyQueueWaitUs, queueWaitUs);
+        ELLM_CHECK(ready.payloadBytes <= mReadyPrefillBytes, "Ready prefill byte accounting underflow");
+        mReadyPrefillBytes -= ready.payloadBytes;
+        mReadyPrefill.pop_front();
+        ++submitted;
+    }
+    if (submitted > 0)
+    {
+        ++mPrefillAdmissionBatches;
+        mLastPrefillAdmissionBatchSize = submitted;
+        mMaxPrefillAdmissionBatchSize = std::max(mMaxPrefillAdmissionBatchSize, submitted);
+    }
+    return submitted > 0;
 }
 
 size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
@@ -336,10 +437,30 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
     return batchSize;
 }
 
+size_t PhaseThreeCoordinator::nextReadyPrefillBatchSize() const noexcept
+{
+    if (mReadyPrefill.empty())
+    {
+        return 0;
+    }
+    std::vector<int32_t> promptTokenCounts;
+    promptTokenCounts.reserve(mReadyPrefill.size());
+    for (ReadyPrefillRequest const& ready : mReadyPrefill)
+    {
+        promptTokenCounts.push_back(static_cast<int32_t>(ready.promptTokens.size()));
+    }
+    double const oldestWaitUs
+        = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mReadyPrefill.front().encodedAt)
+              .count();
+    return phaseVisionReadyPrefillBatchSize(promptTokenCounts, mConfig.maxPrefillBatchSize,
+        mConfig.maxPrefillBatchTokens, oldestWaitUs, mConfig.prefillBatchWaitUs);
+}
+
 bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) const noexcept
 {
     return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), effectiveEncodedCapacity(),
-        mServer.visionPayloadBytes(), mConfig.maxEncodedBytes, mEstimatedEncodedBytes, additionalRequests);
+        mReadyPrefillBytes + mServer.visionPayloadBytes(), mConfig.maxEncodedBytes, mEstimatedEncodedBytes,
+        additionalRequests);
 }
 
 size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept

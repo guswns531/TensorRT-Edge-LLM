@@ -1761,6 +1761,21 @@ TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadByte
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 0, 0, 0));
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, ReleasesReadyPrefillByCountTokenBudgetOrAge)
+{
+    std::vector<int32_t> const promptTokens{128, 256, 512, 64};
+    std::vector<int32_t> const partialPromptTokens{128, 256, 512};
+
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(partialPromptTokens, 4, 0, 50.0, 100.0), 0U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(partialPromptTokens, 4, 0, 100.0, 100.0), 3U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 4, 0, 0.0, 100.0), 4U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 2, 0, 0.0, 100.0), 2U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 4, 400, 0.0, 100.0), 2U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 4, 64, 0.0, 100.0), 1U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize({}, 4, 0, 100.0, 100.0), 0U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 0, 0, 100.0, 100.0), 0U);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGuard)
 {
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, false, 900000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);

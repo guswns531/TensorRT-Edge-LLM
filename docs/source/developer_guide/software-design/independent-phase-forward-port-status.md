@@ -411,3 +411,42 @@ fragmented this short trace into roughly 80 decode dispatches instead of the
 selected static cohort's roughly 53 and reduced throughput to about 1,678
 token/s even on the unmodified server. Reservation comparisons must keep the
 decode policy identical.
+
+## Decoupled encoded-prefill queue
+
+The three-phase coordinator now retains completed encoder payloads in an
+explicit FIFO prefill-ready queue instead of immediately allocating KV and
+calling the LLM admission path. CUDA events remain private to the vision
+adapter as completion fences and timers; the prefill scheduler only receives
+completed request-owned tensor views.
+
+The ready queue has independent count, prompt-token, and age gates:
+
+```text
+TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE=4
+TRT_EDGELLM_VISION_PREFILL_BATCH_TOKENS=4096
+TRT_EDGELLM_VISION_PREFILL_BATCH_WAIT_US=100000
+```
+
+All controls default to the previous latency behavior: the prefill batch size
+inherits the encoder batch size and the wait is zero. Stable KV slots and
+pages are allocated only when a ready request enters the LLM server. The
+encoded request count and byte backpressure include both ready payloads and
+payloads already owned by the LLM server. Cancellation removes a ready
+payload without acquiring or releasing a KV lease.
+
+On a five-request semantic trace, encoder BS1 plus prefill admission BS4
+formed `4 -> 1` admissions instead of five BS1 admissions. All 160 greedy
+tokens were byte-identical to immediate admission and all five semantic cases,
+including two-image placement, passed in all three fresh runs. The 150 ms tail
+timeout reduced median throughput by 6.7% and increased TTFT p95 by 8.0%, while
+reducing TPOT p95 by 6.8%, so delayed batching is not the default.
+
+On the 64-request mixed Poisson trace, P4 with a 100 ms timeout formed eleven
+actual KV-admission groups for 16 vision requests, with maximum group size
+three under slot pressure. Against immediate admission it changed generated
+throughput from 959.4 to 977.9 token/s, TTFT p95 from 3787.9 to 3625.3 ms,
+TPOT p95 from 25.55 to 24.52 ms, and E2E p95 from 4118.8 to 4011.3 ms. Peak
+memory remained 9741 MiB. One run is sufficient to validate the saturated
+data path, but not to select P4 as a production default; a repeated policy
+sweep is still required.

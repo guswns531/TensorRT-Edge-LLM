@@ -1434,6 +1434,18 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.encoderBatchWaitUs = std::stod(value);
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE"))
+                {
+                    threePhaseConfig.maxPrefillBatchSize = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BATCH_TOKENS"))
+                {
+                    threePhaseConfig.maxPrefillBatchTokens = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BATCH_WAIT_US"))
+                {
+                    threePhaseConfig.prefillBatchWaitUs = std::stod(value);
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_TTFT_TARGET_MS"))
                 {
                     threePhaseConfig.visionTtftTargetUs = std::stod(value) * 1000.0;
@@ -1771,6 +1783,8 @@ int main(int argc, char** argv)
                         {"sampling_event_slots", samplingSlotPool.size()},
                         {"sampling_event_reuses", samplingSlotPool.reuseCount()},
                         {"vision_pending", visionMetrics.pendingVisionRequests},
+                        {"vision_prefill_ready", visionMetrics.pendingPrefillReadyRequests},
+                        {"vision_prefill_ready_bytes", visionMetrics.pendingPrefillReadyBytes},
                         {"vision_downstream", visionMetrics.downstreamEncodedRequests},
                         {"vision_downstream_bytes", visionMetrics.downstreamEncodedBytes},
                         {"vision_prefill_storage_releases", visionMetrics.prefillStorageReleases},
@@ -1784,7 +1798,12 @@ int main(int argc, char** argv)
                         {"vision_encoder_queue_wait_ms", visionMetrics.lastEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_gpu_ms", visionMetrics.lastEncoderGpuMs},
-                        {"vision_encoder_gpu_max_ms", visionMetrics.maxEncoderGpuMs}};
+                        {"vision_encoder_gpu_max_ms", visionMetrics.maxEncoderGpuMs},
+                        {"vision_prefill_admission_batches", visionMetrics.prefillAdmissionBatches},
+                        {"vision_prefill_admission_batch", visionMetrics.lastPrefillAdmissionBatchSize},
+                        {"vision_prefill_admission_batch_max", visionMetrics.maxPrefillAdmissionBatchSize},
+                        {"vision_prefill_ready_wait_ms", visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0},
+                        {"vision_prefill_ready_wait_max_ms", visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0}};
                     serializedRecords.push_back("PHASE_METRIC\t" + metricEvent.dump());
                 }
                 while (auto token = popTokenEvent())
@@ -1889,17 +1908,24 @@ int main(int argc, char** argv)
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
-                    "pending=%zu downstream=%zu bytes=%zu prefill_releases=%zu prefill_released_bytes=%zu "
+                    "pending=%zu prefill_ready=%zu prefill_ready_bytes=%zu downstream=%zu bytes=%zu "
+                    "prefill_admission_batches=%zu prefill_admission_last=%zu prefill_admission_max=%zu "
+                    "prefill_releases=%zu prefill_released_bytes=%zu "
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
+                    "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
                     "decode_tpot_pressure=%.3f",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
-                    visionMetrics.pendingVisionRequests, visionMetrics.downstreamEncodedRequests,
-                    visionMetrics.downstreamEncodedBytes, visionMetrics.prefillStorageReleases,
-                    visionMetrics.prefillStorageReleasedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
-                    visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
-                    visionMetrics.maxEncoderGpuMs, visionMetrics.effectiveEncodedCapacity,
+                    visionMetrics.pendingVisionRequests, visionMetrics.pendingPrefillReadyRequests,
+                    visionMetrics.pendingPrefillReadyBytes, visionMetrics.downstreamEncodedRequests,
+                    visionMetrics.downstreamEncodedBytes, visionMetrics.prefillAdmissionBatches,
+                    visionMetrics.lastPrefillAdmissionBatchSize, visionMetrics.maxPrefillAdmissionBatchSize,
+                    visionMetrics.prefillStorageReleases, visionMetrics.prefillStorageReleasedBytes,
+                    visionMetrics.lastEncoderQueueWaitUs / 1000.0, visionMetrics.maxEncoderQueueWaitUs / 1000.0,
+                    visionMetrics.lastEncoderGpuMs, visionMetrics.maxEncoderGpuMs,
+                    visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
+                    visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
                     visionMetrics.decodeTpotPressure);
                 rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();

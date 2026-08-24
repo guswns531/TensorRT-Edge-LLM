@@ -20,9 +20,11 @@
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,6 +54,12 @@ struct PhaseThreeCoordinatorConfig
     size_t maxEncoderMediaItems{};
     //! Maximum time to wait for encoder batch formation. Zero dispatches immediately.
     double encoderBatchWaitUs{};
+    //! Maximum encoded requests released together into the independent prefill scheduler. Zero inherits encoder BS.
+    size_t maxPrefillBatchSize{};
+    //! Optional prompt-token budget for one release into the prefill scheduler. Zero disables the token gate.
+    size_t maxPrefillBatchTokens{};
+    //! Maximum time an encoded request waits for prefill batch formation. Zero dispatches immediately.
+    double prefillBatchWaitUs{};
     //! Default end-to-end image TTFT SLO, including encoder queue and execution. Zero inherits the LLM default.
     double visionTtftTargetUs{2500000.0};
     //! Escalate lookahead after this fraction of the oldest vision request's TTFT target. Zero disables age escalation.
@@ -63,6 +71,8 @@ struct PhaseThreeCoordinatorConfig
 struct PhaseThreeCoordinatorMetrics
 {
     size_t pendingVisionRequests{};
+    size_t pendingPrefillReadyRequests{};
+    size_t pendingPrefillReadyBytes{};
     size_t downstreamEncodedRequests{};
     size_t downstreamEncodedBytes{};
     size_t prefillStorageReleases{};
@@ -77,6 +87,11 @@ struct PhaseThreeCoordinatorMetrics
     double maxEncoderQueueWaitUs{};
     float lastEncoderGpuMs{};
     float maxEncoderGpuMs{};
+    size_t prefillAdmissionBatches{};
+    size_t lastPrefillAdmissionBatchSize{};
+    size_t maxPrefillAdmissionBatchSize{};
+    double lastPrefillReadyQueueWaitUs{};
+    double maxPrefillReadyQueueWaitUs{};
     size_t effectiveEncodedCapacity{};
     size_t maxEffectiveEncodedCapacity{};
     size_t lookaheadEscalations{};
@@ -96,6 +111,10 @@ PhaseSchedulingHints phaseVisionSchedulingHints(PhaseSchedulingHints scheduling,
 bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDownstreamRequests,
     size_t downstreamBytes, size_t maxDownstreamBytes, size_t estimatedPayloadBytes,
     size_t additionalRequests = 1U) noexcept;
+
+//! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
+size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
+    size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept;
 
 //! Encoder -> prefill -> decode coordinator over three independent contexts.
 class PhaseThreeCoordinator
@@ -123,9 +142,22 @@ private:
         PhaseSchedulingHints scheduling;
     };
 
+    struct ReadyPrefillRequest
+    {
+        uint64_t requestId{};
+        std::vector<int32_t> promptTokens;
+        std::shared_ptr<PhaseVisionPayload> payload;
+        int32_t maxOutputTokens{};
+        PhaseSchedulingHints scheduling;
+        size_t payloadBytes{};
+        std::chrono::steady_clock::time_point encodedAt;
+    };
+
     bool startNextEncoder();
     bool completeEncoder();
+    bool dispatchReadyPrefill();
     size_t nextEncoderBatchSize() const noexcept;
+    size_t nextReadyPrefillBatchSize() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
@@ -135,6 +167,7 @@ private:
     PhaseThreeCoordinatorConfig mConfig;
     std::deque<PendingVisionRequest> mPending;
     std::vector<PendingVisionRequest> mEncoding;
+    std::deque<ReadyPrefillRequest> mReadyPrefill;
     std::unordered_set<uint64_t> mRequestIds;
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
@@ -148,6 +181,12 @@ private:
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};
     float mMaxEncoderGpuMs{};
+    size_t mReadyPrefillBytes{};
+    size_t mPrefillAdmissionBatches{};
+    size_t mLastPrefillAdmissionBatchSize{};
+    size_t mMaxPrefillAdmissionBatchSize{};
+    double mLastPrefillReadyQueueWaitUs{};
+    double mMaxPrefillReadyQueueWaitUs{};
     size_t mMaxEffectiveEncodedCapacity{};
     size_t mLookaheadEscalations{};
     size_t mLastEffectiveEncodedCapacity{};
