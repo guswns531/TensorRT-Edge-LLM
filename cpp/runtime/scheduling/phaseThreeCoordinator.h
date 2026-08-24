@@ -60,6 +60,14 @@ struct PhaseThreeCoordinatorConfig
     size_t maxPrefillBatchTokens{};
     //! Maximum time an encoded request waits for prefill batch formation. Zero dispatches immediately.
     double prefillBatchWaitUs{};
+    //! Adapt P-ready batching to arrival backlog, stable-slot capacity, byte pressure, and decode TPOT pressure.
+    bool enableAdaptivePrefillAdmission{};
+    //! Smallest ready backlog that may be released as a throughput batch.
+    size_t adaptivePrefillMinBatchSize{2U};
+    //! Collapse adaptive P-ready admission to P1 at or above this decode pressure. Zero disables the guard.
+    float prefillDecodeTpotPressureLimit{0.8F};
+    //! Bypass batch waiting above this fraction of maxEncodedBytes. Zero disables the byte-pressure guard.
+    double prefillReadyBytePressureRatio{0.8};
     //! Default end-to-end image TTFT SLO, including encoder queue and execution. Zero inherits the LLM default.
     double visionTtftTargetUs{2500000.0};
     //! Escalate lookahead after this fraction of the oldest vision request's TTFT target. Zero disables age escalation.
@@ -90,8 +98,17 @@ struct PhaseThreeCoordinatorMetrics
     size_t prefillAdmissionBatches{};
     size_t lastPrefillAdmissionBatchSize{};
     size_t maxPrefillAdmissionBatchSize{};
+    size_t adaptivePrefillAdmissions{};
+    size_t lowLoadPrefillAdmissions{};
+    size_t backlogPrefillAdmissions{};
+    size_t decodeProtectedPrefillAdmissions{};
+    size_t capacityProtectedPrefillAdmissions{};
+    size_t ageForcedPrefillAdmissions{};
+    size_t byteForcedPrefillAdmissions{};
     double lastPrefillReadyQueueWaitUs{};
     double maxPrefillReadyQueueWaitUs{};
+    size_t availablePrefillAdmissionSlots{};
+    int32_t availableKVPages{};
     size_t effectiveEncodedCapacity{};
     size_t maxEffectiveEncodedCapacity{};
     size_t lookaheadEscalations{};
@@ -115,6 +132,31 @@ bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDo
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
     size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept;
+
+enum class PhaseVisionPrefillAdmissionReason
+{
+    kNone,
+    kLegacy,
+    kLowLoad,
+    kBacklog,
+    kDecodeProtection,
+    kAge,
+    kBytePressure,
+    kCapacity,
+};
+
+struct PhaseVisionPrefillAdmissionDecision
+{
+    size_t batchSize{};
+    PhaseVisionPrefillAdmissionReason reason{PhaseVisionPrefillAdmissionReason::kNone};
+};
+
+//! Select a load-aware P-ready FIFO prefix without acquiring a KV lease.
+PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
+    std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize, size_t maxBatchTokens, double oldestWaitUs,
+    double batchWaitUs, bool enabled, size_t minBacklogBatchSize, size_t upstreamVisionRequests,
+    size_t availableAdmissionSlots, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
+    size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio) noexcept;
 
 //! Encoder -> prefill -> decode coordinator over three independent contexts.
 class PhaseThreeCoordinator
@@ -157,7 +199,7 @@ private:
     bool completeEncoder();
     bool dispatchReadyPrefill();
     size_t nextEncoderBatchSize() const noexcept;
-    size_t nextReadyPrefillBatchSize() const noexcept;
+    PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
@@ -185,6 +227,13 @@ private:
     size_t mPrefillAdmissionBatches{};
     size_t mLastPrefillAdmissionBatchSize{};
     size_t mMaxPrefillAdmissionBatchSize{};
+    size_t mAdaptivePrefillAdmissions{};
+    size_t mLowLoadPrefillAdmissions{};
+    size_t mBacklogPrefillAdmissions{};
+    size_t mDecodeProtectedPrefillAdmissions{};
+    size_t mCapacityProtectedPrefillAdmissions{};
+    size_t mAgeForcedPrefillAdmissions{};
+    size_t mByteForcedPrefillAdmissions{};
     double mLastPrefillReadyQueueWaitUs{};
     double mMaxPrefillReadyQueueWaitUs{};
     size_t mMaxEffectiveEncodedCapacity{};

@@ -1387,6 +1387,9 @@ int main(int argc, char** argv)
             }
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
+            // Shape priming is not production traffic. Keep graph entries, but
+            // do not let synthetic queue waits drive adaptive admission.
+            semanticCoordinator.scheduler().resetHistory();
             if (serverConfig.enableCudaGraphs)
             {
                 // Retain the primed graph cache, but do not synchronously capture
@@ -1445,6 +1448,22 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BATCH_WAIT_US"))
                 {
                     threePhaseConfig.prefillBatchWaitUs = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ADAPTIVE_PREFILL"))
+                {
+                    threePhaseConfig.enableAdaptivePrefillAdmission = std::stoi(value) != 0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ADAPTIVE_PREFILL_MIN_BATCH"))
+                {
+                    threePhaseConfig.adaptivePrefillMinBatchSize = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_TPOT_PRESSURE_LIMIT"))
+                {
+                    threePhaseConfig.prefillDecodeTpotPressureLimit = std::stof(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BYTE_PRESSURE_RATIO"))
+                {
+                    threePhaseConfig.prefillReadyBytePressureRatio = std::stod(value);
                 }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_TTFT_TARGET_MS"))
                 {
@@ -1802,6 +1821,16 @@ int main(int argc, char** argv)
                         {"vision_prefill_admission_batches", visionMetrics.prefillAdmissionBatches},
                         {"vision_prefill_admission_batch", visionMetrics.lastPrefillAdmissionBatchSize},
                         {"vision_prefill_admission_batch_max", visionMetrics.maxPrefillAdmissionBatchSize},
+                        {"vision_prefill_adaptive_admissions", visionMetrics.adaptivePrefillAdmissions},
+                        {"vision_prefill_low_load_admissions", visionMetrics.lowLoadPrefillAdmissions},
+                        {"vision_prefill_backlog_admissions", visionMetrics.backlogPrefillAdmissions},
+                        {"vision_prefill_decode_protected_admissions", visionMetrics.decodeProtectedPrefillAdmissions},
+                        {"vision_prefill_capacity_protected_admissions",
+                            visionMetrics.capacityProtectedPrefillAdmissions},
+                        {"vision_prefill_age_forced_admissions", visionMetrics.ageForcedPrefillAdmissions},
+                        {"vision_prefill_byte_forced_admissions", visionMetrics.byteForcedPrefillAdmissions},
+                        {"vision_prefill_available_slots", visionMetrics.availablePrefillAdmissionSlots},
+                        {"vision_available_kv_pages", visionMetrics.availableKVPages},
                         {"vision_prefill_ready_wait_ms", visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0},
                         {"vision_prefill_ready_wait_max_ms", visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0}};
                     serializedRecords.push_back("PHASE_METRIC\t" + metricEvent.dump());
@@ -1910,6 +1939,10 @@ int main(int argc, char** argv)
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
                     "pending=%zu prefill_ready=%zu prefill_ready_bytes=%zu downstream=%zu bytes=%zu "
                     "prefill_admission_batches=%zu prefill_admission_last=%zu prefill_admission_max=%zu "
+                    "prefill_adaptive=%zu prefill_low_load=%zu prefill_backlog=%zu prefill_decode_protected=%zu "
+                    "prefill_capacity_protected=%zu prefill_age_forced=%zu prefill_byte_forced=%zu "
+                    "available_prefill_slots=%zu "
+                    "available_kv_pages=%d "
                     "prefill_releases=%zu prefill_released_bytes=%zu "
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
                     "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
@@ -1921,10 +1954,14 @@ int main(int argc, char** argv)
                     visionMetrics.pendingPrefillReadyBytes, visionMetrics.downstreamEncodedRequests,
                     visionMetrics.downstreamEncodedBytes, visionMetrics.prefillAdmissionBatches,
                     visionMetrics.lastPrefillAdmissionBatchSize, visionMetrics.maxPrefillAdmissionBatchSize,
-                    visionMetrics.prefillStorageReleases, visionMetrics.prefillStorageReleasedBytes,
-                    visionMetrics.lastEncoderQueueWaitUs / 1000.0, visionMetrics.maxEncoderQueueWaitUs / 1000.0,
-                    visionMetrics.lastEncoderGpuMs, visionMetrics.maxEncoderGpuMs,
-                    visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
+                    visionMetrics.adaptivePrefillAdmissions, visionMetrics.lowLoadPrefillAdmissions,
+                    visionMetrics.backlogPrefillAdmissions, visionMetrics.decodeProtectedPrefillAdmissions,
+                    visionMetrics.capacityProtectedPrefillAdmissions, visionMetrics.ageForcedPrefillAdmissions,
+                    visionMetrics.byteForcedPrefillAdmissions, visionMetrics.availablePrefillAdmissionSlots,
+                    visionMetrics.availableKVPages, visionMetrics.prefillStorageReleases,
+                    visionMetrics.prefillStorageReleasedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
+                    visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
+                    visionMetrics.maxEncoderGpuMs, visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
                     visionMetrics.decodeTpotPressure);

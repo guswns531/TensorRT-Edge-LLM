@@ -450,3 +450,32 @@ TPOT p95 from 25.55 to 24.52 ms, and E2E p95 from 4118.8 to 4011.3 ms. Peak
 memory remained 9741 MiB. One run is sufficient to validate the saturated
 data path, but not to select P4 as a production default; a repeated policy
 sweep is still required.
+
+## Load-aware prefill-ready admission
+
+An opt-in policy now replaces the fixed ready-queue timeout with a decision
+over ready depth, upstream vision backlog, oldest age, live bytes, decode TPOT
+pressure, immediate stable-slot capacity, and free KV pages. It releases a
+single request for low load, decode protection, or slot pressure; releases a
+larger FIFO prefix only with sufficient backlog and headroom; bypasses waiting
+under byte or age pressure; and waits without acquiring KV when no slot/page
+can be admitted.
+
+```text
+TRT_EDGELLM_VISION_ADAPTIVE_PREFILL=1
+TRT_EDGELLM_VISION_ADAPTIVE_PREFILL_MIN_BATCH=2
+TRT_EDGELLM_VISION_PREFILL_TPOT_PRESSURE_LIMIT=0.8
+TRT_EDGELLM_VISION_PREFILL_BYTE_PRESSURE_RATIO=0.8
+```
+
+Each decision reason and the current slot/page headroom are exported in phase
+metrics. Synthetic IPC shape warmup now resets scheduler history before the
+serving epoch so its queue waits cannot select a production admission mode;
+prepared TensorRT/CUDA graph state remains retained.
+
+With server in-flight 16, the five-request semantic trace formed `2 -> 2 -> 1`
+and improved throughput by 4.0%, TTFT p95 by 4.5%, and E2E p95 by 3.1% versus
+immediate P1, while preserving all 160 greedy tokens and all five semantic
+checks. On the saturated 64-request mixed trace, the slot guard collapsed the
+policy back toward P1: throughput changed by -0.11%, TTFT p95 by +0.22%, TPOT
+p95 by +0.21%, and E2E p95 by +0.003%. The policy remains opt-in.

@@ -1776,6 +1776,58 @@ TEST(PhaseThreeCoordinatorPolicyTest, ReleasesReadyPrefillByCountTokenBudgetOrAg
     EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 0, 0, 100.0, 100.0), 0U);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, AdaptsReadyPrefillToLoadCapacityAndDecodePressure)
+{
+    std::vector<int32_t> const one{128};
+    std::vector<int32_t> const two{128, 256};
+    std::vector<int32_t> const four{128, 256, 512, 64};
+
+    auto decision = phaseVisionAdaptiveReadyPrefillDecision(
+        one, 4, 4096, 0.0, 50000.0, true, 2, 0, 8, 256, 0.2F, 0.8F, 100, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kLowLoad);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        two, 4, 4096, 0.0, 50000.0, true, 2, 2, 8, 256, 0.2F, 0.8F, 200, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 2U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kBacklog);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 1, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kCapacity);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 4, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kCapacity);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 8, 256, 0.8F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeProtection);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        one, 4, 4096, 50000.0, 50000.0, true, 2, 1, 8, 256, 0.2F, 0.8F, 100, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kAge);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        one, 4, 4096, 0.0, 50000.0, true, 2, 1, 8, 256, 0.2F, 0.8F, 800, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kBytePressure);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 100000.0, 50000.0, true, 2, 4, 0, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kNone);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 100000.0, 50000.0, true, 2, 4, 8, 0, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kNone);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGuard)
 {
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, false, 900000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);

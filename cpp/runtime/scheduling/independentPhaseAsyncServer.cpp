@@ -487,6 +487,18 @@ size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
     return mPendingRequests.size();
 }
 
+size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
+{
+    size_t const limit = admissionLimit();
+    size_t const requestCapacity = mRequests.size() < limit ? limit - mRequests.size() : 0U;
+    return std::min(requestCapacity, static_cast<size_t>(std::max(mOwnership.availableSlots(), 0)));
+}
+
+int32_t IndependentPhaseAsyncServer::availableKVPages() const noexcept
+{
+    return mOwnership.availablePages();
+}
+
 size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept
 {
     return mDecodeRefillWaitCount;

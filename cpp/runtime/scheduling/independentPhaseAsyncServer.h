@@ -216,6 +216,10 @@ public:
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
+    //! Stable slots that can be admitted immediately under the current latency/throughput limit.
+    size_t availableAdmissionSlots() const noexcept;
+    //! Physical KV pages currently free in the shared stable page pool.
+    int32_t availableKVPages() const noexcept;
     size_t decodeRefillWaitCount() const noexcept;
     size_t pageGrowthWaitCount() const noexcept;
     size_t pendingPageGrowthCount() const noexcept;

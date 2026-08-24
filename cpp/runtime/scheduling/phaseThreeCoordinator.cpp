@@ -102,6 +102,65 @@ size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenC
     return batchFull || tokenFull || oldestWaitUs >= batchWaitUs ? batchSize : 0;
 }
 
+PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
+    std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize, size_t maxBatchTokens, double oldestWaitUs,
+    double batchWaitUs, bool enabled, size_t minBacklogBatchSize, size_t upstreamVisionRequests,
+    size_t availableAdmissionSlots, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
+    size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio) noexcept
+{
+    if (promptTokenCounts.empty() || maxBatchSize == 0 || availableAdmissionSlots == 0 || availableKVPages <= 0)
+    {
+        return {};
+    }
+    size_t const admissionLimit = std::min(maxBatchSize, availableAdmissionSlots);
+    if (!enabled)
+    {
+        return {phaseVisionReadyPrefillBatchSize(
+                    promptTokenCounts, admissionLimit, maxBatchTokens, oldestWaitUs, batchWaitUs),
+            PhaseVisionPrefillAdmissionReason::kLegacy};
+    }
+
+    bool const decodeProtected = decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit;
+    if (decodeProtected)
+    {
+        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, 1U, maxBatchTokens, oldestWaitUs, 0.0),
+            PhaseVisionPrefillAdmissionReason::kDecodeProtection};
+    }
+    bool const bytePressure = maxReadyBytes > 0 && readyBytePressureRatio > 0.0
+        && static_cast<double>(readyBytes) >= static_cast<double>(maxReadyBytes) * readyBytePressureRatio;
+    if (bytePressure)
+    {
+        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, admissionLimit, maxBatchTokens, oldestWaitUs, 0.0),
+            PhaseVisionPrefillAdmissionReason::kBytePressure};
+    }
+    if (promptTokenCounts.size() == 1U && upstreamVisionRequests == 0)
+    {
+        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, 1U, maxBatchTokens, oldestWaitUs, 0.0),
+            PhaseVisionPrefillAdmissionReason::kLowLoad};
+    }
+    bool const slotPressure
+        = availableAdmissionSlots < maxBatchSize || availableAdmissionSlots - maxBatchSize < maxBatchSize;
+    if (slotPressure)
+    {
+        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, 1U, maxBatchTokens, oldestWaitUs, 0.0),
+            PhaseVisionPrefillAdmissionReason::kCapacity};
+    }
+    size_t const backlogThreshold = std::max(minBacklogBatchSize, size_t{1});
+    if (promptTokenCounts.size() >= backlogThreshold)
+    {
+        size_t const backlogBatchSize = std::min(admissionLimit, promptTokenCounts.size());
+        return {
+            phaseVisionReadyPrefillBatchSize(promptTokenCounts, backlogBatchSize, maxBatchTokens, oldestWaitUs, 0.0),
+            PhaseVisionPrefillAdmissionReason::kBacklog};
+    }
+    if (oldestWaitUs >= batchWaitUs)
+    {
+        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, admissionLimit, maxBatchTokens, oldestWaitUs, 0.0),
+            PhaseVisionPrefillAdmissionReason::kAge};
+    }
+    return {};
+}
+
 size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
     double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio, float decodeTpotPressure,
     float decodeTpotPressureLimit) noexcept
@@ -141,6 +200,13 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Three-phase encoder batch wait must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.prefillBatchWaitUs) && mConfig.prefillBatchWaitUs >= 0.0,
         "Three-phase prefill batch wait must be finite and non-negative");
+    ELLM_CHECK(
+        mConfig.adaptivePrefillMinBatchSize > 0, "Three-phase adaptive prefill minimum batch size must be positive");
+    ELLM_CHECK(std::isfinite(mConfig.prefillDecodeTpotPressureLimit) && mConfig.prefillDecodeTpotPressureLimit >= 0.0F,
+        "Three-phase prefill decode pressure limit must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.prefillReadyBytePressureRatio) && mConfig.prefillReadyBytePressureRatio >= 0.0
+            && mConfig.prefillReadyBytePressureRatio <= 1.0,
+        "Three-phase prefill ready byte pressure ratio must be in [0, 1]");
     ELLM_CHECK(std::isfinite(mConfig.visionTtftTargetUs) && mConfig.visionTtftTargetUs >= 0.0,
         "Three-phase vision TTFT target must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.lookaheadEscalationRatio) && mConfig.lookaheadEscalationRatio >= 0.0,
@@ -246,8 +312,17 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.prefillAdmissionBatches = mPrefillAdmissionBatches;
     result.lastPrefillAdmissionBatchSize = mLastPrefillAdmissionBatchSize;
     result.maxPrefillAdmissionBatchSize = mMaxPrefillAdmissionBatchSize;
+    result.adaptivePrefillAdmissions = mAdaptivePrefillAdmissions;
+    result.lowLoadPrefillAdmissions = mLowLoadPrefillAdmissions;
+    result.backlogPrefillAdmissions = mBacklogPrefillAdmissions;
+    result.decodeProtectedPrefillAdmissions = mDecodeProtectedPrefillAdmissions;
+    result.capacityProtectedPrefillAdmissions = mCapacityProtectedPrefillAdmissions;
+    result.ageForcedPrefillAdmissions = mAgeForcedPrefillAdmissions;
+    result.byteForcedPrefillAdmissions = mByteForcedPrefillAdmissions;
     result.lastPrefillReadyQueueWaitUs = mLastPrefillReadyQueueWaitUs;
     result.maxPrefillReadyQueueWaitUs = mMaxPrefillReadyQueueWaitUs;
+    result.availablePrefillAdmissionSlots = mServer.availableAdmissionSlots();
+    result.availableKVPages = mServer.availableKVPages();
     result.effectiveEncodedCapacity = effectiveEncodedCapacity();
     result.maxEffectiveEncodedCapacity = mMaxEffectiveEncodedCapacity;
     result.lookaheadEscalations = mLookaheadEscalations;
@@ -365,7 +440,8 @@ bool PhaseThreeCoordinator::completeEncoder()
 
 bool PhaseThreeCoordinator::dispatchReadyPrefill()
 {
-    size_t const batchSize = nextReadyPrefillBatchSize();
+    PhaseVisionPrefillAdmissionDecision const decision = nextReadyPrefillDecision();
+    size_t const batchSize = decision.batchSize;
     if (batchSize == 0)
     {
         return false;
@@ -398,6 +474,21 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
         ++mPrefillAdmissionBatches;
         mLastPrefillAdmissionBatchSize = submitted;
         mMaxPrefillAdmissionBatchSize = std::max(mMaxPrefillAdmissionBatchSize, submitted);
+        if (mConfig.enableAdaptivePrefillAdmission)
+        {
+            ++mAdaptivePrefillAdmissions;
+            switch (decision.reason)
+            {
+            case PhaseVisionPrefillAdmissionReason::kLowLoad: ++mLowLoadPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kBacklog: ++mBacklogPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kDecodeProtection: ++mDecodeProtectedPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kCapacity: ++mCapacityProtectedPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kAge: ++mAgeForcedPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kBytePressure: ++mByteForcedPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kLegacy:
+            case PhaseVisionPrefillAdmissionReason::kNone: break;
+            }
+        }
     }
     return submitted > 0;
 }
@@ -437,11 +528,11 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
     return batchSize;
 }
 
-size_t PhaseThreeCoordinator::nextReadyPrefillBatchSize() const noexcept
+PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecision() const noexcept
 {
     if (mReadyPrefill.empty())
     {
-        return 0;
+        return {};
     }
     std::vector<int32_t> promptTokenCounts;
     promptTokenCounts.reserve(mReadyPrefill.size());
@@ -452,8 +543,11 @@ size_t PhaseThreeCoordinator::nextReadyPrefillBatchSize() const noexcept
     double const oldestWaitUs
         = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mReadyPrefill.front().encodedAt)
               .count();
-    return phaseVisionReadyPrefillBatchSize(promptTokenCounts, mConfig.maxPrefillBatchSize,
-        mConfig.maxPrefillBatchTokens, oldestWaitUs, mConfig.prefillBatchWaitUs);
+    return phaseVisionAdaptiveReadyPrefillDecision(promptTokenCounts, mConfig.maxPrefillBatchSize,
+        mConfig.maxPrefillBatchTokens, oldestWaitUs, mConfig.prefillBatchWaitUs, mConfig.enableAdaptivePrefillAdmission,
+        mConfig.adaptivePrefillMinBatchSize, mPending.size() + mEncoding.size(), mServer.availableAdmissionSlots(),
+        mServer.availableKVPages(), mServer.decodeTpotPressure(), mConfig.prefillDecodeTpotPressureLimit,
+        mReadyPrefillBytes, mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio);
 }
 
 bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) const noexcept
