@@ -354,3 +354,60 @@ longer binds the vision payload after the final prefill chunk.
 A real two-image OpenAI-style HTTP trace completes 2/2 requests with 1,017
 prompt tokens and 32 generated tokens. The one-run smoke result is 70.4
 token/s, 315.5 ms median TTFT, 9.23 ms median TPOT, and 453.9 ms median E2E.
+
+## Bounded incremental page leases
+
+The full-reservation default guarantees every admitted request's declared
+output length before prefill. This protects decode continuity, but an
+80-request long-output burst can leave later requests outside the active set
+for tens of seconds even though their prompt KV would fit. The opt-in headroom
+mode now separates three quantities:
+
+- every admitted request owns a base reservation for its prompt plus the
+  configured output headroom;
+- at most `maxConcurrentPageGrowthRequests` sticky growth owners may expand to
+  their complete declared length;
+- admission is accepted only when all base reservations plus the largest
+  possible growth tails fit the physical page budget.
+
+Growth owners rendezvous at their first page boundary before decode resumes.
+An owner remains sticky until completion or cancellation, then the longest
+remaining tail receives the released growth lease. Non-owners retain their
+stable slot and base pages without entering decode growth. This avoids both
+page overcommit deadlock and the per-poll scan of every blocked request. The
+legacy full-reservation path bypasses all new reservation calculations.
+
+The controls are:
+
+```text
+TRT_EDGELLM_PAGE_RESERVATION=headroom
+TRT_EDGELLM_PAGE_RESERVATION_HEADROOM_TOKENS=0
+TRT_EDGELLM_PAGE_GROWTH_REQUESTS=13
+```
+
+Prefix reuse is rejected with headroom mode in this version because retained
+prefix-cache slots are outside the bounded-growth proof. Page base,
+guaranteed, owner, pending, and wait counts are exported in phase metrics.
+
+On the Cosmos FP16 P8/D64 engine with 80 long-output requests, 256 page bundles,
+and the throughput-selected static decode cohort policy, three fresh runs give:
+
+| reservation | token/s | TTFT p95 | TPOT p95 | E2E p95 | ready/peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| full | 2,198.7 | 25,585 ms | 9.88 ms | 35,018 ms | 8,089/8,089 |
+| headroom 0, growth 13 | 1,667.2 | 325 ms | 125.07 ms | 49,030 ms | 8,089/8,089 |
+
+Incremental leasing reduces TTFT p95 by 98.7% while losing 24.2% throughput
+and increasing E2E p95 by 40.0%. It is therefore a latency-first operating
+point, not the new default. The result also exposes the next missing policy:
+with a fixed 256-page pool, all 80 requests cannot simultaneously receive an
+early first token and remain continuously decodable. Closing the remaining
+gap requires request preemption/recompute, KV offload, or a larger page pool.
+
+The short 48-request full-reservation regression remains at 2,210.9 token/s
+and 8,089 MiB, versus 2,181.7 token/s before the change. During validation, a
+separate command mismatch was isolated: enabling cost-model dynamic decode
+fragmented this short trace into roughly 80 decode dispatches instead of the
+selected static cohort's roughly 53 and reduced throughput to about 1,678
+token/s even on the unmodified server. Reservation comparisons must keep the
+decode policy identical.

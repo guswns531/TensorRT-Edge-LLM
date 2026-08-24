@@ -48,6 +48,27 @@ bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingReques
 std::vector<int32_t> phaseServingWarmupBatchSizes(
     int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes = {});
 
+//! Logical page reservation used to guarantee bounded incremental KV growth.
+struct IndependentPhasePageReservation
+{
+    uint64_t requestId{};
+    int32_t basePages{};
+    int32_t fullPages{};
+};
+
+//! Sum base reservations and the largest growth tails that must be simultaneously drainable.
+int32_t phasePageReservationGuaranteedPages(
+    std::vector<IndependentPhasePageReservation> const& reservations, int32_t maxGrowthRequests);
+//! Test whether a set of incremental reservations is safe for one physical page budget.
+bool phasePageReservationsFit(
+    int32_t pageBudget, std::vector<IndependentPhasePageReservation> const& reservations, int32_t maxGrowthRequests);
+//! Retain valid sticky owners, then fill free growth leases by descending tail size.
+std::vector<uint64_t> selectPhasePageGrowthOwners(std::vector<IndependentPhasePageReservation> const& reservations,
+    std::vector<uint64_t> const& currentOwners, int32_t maxGrowthRequests);
+//! Wait until every not-yet-started growth owner reaches its first page boundary.
+bool shouldDeferPhasePageGrowthCohort(
+    size_t growthOwners, size_t startedGrowthOwners, size_t waitingUnstartedOwners) noexcept;
+
 //! Request view passed to a model-specific text or multimodal adapter.
 struct IndependentPhaseRequestView
 {
@@ -113,6 +134,8 @@ struct IndependentPhaseServerConfig
     size_t maxDecodeGraphs{8U};
     IndependentPhasePageReservationMode pageReservationMode{IndependentPhasePageReservationMode::kFull};
     int32_t outputHeadroomTokens{128};
+    //! Headroom mode guarantees this many sticky requests can grow to their full declared length.
+    int32_t maxConcurrentPageGrowthRequests{8};
     //! Defer a partial decode tail while completed decode sampling tickets can refill this many rows.
     size_t decodeRefillBatchSize{};
     //! Switch between latencyInFlightRequests/refill-off and maxInFlightRequests/refill-on from pending backlog.
@@ -194,6 +217,11 @@ public:
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
     size_t decodeRefillWaitCount() const noexcept;
+    size_t pageGrowthWaitCount() const noexcept;
+    size_t pendingPageGrowthCount() const noexcept;
+    size_t pageGrowthOwnerCount() const noexcept;
+    int32_t pageReservationBasePages() const noexcept;
+    int32_t pageReservationGuaranteedPages() const;
     float decodeTpotPressure() const noexcept;
     size_t visionPayloadBytes() const noexcept;
     size_t visionPrefillReleaseCount() const noexcept;
@@ -213,6 +241,9 @@ private:
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
         std::shared_ptr<PhaseVisionPayload> visionPayload;
+        int32_t baseReservedPages{};
+        int32_t fullReservedPages{};
+        bool pageGrowthStarted{};
     };
 
     struct PendingRequest
@@ -234,6 +265,11 @@ private:
     bool admitPendingRequests();
     bool resumePendingDecodeRequests();
     bool enqueueDecodeOrWait(uint64_t requestId, RequestState& state);
+    IndependentPhasePageReservation makePageReservation(
+        uint64_t requestId, int32_t promptTokens, int32_t maxOutputTokens) const;
+    bool hasPageReservationCapacity(IndependentPhasePageReservation const& reservation) const;
+    int32_t pageReservationBudget() const;
+    void refreshPageGrowthOwners();
     bool shouldWaitForDecodeRefill() const noexcept;
     size_t admissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
@@ -253,12 +289,14 @@ private:
     std::unordered_set<uint64_t> mPendingRequestIds;
     std::deque<uint64_t> mPendingDecodeRequests;
     std::unordered_set<uint64_t> mPendingDecodeRequestIds;
+    std::unordered_set<uint64_t> mPageGrowthRequestIds;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
     std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
     size_t mDecodeRefillWaitCount{};
+    size_t mPageGrowthWaitCount{};
     size_t mVisionPrefillReleaseCount{};
     size_t mVisionPrefillReleasedBytes{};
     bool mThroughputMode{};

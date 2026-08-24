@@ -23,8 +23,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace trt_edgellm::rt
 {
@@ -65,6 +69,95 @@ std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize, st
     return requestedBatchSizes;
 }
 
+int32_t phasePageReservationGuaranteedPages(
+    std::vector<IndependentPhasePageReservation> const& reservations, int32_t maxGrowthRequests)
+{
+    ELLM_CHECK(maxGrowthRequests > 0, "Phase page growth request limit must be positive");
+    int64_t basePages{};
+    std::vector<int32_t> tails;
+    tails.reserve(reservations.size());
+    for (IndependentPhasePageReservation const& reservation : reservations)
+    {
+        ELLM_CHECK(reservation.basePages >= 0 && reservation.fullPages >= reservation.basePages,
+            "Phase page reservation is invalid");
+        basePages += reservation.basePages;
+        tails.push_back(reservation.fullPages - reservation.basePages);
+    }
+    std::sort(tails.begin(), tails.end(), std::greater<int32_t>());
+    int32_t const growthCount = std::min<int32_t>(maxGrowthRequests, tails.size());
+    int64_t const guaranteed = basePages + std::accumulate(tails.begin(), tails.begin() + growthCount, int64_t{});
+    ELLM_CHECK(guaranteed <= std::numeric_limits<int32_t>::max(), "Phase page reservation count overflowed");
+    return static_cast<int32_t>(guaranteed);
+}
+
+bool phasePageReservationsFit(
+    int32_t pageBudget, std::vector<IndependentPhasePageReservation> const& reservations, int32_t maxGrowthRequests)
+{
+    ELLM_CHECK(pageBudget >= 0, "Phase page reservation budget must be non-negative");
+    return phasePageReservationGuaranteedPages(reservations, maxGrowthRequests) <= pageBudget;
+}
+
+std::vector<uint64_t> selectPhasePageGrowthOwners(std::vector<IndependentPhasePageReservation> const& reservations,
+    std::vector<uint64_t> const& currentOwners, int32_t maxGrowthRequests)
+{
+    ELLM_CHECK(maxGrowthRequests > 0, "Phase page growth request limit must be positive");
+    std::unordered_map<uint64_t, int32_t> tails;
+    tails.reserve(reservations.size());
+    for (IndependentPhasePageReservation const& reservation : reservations)
+    {
+        ELLM_CHECK(reservation.fullPages >= reservation.basePages, "Phase page reservation tail is invalid");
+        ELLM_CHECK(tails.emplace(reservation.requestId, reservation.fullPages - reservation.basePages).second,
+            "Phase page reservations contain a duplicate request");
+    }
+
+    std::vector<uint64_t> owners;
+    owners.reserve(static_cast<size_t>(maxGrowthRequests));
+    std::unordered_set<uint64_t> selected;
+    std::vector<uint64_t> sortedCurrent = currentOwners;
+    std::sort(sortedCurrent.begin(), sortedCurrent.end());
+    for (uint64_t const requestId : sortedCurrent)
+    {
+        auto const tail = tails.find(requestId);
+        if (tail != tails.end() && tail->second > 0 && selected.insert(requestId).second)
+        {
+            owners.push_back(requestId);
+            if (static_cast<int32_t>(owners.size()) == maxGrowthRequests)
+            {
+                return owners;
+            }
+        }
+    }
+
+    std::vector<std::pair<int32_t, uint64_t>> candidates;
+    candidates.reserve(reservations.size());
+    for (IndependentPhasePageReservation const& reservation : reservations)
+    {
+        int32_t const tail = reservation.fullPages - reservation.basePages;
+        if (tail > 0 && selected.find(reservation.requestId) == selected.end())
+        {
+            candidates.emplace_back(tail, reservation.requestId);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](auto const& left, auto const& right) {
+        return left.first > right.first || (left.first == right.first && left.second < right.second);
+    });
+    for (auto const& candidate : candidates)
+    {
+        owners.push_back(candidate.second);
+        if (static_cast<int32_t>(owners.size()) == maxGrowthRequests)
+        {
+            break;
+        }
+    }
+    return owners;
+}
+
+bool shouldDeferPhasePageGrowthCohort(
+    size_t growthOwners, size_t startedGrowthOwners, size_t waitingUnstartedOwners) noexcept
+{
+    return startedGrowthOwners < growthOwners && waitingUnstartedOwners < growthOwners - startedGrowthOwners;
+}
+
 IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerConfig config,
     IndependentPhaseCoordinator& coordinator, StableKVPageManager& ownership, IndependentPhaseRequestAdapter adapter,
     PhasePrefixReuseCache* prefixCache)
@@ -76,7 +169,16 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
 {
     ELLM_CHECK(mConfig.maxInFlightRequests > 0, "Independent phase server request capacity must be positive");
     ELLM_CHECK(mConfig.defaultMaxOutputTokens > 0, "Independent phase server output capacity must be positive");
-    ELLM_CHECK(mConfig.outputHeadroomTokens > 0, "Independent phase server output headroom must be positive");
+    ELLM_CHECK(mConfig.outputHeadroomTokens >= 0, "Independent phase server output headroom must be non-negative");
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        ELLM_CHECK(mConfig.maxConcurrentPageGrowthRequests > 0,
+            "Independent phase server page growth request limit must be positive");
+        ELLM_CHECK(static_cast<size_t>(mConfig.maxConcurrentPageGrowthRequests) <= mConfig.maxInFlightRequests,
+            "Independent phase server page growth request limit exceeds in-flight capacity");
+        ELLM_CHECK(!mConfig.enablePrefixReuse,
+            "Incremental phase page reservation does not support retained prefix-cache slots");
+    }
     ELLM_CHECK(mConfig.decodeRefillBatchSize <= mConfig.maxInFlightRequests,
         "Decode refill batch cannot exceed the server in-flight capacity");
     ELLM_CHECK(!mConfig.enableAdaptiveAdmission
@@ -131,6 +233,16 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     }
     maxOutputTokens = maxOutputTokens > 0 ? maxOutputTokens : mConfig.defaultMaxOutputTokens;
 
+    IndependentPhasePageReservation reservation;
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        reservation = makePageReservation(requestId, static_cast<int32_t>(promptTokens.size()), maxOutputTokens);
+        if (!hasPageReservationCapacity(reservation))
+        {
+            return result;
+        }
+    }
+
     int32_t const slot = mOwnership.reserve();
     int32_t reusedPrefixTokens{};
     try
@@ -161,7 +273,13 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     state.scheduling = scheduling;
     state.submittedAt = std::chrono::steady_clock::now();
     state.visionPayload = std::move(visionPayload);
+    state.baseReservedPages = reservation.basePages;
+    state.fullReservedPages = reservation.fullPages;
     mRequests.emplace(requestId, std::move(state));
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        refreshPageGrowthOwners();
+    }
     int32_t const remaining = static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()) - reusedPrefixTokens;
     mCoordinator.enqueuePrefill({requestId, remaining, slot, reusedPrefixTokens,
         static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()), allowChunkedPrefill, scheduling,
@@ -236,6 +354,10 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
     }
     mOwnership.release(it->second.kvSlotId);
     mRequests.erase(it);
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        refreshPageGrowthOwners();
+    }
     return true;
 }
 
@@ -290,8 +412,11 @@ bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
             pendingDecodeRows += ticket->requestIds.size();
         }
     }
-    size_t const refillTarget
-        = !mConfig.enableAdaptiveAdmission || mThroughputMode ? mConfig.decodeRefillBatchSize : 0U;
+    bool const retainGrowthCohort = mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom
+        && !mPageGrowthRequestIds.empty();
+    size_t const refillTarget = !mConfig.enableAdaptiveAdmission || mThroughputMode || retainGrowthCohort
+        ? mConfig.decodeRefillBatchSize
+        : 0U;
     return shouldDeferDecodeForSamplingRefill(
         refillTarget, mCoordinator.scheduler().prefillQueueSize(), queuedDecode, pendingDecodeRows);
 }
@@ -365,6 +490,42 @@ size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
 size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept
 {
     return mDecodeRefillWaitCount;
+}
+
+size_t IndependentPhaseAsyncServer::pageGrowthWaitCount() const noexcept
+{
+    return mPageGrowthWaitCount;
+}
+
+size_t IndependentPhaseAsyncServer::pendingPageGrowthCount() const noexcept
+{
+    return mPendingDecodeRequests.size();
+}
+
+size_t IndependentPhaseAsyncServer::pageGrowthOwnerCount() const noexcept
+{
+    return mPageGrowthRequestIds.size();
+}
+
+int32_t IndependentPhaseAsyncServer::pageReservationBasePages() const noexcept
+{
+    int32_t result{};
+    for (auto const& request : mRequests)
+    {
+        result += request.second.baseReservedPages;
+    }
+    return result;
+}
+
+int32_t IndependentPhaseAsyncServer::pageReservationGuaranteedPages() const
+{
+    std::vector<IndependentPhasePageReservation> reservations;
+    reservations.reserve(mRequests.size());
+    for (auto const& request : mRequests)
+    {
+        reservations.push_back({request.first, request.second.baseReservedPages, request.second.fullReservedPages});
+    }
+    return phasePageReservationGuaranteedPages(reservations, mConfig.maxConcurrentPageGrowthRequests);
 }
 
 float IndependentPhaseAsyncServer::decodeTpotPressure() const noexcept
@@ -450,6 +611,56 @@ bool IndependentPhaseAsyncServer::admitPendingRequests()
 bool IndependentPhaseAsyncServer::resumePendingDecodeRequests()
 {
     bool resumed{};
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        std::vector<uint64_t> owners(mPageGrowthRequestIds.begin(), mPageGrowthRequestIds.end());
+        std::sort(owners.begin(), owners.end());
+        size_t startedOwners{};
+        size_t waitingUnstartedOwners{};
+        for (uint64_t const requestId : owners)
+        {
+            auto const request = mRequests.find(requestId);
+            ELLM_CHECK(request != mRequests.end(), "Page growth owner request is missing");
+            if (request->second.pageGrowthStarted)
+            {
+                ++startedOwners;
+            }
+            else if (mPendingDecodeRequestIds.find(requestId) != mPendingDecodeRequestIds.end())
+            {
+                ++waitingUnstartedOwners;
+            }
+        }
+        if (shouldDeferPhasePageGrowthCohort(owners.size(), startedOwners, waitingUnstartedOwners))
+        {
+            return false;
+        }
+        if (waitingUnstartedOwners > 0)
+        {
+            for (uint64_t const requestId : owners)
+            {
+                auto request = mRequests.find(requestId);
+                if (!request->second.pageGrowthStarted
+                    && mPendingDecodeRequestIds.find(requestId) != mPendingDecodeRequestIds.end())
+                {
+                    request->second.pageGrowthStarted = true;
+                }
+            }
+        }
+        for (uint64_t const requestId : owners)
+        {
+            if (mPendingDecodeRequestIds.erase(requestId) == 0)
+            {
+                continue;
+            }
+            auto const pending = std::find(mPendingDecodeRequests.begin(), mPendingDecodeRequests.end(), requestId);
+            ELLM_CHECK(pending != mPendingDecodeRequests.end(), "Pending page growth request index is inconsistent");
+            mPendingDecodeRequests.erase(pending);
+            auto it = mRequests.find(requestId);
+            ELLM_CHECK(it != mRequests.end(), "Pending page growth request is missing");
+            resumed = enqueueDecodeOrWait(requestId, it->second) || resumed;
+        }
+        return resumed;
+    }
     while (!mPendingDecodeRequests.empty())
     {
         uint64_t const requestId = mPendingDecodeRequests.front();
@@ -468,9 +679,25 @@ bool IndependentPhaseAsyncServer::resumePendingDecodeRequests()
 
 bool IndependentPhaseAsyncServer::enqueueDecodeOrWait(uint64_t requestId, RequestState& state)
 {
+    int32_t const targetLength = mOwnership.length(state.kvSlotId) + 1;
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        int32_t const requiredPages
+            = (targetLength + mOwnership.config().tokensPerPage - 1) / mOwnership.config().tokensPerPage;
+        if (requiredPages > state.baseReservedPages
+            && (mPageGrowthRequestIds.find(requestId) == mPageGrowthRequestIds.end() || !state.pageGrowthStarted))
+        {
+            if (mPendingDecodeRequestIds.insert(requestId).second)
+            {
+                mPendingDecodeRequests.push_back(requestId);
+                ++mPageGrowthWaitCount;
+            }
+            return false;
+        }
+    }
     try
     {
-        mOwnership.ensureCapacity(state.kvSlotId, mOwnership.length(state.kvSlotId) + 1);
+        mOwnership.ensureCapacity(state.kvSlotId, targetLength);
     }
     catch (std::runtime_error const&)
     {
@@ -483,6 +710,72 @@ bool IndependentPhaseAsyncServer::enqueueDecodeOrWait(uint64_t requestId, Reques
     mCoordinator.enqueueDecode(
         {requestId, mOwnership.length(state.kvSlotId), state.kvSlotId, 0, 0, true, state.scheduling});
     return true;
+}
+
+IndependentPhasePageReservation IndependentPhaseAsyncServer::makePageReservation(
+    uint64_t requestId, int32_t promptTokens, int32_t maxOutputTokens) const
+{
+    int32_t const tokensPerPage = mOwnership.config().tokensPerPage;
+    auto const pagesForTokens
+        = [tokensPerPage](int32_t tokens) { return (tokens + tokensPerPage - 1) / tokensPerPage; };
+    int32_t const fullPages = pagesForTokens(promptTokens + maxOutputTokens);
+    int32_t const reservedOutput = mConfig.pageReservationMode == IndependentPhasePageReservationMode::kFull
+        ? maxOutputTokens
+        : std::min(maxOutputTokens, mConfig.outputHeadroomTokens);
+    return {requestId, pagesForTokens(promptTokens + reservedOutput), fullPages};
+}
+
+bool IndependentPhaseAsyncServer::hasPageReservationCapacity(IndependentPhasePageReservation const& reservation) const
+{
+    std::vector<IndependentPhasePageReservation> reservations;
+    reservations.reserve(mRequests.size() + 1U);
+    for (auto const& request : mRequests)
+    {
+        reservations.push_back({request.first, request.second.baseReservedPages, request.second.fullReservedPages});
+    }
+    reservations.push_back(reservation);
+    return phasePageReservationsFit(pageReservationBudget(), reservations, mConfig.maxConcurrentPageGrowthRequests);
+}
+
+int32_t IndependentPhaseAsyncServer::pageReservationBudget() const
+{
+    std::unordered_set<int32_t> requestSlots;
+    requestSlots.reserve(mRequests.size());
+    for (auto const& request : mRequests)
+    {
+        requestSlots.insert(request.second.kvSlotId);
+    }
+    std::unordered_set<int32_t> externalPages;
+    for (int32_t slot{}; slot < mOwnership.config().maxStableSlots; ++slot)
+    {
+        if (!mOwnership.leased(slot) || requestSlots.find(slot) != requestSlots.end())
+        {
+            continue;
+        }
+        auto const& pages = mOwnership.pages(slot);
+        externalPages.insert(pages.begin(), pages.end());
+    }
+    return mOwnership.config().numPages - static_cast<int32_t>(externalPages.size());
+}
+
+void IndependentPhaseAsyncServer::refreshPageGrowthOwners()
+{
+    if (mConfig.pageReservationMode != IndependentPhasePageReservationMode::kHeadroom)
+    {
+        mPageGrowthRequestIds.clear();
+        return;
+    }
+    std::vector<IndependentPhasePageReservation> reservations;
+    reservations.reserve(mRequests.size());
+    for (auto const& request : mRequests)
+    {
+        reservations.push_back({request.first, request.second.baseReservedPages, request.second.fullReservedPages});
+    }
+    std::vector<uint64_t> currentOwners(mPageGrowthRequestIds.begin(), mPageGrowthRequestIds.end());
+    std::vector<uint64_t> const selected
+        = selectPhasePageGrowthOwners(reservations, currentOwners, mConfig.maxConcurrentPageGrowthRequests);
+    mPageGrowthRequestIds.clear();
+    mPageGrowthRequestIds.insert(selected.begin(), selected.end());
 }
 
 IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks()
@@ -664,6 +957,10 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     mCompletions.push_back({requestId, std::move(state.generatedTokens),
         static_cast<int32_t>(state.promptTokens.size()), latencyMs, stoppedByEos});
     mRequests.erase(it);
+    if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
+    {
+        refreshPageGrowthOwners();
+    }
 }
 
 void IndependentPhaseAsyncServer::destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept

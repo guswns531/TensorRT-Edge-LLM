@@ -1208,6 +1208,14 @@ int main(int argc, char** argv)
         {
             serverConfig.pageReservationMode = rt::IndependentPhasePageReservationMode::kHeadroom;
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_PAGE_RESERVATION_HEADROOM_TOKENS"))
+        {
+            serverConfig.outputHeadroomTokens = std::stoi(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PAGE_GROWTH_REQUESTS"))
+        {
+            serverConfig.maxConcurrentPageGrowthRequests = std::stoi(value);
+        }
         std::unique_ptr<rt::PhasePrefixReuseCache> semanticPrefixCache;
         if (enablePrefixReuse)
         {
@@ -1749,6 +1757,11 @@ int main(int argc, char** argv)
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
+                        {"page_growth_waits", semanticServer.pageGrowthWaitCount()},
+                        {"page_growth_pending", semanticServer.pendingPageGrowthCount()},
+                        {"page_growth_owners", semanticServer.pageGrowthOwnerCount()},
+                        {"page_reservation_base", semanticServer.pageReservationBasePages()},
+                        {"page_reservation_guaranteed", semanticServer.pageReservationGuaranteedPages()},
                         {"online_decode_cost_samples",
                             semanticCoordinator.scheduler().telemetry().onlineDecodeCostSampleCount},
                         {"online_decode_cost_buckets",
@@ -1863,6 +1876,14 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
                 emitPhaseMetrics ? "yes" : "no");
             LOG_INFO("Phase IPC response path: %s", nativeEventCallbacks ? "native_callback" : "polling_queue");
+            LOG_INFO(
+                "Phase page reservation: mode=%s base=%d guaranteed=%d growth_owners=%zu growth_pending=%zu "
+                "growth_waits=%zu",
+                serverConfig.pageReservationMode == rt::IndependentPhasePageReservationMode::kFull ? "full"
+                                                                                                   : "headroom",
+                semanticServer.pageReservationBasePages(), semanticServer.pageReservationGuaranteedPages(),
+                semanticServer.pageGrowthOwnerCount(), semanticServer.pendingPageGrowthCount(),
+                semanticServer.pageGrowthWaitCount());
             if (ipcThreePhase != nullptr)
             {
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();

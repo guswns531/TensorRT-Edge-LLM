@@ -52,4 +52,40 @@ TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuc
     EXPECT_THROW(phaseServingWarmupBatchSizes(64, {65}), std::runtime_error);
 }
 
+TEST(IndependentPhaseAsyncServerTest, IncrementalPageReservationGuaranteesADrainableCohort)
+{
+    std::vector<IndependentPhasePageReservation> reservations;
+    for (uint64_t requestId{}; requestId < 80U; ++requestId)
+    {
+        reservations.push_back({requestId, 2, 13});
+    }
+    EXPECT_EQ(phasePageReservationGuaranteedPages(reservations, 8), 248);
+    EXPECT_TRUE(phasePageReservationsFit(256, reservations, 8));
+    EXPECT_FALSE(phasePageReservationsFit(256, reservations, 9));
+}
+
+TEST(IndependentPhaseAsyncServerTest, PageGrowthOwnersRemainStickyAndDeterministic)
+{
+    std::vector<IndependentPhasePageReservation> const reservations{
+        {10, 2, 8}, {11, 2, 13}, {12, 2, 10}, {13, 2, 12}, {14, 2, 9}};
+    EXPECT_EQ(selectPhasePageGrowthOwners(reservations, {14, 10}, 4), (std::vector<uint64_t>{10, 14, 11, 13}));
+    EXPECT_EQ(selectPhasePageGrowthOwners(reservations, {99, 11}, 2), (std::vector<uint64_t>{11, 13}));
+}
+
+TEST(IndependentPhaseAsyncServerTest, PageReservationRejectsInvalidAndDuplicateInputs)
+{
+    EXPECT_THROW(phasePageReservationGuaranteedPages({{0, 3, 2}}, 1), std::runtime_error);
+    EXPECT_THROW(phasePageReservationGuaranteedPages({}, 0), std::runtime_error);
+    EXPECT_THROW(selectPhasePageGrowthOwners({{0, 1, 2}, {0, 1, 2}}, {}, 1), std::runtime_error);
+}
+
+TEST(IndependentPhaseAsyncServerTest, GrowthCohortWaitsOnlyForOwnersThatHaveNotStarted)
+{
+    EXPECT_TRUE(shouldDeferPhasePageGrowthCohort(13, 0, 12));
+    EXPECT_FALSE(shouldDeferPhasePageGrowthCohort(13, 0, 13));
+    EXPECT_TRUE(shouldDeferPhasePageGrowthCohort(13, 12, 0));
+    EXPECT_FALSE(shouldDeferPhasePageGrowthCohort(13, 12, 1));
+    EXPECT_FALSE(shouldDeferPhasePageGrowthCohort(13, 13, 0));
+}
+
 } // namespace trt_edgellm::rt
