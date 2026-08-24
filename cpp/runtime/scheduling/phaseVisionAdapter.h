@@ -32,6 +32,17 @@
 namespace trt_edgellm::rt
 {
 
+struct PhaseVisionBatchStorage;
+
+//! GPU-memory operations performed while retaining encoder output for downstream prefill.
+struct PhaseVisionMemoryStats
+{
+    size_t batchStorageAllocations{};
+    size_t batchStorageReuses{};
+    size_t deviceCopyOperations{};
+    size_t deviceCopyBytes{};
+};
+
 //! Request-owned encoder output retained until the corresponding prefill completes.
 struct PhaseVisionPayload
 {
@@ -43,6 +54,7 @@ struct PhaseVisionPayload
     Tensor outputEmbedding;
     std::vector<Tensor> deepstackFeatures;
     Tensor mropeCosSin;
+    std::shared_ptr<PhaseVisionBatchStorage> storageOwner;
     float encoderGpuMs{};
     cudaEvent_t startEvent{};
     cudaEvent_t readyEvent{};
@@ -79,10 +91,12 @@ public:
     bool cancel(uint64_t requestId);
     bool busy() const noexcept;
     CUcontext cudaContext() const noexcept;
+    PhaseVisionMemoryStats const& memoryStats() const noexcept;
 
 private:
-    static Tensor copyTensorRows(
-        Tensor const& source, int64_t rowOffset, int64_t rowCount, std::string const& name, cudaStream_t stream);
+    static Tensor viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name);
+    std::shared_ptr<PhaseVisionBatchStorage> retainBatchOutputs(
+        Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures);
     void releaseBatchStorageIfIdle();
 
     MultimodalRunner& mRunner;
@@ -93,6 +107,8 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<PhaseVisionPayload>> mRequests;
     std::optional<LLMGenerationRequest> mBatchedRequest;
     Tensor mBatchedMrope;
+    std::vector<std::shared_ptr<PhaseVisionBatchStorage>> mStoragePool;
+    PhaseVisionMemoryStats mMemoryStats;
 };
 
 } // namespace trt_edgellm::rt

@@ -635,8 +635,7 @@ int main(int argc, char** argv)
 
         int32_t const prefillTokenCapacity
             = config.packedPrefill ? config.maxPackedPrefillChunkTokens : config.maxSupportedInputLength;
-        bool const enableBatchedVisionPrefill
-            = std::getenv("TRT_EDGELLM_ENABLE_BATCHED_VISION_PREFILL") != nullptr;
+        bool const enableBatchedVisionPrefill = std::getenv("TRT_EDGELLM_ENABLE_BATCHED_VISION_PREFILL") != nullptr;
         ELLM_CHECK(!enableBatchedVisionPrefill || config.packedPrefill,
             "Batched vision prefill requires a packed-prefill engine");
         int32_t prefillBatchTokenBudget = config.maxSupportedPrefillBatchSize * 128;
@@ -666,6 +665,15 @@ int main(int argc, char** argv)
         rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
         SamplingSlotPool samplingSlotPool(maxPhaseBatch);
+        std::vector<uint64_t> lastDecodeSampleRequestIds;
+        size_t tokenH2DOperations{};
+        size_t tokenH2DBytes{};
+        size_t decodeDeviceTokenReuseBatches{};
+        size_t decodeDeviceTokenReuseRows{};
+        size_t visionPackD2DOperations{};
+        size_t visionPackD2DBytes{};
+        size_t mropeD2DOperations{};
+        size_t mropeD2DBytes{};
         rt::Tensor textOnlyMropeTemplate;
         std::vector<std::optional<uint64_t>> prefillMropeOwners(
             static_cast<size_t>(config.maxSupportedPrefillBatchSize));
@@ -754,7 +762,8 @@ int main(int argc, char** argv)
                 {
                     totalImageTokens += imageRange(*view).second;
                 }
-                ELLM_CHECK(totalImageTokens > 0 && batchedVisionEmbedding.reshape({totalImageTokens, config.hiddenSize}),
+                ELLM_CHECK(
+                    totalImageTokens > 0 && batchedVisionEmbedding.reshape({totalImageTokens, config.hiddenSize}),
                     "Batched vision embedding exceeds its packed-prefill buffer");
                 ELLM_CHECK(batchedVisionDeepstack.size() == static_cast<size_t>(config.numDeepstackFeatures),
                     "Batched vision deepstack buffer count does not match the engine");
@@ -784,8 +793,11 @@ int main(int argc, char** argv)
                             = static_cast<std::byte const*>(source.rawPointer()) + imageOffset * rowBytes;
                         auto* const destinationBytes
                             = static_cast<std::byte*>(destination.rawPointer()) + destinationOffset * rowBytes;
-                        CUDA_CHECK(cudaMemcpyAsync(destinationBytes, sourceBytes,
-                            static_cast<size_t>(imageTokens) * rowBytes, cudaMemcpyDeviceToDevice, stream));
+                        size_t const copyBytes = static_cast<size_t>(imageTokens) * rowBytes;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            destinationBytes, sourceBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
+                        ++visionPackD2DOperations;
+                        visionPackD2DBytes += copyBytes;
                     };
                     copyRows(payload.outputEmbedding, batchedVisionEmbedding);
                     ELLM_CHECK(payload.deepstackFeatures.size() == batchedVisionDeepstack.size(),
@@ -796,7 +808,8 @@ int main(int argc, char** argv)
                     }
                     destinationOffset += imageTokens;
                 }
-                ELLM_CHECK(destinationOffset == totalImageTokens, "Batched vision copy did not consume every image row");
+                ELLM_CHECK(
+                    destinationOffset == totalImageTokens, "Batched vision copy did not consume every image row");
                 visionEmbedding = std::cref(batchedVisionEmbedding);
                 deepstackFeatures.reserve(batchedVisionDeepstack.size());
                 for (rt::Tensor const& feature : batchedVisionDeepstack)
@@ -823,6 +836,8 @@ int main(int argc, char** argv)
                     auto* const destination = static_cast<std::byte*>(io.mropeCosSin.rawPointer()) + row * rowBytes;
                     CUDA_CHECK(
                         cudaMemcpyAsync(destination, source.rawPointer(), rowBytes, cudaMemcpyDeviceToDevice, stream));
+                    ++mropeD2DOperations;
+                    mropeD2DBytes += rowBytes;
                     owners[row] = desiredOwner;
                 }
                 map.set(binding_names::kRopeCosSin, io.mropeCosSin);
@@ -836,30 +851,53 @@ int main(int argc, char** argv)
                 ? (config.packedPrefill ? rt::Coords{1, totalTokens}
                                         : rt::Coords{static_cast<int64_t>(views.size()), views.front().work.tokenCount})
                 : rt::Coords{static_cast<int64_t>(views.size()), 1};
-            rt::Tensor& hostIds = prefill ? hostSemanticPrefillIds : hostSemanticDecodeIds;
-            rt::Tensor& deviceIds = prefill ? deviceSemanticPrefillIds : deviceSemanticDecodeIds;
-            ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
-                "Semantic phase token staging reshape failed");
-            int32_t* destination = hostIds.dataPointer<int32_t>();
-            int32_t destinationOffset{};
-            for (rt::IndependentPhaseRequestView const& view : views)
+            bool const reuseDecodeSample = !prefill && lastDecodeSampleRequestIds.size() == views.size()
+                && std::equal(views.begin(), views.end(), lastDecodeSampleRequestIds.begin(),
+                    [](rt::IndependentPhaseRequestView const& view, uint64_t requestId) {
+                        return view.requestId == requestId;
+                    });
+            rt::Tensor sampledIdsView;
+            rt::Tensor* stagedIds{};
+            if (reuseDecodeSample)
             {
-                if (prefill)
-                {
-                    std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
-                        destination + destinationOffset);
-                    destinationOffset += view.work.tokenCount;
-                }
-                else
-                {
-                    ELLM_CHECK(!view.generatedTokens->empty(), "Semantic decode request has no sampled input token");
-                    destination[destinationOffset++] = view.generatedTokens->back();
-                }
+                sampledIdsView = rt::Tensor(decodeSelectedIds.rawPointer(), tokenShape, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kINT32, "semantic_phase_reused_decode_ids");
+                stagedIds = &sampledIdsView;
+                ++decodeDeviceTokenReuseBatches;
+                decodeDeviceTokenReuseRows += views.size();
             }
-            CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
-                static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-            embeddingPreprocessor.embed(deviceIds, visionEmbedding, std::nullopt, io, stream);
-            embeddingPreprocessor.prepareDeepstack(deviceIds, deepstackFeatures, io, stream);
+            else
+            {
+                rt::Tensor& hostIds = prefill ? hostSemanticPrefillIds : hostSemanticDecodeIds;
+                rt::Tensor& deviceIds = prefill ? deviceSemanticPrefillIds : deviceSemanticDecodeIds;
+                ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
+                    "Semantic phase token staging reshape failed");
+                int32_t* destination = hostIds.dataPointer<int32_t>();
+                int32_t destinationOffset{};
+                for (rt::IndependentPhaseRequestView const& view : views)
+                {
+                    if (prefill)
+                    {
+                        std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
+                            destination + destinationOffset);
+                        destinationOffset += view.work.tokenCount;
+                    }
+                    else
+                    {
+                        ELLM_CHECK(
+                            !view.generatedTokens->empty(), "Semantic decode request has no sampled input token");
+                        destination[destinationOffset++] = view.generatedTokens->back();
+                    }
+                }
+                size_t const copyBytes = static_cast<size_t>(totalTokens) * sizeof(int32_t);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    deviceIds.rawPointer(), hostIds.rawPointer(), copyBytes, cudaMemcpyHostToDevice, stream));
+                ++tokenH2DOperations;
+                tokenH2DBytes += copyBytes;
+                stagedIds = &deviceIds;
+            }
+            embeddingPreprocessor.embed(*stagedIds, visionEmbedding, std::nullopt, io, stream);
+            embeddingPreprocessor.prepareDeepstack(*stagedIds, deepstackFeatures, io, stream);
             if (prefill)
             {
                 for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
@@ -888,6 +926,10 @@ int main(int argc, char** argv)
             for (rt::IndependentPhaseRequestView const& view : views)
             {
                 ticket->requestIds.push_back(view.requestId);
+            }
+            if (!prefill)
+            {
+                lastDecodeSampleRequestIds = ticket->requestIds;
             }
             ticket->collect = [&slot, batchSize]() {
                 int32_t const* selected = slot.hostIds.dataPointer<int32_t>();
@@ -1665,6 +1707,31 @@ int main(int argc, char** argv)
                 semanticServer.throughputMode() ? "yes" : "no");
             LOG_INFO(
                 "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
+            LOG_INFO(
+                "Phase token memory ops: h2d_operations=%zu h2d_bytes=%zu decode_device_reuse_batches=%zu "
+                "decode_device_reuse_rows=%zu",
+                tokenH2DOperations, tokenH2DBytes, decodeDeviceTokenReuseBatches, decodeDeviceTokenReuseRows);
+            LOG_INFO(
+                "Phase staging memory ops: vision_pack_d2d_operations=%zu vision_pack_d2d_bytes=%zu "
+                "mrope_d2d_operations=%zu mrope_d2d_bytes=%zu",
+                visionPackD2DOperations, visionPackD2DBytes, mropeD2DOperations, mropeD2DBytes);
+            auto logKVMemoryOps = [](char const* phase, rt::PhaseKVMemoryStats const& memory,
+                                      rt::KVPageTableUploadStats const& pageTable) {
+                LOG_INFO(
+                    "Phase %s KV memory ops: prepares=%zu length_h2d_ops=%zu length_h2d_bytes=%zu "
+                    "metadata_h2d_ops=%zu metadata_h2d_bytes=%zu memset_ops=%zu memset_bytes=%zu "
+                    "page_calls=%zu page_uploads=%zu page_copy_ops=%zu page_copy_bytes=%zu page_host_waits=%zu "
+                    "page_stream_waits=%zu",
+                    phase, memory.prepareCalls, memory.lengthH2DOperations, memory.lengthH2DBytes,
+                    memory.prefillMetadataH2DOperations + memory.decodeMetadataH2DOperations,
+                    memory.prefillMetadataH2DBytes + memory.decodeMetadataH2DBytes, memory.decodeMemsetOperations,
+                    memory.decodeMemsetBytes, pageTable.calls, pageTable.uploads, pageTable.copyOperations,
+                    pageTable.copyBytes, pageTable.hostWaits, pageTable.streamWaits);
+            };
+            logKVMemoryOps("prefill", semanticCoordinator.prefillKVMemoryStats(),
+                semanticCoordinator.prefillPageTableUploadStats());
+            logKVMemoryOps(
+                "decode", semanticCoordinator.decodeKVMemoryStats(), semanticCoordinator.decodePageTableUploadStats());
             LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
                 emitPhaseMetrics ? "yes" : "no");
             LOG_INFO("Phase IPC response path: %s", nativeEventCallbacks ? "native_callback" : "polling_queue");
@@ -1681,6 +1748,11 @@ int main(int argc, char** argv)
                     visionMetrics.downstreamEncodedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
                     visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
                     visionMetrics.maxEncoderGpuMs);
+                rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();
+                LOG_INFO(
+                    "Phase vision memory ops: slab_allocations=%zu slab_reuses=%zu d2d_operations=%zu d2d_bytes=%zu",
+                    memoryStats.batchStorageAllocations, memoryStats.batchStorageReuses,
+                    memoryStats.deviceCopyOperations, memoryStats.deviceCopyBytes);
             }
             {
                 std::lock_guard<std::mutex> lock(outputMutex);

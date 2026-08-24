@@ -331,4 +331,24 @@ CUcontext IndependentPhaseCoordinator::cudaContext() const noexcept
     return mWorker->cudaContext();
 }
 
+PhaseKVMemoryStats const& IndependentPhaseCoordinator::prefillKVMemoryStats() const noexcept
+{
+    return mPrefillKV.memoryStats();
+}
+
+PhaseKVMemoryStats const& IndependentPhaseCoordinator::decodeKVMemoryStats() const noexcept
+{
+    return mDecodeKV.memoryStats();
+}
+
+KVPageTableUploadStats const& IndependentPhaseCoordinator::prefillPageTableUploadStats() const noexcept
+{
+    return mPrefillKV.pageTableUploadStats();
+}
+
+KVPageTableUploadStats const& IndependentPhaseCoordinator::decodePageTableUploadStats() const noexcept
+{
+    return mDecodeKV.pageTableUploadStats();
+}
+
 } // namespace trt_edgellm::rt

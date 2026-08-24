@@ -28,6 +28,29 @@
 namespace trt_edgellm::rt
 {
 
+struct PhaseVisionBatchStorage
+{
+    Tensor outputEmbedding;
+    std::vector<Tensor> deepstackFeatures;
+    Tensor mropeCosSin;
+};
+
+namespace
+{
+void resizeTensor(Tensor& destination, Tensor const& source, std::string const& name)
+{
+    int64_t const requiredBytes
+        = source.getShape().volume() * static_cast<int64_t>(utils::getTypeSize(source.getDataType()));
+    if (destination.isEmpty() || destination.getDataType() != source.getDataType()
+        || destination.getMemoryCapacity() < requiredBytes)
+    {
+        destination = Tensor(source.getShape(), DeviceType::kGPU, source.getDataType(), name);
+        return;
+    }
+    ELLM_CHECK(destination.reshape(source.getShape()), "Failed to reshape retained vision tensor");
+}
+} // namespace
+
 PhaseVisionPayload::~PhaseVisionPayload() noexcept
 {
     if (startEvent != nullptr)
@@ -79,8 +102,7 @@ PhaseVisionAdapter::PhaseVisionAdapter(
     ELLM_CHECK(mCudaContext != nullptr, "Phase vision stream has no CUDA context");
 }
 
-Tensor PhaseVisionAdapter::copyTensorRows(
-    Tensor const& source, int64_t rowOffset, int64_t rowCount, std::string const& name, cudaStream_t stream)
+Tensor PhaseVisionAdapter::viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name)
 {
     ELLM_CHECK(!source.isEmpty() && source.getDeviceType() == DeviceType::kGPU,
         "Phase vision output must be a non-empty GPU tensor");
@@ -97,12 +119,54 @@ Tensor PhaseVisionAdapter::copyTensorRows(
     int64_t const elementsPerRow = sourceShape.volume() / sourceShape[0];
     size_t const elementBytes = utils::getTypeSize(source.getDataType());
     size_t const offsetBytes = static_cast<size_t>(rowOffset * elementsPerRow) * elementBytes;
-    size_t const copyBytes = static_cast<size_t>(rowCount * elementsPerRow) * elementBytes;
-    Tensor result(Coords(resultShape), DeviceType::kGPU, source.getDataType(), name);
-    auto const* sourceBytes = static_cast<std::byte const*>(source.rawPointer());
-    CUDA_CHECK(
-        cudaMemcpyAsync(result.rawPointer(), sourceBytes + offsetBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
-    return result;
+    auto* sourceBytes = static_cast<std::byte*>(source.rawPointer());
+    return Tensor(sourceBytes + offsetBytes, Coords(resultShape), DeviceType::kGPU, source.getDataType(), name);
+}
+
+std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::retainBatchOutputs(
+    Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures)
+{
+    std::shared_ptr<PhaseVisionBatchStorage> storage;
+    for (auto const& candidate : mStoragePool)
+    {
+        if (candidate.use_count() == 1)
+        {
+            storage = candidate;
+            ++mMemoryStats.batchStorageReuses;
+            break;
+        }
+    }
+    if (storage == nullptr)
+    {
+        storage = std::make_shared<PhaseVisionBatchStorage>();
+        mStoragePool.push_back(storage);
+        ++mMemoryStats.batchStorageAllocations;
+    }
+
+    auto retain = [&](Tensor const& source, Tensor& destination, std::string const& name) {
+        resizeTensor(destination, source, name);
+        size_t const copyBytes
+            = static_cast<size_t>(source.getShape().volume()) * utils::getTypeSize(source.getDataType());
+        CUDA_CHECK(cudaMemcpyAsync(
+            destination.rawPointer(), source.rawPointer(), copyBytes, cudaMemcpyDeviceToDevice, mStream));
+        ++mMemoryStats.deviceCopyOperations;
+        mMemoryStats.deviceCopyBytes += copyBytes;
+    };
+    retain(outputEmbedding, storage->outputEmbedding, "phase_vision_batch_output");
+    storage->deepstackFeatures.resize(deepstackFeatures.size());
+    for (size_t index{}; index < deepstackFeatures.size(); ++index)
+    {
+        retain(deepstackFeatures[index], storage->deepstackFeatures[index], "phase_vision_batch_deepstack");
+    }
+    if (!mBatchedMrope.isEmpty())
+    {
+        retain(mBatchedMrope, storage->mropeCosSin, "phase_vision_batch_mrope");
+    }
+    else
+    {
+        storage->mropeCosSin = Tensor{};
+    }
+    return storage;
 }
 
 bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& request)
@@ -162,8 +226,18 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             int64_t const activeBatchSize = static_cast<int64_t>(submissions.size());
             ELLM_CHECK(activeBatchSize <= mConfig.maxSupportedBatchSize,
                 "Phase vision M-RoPE batch is outside the engine profile");
-            mBatchedMrope = Tensor({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, DeviceType::kGPU,
-                nvinfer1::DataType::kFLOAT, "phase_vision_batched_mrope");
+            Coords const requiredShape{activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim};
+            int64_t const requiredBytes
+                = requiredShape.volume() * static_cast<int64_t>(utils::getTypeSize(nvinfer1::DataType::kFLOAT));
+            if (mBatchedMrope.isEmpty() || mBatchedMrope.getMemoryCapacity() < requiredBytes)
+            {
+                mBatchedMrope
+                    = Tensor(requiredShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_vision_batched_mrope");
+            }
+            else
+            {
+                ELLM_CHECK(mBatchedMrope.reshape(requiredShape), "Failed to reshape batched vision M-RoPE storage");
+            }
         }
         OptionalOutputTensor mrope
             = mBatchedMrope.isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(mBatchedMrope)};
@@ -185,6 +259,7 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             ELLM_CHECK(feature.getShape().getNumDims() > 0 && feature.getShape()[0] == totalEmbeddingRows,
                 "Phase vision deepstack rows do not match expanded image-token rows");
         }
+        std::shared_ptr<PhaseVisionBatchStorage> const storage = retainBatchOutputs(outputEmbedding, deepstackFeatures);
 
         int64_t embeddingOffset{};
         for (size_t index = 0; index < submissions.size(); ++index)
@@ -192,18 +267,19 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             int64_t const rowCount = embeddingRows[index];
             ELLM_CHECK(rowCount > 0, "Phase vision logical request produced no image embedding rows");
             PhaseVisionPayload& payload = *payloads[index];
+            payload.storageOwner = storage;
             payload.tokenIds.push_back(std::move(batchedTokenIds[index]));
             payload.outputEmbedding
-                = copyTensorRows(outputEmbedding, embeddingOffset, rowCount, "phase_vision_output", mStream);
-            for (Tensor const& feature : deepstackFeatures)
+                = viewTensorRows(storage->outputEmbedding, embeddingOffset, rowCount, "phase_vision_output");
+            for (Tensor& feature : storage->deepstackFeatures)
             {
                 payload.deepstackFeatures.push_back(
-                    copyTensorRows(feature, embeddingOffset, rowCount, "phase_vision_deepstack", mStream));
+                    viewTensorRows(feature, embeddingOffset, rowCount, "phase_vision_deepstack"));
             }
-            if (!mBatchedMrope.isEmpty())
+            if (!storage->mropeCosSin.isEmpty())
             {
                 payload.mropeCosSin
-                    = copyTensorRows(mBatchedMrope, static_cast<int64_t>(index), 1, "phase_vision_mrope", mStream);
+                    = viewTensorRows(storage->mropeCosSin, static_cast<int64_t>(index), 1, "phase_vision_mrope");
             }
             embeddingOffset += rowCount;
             CUDA_CHECK(cudaEventRecord(payload.readyEvent, mStream));
@@ -273,13 +349,17 @@ CUcontext PhaseVisionAdapter::cudaContext() const noexcept
     return mCudaContext;
 }
 
+PhaseVisionMemoryStats const& PhaseVisionAdapter::memoryStats() const noexcept
+{
+    return mMemoryStats;
+}
+
 void PhaseVisionAdapter::releaseBatchStorageIfIdle()
 {
     if (!mRequests.empty())
     {
         return;
     }
-    mBatchedMrope = Tensor{};
     mBatchedRequest.reset();
 }
 

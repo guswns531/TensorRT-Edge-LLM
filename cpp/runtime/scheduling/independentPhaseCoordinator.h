@@ -98,6 +98,10 @@ public:
     //! Enable external metric retention; scheduler telemetry remains active either way.
     void setMetricsCollectionEnabled(bool enabled) noexcept;
     CUcontext cudaContext() const noexcept;
+    PhaseKVMemoryStats const& prefillKVMemoryStats() const noexcept;
+    PhaseKVMemoryStats const& decodeKVMemoryStats() const noexcept;
+    KVPageTableUploadStats const& prefillPageTableUploadStats() const noexcept;
+    KVPageTableUploadStats const& decodePageTableUploadStats() const noexcept;
 
 private:
     PhaseDispatchWorkerCallbacks makeWorkerCallbacks();

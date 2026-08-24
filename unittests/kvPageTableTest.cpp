@@ -340,3 +340,27 @@ TEST(KVPageTableTest, BackToBackUploadPreservesStagingLifetime)
     EXPECT_EQ(device[2], 7);
     EXPECT_EQ(device[static_cast<size_t>(maxPagesPerSeq)], 5 + numPages);
 }
+
+TEST(KVPageTableTest, UploadRingPreservesMoreThanOneFullRotation)
+{
+    constexpr int32_t maxBatch = 1;
+    constexpr int32_t maxPagesPerSeq = 3;
+    constexpr int32_t numPages = 16;
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
+
+    constexpr int32_t updateCount = 2 * static_cast<int32_t>(KVPageTable::kUPLOAD_STAGING_SLOTS) + 1;
+    for (int32_t update{}; update < updateCount; ++update)
+    {
+        std::vector<int32_t> const row{update, update + 1, update + 2};
+        table.setRow(0, row.data(), static_cast<int32_t>(row.size()));
+        ASSERT_TRUE(table.upload(/*stream=*/nullptr));
+    }
+
+    std::vector<int32_t> const device = copyDeviceTable(table, maxBatch, maxPagesPerSeq);
+    int32_t const finalValue = updateCount - 1;
+    EXPECT_EQ(device[0], finalValue);
+    EXPECT_EQ(device[1], finalValue + 1);
+    EXPECT_EQ(device[2], finalValue + 2);
+    EXPECT_EQ(device[static_cast<size_t>(maxPagesPerSeq)], finalValue + numPages);
+    EXPECT_EQ(table.uploadStats().streamWaits, 0U);
+}

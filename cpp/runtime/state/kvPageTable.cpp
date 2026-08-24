@@ -53,20 +53,27 @@ KVPageTable::KVPageTable(int32_t maxBatch, int32_t maxPagesPerSeq, int32_t numPa
     mDirtyRows.resize(static_cast<size_t>(maxBatch), 1U);
     mDevice = rt::Tensor(
         Coords{maxBatch, 2, maxPagesPerSeq}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "KVPageTable::kernelView");
-    mUploadStaging = rt::Tensor(Coords{maxBatch, 2, maxPagesPerSeq}, DeviceType::kCPU, nvinfer1::DataType::kINT32,
-        "KVPageTable::uploadStaging");
-    CUDA_CHECK(cudaEventCreateWithFlags(&mUploadComplete, cudaEventDisableTiming));
+    for (size_t slot{}; slot < kUPLOAD_STAGING_SLOTS; ++slot)
+    {
+        mUploadStaging[slot] = rt::Tensor(Coords{maxBatch, 2, maxPagesPerSeq}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "KVPageTable::uploadStaging");
+        CUDA_CHECK(cudaEventCreateWithFlags(&mUploadComplete[slot], cudaEventDisableTiming));
+    }
 }
 
 KVPageTable::~KVPageTable() noexcept
 {
-    if (mUploadComplete != nullptr)
+    for (size_t slot{}; slot < kUPLOAD_STAGING_SLOTS; ++slot)
     {
-        if (mUploadPending)
+        if (mUploadComplete[slot] == nullptr)
         {
-            static_cast<void>(cudaEventSynchronize(mUploadComplete));
+            continue;
         }
-        static_cast<void>(cudaEventDestroy(mUploadComplete));
+        if (mUploadPending[slot])
+        {
+            static_cast<void>(cudaEventSynchronize(mUploadComplete[slot]));
+        }
+        static_cast<void>(cudaEventDestroy(mUploadComplete[slot]));
     }
 }
 
@@ -242,6 +249,7 @@ bool KVPageTable::checkInvariants(std::string& error) const
 
 bool KVPageTable::upload(cudaStream_t stream)
 {
+    ++mUploadStats.calls;
     if (std::none_of(mDirtyRows.begin(), mDirtyRows.end(), [](uint8_t dirty) { return dirty != 0U; }))
     {
         return false;
@@ -250,14 +258,39 @@ bool KVPageTable::upload(cudaStream_t stream)
     std::string error;
     ELLM_CHECK(checkInvariants(error), "KVPageTable::upload: " + error);
 
-    if (mUploadPending)
+    size_t uploadSlot = kUPLOAD_STAGING_SLOTS;
+    for (size_t offset{}; offset < kUPLOAD_STAGING_SLOTS; ++offset)
     {
-        CUDA_CHECK(cudaEventSynchronize(mUploadComplete));
-        mUploadPending = false;
+        size_t const candidate = (mNextUploadSlot + offset) % kUPLOAD_STAGING_SLOTS;
+        if (!mUploadPending[candidate])
+        {
+            uploadSlot = candidate;
+            break;
+        }
+        cudaError_t const status = cudaEventQuery(mUploadComplete[candidate]);
+        if (status == cudaSuccess)
+        {
+            mUploadPending[candidate] = false;
+            uploadSlot = candidate;
+            break;
+        }
+        ELLM_CHECK(status == cudaErrorNotReady, "KVPageTable staging event query failed");
+    }
+    if (uploadSlot == kUPLOAD_STAGING_SLOTS)
+    {
+        uploadSlot = mNextUploadSlot;
+        CUDA_CHECK(cudaEventSynchronize(mUploadComplete[uploadSlot]));
+        mUploadPending[uploadSlot] = false;
+        ++mUploadStats.hostWaits;
+    }
+    if (mLastUploadSlot < kUPLOAD_STAGING_SLOTS && mUploadPending[mLastUploadSlot] && mLastUploadStream != stream)
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, mUploadComplete[mLastUploadSlot]));
+        ++mUploadStats.streamWaits;
     }
 
     size_t const rowElements = static_cast<size_t>(2 * mMaxPagesPerSeq);
-    int32_t* const staging = mUploadStaging.dataPointer<int32_t>();
+    int32_t* const staging = mUploadStaging[uploadSlot].dataPointer<int32_t>();
     int32_t* const device = mDevice.dataPointer<int32_t>();
     int32_t rangeBegin = 0;
     while (rangeBegin < mMaxBatch)
@@ -282,11 +315,17 @@ bool KVPageTable::upload(cudaStream_t stream)
         std::copy_n(mHost.data() + elementOffset, elementCount, staging + elementOffset);
         CUDA_CHECK(cudaMemcpyAsync(device + elementOffset, staging + elementOffset, elementCount * sizeof(int32_t),
             cudaMemcpyHostToDevice, stream));
+        ++mUploadStats.copyOperations;
+        mUploadStats.copyBytes += elementCount * sizeof(int32_t);
         rangeBegin = rangeEnd;
     }
 
-    CUDA_CHECK(cudaEventRecord(mUploadComplete, stream));
-    mUploadPending = true;
+    CUDA_CHECK(cudaEventRecord(mUploadComplete[uploadSlot], stream));
+    mUploadPending[uploadSlot] = true;
+    mLastUploadSlot = uploadSlot;
+    mLastUploadStream = stream;
+    mNextUploadSlot = (uploadSlot + 1U) % kUPLOAD_STAGING_SLOTS;
+    ++mUploadStats.uploads;
     std::fill(mDirtyRows.begin(), mDirtyRows.end(), 0U);
     return true;
 }

@@ -32,6 +32,20 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Phase-local metadata memory operations submitted around TensorRT execution.
+struct PhaseKVMemoryStats
+{
+    size_t prepareCalls{};
+    size_t lengthH2DOperations{};
+    size_t lengthH2DBytes{};
+    size_t prefillMetadataH2DOperations{};
+    size_t prefillMetadataH2DBytes{};
+    size_t decodeMetadataH2DOperations{};
+    size_t decodeMetadataH2DBytes{};
+    size_t decodeMemsetOperations{};
+    size_t decodeMemsetBytes{};
+};
+
 //! Phase-local active-row view over shared stable paged-KV ownership.
 //!
 //! Prefill and decode create separate instances so their TensorRT contexts never
@@ -67,6 +81,8 @@ public:
     Tensor& activeLengths() noexcept;
     std::vector<int32_t> const& activeStableSlots() const noexcept;
     bool prepared() const noexcept;
+    PhaseKVMemoryStats const& memoryStats() const noexcept;
+    KVPageTableUploadStats const& pageTableUploadStats() const noexcept;
 
 private:
     void restoreBindings() noexcept;
@@ -81,6 +97,7 @@ private:
     Tensor* mPreviousLengths{};
     Tensor* mPreviousPageTable{};
     bool mPrepared{};
+    mutable PhaseKVMemoryStats mMemoryStats;
 };
 
 } // namespace rt

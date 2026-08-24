@@ -25,6 +25,17 @@
 
 using namespace trt_edgellm;
 
+TEST(PhaseDispatchWorkerTest, PreservesSelectedDecodeRowsWithoutChangingRequestSet)
+{
+    std::vector<rt::PhaseWorkItem> batch{{13, 1}, {11, 1}, {14, 1}};
+    rt::preservePhaseBatchRowAffinity(batch, {10, 11, 12, 13});
+
+    ASSERT_EQ(batch.size(), 3U);
+    EXPECT_EQ(batch[0].requestId, 13U);
+    EXPECT_EQ(batch[1].requestId, 11U);
+    EXPECT_EQ(batch[2].requestId, 14U);
+}
+
 TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
 {
     rt::PhaseQueueSchedulerConfig config;

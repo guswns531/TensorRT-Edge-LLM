@@ -47,6 +47,7 @@ PhaseKVActiveView::~PhaseKVActiveView() noexcept
 
 void PhaseKVActiveView::prepare(std::vector<int32_t> const& activeStableSlots, cudaStream_t stream)
 {
+    ++mMemoryStats.prepareCalls;
     ELLM_CHECK(!mPrepared, "Phase KV active view is already prepared");
     ELLM_CHECK(!activeStableSlots.empty(), "Phase KV active view cannot prepare an empty batch");
     ELLM_CHECK(static_cast<int32_t>(activeStableSlots.size()) <= mMaxActiveRows,
@@ -64,6 +65,8 @@ void PhaseKVActiveView::prepare(std::vector<int32_t> const& activeStableSlots, c
     std::copy(lengths.begin(), lengths.end(), mHostLengths.dataPointer<int32_t>());
     CUDA_CHECK(cudaMemcpyAsync(mDeviceLengths.rawPointer(), mHostLengths.rawPointer(), lengths.size() * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
+    ++mMemoryStats.lengthH2DOperations;
+    mMemoryStats.lengthH2DBytes += lengths.size() * sizeof(int32_t);
 
     mTensorMap.set(binding_names::kKVCacheStartIndex, mDeviceLengths);
     mTensorMap.set(binding_names::kKVPageTable, mPageTable.kernelView());
@@ -122,6 +125,8 @@ void PhaseKVActiveView::preparePrefillMetadata(
         static_cast<size_t>(batchSize) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), io.hostContextLengths.rawPointer(),
         static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    mMemoryStats.prefillMetadataH2DOperations += 2U;
+    mMemoryStats.prefillMetadataH2DBytes += static_cast<size_t>(batchSize) * (sizeof(int64_t) + sizeof(int32_t));
 }
 
 void PhaseKVActiveView::prepareDecodeMetadata(PipelineIO& io, cudaStream_t stream) const
@@ -134,6 +139,8 @@ void PhaseKVActiveView::prepareDecodeMetadata(PipelineIO& io, cudaStream_t strea
 
     CUDA_CHECK(cudaMemsetAsync(
         io.selectTokenIndices.rawPointer(), 0, static_cast<size_t>(batchSize) * sizeof(int64_t), stream));
+    ++mMemoryStats.decodeMemsetOperations;
+    mMemoryStats.decodeMemsetBytes += static_cast<size_t>(batchSize) * sizeof(int64_t);
     int32_t* contextLengths = io.hostContextLengths.dataPointer<int32_t>();
     for (int32_t row = 0; row < batchSize; ++row)
     {
@@ -142,6 +149,8 @@ void PhaseKVActiveView::prepareDecodeMetadata(PipelineIO& io, cudaStream_t strea
     }
     CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), io.hostContextLengths.rawPointer(),
         static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    ++mMemoryStats.decodeMetadataH2DOperations;
+    mMemoryStats.decodeMetadataH2DBytes += static_cast<size_t>(batchSize) * sizeof(int32_t);
 }
 
 KVPageTable& PhaseKVActiveView::pageTable() noexcept
@@ -162,6 +171,16 @@ std::vector<int32_t> const& PhaseKVActiveView::activeStableSlots() const noexcep
 bool PhaseKVActiveView::prepared() const noexcept
 {
     return mPrepared;
+}
+
+PhaseKVMemoryStats const& PhaseKVActiveView::memoryStats() const noexcept
+{
+    return mMemoryStats;
+}
+
+KVPageTableUploadStats const& PhaseKVActiveView::pageTableUploadStats() const noexcept
+{
+    return mPageTable.uploadStats();
 }
 
 void PhaseKVActiveView::restoreBindings() noexcept

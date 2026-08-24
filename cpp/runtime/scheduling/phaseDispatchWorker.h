@@ -32,6 +32,11 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Reorder one selected phase batch to retain prior request-to-row placement where possible.
+//! The selected request set is unchanged; unassigned rows preserve their current relative order.
+void preservePhaseBatchRowAffinity(
+    std::vector<PhaseWorkItem>& batch, std::vector<uint64_t> const& previousRowRequestIds);
+
 struct PhasePrefillCompletion
 {
     int32_t resultingKVLength{};
@@ -163,6 +168,7 @@ private:
     bool mHasDecode{};
     bool mDecodeDeferred{};
     size_t mDispatchCount{};
+    std::vector<uint64_t> mPreviousDecodeRowRequestIds;
 };
 
 } // namespace rt

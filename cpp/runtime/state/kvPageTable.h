@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -37,6 +38,17 @@ struct KVPageTableRowUpdate
     int32_t count{};
 };
 
+//! Host/device transfer counters for page-table materialization.
+struct KVPageTableUploadStats
+{
+    size_t calls{};
+    size_t uploads{};
+    size_t copyOperations{};
+    size_t copyBytes{};
+    size_t hostWaits{};
+    size_t streamWaits{};
+};
+
 //! One logical KV page table per model (shared by the K and V halves; V page id
 //! == K page id + numPages) plus its
 //! derived K/V kernel view.
@@ -49,6 +61,8 @@ struct KVPageTableRowUpdate
 class KVPageTable
 {
 public:
+    static constexpr size_t kUPLOAD_STAGING_SLOTS = 3U;
+
     //! @brief Construct a page table for up to `maxBatch` slots of `maxPagesPerSeq`
     //!        logical pages each, backed by a pool of `numPages` physical pages.
     //! @throws std::runtime_error if any argument is not positive
@@ -86,9 +100,16 @@ public:
     //! @brief Validate the table and enqueue copies for coalesced dirty-row ranges.
     //!        The first call uploads the complete table. A later call with no dirty
     //!        rows performs no CUDA operation and does not wait for a prior upload.
+    //!        Pinned staging storage is rotated so normal back-to-back dispatches do
+    //!        not block the host while an earlier H2D copy is still in flight.
     //! @return true if at least one device copy was enqueued; false for a no-op
     //! @throws std::runtime_error if `checkInvariants` fails or the copy fails
     bool upload(cudaStream_t stream);
+
+    KVPageTableUploadStats const& uploadStats() const noexcept
+    {
+        return mUploadStats;
+    }
 
     //! @brief The device tensor consumed by the paged kernels: int32 `[maxBatch, 2, maxPagesPerSeq]`.
     rt::Tensor const& kernelView() const;
@@ -133,10 +154,14 @@ private:
     std::vector<int32_t> mHostScratch; //!< Preallocated row-compaction scratch.
     std::vector<uint8_t> mDirtyRows;   //!< One bit-like byte per logical slot.
     rt::Tensor mDevice;
-    //! Immutable pinned snapshot used by an in-flight H2D upload. Reuse waits for mUploadComplete.
-    rt::Tensor mUploadStaging;
-    cudaEvent_t mUploadComplete{};
-    bool mUploadPending{false};
+    //! Immutable pinned snapshots used by in-flight H2D uploads.
+    std::array<rt::Tensor, kUPLOAD_STAGING_SLOTS> mUploadStaging;
+    std::array<cudaEvent_t, kUPLOAD_STAGING_SLOTS> mUploadComplete{};
+    std::array<bool, kUPLOAD_STAGING_SLOTS> mUploadPending{};
+    size_t mNextUploadSlot{};
+    size_t mLastUploadSlot{kUPLOAD_STAGING_SLOTS};
+    cudaStream_t mLastUploadStream{};
+    KVPageTableUploadStats mUploadStats;
 };
 
 } // namespace rt

@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 
 namespace trt_edgellm
@@ -57,6 +58,51 @@ void validatePrimaryCudaContext(CUcontext context)
 }
 
 } // namespace
+
+void preservePhaseBatchRowAffinity(
+    std::vector<PhaseWorkItem>& batch, std::vector<uint64_t> const& previousRowRequestIds)
+{
+    if (batch.empty() || previousRowRequestIds.empty())
+    {
+        return;
+    }
+    std::unordered_map<uint64_t, size_t> selectedRows;
+    selectedRows.reserve(batch.size());
+    for (size_t index{}; index < batch.size(); ++index)
+    {
+        selectedRows.emplace(batch[index].requestId, index);
+    }
+    std::vector<PhaseWorkItem> ordered(batch.size());
+    std::vector<uint8_t> assigned(batch.size());
+    std::vector<uint8_t> consumed(batch.size());
+    size_t const retainedRows = std::min(batch.size(), previousRowRequestIds.size());
+    for (size_t row{}; row < retainedRows; ++row)
+    {
+        auto const selected = selectedRows.find(previousRowRequestIds[row]);
+        if (selected == selectedRows.end())
+        {
+            continue;
+        }
+        ordered[row] = batch[selected->second];
+        assigned[row] = 1U;
+        consumed[selected->second] = 1U;
+    }
+    size_t source{};
+    for (size_t row{}; row < ordered.size(); ++row)
+    {
+        if (assigned[row] != 0U)
+        {
+            continue;
+        }
+        while (consumed[source] != 0U)
+        {
+            ++source;
+        }
+        ordered[row] = batch[source];
+        consumed[source] = 1U;
+    }
+    batch = std::move(ordered);
+}
 
 PhaseExecutionSafetyContract PhaseExecutionSafetyContract::shared(void const* tensorRTExecutionContext) noexcept
 {
@@ -147,6 +193,16 @@ bool PhaseDispatchWorker::dispatchNext()
 
     mHasPrefill = !mInFlight.prefillBatch.empty();
     mHasDecode = !mInFlight.decodeBatch.empty();
+    if (mHasDecode)
+    {
+        preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
+        mPreviousDecodeRowRequestIds.clear();
+        mPreviousDecodeRowRequestIds.reserve(mInFlight.decodeBatch.size());
+        for (PhaseWorkItem const& item : mInFlight.decodeBatch)
+        {
+            mPreviousDecodeRowRequestIds.push_back(item.requestId);
+        }
+    }
     mCurrentMetrics = PhaseDispatchMetrics{};
     mCurrentMetrics.dispatchIndex = mDispatchCount + 1;
     mCurrentMetrics.kind = mInFlight.kind;
