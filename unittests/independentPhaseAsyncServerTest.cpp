@@ -65,6 +65,23 @@ TEST(IndependentPhaseAsyncServerTest, StepwiseAdmissionUsesTpotHysteresisForGrow
     EXPECT_EQ(nextStepwiseAdmissionLimit(32, 16, 64, 16, 8, 32, 1, 128, 8, 0.0F, 3.3F, 3.0F), 48);
 }
 
+TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionSelectsHighestLimitWithinTpotBudget)
+{
+    std::vector<IndependentPhaseAdmissionCost> const costs{{16, 23403.0}, {32, 28984.0}, {48, 33871.0}, {64, 36324.0}};
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 16, 64, 40000.0), 64);
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 16, 64, 34000.0), 48);
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 16, 64, 30000.0), 32);
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 16, 64, 20000.0), 16);
+}
+
+TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionDisablesWithoutCostsOrBudget)
+{
+    std::vector<IndependentPhaseAdmissionCost> const costs{{16, 23403.0}, {32, 28984.0}};
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget({}, 16, 64, 30000.0), 64);
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 16, 64, 0.0), 64);
+    EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 24, 64, 25000.0), 24);
+}
+
 TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuckets)
 {
     EXPECT_EQ(phaseServingWarmupBatchSizes(64), (std::vector<int32_t>{8, 16, 32, 48, 64}));

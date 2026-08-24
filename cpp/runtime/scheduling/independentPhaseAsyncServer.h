@@ -48,6 +48,16 @@ bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingReques
 size_t nextStepwiseAdmissionLimit(size_t currentLimit, size_t latencyLimit, size_t throughputLimit, size_t step,
     size_t pendingRequests, size_t activeRequests, size_t backlogEnterThreshold, int32_t availablePages,
     int32_t minFreePages, float decodeTpotPressure, float pressureEnterRatio, float pressureExitRatio) noexcept;
+
+struct IndependentPhaseAdmissionCost
+{
+    size_t inFlightLimit{};
+    double tpotP95Us{};
+};
+
+//! Highest profiled admission limit that fits the effective TPOT budget.
+size_t phaseAdmissionLimitForTpotBudget(std::vector<IndependentPhaseAdmissionCost> const& costs, size_t latencyLimit,
+    size_t throughputLimit, double tpotBudgetUs) noexcept;
 //! Representative decode buckets to prime before opening a persistent serving endpoint.
 std::vector<int32_t> phaseServingWarmupBatchSizes(
     int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes = {});
@@ -155,6 +165,10 @@ struct IndependentPhaseServerConfig
     float adaptiveAdmissionTpotPressureEnterRatio{};
     float adaptiveAdmissionTpotPressureExitRatio{};
     int32_t adaptiveAdmissionMinFreePages{};
+    //! Optional admission-level TPOT p95 costs. Empty costs disable predictive gating.
+    std::vector<IndependentPhaseAdmissionCost> adaptiveAdmissionCosts;
+    //! Fallback budget for requests without an explicit scheduling TPOT target.
+    double adaptiveAdmissionTpotBudgetUs{};
     //! Multimodal prefill remains atomic unless an engine contract explicitly proves chunk correctness.
     bool allowChunkedVisionPrefill{};
     //! Packed-prefill engines may batch multiple complete multimodal prompts without chunking them.
@@ -230,7 +244,7 @@ public:
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
     //! Include encoder and encoded-ready work that has not entered this server yet.
-    void setExternalPendingRequests(size_t pendingRequests) noexcept;
+    void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0) noexcept;
     //! Stable slots that can be admitted immediately under the current latency/throughput limit.
     size_t availableAdmissionSlots() const noexcept;
     //! Physical KV pages currently free in the shared stable page pool.
@@ -250,6 +264,9 @@ public:
     size_t adaptiveAdmissionLimit() const noexcept;
     size_t adaptiveAdmissionIncreaseCount() const noexcept;
     size_t adaptiveAdmissionDecreaseCount() const noexcept;
+    size_t adaptiveAdmissionCostLimit() const noexcept;
+    size_t adaptiveAdmissionCostBlockCount() const noexcept;
+    double adaptiveAdmissionTpotBudgetUs() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -294,6 +311,8 @@ private:
     void refreshPageGrowthOwners();
     bool shouldWaitForDecodeRefill() const noexcept;
     size_t admissionLimit() const noexcept;
+    double effectiveAdmissionTpotBudgetUs() const noexcept;
+    size_t costLimitedAdmissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
     bool flushEventCallbacks();
@@ -324,10 +343,12 @@ private:
     bool mThroughputMode{};
     size_t mThroughputModeTransitionCount{};
     size_t mExternalPendingRequests{};
+    double mExternalMinTpotTargetUs{};
     size_t mAdaptiveAdmissionLimit{};
     size_t mAdaptiveAdmissionIncreaseCount{};
     size_t mAdaptiveAdmissionDecreaseCount{};
-    size_t mLastAdmissionTransitionSample{};
+    size_t mAdaptiveAdmissionCostBlockCount{};
+    size_t mLastAdmissionDecisionSample{};
 };
 
 } // namespace trt_edgellm::rt

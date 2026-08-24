@@ -516,3 +516,43 @@ transitions. The five-request one/two-image exact gate retained all 160 tokens
 with hash `674ed0a3262f98fa9a3bf8043bd63037050a9eddd1d987c1b310abb0a00ea4cb`.
 The controller remains disabled by default until pre-admission TPOT cost
 prediction can bound saturated-burst tail latency.
+
+## Cost-predictive TPOT admission
+
+Stepwise admission can now consume a profiled mapping from in-flight limits to
+decode TPOT p95 costs. It selects the highest profiled limit within the minimum
+positive TPOT target among the fallback policy, active text requests, pending
+text requests, and vision requests that have not reached the LLM server. The
+three-phase coordinator maintains vision targets across encoder, ready-prefill,
+and server ownership and removes them on cancellation or completion.
+
+```text
+TRT_EDGELLM_ADMISSION_TPOT_COSTS=16:23403,32:28984,48:33871,64:36324
+TRT_EDGELLM_ADMISSION_TPOT_BUDGET_US=34000
+```
+
+The profiled ceiling initializes the controller before the first decode sample,
+so a short saturated burst does not remain trapped at the latency floor.
+Backlog growth is still stepwise and bounded by stable-slot/page headroom.
+Observed decode TPOT at or above the effective budget contracts the limit by
+one step. The legacy dimensionless queue/GPU-pressure hysteresis remains in use
+when no predictive profile is active.
+
+On the matched 64-request mixed Poisson profile, a 30 ms budget delivered
+1336.1 token/s, 2140.3 ms TTFT p95, 27.59 ms TPOT p95, and 2749.9 ms E2E p95.
+This improved all four metrics by 3.1%, 4.5%, 4.8%, and 4.9% respectively over
+static in-flight 32. A 34 ms budget delivered 1530.6 token/s, 1632.4 ms TTFT
+p95, 31.71 ms TPOT p95, and 2451.5 ms E2E p95. Relative to static 48 this was
+2.3% more throughput, 6.4% lower TPOT p95, and 4.1% lower E2E p95, with 3.0%
+higher TTFT p95.
+
+The five-request one/two-image semantic gate retained all 160 exact greedy
+tokens. The full GPU unit suite passed 973 tests, skipped 42 platform-specific
+tests, and failed none.
+
+The table is workload-profile-specific. Reusing the mixed profile on a
+vision-heavy trace produced 54.71 ms TPOT p95 against a 34 ms target; historical
+static-16 measurements were already near 60 ms. The next gate is therefore a
+profile key based on prefill pressure and vision share, explicit reporting when
+the minimum limit cannot satisfy the budget, and vision-prefill interference
+protection. Predictive admission remains opt-in.

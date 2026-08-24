@@ -26,6 +26,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -202,6 +203,7 @@ private:
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
+    void eraseTpotTarget(uint64_t requestId);
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
 
     PhaseVisionAdapter& mVision;
@@ -211,6 +213,8 @@ private:
     std::vector<PendingVisionRequest> mEncoding;
     std::deque<ReadyPrefillRequest> mReadyPrefill;
     std::unordered_set<uint64_t> mRequestIds;
+    std::unordered_map<uint64_t, double> mRequestTpotTargets;
+    std::multiset<double> mTpotTargets;
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
     size_t mEstimatedEncodedBytes{};

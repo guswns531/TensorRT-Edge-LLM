@@ -64,6 +64,23 @@ namespace
 constexpr int32_t kDEFAULT_STABLE_SLOTS = 80;
 constexpr size_t kDEFAULT_MAX_INFLIGHT_REQUESTS = 16U;
 
+std::vector<rt::IndependentPhaseAdmissionCost> parseAdmissionCosts(std::string const& value)
+{
+    std::vector<rt::IndependentPhaseAdmissionCost> result;
+    std::stringstream entries(value);
+    std::string entry;
+    while (std::getline(entries, entry, ','))
+    {
+        size_t const separator = entry.find(':');
+        ELLM_CHECK(separator != std::string::npos && separator > 0 && separator + 1U < entry.size(),
+            "Phase admission cost must use limit:tpot_us entries");
+        result.push_back(
+            {static_cast<size_t>(std::stoul(entry.substr(0, separator))), std::stod(entry.substr(separator + 1U))});
+    }
+    ELLM_CHECK(!result.empty(), "Phase admission cost table cannot be empty");
+    return result;
+}
+
 void loadSchedulerCostModel(std::filesystem::path const& path, rt::PhaseQueueSchedulerConfig& config)
 {
     std::ifstream stream(path);
@@ -1225,6 +1242,14 @@ int main(int argc, char** argv)
         {
             serverConfig.adaptiveAdmissionMinFreePages = std::stoi(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_TPOT_COSTS"))
+        {
+            serverConfig.adaptiveAdmissionCosts = parseAdmissionCosts(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_TPOT_BUDGET_US"))
+        {
+            serverConfig.adaptiveAdmissionTpotBudgetUs = std::stod(value);
+        }
         if (char const* reservation = std::getenv("TRT_EDGELLM_PAGE_RESERVATION");
             reservation != nullptr && std::string(reservation) == "headroom")
         {
@@ -1812,6 +1837,9 @@ int main(int argc, char** argv)
                         {"adaptive_admission_limit", semanticServer.adaptiveAdmissionLimit()},
                         {"adaptive_admission_increases", semanticServer.adaptiveAdmissionIncreaseCount()},
                         {"adaptive_admission_decreases", semanticServer.adaptiveAdmissionDecreaseCount()},
+                        {"adaptive_admission_cost_limit", semanticServer.adaptiveAdmissionCostLimit()},
+                        {"adaptive_admission_cost_blocks", semanticServer.adaptiveAdmissionCostBlockCount()},
+                        {"adaptive_admission_tpot_budget_us", semanticServer.adaptiveAdmissionTpotBudgetUs()},
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
                         {"page_growth_waits", semanticServer.pageGrowthWaitCount()},
                         {"page_growth_pending", semanticServer.pendingPageGrowthCount()},
@@ -1915,10 +1943,13 @@ int main(int argc, char** argv)
             inputReader.join();
             LOG_INFO(
                 "Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s "
-                "admission_limit=%zu admission_increases=%zu admission_decreases=%zu",
+                "admission_limit=%zu admission_increases=%zu admission_decreases=%zu cost_limit=%zu "
+                "cost_blocks=%zu tpot_budget_us=%.3f",
                 semanticServer.decodeRefillWaitCount(), semanticServer.throughputModeTransitionCount(),
                 semanticServer.throughputMode() ? "yes" : "no", semanticServer.adaptiveAdmissionLimit(),
-                semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount());
+                semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount(),
+                semanticServer.adaptiveAdmissionCostLimit(), semanticServer.adaptiveAdmissionCostBlockCount(),
+                semanticServer.adaptiveAdmissionTpotBudgetUs());
             LOG_INFO(
                 "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
             LOG_INFO(

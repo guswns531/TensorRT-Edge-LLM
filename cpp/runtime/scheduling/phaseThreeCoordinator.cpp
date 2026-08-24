@@ -226,6 +226,11 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
         return PhaseThreeSubmissionStatus::kDuplicateRequest;
     }
     scheduling = phaseVisionSchedulingHints(scheduling, mConfig.visionTtftTargetUs);
+    if (scheduling.tpotTargetUs > 0.0)
+    {
+        mRequestTpotTargets.emplace(requestId, scheduling.tpotTargetUs);
+        mTpotTargets.insert(scheduling.tpotTargetUs);
+    }
     mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling});
     bool const started = startNextEncoder();
     bool const encodingThisRequest = started
@@ -242,6 +247,7 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
     {
         mPending.erase(pending);
         mRequestIds.erase(requestId);
+        eraseTpotTarget(requestId);
         return true;
     }
     auto const encoding = std::find_if(mEncoding.begin(), mEncoding.end(),
@@ -260,12 +266,14 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         mReadyPrefill.erase(ready);
         mDownstreamRequestBytes.erase(requestId);
         mRequestIds.erase(requestId);
+        eraseTpotTarget(requestId);
         return true;
     }
     bool const cancelled = mServer.cancel(requestId);
     if (cancelled)
     {
         mRequestIds.erase(requestId);
+        eraseTpotTarget(requestId);
         auto const downstream = mDownstreamRequestBytes.find(requestId);
         if (downstream != mDownstreamRequestBytes.end())
         {
@@ -280,7 +288,8 @@ bool PhaseThreeCoordinator::poll()
     bool progressed = completeEncoder();
     progressed = startNextEncoder() || progressed;
     progressed = dispatchReadyPrefill() || progressed;
-    mServer.setExternalPendingRequests(mPending.size() + mEncoding.size() + mReadyPrefill.size());
+    double const minTpotTargetUs = mTpotTargets.empty() ? 0.0 : *mTpotTargets.begin();
+    mServer.setExternalPendingRequests(mPending.size() + mEncoding.size() + mReadyPrefill.size(), minTpotTargetUs);
     progressed = mServer.poll() || progressed;
     mVision.reclaimIdleStorage();
     return progressed;
@@ -348,6 +357,7 @@ std::optional<IndependentPhaseServerCompletion> PhaseThreeCoordinator::tryPopCom
     if (completion.has_value())
     {
         mRequestIds.erase(completion->requestId);
+        eraseTpotTarget(completion->requestId);
         auto const downstream = mDownstreamRequestBytes.find(completion->requestId);
         if (downstream != mDownstreamRequestBytes.end())
         {
@@ -421,6 +431,7 @@ bool PhaseThreeCoordinator::completeEncoder()
         if (mCancelRequested.erase(requestId) > 0)
         {
             mRequestIds.erase(requestId);
+            eraseTpotTarget(requestId);
             continue;
         }
         ELLM_CHECK(encoded->tokenIds.size() == 1U && !encoded->tokenIds.front().empty(),
@@ -576,6 +587,19 @@ size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept
     return phaseVisionEffectiveEncodedCapacity(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight,
         mServer.throughputMode(), oldestVisionAgeUs, visionTtftTargetUs, mConfig.lookaheadEscalationRatio,
         mServer.decodeTpotPressure(), mConfig.lookaheadDecodeTpotPressureLimit);
+}
+
+void PhaseThreeCoordinator::eraseTpotTarget(uint64_t requestId)
+{
+    auto const requestTarget = mRequestTpotTargets.find(requestId);
+    if (requestTarget == mRequestTpotTargets.end())
+    {
+        return;
+    }
+    auto const target = mTpotTargets.find(requestTarget->second);
+    ELLM_CHECK(target != mTpotTargets.end(), "Three-phase TPOT target index is inconsistent");
+    mTpotTargets.erase(target);
+    mRequestTpotTargets.erase(requestTarget);
 }
 
 size_t PhaseThreeCoordinator::mediaItemCount(PendingVisionRequest const& pending) noexcept

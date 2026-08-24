@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -77,6 +78,25 @@ size_t nextStepwiseAdmissionLimit(size_t currentLimit, size_t latencyLimit, size
         return lowerLimit;
     }
     return currentLimit;
+}
+
+size_t phaseAdmissionLimitForTpotBudget(std::vector<IndependentPhaseAdmissionCost> const& costs, size_t latencyLimit,
+    size_t throughputLimit, double tpotBudgetUs) noexcept
+{
+    if (costs.empty() || tpotBudgetUs <= 0.0)
+    {
+        return throughputLimit;
+    }
+    size_t result = latencyLimit;
+    for (IndependentPhaseAdmissionCost const& cost : costs)
+    {
+        if (cost.inFlightLimit >= latencyLimit && cost.inFlightLimit <= throughputLimit
+            && cost.tpotP95Us <= tpotBudgetUs)
+        {
+            result = std::max(result, cost.inFlightLimit);
+        }
+    }
+    return result;
 }
 
 std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes)
@@ -224,13 +244,30 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
                         && mConfig.adaptiveAdmissionTpotPressureExitRatio
                             <= mConfig.adaptiveAdmissionTpotPressureEnterRatio))),
         "Stepwise admission requires valid step, dwell, page, and TPOT thresholds");
+    ELLM_CHECK(std::isfinite(mConfig.adaptiveAdmissionTpotBudgetUs) && mConfig.adaptiveAdmissionTpotBudgetUs >= 0.0,
+        "Predictive admission TPOT budget must be finite and non-negative");
+    size_t previousAdmissionCostLimit{};
+    for (IndependentPhaseAdmissionCost const& cost : mConfig.adaptiveAdmissionCosts)
+    {
+        ELLM_CHECK(cost.inFlightLimit > previousAdmissionCostLimit && cost.inFlightLimit <= mConfig.maxInFlightRequests
+                && std::isfinite(cost.tpotP95Us) && cost.tpotP95Us > 0.0,
+            "Predictive admission costs must have increasing valid limits and positive finite TPOT values");
+        previousAdmissionCostLimit = cost.inFlightLimit;
+    }
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
     mCoordinator.setGraphCaptureEnabled(mConfig.enableCudaGraphs);
-    mCoordinator.scheduler().setOnlineDecodeCostLearningActive(!mConfig.enableAdaptiveAdmission);
     mCoordinator.setCallbacks(makeCallbacks());
     mAdaptiveAdmissionLimit
         = mConfig.enableAdaptiveAdmission ? mConfig.latencyInFlightRequests : mConfig.maxInFlightRequests;
+    if (mConfig.enableStepwiseAdaptiveAdmission && !mConfig.adaptiveAdmissionCosts.empty()
+        && mConfig.adaptiveAdmissionTpotBudgetUs > 0.0)
+    {
+        mAdaptiveAdmissionLimit = phaseAdmissionLimitForTpotBudget(mConfig.adaptiveAdmissionCosts,
+            mConfig.latencyInFlightRequests, mConfig.maxInFlightRequests, mConfig.adaptiveAdmissionTpotBudgetUs);
+        mThroughputMode = mAdaptiveAdmissionLimit > mConfig.latencyInFlightRequests;
+    }
+    mCoordinator.scheduler().setOnlineDecodeCostLearningActive(!mConfig.enableAdaptiveAdmission || mThroughputMode);
 }
 
 IndependentPhaseAsyncServer::~IndependentPhaseAsyncServer() noexcept
@@ -472,6 +509,33 @@ size_t IndependentPhaseAsyncServer::admissionLimit() const noexcept
                                                                : mConfig.latencyInFlightRequests;
 }
 
+double IndependentPhaseAsyncServer::effectiveAdmissionTpotBudgetUs() const noexcept
+{
+    double result = mConfig.adaptiveAdmissionTpotBudgetUs;
+    auto includeTarget = [&](double targetUs) {
+        if (targetUs > 0.0 && (result == 0.0 || targetUs < result))
+        {
+            result = targetUs;
+        }
+    };
+    includeTarget(mExternalMinTpotTargetUs);
+    for (auto const& request : mRequests)
+    {
+        includeTarget(request.second.scheduling.tpotTargetUs);
+    }
+    for (PendingRequest const& request : mPendingRequests)
+    {
+        includeTarget(request.scheduling.tpotTargetUs);
+    }
+    return result;
+}
+
+size_t IndependentPhaseAsyncServer::costLimitedAdmissionLimit() const noexcept
+{
+    return phaseAdmissionLimitForTpotBudget(mConfig.adaptiveAdmissionCosts, mConfig.latencyInFlightRequests,
+        mConfig.maxInFlightRequests, effectiveAdmissionTpotBudgetUs());
+}
+
 void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
 {
     if (!mConfig.enableAdaptiveAdmission)
@@ -481,15 +545,40 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
     if (mConfig.enableStepwiseAdaptiveAdmission)
     {
         PhaseSchedulerTelemetry const& telemetry = mCoordinator.scheduler().telemetry();
-        if (telemetry.sampleCount < mLastAdmissionTransitionSample
-            || telemetry.sampleCount - mLastAdmissionTransitionSample >= mConfig.adaptiveAdmissionDwellSamples)
+        size_t const costLimit = costLimitedAdmissionLimit();
+        double const effectiveTpotBudgetUs = effectiveAdmissionTpotBudgetUs();
+        bool const predictiveAdmission = !mConfig.adaptiveAdmissionCosts.empty() && effectiveTpotBudgetUs > 0.0;
+        bool const predictiveFastStart
+            = predictiveAdmission && mAdaptiveAdmissionLimit < costLimit && telemetry.decodeTpotSampleCount == 0;
+        if (predictiveFastStart || telemetry.sampleCount < mLastAdmissionDecisionSample
+            || telemetry.sampleCount - mLastAdmissionDecisionSample >= mConfig.adaptiveAdmissionDwellSamples)
         {
             size_t const pendingRequests = mPendingRequests.size() + mExternalPendingRequests;
-            size_t const next = nextStepwiseAdmissionLimit(mAdaptiveAdmissionLimit, mConfig.latencyInFlightRequests,
-                mConfig.maxInFlightRequests, mConfig.adaptiveAdmissionStep, pendingRequests, mRequests.size(),
-                mConfig.adaptiveBacklogEnterRequests, mOwnership.availablePages(),
-                mConfig.adaptiveAdmissionMinFreePages, telemetry.recentDecodeTpotPressure,
-                mConfig.adaptiveAdmissionTpotPressureEnterRatio, mConfig.adaptiveAdmissionTpotPressureExitRatio);
+            size_t next{};
+            bool const observedTpotBudgetPressure = predictiveAdmission && telemetry.recentDecodeTpotP95Us > 0.0
+                && telemetry.recentDecodeTpotP95Us >= effectiveTpotBudgetUs;
+            if (mAdaptiveAdmissionLimit > costLimit || observedTpotBudgetPressure)
+            {
+                next = mAdaptiveAdmissionLimit - mConfig.latencyInFlightRequests > mConfig.adaptiveAdmissionStep
+                    ? mAdaptiveAdmissionLimit - mConfig.adaptiveAdmissionStep
+                    : mConfig.latencyInFlightRequests;
+            }
+            else
+            {
+                next = nextStepwiseAdmissionLimit(mAdaptiveAdmissionLimit, mConfig.latencyInFlightRequests, costLimit,
+                    mConfig.adaptiveAdmissionStep, pendingRequests, mRequests.size(),
+                    mConfig.adaptiveBacklogEnterRequests, mOwnership.availablePages(),
+                    mConfig.adaptiveAdmissionMinFreePages, telemetry.recentDecodeTpotPressure,
+                    predictiveAdmission ? 0.0F : mConfig.adaptiveAdmissionTpotPressureEnterRatio,
+                    predictiveAdmission ? 0.0F : mConfig.adaptiveAdmissionTpotPressureExitRatio);
+            }
+            bool const costBlocked = pendingRequests >= mConfig.adaptiveBacklogEnterRequests
+                && mRequests.size() >= mAdaptiveAdmissionLimit && mAdaptiveAdmissionLimit < mConfig.maxInFlightRequests
+                && costLimit <= mAdaptiveAdmissionLimit;
+            if (costBlocked)
+            {
+                ++mAdaptiveAdmissionCostBlockCount;
+            }
             if (next != mAdaptiveAdmissionLimit)
             {
                 if (next > mAdaptiveAdmissionLimit)
@@ -507,8 +596,8 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
                 {
                     ++mThroughputModeTransitionCount;
                 }
-                mLastAdmissionTransitionSample = telemetry.sampleCount;
             }
+            mLastAdmissionDecisionSample = telemetry.sampleCount;
         }
         mCoordinator.scheduler().setOnlineDecodeCostLearningActive(mThroughputMode);
         return;
@@ -567,9 +656,10 @@ size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
     return mPendingRequests.size();
 }
 
-void IndependentPhaseAsyncServer::setExternalPendingRequests(size_t pendingRequests) noexcept
+void IndependentPhaseAsyncServer::setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs) noexcept
 {
     mExternalPendingRequests = pendingRequests;
+    mExternalMinTpotTargetUs = minTpotTargetUs;
 }
 
 size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
@@ -683,6 +773,21 @@ size_t IndependentPhaseAsyncServer::adaptiveAdmissionIncreaseCount() const noexc
 size_t IndependentPhaseAsyncServer::adaptiveAdmissionDecreaseCount() const noexcept
 {
     return mAdaptiveAdmissionDecreaseCount;
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionCostLimit() const noexcept
+{
+    return costLimitedAdmissionLimit();
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionCostBlockCount() const noexcept
+{
+    return mAdaptiveAdmissionCostBlockCount;
+}
+
+double IndependentPhaseAsyncServer::adaptiveAdmissionTpotBudgetUs() const noexcept
+{
+    return effectiveAdmissionTpotBudgetUs();
 }
 
 bool IndependentPhaseAsyncServer::empty() const noexcept
