@@ -1192,6 +1192,7 @@ int main(int argc, char** argv)
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
+        serverConfig.releaseVisionPrefillStorage = std::getenv("TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE") != nullptr;
         serverConfig.maxPendingRequests = 1024;
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_REFILL_BATCH"))
         {
@@ -1219,6 +1220,7 @@ int main(int argc, char** argv)
         char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
         char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
         rt::PhaseVisionStoragePolicy visionStoragePolicy;
+        visionStoragePolicy.splitMropeLease = serverConfig.releaseVisionPrefillStorage;
         if (char const* value = std::getenv("TRT_EDGELLM_VISION_IDLE_SLABS"))
         {
             visionStoragePolicy.maxIdleBatches = static_cast<size_t>(std::stoul(value));
@@ -1758,6 +1760,8 @@ int main(int argc, char** argv)
                         {"vision_pending", visionMetrics.pendingVisionRequests},
                         {"vision_downstream", visionMetrics.downstreamEncodedRequests},
                         {"vision_downstream_bytes", visionMetrics.downstreamEncodedBytes},
+                        {"vision_prefill_storage_releases", visionMetrics.prefillStorageReleases},
+                        {"vision_prefill_storage_released_bytes", visionMetrics.prefillStorageReleasedBytes},
                         {"vision_encoder_starts", visionMetrics.encoderStarts},
                         {"vision_encoder_completions", visionMetrics.encoderCompletions},
                         {"vision_encoder_batches", visionMetrics.encoderBatches},
@@ -1864,14 +1868,15 @@ int main(int argc, char** argv)
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
-                    "pending=%zu downstream=%zu bytes=%zu "
+                    "pending=%zu downstream=%zu bytes=%zu prefill_releases=%zu prefill_released_bytes=%zu "
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
                     "decode_tpot_pressure=%.3f",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
                     visionMetrics.pendingVisionRequests, visionMetrics.downstreamEncodedRequests,
-                    visionMetrics.downstreamEncodedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
+                    visionMetrics.downstreamEncodedBytes, visionMetrics.prefillStorageReleases,
+                    visionMetrics.prefillStorageReleasedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
                     visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
                     visionMetrics.maxEncoderGpuMs, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,

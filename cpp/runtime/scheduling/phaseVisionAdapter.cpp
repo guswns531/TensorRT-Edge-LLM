@@ -36,6 +36,11 @@ struct PhaseVisionBatchStorage
     size_t lastUseGeneration{};
 };
 
+struct PhaseVisionMropeStorage
+{
+    Tensor mropeCosSin;
+};
+
 namespace
 {
 void resizeTensor(Tensor& destination, Tensor const& source, std::string const& name)
@@ -56,11 +61,12 @@ size_t storageByteSize(PhaseVisionBatchStorage const& storage) noexcept
     auto capacity = [](Tensor const& tensor) {
         return tensor.isEmpty() ? size_t{} : static_cast<size_t>(tensor.getMemoryCapacity());
     };
-    size_t result = capacity(storage.outputEmbedding) + capacity(storage.mropeCosSin);
+    size_t result = capacity(storage.outputEmbedding);
     for (Tensor const& feature : storage.deepstackFeatures)
     {
         result += capacity(feature);
     }
+    result += capacity(storage.mropeCosSin);
     return result;
 }
 } // namespace
@@ -90,6 +96,36 @@ size_t PhaseVisionPayload::byteSize() const noexcept
         result += tensorBytes(feature);
     }
     return result;
+}
+
+size_t PhaseVisionPayload::prefillByteSize() const noexcept
+{
+    auto tensorBytes = [](Tensor const& tensor) {
+        return tensor.isEmpty()
+            ? size_t{}
+            : static_cast<size_t>(tensor.getShape().volume()) * utils::getTypeSize(tensor.getDataType());
+    };
+    size_t result = tensorBytes(outputEmbedding);
+    for (Tensor const& feature : deepstackFeatures)
+    {
+        result += tensorBytes(feature);
+    }
+    return result;
+}
+
+size_t PhaseVisionPayload::releasePrefillStorage() noexcept
+{
+    // A legacy payload keeps M-RoPE in the same slab as the prefill tensors. Retaining the whole slab is required
+    // until decode finishes; only the split-lease path can safely release it after the final prefill.
+    if (!mropeCosSin.isEmpty() && mropeStorageOwner == nullptr)
+    {
+        return 0;
+    }
+    size_t const releasedBytes = prefillByteSize();
+    outputEmbedding = Tensor{};
+    deepstackFeatures.clear();
+    storageOwner.reset();
+    return releasedBytes;
 }
 
 std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> const& tokenIds, int32_t imageTokenId)
@@ -243,6 +279,14 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
     std::vector<std::unique_ptr<PhaseVisionPayload>> payloads;
     payloads.reserve(submissions.size());
     std::shared_ptr<PhaseVisionBatchStorage> const storage = acquireBatchStorage();
+    std::shared_ptr<PhaseVisionMropeStorage> mropeStorage;
+    Tensor* mropeCosSin = &storage->mropeCosSin;
+    if (mStoragePolicy.splitMropeLease)
+    {
+        storage->mropeCosSin = Tensor{};
+        mropeStorage = std::make_shared<PhaseVisionMropeStorage>();
+        mropeCosSin = &mropeStorage->mropeCosSin;
+    }
     try
     {
         for (size_t index = 0; index < submissions.size(); ++index)
@@ -262,23 +306,22 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             Coords const requiredShape{activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim};
             int64_t const requiredBytes
                 = requiredShape.volume() * static_cast<int64_t>(utils::getTypeSize(nvinfer1::DataType::kFLOAT));
-            if (storage->mropeCosSin.isEmpty() || storage->mropeCosSin.getMemoryCapacity() < requiredBytes)
+            if (mropeCosSin->isEmpty() || mropeCosSin->getMemoryCapacity() < requiredBytes)
             {
-                storage->mropeCosSin
+                *mropeCosSin
                     = Tensor(requiredShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_vision_batched_mrope");
             }
             else
             {
-                ELLM_CHECK(
-                    storage->mropeCosSin.reshape(requiredShape), "Failed to reshape batched vision M-RoPE storage");
+                ELLM_CHECK(mropeCosSin->reshape(requiredShape), "Failed to reshape batched vision M-RoPE storage");
             }
         }
         else
         {
-            storage->mropeCosSin = Tensor{};
+            *mropeCosSin = Tensor{};
         }
         OptionalOutputTensor mrope
-            = storage->mropeCosSin.isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(storage->mropeCosSin)};
+            = mropeCosSin->isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(*mropeCosSin)};
         std::vector<std::vector<int32_t>> batchedTokenIds;
         ELLM_CHECK(mRunner.preprocess(*mBatchedRequest, batchedTokenIds, &mTokenizer, mrope, mStream),
             "Phase vision preprocessing failed");
@@ -335,6 +378,7 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             ELLM_CHECK(rowCount > 0, "Phase vision logical request produced no image embedding rows");
             PhaseVisionPayload& payload = *payloads[index];
             payload.storageOwner = storage;
+            payload.mropeStorageOwner = mropeStorage;
             payload.tokenIds.push_back(std::move(batchedTokenIds[index]));
             payload.outputEmbedding
                 = viewTensorRows(storage->outputEmbedding, embeddingOffset, rowCount, "phase_vision_output");
@@ -343,10 +387,10 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
                 payload.deepstackFeatures.push_back(
                     viewTensorRows(feature, embeddingOffset, rowCount, "phase_vision_deepstack"));
             }
-            if (!storage->mropeCosSin.isEmpty())
+            if (!mropeCosSin->isEmpty())
             {
                 payload.mropeCosSin
-                    = viewTensorRows(storage->mropeCosSin, static_cast<int64_t>(index), 1, "phase_vision_mrope");
+                    = viewTensorRows(*mropeCosSin, static_cast<int64_t>(index), 1, "phase_vision_mrope");
             }
             embeddingOffset += rowCount;
             CUDA_CHECK(cudaEventRecord(payload.readyEvent, mStream));

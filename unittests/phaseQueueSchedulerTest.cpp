@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <set>
 
 namespace trt_edgellm
@@ -1816,6 +1817,37 @@ TEST(PhaseThreeCoordinatorPolicyTest, StagesOnlyNewMropePrefix)
     EXPECT_EQ(range.offsetPositions, 0);
     EXPECT_EQ(range.countPositions, 2048);
     EXPECT_EQ(range.validPositions, 2048);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, RetainsLegacyVisionSlabForMrope)
+{
+    std::byte storage{};
+    PhaseVisionPayload payload;
+    payload.outputEmbedding = Tensor(&storage, {2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    payload.deepstackFeatures.emplace_back(&storage, Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    payload.mropeCosSin = Tensor(&storage, {1, 4, 2}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+
+    EXPECT_EQ(payload.prefillByteSize(), 64U);
+    EXPECT_EQ(payload.byteSize(), 96U);
+    EXPECT_EQ(payload.releasePrefillStorage(), 0U);
+    EXPECT_FALSE(payload.outputEmbedding.isEmpty());
+    EXPECT_FALSE(payload.deepstackFeatures.empty());
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, ReleasesNonMropePrefillVisionStorage)
+{
+    std::byte storage{};
+    PhaseVisionPayload payload;
+    payload.outputEmbedding = Tensor(&storage, {2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    payload.deepstackFeatures.emplace_back(&storage, Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+
+    EXPECT_EQ(payload.prefillByteSize(), 64U);
+    EXPECT_EQ(payload.byteSize(), 64U);
+    EXPECT_EQ(payload.releasePrefillStorage(), 64U);
+    EXPECT_TRUE(payload.outputEmbedding.isEmpty());
+    EXPECT_TRUE(payload.deepstackFeatures.empty());
+    EXPECT_EQ(payload.byteSize(), 0U);
+    EXPECT_EQ(payload.releasePrefillStorage(), 0U);
 }
 
 } // namespace

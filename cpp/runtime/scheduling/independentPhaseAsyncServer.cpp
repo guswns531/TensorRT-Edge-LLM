@@ -372,6 +372,36 @@ float IndependentPhaseAsyncServer::decodeTpotPressure() const noexcept
     return mCoordinator.scheduler().telemetry().recentDecodeTpotPressure;
 }
 
+size_t IndependentPhaseAsyncServer::visionPayloadBytes() const noexcept
+{
+    size_t result{};
+    for (auto const& request : mRequests)
+    {
+        if (request.second.visionPayload != nullptr)
+        {
+            result += request.second.visionPayload->byteSize();
+        }
+    }
+    for (PendingRequest const& request : mPendingRequests)
+    {
+        if (request.visionPayload != nullptr)
+        {
+            result += request.visionPayload->byteSize();
+        }
+    }
+    return result;
+}
+
+size_t IndependentPhaseAsyncServer::visionPrefillReleaseCount() const noexcept
+{
+    return mVisionPrefillReleaseCount;
+}
+
+size_t IndependentPhaseAsyncServer::visionPrefillReleasedBytes() const noexcept
+{
+    return mVisionPrefillReleasedBytes;
+}
+
 bool IndependentPhaseAsyncServer::throughputMode() const noexcept
 {
     return mThroughputMode;
@@ -487,6 +517,19 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
                       = mAdapter.submitSampling(finalViews, io, stream, true);
                   ELLM_CHECK(ticket != nullptr, "Prefill sampling adapter returned no completion ticket");
                   mSamplingTickets.push_back(std::move(ticket));
+                  for (IndependentPhaseRequestView const& view : finalViews)
+                  {
+                      if (!mConfig.releaseVisionPrefillStorage || view.visionPayload == nullptr)
+                      {
+                          continue;
+                      }
+                      size_t const releasedBytes = view.visionPayload->releasePrefillStorage();
+                      if (releasedBytes > 0)
+                      {
+                          ++mVisionPrefillReleaseCount;
+                          mVisionPrefillReleasedBytes += releasedBytes;
+                      }
+                  }
               }
           };
     callbacks.completeDecodeBatch

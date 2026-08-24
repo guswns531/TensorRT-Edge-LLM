@@ -123,6 +123,8 @@ struct IndependentPhaseServerConfig
     bool allowChunkedVisionPrefill{};
     //! Packed-prefill engines may batch multiple complete multimodal prompts without chunking them.
     bool allowBatchedVisionPrefill{};
+    //! Release embedding/deepstack leases after the final prefill event while retaining M-RoPE for decode.
+    bool releaseVisionPrefillStorage{};
 };
 
 struct IndependentPhaseServerSubmission
@@ -193,6 +195,9 @@ public:
     size_t pendingCount() const noexcept;
     size_t decodeRefillWaitCount() const noexcept;
     float decodeTpotPressure() const noexcept;
+    size_t visionPayloadBytes() const noexcept;
+    size_t visionPrefillReleaseCount() const noexcept;
+    size_t visionPrefillReleasedBytes() const noexcept;
     bool throughputMode() const noexcept;
     size_t throughputModeTransitionCount() const noexcept;
     bool empty() const noexcept;
@@ -254,6 +259,8 @@ private:
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
     std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
     size_t mDecodeRefillWaitCount{};
+    size_t mVisionPrefillReleaseCount{};
+    size_t mVisionPrefillReleasedBytes{};
     bool mThroughputMode{};
     size_t mThroughputModeTransitionCount{};
 };

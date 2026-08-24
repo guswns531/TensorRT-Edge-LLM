@@ -65,6 +65,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t pendingVisionRequests{};
     size_t downstreamEncodedRequests{};
     size_t downstreamEncodedBytes{};
+    size_t prefillStorageReleases{};
+    size_t prefillStorageReleasedBytes{};
     size_t encoderStarts{};
     size_t encoderCompletions{};
     size_t encoderBatches{};
@@ -136,7 +138,6 @@ private:
     std::unordered_set<uint64_t> mRequestIds;
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
-    size_t mDownstreamEncodedBytes{};
     size_t mEstimatedEncodedBytes{};
     size_t mEncoderStarts{};
     size_t mEncoderCompletions{};

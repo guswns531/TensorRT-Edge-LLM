@@ -33,12 +33,14 @@ namespace trt_edgellm::rt
 {
 
 struct PhaseVisionBatchStorage;
+struct PhaseVisionMropeStorage;
 
 //! High-water policy for encoder-output slabs that are no longer request-owned.
 struct PhaseVisionStoragePolicy
 {
     size_t maxIdleBatches{4U};
     size_t maxIdleBytes{256U * 1024U * 1024U};
+    bool splitMropeLease{};
 };
 
 //! GPU-memory operations performed while retaining encoder output for downstream prefill.
@@ -74,12 +76,15 @@ struct PhaseVisionPayload
     ~PhaseVisionPayload() noexcept;
 
     size_t byteSize() const noexcept;
+    size_t prefillByteSize() const noexcept;
+    size_t releasePrefillStorage() noexcept;
 
     std::vector<std::vector<int32_t>> tokenIds;
     Tensor outputEmbedding;
     std::vector<Tensor> deepstackFeatures;
     Tensor mropeCosSin;
     std::shared_ptr<PhaseVisionBatchStorage> storageOwner;
+    std::shared_ptr<PhaseVisionMropeStorage> mropeStorageOwner;
     float encoderGpuMs{};
     cudaEvent_t startEvent{};
     cudaEvent_t readyEvent{};

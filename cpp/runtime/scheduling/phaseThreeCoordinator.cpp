@@ -147,7 +147,6 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         auto const downstream = mDownstreamRequestBytes.find(requestId);
         if (downstream != mDownstreamRequestBytes.end())
         {
-            mDownstreamEncodedBytes -= downstream->second;
             mDownstreamRequestBytes.erase(downstream);
         }
     }
@@ -173,7 +172,9 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     PhaseThreeCoordinatorMetrics result;
     result.pendingVisionRequests = mPending.size();
     result.downstreamEncodedRequests = mDownstreamRequestBytes.size();
-    result.downstreamEncodedBytes = mDownstreamEncodedBytes;
+    result.downstreamEncodedBytes = mServer.visionPayloadBytes();
+    result.prefillStorageReleases = mServer.visionPrefillReleaseCount();
+    result.prefillStorageReleasedBytes = mServer.visionPrefillReleasedBytes();
     result.encoderStarts = mEncoderStarts;
     result.encoderCompletions = mEncoderCompletions;
     result.encoderBatches = mEncoderBatches;
@@ -210,7 +211,6 @@ std::optional<IndependentPhaseServerCompletion> PhaseThreeCoordinator::tryPopCom
         auto const downstream = mDownstreamRequestBytes.find(completion->requestId);
         if (downstream != mDownstreamRequestBytes.end())
         {
-            mDownstreamEncodedBytes -= downstream->second;
             mDownstreamRequestBytes.erase(downstream);
         }
     }
@@ -295,7 +295,6 @@ bool PhaseThreeCoordinator::completeEncoder()
             "Encoded phase request could not enter the LLM admission queue");
         ELLM_CHECK(mDownstreamRequestBytes.emplace(requestId, encodedBytes).second,
             "Encoded phase request is already downstream");
-        mDownstreamEncodedBytes += encodedBytes;
         mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
     }
     mEncoding.clear();
@@ -340,7 +339,7 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
 bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) const noexcept
 {
     return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), effectiveEncodedCapacity(),
-        mDownstreamEncodedBytes, mConfig.maxEncodedBytes, mEstimatedEncodedBytes, additionalRequests);
+        mServer.visionPayloadBytes(), mConfig.maxEncodedBytes, mEstimatedEncodedBytes, additionalRequests);
 }
 
 size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept
