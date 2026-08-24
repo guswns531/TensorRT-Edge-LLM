@@ -78,6 +78,7 @@ public:
 
     std::vector<int32_t> const& pages(int32_t stableSlot) const;
     bool leased(int32_t stableSlot) const;
+    uint64_t generation(int32_t stableSlot) const;
     int32_t availableSlots() const noexcept;
     int32_t availablePages() const noexcept;
     int32_t maxPagesPerSequence() const noexcept;
@@ -93,6 +94,7 @@ private:
     std::set<int32_t> mFreeSlots;
     std::set<int32_t> mFreePages;
     std::vector<uint8_t> mLeased;
+    std::vector<uint64_t> mGenerations;
     std::vector<int32_t> mLengths;
     std::vector<std::vector<int32_t>> mSlotPages;
     std::vector<int32_t> mPageRefCounts;

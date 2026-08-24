@@ -335,19 +335,25 @@ int main(int argc, char** argv)
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
         rt::buildTensorMap(decodeMap, *decodeIO, *resources, config, 0);
+        rt::MambaCacheManager* stableStates
+            = config.numLinearAttnLayers > 0 ? &resources->cacheManagers[0]->getMambaCacheManager() : nullptr;
         resources->externalWeightManager->load(
             engineDir, engineDir / "config.json", setupStream, checkpointDir, {}, &embedding.table);
         resources->externalWeightManager->validateAgainstEngine(pair->prefillExecutor(), "base");
         resources->externalWeightManager->registerTensorMapEntries(prefillMap);
         resources->externalWeightManager->registerTensorMapEntries(decodeMap);
 
-        int32_t maxStableSlots = std::max(kDEFAULT_STABLE_SLOTS, config.maxSupportedBatchSize);
+        int32_t maxStableSlots = config.numLinearAttnLayers > 0
+            ? config.maxSupportedBatchSize
+            : std::max(kDEFAULT_STABLE_SLOTS, config.maxSupportedBatchSize);
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_STABLE_SLOTS"))
         {
             maxStableSlots = std::stoi(value);
         }
         int32_t const maxPhaseBatch = std::max(config.maxSupportedPrefillBatchSize, config.maxSupportedDecodeBatchSize);
         ELLM_CHECK(maxStableSlots >= maxPhaseBatch, "Stable slot capacity must cover the largest phase batch");
+        ELLM_CHECK(stableStates == nullptr || maxStableSlots <= stableStates->getConfig().maxBatchSize,
+            "Hybrid stable slots exceed the recurrent state store capacity");
         rt::StableKVPageManager ownership(
             {maxStableSlots, maxPhaseBatch, config.kvPoolPages, config.maxKVCacheCapacity, 128});
         bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
@@ -476,8 +482,9 @@ int main(int argc, char** argv)
             rt::IndependentPhaseCoordinatorCallbacks coordinatorCallbacks;
             coordinatorCallbacks.isDecodeFinished
                 = [&](rt::PhaseWorkItem const& item, int32_t) { return ++decodeSteps[item.requestId] >= 2; };
-            rt::IndependentPhaseCoordinator coordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
-                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks));
+            rt::IndependentPhaseCoordinator coordinator(config, schedulerConfig, *pair, ownership, stableStates,
+                *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream,
+                std::move(coordinatorCallbacks));
 
             rt::PhaseSchedulingHints decodeHints;
             decodeHints.tpotTargetUs = 50000.0;
@@ -529,8 +536,8 @@ int main(int argc, char** argv)
                 }
                 return finished;
             };
-            rt::IndependentPhaseCoordinator traceCoordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
-                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
+            rt::IndependentPhaseCoordinator traceCoordinator(config, schedulerConfig, *pair, ownership, stableStates,
+                *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
 
             auto const traceStart = std::chrono::steady_clock::now();
             size_t loopIterations{};
@@ -620,9 +627,11 @@ int main(int argc, char** argv)
             ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
         }
 
-        rt::Tensor hostSemanticPrefillIds({config.maxSupportedPrefillBatchSize, config.maxPackedPrefillChunkTokens},
+        int32_t const semanticPrefillTokenCapacity
+            = config.packedPrefill ? config.maxPackedPrefillChunkTokens : config.maxSupportedInputLength;
+        rt::Tensor hostSemanticPrefillIds({config.maxSupportedPrefillBatchSize, semanticPrefillTokenCapacity},
             rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_ids");
-        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedPrefillBatchSize, config.maxPackedPrefillChunkTokens},
+        rt::Tensor deviceSemanticPrefillIds({config.maxSupportedPrefillBatchSize, semanticPrefillTokenCapacity},
             rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "semantic_phase_prefill_ids");
         rt::Tensor hostSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kCPU,
             nvinfer1::DataType::kINT32, "semantic_phase_host_decode_ids");
@@ -637,6 +646,13 @@ int main(int argc, char** argv)
             nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
         rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
+        int32_t const tokenizerVocabSize = tokenizer.getNumVocab();
+        ELLM_CHECK(tokenizerVocabSize > 0 && tokenizerVocabSize <= config.outputVocabSize,
+            "Tokenizer vocabulary is outside the engine output vocabulary");
+        rt::Tensor prefillValidLogits({config.maxSupportedPrefillBatchSize, tokenizerVocabSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT, "semantic_phase_prefill_valid_logits");
+        rt::Tensor decodeValidLogits({config.maxSupportedDecodeBatchSize, tokenizerVocabSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT, "semantic_phase_decode_valid_logits");
         SamplingSlotPool samplingSlotPool(maxPhaseBatch);
 
         auto stageTokens = [&](std::vector<rt::IndependentPhaseRequestView> const& views, rt::PipelineIO& io,
@@ -682,25 +698,41 @@ int main(int argc, char** argv)
                 }
             }
             int32_t totalTokens{};
+            int32_t paddedTokens{};
             for (rt::IndependentPhaseRequestView const& view : views)
             {
                 totalTokens += prefill ? view.work.tokenCount : 1;
+                paddedTokens = std::max(paddedTokens, prefill ? view.work.tokenCount : 1);
             }
-            rt::Coords const tokenShape
-                = prefill ? rt::Coords{1, totalTokens} : rt::Coords{static_cast<int64_t>(views.size()), 1};
+            rt::Coords const tokenShape = prefill
+                ? (config.packedPrefill ? rt::Coords{1, totalTokens}
+                                        : rt::Coords{static_cast<int64_t>(views.size()), paddedTokens})
+                : rt::Coords{static_cast<int64_t>(views.size()), 1};
             rt::Tensor& hostIds = prefill ? hostSemanticPrefillIds : hostSemanticDecodeIds;
             rt::Tensor& deviceIds = prefill ? deviceSemanticPrefillIds : deviceSemanticDecodeIds;
             ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
                 "Semantic phase token staging reshape failed");
             int32_t* destination = hostIds.dataPointer<int32_t>();
             int32_t destinationOffset{};
-            for (rt::IndependentPhaseRequestView const& view : views)
+            if (prefill && !config.packedPrefill)
             {
+                std::fill(destination, destination + views.size() * static_cast<size_t>(paddedTokens), 0);
+            }
+            for (size_t row = 0; row < views.size(); ++row)
+            {
+                rt::IndependentPhaseRequestView const& view = views[row];
                 if (prefill)
                 {
+                    if (!config.packedPrefill)
+                    {
+                        destinationOffset = static_cast<int32_t>(row) * paddedTokens;
+                    }
                     std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
                         destination + destinationOffset);
-                    destinationOffset += view.work.tokenCount;
+                    if (config.packedPrefill)
+                    {
+                        destinationOffset += view.work.tokenCount;
+                    }
                 }
                 else
                 {
@@ -709,7 +741,7 @@ int main(int argc, char** argv)
                 }
             }
             CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
-                static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                static_cast<size_t>(tokenShape.volume()) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
             embeddingPreprocessor.embed(deviceIds, visionEmbedding, std::nullopt, io, stream);
             embeddingPreprocessor.prepareDeepstack(deviceIds, deepstackFeatures, io, stream);
             if (prefill)
@@ -726,11 +758,16 @@ int main(int argc, char** argv)
             int32_t const batchSize = static_cast<int32_t>(views.size());
             rt::Tensor& selectedIds = prefill ? prefillSelectedIds : decodeSelectedIds;
             rt::Tensor& workspace = prefill ? prefillSamplingWorkspace : decodeSamplingWorkspace;
+            rt::Tensor& validLogits = prefill ? prefillValidLogits : decodeValidLogits;
             SamplingSlotPool::Slot& slot = samplingSlotPool.acquire();
             ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
-                    && selectedIds.reshape({batchSize, 1}) && slot.hostIds.reshape({batchSize}),
+                    && validLogits.reshape({batchSize, tokenizerVocabSize}) && selectedIds.reshape({batchSize, 1})
+                    && slot.hostIds.reshape({batchSize}),
                 "Semantic phase sampling reshape failed");
-            selectAllTopK(io.outputLogits, std::nullopt, selectedIds, 1, workspace, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(validLogits.rawPointer(), tokenizerVocabSize * sizeof(float),
+                io.outputLogits.rawPointer(), config.outputVocabSize * sizeof(float),
+                tokenizerVocabSize * sizeof(float), batchSize, cudaMemcpyDeviceToDevice, stream));
+            selectAllTopK(validLogits, std::nullopt, selectedIds, 1, workspace, stream);
             CUDA_CHECK(cudaMemcpyAsync(slot.hostIds.rawPointer(), selectedIds.rawPointer(),
                 static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaEventRecord(slot.ready, stream));
@@ -758,7 +795,7 @@ int main(int argc, char** argv)
                   cudaStream_t stream) { stageTokens(views, io, map, stream, false); };
         semanticAdapter.submitSampling = submitSampling;
         bool const enablePrefixReuse = std::getenv("TRT_EDGELLM_ENABLE_PREFIX_REUSE") != nullptr;
-        semanticAdapter.supportsPageAlignedPrefixReuse = enablePrefixReuse;
+        semanticAdapter.supportsPageAlignedPrefixReuse = enablePrefixReuse && config.numLinearAttnLayers == 0;
 
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
@@ -779,15 +816,23 @@ int main(int argc, char** argv)
         ELLM_CHECK(semanticSchedulerConfig.maxDecodeBatchSize > 0
                 && semanticSchedulerConfig.maxDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
             "Semantic decode batch cap is outside the engine profile");
-        semanticSchedulerConfig.maxPrefillChunkTokens = 128;
+        int32_t const maximumPrefillChunk = config.packedPrefill ? 128 : config.maxSupportedInputLength;
+        semanticSchedulerConfig.maxPrefillChunkTokens = maximumPrefillChunk;
+        semanticSchedulerConfig.decodeActivePrefillChunkTokens = std::min(128, maximumPrefillChunk);
+        semanticSchedulerConfig.largePrefillChunkQueueThreshold = config.packedPrefill ? 0U : 1U;
+        if (char const* value = std::getenv("TRT_EDGELLM_LARGE_PREFILL_QUEUE_THRESHOLD"))
+        {
+            semanticSchedulerConfig.largePrefillChunkQueueThreshold = static_cast<size_t>(std::stoul(value));
+        }
         semanticSchedulerConfig.maxOverlapPrefillTokens = 128;
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_OVERLAP_PREFILL_TOKENS"))
         {
             semanticSchedulerConfig.maxOverlapPrefillTokens = std::stoi(value);
         }
-        semanticSchedulerConfig.maxPrefillBatchTokens = semanticSchedulerConfig.maxPrefillBatchSize * 128;
+        semanticSchedulerConfig.maxPrefillBatchTokens
+            = semanticSchedulerConfig.maxPrefillBatchSize * maximumPrefillChunk;
         semanticSchedulerConfig.enableRaggedPrefillBatching = true;
-        semanticSchedulerConfig.enablePackedPrefillTokenLayout = true;
+        semanticSchedulerConfig.enablePackedPrefillTokenLayout = config.packedPrefill;
         semanticSchedulerConfig.prefillCompletionBonusTokens = 128;
         semanticSchedulerConfig.enableWavefrontPrefillBatching
             = std::getenv("TRT_EDGELLM_DISABLE_WAVEFRONT_PREFILL") == nullptr;
@@ -800,7 +845,8 @@ int main(int argc, char** argv)
         if (char const* value = std::getenv("TRT_EDGELLM_FIXED_PREFILL_CHUNK"))
         {
             int32_t const fixedChunk = std::stoi(value);
-            ELLM_CHECK(fixedChunk > 0 && fixedChunk <= 128, "Fixed prefill chunk is outside the engine profile");
+            ELLM_CHECK(fixedChunk > 0 && fixedChunk <= maximumPrefillChunk,
+                "Fixed prefill chunk is outside the engine profile");
             semanticSchedulerConfig.maxPrefillChunkTokens = fixedChunk;
             semanticSchedulerConfig.minPrefillChunkTokens = fixedChunk;
             semanticSchedulerConfig.enableAdaptivePrefillChunking = false;
@@ -819,14 +865,19 @@ int main(int argc, char** argv)
         {
             semanticSchedulerConfig.decodeQueueWaitTargetUs = std::stod(value);
         }
+        bool const hybridRecurrentState = config.numLinearAttnLayers > 0;
         semanticSchedulerConfig.enableDynamicDecodeBatching
-            = std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr;
+            = !hybridRecurrentState && std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr;
+        if (std::getenv("TRT_EDGELLM_ENABLE_DYNAMIC_DECODE") != nullptr)
+        {
+            semanticSchedulerConfig.enableDynamicDecodeBatching = true;
+        }
         semanticSchedulerConfig.enableOnlineDecodeCostLearning
             = std::getenv("TRT_EDGELLM_DISABLE_ONLINE_COST") == nullptr;
         bool const asymmetricDecodeStaging = maxStableSlots > semanticSchedulerConfig.maxDecodeBatchSize
             && semanticSchedulerConfig.maxDecodeBatchSize > semanticSchedulerConfig.maxPrefillBatchSize;
-        semanticSchedulerConfig.enableDecodeCohortBatching
-            = asymmetricDecodeStaging && std::getenv("TRT_EDGELLM_DISABLE_DECODE_COHORT") == nullptr;
+        semanticSchedulerConfig.enableDecodeCohortBatching = (asymmetricDecodeStaging || hybridRecurrentState)
+            && std::getenv("TRT_EDGELLM_DISABLE_DECODE_COHORT") == nullptr;
         if (std::getenv("TRT_EDGELLM_ENABLE_DECODE_COHORT") != nullptr)
         {
             semanticSchedulerConfig.enableDecodeCohortBatching = true;
@@ -876,7 +927,8 @@ int main(int argc, char** argv)
             loadSchedulerCostModel(value, semanticSchedulerConfig);
         }
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
-            *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
+            stableStates, *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream,
+            std::move(seedCallbacks));
         rt::IndependentPhaseServerConfig serverConfig;
         size_t maxInFlightRequests = std::min(kDEFAULT_MAX_INFLIGHT_REQUESTS, static_cast<size_t>(maxStableSlots));
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_INFLIGHT"))
@@ -1462,6 +1514,22 @@ int main(int argc, char** argv)
                 prefillGraphStats.entries, prefillGraphStats.hits, prefillGraphStats.misses, prefillGraphStats.captures,
                 prefillGraphStats.evictions, decodeGraphStats.entries, decodeGraphStats.hits, decodeGraphStats.misses,
                 decodeGraphStats.captures, decodeGraphStats.evictions);
+            if (auto const* stats = semanticCoordinator.prefillRecurrentStateStats())
+            {
+                LOG_INFO(
+                    "Phase prefill state: prepares=%zu residency_hits=%zu gathered_slots=%zu scattered_slots=%zu "
+                    "gathered_bytes=%zu scattered_bytes=%zu",
+                    stats->prepareCalls, stats->residencyHits, stats->gatheredSlots, stats->scatteredSlots,
+                    stats->gatheredBytes, stats->scatteredBytes);
+            }
+            if (auto const* stats = semanticCoordinator.decodeRecurrentStateStats())
+            {
+                LOG_INFO(
+                    "Phase decode state: prepares=%zu residency_hits=%zu gathered_slots=%zu scattered_slots=%zu "
+                    "gathered_bytes=%zu scattered_bytes=%zu",
+                    stats->prepareCalls, stats->residencyHits, stats->gatheredSlots, stats->scatteredSlots,
+                    stats->gatheredBytes, stats->scatteredBytes);
+            }
             ipcThreePhase.reset();
             ipcVisionAdapter.reset();
             ipcVisionRunner.reset();

@@ -505,6 +505,36 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
+TEST(PhaseQueueSchedulerTest, DynamicDecodeCohortMatchesThePlannedActiveRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeCohortBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.0F}, {4, 512, 4.0F}};
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 2U);
+    EXPECT_EQ(first.decodeBatch[0].requestId, 1U);
+    EXPECT_EQ(first.decodeBatch[1].requestId, 2U);
+    EXPECT_EQ(scheduler.decodeCohortSize(), 2U);
+    for (PhaseWorkItem const& item : first.decodeBatch)
+    {
+        scheduler.completeDecode(item, 257, false);
+    }
+
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.decodeBatch.size(), 2U);
+    EXPECT_EQ(second.decodeBatch[0].requestId, 1U);
+    EXPECT_EQ(second.decodeBatch[1].requestId, 2U);
+}
+
 TEST(PhaseQueueSchedulerTest, ConfidentOnlineDecodeCostRefinesStaticPrior)
 {
     PhaseQueueSchedulerConfig config;

@@ -21,6 +21,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/scheduling/phaseRecurrentStateActiveView.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/stableKVPageManager.h"
 
@@ -61,9 +62,9 @@ class IndependentPhaseCoordinator
 {
 public:
     IndependentPhaseCoordinator(LLMEngineConfig const& config, PhaseQueueSchedulerConfig schedulerConfig,
-        IndependentEngineExecutorPair& executors, StableKVPageManager& ownership, PipelineIO& prefillIO,
-        PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap, cudaStream_t prefillStream,
-        cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks);
+        IndependentEngineExecutorPair& executors, StableKVPageManager& ownership, MambaCacheManager* stableStates,
+        PipelineIO& prefillIO, PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap,
+        cudaStream_t prefillStream, cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks);
     ~IndependentPhaseCoordinator() noexcept = default;
 
     IndependentPhaseCoordinator(IndependentPhaseCoordinator const&) = delete;
@@ -95,6 +96,8 @@ public:
     TensorMap& decodeTensorMap() noexcept;
     PhaseQueueScheduler& scheduler() noexcept;
     std::vector<PhaseDispatchMetrics> const& metrics() const noexcept;
+    PhaseRecurrentStateStats const* prefillRecurrentStateStats() const noexcept;
+    PhaseRecurrentStateStats const* decodeRecurrentStateStats() const noexcept;
     //! Enable external metric retention; scheduler telemetry remains active either way.
     void setMetricsCollectionEnabled(bool enabled) noexcept;
     CUcontext cudaContext() const noexcept;
@@ -118,6 +121,8 @@ private:
     IndependentPhaseCoordinatorCallbacks mCallbacks;
     PhaseKVActiveView mPrefillKV;
     PhaseKVActiveView mDecodeKV;
+    std::unique_ptr<PhaseRecurrentStateActiveView> mPrefillStates;
+    std::unique_ptr<PhaseRecurrentStateActiveView> mDecodeStates;
     PhaseQueueScheduler mScheduler;
     std::unique_ptr<PhaseDispatchWorker> mWorker;
     std::vector<PhaseDispatchMetrics> mMetrics;

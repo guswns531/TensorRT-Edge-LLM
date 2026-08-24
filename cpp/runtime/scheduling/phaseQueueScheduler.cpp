@@ -839,7 +839,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         {
             for (PhaseWorkItem const& item : queue)
             {
-                if (static_cast<int32_t>(mDecodeCohortIds.size()) >= mConfig.maxDecodeBatchSize)
+                if (static_cast<int32_t>(mDecodeCohortIds.size()) >= maxBatchSize)
                 {
                     break;
                 }

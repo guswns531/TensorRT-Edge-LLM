@@ -48,6 +48,7 @@ StableKVPageManager::StableKVPageManager(Config const& config)
         mFreePages.insert(page);
     }
     mLeased.assign(static_cast<size_t>(mConfig.maxStableSlots), 0U);
+    mGenerations.assign(static_cast<size_t>(mConfig.maxStableSlots), 0U);
     mLengths.assign(static_cast<size_t>(mConfig.maxStableSlots), 0);
     mSlotPages.resize(static_cast<size_t>(mConfig.maxStableSlots));
     mPageRefCounts.assign(static_cast<size_t>(mConfig.numPages), 0);
@@ -60,6 +61,7 @@ int32_t StableKVPageManager::reserve()
     int32_t const slot = *slotIt;
     mFreeSlots.erase(slotIt);
     mLeased[static_cast<size_t>(slot)] = 1U;
+    ++mGenerations[static_cast<size_t>(slot)];
     mLengths[static_cast<size_t>(slot)] = 0;
     return slot;
 }
@@ -212,6 +214,12 @@ bool StableKVPageManager::leased(int32_t stableSlot) const
 {
     validateSlot(stableSlot);
     return mLeased[static_cast<size_t>(stableSlot)] != 0U;
+}
+
+uint64_t StableKVPageManager::generation(int32_t stableSlot) const
+{
+    validateSlot(stableSlot);
+    return mGenerations[static_cast<size_t>(stableSlot)];
 }
 
 int32_t StableKVPageManager::availableSlots() const noexcept

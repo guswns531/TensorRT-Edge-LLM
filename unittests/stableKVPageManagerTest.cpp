@@ -50,6 +50,16 @@ TEST(StableKVPageManagerTest, ReusesReleasedSlotsAndPagesDeterministically)
     EXPECT_EQ(manager.pages(reusedSlot), (std::vector<int32_t>{0, 1}));
 }
 
+TEST(StableKVPageManagerTest, AdvancesGenerationWhenSlotIsReused)
+{
+    auto manager = makeManager();
+    int32_t const slot = manager.reserve();
+    uint64_t const firstGeneration = manager.generation(slot);
+    manager.release(slot);
+    EXPECT_EQ(manager.reserve(), slot);
+    EXPECT_GT(manager.generation(slot), firstGeneration);
+}
+
 TEST(StableKVPageManagerTest, ExhaustionIsTransactional)
 {
     auto manager = makeManager(4);

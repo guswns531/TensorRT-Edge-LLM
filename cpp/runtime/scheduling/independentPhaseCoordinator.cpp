@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -27,8 +28,9 @@ namespace trt_edgellm::rt
 
 IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& config,
     PhaseQueueSchedulerConfig schedulerConfig, IndependentEngineExecutorPair& executors, StableKVPageManager& ownership,
-    PipelineIO& prefillIO, PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap,
-    cudaStream_t prefillStream, cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks)
+    MambaCacheManager* stableStates, PipelineIO& prefillIO, PipelineIO& decodeIO, TensorMap& prefillMap,
+    TensorMap& decodeMap, cudaStream_t prefillStream, cudaStream_t decodeStream,
+    IndependentPhaseCoordinatorCallbacks callbacks)
     : mConfig(config)
     , mExecutors(executors)
     , mOwnership(ownership)
@@ -43,7 +45,6 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
     , mScheduler(std::move(schedulerConfig))
 {
-    ELLM_CHECK(config.packedPrefill, "Independent phase coordinator currently requires a packed-prefill engine");
     ELLM_CHECK(mPrefillStream != nullptr && mDecodeStream != nullptr && mPrefillStream != mDecodeStream,
         "Independent phase coordinator requires distinct explicit CUDA streams");
     ELLM_CHECK(static_cast<bool>(mCallbacks.isDecodeFinished),
@@ -55,6 +56,15 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     for (Tensor& deepstack : mDecodeIO.deepstackEmbeds)
     {
         CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), mDecodeStream));
+    }
+    if (config.numLinearAttnLayers > 0)
+    {
+        ELLM_CHECK(stableStates != nullptr && stableStates->numLayers() == config.numLinearAttnLayers,
+            "Independent hybrid phase execution requires the stable recurrent state store");
+        mPrefillStates = std::make_unique<PhaseRecurrentStateActiveView>(
+            mOwnership, *stableStates, mPrefillMap, config.maxSupportedPrefillBatchSize, false, mPrefillStream);
+        mDecodeStates = std::make_unique<PhaseRecurrentStateActiveView>(
+            mOwnership, *stableStates, mDecodeMap, config.maxSupportedDecodeBatchSize, true, mDecodeStream);
     }
 
     PhaseExecutionSafetyContract const safety
@@ -110,16 +120,26 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
     std::vector<int32_t> slots;
     std::vector<int32_t> chunks;
     int32_t totalTokens{};
+    int32_t paddedTokens{};
+    bool kvCacheAllEmpty{true};
     for (PhaseWorkItem const& item : batch)
     {
         slots.push_back(item.kvSlotId);
         chunks.push_back(item.tokenCount);
         totalTokens += item.tokenCount;
+        paddedTokens = std::max(paddedTokens, item.tokenCount);
+        kvCacheAllEmpty = kvCacheAllEmpty && mOwnership.length(item.kvSlotId) == 0;
         mOwnership.ensureCapacity(item.kvSlotId, mOwnership.length(item.kvSlotId) + item.tokenCount);
     }
+    if (mPrefillStates)
+    {
+        mPrefillStates->prepare(slots, stream);
+    }
     mPrefillKV.prepare(slots, stream);
-    ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape({1, totalTokens, mConfig.hiddenSize}),
-        "Independent packed prefill embedding reshape failed");
+    Coords const embeddingShape = mConfig.packedPrefill
+        ? Coords{1, totalTokens, mConfig.hiddenSize}
+        : Coords{static_cast<int64_t>(batch.size()), paddedTokens, mConfig.hiddenSize};
+    ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape(embeddingShape), "Independent prefill embedding reshape failed");
     if (mCallbacks.stagePrefill)
     {
         mCallbacks.stagePrefill(batch, mPrefillIO, stream);
@@ -129,19 +149,25 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         CUDA_CHECK(cudaMemsetAsync(
             mPrefillIO.inputsEmbeds.rawPointer(), 0, mPrefillIO.inputsEmbeds.getMemoryCapacity(), stream));
     }
-    mPrefillKV.preparePrefillMetadata(mPrefillIO, chunks, stream, true);
-    ELLM_CHECK(mExecutors.prefillExecutor().prepare(mExecutors.config().prefillProfile,
-                   mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens), mPrefillMap, stream),
-        "Independent packed prefill prepare failed");
-    std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(totalTokens);
+    mPrefillKV.preparePrefillMetadata(mPrefillIO, chunks, stream, mConfig.packedPrefill);
+    InferenceDims const dims = mConfig.packedPrefill
+        ? mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
+        : mConfig.prefillDims(static_cast<int64_t>(batch.size()), paddedTokens, kvCacheAllEmpty);
+    ELLM_CHECK(mExecutors.prefillExecutor().prepare(mExecutors.config().prefillProfile, dims, mPrefillMap, stream),
+        "Independent prefill prepare failed");
+    std::string const graphShape
+        = std::to_string(batch.size()) + ":" + std::to_string(mConfig.packedPrefill ? totalTokens : paddedTokens);
     if (mGraphCaptureEnabled && mCapturedPrefillShapes.find(graphShape) == mCapturedPrefillShapes.end()
         && mCapturedPrefillShapes.size() < mMaxPrefillGraphs)
     {
-        ELLM_CHECK(
-            mExecutors.prefillExecutor().captureGraph(stream), "Independent packed prefill graph capture failed");
+        ELLM_CHECK(mExecutors.prefillExecutor().captureGraph(stream), "Independent prefill graph capture failed");
         mCapturedPrefillShapes.insert(graphShape);
     }
-    ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent packed prefill execute failed");
+    ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent prefill execute failed");
+    if (mPrefillStates)
+    {
+        mPrefillStates->markUpdated();
+    }
 }
 
 void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
@@ -151,6 +177,10 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
     {
         slots.push_back(item.kvSlotId);
         mOwnership.ensureCapacity(item.kvSlotId, mOwnership.length(item.kvSlotId) + 1);
+    }
+    if (mDecodeStates)
+    {
+        mDecodeStates->prepare(slots, stream);
     }
     mDecodeKV.prepare(slots, stream);
     ELLM_CHECK(mDecodeIO.inputsEmbeds.reshape({static_cast<int64_t>(batch.size()), 1, mConfig.hiddenSize}),
@@ -176,6 +206,10 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
         mCapturedDecodeShapes.insert(graphShape);
     }
     ELLM_CHECK(mExecutors.decodeExecutor().execute(stream), "Independent decode execute failed");
+    if (mDecodeStates)
+    {
+        mDecodeStates->markUpdated();
+    }
 }
 
 void IndependentPhaseCoordinator::completePrefillBatch(std::vector<PhaseWorkItem> const& batch)
@@ -187,6 +221,11 @@ void IndependentPhaseCoordinator::completePrefillBatch(std::vector<PhaseWorkItem
     }
     mPrefillKV.commitLengths(resultingLengths);
     mPrefillKV.complete();
+    if (mPrefillStates)
+    {
+        mPrefillStates->complete(mPrefillStream);
+        CUDA_CHECK(cudaStreamSynchronize(mPrefillStream));
+    }
     if (mCallbacks.completePrefillBatch)
     {
         mCallbacks.completePrefillBatch(batch, mPrefillIO, mPrefillStream);
@@ -202,6 +241,10 @@ void IndependentPhaseCoordinator::completeDecodeBatch(std::vector<PhaseWorkItem>
     }
     mDecodeKV.commitLengths(resultingLengths);
     mDecodeKV.complete();
+    if (mDecodeStates)
+    {
+        mDecodeStates->complete(mDecodeStream);
+    }
     if (mCallbacks.completeDecodeBatch)
     {
         mCallbacks.completeDecodeBatch(batch, mDecodeIO, mDecodeStream);
@@ -297,6 +340,16 @@ PhaseQueueScheduler& IndependentPhaseCoordinator::scheduler() noexcept
 std::vector<PhaseDispatchMetrics> const& IndependentPhaseCoordinator::metrics() const noexcept
 {
     return mMetrics;
+}
+
+PhaseRecurrentStateStats const* IndependentPhaseCoordinator::prefillRecurrentStateStats() const noexcept
+{
+    return mPrefillStates ? &mPrefillStates->stats() : nullptr;
+}
+
+PhaseRecurrentStateStats const* IndependentPhaseCoordinator::decodeRecurrentStateStats() const noexcept
+{
+    return mDecodeStates ? &mDecodeStates->stats() : nullptr;
 }
 
 void IndependentPhaseCoordinator::setMetricsCollectionEnabled(bool enabled) noexcept

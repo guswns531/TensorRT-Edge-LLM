@@ -324,7 +324,7 @@ void IndependentPhaseAsyncServer::runUntilIdle(size_t maxPolls)
     {
         if (!poll())
         {
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
     ELLM_CHECK(empty(), "Independent phase server exceeded its poll guard");
