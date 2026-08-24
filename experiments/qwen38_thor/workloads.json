@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "chat_template_overhead_tokens": 72,
+  "cases": {
+    "short_burst": {
+      "requests": 64,
+      "concurrency": 32,
+      "input_tokens": 128,
+      "output_tokens": 64,
+      "arrival": "burst"
+    },
+    "short_steady": {
+      "requests": 64,
+      "concurrency": 16,
+      "input_tokens": 128,
+      "output_tokens": 64,
+      "arrival": "constant",
+      "request_rate": 2.0
+    },
+    "balanced_burst": {
+      "requests": 64,
+      "concurrency": 32,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "arrival": "burst"
+    },
+    "balanced_poisson": {
+      "requests": 64,
+      "concurrency": 24,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "arrival": "poisson",
+      "request_rate": 1.5
+    },
+    "prefill_heavy": {
+      "requests": 24,
+      "concurrency": 8,
+      "input_tokens": 2048,
+      "output_tokens": 32,
+      "arrival": "burst"
+    },
+    "decode_heavy": {
+      "requests": 64,
+      "concurrency": 32,
+      "input_tokens": 128,
+      "output_tokens": 256,
+      "arrival": "burst"
+    },
+    "bimodal_burst": {
+      "requests": 64,
+      "concurrency": 32,
+      "arrival": "burst",
+      "profiles": [
+        {"input_tokens": 128, "output_tokens": 256},
+        {"input_tokens": 2048, "output_tokens": 32}
+      ]
+    },
+    "wave_burst": {
+      "requests": 64,
+      "concurrency": 32,
+      "input_tokens": 256,
+      "output_tokens": 96,
+      "arrival": "waves",
+      "wave_size": 8,
+      "wave_interval_seconds": 1.0
+    },
+    "shared_prefix": {
+      "requests": 32,
+      "concurrency": 16,
+      "input_tokens": 1024,
+      "output_tokens": 64,
+      "shared_prefix_tokens": 768,
+      "arrival": "burst"
+    },
+    "multi_turn": {
+      "requests": 32,
+      "concurrency": 16,
+      "input_tokens": 768,
+      "output_tokens": 96,
+      "turns": 3,
+      "arrival": "poisson",
+      "request_rate": 2.0
+    }
+  }
+}

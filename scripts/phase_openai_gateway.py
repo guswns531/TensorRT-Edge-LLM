@@ -44,7 +44,8 @@ class EventBroker:
         self.write_lock = threading.Lock()
         self.queues: dict[int, queue.Queue[dict[str, Any]]] = {}
         self.queues_lock = threading.Lock()
-        threading.Thread(target=self._read_events, daemon=True).start()
+        self.reader = threading.Thread(target=self._read_events, daemon=True)
+        self.reader.start()
 
     def _read_events(self) -> None:
         assert self.process.stdout is not None
@@ -93,6 +94,19 @@ class EventBroker:
                 }) + "\n")
             self.process.stdin.flush()
 
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            self.reader.join(timeout=5)
+            return
+        assert self.process.stdin is not None
+        self.process.stdin.close()
+        try:
+            self.process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            self.process.wait(timeout=30)
+        self.reader.join(timeout=5)
+
 
 def make_handler(broker: EventBroker, model: str,
                  timeout: float) -> type[BaseHTTPRequestHandler]:
@@ -112,14 +126,22 @@ def make_handler(broker: EventBroker, model: str,
             self.end_headers()
             self.wfile.write(body)
 
+        def send_json(self, status: int, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self) -> None:
             if self.path == "/health":
                 return_code = broker.process.poll()
-                if broker.ready.is_set():
-                    self.send_text(200, "ok\n")
-                elif return_code is not None:
+                if return_code is not None:
                     self.send_text(
                         500, f"backend exited with code {return_code}\n")
+                elif broker.ready.is_set():
+                    self.send_text(200, "ok\n")
                 else:
                     self.send_text(503, "loading\n")
             elif self.path == "/version":
@@ -143,9 +165,8 @@ def make_handler(broker: EventBroker, model: str,
             content_length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(content_length))
             metadata = payload.get("metadata") or {}
-            if "request_index" not in metadata or not payload.get("stream"):
-                self.send_text(
-                    400, "streaming metadata.request_index is required\n")
+            if "request_index" not in metadata:
+                self.send_text(400, "metadata.request_index is required\n")
                 return
             request_index = int(metadata["request_index"])
             try:
@@ -153,6 +174,51 @@ def make_handler(broker: EventBroker, model: str,
             except ValueError as exception:
                 self.send_text(409, str(exception) + "\n")
                 return
+
+            if not payload.get("stream"):
+                content_parts: list[str] = []
+                token_ids: list[int] = []
+                try:
+                    while True:
+                        event = events.get(timeout=timeout)
+                        if event["type"] == "error":
+                            self.send_json(400, {"error": event["message"]})
+                            return
+                        if event["type"] == "token":
+                            content_parts.append(event["text"])
+                            token_ids.append(event["token_id"])
+                            continue
+                        if event["type"] == "cancelled":
+                            self.send_json(409, {"error": "request cancelled"})
+                            return
+                        finish_reason = ("stop" if event["finish_reason"]
+                                         == "end-of-sequence" else "length")
+                        self.send_json(
+                            200, {
+                                "model":
+                                model,
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "".join(content_parts),
+                                        "token_ids": token_ids,
+                                    },
+                                    "finish_reason": finish_reason,
+                                }],
+                                "usage": {
+                                    "prompt_tokens":
+                                    event["prompt_tokens"],
+                                    "completion_tokens":
+                                    event["output_tokens"],
+                                    "total_tokens": (event["prompt_tokens"] +
+                                                     event["output_tokens"]),
+                                },
+                            })
+                        return
+                finally:
+                    broker.cancel(request_index)
+                    broker.release(request_index)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -241,9 +307,7 @@ def main() -> None:
         pass
     finally:
         server.server_close()
-        if broker.process.poll() is None:
-            broker.process.terminate()
-        broker.process.wait(timeout=30)
+        broker.close()
 
 
 if __name__ == "__main__":

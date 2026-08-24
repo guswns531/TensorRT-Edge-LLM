@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-24",
+  "device": "NVIDIA Thor",
+  "model": "Qwen/Qwen3.8-27B",
+  "checkpoint_precision": "NVFP4",
+  "measurement": "median of three steady-state HTTP runs",
+  "vanilla_nonstream_output_tokens_per_second": {
+    "short_burst": {
+      "upstream_v0_10": 65.6294341872382,
+      "phase_p1_d32": 143.6983542202028,
+      "vllm": 131.39982607828978
+    },
+    "prefill_heavy": {
+      "upstream_v0_10": 15.701341486625385,
+      "phase_p1_d32": 22.213520098857437,
+      "vllm": 27.461534145597714
+    },
+    "decode_heavy": {
+      "upstream_v0_10": 66.40831766751113,
+      "phase_p1_d32": 193.48998781143462,
+      "vllm": 137.46206795928597
+    }
+  },
+  "short_burst_streaming": {
+    "phase_p1_d32": {
+      "output_tokens_per_second": 144.3454990594062,
+      "ttft_ms": 2354.281362495385,
+      "tpot_ms": 187.1711948169543,
+      "e2e_ms": 13808.954677544534
+    },
+    "vllm": {
+      "output_tokens_per_second": 129.35267027271,
+      "ttft_ms": 938.4378220420331,
+      "tpot_ms": 121.92389412620474,
+      "e2e_ms": 8559.02474699542
+    }
+  },
+  "vllm_mtp_output_tokens_per_second": {
+    "mtp_1": {
+      "short_burst": 114.1386388825442,
+      "decode_heavy": 119.24879388631051,
+      "draft_acceptance": 0.730617468273435
+    },
+    "mtp_3": {
+      "short_burst": 68.57290802816316,
+      "draft_acceptance": 0.46928529238039,
+      "acceptance_by_position": [
+        0.715889,
+        0.444034,
+        0.247932
+      ]
+    }
+  },
+  "phase_decode_residency": {
+    "workload": "three short_burst streaming runs",
+    "prepare_calls": 405,
+    "full_residency_hits": 332,
+    "full_residency_hit_rate": 0.8197530864197531,
+    "gathered_slots": 1303,
+    "scattered_slots": 1111
+  },
+  "vllm_settings": {
+    "version": "0.22.1+7b9cb5b7.dev",
+    "max_model_len": 4096,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "kv_cache_memory_bytes": 4294967296,
+    "gpu_memory_utilization": 0.6,
+    "performance_mode": "throughput",
+    "prefix_caching": false,
+    "nvfp4_kernel": "FlashInferCutlassNvFp4LinearKernel",
+    "gdn_prefill_kernel": "Triton/FLA fallback"
+  }
+}
