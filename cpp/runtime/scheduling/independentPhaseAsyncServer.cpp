@@ -123,6 +123,22 @@ bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequ
     return externalFraction >= minExternalRequestFraction && externalPrefillTokens >= minExternalPrefillTokens;
 }
 
+std::optional<bool> phaseAdmissionExternalProfileForEpoch(std::optional<bool> currentSelection, size_t externalRequests,
+    size_t totalRequests, size_t externalPrefillTokens, double minExternalRequestFraction,
+    size_t minExternalPrefillTokens) noexcept
+{
+    if (totalRequests == 0)
+    {
+        return std::nullopt;
+    }
+    if (currentSelection || externalPrefillTokens < minExternalPrefillTokens)
+    {
+        return currentSelection;
+    }
+    return phaseAdmissionUsesExternalProfile(
+        externalRequests, totalRequests, externalPrefillTokens, minExternalRequestFraction, minExternalPrefillTokens);
+}
+
 double phaseAdmissionProfileTpotBudget(
     double defaultBudgetUs, double externalBudgetUs, bool externalProfileActive) noexcept
 {
@@ -731,6 +747,10 @@ void IndependentPhaseAsyncServer::setExternalPendingRequests(
     mExternalMinTpotTargetUs = minTpotTargetUs;
     mExternalRequests = externalRequests;
     mExternalPrefillTokens = externalPrefillTokens;
+    size_t const totalRequests = mRequests.size() + mPendingRequests.size() + mExternalPendingRequests;
+    mAdmissionExternalProfileEpochSelection = phaseAdmissionExternalProfileForEpoch(
+        mAdmissionExternalProfileEpochSelection, mExternalRequests, totalRequests, mExternalPrefillTokens,
+        mConfig.adaptiveAdmissionExternalRequestFraction, mConfig.adaptiveAdmissionExternalPrefillTokens);
 }
 
 size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
@@ -869,10 +889,7 @@ bool IndependentPhaseAsyncServer::adaptiveAdmissionTpotBudgetSatisfiable() const
 
 bool IndependentPhaseAsyncServer::adaptiveAdmissionExternalProfileActive() const noexcept
 {
-    size_t const totalRequests = mRequests.size() + mPendingRequests.size() + mExternalPendingRequests;
-    return !mConfig.adaptiveAdmissionExternalCosts.empty()
-        && phaseAdmissionUsesExternalProfile(mExternalRequests, totalRequests, mExternalPrefillTokens,
-            mConfig.adaptiveAdmissionExternalRequestFraction, mConfig.adaptiveAdmissionExternalPrefillTokens);
+    return !mConfig.adaptiveAdmissionExternalCosts.empty() && mAdmissionExternalProfileEpochSelection.value_or(false);
 }
 
 size_t IndependentPhaseAsyncServer::adaptiveAdmissionExternalProfileSelectionCount() const noexcept

@@ -100,6 +100,24 @@ TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionSelectsExternalWorkload
     EXPECT_FALSE(phaseAdmissionUsesExternalProfile(0, 0, 2048, 0.0, 1024));
 }
 
+TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionLatchesProfileForOneBusyEpoch)
+{
+    std::optional<bool> selection;
+    selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 16, 512, 0.5, 1024);
+    EXPECT_FALSE(selection.has_value());
+    selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 16, 2048, 0.5, 1024);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_FALSE(*selection);
+    selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 4, 2048, 0.5, 1024);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_FALSE(*selection);
+    selection = phaseAdmissionExternalProfileForEpoch(selection, 0, 0, 0, 0.5, 1024);
+    EXPECT_FALSE(selection.has_value());
+    selection = phaseAdmissionExternalProfileForEpoch(selection, 12, 16, 2048, 0.5, 1024);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_TRUE(*selection);
+}
+
 TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionUsesExternalFallbackBudget)
 {
     EXPECT_DOUBLE_EQ(phaseAdmissionProfileTpotBudget(34000.0, 75000.0, true), 75000.0);

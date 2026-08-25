@@ -64,6 +64,10 @@ bool phaseAdmissionTpotBudgetSatisfiable(
 //! Select an external-phase profile from its live request share and ready-prefill token pressure.
 bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequests, size_t externalPrefillTokens,
     double minExternalRequestFraction, size_t minExternalPrefillTokens) noexcept;
+//! Latch a workload profile for one non-idle admission epoch once external prefill pressure is observable.
+std::optional<bool> phaseAdmissionExternalProfileForEpoch(std::optional<bool> currentSelection, size_t externalRequests,
+    size_t totalRequests, size_t externalPrefillTokens, double minExternalRequestFraction,
+    size_t minExternalPrefillTokens) noexcept;
 //! Choose a workload-specific fallback TPOT budget without weakening an explicit per-request target.
 double phaseAdmissionProfileTpotBudget(
     double defaultBudgetUs, double externalBudgetUs, bool externalProfileActive) noexcept;
@@ -378,6 +382,7 @@ private:
     size_t mAdaptiveAdmissionUnsatisfiableDecisionCount{};
     size_t mLastAdmissionDecisionSample{};
     bool mLastAdmissionExternalProfileActive{};
+    std::optional<bool> mAdmissionExternalProfileEpochSelection;
 };
 
 } // namespace trt_edgellm::rt
