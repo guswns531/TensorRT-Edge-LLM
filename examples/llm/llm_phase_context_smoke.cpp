@@ -409,9 +409,28 @@ int main(int argc, char** argv)
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
-    CUDA_CHECK(cudaStreamCreateWithFlags(&setupStream, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    bool const enablePhaseStreamPriorities = std::getenv("TRT_EDGELLM_PHASE_STREAM_PRIORITIES") != nullptr;
+    int leastPriority{};
+    int greatestPriority{};
+    if (enablePhaseStreamPriorities)
+    {
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+    }
+    int const normalPriority = std::clamp(0, greatestPriority, leastPriority);
+    if (enablePhaseStreamPriorities)
+    {
+        CUDA_CHECK(cudaStreamCreateWithPriority(&setupStream, cudaStreamNonBlocking, normalPriority));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&prefillStream, cudaStreamNonBlocking, normalPriority));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&decodeStream, cudaStreamNonBlocking, greatestPriority));
+        LOG_INFO("Phase stream priorities: encoder=%d prefill=%d decode=%d", leastPriority, normalPriority,
+            greatestPriority);
+    }
+    else
+    {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&setupStream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    }
 
     {
         auto executor = rt::EngineExecutor::createForLLM(engineDir / "llm.engine", config);
@@ -1331,7 +1350,14 @@ int main(int argc, char** argv)
         if (visionEngineDir != nullptr && visionImagePath != nullptr)
         {
             cudaStream_t encoderStream{};
-            CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+            if (enablePhaseStreamPriorities)
+            {
+                CUDA_CHECK(cudaStreamCreateWithPriority(&encoderStream, cudaStreamNonBlocking, leastPriority));
+            }
+            else
+            {
+                CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+            }
             {
                 auto runner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, encoderStream, checkpointDir);
@@ -1491,7 +1517,14 @@ int main(int argc, char** argv)
                 ELLM_CHECK(
                     !config.packedPrefill || config.maxPackedPrefillChunkTokens >= config.maxSupportedInputLength,
                     "Three-phase packed vision requires an atomic packed-prefill chunk covering maxInputLength");
-                CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
+                if (enablePhaseStreamPriorities)
+                {
+                    CUDA_CHECK(cudaStreamCreateWithPriority(&ipcEncoderStream, cudaStreamNonBlocking, leastPriority));
+                }
+                else
+                {
+                    CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
+                }
                 ipcVisionRunner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
                 configureVisionContextMemory(*ipcVisionRunner);
