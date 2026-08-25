@@ -1616,6 +1616,14 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.encoderBatchWaitUs = std::stod(value);
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_CREDIT_WAIT_US"))
+                {
+                    threePhaseConfig.encoderCreditWaitUs = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_CREDIT_TARGET"))
+                {
+                    threePhaseConfig.encoderCreditTargetBatchSize = static_cast<size_t>(std::stoul(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_HOMOGENEOUS_BATCHING"))
                 {
                     threePhaseConfig.enableHomogeneousEncoderBatching = std::stoi(value) != 0;
@@ -2125,6 +2133,8 @@ int main(int argc, char** argv)
                         {"vision_encoder_prefill_guard_deferrals", visionMetrics.encoderPrefillGuardDeferrals},
                         {"vision_encoder_decode_guard_deferrals", visionMetrics.encoderDecodeGuardDeferrals},
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
+                        {"vision_encoder_credit_wait_periods", visionMetrics.encoderCreditWaitPeriods},
+                        {"vision_encoder_credit_age_releases", visionMetrics.encoderCreditAgeReleases},
                         {"phase_memory_broker_decisions", visionMetrics.memoryBrokerDecisions},
                         {"phase_memory_encoder_reductions", visionMetrics.memoryBrokerEncoderReductions},
                         {"phase_memory_backpressure", visionMetrics.memoryBrokerBackpressure},

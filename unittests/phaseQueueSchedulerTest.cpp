@@ -1986,6 +1986,18 @@ TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)
     EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2048}}, 4, 0, 0, 4096), 2U);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, AccumulatesEncoderCreditsWithinBound)
+{
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 0.0, 0.0));
+    EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 999.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 1000.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(4, 4, 4, 0.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(2, 4, 2, 0.0, 1000.0));
+    EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 2, 4, 0.0, 1000.0));
+    EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 1, 4, 0.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 1, 0, 0.0, 1000.0));
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadForHomogeneousEncoderGeometry)
 {
     std::vector<PhaseVisionEncoderInput> const inputs{

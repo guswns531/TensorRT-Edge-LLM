@@ -61,6 +61,10 @@ struct PhaseThreeCoordinatorConfig
     size_t maxEncoderInputTokens{};
     //! Maximum time to wait for encoder batch formation. Zero dispatches immediately.
     double encoderBatchWaitUs{};
+    //! Maximum time to accumulate queued requests and downstream credits for a larger encoder batch.
+    double encoderCreditWaitUs{};
+    //! Desired encoder batch size while accumulating downstream credits. Zero uses the physical candidate size.
+    size_t encoderCreditTargetBatchSize{};
     //! Coalesce only requests with identical media geometry, while retaining the oldest request as the FIFO anchor.
     bool enableHomogeneousEncoderBatching{};
     //! Skip non-fitting queued requests while retaining the oldest request as the FIFO anchor.
@@ -162,6 +166,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderPrefillGuardDeferrals{};
     size_t encoderDecodeGuardDeferrals{};
     size_t encoderAgeForcedStarts{};
+    size_t encoderCreditWaitPeriods{};
+    size_t encoderCreditAgeReleases{};
     size_t memoryBrokerDecisions{};
     size_t memoryBrokerEncoderReductions{};
     size_t memoryBrokerBackpressure{};
@@ -239,6 +245,10 @@ std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncode
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
     size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U, bool requireHomogeneousGeometry = false,
     bool enableFitLookahead = false, size_t maxLookahead = 0U);
+
+//! Decide whether a partial encoder candidate should wait for queue and downstream admission credits.
+bool phaseVisionShouldAccumulateEncoderCredits(size_t admittedBatchSize, size_t candidateBatchSize,
+    size_t targetBatchSize, double oldestWaitUs, double maxWaitUs) noexcept;
 
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
@@ -388,6 +398,9 @@ private:
     size_t mEncoderPrefillGuardDeferrals{};
     size_t mEncoderDecodeGuardDeferrals{};
     size_t mEncoderAgeForcedStarts{};
+    size_t mEncoderCreditWaitPeriods{};
+    size_t mEncoderCreditAgeReleases{};
+    bool mEncoderCreditDeferred{};
     size_t mMemoryBrokerDecisions{};
     size_t mMemoryBrokerEncoderReductions{};
     size_t mMemoryBrokerBackpressure{};

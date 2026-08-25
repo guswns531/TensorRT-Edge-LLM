@@ -116,6 +116,17 @@ size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& i
         .size();
 }
 
+bool phaseVisionShouldAccumulateEncoderCredits(size_t admittedBatchSize, size_t candidateBatchSize,
+    size_t targetBatchSize, double oldestWaitUs, double maxWaitUs) noexcept
+{
+    if (maxWaitUs <= 0.0 || oldestWaitUs >= maxWaitUs)
+    {
+        return false;
+    }
+    size_t const effectiveTarget = targetBatchSize == 0U ? candidateBatchSize : targetBatchSize;
+    return admittedBatchSize < effectiveTarget;
+}
+
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
     size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept
 {
@@ -296,6 +307,11 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Three-phase prefill batch size cannot exceed downstream encoded capacity");
     ELLM_CHECK(std::isfinite(mConfig.encoderBatchWaitUs) && mConfig.encoderBatchWaitUs >= 0.0,
         "Three-phase encoder batch wait must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encoderCreditWaitUs) && mConfig.encoderCreditWaitUs >= 0.0,
+        "Three-phase encoder credit wait must be finite and non-negative");
+    ELLM_CHECK(mConfig.encoderCreditTargetBatchSize == 0
+            || mConfig.encoderCreditTargetBatchSize <= mConfig.maxEncoderBatchSize,
+        "Three-phase encoder credit target cannot exceed the encoder batch size");
     ELLM_CHECK(std::isfinite(mConfig.prefillBatchWaitUs) && mConfig.prefillBatchWaitUs >= 0.0,
         "Three-phase prefill batch wait must be finite and non-negative");
     ELLM_CHECK(
@@ -501,6 +517,8 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderPrefillGuardDeferrals = mEncoderPrefillGuardDeferrals;
     result.encoderDecodeGuardDeferrals = mEncoderDecodeGuardDeferrals;
     result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
+    result.encoderCreditWaitPeriods = mEncoderCreditWaitPeriods;
+    result.encoderCreditAgeReleases = mEncoderCreditAgeReleases;
     result.memoryBrokerDecisions = mMemoryBrokerDecisions;
     result.memoryBrokerEncoderReductions = mMemoryBrokerEncoderReductions;
     result.memoryBrokerBackpressure = mMemoryBrokerBackpressure;
@@ -777,11 +795,6 @@ void PhaseThreeCoordinator::recordTimeline(
 
 std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
 {
-    size_t capacityLimit{};
-    while (capacityLimit < mConfig.maxEncoderBatchSize && encoderCapacityAvailable(capacityLimit + 1U))
-    {
-        ++capacityLimit;
-    }
     std::vector<PhaseVisionEncoderInput> inputs;
     inputs.reserve(mPending.size());
     for (PendingVisionRequest const& pending : mPending)
@@ -789,12 +802,34 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
         inputs.push_back(
             {mediaItemCount(pending), mediaInputBytes(pending), pending.inputTokens, pending.mediaGeometry});
     }
+    double const oldestWaitUs = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - mPending.front().scheduling.submittedAt)
+                                    .count();
+    size_t potentialBatchSize{};
+    if (mConfig.encoderCreditWaitUs > 0.0)
+    {
+        potentialBatchSize = phaseVisionEncoderBatchSize(inputs, mConfig.maxEncoderBatchSize,
+            mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens,
+            mConfig.enableHomogeneousEncoderBatching, mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
+    }
+    size_t capacityLimit{};
+    while (capacityLimit < mConfig.maxEncoderBatchSize && encoderCapacityAvailable(capacityLimit + 1U))
+    {
+        ++capacityLimit;
+    }
     std::vector<size_t> batchIndices = phaseVisionEncoderBatchIndices(inputs, capacityLimit,
         mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens,
         mConfig.enableHomogeneousEncoderBatching, mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
     size_t batchSize = batchIndices.size();
     if (batchSize == 0)
     {
+        bool const waitForCredits = phaseVisionShouldAccumulateEncoderCredits(
+            0U, potentialBatchSize, mConfig.encoderCreditTargetBatchSize, oldestWaitUs, mConfig.encoderCreditWaitUs);
+        if (waitForCredits && !mEncoderCreditDeferred)
+        {
+            ++mEncoderCreditWaitPeriods;
+        }
+        mEncoderCreditDeferred = waitForCredits;
         return {};
     }
 
@@ -850,8 +885,31 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     batchSize = batchIndices.size();
     if (batchSize == 0U)
     {
+        mEncoderCreditDeferred = false;
         return {};
     }
+
+    bool const memoryAllowsCreditWait = memoryDecision.reason == PhaseMemoryBrokerReason::kDisabled
+        || memoryDecision.reason == PhaseMemoryBrokerReason::kAllowed;
+    bool const waitForCredits = memoryAllowsCreditWait
+        && phaseVisionShouldAccumulateEncoderCredits(batchSize, potentialBatchSize,
+            mConfig.encoderCreditTargetBatchSize, oldestWaitUs, mConfig.encoderCreditWaitUs);
+    if (waitForCredits)
+    {
+        if (!mEncoderCreditDeferred)
+        {
+            ++mEncoderCreditWaitPeriods;
+        }
+        mEncoderCreditDeferred = true;
+        return {};
+    }
+    size_t const creditTargetBatchSize
+        = mConfig.encoderCreditTargetBatchSize == 0U ? potentialBatchSize : mConfig.encoderCreditTargetBatchSize;
+    if (mEncoderCreditDeferred && creditTargetBatchSize > batchSize && oldestWaitUs >= mConfig.encoderCreditWaitUs)
+    {
+        ++mEncoderCreditAgeReleases;
+    }
+    mEncoderCreditDeferred = false;
 
     size_t mediaItems{};
     size_t inputBytes{};
@@ -869,9 +927,6 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     bool const tokenFull = mConfig.maxEncoderInputTokens > 0 && inputTokens >= mConfig.maxEncoderInputTokens;
     bool const resourceLimited = batchSize < inputs.size();
     bool const capacityFull = !encoderCapacityAvailable(batchSize + 1U);
-    double const oldestWaitUs = std::chrono::duration<double, std::micro>(
-        std::chrono::steady_clock::now() - mPending.front().scheduling.submittedAt)
-                                    .count();
     if (!batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
         && oldestWaitUs < mConfig.encoderBatchWaitUs)
     {
