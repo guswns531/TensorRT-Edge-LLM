@@ -1603,6 +1603,14 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.enableHomogeneousEncoderBatching = std::stoi(value) != 0;
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_FIT_LOOKAHEAD"))
+                {
+                    threePhaseConfig.enableEncoderFitLookahead = std::stoi(value) != 0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_MAX_LOOKAHEAD"))
+                {
+                    threePhaseConfig.maxEncoderLookahead = static_cast<size_t>(std::stoul(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFIX_PREFILL"))
                 {
                     threePhaseConfig.enablePrefixBeforeVisionPrefill = std::stoi(value) != 0;

@@ -69,14 +69,16 @@ bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDo
 
 std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
     size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens,
-    bool requireHomogeneousGeometry)
+    bool requireHomogeneousGeometry, bool enableFitLookahead, size_t maxLookahead)
 {
     std::vector<size_t> indices;
     indices.reserve(std::min(maxBatchSize, inputs.size()));
     size_t mediaItems{};
     size_t inputBytes{};
     size_t inputTokens{};
-    for (size_t index{}; index < inputs.size() && indices.size() < maxBatchSize; ++index)
+    size_t const candidateLimit
+        = !enableFitLookahead || maxLookahead == 0 ? inputs.size() : std::min(maxLookahead, inputs.size());
+    for (size_t index{}; index < candidateLimit && indices.size() < maxBatchSize; ++index)
     {
         PhaseVisionEncoderInput const& candidate = inputs[index];
         if (requireHomogeneousGeometry && index > 0 && candidate.mediaGeometry != inputs.front().mediaGeometry)
@@ -91,6 +93,10 @@ std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncode
             = maxInputTokens > 0 && candidate.inputTokens > maxInputTokens - std::min(inputTokens, maxInputTokens);
         if (!indices.empty() && (mediaOverflow || byteOverflow || tokenOverflow))
         {
+            if (enableFitLookahead)
+            {
+                continue;
+            }
             break;
         }
         mediaItems += candidate.mediaItems;
@@ -102,10 +108,11 @@ std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncode
 }
 
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
-    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens, bool requireHomogeneousGeometry)
+    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens, bool requireHomogeneousGeometry,
+    bool enableFitLookahead, size_t maxLookahead)
 {
-    return phaseVisionEncoderBatchIndices(
-        inputs, maxBatchSize, maxMediaItems, maxInputBytes, maxInputTokens, requireHomogeneousGeometry)
+    return phaseVisionEncoderBatchIndices(inputs, maxBatchSize, maxMediaItems, maxInputBytes, maxInputTokens,
+        requireHomogeneousGeometry, enableFitLookahead, maxLookahead)
         .size();
 }
 
@@ -752,9 +759,9 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices() const
         inputs.push_back(
             {mediaItemCount(pending), mediaInputBytes(pending), pending.inputTokens, pending.mediaGeometry});
     }
-    std::vector<size_t> const batchIndices
-        = phaseVisionEncoderBatchIndices(inputs, capacityLimit, mConfig.maxEncoderMediaItems,
-            mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens, mConfig.enableHomogeneousEncoderBatching);
+    std::vector<size_t> const batchIndices = phaseVisionEncoderBatchIndices(inputs, capacityLimit,
+        mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens,
+        mConfig.enableHomogeneousEncoderBatching, mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
     size_t const batchSize = batchIndices.size();
     if (batchSize == 0)
     {

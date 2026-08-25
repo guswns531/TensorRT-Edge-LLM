@@ -62,6 +62,10 @@ struct PhaseThreeCoordinatorConfig
     double encoderBatchWaitUs{};
     //! Coalesce only requests with identical media geometry, while retaining the oldest request as the FIFO anchor.
     bool enableHomogeneousEncoderBatching{};
+    //! Skip non-fitting queued requests while retaining the oldest request as the FIFO anchor.
+    bool enableEncoderFitLookahead{};
+    //! Maximum queued requests examined by fit lookahead. Zero examines the complete queue.
+    size_t maxEncoderLookahead{};
     //! Prefill the causal text prefix into stable KV ownership while the vision encoder is still pending.
     bool enablePrefixBeforeVisionPrefill{};
     //! Avoid a separate prefix launch below this token count. Zero accepts every non-empty prefix.
@@ -205,11 +209,12 @@ struct PhaseVisionEncoderInput
 //! Select encoder queue indices, optionally looking ahead for media geometry compatible with the FIFO anchor.
 std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
     size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U,
-    bool requireHomogeneousGeometry = false);
+    bool requireHomogeneousGeometry = false, bool enableFitLookahead = false, size_t maxLookahead = 0U);
 
-//! Select a FIFO encoder batch bounded independently by requests, media items, and raw bytes.
+//! Select an encoder batch bounded independently by requests, media items, and raw bytes.
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
-    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U, bool requireHomogeneousGeometry = false);
+    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U, bool requireHomogeneousGeometry = false,
+    bool enableFitLookahead = false, size_t maxLookahead = 0U);
 
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
