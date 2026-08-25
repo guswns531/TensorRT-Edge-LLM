@@ -32,6 +32,8 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cuda_bf16.h>
@@ -434,6 +436,13 @@ float runRepeatedE2ETiming(
     std::vector<double> e2eTimesDouble(e2eTimes.begin(), e2eTimes.end());
     auto [mean, std] = computeStats(e2eTimesDouble);
     LOG_INFO("%s E2E Time: %.4f +/- %.4f ms", modeName.c_str(), mean, std);
+    std::sort(e2eTimes.begin(), e2eTimes.end());
+    auto const percentile = [&](double fraction) {
+        size_t const index = static_cast<size_t>(std::ceil(fraction * static_cast<double>(e2eTimes.size() - 1)));
+        return e2eTimes[index];
+    };
+    LOG_INFO("%s E2E Distribution: samples=%zu min=%.4f median=%.4f p95=%.4f max=%.4f ms", modeName.c_str(),
+        e2eTimes.size(), e2eTimes.front(), percentile(0.5), percentile(0.95), e2eTimes.back());
     return static_cast<float>(mean);
 }
 
