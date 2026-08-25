@@ -879,6 +879,26 @@ void IndependentPhaseAsyncServer::setExternalPendingRequests(
     }
 }
 
+void IndependentPhaseAsyncServer::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
+{
+    mCoordinator.scheduler().setExternalDrainPreference(preference);
+}
+
+PhaseDrainPreference IndependentPhaseAsyncServer::activeDrainPreference() const noexcept
+{
+    return mCoordinator.scheduler().telemetry().activeDrainPreference;
+}
+
+size_t IndependentPhaseAsyncServer::drainPreferenceTransitionCount() const noexcept
+{
+    return mCoordinator.scheduler().telemetry().drainPreferenceTransitions;
+}
+
+size_t IndependentPhaseAsyncServer::drainPreferenceAppliedDispatchCount() const noexcept
+{
+    return mCoordinator.scheduler().telemetry().drainPreferenceAppliedDispatches;
+}
+
 size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
 {
     size_t const limit = admissionLimit();

@@ -304,6 +304,11 @@ public:
     //! Include encoder and encoded-ready work that has not entered this server yet.
     void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0, size_t externalRequests = 0U,
         size_t externalPrefillTokens = 0U) noexcept;
+    //! Forward a memory-broker drain preference into the common P/D scheduler.
+    void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
+    PhaseDrainPreference activeDrainPreference() const noexcept;
+    size_t drainPreferenceTransitionCount() const noexcept;
+    size_t drainPreferenceAppliedDispatchCount() const noexcept;
     //! Stable slots that can be admitted immediately under the current latency/throughput limit.
     size_t availableAdmissionSlots() const noexcept;
     //! Physical KV pages currently free in the shared stable page pool.

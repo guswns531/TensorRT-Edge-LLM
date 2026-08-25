@@ -1143,7 +1143,8 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
         semanticSchedulerConfig.enableDecodeTpotTelemetry
             = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr
-            || std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr;
+            || std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr
+            || std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr;
         semanticSchedulerConfig.minPrefillChunkTokens = 32;
         semanticSchedulerConfig.prefillChunkAlignment = 8;
         semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
@@ -1162,6 +1163,22 @@ int main(int argc, char** argv)
             }
         }
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
+        semanticSchedulerConfig.enableExternalDrainPreference
+            = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
+            && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_DRAIN_DWELL_DISPATCHES"))
+        {
+            semanticSchedulerConfig.externalDrainPreferenceMinDwellDispatches = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_DRAIN_MAX_CONSECUTIVE_DISPATCHES"))
+        {
+            semanticSchedulerConfig.externalDrainPreferenceMaxConsecutiveDispatches
+                = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_PREFILL_DECODE_PRESSURE_LIMIT"))
+        {
+            semanticSchedulerConfig.externalPrefillDrainDecodePressureLimit = std::stof(value);
+        }
         semanticSchedulerConfig.minMetricsSamples = 2;
         semanticSchedulerConfig.prefillQueueWaitTargetUs = 5000.0;
         semanticSchedulerConfig.decodeQueueWaitTargetUs = 2000.0;
@@ -2047,6 +2064,8 @@ int main(int argc, char** argv)
                         {"decode_replacement_rows", metrics.predictedDecodeReplacementRows},
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
+                        {"memory_drain_preference", rt::phaseDrainPreferenceName(metrics.drainPreference)},
+                        {"memory_drain_preference_applied", metrics.drainPreferenceApplied},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
                         {"adaptive_admission_limit", semanticServer.adaptiveAdmissionLimit()},
@@ -2114,6 +2133,10 @@ int main(int argc, char** argv)
                         {"phase_memory_decode_preferences", visionMetrics.memoryBrokerDecodePreferences},
                         {"phase_memory_predicted_bytes", visionMetrics.memoryBrokerLastPredictedBytes},
                         {"phase_memory_reason", rt::phaseMemoryBrokerReasonName(visionMetrics.memoryBrokerLastReason)},
+                        {"phase_memory_drain_active",
+                            rt::phaseDrainPreferenceName(visionMetrics.activeMemoryDrainPreference)},
+                        {"phase_memory_drain_transitions", visionMetrics.memoryDrainPreferenceTransitions},
+                        {"phase_memory_drain_applied_dispatches", visionMetrics.memoryDrainPreferenceAppliedDispatches},
                         {"vision_prefill_admission_batches", visionMetrics.prefillAdmissionBatches},
                         {"vision_prefill_admission_batch", visionMetrics.lastPrefillAdmissionBatchSize},
                         {"vision_prefill_admission_batch_max", visionMetrics.maxPrefillAdmissionBatchSize},

@@ -240,6 +240,8 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.adaptiveChunkDecodeQueuePressure = mInFlight.adaptiveChunkDecodeQueuePressure;
     mCurrentMetrics.adaptiveChunkObservedTpotPressure = mInFlight.adaptiveChunkObservedTpotPressure;
     mCurrentMetrics.adaptiveChunkCombinedPressure = mInFlight.adaptiveChunkCombinedPressure;
+    mCurrentMetrics.drainPreference = mInFlight.drainPreference;
+    mCurrentMetrics.drainPreferenceApplied = mInFlight.drainPreferenceApplied;
     mCurrentMetrics.plannedDecodeBatchSize = mInFlight.plannedDecodeBatchSize;
     mCurrentMetrics.plannedDecodeContextTokens = mInFlight.plannedDecodeContextTokens;
     mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;

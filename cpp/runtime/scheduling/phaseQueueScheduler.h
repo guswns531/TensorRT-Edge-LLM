@@ -96,6 +96,16 @@ enum class PhaseDispatchKind
     kOverlap,
 };
 
+//! External resource-pressure hint for draining one runnable phase without overriding expired SLOs.
+enum class PhaseDrainPreference
+{
+    kNone,
+    kPrefill,
+    kDecode,
+};
+
+char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept;
+
 struct PhaseDispatchMetrics
 {
     size_t dispatchIndex{};
@@ -163,6 +173,8 @@ struct PhaseDispatchMetrics
     int32_t pageGrowthRequestLimit{};
     int32_t pageGrowthRequestOwners{};
     float pageGrowthTpotPressure{};
+    PhaseDrainPreference drainPreference{PhaseDrainPreference::kNone};
+    bool drainPreferenceApplied{};
 };
 
 struct PhaseSchedulerTelemetry
@@ -179,6 +191,9 @@ struct PhaseSchedulerTelemetry
     float recentDecodeTpotPressure{};
     bool latencySafeFallback{};
     size_t tpotHysteresisTransitions{};
+    size_t drainPreferenceTransitions{};
+    size_t drainPreferenceAppliedDispatches{};
+    PhaseDrainPreference activeDrainPreference{PhaseDrainPreference::kNone};
     std::optional<PhaseDispatchMetrics> lastDispatch;
 };
 
@@ -435,6 +450,14 @@ struct PhaseQueueSchedulerConfig
     //! At or above this page-pool pressure, prefer draining decode work when
     //! neither queue has already violated its SLO. Zero disables the rule.
     float pagePressureDecodeThreshold{0.8F};
+    //! Permit a scheduler-external memory broker to bias safe P/D drain decisions.
+    bool enableExternalDrainPreference{};
+    //! Keep an active preference for at least this many dispatches before switching or clearing it.
+    size_t externalDrainPreferenceMinDwellDispatches{2U};
+    //! Bound consecutive preference-selected dispatches so the other runnable phase cannot starve.
+    size_t externalDrainPreferenceMaxConsecutiveDispatches{2U};
+    //! Ignore a prefill drain preference at or above this observed decode TPOT pressure. Zero disables the guard.
+    float externalPrefillDrainDecodePressureLimit{0.8F};
     size_t minMetricsSamples{2};
     float metricsEwmaAlpha{0.2F};
     //! Priority is constrained to [0, maxPriority]. Its contribution is bounded
@@ -486,6 +509,8 @@ struct PhaseDispatchPlan
     float adaptiveChunkObservedTpotPressure{};
     float adaptiveChunkCombinedPressure{};
     int32_t prefillCohortSize{};
+    PhaseDrainPreference drainPreference{PhaseDrainPreference::kNone};
+    bool drainPreferenceApplied{};
 };
 
 //! Host-side two-queue batch scheduler for phase-separated, dual-stream inference.
@@ -529,6 +554,8 @@ public:
     PhaseQueueSnapshot queueSnapshot() const;
     //! Keep online decode refinement out of latency mode while retaining learned samples.
     void setOnlineDecodeCostLearningActive(bool active) noexcept;
+    //! Update a scheduler-external resource drain hint. Disabled schedulers retain legacy decisions.
+    void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Reset learned scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
@@ -539,6 +566,9 @@ private:
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
+    void refreshExternalDrainPreference() noexcept;
+    PhaseDispatchKind applyExternalDrainPreference(
+        PhaseQueueSnapshot const& snapshot, PhaseDispatchKind baseline, bool& applied) const noexcept;
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const;
     uint64_t onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept;
     std::optional<float> onlineDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
@@ -580,6 +610,10 @@ private:
     int32_t mPrefillCohortTurns{};
     std::unordered_set<uint64_t> mDecodeCohortIds;
     std::vector<uint64_t> mPreviousDecodeSelectionIds;
+    PhaseDrainPreference mRequestedDrainPreference{PhaseDrainPreference::kNone};
+    PhaseDrainPreference mActiveDrainPreference{PhaseDrainPreference::kNone};
+    size_t mDrainPreferenceDispatches{};
+    size_t mConsecutiveDrainPreferenceDispatches{};
 };
 
 } // namespace rt

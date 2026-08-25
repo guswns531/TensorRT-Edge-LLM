@@ -87,6 +87,18 @@ size_t phaseDecodeReplacementRows(
         [&](uint64_t requestId) { return previous.find(requestId) == previous.end(); }));
 }
 
+char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept
+{
+    char const* result = "unknown";
+    switch (preference)
+    {
+    case PhaseDrainPreference::kNone: result = "none"; break;
+    case PhaseDrainPreference::kPrefill: result = "prefill"; break;
+    case PhaseDrainPreference::kDecode: result = "decode"; break;
+    }
+    return result;
+}
+
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mOnlineDecodeCostLearningActive(mConfig.enableOnlineDecodeCostLearning)
@@ -222,6 +234,12 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
         "minObservedOverlapRatio must be in [0, 1]");
     check::check(mConfig.pagePressureDecodeThreshold >= 0.0F && mConfig.pagePressureDecodeThreshold <= 1.0F,
         "pagePressureDecodeThreshold must be in [0, 1]");
+    check::check(mConfig.externalDrainPreferenceMaxConsecutiveDispatches > 0U,
+        "External drain preference consecutive dispatch limit must be positive");
+    check::check(std::isfinite(mConfig.externalPrefillDrainDecodePressureLimit)
+            && mConfig.externalPrefillDrainDecodePressureLimit >= 0.0F
+            && mConfig.externalPrefillDrainDecodePressureLimit <= 1.0F,
+        "External prefill drain decode pressure limit must be in [0, 1]");
     check::check(
         mConfig.metricsEwmaAlpha > 0.0F && mConfig.metricsEwmaAlpha <= 1.0F, "metricsEwmaAlpha must be in (0, 1]");
     check::check(mConfig.maxPriority > 0, "maxPriority must be positive");
@@ -1313,11 +1331,14 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
 
 PhaseDispatchPlan PhaseQueueScheduler::next()
 {
+    refreshExternalDrainPreference();
     PhaseQueueSnapshot const state = snapshot();
-    PhaseDispatchKind const kind = mConfig.metricsPolicy
+    PhaseDispatchKind const baseline = mConfig.metricsPolicy
         ? mConfig.metricsPolicy(state, mTelemetry)
         : (mConfig.enableMetricsPolicy ? metricsDecision(state, mTelemetry)
                                        : (mConfig.policy ? mConfig.policy(state) : defaultDecision(state)));
+    bool drainPreferenceApplied{};
+    PhaseDispatchKind const kind = applyExternalDrainPreference(state, baseline, drainPreferenceApplied);
     check::check(kind != PhaseDispatchKind::kPrefill || state.prefillQueued > 0,
         "Scheduling policy selected an empty prefill queue");
     check::check(kind != PhaseDispatchKind::kDecode || state.decodeQueued > 0,
@@ -1327,6 +1348,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 
     PhaseDispatchPlan plan;
     plan.kind = kind;
+    plan.drainPreference = mActiveDrainPreference;
+    plan.drainPreferenceApplied = drainPreferenceApplied;
     plan.adaptiveChunkDecodeQueuePressure
         = std::min(1.0F, static_cast<float>(mDecodeQueue.size()) / static_cast<float>(mConfig.maxDecodeBatchSize));
     plan.adaptiveChunkObservedTpotPressure = mTelemetry.recentDecodeTpotPressure;
@@ -1378,7 +1401,82 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     plan.predictedDecodeDebtUs = mPredictedDecodeDebtUs;
     plan.consecutiveOverlapBatches = mConsecutiveOverlapBatches;
+    if (plan.kind != PhaseDispatchKind::kNone && mActiveDrainPreference != PhaseDrainPreference::kNone)
+    {
+        ++mDrainPreferenceDispatches;
+    }
+    if (drainPreferenceApplied)
+    {
+        ++mConsecutiveDrainPreferenceDispatches;
+        ++mTelemetry.drainPreferenceAppliedDispatches;
+    }
+    else
+    {
+        mConsecutiveDrainPreferenceDispatches = 0U;
+    }
+    mTelemetry.activeDrainPreference = mActiveDrainPreference;
     return plan;
+}
+
+void PhaseQueueScheduler::refreshExternalDrainPreference() noexcept
+{
+    if (!mConfig.enableExternalDrainPreference)
+    {
+        mRequestedDrainPreference = PhaseDrainPreference::kNone;
+        mActiveDrainPreference = PhaseDrainPreference::kNone;
+        mDrainPreferenceDispatches = 0U;
+        mConsecutiveDrainPreferenceDispatches = 0U;
+        mTelemetry.activeDrainPreference = PhaseDrainPreference::kNone;
+        return;
+    }
+    if (mRequestedDrainPreference == mActiveDrainPreference)
+    {
+        return;
+    }
+    bool const canTransition = mActiveDrainPreference == PhaseDrainPreference::kNone
+        || mDrainPreferenceDispatches >= mConfig.externalDrainPreferenceMinDwellDispatches;
+    if (!canTransition)
+    {
+        return;
+    }
+    mActiveDrainPreference = mRequestedDrainPreference;
+    mDrainPreferenceDispatches = 0U;
+    mConsecutiveDrainPreferenceDispatches = 0U;
+    ++mTelemetry.drainPreferenceTransitions;
+    mTelemetry.activeDrainPreference = mActiveDrainPreference;
+}
+
+PhaseDispatchKind PhaseQueueScheduler::applyExternalDrainPreference(
+    PhaseQueueSnapshot const& state, PhaseDispatchKind baseline, bool& applied) const noexcept
+{
+    applied = false;
+    if (!mConfig.enableExternalDrainPreference || mActiveDrainPreference == PhaseDrainPreference::kNone
+        || state.prefillQueued == 0U || state.decodeQueued == 0U || state.prefillMaxSloPressure >= 1.0
+        || state.decodeMaxSloPressure >= 1.0
+        || mConsecutiveDrainPreferenceDispatches >= mConfig.externalDrainPreferenceMaxConsecutiveDispatches)
+    {
+        return baseline;
+    }
+    if (mActiveDrainPreference == PhaseDrainPreference::kPrefill)
+    {
+        bool const pagePressureBlocked = mConfig.pagePressureDecodeThreshold > 0.0F && state.pagePoolTotalBundles > 0
+            && static_cast<float>(state.pagePoolAllocatedBundles) / static_cast<float>(state.pagePoolTotalBundles)
+                >= mConfig.pagePressureDecodeThreshold;
+        bool const decodePressureBlocked = mConfig.externalPrefillDrainDecodePressureLimit > 0.0F
+            && mTelemetry.recentDecodeTpotPressure >= mConfig.externalPrefillDrainDecodePressureLimit;
+        if (pagePressureBlocked || decodePressureBlocked)
+        {
+            return baseline;
+        }
+        applied = true;
+        return PhaseDispatchKind::kPrefill;
+    }
+    if (state.consecutiveDecodeBatches >= mConfig.decodeBurstLimit)
+    {
+        return baseline;
+    }
+    applied = true;
+    return PhaseDispatchKind::kDecode;
 }
 
 std::pair<int64_t, int32_t> PhaseQueueScheduler::decodeCandidateShape(int32_t maxRows) const
@@ -1813,6 +1911,11 @@ void PhaseQueueScheduler::setOnlineDecodeCostLearningActive(bool active) noexcep
     mOnlineDecodeCostLearningActive = mConfig.enableOnlineDecodeCostLearning && active;
 }
 
+void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
+{
+    mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
+}
+
 void PhaseQueueScheduler::resetHistory()
 {
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
@@ -1828,6 +1931,10 @@ void PhaseQueueScheduler::resetHistory()
     mPrefillCohortTurns = 0;
     mDecodeCohortIds.clear();
     mPreviousDecodeSelectionIds.clear();
+    mRequestedDrainPreference = PhaseDrainPreference::kNone;
+    mActiveDrainPreference = PhaseDrainPreference::kNone;
+    mDrainPreferenceDispatches = 0U;
+    mConsecutiveDrainPreferenceDispatches = 0U;
 }
 
 } // namespace rt

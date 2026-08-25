@@ -170,6 +170,9 @@ struct PhaseThreeCoordinatorMetrics
     size_t memoryBrokerDecodePreferences{};
     size_t memoryBrokerLastPredictedBytes{};
     PhaseMemoryBrokerReason memoryBrokerLastReason{PhaseMemoryBrokerReason::kDisabled};
+    PhaseDrainPreference activeMemoryDrainPreference{PhaseDrainPreference::kNone};
+    size_t memoryDrainPreferenceTransitions{};
+    size_t memoryDrainPreferenceAppliedDispatches{};
 };
 
 //! One completed vision encoder batch measured by CUDA events.

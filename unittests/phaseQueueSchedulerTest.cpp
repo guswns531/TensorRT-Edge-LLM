@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseQueueScheduler.h"
+#include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseThreeCoordinator.h"
 
 #include <gtest/gtest.h>
@@ -176,6 +176,109 @@ TEST(PhaseQueueSchedulerTest, SupportsCustomPolicy)
     scheduler.enqueueDecode({2, 128});
 
     EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDrainPreferenceSelectsRunnablePhase)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 0U;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+
+    PhaseQueueScheduler prefillScheduler(config);
+    prefillScheduler.enqueuePrefill({1, 32});
+    prefillScheduler.enqueueDecode({2, 128});
+    prefillScheduler.setExternalDrainPreference(PhaseDrainPreference::kPrefill);
+    PhaseDispatchPlan const prefill = prefillScheduler.next();
+    EXPECT_EQ(prefill.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(prefill.drainPreference, PhaseDrainPreference::kPrefill);
+    EXPECT_TRUE(prefill.drainPreferenceApplied);
+
+    PhaseQueueScheduler decodeScheduler(config);
+    decodeScheduler.enqueuePrefill({1, 32});
+    decodeScheduler.enqueueDecode({2, 128});
+    decodeScheduler.setExternalDrainPreference(PhaseDrainPreference::kDecode);
+    PhaseDispatchPlan const decode = decodeScheduler.next();
+    EXPECT_EQ(decode.kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(decode.drainPreference, PhaseDrainPreference::kDecode);
+    EXPECT_TRUE(decode.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDrainPreferencePreservesExpiredSloDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 0U;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints overduePrefill;
+    overduePrefill.ttftTargetUs = 1.0;
+    overduePrefill.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(10);
+    scheduler.enqueuePrefill({1, 32, -1, 0, 0, true, overduePrefill});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kDecode);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_FALSE(plan.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalPrefillDrainPreservesPagePressureGuard)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 0U;
+    config.pagePressureDecodeThreshold = 0.8F;
+    config.resourceSupplier = [] { return PhaseQueueResourceSnapshot{10, 9, 1, 0, 0}; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kPrefill);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_FALSE(plan.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDrainPreferenceIsBoundedAndHasMinimumDwell)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 2U;
+    config.externalDrainPreferenceMaxConsecutiveDispatches = 2U;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 32});
+        scheduler.enqueueDecode({requestId + 4U, 128});
+    }
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kPrefill);
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.kind, PhaseDispatchKind::kPrefill);
+    scheduler.completePrefill(first.prefillBatch.front(), 32, true);
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kDecode);
+
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.kind, PhaseDispatchKind::kPrefill);
+    scheduler.completePrefill(second.prefillBatch.front(), 32, true);
+
+    PhaseDispatchPlan third = scheduler.next();
+    EXPECT_EQ(third.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(third.drainPreferenceApplied);
+    EXPECT_EQ(scheduler.telemetry().drainPreferenceTransitions, 2U);
+
+    scheduler.completeDecode(third.decodeBatch.front(), 129, true);
+    PhaseDispatchPlan fourth = scheduler.next();
+    ASSERT_EQ(fourth.kind, PhaseDispatchKind::kDecode);
+    scheduler.completeDecode(fourth.decodeBatch.front(), 129, true);
+    PhaseDispatchPlan const bounded = scheduler.next();
+    EXPECT_EQ(bounded.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_FALSE(bounded.drainPreferenceApplied);
 }
 
 TEST(PhaseQueueSchedulerTest, UsesEwmaCostToAvoidExpensiveOverlap)

@@ -423,6 +423,10 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
 
 bool PhaseThreeCoordinator::poll()
 {
+    if (!mConfig.memoryBroker.enabled || mPending.empty())
+    {
+        mServer.setExternalDrainPreference(PhaseDrainPreference::kNone);
+    }
     bool progressed = completeEncoder();
     if (!mConfig.enableEncoderDispatchArbitration)
     {
@@ -505,6 +509,9 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.memoryBrokerDecodePreferences = mMemoryBrokerDecodePreferences;
     result.memoryBrokerLastPredictedBytes = mMemoryBrokerLastPredictedBytes;
     result.memoryBrokerLastReason = mMemoryBrokerLastReason;
+    result.activeMemoryDrainPreference = mServer.activeDrainPreference();
+    result.memoryDrainPreferenceTransitions = mServer.drainPreferenceTransitionCount();
+    result.memoryDrainPreferenceAppliedDispatches = mServer.drainPreferenceAppliedDispatchCount();
     if (!mPending.empty())
     {
         result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
@@ -802,6 +809,16 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     PhaseMemoryBrokerDecision const memoryDecision = mMemoryBroker.planEncoder(
         {mServer.availableKVPages(), mReadyPrefillBytes + mServer.visionPayloadBytes(), visionMemory.idleStorageBytes},
         candidatePayloadBytes);
+    PhaseDrainPreference drainPreference = PhaseDrainPreference::kNone;
+    if (memoryDecision.preferPrefill)
+    {
+        drainPreference = PhaseDrainPreference::kPrefill;
+    }
+    if (memoryDecision.preferDecode)
+    {
+        drainPreference = PhaseDrainPreference::kDecode;
+    }
+    mServer.setExternalDrainPreference(drainPreference);
     if (mConfig.memoryBroker.enabled)
     {
         ++mMemoryBrokerDecisions;
