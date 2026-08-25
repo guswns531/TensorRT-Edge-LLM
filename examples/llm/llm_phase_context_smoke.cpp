@@ -1697,6 +1697,7 @@ int main(int argc, char** argv)
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
             }
             std::deque<rt::PhaseTimelineEvent> phaseTimelineEvents;
+            std::deque<rt::PhaseVisionEncoderBatchMetric> encoderBatchMetrics;
             if (emitPhaseMetrics)
             {
                 auto const timelineCallback
@@ -1705,6 +1706,9 @@ int main(int argc, char** argv)
                 if (ipcThreePhase != nullptr)
                 {
                     ipcThreePhase->setTimelineCallback(timelineCallback);
+                    ipcThreePhase->setEncoderBatchMetricCallback([&](rt::PhaseVisionEncoderBatchMetric const& metric) {
+                        encoderBatchMetrics.push_back(metric);
+                    });
                 }
             }
             std::deque<std::string> pendingLines;
@@ -2105,6 +2109,16 @@ int main(int argc, char** argv)
                         {"dispatch_index", event.dispatchIndex}, {"batch_size", event.batchSize},
                         {"kv_slot_id", event.kvSlotId}};
                     serializedRecords.push_back("PHASE_TIMELINE\t" + timelineEvent.dump());
+                }
+                while (emitPhaseMetrics && !encoderBatchMetrics.empty())
+                {
+                    madeProgress = true;
+                    rt::PhaseVisionEncoderBatchMetric const metric = encoderBatchMetrics.front();
+                    encoderBatchMetrics.pop_front();
+                    nlohmann::json const metricEvent{{"batch_index", metric.batchIndex},
+                        {"batch_size", metric.batchSize}, {"input_bytes", metric.inputBytes},
+                        {"input_tokens", metric.inputTokens}, {"gpu_ms", metric.gpuMs}};
+                    serializedRecords.push_back("PHASE_ENCODER_METRIC\t" + metricEvent.dump());
                 }
                 while (auto token = popTokenEvent())
                 {

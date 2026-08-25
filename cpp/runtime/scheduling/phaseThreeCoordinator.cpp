@@ -510,6 +510,13 @@ void PhaseThreeCoordinator::setTimelineCallback(std::function<void(PhaseTimeline
     mTimelineCallback = std::move(timelineCallback);
 }
 
+void PhaseThreeCoordinator::setEncoderBatchMetricCallback(
+    std::function<void(PhaseVisionEncoderBatchMetric const&)> encoderBatchMetricCallback)
+{
+    ELLM_CHECK(empty(), "Three-phase encoder metric callback can only change while the coordinator is idle");
+    mEncoderBatchMetricCallback = std::move(encoderBatchMetricCallback);
+}
+
 std::optional<IndependentPhaseServerToken> PhaseThreeCoordinator::tryPopToken()
 {
     return mServer.tryPopToken();
@@ -630,6 +637,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     {
         return false;
     }
+    size_t const batchSize = mEncoding.size();
     for (PendingVisionRequest& encoding : mEncoding)
     {
         uint64_t const requestId = encoding.requestId;
@@ -662,6 +670,11 @@ bool PhaseThreeCoordinator::completeEncoder()
         mReadyPrefillTokens += mReadyPrefill.back().promptTokens.size();
         mReadyPrefillBytes += encodedBytes;
         mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
+    }
+    if (mEncoderBatchMetricCallback)
+    {
+        mEncoderBatchMetricCallback(
+            {mEncoderBatches, batchSize, mLastEncoderInputBytes, mLastEncoderInputTokens, mLastEncoderGpuMs});
     }
     mEncoding.clear();
     return true;

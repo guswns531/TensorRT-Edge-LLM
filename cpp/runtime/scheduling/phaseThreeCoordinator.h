@@ -161,6 +161,16 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderAgeForcedStarts{};
 };
 
+//! One completed vision encoder batch measured by CUDA events.
+struct PhaseVisionEncoderBatchMetric
+{
+    size_t batchIndex{};
+    size_t batchSize{};
+    size_t inputBytes{};
+    size_t inputTokens{};
+    float gpuMs{};
+};
+
 enum class PhaseVisionEncoderDispatchReason
 {
     kLegacy,
@@ -263,6 +273,10 @@ public:
     //! Enable optional request-level encoder and prefill-handoff telemetry.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
 
+    //! Observe each completed encoder batch exactly once.
+    void setEncoderBatchMetricCallback(
+        std::function<void(PhaseVisionEncoderBatchMetric const&)> encoderBatchMetricCallback);
+
     std::optional<IndependentPhaseServerToken> tryPopToken();
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
 
@@ -317,6 +331,7 @@ private:
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
+    std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
     size_t mEstimatedEncodedBytes{};
     size_t mEncoderStarts{};
     size_t mEncoderCompletions{};
