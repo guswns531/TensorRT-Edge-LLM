@@ -334,7 +334,21 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     }
     size_t const inputTokens = mVision.estimateInputTokens(request);
     std::vector<int64_t> const geometry = mediaGeometry(request);
-    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, geometry});
+    bool prefixSubmitted{};
+    if (mConfig.enablePrefixBeforeVisionPrefill)
+    {
+        if (auto plan = mVision.makePrefixPlan(request); plan.has_value())
+        {
+            if (plan->prefixTokens.size() >= mConfig.minPrefixBeforeVisionTokens)
+            {
+                IndependentPhaseServerSubmission const prefix = mServer.submitVisionPrefix(requestId,
+                    std::move(plan->prefixTokens), plan->estimatedFinalPromptTokens, maxOutputTokens, scheduling);
+                prefixSubmitted = prefix.status == IndependentPhaseServerStatus::kAdmitted;
+            }
+        }
+    }
+    mPending.push_back(
+        {requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, geometry, prefixSubmitted});
     recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
     bool const started = !mConfig.enableEncoderDispatchArbitration && startNextEncoder();
     bool const encodingThisRequest = started
@@ -349,6 +363,10 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         [&](PendingVisionRequest const& request) { return request.requestId == requestId; });
     if (pending != mPending.end())
     {
+        if (pending->prefixSubmitted)
+        {
+            ELLM_CHECK(mServer.cancel(requestId), "Deferred vision prefix could not be cancelled");
+        }
         mPending.erase(pending);
         mRequestIds.erase(requestId);
         eraseTpotTarget(requestId);
@@ -605,6 +623,10 @@ bool PhaseThreeCoordinator::completeEncoder()
         mMaxEncoderGpuMs = std::max(mMaxEncoderGpuMs, mLastEncoderGpuMs);
         if (mCancelRequested.erase(requestId) > 0)
         {
+            if (encoding.prefixSubmitted)
+            {
+                ELLM_CHECK(mServer.cancel(requestId), "Cancelled encoder prefix could not be released");
+            }
             mRequestIds.erase(requestId);
             eraseTpotTarget(requestId);
             continue;
@@ -618,7 +640,7 @@ bool PhaseThreeCoordinator::completeEncoder()
         ELLM_CHECK(mDownstreamRequestBytes.emplace(requestId, encodedBytes).second,
             "Encoded phase request is already downstream");
         mReadyPrefill.push_back({requestId, std::move(promptTokens), std::move(sharedPayload), encoding.maxOutputTokens,
-            encoding.scheduling, encodedBytes, std::chrono::steady_clock::now()});
+            encoding.scheduling, encodedBytes, std::chrono::steady_clock::now(), encoding.prefixSubmitted});
         recordTimeline(requestId, PhaseTimelineStage::kPrefillReady, mEncoding.size());
         mReadyPrefillTokens += mReadyPrefill.back().promptTokens.size();
         mReadyPrefillBytes += encodedBytes;
@@ -649,8 +671,10 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
     while (submitted < batchSize && !mReadyPrefill.empty())
     {
         ReadyPrefillRequest& ready = mReadyPrefill.front();
-        IndependentPhaseServerSubmission const result = mServer.submitWithVision(
-            ready.requestId, ready.promptTokens, ready.payload, ready.maxOutputTokens, ready.scheduling);
+        IndependentPhaseServerSubmission const result = ready.prefixSubmitted
+            ? mServer.attachVisionSuffix(ready.requestId, ready.promptTokens, ready.payload)
+            : mServer.submitWithVision(
+                  ready.requestId, ready.promptTokens, ready.payload, ready.maxOutputTokens, ready.scheduling);
         if (result.status == IndependentPhaseServerStatus::kBackpressure)
         {
             break;
@@ -764,11 +788,24 @@ PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecis
     std::vector<IndependentPhaseAdmissionRequest> admissionRequests;
     promptTokenCounts.reserve(mReadyPrefill.size());
     admissionRequests.reserve(mReadyPrefill.size());
+    size_t attachedPrefix{};
+    bool encounteredUnattached{};
     for (ReadyPrefillRequest const& ready : mReadyPrefill)
     {
         promptTokenCounts.push_back(static_cast<int32_t>(ready.promptTokens.size()));
-        admissionRequests.push_back(
-            {ready.requestId, static_cast<int32_t>(ready.promptTokens.size()), ready.maxOutputTokens});
+        if (ready.prefixSubmitted)
+        {
+            if (!encounteredUnattached)
+            {
+                ++attachedPrefix;
+            }
+        }
+        else
+        {
+            encounteredUnattached = true;
+            admissionRequests.push_back(
+                {ready.requestId, static_cast<int32_t>(ready.promptTokens.size()), ready.maxOutputTokens});
+        }
     }
     double const oldestWaitUs
         = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mReadyPrefill.front().encodedAt)
@@ -776,7 +813,8 @@ PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecis
     return phaseVisionAdaptiveReadyPrefillDecision(promptTokenCounts, mConfig.maxPrefillBatchSize,
         mConfig.maxPrefillBatchTokens, oldestWaitUs, mConfig.prefillBatchWaitUs, mConfig.enableAdaptivePrefillAdmission,
         mConfig.adaptivePrefillMinBatchSize, mPending.size() + mEncoding.size(),
-        mServer.admissibleRequestPrefix(admissionRequests), mServer.availableKVPages(),
+        attachedPrefix + mServer.admissibleRequestPrefix(admissionRequests),
+        attachedPrefix > 0U ? std::max(mServer.availableKVPages(), 1) : mServer.availableKVPages(),
         mServer.decodeAdmissionTpotPressure(), mConfig.prefillDecodeTpotPressureLimit, mReadyPrefillBytes,
         mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio,
         mConfig.enableDecodeProtectedPrefillDeferral && mServer.adaptiveAdmissionExternalProfileActive()

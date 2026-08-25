@@ -62,6 +62,10 @@ struct PhaseThreeCoordinatorConfig
     double encoderBatchWaitUs{};
     //! Coalesce only requests with identical media geometry, while retaining the oldest request as the FIFO anchor.
     bool enableHomogeneousEncoderBatching{};
+    //! Prefill the causal text prefix into stable KV ownership while the vision encoder is still pending.
+    bool enablePrefixBeforeVisionPrefill{};
+    //! Avoid a separate prefix launch below this token count. Zero accepts every non-empty prefix.
+    size_t minPrefixBeforeVisionTokens{128U};
     //! Maximum encoded requests released together into the independent prefill scheduler. Zero inherits encoder BS.
     size_t maxPrefillBatchSize{};
     //! Optional prompt-token budget for one release into the prefill scheduler. Zero disables the token gate.
@@ -263,6 +267,7 @@ private:
         PhaseSchedulingHints scheduling;
         size_t inputTokens{};
         std::vector<int64_t> mediaGeometry;
+        bool prefixSubmitted{};
     };
 
     struct ReadyPrefillRequest
@@ -274,6 +279,7 @@ private:
         PhaseSchedulingHints scheduling;
         size_t payloadBytes{};
         std::chrono::steady_clock::time_point encodedAt;
+        bool prefixSubmitted{};
     };
 
     bool startNextEncoder();

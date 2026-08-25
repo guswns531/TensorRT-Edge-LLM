@@ -98,6 +98,12 @@ struct PhaseVisionSubmission
     LLMGenerationRequest request;
 };
 
+struct PhaseVisionPrefixPlan
+{
+    std::vector<int32_t> prefixTokens;
+    int32_t estimatedFinalPromptTokens{};
+};
+
 //! Host copy of one encoder boundary tensor for opt-in numerical bisecting.
 struct PhaseVisionDebugTensor
 {
@@ -141,6 +147,8 @@ public:
     bool cancel(uint64_t requestId);
     bool busy() const noexcept;
     size_t estimateInputTokens(LLMGenerationRequest const& request);
+    //! Tokenize the causal text prefix before the first image placeholder without launching encoder work.
+    std::optional<PhaseVisionPrefixPlan> makePrefixPlan(LLMGenerationRequest const& request);
     size_t maxInputTokens() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;

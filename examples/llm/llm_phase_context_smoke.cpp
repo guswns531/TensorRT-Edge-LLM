@@ -1570,6 +1570,14 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.enableHomogeneousEncoderBatching = std::stoi(value) != 0;
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFIX_PREFILL"))
+                {
+                    threePhaseConfig.enablePrefixBeforeVisionPrefill = std::stoi(value) != 0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFIX_MIN_TOKENS"))
+                {
+                    threePhaseConfig.minPrefixBeforeVisionTokens = static_cast<size_t>(std::stoul(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE"))
                 {
                     threePhaseConfig.maxPrefillBatchSize = static_cast<size_t>(std::stoul(value));

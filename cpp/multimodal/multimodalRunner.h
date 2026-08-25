@@ -125,8 +125,7 @@ public:
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false)
-        = 0;
+        cudaStream_t stream, bool imageOnly = false) = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
@@ -169,6 +168,9 @@ public:
 
     //! Estimate model-specific encoder input tokens without launching CUDA work. Zero means unavailable.
     virtual int64_t estimateInputTokens(rt::LLMGenerationRequest const& request);
+
+    //! Estimate request-local encoder output rows inserted into the LLM prompt. Zero means unavailable.
+    virtual int64_t estimateOutputTokens(rt::LLMGenerationRequest const& request);
 
     //! Return the physical encoder input-token budget. Zero means the runner does not expose one.
     virtual int64_t maxInputTokens() const noexcept;

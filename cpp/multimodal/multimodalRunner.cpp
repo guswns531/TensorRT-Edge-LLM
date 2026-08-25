@@ -283,6 +283,11 @@ int64_t MultimodalRunner::estimateInputTokens(rt::LLMGenerationRequest const& re
     return 0;
 }
 
+int64_t MultimodalRunner::estimateOutputTokens(rt::LLMGenerationRequest const& request)
+{
+    return estimateInputTokens(request);
+}
+
 int64_t MultimodalRunner::maxInputTokens() const noexcept
 {
     return 0;

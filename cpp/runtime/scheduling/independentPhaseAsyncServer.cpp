@@ -382,9 +382,42 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitWithVision(u
     return submitImpl(requestId, std::move(promptTokens), std::move(visionPayload), maxOutputTokens, scheduling);
 }
 
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitVisionPrefix(uint64_t requestId,
+    std::vector<int32_t> prefixTokens, int32_t estimatedFinalPromptTokens, int32_t maxOutputTokens,
+    PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(!prefixTokens.empty(), "Deferred vision prefix must not be empty");
+    ELLM_CHECK(estimatedFinalPromptTokens >= static_cast<int32_t>(prefixTokens.size()),
+        "Deferred vision prompt estimate cannot be shorter than its prefix");
+    recordTimeline(requestId, PhaseTimelineStage::kServerSubmit);
+    return submitImpl(
+        requestId, std::move(prefixTokens), nullptr, maxOutputTokens, scheduling, estimatedFinalPromptTokens, true);
+}
+
+IndependentPhaseServerSubmission IndependentPhaseAsyncServer::attachVisionSuffix(
+    uint64_t requestId, std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload)
+{
+    IndependentPhaseServerSubmission result{requestId};
+    auto const found = mRequests.find(requestId);
+    if (found == mRequests.end() || !found->second.awaitingVisionPayload || visionPayload == nullptr)
+    {
+        result.status = IndependentPhaseServerStatus::kDuplicateRequest;
+        return result;
+    }
+    RequestState& state = found->second;
+    ELLM_CHECK(promptTokens.size() >= state.promptTokens.size()
+            && std::equal(state.promptTokens.begin(), state.promptTokens.end(), promptTokens.begin()),
+        "Expanded vision prompt does not preserve the prefilled text prefix");
+    state.pendingVisionPromptTokens = std::move(promptTokens);
+    state.pendingVisionPayload = std::move(visionPayload);
+    result.status = IndependentPhaseServerStatus::kAdmitted;
+    result.kvSlotId = state.kvSlotId;
+    return result;
+}
+
 IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_t requestId,
     std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens,
-    PhaseSchedulingHints scheduling)
+    PhaseSchedulingHints scheduling, int32_t reservationPromptTokens, bool deferredVisionPrefix)
 {
     bool const allowChunkedPrefill = visionPayload == nullptr || mConfig.allowChunkedVisionPrefill;
     bool const exclusivePrefill = visionPayload != nullptr && !mConfig.allowBatchedVisionPrefill;
@@ -404,9 +437,11 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     maxOutputTokens = maxOutputTokens > 0 ? maxOutputTokens : mConfig.defaultMaxOutputTokens;
 
     IndependentPhasePageReservation reservation;
+    int32_t const reservedPromptTokens
+        = reservationPromptTokens > 0 ? reservationPromptTokens : static_cast<int32_t>(promptTokens.size());
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
-        reservation = makePageReservation(requestId, static_cast<int32_t>(promptTokens.size()), maxOutputTokens);
+        reservation = makePageReservation(requestId, reservedPromptTokens, maxOutputTokens);
         if (!hasPageReservationCapacity(reservation))
         {
             return result;
@@ -428,7 +463,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
         int32_t const reservedOutput = mConfig.pageReservationMode == IndependentPhasePageReservationMode::kFull
             ? maxOutputTokens
             : std::min(maxOutputTokens, mConfig.outputHeadroomTokens);
-        mOwnership.ensureCapacity(slot, static_cast<int32_t>(promptTokens.size()) + reservedOutput);
+        mOwnership.ensureCapacity(slot, reservedPromptTokens + reservedOutput);
     }
     catch (std::runtime_error const&)
     {
@@ -442,10 +477,11 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     state.kvSlotId = slot;
     state.scheduling = scheduling;
     state.submittedAt = std::chrono::steady_clock::now();
-    state.externalProducer = visionPayload != nullptr;
+    state.externalProducer = visionPayload != nullptr || deferredVisionPrefix;
     state.visionPayload = std::move(visionPayload);
     state.baseReservedPages = reservation.basePages;
     state.fullReservedPages = reservation.fullPages;
+    state.awaitingVisionPayload = deferredVisionPrefix;
     mRequests.emplace(requestId, std::move(state));
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
@@ -460,6 +496,40 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     result.reusedPrefixTokens = reusedPrefixTokens;
     recordTimeline(requestId, PhaseTimelineStage::kServerAdmit, slot);
     return result;
+}
+
+void IndependentPhaseAsyncServer::activateVisionSuffix(uint64_t requestId, RequestState& state)
+{
+    ELLM_CHECK(state.awaitingVisionPayload && state.visionPrefixComplete && state.pendingVisionPayload != nullptr,
+        "Deferred vision suffix is not ready for activation");
+    int32_t const prefixTokens = static_cast<int32_t>(state.promptTokens.size());
+    int32_t const finalPromptTokens = static_cast<int32_t>(state.pendingVisionPromptTokens.size());
+    ELLM_CHECK(finalPromptTokens > prefixTokens, "Deferred vision suffix must extend its text prefix");
+    int32_t const reservedOutput = mConfig.pageReservationMode == IndependentPhasePageReservationMode::kFull
+        ? state.maxOutputTokens
+        : std::min(state.maxOutputTokens, mConfig.outputHeadroomTokens);
+    mOwnership.ensureCapacity(state.kvSlotId, finalPromptTokens + reservedOutput);
+    state.promptTokens = std::move(state.pendingVisionPromptTokens);
+    state.visionPayload = std::move(state.pendingVisionPayload);
+    state.awaitingVisionPayload = false;
+    bool const allowChunkedPrefill = mConfig.allowChunkedVisionPrefill;
+    bool const exclusivePrefill = !mConfig.allowBatchedVisionPrefill;
+    mCoordinator.enqueuePrefill({requestId, finalPromptTokens - prefixTokens, state.kvSlotId, prefixTokens,
+        finalPromptTokens, allowChunkedPrefill, state.scheduling, exclusivePrefill, PhasePrefillClass::kExternal});
+}
+
+bool IndependentPhaseAsyncServer::activateReadyVisionSuffixes()
+{
+    bool activated{};
+    for (auto& [requestId, state] : mRequests)
+    {
+        if (state.awaitingVisionPayload && state.visionPrefixComplete && state.pendingVisionPayload != nullptr)
+        {
+            activateVisionSuffix(requestId, state);
+            activated = true;
+        }
+    }
+    return activated;
 }
 
 IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueue(
@@ -569,6 +639,7 @@ bool IndependentPhaseAsyncServer::poll()
     bool progressed = admitPendingRequests();
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = mCoordinator.poll() || progressed;
+    progressed = activateReadyVisionSuffixes() || progressed;
     progressed = processSamplingTickets() || progressed;
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = admitPendingRequests() || progressed;
@@ -1256,6 +1327,12 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
               {
                   if (view.work.tokenOffset + view.work.tokenCount == static_cast<int32_t>(view.promptTokens->size()))
                   {
+                      RequestState& state = mRequests.at(view.requestId);
+                      if (state.awaitingVisionPayload)
+                      {
+                          state.visionPrefixComplete = true;
+                          continue;
+                      }
                       finalViews.push_back(view);
                   }
               }

@@ -434,6 +434,15 @@ int64_t QwenViTRunner::estimateInputTokens(rt::LLMGenerationRequest const& reque
     return result;
 }
 
+int64_t QwenViTRunner::estimateOutputTokens(rt::LLMGenerationRequest const& request)
+{
+    int64_t const inputTokens = estimateInputTokens(request);
+    int64_t const mergeArea = mConfig.mergeSize * mConfig.mergeSize;
+    ELLM_CHECK(mergeArea > 0 && inputTokens % mergeArea == 0,
+        "Estimated Qwen visual input tokens are not divisible by the spatial merge area");
+    return inputTokens / mergeArea;
+}
+
 int64_t QwenViTRunner::maxInputTokens() const noexcept
 {
     return mConfig.maxHW;

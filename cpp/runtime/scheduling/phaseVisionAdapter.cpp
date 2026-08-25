@@ -21,6 +21,7 @@
 #include "common/cudaMacros.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <unordered_set>
 #include <utility>
@@ -503,6 +504,44 @@ size_t PhaseVisionAdapter::estimateInputTokens(LLMGenerationRequest const& reque
     int64_t const tokens = mRunner.estimateInputTokens(request);
     ELLM_CHECK(tokens >= 0, "Vision runner returned a negative input-token estimate");
     return static_cast<size_t>(tokens);
+}
+
+std::optional<PhaseVisionPrefixPlan> PhaseVisionAdapter::makePrefixPlan(LLMGenerationRequest const& request)
+{
+    if (request.requests.size() != 1U)
+    {
+        return std::nullopt;
+    }
+    LLMGenerationRequest::FormattedRequest formatted;
+    if (request.formattedRequests.size() == 1U && !request.formattedRequests.front().formattedCompleteRequest.empty())
+    {
+        formatted = request.formattedRequests.front();
+    }
+    else if (!mTokenizer.applyChatTemplate(request.requests.front(), formatted, request.applyChatTemplate,
+                 request.addGenerationPrompt, request.enableThinking))
+    {
+        return std::nullopt;
+    }
+    std::vector<int32_t> const rawTokens = mTokenizer.encode(formatted.formattedCompleteRequest);
+    auto const firstImage = std::find(rawTokens.begin(), rawTokens.end(), mConfig.imageTokenId);
+    if (firstImage == rawTokens.end() || firstImage == rawTokens.begin())
+    {
+        return std::nullopt;
+    }
+    int64_t const outputTokens = mRunner.estimateOutputTokens(request);
+    size_t const placeholderTokens
+        = static_cast<size_t>(std::count(rawTokens.begin(), rawTokens.end(), mConfig.imageTokenId));
+    if (outputTokens <= 0 || placeholderTokens == 0U)
+    {
+        return std::nullopt;
+    }
+    int64_t const estimatedFinal = static_cast<int64_t>(rawTokens.size() - placeholderTokens) + outputTokens;
+    ELLM_CHECK(estimatedFinal > 0 && estimatedFinal <= std::numeric_limits<int32_t>::max(),
+        "Estimated expanded vision prompt length is invalid");
+    PhaseVisionPrefixPlan plan;
+    plan.prefixTokens.assign(rawTokens.begin(), firstImage);
+    plan.estimatedFinalPromptTokens = static_cast<int32_t>(estimatedFinal);
+    return plan;
 }
 
 size_t PhaseVisionAdapter::maxInputTokens() const noexcept

@@ -273,6 +273,12 @@ public:
     IndependentPhaseServerSubmission submitWithVision(uint64_t requestId, std::vector<int32_t> promptTokens,
         std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens = 0,
         PhaseSchedulingHints scheduling = {});
+    //! Admit a text prefix into stable KV ownership before its encoder payload is ready.
+    IndependentPhaseServerSubmission submitVisionPrefix(uint64_t requestId, std::vector<int32_t> prefixTokens,
+        int32_t estimatedFinalPromptTokens, int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
+    //! Attach the expanded multimodal prompt and encoder payload to a previously admitted prefix.
+    IndependentPhaseServerSubmission attachVisionSuffix(
+        uint64_t requestId, std::vector<int32_t> promptTokens, std::shared_ptr<PhaseVisionPayload> visionPayload);
     IndependentPhaseServerSubmission submitOrQueueWithVision(uint64_t requestId, std::vector<int32_t> promptTokens,
         std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens = 0,
         PhaseSchedulingHints scheduling = {});
@@ -342,6 +348,10 @@ private:
         int32_t fullReservedPages{};
         bool pageGrowthStarted{};
         bool externalProducer{};
+        bool awaitingVisionPayload{};
+        bool visionPrefixComplete{};
+        std::vector<int32_t> pendingVisionPromptTokens;
+        std::shared_ptr<PhaseVisionPayload> pendingVisionPayload;
     };
 
     struct PendingRequest
@@ -355,7 +365,8 @@ private:
 
     IndependentPhaseCoordinatorCallbacks makeCallbacks();
     IndependentPhaseServerSubmission submitImpl(uint64_t requestId, std::vector<int32_t> promptTokens,
-        std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens, PhaseSchedulingHints scheduling);
+        std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens, PhaseSchedulingHints scheduling,
+        int32_t reservationPromptTokens = 0, bool deferredVisionPrefix = false);
     IndependentPhaseServerSubmission submitOrQueueImpl(uint64_t requestId, std::vector<int32_t> promptTokens,
         std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens, PhaseSchedulingHints scheduling);
     std::vector<IndependentPhaseRequestView> makeViews(std::vector<PhaseWorkItem> const& batch) const;
@@ -363,6 +374,8 @@ private:
     bool admitPendingRequests();
     bool resumePendingDecodeRequests();
     bool enqueueDecodeOrWait(uint64_t requestId, RequestState& state);
+    void activateVisionSuffix(uint64_t requestId, RequestState& state);
+    bool activateReadyVisionSuffixes();
     IndependentPhasePageReservation makePageReservation(
         uint64_t requestId, int32_t promptTokens, int32_t maxOutputTokens) const;
     bool hasPageReservationCapacity(IndependentPhasePageReservation const& reservation) const;
