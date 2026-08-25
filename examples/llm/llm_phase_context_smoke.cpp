@@ -1497,6 +1497,42 @@ int main(int argc, char** argv)
                 configureVisionContextMemory(*ipcVisionRunner);
                 ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
                     *ipcVisionRunner, tokenizer, config, ipcEncoderStream, visionStoragePolicy);
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_DEBUG_DIR"))
+                {
+                    std::filesystem::path const debugDirectory(value);
+                    std::filesystem::create_directories(debugDirectory);
+                    ipcVisionAdapter->setDebugCallback([debugDirectory](rt::PhaseVisionDebugSnapshot const& snapshot) {
+                        std::string const stem = "request-" + std::to_string(snapshot.requestId) + "-bs"
+                            + std::to_string(snapshot.encoderBatchSize) + "-row"
+                            + std::to_string(snapshot.encoderBatchIndex);
+                        auto const writeTensor = [&](std::string const& name,
+                                                     rt::PhaseVisionDebugTensor const& tensor) {
+                            std::filesystem::path const path = debugDirectory / (stem + "-" + name + ".bin");
+                            std::ofstream stream(path, std::ios::binary);
+                            ELLM_CHECK(stream.good(), "Failed to open phase vision debug tensor: " + path.string());
+                            stream.write(reinterpret_cast<char const*>(tensor.bytes.data()),
+                                static_cast<std::streamsize>(tensor.bytes.size()));
+                            ELLM_CHECK(stream.good(), "Failed to write phase vision debug tensor: " + path.string());
+                            return path.filename().string();
+                        };
+                        std::string const embeddingFile = writeTensor("embedding", snapshot.outputEmbedding);
+                        std::string const mropeFile = writeTensor("mrope", snapshot.mropeCosSin);
+                        nlohmann::json const metadata{{"request_id", snapshot.requestId},
+                            {"encoder_batch_size", snapshot.encoderBatchSize},
+                            {"encoder_batch_index", snapshot.encoderBatchIndex}, {"token_ids", snapshot.tokenIds},
+                            {"embedding_file", embeddingFile}, {"embedding_shape", snapshot.outputEmbedding.shape},
+                            {"embedding_data_type", static_cast<int32_t>(snapshot.outputEmbedding.dataType)},
+                            {"mrope_file", mropeFile}, {"mrope_shape", snapshot.mropeCosSin.shape},
+                            {"mrope_data_type", static_cast<int32_t>(snapshot.mropeCosSin.dataType)}};
+                        std::filesystem::path const metadataPath = debugDirectory / (stem + ".json");
+                        std::ofstream metadataStream(metadataPath);
+                        ELLM_CHECK(metadataStream.good(),
+                            "Failed to open phase vision debug metadata: " + metadataPath.string());
+                        metadataStream << metadata.dump(2) << '\n';
+                        ELLM_CHECK(metadataStream.good(),
+                            "Failed to write phase vision debug metadata: " + metadataPath.string());
+                    });
+                }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION"))
                 {

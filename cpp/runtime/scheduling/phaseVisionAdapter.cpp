@@ -69,6 +69,26 @@ size_t storageByteSize(PhaseVisionBatchStorage const& storage) noexcept
     result += capacity(storage.mropeCosSin);
     return result;
 }
+
+PhaseVisionDebugTensor captureDebugTensor(Tensor const& tensor, cudaStream_t stream)
+{
+    PhaseVisionDebugTensor result;
+    if (tensor.isEmpty())
+    {
+        return result;
+    }
+    Coords const shape = tensor.getShape();
+    result.shape.reserve(static_cast<size_t>(shape.getNumDims()));
+    for (int32_t dim{}; dim < shape.getNumDims(); ++dim)
+    {
+        result.shape.push_back(shape[dim]);
+    }
+    result.dataType = tensor.getDataType();
+    size_t const bytes = static_cast<size_t>(shape.volume()) * utils::getTypeSize(result.dataType);
+    result.bytes.resize(bytes);
+    CUDA_CHECK(cudaMemcpyAsync(result.bytes.data(), tensor.rawPointer(), bytes, cudaMemcpyDeviceToHost, stream));
+    return result;
+}
 } // namespace
 
 PhaseVisionPayload::~PhaseVisionPayload() noexcept
@@ -372,6 +392,11 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
         }
 
         int64_t embeddingOffset{};
+        std::vector<PhaseVisionDebugSnapshot> debugSnapshots;
+        if (mDebugCallback)
+        {
+            debugSnapshots.reserve(submissions.size());
+        }
         for (size_t index = 0; index < submissions.size(); ++index)
         {
             int64_t const rowCount = embeddingRows[index];
@@ -392,10 +417,29 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
                 payload.mropeCosSin
                     = viewTensorRows(*mropeCosSin, static_cast<int64_t>(index), 1, "phase_vision_mrope");
             }
+            if (mDebugCallback)
+            {
+                PhaseVisionDebugSnapshot snapshot;
+                snapshot.requestId = submissions[index].requestId;
+                snapshot.encoderBatchSize = submissions.size();
+                snapshot.encoderBatchIndex = index;
+                snapshot.tokenIds = payload.tokenIds.front();
+                snapshot.outputEmbedding = captureDebugTensor(payload.outputEmbedding, mStream);
+                snapshot.mropeCosSin = captureDebugTensor(payload.mropeCosSin, mStream);
+                debugSnapshots.push_back(std::move(snapshot));
+            }
             embeddingOffset += rowCount;
             CUDA_CHECK(cudaEventRecord(payload.readyEvent, mStream));
         }
         ELLM_CHECK(embeddingOffset == totalEmbeddingRows, "Phase vision embedding slicing did not consume all rows");
+        if (!debugSnapshots.empty())
+        {
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
+            for (PhaseVisionDebugSnapshot const& snapshot : debugSnapshots)
+            {
+                mDebugCallback(snapshot);
+            }
+        }
     }
     catch (...)
     {
@@ -475,6 +519,12 @@ CUcontext PhaseVisionAdapter::cudaContext() const noexcept
 PhaseVisionMemoryStats const& PhaseVisionAdapter::memoryStats() const noexcept
 {
     return mMemoryStats;
+}
+
+void PhaseVisionAdapter::setDebugCallback(std::function<void(PhaseVisionDebugSnapshot const&)> callback)
+{
+    ELLM_CHECK(!busy(), "Phase vision debug callback can only change while the adapter is idle");
+    mDebugCallback = std::move(callback);
 }
 
 void PhaseVisionAdapter::refreshIdleStorageStats() noexcept

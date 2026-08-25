@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -97,6 +98,25 @@ struct PhaseVisionSubmission
     LLMGenerationRequest request;
 };
 
+//! Host copy of one encoder boundary tensor for opt-in numerical bisecting.
+struct PhaseVisionDebugTensor
+{
+    std::vector<int64_t> shape;
+    nvinfer1::DataType dataType{nvinfer1::DataType::kFLOAT};
+    std::vector<std::byte> bytes;
+};
+
+//! Per-request encoder outputs captured before downstream prefill ownership transfer.
+struct PhaseVisionDebugSnapshot
+{
+    uint64_t requestId{};
+    size_t encoderBatchSize{};
+    size_t encoderBatchIndex{};
+    std::vector<int32_t> tokenIds;
+    PhaseVisionDebugTensor outputEmbedding;
+    PhaseVisionDebugTensor mropeCosSin;
+};
+
 //! Return the contiguous vision-embedding row count for every expanded token row.
 std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> const& tokenIds, int32_t imageTokenId);
 
@@ -125,6 +145,8 @@ public:
     CUcontext cudaContext() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;
     void reclaimIdleStorage();
+    //! Enable synchronous debug capture only while the adapter is idle.
+    void setDebugCallback(std::function<void(PhaseVisionDebugSnapshot const&)> callback);
 
 private:
     static Tensor viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name);
@@ -145,6 +167,7 @@ private:
     std::vector<std::shared_ptr<PhaseVisionBatchStorage>> mStoragePool;
     size_t mStorageGeneration{};
     PhaseVisionMemoryStats mMemoryStats;
+    std::function<void(PhaseVisionDebugSnapshot const&)> mDebugCallback;
 };
 
 } // namespace trt_edgellm::rt
