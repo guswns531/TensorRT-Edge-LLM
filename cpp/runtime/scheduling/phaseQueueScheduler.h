@@ -101,6 +101,12 @@ struct PhaseDispatchMetrics
     size_t dispatchIndex{};
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
     PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
+    //! Host monotonic timestamps bracketing this asynchronous dispatch plan.
+    uint64_t hostDispatchStartNs{};
+    uint64_t hostCompletionNs{};
+    //! Stable request membership used to join dispatch metrics with request timelines.
+    std::vector<uint64_t> prefillRequestIds;
+    std::vector<uint64_t> decodeRequestIds;
     int32_t prefillBatchSize{};
     int32_t decodeBatchSize{};
     int32_t prefillTokens{};

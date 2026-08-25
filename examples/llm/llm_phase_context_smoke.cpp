@@ -1579,6 +1579,17 @@ int main(int argc, char** argv)
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
             }
+            std::deque<rt::PhaseTimelineEvent> phaseTimelineEvents;
+            if (emitPhaseMetrics)
+            {
+                auto const timelineCallback
+                    = [&](rt::PhaseTimelineEvent const& event) { phaseTimelineEvents.push_back(event); };
+                semanticServer.setTimelineCallback(timelineCallback);
+                if (ipcThreePhase != nullptr)
+                {
+                    ipcThreePhase->setTimelineCallback(timelineCallback);
+                }
+            }
             std::deque<std::string> pendingLines;
             std::mutex pendingMutex;
             bool inputClosed{};
@@ -1873,6 +1884,10 @@ int main(int argc, char** argv)
                         = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
+                        {"host_dispatch_start_us", static_cast<double>(metrics.hostDispatchStartNs) / 1000.0},
+                        {"host_completion_us", static_cast<double>(metrics.hostCompletionNs) / 1000.0},
+                        {"prefill_request_ids", metrics.prefillRequestIds},
+                        {"decode_request_ids", metrics.decodeRequestIds},
                         {"prefill_class", static_cast<int32_t>(metrics.prefillClass)},
                         {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
                         {"prefill_chunk_length", metrics.prefillCostLookupChunkLength},
@@ -1956,6 +1971,18 @@ int main(int argc, char** argv)
                         {"vision_prefill_ready_wait_ms", visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0},
                         {"vision_prefill_ready_wait_max_ms", visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0}};
                     serializedRecords.push_back("PHASE_METRIC\t" + metricEvent.dump());
+                }
+                while (emitPhaseMetrics && !phaseTimelineEvents.empty())
+                {
+                    madeProgress = true;
+                    rt::PhaseTimelineEvent const event = phaseTimelineEvents.front();
+                    phaseTimelineEvents.pop_front();
+                    nlohmann::json const timelineEvent{{"type", "timeline"}, {"request_index", event.requestId},
+                        {"stage", std::string(rt::phaseTimelineStageName(event.stage))},
+                        {"timestamp_us", static_cast<double>(event.timestampNs) / 1000.0},
+                        {"dispatch_index", event.dispatchIndex}, {"batch_size", event.batchSize},
+                        {"kv_slot_id", event.kvSlotId}};
+                    serializedRecords.push_back("PHASE_TIMELINE\t" + timelineEvent.dump());
                 }
                 while (auto token = popTokenEvent())
                 {

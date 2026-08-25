@@ -257,6 +257,8 @@ public:
     //! Empty callbacks preserve the polling queues.
     void setEventCallbacks(std::function<void(IndependentPhaseServerToken&&)> tokenCallback,
         std::function<void(IndependentPhaseServerCompletion&&)> completionCallback);
+    //! Enable optional request-level host transition telemetry while the server is idle.
+    void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     bool poll();
     void runUntilIdle(size_t maxPolls);
 
@@ -347,6 +349,7 @@ private:
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
     void destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept;
+    void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, int32_t kvSlotId = -1) const;
 
     IndependentPhaseServerConfig mConfig;
     IndependentPhaseCoordinator& mCoordinator;
@@ -364,6 +367,7 @@ private:
     std::deque<IndependentPhaseServerCompletion> mCompletions;
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
     std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
+    std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     size_t mDecodeRefillWaitCount{};
     size_t mPageGrowthWaitCount{};
     size_t mVisionPrefillReleaseCount{};

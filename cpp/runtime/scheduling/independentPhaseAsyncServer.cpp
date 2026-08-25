@@ -345,6 +345,7 @@ IndependentPhaseAsyncServer::~IndependentPhaseAsyncServer() noexcept
 IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submit(
     uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
 {
+    recordTimeline(requestId, PhaseTimelineStage::kServerSubmit);
     return submitImpl(requestId, std::move(promptTokens), nullptr, maxOutputTokens, scheduling);
 }
 
@@ -353,6 +354,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitWithVision(u
     PhaseSchedulingHints scheduling)
 {
     ELLM_CHECK(visionPayload != nullptr, "Vision phase submission requires an encoded payload");
+    recordTimeline(requestId, PhaseTimelineStage::kServerSubmit);
     return submitImpl(requestId, std::move(promptTokens), std::move(visionPayload), maxOutputTokens, scheduling);
 }
 
@@ -431,12 +433,14 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     result.status = IndependentPhaseServerStatus::kAdmitted;
     result.kvSlotId = slot;
     result.reusedPrefixTokens = reusedPrefixTokens;
+    recordTimeline(requestId, PhaseTimelineStage::kServerAdmit, slot);
     return result;
 }
 
 IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueue(
     uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
 {
+    recordTimeline(requestId, PhaseTimelineStage::kServerSubmit);
     return submitOrQueueImpl(requestId, std::move(promptTokens), nullptr, maxOutputTokens, scheduling);
 }
 
@@ -445,6 +449,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueueWithV
     PhaseSchedulingHints scheduling)
 {
     ELLM_CHECK(visionPayload != nullptr, "Queued vision phase submission requires an encoded payload");
+    recordTimeline(requestId, PhaseTimelineStage::kServerSubmit);
     return submitOrQueueImpl(requestId, std::move(promptTokens), std::move(visionPayload), maxOutputTokens, scheduling);
 }
 
@@ -520,6 +525,13 @@ void IndependentPhaseAsyncServer::setEventCallbacks(std::function<void(Independe
     mTokenCallback = std::move(tokenCallback);
     mCompletionCallback = std::move(completionCallback);
     static_cast<void>(flushEventCallbacks());
+}
+
+void IndependentPhaseAsyncServer::setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback)
+{
+    ELLM_CHECK(mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty(),
+        "Phase timeline callback can only change while the server is idle");
+    mTimelineCallback = std::move(timelineCallback);
 }
 
 bool IndependentPhaseAsyncServer::poll()
@@ -1181,6 +1193,12 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
         return item.tokenOffset + item.tokenCount == item.promptTokenCount;
     };
     callbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
+    callbacks.onTimeline = [this](PhaseTimelineEvent const& event) {
+        if (mTimelineCallback)
+        {
+            mTimelineCallback(event);
+        }
+    };
     return callbacks;
 }
 
@@ -1271,6 +1289,10 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
             = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
         mTokenEvents.push_back(
             {requestId, tokens[index], static_cast<int32_t>(state.generatedTokens.size() - 1U), eos, elapsedMs});
+        if (state.generatedTokens.size() == 1U)
+        {
+            recordTimeline(requestId, PhaseTimelineStage::kFirstToken, state.kvSlotId);
+        }
         if (eos || static_cast<int32_t>(state.generatedTokens.size()) >= state.maxOutputTokens)
         {
             finishRequest(requestId, eos);
@@ -1288,6 +1310,7 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     auto it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Finished phase request is missing");
     RequestState& state = it->second;
+    recordTimeline(requestId, PhaseTimelineStage::kCompletion, state.kvSlotId);
     if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && mPrefixCache != nullptr
         && state.promptTokens.size() >= 128U)
     {
@@ -1305,6 +1328,14 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
         refreshPageGrowthOwners();
+    }
+}
+
+void IndependentPhaseAsyncServer::recordTimeline(uint64_t requestId, PhaseTimelineStage stage, int32_t kvSlotId) const
+{
+    if (mTimelineCallback)
+    {
+        mTimelineCallback({requestId, stage, phaseTimelineNowNs(), 0U, 0, kvSlotId});
     }
 }
 

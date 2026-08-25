@@ -108,6 +108,8 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeUsesTwoStreamsInOneCudaContext)
 
     int32_t prefillEnqueues{};
     int32_t decodeEnqueues{};
+    std::vector<rt::PhaseTimelineEvent> timeline;
+    std::optional<rt::PhaseDispatchMetrics> dispatchMetrics;
     rt::PhaseDispatchWorkerCallbacks callbacks;
     callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
     callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++decodeEnqueues; };
@@ -116,6 +118,8 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeUsesTwoStreamsInOneCudaContext)
     };
     callbacks.completeDecode
         = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    callbacks.onTimeline = [&](rt::PhaseTimelineEvent const& event) { timeline.push_back(event); };
+    callbacks.onMetrics = [&](rt::PhaseDispatchMetrics const& metrics) { dispatchMetrics = metrics; };
 
     int identities[6]{};
     auto const contract = rt::PhaseExecutionSafetyContract::independent(
@@ -131,6 +135,19 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeUsesTwoStreamsInOneCudaContext)
     EXPECT_EQ(decodeEnqueues, 1);
     worker.wait();
     EXPECT_TRUE(scheduler.empty());
+    ASSERT_EQ(timeline.size(), 4U);
+    EXPECT_EQ(timeline[0].stage, rt::PhaseTimelineStage::kPrefillStart);
+    EXPECT_EQ(timeline[0].requestId, 1U);
+    EXPECT_EQ(timeline[1].stage, rt::PhaseTimelineStage::kDecodeStart);
+    EXPECT_EQ(timeline[1].requestId, 2U);
+    EXPECT_EQ(timeline[2].stage, rt::PhaseTimelineStage::kPrefillDone);
+    EXPECT_EQ(timeline[3].stage, rt::PhaseTimelineStage::kDecodeDone);
+    EXPECT_TRUE(std::all_of(timeline.begin(), timeline.end(),
+        [](rt::PhaseTimelineEvent const& event) { return event.dispatchIndex == 1U && event.timestampNs > 0U; }));
+    ASSERT_TRUE(dispatchMetrics.has_value());
+    EXPECT_EQ(dispatchMetrics->prefillRequestIds, std::vector<uint64_t>{1U});
+    EXPECT_EQ(dispatchMetrics->decodeRequestIds, std::vector<uint64_t>{2U});
+    EXPECT_GT(dispatchMetrics->hostCompletionNs, dispatchMetrics->hostDispatchStartNs);
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));

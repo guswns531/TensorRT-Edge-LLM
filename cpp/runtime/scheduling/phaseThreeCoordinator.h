@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -200,6 +201,8 @@ public:
     bool poll();
     bool empty() const noexcept;
     PhaseThreeCoordinatorMetrics metrics() const noexcept;
+    //! Enable optional request-level encoder and prefill-handoff telemetry.
+    void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
 
     std::optional<IndependentPhaseServerToken> tryPopToken();
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
@@ -233,6 +236,8 @@ private:
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
     void eraseTpotTarget(uint64_t requestId);
+    void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,
+        uint64_t timestampNs = 0U) const;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
     static size_t mediaInputBytes(PendingVisionRequest const& pending) noexcept;
 
@@ -247,6 +252,7 @@ private:
     std::multiset<double> mTpotTargets;
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
+    std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     size_t mEstimatedEncodedBytes{};
     size_t mEncoderStarts{};
     size_t mEncoderCompletions{};

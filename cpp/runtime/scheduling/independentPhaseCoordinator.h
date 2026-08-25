@@ -49,6 +49,7 @@ struct IndependentPhaseCoordinatorCallbacks
     IndependentPhaseFinishedCallback isPrefillFinished;
     IndependentPhaseFinishedCallback isDecodeFinished;
     std::function<void(PhaseDispatchMetrics const&)> onMetrics;
+    std::function<void(PhaseTimelineEvent const&)> onTimeline;
 };
 
 //! Reusable queue-to-engine coordinator for independent prefill/decode TensorRT contexts.

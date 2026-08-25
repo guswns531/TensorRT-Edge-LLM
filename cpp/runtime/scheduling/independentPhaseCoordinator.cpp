@@ -106,6 +106,12 @@ PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
             mCallbacks.onMetrics(metrics);
         }
     };
+    callbacks.onTimeline = [this](PhaseTimelineEvent const& event) {
+        if (mCallbacks.onTimeline)
+        {
+            mCallbacks.onTimeline(event);
+        }
+    };
     return callbacks;
 }
 

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "runtime/scheduling/phaseQueueScheduler.h"
+#include "runtime/scheduling/phaseTimeline.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +68,8 @@ struct PhaseDispatchWorkerCallbacks
     std::function<void(PhaseDispatchMetrics const&)> onDispatch;
     //! Observe one immutable timing record after all phase completions.
     std::function<void(PhaseDispatchMetrics const&)> onMetrics;
+    //! Optional request-level host transition telemetry. Empty keeps the hot path allocation-free.
+    std::function<void(PhaseTimelineEvent const&)> onTimeline;
 };
 
 //! Controls whether phase enqueues may overlap across streams.
@@ -146,6 +149,8 @@ private:
     void completeDecodeInFlight();
     void completeInFlight();
     void collectMetrics();
+    void recordTimeline(
+        std::vector<PhaseWorkItem> const& batch, PhaseTimelineStage stage, uint64_t timestampNs = 0U) const;
     bool eventReady(cudaEvent_t event) const;
 
     PhaseQueueScheduler& mScheduler;

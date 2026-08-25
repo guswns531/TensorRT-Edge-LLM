@@ -280,6 +280,7 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     }
     size_t const inputTokens = mVision.estimateInputTokens(request);
     mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens});
+    recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
     bool const started = startNextEncoder();
     bool const encodingThisRequest = started
         && std::any_of(mEncoding.begin(), mEncoding.end(),
@@ -406,6 +407,12 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     return result;
 }
 
+void PhaseThreeCoordinator::setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback)
+{
+    ELLM_CHECK(empty(), "Three-phase timeline callback can only change while the coordinator is idle");
+    mTimelineCallback = std::move(timelineCallback);
+}
+
 std::optional<IndependentPhaseServerToken> PhaseThreeCoordinator::tryPopToken()
 {
     return mServer.tryPopToken();
@@ -471,6 +478,11 @@ bool PhaseThreeCoordinator::startNextEncoder()
         mMaxEncoderQueueWaitUs = std::max(mMaxEncoderQueueWaitUs, queueWaitUs);
         submissions.push_back({encoding.requestId, std::move(encoding.request)});
     }
+    uint64_t const timelineTimestampNs = phaseTimelineNowNs();
+    for (PhaseVisionSubmission const& submission : submissions)
+    {
+        recordTimeline(submission.requestId, PhaseTimelineStage::kEncoderStart, batchSize, -1, timelineTimestampNs);
+    }
     ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
     mEncoderStarts += batchSize;
     ++mEncoderBatches;
@@ -499,6 +511,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     {
         uint64_t const requestId = encoding.requestId;
         std::unique_ptr<PhaseVisionPayload> encoded = mVision.take(requestId);
+        recordTimeline(requestId, PhaseTimelineStage::kEncoderDone, mEncoding.size());
         ++mEncoderCompletions;
         mLastEncoderGpuMs = encoded->encoderGpuMs;
         mMaxEncoderGpuMs = std::max(mMaxEncoderGpuMs, mLastEncoderGpuMs);
@@ -518,6 +531,7 @@ bool PhaseThreeCoordinator::completeEncoder()
             "Encoded phase request is already downstream");
         mReadyPrefill.push_back({requestId, std::move(promptTokens), std::move(sharedPayload), encoding.maxOutputTokens,
             encoding.scheduling, encodedBytes, std::chrono::steady_clock::now()});
+        recordTimeline(requestId, PhaseTimelineStage::kPrefillReady, mEncoding.size());
         mReadyPrefillTokens += mReadyPrefill.back().promptTokens.size();
         mReadyPrefillBytes += encodedBytes;
         mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
@@ -556,6 +570,7 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
         ELLM_CHECK(result.status == IndependentPhaseServerStatus::kAdmitted
                 || result.status == IndependentPhaseServerStatus::kQueued,
             "Ready vision request could not enter the LLM admission queue");
+        recordTimeline(ready.requestId, PhaseTimelineStage::kPrefillRelease, batchSize, result.kvSlotId);
         double const queueWaitUs = std::chrono::duration<double, std::micro>(now - ready.encodedAt).count();
         mLastPrefillReadyQueueWaitUs = queueWaitUs;
         mMaxPrefillReadyQueueWaitUs = std::max(mMaxPrefillReadyQueueWaitUs, queueWaitUs);
@@ -589,6 +604,16 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
         }
     }
     return submitted > 0;
+}
+
+void PhaseThreeCoordinator::recordTimeline(
+    uint64_t requestId, PhaseTimelineStage stage, size_t batchSize, int32_t kvSlotId, uint64_t timestampNs) const
+{
+    if (mTimelineCallback)
+    {
+        timestampNs = timestampNs > 0U ? timestampNs : phaseTimelineNowNs();
+        mTimelineCallback({requestId, stage, timestampNs, 0U, static_cast<int32_t>(batchSize), kvSlotId});
+    }
 }
 
 size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept

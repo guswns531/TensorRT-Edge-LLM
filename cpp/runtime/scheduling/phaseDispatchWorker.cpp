@@ -206,6 +206,17 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics = PhaseDispatchMetrics{};
     mCurrentMetrics.dispatchIndex = mDispatchCount + 1;
     mCurrentMetrics.kind = mInFlight.kind;
+    mCurrentMetrics.hostDispatchStartNs = phaseTimelineNowNs();
+    mCurrentMetrics.prefillRequestIds.reserve(mInFlight.prefillBatch.size());
+    for (PhaseWorkItem const& item : mInFlight.prefillBatch)
+    {
+        mCurrentMetrics.prefillRequestIds.push_back(item.requestId);
+    }
+    mCurrentMetrics.decodeRequestIds.reserve(mInFlight.decodeBatch.size());
+    for (PhaseWorkItem const& item : mInFlight.decodeBatch)
+    {
+        mCurrentMetrics.decodeRequestIds.push_back(item.requestId);
+    }
     if (!mInFlight.prefillBatch.empty())
     {
         mCurrentMetrics.prefillClass = mInFlight.prefillBatch.front().prefillClass;
@@ -292,6 +303,7 @@ bool PhaseDispatchWorker::dispatchNext()
     CUDA_CHECK(cudaEventRecord(mDispatchStart, mPrefillStream));
     if (mHasPrefill)
     {
+        recordTimeline(mInFlight.prefillBatch, PhaseTimelineStage::kPrefillStart);
         CUDA_CHECK(cudaEventRecord(mPrefillStart, mPrefillStream));
         mCallbacks.enqueuePrefill(mInFlight.prefillBatch, mPrefillStream);
         CUDA_CHECK(cudaEventRecord(mPrefillDone, mPrefillStream));
@@ -309,6 +321,7 @@ bool PhaseDispatchWorker::dispatchNext()
         else
         {
             CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, mDispatchStart));
+            recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
             CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
             mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
             CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
@@ -380,6 +393,7 @@ void PhaseDispatchWorker::wait()
 void PhaseDispatchWorker::enqueueDeferredDecode()
 {
     check::check(mDecodeDeferred && mHasDecode, "No deferred decode batch is available.");
+    recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
     CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
     mCallbacks.enqueueDecode(mInFlight.decodeBatch, mDecodeStream);
     CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
@@ -396,6 +410,7 @@ void PhaseDispatchWorker::completePrefillInFlight()
     {
         mCallbacks.completePrefillBatch(mInFlight.prefillBatch);
     }
+    recordTimeline(mInFlight.prefillBatch, PhaseTimelineStage::kPrefillDone);
     for (PhaseWorkItem const& item : mInFlight.prefillBatch)
     {
         PhasePrefillCompletion const completion = mCallbacks.completePrefill(item);
@@ -415,6 +430,7 @@ void PhaseDispatchWorker::completeDecodeInFlight()
     {
         mCallbacks.completeDecodeBatch(mInFlight.decodeBatch);
     }
+    recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeDone);
     for (PhaseWorkItem const& item : mInFlight.decodeBatch)
     {
         PhaseDecodeCompletion const completion = mCallbacks.completeDecode(item);
@@ -428,12 +444,29 @@ void PhaseDispatchWorker::completeInFlight()
 {
     completePrefillInFlight();
     completeDecodeInFlight();
+    mCurrentMetrics.hostCompletionNs = phaseTimelineNowNs();
     collectMetrics();
     mInFlight = PhaseDispatchPlan{};
     mBusy = false;
     mHasPrefill = false;
     mHasDecode = false;
     mDecodeDeferred = false;
+}
+
+void PhaseDispatchWorker::recordTimeline(
+    std::vector<PhaseWorkItem> const& batch, PhaseTimelineStage stage, uint64_t timestampNs) const
+{
+    if (!mCallbacks.onTimeline)
+    {
+        return;
+    }
+    timestampNs = timestampNs > 0U ? timestampNs : phaseTimelineNowNs();
+    int32_t const batchSize = static_cast<int32_t>(batch.size());
+    for (PhaseWorkItem const& item : batch)
+    {
+        mCallbacks.onTimeline(
+            {item.requestId, stage, timestampNs, mCurrentMetrics.dispatchIndex, batchSize, item.kvSlotId});
+    }
 }
 
 void PhaseDispatchWorker::collectMetrics()
