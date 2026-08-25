@@ -152,6 +152,7 @@ struct PhaseThreeCoordinatorMetrics
     float decodeTpotPressure{};
     size_t encoderDispatchDeferrals{};
     size_t encoderTextGuardDeferrals{};
+    size_t encoderPrefillGuardDeferrals{};
     size_t encoderDecodeGuardDeferrals{};
     size_t encoderAgeForcedStarts{};
 };
@@ -161,6 +162,7 @@ enum class PhaseVisionEncoderDispatchReason
     kLegacy,
     kAllowed,
     kTextGuard,
+    kPrefillGuard,
     kDecodeGuard,
     kAgeForced,
 };
@@ -175,7 +177,8 @@ struct PhaseVisionEncoderDispatchDecision
 PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
     double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
     double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
-    bool textPrefillInFlight, bool decodeInFlight) noexcept;
+    bool textPrefillInFlight, bool decodeInFlight, double prefillMinTtftSlackUs = 0.0,
+    bool prefillInFlight = false) noexcept;
 
 //! Select latency or throughput vision lookahead from queue age and observed decode pressure.
 size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
@@ -346,6 +349,7 @@ private:
     bool mDecodePrefillDeferred{};
     size_t mEncoderDispatchDeferrals{};
     size_t mEncoderTextGuardDeferrals{};
+    size_t mEncoderPrefillGuardDeferrals{};
     size_t mEncoderDecodeGuardDeferrals{};
     size_t mEncoderAgeForcedStarts{};
     std::chrono::steady_clock::time_point mLastForcedEncoderStart;

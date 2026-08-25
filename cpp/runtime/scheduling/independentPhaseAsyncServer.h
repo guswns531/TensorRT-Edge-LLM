@@ -220,6 +220,9 @@ struct IndependentPhaseServerArbitrationSnapshot
     PhasePrefillClass inFlightPrefillClass{PhasePrefillClass::kAny};
     size_t prefillQueued{};
     size_t decodeQueued{};
+    double prefillOldestRequestAgeUs{};
+    double prefillMinTtftSlackUs{};
+    double decodeOldestWaitUs{};
     double oldestTextWithoutTokenAgeUs{};
     double recentDecodeTpotP95Us{};
     float recentDecodeTpotPressure{};

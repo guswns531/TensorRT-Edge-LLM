@@ -1070,8 +1070,12 @@ IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrati
     result.busy = mCoordinator.busy();
     result.inFlightKind = mCoordinator.inFlightKind();
     result.inFlightPrefillClass = mCoordinator.inFlightPrefillClass();
-    result.prefillQueued = mCoordinator.scheduler().prefillQueueSize();
-    result.decodeQueued = mCoordinator.scheduler().decodeQueueSize();
+    PhaseQueueSnapshot const queue = mCoordinator.scheduler().queueSnapshot();
+    result.prefillQueued = queue.prefillQueued;
+    result.decodeQueued = queue.decodeQueued;
+    result.prefillOldestRequestAgeUs = queue.prefillOldestRequestAgeUs;
+    result.prefillMinTtftSlackUs = queue.prefillMinTtftSlackUs;
+    result.decodeOldestWaitUs = queue.decodeOldestWaitUs;
     PhaseSchedulerTelemetry const& telemetry = mCoordinator.scheduler().telemetry();
     result.recentDecodeTpotP95Us = telemetry.recentDecodeTpotP95Us;
     result.recentDecodeTpotPressure = telemetry.recentDecodeTpotPressure;

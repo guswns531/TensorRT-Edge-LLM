@@ -1952,6 +1952,21 @@ TEST(PhaseThreeCoordinatorPolicyTest, ArbitratesEncoderByTextDecodeDebtAndBounde
         true, 600000.0, 100000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 1.0F, 0.9F, true, true);
     EXPECT_TRUE(decision.allowed);
     EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kAgeForced);
+
+    decision = phaseVisionEncoderDispatchDecision(true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0,
+        0.2F, 0.9F, false, false, 50000.0, false);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kPrefillGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0,
+        0.2F, 0.9F, false, false, 100000.0, true);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kPrefillGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0,
+        0.2F, 0.9F, false, false, 100000.0, false);
+    EXPECT_TRUE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kAllowed);
 }
 
 TEST(PhaseQueueSchedulerTest, CollectsDecodeTpotForExternalPolicyWithoutHysteresis)

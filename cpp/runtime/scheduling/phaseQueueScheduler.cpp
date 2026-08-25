@@ -421,6 +421,11 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     return result;
 }
 
+PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot() const
+{
+    return snapshot();
+}
+
 bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
 {
     return !mConfig.eligibilityPolicy || mConfig.eligibilityPolicy(item, prefill);

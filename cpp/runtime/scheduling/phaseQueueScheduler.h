@@ -525,6 +525,8 @@ public:
     //! Update scheduling telemetry after one CUDA-complete dispatch.
     void observeMetrics(PhaseDispatchMetrics const& metrics);
     PhaseSchedulerTelemetry const& telemetry() const noexcept;
+    //! Return a read-only scheduling snapshot for an upstream phase arbiter.
+    PhaseQueueSnapshot queueSnapshot() const;
     //! Keep online decode refinement out of latency mode while retaining learned samples.
     void setOnlineDecodeCostLearningActive(bool active) noexcept;
     //! Reset learned scheduling history between benchmark epochs.

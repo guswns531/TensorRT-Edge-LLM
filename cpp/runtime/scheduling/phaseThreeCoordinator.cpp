@@ -227,7 +227,7 @@ size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throug
 PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
     double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
     double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
-    bool textPrefillInFlight, bool decodeInFlight) noexcept
+    bool textPrefillInFlight, bool decodeInFlight, double prefillMinTtftSlackUs, bool prefillInFlight) noexcept
 {
     if (!enabled)
     {
@@ -244,6 +244,11 @@ PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabl
     if (textPrefillInFlight || textLate)
     {
         return {false, PhaseVisionEncoderDispatchReason::kTextGuard};
+    }
+    bool const prefillDeadlineAtRisk = prefillMinTtftSlackUs > 0.0 && prefillMinTtftSlackUs <= predictedEncoderCostUs;
+    if (prefillInFlight || prefillDeadlineAtRisk)
+    {
+        return {false, PhaseVisionEncoderDispatchReason::kPrefillGuard};
     }
     if (decodeInFlight || (decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit))
     {
@@ -480,6 +485,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.decodeTpotPressure = mServer.decodeAdmissionTpotPressure();
     result.encoderDispatchDeferrals = mEncoderDispatchDeferrals;
     result.encoderTextGuardDeferrals = mEncoderTextGuardDeferrals;
+    result.encoderPrefillGuardDeferrals = mEncoderPrefillGuardDeferrals;
     result.encoderDecodeGuardDeferrals = mEncoderDecodeGuardDeferrals;
     result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
     if (!mPending.empty())
@@ -531,6 +537,10 @@ bool PhaseThreeCoordinator::startNextEncoder()
         if (dispatchDecision.reason == PhaseVisionEncoderDispatchReason::kTextGuard)
         {
             ++mEncoderTextGuardDeferrals;
+        }
+        else if (dispatchDecision.reason == PhaseVisionEncoderDispatchReason::kPrefillGuard)
+        {
+            ++mEncoderPrefillGuardDeferrals;
         }
         else if (dispatchDecision.reason == PhaseVisionEncoderDispatchReason::kDecodeGuard)
         {
@@ -849,6 +859,9 @@ PhaseVisionEncoderDispatchDecision PhaseThreeCoordinator::nextEncoderDispatchDec
         && (snapshot.inFlightKind == PhaseDispatchKind::kPrefill
             || snapshot.inFlightKind == PhaseDispatchKind::kOverlap)
         && snapshot.inFlightPrefillClass == PhasePrefillClass::kText;
+    bool const prefillInFlight = snapshot.busy
+        && (snapshot.inFlightKind == PhaseDispatchKind::kPrefill
+            || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
     bool const decodeInFlight = snapshot.busy
         && (snapshot.inFlightKind == PhaseDispatchKind::kDecode
             || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
@@ -856,7 +869,7 @@ PhaseVisionEncoderDispatchDecision PhaseThreeCoordinator::nextEncoderDispatchDec
         sinceLastForcedStartUs, mConfig.encoderDispatchMaxDeferUs, mConfig.encoderDispatchForcedIntervalUs,
         snapshot.oldestTextWithoutTokenAgeUs, predictedEncoderCostUs, mConfig.encoderDispatchTextGuardAgeUs,
         mServer.decodeAdmissionTpotPressure(), mConfig.encoderDispatchDecodeTpotPressureLimit, textPrefillInFlight,
-        decodeInFlight);
+        decodeInFlight, snapshot.prefillMinTtftSlackUs, prefillInFlight);
 }
 
 size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept

@@ -2032,6 +2032,7 @@ int main(int argc, char** argv)
                         {"vision_encoder_gpu_max_ms", visionMetrics.maxEncoderGpuMs},
                         {"vision_encoder_dispatch_deferrals", visionMetrics.encoderDispatchDeferrals},
                         {"vision_encoder_text_guard_deferrals", visionMetrics.encoderTextGuardDeferrals},
+                        {"vision_encoder_prefill_guard_deferrals", visionMetrics.encoderPrefillGuardDeferrals},
                         {"vision_encoder_decode_guard_deferrals", visionMetrics.encoderDecodeGuardDeferrals},
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
                         {"vision_prefill_admission_batches", visionMetrics.prefillAdmissionBatches},
