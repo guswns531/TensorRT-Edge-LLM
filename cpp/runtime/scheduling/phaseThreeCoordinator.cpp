@@ -212,6 +212,34 @@ size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throug
     return !decodeProtected && (throughputMode || visionLate) ? highCapacity : latencyCapacity;
 }
 
+PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
+    double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
+    double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
+    bool textPrefillInFlight, bool decodeInFlight) noexcept
+{
+    if (!enabled)
+    {
+        return {true, PhaseVisionEncoderDispatchReason::kLegacy};
+    }
+    bool const forceDue = maxDeferUs > 0.0 && oldestVisionAgeUs >= maxDeferUs
+        && (forcedIntervalUs == 0.0 || sinceLastForcedStartUs >= forcedIntervalUs);
+    if (forceDue)
+    {
+        return {true, PhaseVisionEncoderDispatchReason::kAgeForced};
+    }
+    bool const textLate
+        = textGuardAgeUs > 0.0 && oldestTextAgeUs > 0.0 && oldestTextAgeUs + predictedEncoderCostUs >= textGuardAgeUs;
+    if (textPrefillInFlight || textLate)
+    {
+        return {false, PhaseVisionEncoderDispatchReason::kTextGuard};
+    }
+    if (decodeInFlight || (decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit))
+    {
+        return {false, PhaseVisionEncoderDispatchReason::kDecodeGuard};
+    }
+    return {true, PhaseVisionEncoderDispatchReason::kAllowed};
+}
+
 PhaseThreeCoordinator::PhaseThreeCoordinator(
     PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server, PhaseThreeCoordinatorConfig config)
     : mVision(vision)
@@ -261,6 +289,20 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(
         std::isfinite(mConfig.lookaheadDecodeTpotPressureLimit) && mConfig.lookaheadDecodeTpotPressureLimit >= 0.0F,
         "Three-phase lookahead decode pressure limit must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encoderDispatchInitialCostUs) && mConfig.encoderDispatchInitialCostUs >= 0.0,
+        "Three-phase encoder dispatch initial cost must be finite and non-negative");
+    ELLM_CHECK(
+        std::isfinite(mConfig.encoderDispatchCostSafetyMarginUs) && mConfig.encoderDispatchCostSafetyMarginUs >= 0.0,
+        "Three-phase encoder dispatch safety margin must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encoderDispatchTextGuardAgeUs) && mConfig.encoderDispatchTextGuardAgeUs >= 0.0,
+        "Three-phase encoder text guard age must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encoderDispatchDecodeTpotPressureLimit)
+            && mConfig.encoderDispatchDecodeTpotPressureLimit >= 0.0F,
+        "Three-phase encoder decode pressure limit must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encoderDispatchMaxDeferUs) && mConfig.encoderDispatchMaxDeferUs >= 0.0,
+        "Three-phase encoder max defer must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encoderDispatchForcedIntervalUs) && mConfig.encoderDispatchForcedIntervalUs >= 0.0,
+        "Three-phase encoder forced interval must be finite and non-negative");
     ELLM_CHECK(mVision.cudaContext() == mServer.cudaContext(),
         "Encoder and LLM phase server must share one CUDA primary context");
 }
@@ -281,7 +323,7 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     size_t const inputTokens = mVision.estimateInputTokens(request);
     mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens});
     recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
-    bool const started = startNextEncoder();
+    bool const started = !mConfig.enableEncoderDispatchArbitration && startNextEncoder();
     bool const encodingThisRequest = started
         && std::any_of(mEncoding.begin(), mEncoding.end(),
             [&](PendingVisionRequest const& encoding) { return encoding.requestId == requestId; });
@@ -337,7 +379,10 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
 bool PhaseThreeCoordinator::poll()
 {
     bool progressed = completeEncoder();
-    progressed = startNextEncoder() || progressed;
+    if (!mConfig.enableEncoderDispatchArbitration)
+    {
+        progressed = startNextEncoder() || progressed;
+    }
     progressed = dispatchReadyPrefill() || progressed;
     double const minTpotTargetUs = mTpotTargets.empty() ? 0.0 : *mTpotTargets.begin();
     size_t const upstreamRequests = mPending.size() + mEncoding.size();
@@ -345,6 +390,10 @@ bool PhaseThreeCoordinator::poll()
     mServer.setExternalPendingRequests(
         upstreamRequests + mReadyPrefill.size(), minTpotTargetUs, mRequestIds.size(), mAdmissionProfilePrefillTokens);
     progressed = mServer.poll() || progressed;
+    if (mConfig.enableEncoderDispatchArbitration)
+    {
+        progressed = startNextEncoder() || progressed;
+    }
     mVision.reclaimIdleStorage();
     return progressed;
 }
@@ -398,6 +447,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.maxEffectiveEncodedCapacity = mMaxEffectiveEncodedCapacity;
     result.lookaheadEscalations = mLookaheadEscalations;
     result.decodeTpotPressure = mServer.decodeAdmissionTpotPressure();
+    result.encoderDispatchDeferrals = mEncoderDispatchDeferrals;
+    result.encoderTextGuardDeferrals = mEncoderTextGuardDeferrals;
+    result.encoderDecodeGuardDeferrals = mEncoderDecodeGuardDeferrals;
+    result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
     if (!mPending.empty())
     {
         result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
@@ -440,6 +493,20 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         return false;
     }
+    PhaseVisionEncoderDispatchDecision const dispatchDecision = nextEncoderDispatchDecision();
+    if (!dispatchDecision.allowed)
+    {
+        ++mEncoderDispatchDeferrals;
+        if (dispatchDecision.reason == PhaseVisionEncoderDispatchReason::kTextGuard)
+        {
+            ++mEncoderTextGuardDeferrals;
+        }
+        else if (dispatchDecision.reason == PhaseVisionEncoderDispatchReason::kDecodeGuard)
+        {
+            ++mEncoderDecodeGuardDeferrals;
+        }
+        return false;
+    }
     size_t const batchSize = nextEncoderBatchSize();
     if (batchSize == 0)
     {
@@ -459,6 +526,11 @@ bool PhaseThreeCoordinator::startNextEncoder()
     size_t encoderInputBytes{};
     size_t encoderInputTokens{};
     auto const now = std::chrono::steady_clock::now();
+    if (dispatchDecision.reason == PhaseVisionEncoderDispatchReason::kAgeForced)
+    {
+        mLastForcedEncoderStart = now;
+        ++mEncoderAgeForcedStarts;
+    }
     for (size_t index = 0; index < batchSize; ++index)
     {
         size_t const requestInputBytes = mediaInputBytes(mPending.front());
@@ -693,6 +765,36 @@ bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) 
     return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), effectiveEncodedCapacity(),
         mReadyPrefillBytes + mServer.visionPayloadBytes(), mConfig.maxEncodedBytes, mEstimatedEncodedBytes,
         additionalRequests);
+}
+
+PhaseVisionEncoderDispatchDecision PhaseThreeCoordinator::nextEncoderDispatchDecision() const noexcept
+{
+    if (mPending.empty())
+    {
+        return {};
+    }
+    auto const now = std::chrono::steady_clock::now();
+    double const oldestVisionAgeUs
+        = std::chrono::duration<double, std::micro>(now - mPending.front().scheduling.submittedAt).count();
+    double const sinceLastForcedStartUs = mLastForcedEncoderStart == std::chrono::steady_clock::time_point{}
+        ? std::numeric_limits<double>::infinity()
+        : std::chrono::duration<double, std::micro>(now - mLastForcedEncoderStart).count();
+    IndependentPhaseServerArbitrationSnapshot const snapshot = mServer.arbitrationSnapshot();
+    double const predictedEncoderCostUs
+        = std::max(mConfig.encoderDispatchInitialCostUs, static_cast<double>(mLastEncoderGpuMs) * 1000.0)
+        + mConfig.encoderDispatchCostSafetyMarginUs;
+    bool const textPrefillInFlight = snapshot.busy
+        && (snapshot.inFlightKind == PhaseDispatchKind::kPrefill
+            || snapshot.inFlightKind == PhaseDispatchKind::kOverlap)
+        && snapshot.inFlightPrefillClass == PhasePrefillClass::kText;
+    bool const decodeInFlight = snapshot.busy
+        && (snapshot.inFlightKind == PhaseDispatchKind::kDecode
+            || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
+    return phaseVisionEncoderDispatchDecision(mConfig.enableEncoderDispatchArbitration, oldestVisionAgeUs,
+        sinceLastForcedStartUs, mConfig.encoderDispatchMaxDeferUs, mConfig.encoderDispatchForcedIntervalUs,
+        snapshot.oldestTextWithoutTokenAgeUs, predictedEncoderCostUs, mConfig.encoderDispatchTextGuardAgeUs,
+        mServer.decodeAdmissionTpotPressure(), mConfig.encoderDispatchDecodeTpotPressureLimit, textPrefillInFlight,
+        decodeInFlight);
 }
 
 size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept

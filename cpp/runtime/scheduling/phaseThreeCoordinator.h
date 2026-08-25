@@ -84,6 +84,20 @@ struct PhaseThreeCoordinatorConfig
     double lookaheadEscalationRatio{0.4};
     //! Do not escalate lookahead at or above this observed decode TPOT pressure. Zero disables the guard.
     float lookaheadDecodeTpotPressureLimit{0.8F};
+    //! Move encoder enqueue behind the LLM poll and gate it by measured phase debt.
+    bool enableEncoderDispatchArbitration{};
+    //! Initial encoder cost used before the first CUDA-event sample is available.
+    double encoderDispatchInitialCostUs{50000.0};
+    //! Margin added to the latest encoder cost when protecting text TTFT.
+    double encoderDispatchCostSafetyMarginUs{5000.0};
+    //! Protect text requests once age plus predicted encoder cost reaches this bound. Zero disables the guard.
+    double encoderDispatchTextGuardAgeUs{250000.0};
+    //! Defer encoder overlap at or above this observed decode TPOT pressure. Zero disables the guard.
+    float encoderDispatchDecodeTpotPressureLimit{0.9F};
+    //! Force bounded encoder progress after this oldest vision queue age. Zero disables forcing.
+    double encoderDispatchMaxDeferUs{500000.0};
+    //! Minimum spacing between age-forced encoder batches. Zero drains the overdue FIFO.
+    double encoderDispatchForcedIntervalUs{};
 };
 
 struct PhaseThreeCoordinatorMetrics
@@ -130,7 +144,32 @@ struct PhaseThreeCoordinatorMetrics
     size_t maxEffectiveEncodedCapacity{};
     size_t lookaheadEscalations{};
     float decodeTpotPressure{};
+    size_t encoderDispatchDeferrals{};
+    size_t encoderTextGuardDeferrals{};
+    size_t encoderDecodeGuardDeferrals{};
+    size_t encoderAgeForcedStarts{};
 };
+
+enum class PhaseVisionEncoderDispatchReason
+{
+    kLegacy,
+    kAllowed,
+    kTextGuard,
+    kDecodeGuard,
+    kAgeForced,
+};
+
+struct PhaseVisionEncoderDispatchDecision
+{
+    bool allowed{};
+    PhaseVisionEncoderDispatchReason reason{PhaseVisionEncoderDispatchReason::kAllowed};
+};
+
+//! Gate a pending encoder enqueue without coupling CUDA-event readiness to scheduling policy.
+PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
+    double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
+    double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
+    bool textPrefillInFlight, bool decodeInFlight) noexcept;
 
 //! Select latency or throughput vision lookahead from queue age and observed decode pressure.
 size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
@@ -235,6 +274,7 @@ private:
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
+    PhaseVisionEncoderDispatchDecision nextEncoderDispatchDecision() const noexcept;
     void eraseTpotTarget(uint64_t requestId);
     void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,
         uint64_t timestampNs = 0U) const;
@@ -288,6 +328,11 @@ private:
     size_t mLookaheadEscalations{};
     size_t mLastEffectiveEncodedCapacity{};
     bool mDecodePrefillDeferred{};
+    size_t mEncoderDispatchDeferrals{};
+    size_t mEncoderTextGuardDeferrals{};
+    size_t mEncoderDecodeGuardDeferrals{};
+    size_t mEncoderAgeForcedStarts{};
+    std::chrono::steady_clock::time_point mLastForcedEncoderStart;
 };
 
 } // namespace trt_edgellm::rt

@@ -190,6 +190,8 @@ struct IndependentPhaseServerConfig
     double adaptiveAdmissionExternalRequestFraction{};
     //! Minimum completed external prefill tokens required to select the external profile.
     size_t adaptiveAdmissionExternalPrefillTokens{};
+    //! Keep a partial ingress cohort provisional until it positively identifies the external profile.
+    bool enableDelayedExternalProfileSelection{};
     //! Multimodal prefill remains atomic unless an engine contract explicitly proves chunk correctness.
     bool allowChunkedVisionPrefill{};
     //! Packed-prefill engines may batch multiple complete multimodal prompts without chunking them.
@@ -204,6 +206,19 @@ struct IndependentPhaseServerSubmission
     IndependentPhaseServerStatus status{IndependentPhaseServerStatus::kBackpressure};
     int32_t kvSlotId{-1};
     int32_t reusedPrefixTokens{};
+};
+
+//! Read-only LLM state used by an upstream encoder dispatch arbiter.
+struct IndependentPhaseServerArbitrationSnapshot
+{
+    bool busy{};
+    PhaseDispatchKind inFlightKind{PhaseDispatchKind::kNone};
+    PhasePrefillClass inFlightPrefillClass{PhasePrefillClass::kAny};
+    size_t prefillQueued{};
+    size_t decodeQueued{};
+    double oldestTextWithoutTokenAgeUs{};
+    double recentDecodeTpotP95Us{};
+    float recentDecodeTpotPressure{};
 };
 
 struct IndependentPhaseServerCompletion
@@ -296,6 +311,7 @@ public:
     size_t adaptiveAdmissionExternalProfileSelectionCount() const noexcept;
     size_t adaptiveAdmissionUnsatisfiableDecisionCount() const noexcept;
     float decodeAdmissionTpotPressure() const noexcept;
+    IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -312,6 +328,7 @@ private:
         int32_t baseReservedPages{};
         int32_t fullReservedPages{};
         bool pageGrowthStarted{};
+        bool externalProducer{};
     };
 
     struct PendingRequest
@@ -368,6 +385,8 @@ private:
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
     std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
+    std::unordered_set<uint64_t> mTimelineDecodeStarted;
+    std::unordered_set<uint64_t> mTimelineDecodeCompleted;
     size_t mDecodeRefillWaitCount{};
     size_t mPageGrowthWaitCount{};
     size_t mVisionPrefillReleaseCount{};

@@ -523,6 +523,20 @@ bool PhaseDispatchWorker::empty() const noexcept
     return !mBusy && mScheduler.empty();
 }
 
+PhaseDispatchKind PhaseDispatchWorker::inFlightKind() const noexcept
+{
+    return mBusy ? mInFlight.kind : PhaseDispatchKind::kNone;
+}
+
+PhasePrefillClass PhaseDispatchWorker::inFlightPrefillClass() const noexcept
+{
+    if (!mBusy || mInFlight.prefillBatch.empty())
+    {
+        return PhasePrefillClass::kAny;
+    }
+    return mInFlight.prefillBatch.front().prefillClass;
+}
+
 size_t PhaseDispatchWorker::dispatchCount() const noexcept
 {
     return mDispatchCount;

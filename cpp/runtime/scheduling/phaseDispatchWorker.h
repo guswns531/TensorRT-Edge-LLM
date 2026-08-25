@@ -136,6 +136,8 @@ public:
 
     bool busy() const noexcept;
     bool empty() const noexcept;
+    PhaseDispatchKind inFlightKind() const noexcept;
+    PhasePrefillClass inFlightPrefillClass() const noexcept;
     size_t dispatchCount() const noexcept;
     std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
     PhaseExecutionSafetyContract const& safetyContract() const noexcept;

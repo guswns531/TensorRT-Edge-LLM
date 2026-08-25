@@ -92,6 +92,8 @@ public:
 
     bool empty() const noexcept;
     bool busy() const noexcept;
+    PhaseDispatchKind inFlightKind() const noexcept;
+    PhasePrefillClass inFlightPrefillClass() const noexcept;
     TensorMap& prefillTensorMap() noexcept;
     TensorMap& decodeTensorMap() noexcept;
     PhaseQueueScheduler& scheduler() noexcept;

@@ -1242,6 +1242,8 @@ int main(int argc, char** argv)
             serverConfig.latencyInFlightRequests = static_cast<size_t>(std::stoul(value));
         }
         serverConfig.enableStepwiseAdaptiveAdmission = std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr;
+        serverConfig.enableDelayedExternalProfileSelection
+            = std::getenv("TRT_EDGELLM_DELAY_EXTERNAL_PROFILE_SELECTION") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_STEP"))
         {
             serverConfig.adaptiveAdmissionStep = static_cast<size_t>(std::stoul(value));
@@ -1575,6 +1577,32 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_LOOKAHEAD_TPOT_PRESSURE_LIMIT"))
                 {
                     threePhaseConfig.lookaheadDecodeTpotPressureLimit = std::stof(value);
+                }
+                threePhaseConfig.enableEncoderDispatchArbitration
+                    = std::getenv("TRT_EDGELLM_VISION_ENCODER_ARBITER") != nullptr;
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_INITIAL_COST_US"))
+                {
+                    threePhaseConfig.encoderDispatchInitialCostUs = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_COST_MARGIN_US"))
+                {
+                    threePhaseConfig.encoderDispatchCostSafetyMarginUs = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_TEXT_GUARD_US"))
+                {
+                    threePhaseConfig.encoderDispatchTextGuardAgeUs = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_DECODE_PRESSURE_LIMIT"))
+                {
+                    threePhaseConfig.encoderDispatchDecodeTpotPressureLimit = std::stof(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_MAX_DEFER_US"))
+                {
+                    threePhaseConfig.encoderDispatchMaxDeferUs = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_FORCE_INTERVAL_US"))
+                {
+                    threePhaseConfig.encoderDispatchForcedIntervalUs = std::stod(value);
                 }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
@@ -1954,6 +1982,10 @@ int main(int argc, char** argv)
                         {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_gpu_ms", visionMetrics.lastEncoderGpuMs},
                         {"vision_encoder_gpu_max_ms", visionMetrics.maxEncoderGpuMs},
+                        {"vision_encoder_dispatch_deferrals", visionMetrics.encoderDispatchDeferrals},
+                        {"vision_encoder_text_guard_deferrals", visionMetrics.encoderTextGuardDeferrals},
+                        {"vision_encoder_decode_guard_deferrals", visionMetrics.encoderDecodeGuardDeferrals},
+                        {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
                         {"vision_prefill_admission_batches", visionMetrics.prefillAdmissionBatches},
                         {"vision_prefill_admission_batch", visionMetrics.lastPrefillAdmissionBatchSize},
                         {"vision_prefill_admission_batch_max", visionMetrics.maxPrefillAdmissionBatchSize},

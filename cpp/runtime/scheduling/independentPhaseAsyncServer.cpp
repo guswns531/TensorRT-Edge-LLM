@@ -424,6 +424,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     state.kvSlotId = slot;
     state.scheduling = scheduling;
     state.submittedAt = std::chrono::steady_clock::now();
+    state.externalProducer = visionPayload != nullptr;
     state.visionPayload = std::move(visionPayload);
     state.baseReservedPages = reservation.basePages;
     state.fullReservedPages = reservation.fullPages;
@@ -474,6 +475,10 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitOrQueueImpl(
         || mRequests.find(requestId) != mRequests.end() || promptTokens.empty())
     {
         return result;
+    }
+    if (scheduling.submittedAt == std::chrono::steady_clock::time_point{})
+    {
+        scheduling.submittedAt = std::chrono::steady_clock::now();
     }
     mPendingRequests.push_back(
         {requestId, std::move(promptTokens), maxOutputTokens, scheduling, std::move(visionPayload)});
@@ -766,9 +771,23 @@ void IndependentPhaseAsyncServer::setExternalPendingRequests(
     mExternalRequests = externalRequests;
     mExternalPrefillTokens = externalPrefillTokens;
     size_t const totalRequests = mRequests.size() + mPendingRequests.size() + mExternalPendingRequests;
-    mAdmissionExternalProfileEpochSelection = phaseAdmissionExternalProfileForEpoch(
-        mAdmissionExternalProfileEpochSelection, mExternalRequests, totalRequests, mExternalPrefillTokens,
-        mConfig.adaptiveAdmissionExternalRequestFraction, mConfig.adaptiveAdmissionExternalPrefillTokens);
+    if (mConfig.enableDelayedExternalProfileSelection)
+    {
+        mAdmissionExternalProfileEpochSelection = phaseAdmissionExternalProfileForEpoch(
+            mAdmissionExternalProfileEpochSelection, mExternalRequests, totalRequests, mExternalPrefillTokens,
+            mConfig.adaptiveAdmissionExternalRequestFraction, mConfig.adaptiveAdmissionExternalPrefillTokens);
+    }
+    else if (totalRequests == 0)
+    {
+        mAdmissionExternalProfileEpochSelection = std::nullopt;
+    }
+    else if (!mAdmissionExternalProfileEpochSelection
+        && mExternalPrefillTokens >= mConfig.adaptiveAdmissionExternalPrefillTokens)
+    {
+        mAdmissionExternalProfileEpochSelection
+            = phaseAdmissionUsesExternalProfile(mExternalRequests, totalRequests, mExternalPrefillTokens,
+                mConfig.adaptiveAdmissionExternalRequestFraction, mConfig.adaptiveAdmissionExternalPrefillTokens);
+    }
 }
 
 size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
@@ -934,6 +953,41 @@ float IndependentPhaseAsyncServer::decodeAdmissionTpotPressure() const noexcept
         return static_cast<float>(observedUs / budgetUs);
     }
     return decodeTpotPressure();
+}
+
+IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrationSnapshot() const noexcept
+{
+    IndependentPhaseServerArbitrationSnapshot result;
+    result.busy = mCoordinator.busy();
+    result.inFlightKind = mCoordinator.inFlightKind();
+    result.inFlightPrefillClass = mCoordinator.inFlightPrefillClass();
+    result.prefillQueued = mCoordinator.scheduler().prefillQueueSize();
+    result.decodeQueued = mCoordinator.scheduler().decodeQueueSize();
+    PhaseSchedulerTelemetry const& telemetry = mCoordinator.scheduler().telemetry();
+    result.recentDecodeTpotP95Us = telemetry.recentDecodeTpotP95Us;
+    result.recentDecodeTpotPressure = telemetry.recentDecodeTpotPressure;
+
+    auto const now = std::chrono::steady_clock::now();
+    for (auto const& [requestId, request] : mRequests)
+    {
+        static_cast<void>(requestId);
+        if (request.externalProducer || !request.generatedTokens.empty())
+        {
+            continue;
+        }
+        double const ageUs = std::chrono::duration<double, std::micro>(now - request.submittedAt).count();
+        result.oldestTextWithoutTokenAgeUs = std::max(result.oldestTextWithoutTokenAgeUs, ageUs);
+    }
+    for (PendingRequest const& request : mPendingRequests)
+    {
+        if (request.visionPayload != nullptr)
+        {
+            continue;
+        }
+        double const ageUs = std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count();
+        result.oldestTextWithoutTokenAgeUs = std::max(result.oldestTextWithoutTokenAgeUs, ageUs);
+    }
+    return result;
 }
 
 bool IndependentPhaseAsyncServer::empty() const noexcept
@@ -1200,7 +1254,20 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
     };
     callbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
     callbacks.onTimeline = [this](PhaseTimelineEvent const& event) {
-        if (mTimelineCallback)
+        if (!mTimelineCallback)
+        {
+            return;
+        }
+        bool emit = true;
+        if (event.stage == PhaseTimelineStage::kDecodeStart)
+        {
+            emit = mTimelineDecodeStarted.insert(event.requestId).second;
+        }
+        else if (event.stage == PhaseTimelineStage::kDecodeDone)
+        {
+            emit = mTimelineDecodeCompleted.insert(event.requestId).second;
+        }
+        if (emit)
         {
             mTimelineCallback(event);
         }
@@ -1317,6 +1384,8 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     ELLM_CHECK(it != mRequests.end(), "Finished phase request is missing");
     RequestState& state = it->second;
     recordTimeline(requestId, PhaseTimelineStage::kCompletion, state.kvSlotId);
+    mTimelineDecodeStarted.erase(requestId);
+    mTimelineDecodeCompleted.erase(requestId);
     if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && mPrefixCache != nullptr
         && state.promptTokens.size() >= 128U)
     {

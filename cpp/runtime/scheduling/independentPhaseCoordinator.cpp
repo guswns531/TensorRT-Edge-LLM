@@ -303,6 +303,16 @@ bool IndependentPhaseCoordinator::busy() const noexcept
     return mWorker->busy();
 }
 
+PhaseDispatchKind IndependentPhaseCoordinator::inFlightKind() const noexcept
+{
+    return mWorker->inFlightKind();
+}
+
+PhasePrefillClass IndependentPhaseCoordinator::inFlightPrefillClass() const noexcept
+{
+    return mWorker->inFlightPrefillClass();
+}
+
 TensorMap& IndependentPhaseCoordinator::prefillTensorMap() noexcept
 {
     return mPrefillMap;

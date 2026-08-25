@@ -1903,6 +1903,39 @@ TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGu
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 0, true, 2000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, ArbitratesEncoderByTextDecodeDebtAndBoundedStarvation)
+{
+    auto decision = phaseVisionEncoderDispatchDecision(
+        false, 0.0, 0.0, 500000.0, 100000.0, 1000000.0, 50000.0, 250000.0, 2.0F, 0.9F, true, true);
+    EXPECT_TRUE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kLegacy);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 100000.0, 1000000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 0.2F, 0.9F, false, false);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kTextGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0, 1.0F, 0.9F, false, false);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kDecodeGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0, 0.0F, 0.9F, false, true);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kDecodeGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 600000.0, 50000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 1.0F, 0.9F, true, true);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kTextGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 600000.0, 100000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 1.0F, 0.9F, true, true);
+    EXPECT_TRUE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kAgeForced);
+}
+
 TEST(PhaseQueueSchedulerTest, CollectsDecodeTpotForExternalPolicyWithoutHysteresis)
 {
     PhaseQueueSchedulerConfig config;
