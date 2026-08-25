@@ -148,15 +148,15 @@ size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenC
 PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
     std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize, size_t maxBatchTokens, double oldestWaitUs,
     double batchWaitUs, bool enabled, size_t minBacklogBatchSize, size_t upstreamVisionRequests,
-    size_t availableAdmissionSlots, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
+    size_t admissibleRequests, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
     size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio, bool enableDecodeProtectedDeferral,
     double maxDecodeProtectedWaitUs) noexcept
 {
-    if (promptTokenCounts.empty() || maxBatchSize == 0 || availableAdmissionSlots == 0 || availableKVPages <= 0)
+    if (promptTokenCounts.empty() || maxBatchSize == 0 || admissibleRequests == 0 || availableKVPages <= 0)
     {
         return {};
     }
-    size_t const admissionLimit = std::min(maxBatchSize, availableAdmissionSlots);
+    size_t const admissionLimit = std::min(maxBatchSize, admissibleRequests);
     bool const decodeProtected = decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit;
     bool const withinDeferralBound = maxDecodeProtectedWaitUs <= 0.0 || oldestWaitUs < maxDecodeProtectedWaitUs;
     if (enableDecodeProtectedDeferral && decodeProtected && withinDeferralBound)
@@ -187,11 +187,10 @@ PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
         return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, 1U, maxBatchTokens, oldestWaitUs, 0.0),
             PhaseVisionPrefillAdmissionReason::kLowLoad};
     }
-    bool const slotPressure
-        = availableAdmissionSlots < maxBatchSize || availableAdmissionSlots - maxBatchSize < maxBatchSize;
-    if (slotPressure)
+    size_t const requestedBatchSize = std::min(maxBatchSize, promptTokenCounts.size());
+    if (admissionLimit < requestedBatchSize)
     {
-        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, 1U, maxBatchTokens, oldestWaitUs, 0.0),
+        return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, admissionLimit, maxBatchTokens, oldestWaitUs, 0.0),
             PhaseVisionPrefillAdmissionReason::kCapacity};
     }
     size_t const backlogThreshold = std::max(minBacklogBatchSize, size_t{1});
@@ -762,19 +761,24 @@ PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecis
         return {};
     }
     std::vector<int32_t> promptTokenCounts;
+    std::vector<IndependentPhaseAdmissionRequest> admissionRequests;
     promptTokenCounts.reserve(mReadyPrefill.size());
+    admissionRequests.reserve(mReadyPrefill.size());
     for (ReadyPrefillRequest const& ready : mReadyPrefill)
     {
         promptTokenCounts.push_back(static_cast<int32_t>(ready.promptTokens.size()));
+        admissionRequests.push_back(
+            {ready.requestId, static_cast<int32_t>(ready.promptTokens.size()), ready.maxOutputTokens});
     }
     double const oldestWaitUs
         = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mReadyPrefill.front().encodedAt)
               .count();
     return phaseVisionAdaptiveReadyPrefillDecision(promptTokenCounts, mConfig.maxPrefillBatchSize,
         mConfig.maxPrefillBatchTokens, oldestWaitUs, mConfig.prefillBatchWaitUs, mConfig.enableAdaptivePrefillAdmission,
-        mConfig.adaptivePrefillMinBatchSize, mPending.size() + mEncoding.size(), mServer.availableAdmissionSlots(),
-        mServer.availableKVPages(), mServer.decodeAdmissionTpotPressure(), mConfig.prefillDecodeTpotPressureLimit,
-        mReadyPrefillBytes, mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio,
+        mConfig.adaptivePrefillMinBatchSize, mPending.size() + mEncoding.size(),
+        mServer.admissibleRequestPrefix(admissionRequests), mServer.availableKVPages(),
+        mServer.decodeAdmissionTpotPressure(), mConfig.prefillDecodeTpotPressureLimit, mReadyPrefillBytes,
+        mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio,
         mConfig.enableDecodeProtectedPrefillDeferral && mServer.adaptiveAdmissionExternalProfileActive()
             && !mServer.adaptiveAdmissionTpotBudgetSatisfiable(),
         mConfig.maxDecodeProtectedPrefillWaitUs);

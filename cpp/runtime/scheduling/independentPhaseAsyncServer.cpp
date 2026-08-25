@@ -198,6 +198,24 @@ bool phasePageReservationsFit(
     return phasePageReservationGuaranteedPages(reservations, maxGrowthRequests) <= pageBudget;
 }
 
+size_t phaseAdmissiblePageReservationPrefix(std::vector<IndependentPhasePageReservation> existing,
+    std::vector<IndependentPhasePageReservation> const& candidates, int32_t pageBudget, int32_t maxGrowthRequests,
+    size_t maxRequests)
+{
+    size_t admitted{};
+    existing.reserve(existing.size() + std::min(maxRequests, candidates.size()));
+    while (admitted < candidates.size() && admitted < maxRequests)
+    {
+        existing.push_back(candidates[admitted]);
+        if (!phasePageReservationsFit(pageBudget, existing, maxGrowthRequests))
+        {
+            break;
+        }
+        ++admitted;
+    }
+    return admitted;
+}
+
 std::vector<uint64_t> selectPhasePageGrowthOwners(std::vector<IndependentPhasePageReservation> const& reservations,
     std::vector<uint64_t> const& currentOwners, int32_t maxGrowthRequests)
 {
@@ -800,6 +818,26 @@ size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
 int32_t IndependentPhaseAsyncServer::availableKVPages() const noexcept
 {
     return mOwnership.availablePages();
+}
+
+size_t IndependentPhaseAsyncServer::admissibleRequestPrefix(
+    std::vector<IndependentPhaseAdmissionRequest> const& candidates) const
+{
+    std::vector<IndependentPhasePageReservation> existing;
+    existing.reserve(mRequests.size());
+    for (auto const& request : mRequests)
+    {
+        existing.push_back({request.first, request.second.baseReservedPages, request.second.fullReservedPages});
+    }
+    std::vector<IndependentPhasePageReservation> candidateReservations;
+    candidateReservations.reserve(candidates.size());
+    for (IndependentPhaseAdmissionRequest const& candidate : candidates)
+    {
+        candidateReservations.push_back(
+            makePageReservation(candidate.requestId, candidate.promptTokens, candidate.maxOutputTokens));
+    }
+    return phaseAdmissiblePageReservationPrefix(std::move(existing), candidateReservations, pageReservationBudget(),
+        mConfig.maxConcurrentPageGrowthRequests, availableAdmissionSlots());
 }
 
 size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept

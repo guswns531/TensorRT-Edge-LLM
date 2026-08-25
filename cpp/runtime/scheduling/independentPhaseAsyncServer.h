@@ -89,6 +89,10 @@ int32_t phasePageReservationGuaranteedPages(
 //! Test whether a set of incremental reservations is safe for one physical page budget.
 bool phasePageReservationsFit(
     int32_t pageBudget, std::vector<IndependentPhasePageReservation> const& reservations, int32_t maxGrowthRequests);
+//! Count the FIFO candidate prefix that fits the current page reservation set and request-count limit.
+size_t phaseAdmissiblePageReservationPrefix(std::vector<IndependentPhasePageReservation> existing,
+    std::vector<IndependentPhasePageReservation> const& candidates, int32_t pageBudget, int32_t maxGrowthRequests,
+    size_t maxRequests);
 //! Retain valid sticky owners, then fill free growth leases by descending tail size.
 std::vector<uint64_t> selectPhasePageGrowthOwners(std::vector<IndependentPhasePageReservation> const& reservations,
     std::vector<uint64_t> const& currentOwners, int32_t maxGrowthRequests);
@@ -239,6 +243,13 @@ struct IndependentPhaseServerToken
     double elapsedMs{};
 };
 
+struct IndependentPhaseAdmissionRequest
+{
+    uint64_t requestId{};
+    int32_t promptTokens{};
+    int32_t maxOutputTokens{};
+};
+
 //! Production-facing event-loop facade over independent prefill/decode contexts.
 //!
 //! The facade owns request admission, stable-slot leases, prefix sharing, and
@@ -288,6 +299,8 @@ public:
     size_t availableAdmissionSlots() const noexcept;
     //! Physical KV pages currently free in the shared stable page pool.
     int32_t availableKVPages() const noexcept;
+    //! FIFO candidate count that can be admitted under stable-slot and page-reservation constraints.
+    size_t admissibleRequestPrefix(std::vector<IndependentPhaseAdmissionRequest> const& candidates) const;
     size_t decodeRefillWaitCount() const noexcept;
     size_t pageGrowthWaitCount() const noexcept;
     size_t pendingPageGrowthCount() const noexcept;

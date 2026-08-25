@@ -231,7 +231,7 @@ struct PhaseVisionPrefillAdmissionDecision
 PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
     std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize, size_t maxBatchTokens, double oldestWaitUs,
     double batchWaitUs, bool enabled, size_t minBacklogBatchSize, size_t upstreamVisionRequests,
-    size_t availableAdmissionSlots, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
+    size_t admissibleRequests, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
     size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio, bool enableDecodeProtectedDeferral = false,
     double maxDecodeProtectedWaitUs = 0.0) noexcept;
 

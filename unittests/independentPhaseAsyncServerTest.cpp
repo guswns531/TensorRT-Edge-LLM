@@ -149,6 +149,15 @@ TEST(IndependentPhaseAsyncServerTest, IncrementalPageReservationGuaranteesADrain
     EXPECT_FALSE(phasePageReservationsFit(256, reservations, 9));
 }
 
+TEST(IndependentPhaseAsyncServerTest, AdmitsOnlyTheFifoPageReservationPrefixThatFits)
+{
+    std::vector<IndependentPhasePageReservation> const existing{{10, 2, 8}};
+    std::vector<IndependentPhasePageReservation> const candidates{{20, 2, 8}, {21, 2, 8}, {22, 2, 8}};
+    EXPECT_EQ(phaseAdmissiblePageReservationPrefix(existing, candidates, 18, 2, 3), 2U);
+    EXPECT_EQ(phaseAdmissiblePageReservationPrefix(existing, candidates, 18, 2, 1), 1U);
+    EXPECT_EQ(phaseAdmissiblePageReservationPrefix(existing, candidates, 7, 2, 3), 0U);
+}
+
 TEST(IndependentPhaseAsyncServerTest, PageGrowthOwnersRemainStickyAndDeterministic)
 {
     std::vector<IndependentPhasePageReservation> const reservations{
