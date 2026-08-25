@@ -131,12 +131,18 @@ std::optional<bool> phaseAdmissionExternalProfileForEpoch(std::optional<bool> cu
     {
         return std::nullopt;
     }
-    if (currentSelection || externalPrefillTokens < minExternalPrefillTokens)
+    if (currentSelection.value_or(false) || externalPrefillTokens < minExternalPrefillTokens)
     {
         return currentSelection;
     }
-    return phaseAdmissionUsesExternalProfile(
-        externalRequests, totalRequests, externalPrefillTokens, minExternalRequestFraction, minExternalPrefillTokens);
+    if (phaseAdmissionUsesExternalProfile(externalRequests, totalRequests, externalPrefillTokens,
+            minExternalRequestFraction, minExternalPrefillTokens))
+    {
+        return true;
+    }
+    // A partial ingress cohort is not evidence of a text-only epoch. Keep the
+    // profile provisional so later vision arrivals can still select it.
+    return std::nullopt;
 }
 
 double phaseAdmissionProfileTpotBudget(

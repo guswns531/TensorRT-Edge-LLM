@@ -64,7 +64,7 @@ bool phaseAdmissionTpotBudgetSatisfiable(
 //! Select an external-phase profile from its live request share and ready-prefill token pressure.
 bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequests, size_t externalPrefillTokens,
     double minExternalRequestFraction, size_t minExternalPrefillTokens) noexcept;
-//! Latch a workload profile for one non-idle admission epoch once external prefill pressure is observable.
+//! Latch the external workload profile for one non-idle epoch; partial ingress remains provisional.
 std::optional<bool> phaseAdmissionExternalProfileForEpoch(std::optional<bool> currentSelection, size_t externalRequests,
     size_t totalRequests, size_t externalPrefillTokens, double minExternalRequestFraction,
     size_t minExternalPrefillTokens) noexcept;

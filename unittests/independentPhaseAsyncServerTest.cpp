@@ -106,11 +106,13 @@ TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionLatchesProfileForOneBus
     selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 16, 512, 0.5, 1024);
     EXPECT_FALSE(selection.has_value());
     selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 16, 2048, 0.5, 1024);
-    ASSERT_TRUE(selection.has_value());
-    EXPECT_FALSE(*selection);
+    EXPECT_FALSE(selection.has_value());
     selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 4, 2048, 0.5, 1024);
     ASSERT_TRUE(selection.has_value());
-    EXPECT_FALSE(*selection);
+    EXPECT_TRUE(*selection);
+    selection = phaseAdmissionExternalProfileForEpoch(selection, 4, 16, 2048, 0.5, 1024);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_TRUE(*selection);
     selection = phaseAdmissionExternalProfileForEpoch(selection, 0, 0, 0, 0.5, 1024);
     EXPECT_FALSE(selection.has_value());
     selection = phaseAdmissionExternalProfileForEpoch(selection, 12, 16, 2048, 0.5, 1024);
