@@ -18,6 +18,7 @@
 #pragma once
 
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
+#include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
 #include <chrono>
@@ -108,6 +109,8 @@ struct PhaseThreeCoordinatorConfig
     double encoderDispatchMaxDeferUs{500000.0};
     //! Minimum spacing between age-forced encoder batches. Zero drains the overdue FIFO.
     double encoderDispatchForcedIntervalUs{};
+    //! Opt-in memory-aware encoder admission coupled to the E/P/D scheduler.
+    PhaseMemoryBrokerConfig memoryBroker;
 };
 
 struct PhaseThreeCoordinatorMetrics
@@ -159,6 +162,14 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderPrefillGuardDeferrals{};
     size_t encoderDecodeGuardDeferrals{};
     size_t encoderAgeForcedStarts{};
+    size_t memoryBrokerDecisions{};
+    size_t memoryBrokerEncoderReductions{};
+    size_t memoryBrokerBackpressure{};
+    size_t memoryBrokerIdleReclaims{};
+    size_t memoryBrokerPrefillPreferences{};
+    size_t memoryBrokerDecodePreferences{};
+    size_t memoryBrokerLastPredictedBytes{};
+    PhaseMemoryBrokerReason memoryBrokerLastReason{PhaseMemoryBrokerReason::kDisabled};
 };
 
 //! One completed vision encoder batch measured by CUDA events.
@@ -288,6 +299,7 @@ private:
         int32_t maxOutputTokens{};
         PhaseSchedulingHints scheduling;
         size_t inputTokens{};
+        size_t estimatedPayloadBytes{};
         std::vector<int64_t> mediaGeometry;
         bool prefixSubmitted{};
     };
@@ -307,7 +319,7 @@ private:
     bool startNextEncoder();
     bool completeEncoder();
     bool dispatchReadyPrefill();
-    std::vector<size_t> nextEncoderBatchIndices() const;
+    std::vector<size_t> nextEncoderBatchIndices();
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
@@ -322,6 +334,7 @@ private:
     PhaseVisionAdapter& mVision;
     IndependentPhaseAsyncServer& mServer;
     PhaseThreeCoordinatorConfig mConfig;
+    PhaseMemoryBroker mMemoryBroker;
     std::deque<PendingVisionRequest> mPending;
     std::vector<PendingVisionRequest> mEncoding;
     std::deque<ReadyPrefillRequest> mReadyPrefill;
@@ -372,6 +385,14 @@ private:
     size_t mEncoderPrefillGuardDeferrals{};
     size_t mEncoderDecodeGuardDeferrals{};
     size_t mEncoderAgeForcedStarts{};
+    size_t mMemoryBrokerDecisions{};
+    size_t mMemoryBrokerEncoderReductions{};
+    size_t mMemoryBrokerBackpressure{};
+    size_t mMemoryBrokerIdleReclaims{};
+    size_t mMemoryBrokerPrefillPreferences{};
+    size_t mMemoryBrokerDecodePreferences{};
+    size_t mMemoryBrokerLastPredictedBytes{};
+    PhaseMemoryBrokerReason mMemoryBrokerLastReason{PhaseMemoryBrokerReason::kDisabled};
     std::chrono::steady_clock::time_point mLastForcedEncoderStart;
 };
 

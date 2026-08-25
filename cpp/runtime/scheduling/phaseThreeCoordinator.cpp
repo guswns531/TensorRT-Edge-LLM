@@ -269,6 +269,7 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     : mVision(vision)
     , mServer(server)
     , mConfig(config)
+    , mMemoryBroker(mConfig.memoryBroker)
 {
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
     ELLM_CHECK(
@@ -345,6 +346,7 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
         mTpotTargets.insert(scheduling.tpotTargetUs);
     }
     size_t const inputTokens = mVision.estimateInputTokens(request);
+    size_t const estimatedPayloadBytes = mVision.estimatePayloadBytes(request);
     std::vector<int64_t> const geometry = mediaGeometry(request);
     bool prefixSubmitted{};
     if (mConfig.enablePrefixBeforeVisionPrefill)
@@ -359,8 +361,8 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
             }
         }
     }
-    mPending.push_back(
-        {requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, geometry, prefixSubmitted});
+    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, estimatedPayloadBytes,
+        geometry, prefixSubmitted});
     recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
     bool const started = !mConfig.enableEncoderDispatchArbitration && startNextEncoder();
     bool const encodingThisRequest = started
@@ -495,6 +497,14 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderPrefillGuardDeferrals = mEncoderPrefillGuardDeferrals;
     result.encoderDecodeGuardDeferrals = mEncoderDecodeGuardDeferrals;
     result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
+    result.memoryBrokerDecisions = mMemoryBrokerDecisions;
+    result.memoryBrokerEncoderReductions = mMemoryBrokerEncoderReductions;
+    result.memoryBrokerBackpressure = mMemoryBrokerBackpressure;
+    result.memoryBrokerIdleReclaims = mMemoryBrokerIdleReclaims;
+    result.memoryBrokerPrefillPreferences = mMemoryBrokerPrefillPreferences;
+    result.memoryBrokerDecodePreferences = mMemoryBrokerDecodePreferences;
+    result.memoryBrokerLastPredictedBytes = mMemoryBrokerLastPredictedBytes;
+    result.memoryBrokerLastReason = mMemoryBrokerLastReason;
     if (!mPending.empty())
     {
         result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
@@ -758,7 +768,7 @@ void PhaseThreeCoordinator::recordTimeline(
     }
 }
 
-std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices() const
+std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
 {
     size_t capacityLimit{};
     while (capacityLimit < mConfig.maxEncoderBatchSize && encoderCapacityAvailable(capacityLimit + 1U))
@@ -772,11 +782,56 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices() const
         inputs.push_back(
             {mediaItemCount(pending), mediaInputBytes(pending), pending.inputTokens, pending.mediaGeometry});
     }
-    std::vector<size_t> const batchIndices = phaseVisionEncoderBatchIndices(inputs, capacityLimit,
+    std::vector<size_t> batchIndices = phaseVisionEncoderBatchIndices(inputs, capacityLimit,
         mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens,
         mConfig.enableHomogeneousEncoderBatching, mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
-    size_t const batchSize = batchIndices.size();
+    size_t batchSize = batchIndices.size();
     if (batchSize == 0)
+    {
+        return {};
+    }
+
+    std::vector<size_t> candidatePayloadBytes;
+    candidatePayloadBytes.reserve(batchSize);
+    for (size_t const index : batchIndices)
+    {
+        size_t const estimate = mPending[index].estimatedPayloadBytes;
+        candidatePayloadBytes.push_back(estimate > 0U ? estimate : mEstimatedEncodedBytes);
+    }
+    PhaseVisionMemoryStats const& visionMemory = mVision.memoryStats();
+    PhaseMemoryBrokerDecision const memoryDecision = mMemoryBroker.planEncoder(
+        {mServer.availableKVPages(), mReadyPrefillBytes + mServer.visionPayloadBytes(), visionMemory.idleStorageBytes},
+        candidatePayloadBytes);
+    if (mConfig.memoryBroker.enabled)
+    {
+        ++mMemoryBrokerDecisions;
+        mMemoryBrokerLastReason = memoryDecision.reason;
+        mMemoryBrokerLastPredictedBytes = memoryDecision.predictedManagedBytes;
+        if (memoryDecision.encoderBatchSize < batchSize)
+        {
+            ++mMemoryBrokerEncoderReductions;
+        }
+        if (memoryDecision.encoderBatchSize == 0U)
+        {
+            ++mMemoryBrokerBackpressure;
+        }
+        if (memoryDecision.preferPrefill)
+        {
+            ++mMemoryBrokerPrefillPreferences;
+        }
+        if (memoryDecision.preferDecode)
+        {
+            ++mMemoryBrokerDecodePreferences;
+        }
+        if (memoryDecision.reclaimIdleVision)
+        {
+            mVision.reclaimIdleStorage(true);
+            ++mMemoryBrokerIdleReclaims;
+        }
+    }
+    batchIndices.resize(memoryDecision.encoderBatchSize);
+    batchSize = batchIndices.size();
+    if (batchSize == 0U)
     {
         return {};
     }

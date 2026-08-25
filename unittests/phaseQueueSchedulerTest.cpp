@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseQueueScheduler.h"
 #include "runtime/scheduling/phaseThreeCoordinator.h"
 
@@ -1801,6 +1802,71 @@ TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadByte
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 30, 100, 40, 2));
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(3, 4, 0, 0, 0, 2));
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 0, 0, 0));
+}
+
+TEST(PhaseMemoryBrokerTest, PreservesCandidateBatchWhileDisabled)
+{
+    PhaseMemoryBroker broker;
+    PhaseMemoryBrokerDecision const decision = broker.planEncoder({0, 900, 500}, {100, 200, 300});
+    EXPECT_EQ(decision.encoderBatchSize, 3U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kDisabled);
+    EXPECT_STREQ(phaseMemoryBrokerReasonName(decision.reason), "disabled");
+    EXPECT_FALSE(decision.reclaimIdleVision);
+}
+
+TEST(PhaseMemoryBrokerTest, ContractsAndBlocksEncoderAtKVWatermarks)
+{
+    PhaseMemoryBrokerConfig config;
+    config.enabled = true;
+    config.kvReservePages = 8;
+    config.kvPressurePages = 24;
+    config.pressureMaxEncoderBatchSize = 1;
+    PhaseMemoryBroker broker(config);
+
+    PhaseMemoryBrokerDecision decision = broker.planEncoder({16, 0, 0}, {100, 100, 100, 100});
+    EXPECT_EQ(decision.encoderBatchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kKVPressure);
+    EXPECT_TRUE(decision.preferDecode);
+
+    decision = broker.planEncoder({8, 0, 0}, {100, 100});
+    EXPECT_EQ(decision.encoderBatchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kKVReserve);
+    EXPECT_TRUE(decision.preferDecode);
+}
+
+TEST(PhaseMemoryBrokerTest, ReclaimsIdleVisionBeforeApplyingByteBackpressure)
+{
+    PhaseMemoryBrokerConfig config;
+    config.enabled = true;
+    config.maxManagedBytes = 1000;
+    config.safetyReserveBytes = 100;
+    config.committedKVPages = 2;
+    config.bytesPerKVPage = 100;
+    PhaseMemoryBroker broker(config);
+
+    PhaseMemoryBrokerDecision const decision = broker.planEncoder({32, 300, 250}, {200, 200, 200});
+    EXPECT_EQ(decision.encoderBatchSize, 2U);
+    EXPECT_EQ(decision.predictedManagedBytes, 900U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kManagedByteLimit);
+    EXPECT_TRUE(decision.reclaimIdleVision);
+    EXPECT_TRUE(decision.preferPrefill);
+}
+
+TEST(PhaseMemoryBrokerTest, RetainsIdleVisionWhenReclaimIsDisabled)
+{
+    PhaseMemoryBrokerConfig config;
+    config.enabled = true;
+    config.maxManagedBytes = 1000;
+    config.safetyReserveBytes = 100;
+    config.committedKVPages = 2;
+    config.bytesPerKVPage = 100;
+    config.reclaimIdleVision = false;
+    PhaseMemoryBroker broker(config);
+
+    PhaseMemoryBrokerDecision const decision = broker.planEncoder({32, 300, 250}, {100, 100});
+    EXPECT_EQ(decision.encoderBatchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kManagedByteLimit);
+    EXPECT_FALSE(decision.reclaimIdleVision);
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)

@@ -147,12 +147,15 @@ public:
     bool cancel(uint64_t requestId);
     bool busy() const noexcept;
     size_t estimateInputTokens(LLMGenerationRequest const& request);
+    //! Estimate request-owned encoder output, deepstack, and M-RoPE bytes retained through prefill.
+    size_t estimatePayloadBytes(LLMGenerationRequest const& request);
     //! Tokenize the causal text prefix before the first image placeholder without launching encoder work.
     std::optional<PhaseVisionPrefixPlan> makePrefixPlan(LLMGenerationRequest const& request);
     size_t maxInputTokens() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;
-    void reclaimIdleStorage();
+    //! Reclaim idle slabs above the configured high-water mark, or every idle slab under broker pressure.
+    void reclaimIdleStorage(bool force = false);
     //! Enable synchronous debug capture only while the adapter is idle.
     void setDebugCallback(std::function<void(PhaseVisionDebugSnapshot const&)> callback);
 

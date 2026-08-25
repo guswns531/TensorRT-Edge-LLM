@@ -1693,6 +1693,32 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.encoderDispatchForcedIntervalUs = std::stod(value);
                 }
+                threePhaseConfig.memoryBroker.enabled = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr;
+                threePhaseConfig.memoryBroker.committedKVPages = config.kvPoolPages;
+                constexpr size_t kTOKENS_PER_KV_PAGE = 128U;
+                threePhaseConfig.memoryBroker.bytesPerKVPage = static_cast<size_t>(config.numAttentionLayers) * 2U
+                    * kTOKENS_PER_KV_PAGE * static_cast<size_t>(config.numKVHeads) * static_cast<size_t>(config.headDim)
+                    * rt::utils::getTypeSize(config.kvCacheDtype);
+                if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_KV_RESERVE_PAGES"))
+                {
+                    threePhaseConfig.memoryBroker.kvReservePages = std::stoi(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_KV_PRESSURE_PAGES"))
+                {
+                    threePhaseConfig.memoryBroker.kvPressurePages = std::stoi(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_PRESSURE_ENCODER_BATCH"))
+                {
+                    threePhaseConfig.memoryBroker.pressureMaxEncoderBatchSize = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_MAX_BYTES"))
+                {
+                    threePhaseConfig.memoryBroker.maxManagedBytes = static_cast<size_t>(std::stoull(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_SAFETY_BYTES"))
+                {
+                    threePhaseConfig.memoryBroker.safetyReserveBytes = static_cast<size_t>(std::stoull(value));
+                }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
             }
@@ -2080,6 +2106,14 @@ int main(int argc, char** argv)
                         {"vision_encoder_prefill_guard_deferrals", visionMetrics.encoderPrefillGuardDeferrals},
                         {"vision_encoder_decode_guard_deferrals", visionMetrics.encoderDecodeGuardDeferrals},
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
+                        {"phase_memory_broker_decisions", visionMetrics.memoryBrokerDecisions},
+                        {"phase_memory_encoder_reductions", visionMetrics.memoryBrokerEncoderReductions},
+                        {"phase_memory_backpressure", visionMetrics.memoryBrokerBackpressure},
+                        {"phase_memory_idle_reclaims", visionMetrics.memoryBrokerIdleReclaims},
+                        {"phase_memory_prefill_preferences", visionMetrics.memoryBrokerPrefillPreferences},
+                        {"phase_memory_decode_preferences", visionMetrics.memoryBrokerDecodePreferences},
+                        {"phase_memory_predicted_bytes", visionMetrics.memoryBrokerLastPredictedBytes},
+                        {"phase_memory_reason", rt::phaseMemoryBrokerReasonName(visionMetrics.memoryBrokerLastReason)},
                         {"vision_prefill_admission_batches", visionMetrics.prefillAdmissionBatches},
                         {"vision_prefill_admission_batch", visionMetrics.lastPrefillAdmissionBatchSize},
                         {"vision_prefill_admission_batch_max", visionMetrics.maxPrefillAdmissionBatchSize},

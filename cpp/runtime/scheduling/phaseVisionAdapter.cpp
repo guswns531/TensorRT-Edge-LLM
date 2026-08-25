@@ -506,6 +506,34 @@ size_t PhaseVisionAdapter::estimateInputTokens(LLMGenerationRequest const& reque
     return static_cast<size_t>(tokens);
 }
 
+size_t PhaseVisionAdapter::estimatePayloadBytes(LLMGenerationRequest const& request)
+{
+    int64_t const outputTokens = mRunner.estimateOutputTokens(request);
+    if (outputTokens <= 0)
+    {
+        return 0U;
+    }
+    auto saturatedMultiply = [](size_t left, size_t right) {
+        return left > 0U && right > std::numeric_limits<size_t>::max() / left ? std::numeric_limits<size_t>::max()
+                                                                              : left * right;
+    };
+    auto saturatedAdd = [](size_t left, size_t right) {
+        return right > std::numeric_limits<size_t>::max() - left ? std::numeric_limits<size_t>::max() : left + right;
+    };
+    size_t const rows = static_cast<size_t>(outputTokens);
+    size_t const featureCount = static_cast<size_t>(std::max(mConfig.numDeepstackFeatures, 0)) + 1U;
+    size_t const embeddingElements
+        = saturatedMultiply(saturatedMultiply(rows, static_cast<size_t>(mConfig.hiddenSize)), featureCount);
+    size_t result = saturatedMultiply(embeddingElements, utils::getTypeSize(nvinfer1::DataType::kHALF));
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
+    {
+        size_t const mropeElements = saturatedMultiply(
+            static_cast<size_t>(mConfig.maxKVCacheCapacity), static_cast<size_t>(mConfig.rotaryDim));
+        result = saturatedAdd(result, saturatedMultiply(mropeElements, sizeof(float)));
+    }
+    return result;
+}
+
 std::optional<PhaseVisionPrefixPlan> PhaseVisionAdapter::makePrefixPlan(LLMGenerationRequest const& request)
 {
     if (request.requests.size() != 1U)
@@ -580,11 +608,12 @@ void PhaseVisionAdapter::refreshIdleStorageStats() noexcept
     }
 }
 
-void PhaseVisionAdapter::reclaimIdleStorage()
+void PhaseVisionAdapter::reclaimIdleStorage(bool force)
 {
     refreshIdleStorageStats();
     auto overBudget = [&] {
-        return mMemoryStats.idleStorageBatches > mStoragePolicy.maxIdleBatches
+        return (force && mMemoryStats.idleStorageBatches > 0U)
+            || mMemoryStats.idleStorageBatches > mStoragePolicy.maxIdleBatches
             || mMemoryStats.idleStorageBytes > mStoragePolicy.maxIdleBytes;
     };
     while (overBudget())
