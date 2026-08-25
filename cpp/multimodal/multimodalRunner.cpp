@@ -16,6 +16,7 @@
  */
 
 #include "multimodalRunner.h"
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/trtUtils.h"
 #include "multimodal/audioRunner.h"
@@ -64,6 +65,7 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
         mVisualEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     bool const profileSet = mVisualContext->setOptimizationProfileAsync(0, stream);
     ELLM_CHECK(profileSet, "Failed to set optimization profile for visual engine");
+    mProfileContextMemories.resize(static_cast<size_t>(mVisualEngine->getNbOptimizationProfiles()));
 
     setNonBlockingAuxStreams(mVisualContext.get(), mVisualEngine.get(), mAuxStreams);
 
@@ -106,6 +108,32 @@ int64_t MultimodalRunner::getRequiredContextMemorySize() const
     return engine ? engine->getDeviceMemorySizeV2() : 0;
 }
 
+int64_t MultimodalRunner::getRequiredContextMemorySizeForProfile(int32_t profileIndex) const
+{
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    ELLM_CHECK(engine != nullptr, "Multimodal runner has no TensorRT engine");
+    ELLM_CHECK(profileIndex >= 0 && profileIndex < engine->getNbOptimizationProfiles(),
+        "Multimodal optimization profile index is out of range");
+    return engine->getDeviceMemorySizeForProfileV2(profileIndex);
+}
+
+int32_t MultimodalRunner::getOptimizationProfileCount() const noexcept
+{
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    return engine ? engine->getNbOptimizationProfiles() : 0;
+}
+
+int64_t MultimodalRunner::getInputTokenLimitForProfile(int32_t profileIndex) const
+{
+    ELLM_CHECK(mVisualEngine != nullptr, "Multimodal runner has no visual TensorRT engine");
+    ELLM_CHECK(profileIndex >= 0 && profileIndex < mVisualEngine->getNbOptimizationProfiles(),
+        "Visual optimization profile index is out of range");
+    nvinfer1::Dims const maximum
+        = mVisualEngine->getProfileShape(binding_names::kVisualInput, profileIndex, nvinfer1::OptProfileSelector::kMAX);
+    ELLM_CHECK(maximum.nbDims > 0, "Visual input profile has no token dimension");
+    return maximum.d[0];
+}
+
 bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
 {
     // Pick the audio pair for audio-only runners, otherwise the visual pair.
@@ -125,7 +153,92 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
         return false;
     }
 
+    size_t const profileCount = static_cast<size_t>(engine->getNbOptimizationProfiles());
+    mProfileContextMemories.assign(
+        profileCount, {sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity()});
     context->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    return true;
+}
+
+bool MultimodalRunner::setContextMemoryForProfile(
+    int32_t profileIndex, rt::Tensor& sharedContextMemory, cudaStream_t stream)
+{
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    auto* context = mAudioEngine ? mAudioContext.get() : mVisualContext.get();
+    if (!engine)
+    {
+        return true;
+    }
+    if (profileIndex < 0 || profileIndex >= engine->getNbOptimizationProfiles())
+    {
+        LOG_ERROR("Multimodal optimization profile index %d is out of range", profileIndex);
+        return false;
+    }
+    int64_t const requiredSize = getRequiredContextMemorySizeForProfile(profileIndex);
+    if (sharedContextMemory.getMemoryCapacity() < requiredSize)
+    {
+        LOG_ERROR("Profile %d context memory (%zu bytes) is smaller than required (%zu bytes)", profileIndex,
+            static_cast<size_t>(sharedContextMemory.getMemoryCapacity()), static_cast<size_t>(requiredSize));
+        return false;
+    }
+    if (mProfileContextMemories.size() != static_cast<size_t>(engine->getNbOptimizationProfiles()))
+    {
+        mProfileContextMemories.resize(static_cast<size_t>(engine->getNbOptimizationProfiles()));
+    }
+    mProfileContextMemories[static_cast<size_t>(profileIndex)]
+        = {sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity()};
+    if (!context->setOptimizationProfileAsync(profileIndex, stream))
+    {
+        LOG_ERROR("Failed to select multimodal optimization profile %d", profileIndex);
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    context->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    mCurrentOptimizationProfile = profileIndex;
+    return true;
+}
+
+bool MultimodalRunner::selectVisualProfileForInputTokens(int64_t inputTokens, cudaStream_t stream)
+{
+    if (!mVisualEngine || !mVisualContext)
+    {
+        return false;
+    }
+    int32_t selectedProfile{-1};
+    for (int32_t profileIndex = 0; profileIndex < mVisualEngine->getNbOptimizationProfiles(); ++profileIndex)
+    {
+        nvinfer1::Dims const maximum = mVisualEngine->getProfileShape(
+            binding_names::kVisualInput, profileIndex, nvinfer1::OptProfileSelector::kMAX);
+        if (maximum.nbDims > 0 && inputTokens <= maximum.d[0])
+        {
+            selectedProfile = profileIndex;
+            break;
+        }
+    }
+    if (selectedProfile < 0)
+    {
+        LOG_ERROR("Visual input tokens %lld exceed every optimization profile", static_cast<long long>(inputTokens));
+        return false;
+    }
+    if (mProfileContextMemories.size() <= static_cast<size_t>(selectedProfile)
+        || mProfileContextMemories[static_cast<size_t>(selectedProfile)].pointer == nullptr)
+    {
+        LOG_ERROR("No context memory is registered for visual optimization profile %d", selectedProfile);
+        return false;
+    }
+    if (selectedProfile == mCurrentOptimizationProfile)
+    {
+        return true;
+    }
+    if (!mVisualContext->setOptimizationProfileAsync(selectedProfile, stream))
+    {
+        LOG_ERROR("Failed to switch to visual optimization profile %d", selectedProfile);
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    ProfileContextMemory const& memory = mProfileContextMemories[static_cast<size_t>(selectedProfile)];
+    mVisualContext->setDeviceMemoryV2(memory.pointer, memory.capacity);
+    mCurrentOptimizationProfile = selectedProfile;
     return true;
 }
 

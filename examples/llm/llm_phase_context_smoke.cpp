@@ -1358,10 +1358,27 @@ int main(int argc, char** argv)
         {
             visionStoragePolicy.maxIdleBytes = static_cast<size_t>(std::stoull(value));
         }
+        size_t tieredVisionExclusiveInputTokens{};
         auto configureVisionContextMemory = [&](rt::MultimodalRunner& runner) {
             int64_t const requiredBytes = runner.getRequiredContextMemorySize();
             LOG_INFO("Vision context workspace: required=%lld prefill_available=%zu bytes",
                 static_cast<long long>(requiredBytes), pair->prefillContextMemory().getMemoryCapacity());
+            if (std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr)
+            {
+                int32_t const profileCount = runner.getOptimizationProfileCount();
+                ELLM_CHECK(profileCount >= 2, "Tiered vision context memory requires at least two visual profiles");
+                int32_t const largeProfile = profileCount - 1;
+                rt::TieredVisionContextMemoryInfo const info
+                    = pair->configureTieredVisionContextMemory(runner, 0, largeProfile);
+                tieredVisionExclusiveInputTokens = static_cast<size_t>(runner.getInputTokenLimitForProfile(0));
+                LOG_INFO(
+                    "Tiered E/P context arena: total=%lld prefill=%lld small_vision=%lld large_vision=%lld "
+                    "exclusive_above_input_tokens=%zu",
+                    static_cast<long long>(info.arenaBytes), static_cast<long long>(info.prefillBytes),
+                    static_cast<long long>(info.smallVisionBytes), static_cast<long long>(info.largeVisionBytes),
+                    tieredVisionExclusiveInputTokens);
+                return;
+            }
             runner.allocateContextMemory();
         };
         if (visionEngineDir != nullptr && visionImagePath != nullptr)
@@ -1584,6 +1601,11 @@ int main(int argc, char** argv)
                     });
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
+                threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
+                {
+                    threePhaseConfig.exclusiveEncoderInputTokenThreshold = static_cast<size_t>(std::stoull(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_MAX_ENCODED_VISION"))
                 {
                     threePhaseConfig.maxEncodedInFlight = static_cast<size_t>(std::stoul(value));
@@ -2135,6 +2157,8 @@ int main(int argc, char** argv)
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
                         {"vision_encoder_credit_wait_periods", visionMetrics.encoderCreditWaitPeriods},
                         {"vision_encoder_credit_age_releases", visionMetrics.encoderCreditAgeReleases},
+                        {"vision_encoder_exclusive_batches", visionMetrics.exclusiveEncoderBatches},
+                        {"vision_encoder_exclusive_prefill_deferrals", visionMetrics.exclusiveEncoderPrefillDeferrals},
                         {"phase_memory_broker_decisions", visionMetrics.memoryBrokerDecisions},
                         {"phase_memory_encoder_reductions", visionMetrics.memoryBrokerEncoderReductions},
                         {"phase_memory_backpressure", visionMetrics.memoryBrokerBackpressure},
@@ -2313,7 +2337,7 @@ int main(int argc, char** argv)
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
                     "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
-                    "decode_tpot_pressure=%.3f",
+                    "decode_tpot_pressure=%.3f exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
                     visionMetrics.lastEncoderInputBytes, visionMetrics.maxEncoderInputBytes,
@@ -2333,7 +2357,8 @@ int main(int argc, char** argv)
                     visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
-                    visionMetrics.decodeTpotPressure);
+                    visionMetrics.decodeTpotPressure, visionMetrics.exclusiveEncoderBatches,
+                    visionMetrics.exclusiveEncoderPrefillDeferrals);
                 rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();
                 LOG_INFO(
                     "Phase vision memory ops: slab_allocations=%zu slab_reuses=%zu slab_reclaims=%zu "

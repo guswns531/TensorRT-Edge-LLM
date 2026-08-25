@@ -306,6 +306,8 @@ public:
         size_t externalPrefillTokens = 0U) noexcept;
     //! Forward a memory-broker drain preference into the common P/D scheduler.
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
+    //! Exclude or restore prefill dispatch while an external phase owns overlapping workspace.
+    void setPrefillDispatchBlocked(bool blocked) noexcept;
     PhaseDrainPreference activeDrainPreference() const noexcept;
     size_t drainPreferenceTransitionCount() const noexcept;
     size_t drainPreferenceAppliedDispatchCount() const noexcept;

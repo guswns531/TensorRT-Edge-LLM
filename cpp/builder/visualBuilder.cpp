@@ -24,6 +24,7 @@
 #include "common/version.h"
 #include "multimodal/imageUtils.h"
 
+#include <algorithm>
 #include <cmath>
 
 using namespace trt_edgellm;
@@ -268,43 +269,70 @@ bool VisualBuilder::parseConfig()
 bool VisualBuilder::setupVisualOptimizationProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
-    auto* visualProfile = builder.createOptimizationProfile();
-    bool result = true;
-
-    switch (mModelType)
+    std::vector<int64_t> profileMaxima = mBuilderConfig.imageTokenProfiles;
+    if (profileMaxima.empty())
     {
-    case multimodal::ModelType::QWEN2_VL:
-    case multimodal::ModelType::QWEN2_5_VL:
-    case multimodal::ModelType::QWEN3_VL:
-    case multimodal::ModelType::QWEN3_5:
-    case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
-    case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
-
-    case multimodal::ModelType::INTERNVL:
-    case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
-
-    case multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER:
-        result = setupNemotronOmniViTProfile(*visualProfile);
-        break;
-
-    case multimodal::ModelType::GEMMA4_VISION: result = setupGemma4ViTProfile(*visualProfile, network); break;
-
-    case multimodal::ModelType::GEMMA4_UNIFIED_VISION:
-        result = setupGemma4UnifiedVisionProfile(*visualProfile, network);
-        break;
-
-    default: LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType)); return false;
+        profileMaxima.push_back(mBuilderConfig.maxImageTokens);
     }
-
-    if (!result)
+    if (!std::is_sorted(profileMaxima.begin(), profileMaxima.end())
+        || std::adjacent_find(profileMaxima.begin(), profileMaxima.end()) != profileMaxima.end()
+        || profileMaxima.front() < mBuilderConfig.minImageTokens
+        || profileMaxima.back() != mBuilderConfig.maxImageTokens)
     {
-        LOG_ERROR("Failed to setup optimization profile");
+        LOG_ERROR(
+            "imageTokenProfiles must be strictly increasing, start at or above minImageTokens, and end at "
+            "maxImageTokens");
         return false;
     }
 
-    LOG_DEBUG("%s", printOptimizationProfile(visualProfile, "visual_profile", &network).c_str());
+    int64_t const configuredMaxImageTokens = mBuilderConfig.maxImageTokens;
+    for (size_t profileIndex = 0; profileIndex < profileMaxima.size(); ++profileIndex)
+    {
+        mBuilderConfig.maxImageTokens = profileMaxima[profileIndex];
+        auto* visualProfile = builder.createOptimizationProfile();
+        bool result = true;
 
-    config.addOptimizationProfile(visualProfile);
+        switch (mModelType)
+        {
+        case multimodal::ModelType::QWEN2_VL:
+        case multimodal::ModelType::QWEN2_5_VL:
+        case multimodal::ModelType::QWEN3_VL:
+        case multimodal::ModelType::QWEN3_5:
+        case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
+        case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
+
+        case multimodal::ModelType::INTERNVL:
+        case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
+
+        case multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER:
+            result = setupNemotronOmniViTProfile(*visualProfile);
+            break;
+
+        case multimodal::ModelType::GEMMA4_VISION: result = setupGemma4ViTProfile(*visualProfile, network); break;
+
+        case multimodal::ModelType::GEMMA4_UNIFIED_VISION:
+            result = setupGemma4UnifiedVisionProfile(*visualProfile, network);
+            break;
+
+        default:
+            LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType));
+            mBuilderConfig.maxImageTokens = configuredMaxImageTokens;
+            return false;
+        }
+
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup visual optimization profile %zu", profileIndex);
+            mBuilderConfig.maxImageTokens = configuredMaxImageTokens;
+            return false;
+        }
+
+        std::string const profileName = "visual_profile_" + std::to_string(profileIndex);
+        LOG_DEBUG("%s", printOptimizationProfile(visualProfile, profileName, &network).c_str());
+        config.addOptimizationProfile(visualProfile);
+    }
+
+    mBuilderConfig.maxImageTokens = configuredMaxImageTokens;
     return true;
 }
 

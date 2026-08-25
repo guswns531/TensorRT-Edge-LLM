@@ -884,6 +884,11 @@ void IndependentPhaseAsyncServer::setExternalDrainPreference(PhaseDrainPreferenc
     mCoordinator.scheduler().setExternalDrainPreference(preference);
 }
 
+void IndependentPhaseAsyncServer::setPrefillDispatchBlocked(bool blocked) noexcept
+{
+    mCoordinator.scheduler().setPrefillDispatchBlocked(blocked);
+}
+
 PhaseDrainPreference IndependentPhaseAsyncServer::activeDrainPreference() const noexcept
 {
     return mCoordinator.scheduler().telemetry().activeDrainPreference;

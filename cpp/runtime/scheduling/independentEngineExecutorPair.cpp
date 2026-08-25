@@ -18,8 +18,10 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 
 #include "common/checkMacros.h"
+#include "multimodal/multimodalRunner.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <utility>
 
 namespace trt_edgellm
@@ -130,6 +132,50 @@ Tensor& IndependentEngineExecutorPair::prefillContextMemory() noexcept
 Tensor& IndependentEngineExecutorPair::decodeContextMemory() noexcept
 {
     return mConfig.sharedExecutionContext ? mPrefillContextMemory : mDecodeContextMemory;
+}
+
+TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureTieredVisionContextMemory(
+    MultimodalRunner& vision, int32_t smallVisionProfile, int32_t largeVisionProfile)
+{
+    ELLM_CHECK(!mConfig.sharedExecutionContext,
+        "Tiered E/P context memory requires independent prefill and decode execution contexts");
+    ELLM_CHECK(smallVisionProfile >= 0 && smallVisionProfile < vision.getOptimizationProfileCount(),
+        "Small vision optimization profile is out of range");
+    ELLM_CHECK(largeVisionProfile >= 0 && largeVisionProfile < vision.getOptimizationProfileCount(),
+        "Large vision optimization profile is out of range");
+    ELLM_CHECK(smallVisionProfile != largeVisionProfile,
+        "Tiered E/P context memory requires distinct small and large vision profiles");
+
+    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    int64_t const smallVisionBytes = vision.getRequiredContextMemorySizeForProfile(smallVisionProfile);
+    int64_t const largeVisionBytes = vision.getRequiredContextMemorySizeForProfile(largeVisionProfile);
+    constexpr int64_t kContextAlignment = 256;
+    int64_t const prefillSpanBytes = ((prefillBytes + kContextAlignment - 1) / kContextAlignment) * kContextAlignment;
+    int64_t const arenaBytes = std::max(prefillSpanBytes + smallVisionBytes, largeVisionBytes);
+
+    // Release the old prefill allocation before acquiring the replacement arena,
+    // avoiding a transient peak on memory-constrained edge GPUs.
+    mPrefillContextMemory = Tensor{};
+    mTieredContextMemoryArena = Tensor{};
+    mTieredContextMemoryArena = Tensor({arenaBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::tieredVisionContextMemory");
+    auto* const arenaBase = static_cast<std::byte*>(mTieredContextMemoryArena.rawPointer());
+    mPrefillContextMemory = Tensor(arenaBase, {prefillBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::tieredPrefillContextMemory");
+    Tensor smallVisionMemory(arenaBase + prefillSpanBytes, {smallVisionBytes}, DeviceType::kGPU,
+        nvinfer1::DataType::kUINT8, "IndependentEngineExecutorPair::tieredSmallVisionContextMemory");
+    Tensor largeVisionMemory(arenaBase, {largeVisionBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::tieredLargeVisionContextMemory");
+
+    ELLM_CHECK(vision.setContextMemoryForProfile(smallVisionProfile, smallVisionMemory, mConfig.setupStream),
+        "Failed to assign the small vision profile workspace");
+    ELLM_CHECK(vision.setContextMemoryForProfile(largeVisionProfile, largeVisionMemory, mConfig.setupStream),
+        "Failed to assign the large vision profile workspace");
+    ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(
+                   mConfig.prefillProfile, mPrefillContextMemory, mConfig.setupStream),
+        "Failed to rebind prefill to the tiered E/P context arena");
+
+    return {arenaBytes, prefillBytes, smallVisionBytes, largeVisionBytes};
 }
 
 CUcontext IndependentEngineExecutorPair::cudaContext() const noexcept

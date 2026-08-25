@@ -24,7 +24,9 @@
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 using namespace trt_edgellm;
 
@@ -38,7 +40,8 @@ enum VLMBuildOptionId : int
     MIN_IMAGE_TOKENS = 605,
     MAX_IMAGE_TOKENS = 606,
     MAX_IMAGE_TOKENS_PER_IMAGE = 607,
-    PROFILING_DETAILED = 608
+    PROFILING_DETAILED = 608,
+    IMAGE_TOKEN_PROFILES = 609
 };
 
 struct ViTBuildArgs
@@ -50,6 +53,7 @@ struct ViTBuildArgs
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
     int64_t maxImageTokensPerImage{512};
+    std::vector<int64_t> imageTokenProfiles;
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
 };
 
@@ -57,7 +61,8 @@ void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] <--onnxDir str> <--engineDir str> [--debug]"
-                 "[--minImageTokens int] [--maxImageTokens int] [--maxImageTokensPerImage int] [--profilingDetailed]"
+                 "[--minImageTokens int] [--maxImageTokens int] [--maxImageTokensPerImage int] "
+                 "[--imageTokenProfiles int,int] [--profilingDetailed]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help               Display this help message" << std::endl;
@@ -70,6 +75,8 @@ void printUsage(char const* programName)
     std::cerr << "  --minImageTokens     Minimum image tokens. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens     Maximum image tokens. Default = 1024" << std::endl;
     std::cerr << "  --maxImageTokensPerImage     Maximum image tokens per image. Default = 512" << std::endl;
+    std::cerr << "  --imageTokenProfiles         Ascending profile maxima, e.g. 2048,4096. Default = one profile."
+              << std::endl;
     std::cerr << "  --profilingDetailed  Enable detailed profiling verbosity to include ONNX op names. "
                  "Use for DLSim analysis."
               << std::endl;
@@ -84,6 +91,7 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
         {"minImageTokens", required_argument, 0, VLMBuildOptionId::MIN_IMAGE_TOKENS},
         {"maxImageTokens", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS},
         {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE},
+        {"imageTokenProfiles", required_argument, 0, VLMBuildOptionId::IMAGE_TOKEN_PROFILES},
         {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};
 
     int opt;
@@ -131,6 +139,22 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
             if (optarg)
             {
                 args.maxImageTokensPerImage = std::stoi(optarg);
+            }
+            break;
+        case VLMBuildOptionId::IMAGE_TOKEN_PROFILES:
+            if (optarg)
+            {
+                std::stringstream values(optarg);
+                std::string value;
+                while (std::getline(values, value, ','))
+                {
+                    if (value.empty())
+                    {
+                        LOG_ERROR("--imageTokenProfiles contains an empty value.");
+                        return false;
+                    }
+                    args.imageTokenProfiles.push_back(std::stoll(value));
+                }
             }
             break;
         case VLMBuildOptionId::PROFILING_DETAILED: args.profilingDetailed = true; break;
@@ -188,6 +212,7 @@ int main(int argc, char** argv)
     config.minImageTokens = args.minImageTokens;
     config.maxImageTokens = args.maxImageTokens;
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
+    config.imageTokenProfiles = args.imageTokenProfiles;
     config.profilingDetailed = args.profilingDetailed;
 
     // The server loads <engineDir>/visual.engine, so land the engine under a

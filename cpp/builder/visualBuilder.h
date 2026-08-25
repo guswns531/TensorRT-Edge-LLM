@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using Json = nlohmann::json;
 
@@ -41,8 +42,10 @@ struct VisualBuilderConfig
     int64_t minImageTokens{4};           //!< Minimum number of image tokens in a batch
     int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
     int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
-    bool profilingDetailed{false};       //!< Enable detailed profiling verbosity for layer info extraction
-    bool useTrtNativeVitAttn{false};     //!< Use TRT IAttention
+    //! Optional ascending profile maxima. Empty preserves the legacy single-profile engine.
+    std::vector<int64_t> imageTokenProfiles;
+    bool profilingDetailed{false};   //!< Enable detailed profiling verbosity for layer info extraction
+    bool useTrtNativeVitAttn{false}; //!< Use TRT IAttention
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -52,6 +55,10 @@ struct VisualBuilderConfig
         json["min_image_tokens"] = minImageTokens;
         json["max_image_tokens"] = maxImageTokens;
         json["max_image_tokens_per_image"] = maxImageTokensPerImage;
+        if (!imageTokenProfiles.empty())
+        {
+            json["image_token_profiles"] = imageTokenProfiles;
+        }
         // The cu_seqlens profile capacity, so the server can budget request
         // media against the real engine limit instead of re-deriving it.
         json["max_cu_seqlen_groups"] = rt::imageUtils::maxCuSeqlenGroups(maxImageTokens);
@@ -77,6 +84,10 @@ struct VisualBuilderConfig
         {
             config.maxImageTokensPerImage = json["max_image_tokens_per_image"];
         }
+        if (json.contains("image_token_profiles"))
+        {
+            config.imageTokenProfiles = json["image_token_profiles"].get<std::vector<int64_t>>();
+        }
         if (json.contains("use_trt_native_vit_attn"))
         {
             config.useTrtNativeVitAttn = json["use_trt_native_vit_attn"];
@@ -93,6 +104,15 @@ struct VisualBuilderConfig
         oss << "  minImageTokens: " << minImageTokens << "\n";
         oss << "  maxImageTokens: " << maxImageTokens << "\n";
         oss << "  maxImageTokensPerImage: " << maxImageTokensPerImage << "\n";
+        if (!imageTokenProfiles.empty())
+        {
+            oss << "  imageTokenProfiles:";
+            for (int64_t const profile : imageTokenProfiles)
+            {
+                oss << " " << profile;
+            }
+            oss << "\n";
+        }
         return oss.str();
     }
 };

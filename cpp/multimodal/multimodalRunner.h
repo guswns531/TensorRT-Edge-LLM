@@ -80,6 +80,15 @@ public:
      */
     int64_t getRequiredContextMemorySize() const;
 
+    //! Return the profile-specific TensorRT USER_MANAGED workspace size.
+    int64_t getRequiredContextMemorySizeForProfile(int32_t profileIndex) const;
+
+    //! Return the number of optimization profiles in the loaded encoder engine.
+    int32_t getOptimizationProfileCount() const noexcept;
+
+    //! Return the raw visual input-token ceiling for one optimization profile.
+    int64_t getInputTokenLimitForProfile(int32_t profileIndex) const;
+
     /*!
      * @brief Set shared context memory for the execution context
      * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
@@ -88,6 +97,9 @@ public:
      * @note Handles both visual and audio engines
      */
     bool setContextMemory(rt::Tensor& sharedContextMemory);
+
+    //! Register and bind caller-owned context memory for one optimization profile.
+    bool setContextMemoryForProfile(int32_t profileIndex, rt::Tensor& sharedContextMemory, cudaStream_t stream);
 
     //! Allocate and bind runner-owned USER_MANAGED TensorRT context memory.
     //! Idempotent and required before a runner initialization that enqueues work.
@@ -217,6 +229,9 @@ public:
     void loadExternalWeights(std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream);
 
 protected:
+    //! Select the smallest visual profile whose first input dimension contains inputTokens.
+    bool selectVisualProfileForInputTokens(int64_t inputTokens, cudaStream_t stream);
+
     multimodal::ModelType mModelType; //!< Model type identifier
     AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;         //!< TensorRT runtime
@@ -228,7 +243,14 @@ protected:
     metrics::MultimodalMetrics mMultimodalMetrics;              //!< Performance metrics
     //! Owns the encoder's externalized weights; the context points into them.
     std::unique_ptr<ExternalWeightManager> mExternalWeights;
-    rt::Tensor mOwnedContextMemory;     //!< Encoder context memory for independent execution.
+    rt::Tensor mOwnedContextMemory; //!< Encoder context memory for independent execution.
+    struct ProfileContextMemory
+    {
+        void* pointer{};
+        int64_t capacity{};
+    };
+    std::vector<ProfileContextMemory> mProfileContextMemories;
+    int32_t mCurrentOptimizationProfile{};
     bool mExternalWeightsLoaded{false}; //!< Guards the idempotent load
 };
 

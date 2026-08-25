@@ -52,6 +52,30 @@ TEST(PhaseQueueSchedulerTest, BatchesQueuesIndependently)
     EXPECT_EQ(plan.decodeBatch[0].requestId, 3U);
 }
 
+TEST(PhaseQueueSchedulerTest, ExternalArenaBlockExcludesOnlyPrefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 2;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    scheduler.setPrefillDispatchBlocked(true);
+    PhaseDispatchPlan decodeOnly = scheduler.next();
+    ASSERT_EQ(decodeOnly.kind, PhaseDispatchKind::kDecode);
+    ASSERT_EQ(decodeOnly.decodeBatch.size(), 1U);
+    EXPECT_TRUE(decodeOnly.prefillBatch.empty());
+    scheduler.completeDecode(decodeOnly.decodeBatch.front(), 129, true);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    scheduler.setPrefillDispatchBlocked(false);
+    PhaseDispatchPlan prefill = scheduler.next();
+    ASSERT_EQ(prefill.kind, PhaseDispatchKind::kPrefill);
+    ASSERT_EQ(prefill.prefillBatch.size(), 1U);
+    EXPECT_EQ(prefill.prefillBatch.front().requestId, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, DecodeReplacementCostPreservesWarmRowsWhenBatchGrowthIsTransientlyExpensive)
 {
     rt::PhaseQueueSchedulerConfig config;

@@ -30,6 +30,16 @@ namespace trt_edgellm
 namespace rt
 {
 
+class MultimodalRunner;
+
+struct TieredVisionContextMemoryInfo
+{
+    int64_t arenaBytes{};
+    int64_t prefillBytes{};
+    int64_t smallVisionBytes{};
+    int64_t largeVisionBytes{};
+};
+
 //! @brief Resources required to run two phases concurrently on one CUDA context.
 struct IndependentEngineExecutorPairConfig
 {
@@ -69,6 +79,14 @@ public:
     Tensor& prefillContextMemory() noexcept;
     Tensor& decodeContextMemory() noexcept;
 
+    //! Replace the independent prefill workspace with an E/P tiered arena.
+    //!
+    //! Small vision batches use a disjoint suffix and may overlap prefill.
+    //! Large vision batches use the complete arena and therefore require the
+    //! scheduler to exclude prefill until their CUDA completion event fires.
+    TieredVisionContextMemoryInfo configureTieredVisionContextMemory(
+        MultimodalRunner& vision, int32_t smallVisionProfile, int32_t largeVisionProfile);
+
     //! The CUDA context owning all three supplied streams.
     CUcontext cudaContext() const noexcept;
 
@@ -82,6 +100,8 @@ private:
     static CUcontext streamContext(cudaStream_t stream);
     static void validateStreams(IndependentEngineExecutorPairConfig const& config, CUcontext& context);
 
+    //! Declared before non-owning subviews so it is destroyed after them.
+    Tensor mTieredContextMemoryArena;
     Tensor mPrefillContextMemory;
     Tensor mDecodeContextMemory;
     std::unique_ptr<EngineExecutor> mPrefillExecutor;

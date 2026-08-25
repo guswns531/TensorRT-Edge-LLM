@@ -556,6 +556,8 @@ public:
     void setOnlineDecodeCostLearningActive(bool active) noexcept;
     //! Update a scheduler-external resource drain hint. Disabled schedulers retain legacy decisions.
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
+    //! Temporarily exclude prefill dispatch while an external encoder owns overlapping context memory.
+    void setPrefillDispatchBlocked(bool blocked) noexcept;
     //! Reset learned scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
@@ -614,6 +616,7 @@ private:
     PhaseDrainPreference mActiveDrainPreference{PhaseDrainPreference::kNone};
     size_t mDrainPreferenceDispatches{};
     size_t mConsecutiveDrainPreferenceDispatches{};
+    bool mPrefillDispatchBlocked{};
 };
 
 } // namespace rt

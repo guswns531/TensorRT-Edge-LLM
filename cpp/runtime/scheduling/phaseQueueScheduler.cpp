@@ -446,7 +446,13 @@ PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot() const
 
 bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
 {
-    return !mConfig.eligibilityPolicy || mConfig.eligibilityPolicy(item, prefill);
+    return !(prefill && mPrefillDispatchBlocked)
+        && (!mConfig.eligibilityPolicy || mConfig.eligibilityPolicy(item, prefill));
+}
+
+void PhaseQueueScheduler::setPrefillDispatchBlocked(bool blocked) noexcept
+{
+    mPrefillDispatchBlocked = blocked;
 }
 
 PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const& state) const noexcept

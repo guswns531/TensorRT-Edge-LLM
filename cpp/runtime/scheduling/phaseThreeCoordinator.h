@@ -115,6 +115,8 @@ struct PhaseThreeCoordinatorConfig
     double encoderDispatchForcedIntervalUs{};
     //! Opt-in memory-aware encoder admission coupled to the E/P/D scheduler.
     PhaseMemoryBrokerConfig memoryBroker;
+    //! Above this raw encoder input-token count, the encoder exclusively owns the shared E/P arena.
+    size_t exclusiveEncoderInputTokenThreshold{};
 };
 
 struct PhaseThreeCoordinatorMetrics
@@ -179,6 +181,8 @@ struct PhaseThreeCoordinatorMetrics
     PhaseDrainPreference activeMemoryDrainPreference{PhaseDrainPreference::kNone};
     size_t memoryDrainPreferenceTransitions{};
     size_t memoryDrainPreferenceAppliedDispatches{};
+    size_t exclusiveEncoderBatches{};
+    size_t exclusiveEncoderPrefillDeferrals{};
 };
 
 //! One completed vision encoder batch measured by CUDA events.
@@ -400,6 +404,9 @@ private:
     size_t mEncoderAgeForcedStarts{};
     size_t mEncoderCreditWaitPeriods{};
     size_t mEncoderCreditAgeReleases{};
+    size_t mExclusiveEncoderBatches{};
+    size_t mExclusiveEncoderPrefillDeferrals{};
+    bool mExclusiveEncoderInFlight{};
     bool mEncoderCreditDeferred{};
     size_t mMemoryBrokerDecisions{};
     size_t mMemoryBrokerEncoderReductions{};

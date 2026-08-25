@@ -530,6 +530,8 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.activeMemoryDrainPreference = mServer.activeDrainPreference();
     result.memoryDrainPreferenceTransitions = mServer.drainPreferenceTransitionCount();
     result.memoryDrainPreferenceAppliedDispatches = mServer.drainPreferenceAppliedDispatchCount();
+    result.exclusiveEncoderBatches = mExclusiveEncoderBatches;
+    result.exclusiveEncoderPrefillDeferrals = mExclusiveEncoderPrefillDeferrals;
     if (!mPending.empty())
     {
         result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
@@ -603,6 +605,30 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         return false;
     }
+    size_t candidateInputTokens{};
+    for (size_t const pendingIndex : batchIndices)
+    {
+        size_t const requestInputTokens = mPending[pendingIndex].inputTokens;
+        candidateInputTokens = requestInputTokens > std::numeric_limits<size_t>::max() - candidateInputTokens
+            ? std::numeric_limits<size_t>::max()
+            : candidateInputTokens + requestInputTokens;
+    }
+    bool const exclusiveEncoder = mConfig.exclusiveEncoderInputTokenThreshold > 0
+        && candidateInputTokens > mConfig.exclusiveEncoderInputTokenThreshold;
+    if (exclusiveEncoder)
+    {
+        IndependentPhaseServerArbitrationSnapshot const snapshot = mServer.arbitrationSnapshot();
+        bool const prefillInFlight = snapshot.busy
+            && (snapshot.inFlightKind == PhaseDispatchKind::kPrefill
+                || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
+        if (prefillInFlight)
+        {
+            ++mExclusiveEncoderPrefillDeferrals;
+            return false;
+        }
+        mServer.setPrefillDispatchBlocked(true);
+        mExclusiveEncoderInFlight = true;
+    }
 
     size_t const encodedCapacity = effectiveEncodedCapacity();
     if (encodedCapacity > mLastEffectiveEncodedCapacity && mLastEffectiveEncodedCapacity > 0)
@@ -648,7 +674,19 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         recordTimeline(submission.requestId, PhaseTimelineStage::kEncoderStart, batchSize, -1, timelineTimestampNs);
     }
-    ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
+    try
+    {
+        ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
+    }
+    catch (...)
+    {
+        if (mExclusiveEncoderInFlight)
+        {
+            mServer.setPrefillDispatchBlocked(false);
+            mExclusiveEncoderInFlight = false;
+        }
+        throw;
+    }
     mEncoderStarts += batchSize;
     ++mEncoderBatches;
     mLastEncoderBatchSize = batchSize;
@@ -657,6 +695,10 @@ bool PhaseThreeCoordinator::startNextEncoder()
     mMaxEncoderInputBytes = std::max(mMaxEncoderInputBytes, encoderInputBytes);
     mLastEncoderInputTokens = encoderInputTokens;
     mMaxEncoderInputTokens = std::max(mMaxEncoderInputTokens, encoderInputTokens);
+    if (exclusiveEncoder)
+    {
+        ++mExclusiveEncoderBatches;
+    }
     return true;
 }
 
@@ -671,6 +713,13 @@ bool PhaseThreeCoordinator::completeEncoder()
     if (!batchReady)
     {
         return false;
+    }
+    if (mExclusiveEncoderInFlight)
+    {
+        // ready() is driven by the encoder CUDA completion event, so the
+        // overlapping arena is safe for the next prefill enqueue now.
+        mServer.setPrefillDispatchBlocked(false);
+        mExclusiveEncoderInFlight = false;
     }
     size_t const batchSize = mEncoding.size();
     for (PendingVisionRequest& encoding : mEncoding)

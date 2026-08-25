@@ -880,6 +880,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("min_image_tokens", &builder::VisualBuilderConfig::minImageTokens)
         .def_readwrite("max_image_tokens", &builder::VisualBuilderConfig::maxImageTokens)
         .def_readwrite("max_image_tokens_per_image", &builder::VisualBuilderConfig::maxImageTokensPerImage)
+        .def_readwrite("image_token_profiles", &builder::VisualBuilderConfig::imageTokenProfiles)
         .def("__repr__", &builder::VisualBuilderConfig::toString);
 
     py::class_<builder::VisualBuilder>(
