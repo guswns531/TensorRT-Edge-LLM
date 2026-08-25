@@ -1817,6 +1817,19 @@ TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)
     EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2048}}, 4, 0, 0, 4096), 2U);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadForHomogeneousEncoderGeometry)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 64, 1024, {1, 480, 640, 3}},
+    };
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 0, true), (std::vector<size_t>{0, 2, 3}));
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 2048, true), (std::vector<size_t>{0, 2}));
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 0, false), (std::vector<size_t>{0, 1, 2}));
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, ReleasesReadyPrefillByCountTokenBudgetOrAge)
 {
     std::vector<int32_t> const promptTokens{128, 256, 512, 64};

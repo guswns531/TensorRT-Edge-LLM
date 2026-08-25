@@ -60,6 +60,8 @@ struct PhaseThreeCoordinatorConfig
     size_t maxEncoderInputTokens{};
     //! Maximum time to wait for encoder batch formation. Zero dispatches immediately.
     double encoderBatchWaitUs{};
+    //! Coalesce only requests with identical media geometry, while retaining the oldest request as the FIFO anchor.
+    bool enableHomogeneousEncoderBatching{};
     //! Maximum encoded requests released together into the independent prefill scheduler. Zero inherits encoder BS.
     size_t maxPrefillBatchSize{};
     //! Optional prompt-token budget for one release into the prefill scheduler. Zero disables the token gate.
@@ -190,11 +192,17 @@ struct PhaseVisionEncoderInput
     size_t mediaItems{};
     size_t inputBytes{};
     size_t inputTokens{};
+    std::vector<int64_t> mediaGeometry;
 };
+
+//! Select encoder queue indices, optionally looking ahead for media geometry compatible with the FIFO anchor.
+std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
+    size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U,
+    bool requireHomogeneousGeometry = false);
 
 //! Select a FIFO encoder batch bounded independently by requests, media items, and raw bytes.
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
-    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U) noexcept;
+    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U, bool requireHomogeneousGeometry = false);
 
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
@@ -254,6 +262,7 @@ private:
         int32_t maxOutputTokens{};
         PhaseSchedulingHints scheduling;
         size_t inputTokens{};
+        std::vector<int64_t> mediaGeometry;
     };
 
     struct ReadyPrefillRequest
@@ -270,7 +279,7 @@ private:
     bool startNextEncoder();
     bool completeEncoder();
     bool dispatchReadyPrefill();
-    size_t nextEncoderBatchSize() const noexcept;
+    std::vector<size_t> nextEncoderBatchIndices() const;
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
@@ -280,6 +289,7 @@ private:
         uint64_t timestampNs = 0U) const;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
     static size_t mediaInputBytes(PendingVisionRequest const& pending) noexcept;
+    static std::vector<int64_t> mediaGeometry(LLMGenerationRequest const& request);
 
     PhaseVisionAdapter& mVision;
     IndependentPhaseAsyncServer& mServer;

@@ -67,33 +67,46 @@ bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDo
     return estimatedPayloadBytes <= remainingBytes / additionalRequests;
 }
 
-size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
-    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens) noexcept
+std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
+    size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens,
+    bool requireHomogeneousGeometry)
 {
-    size_t batchSize{};
+    std::vector<size_t> indices;
+    indices.reserve(std::min(maxBatchSize, inputs.size()));
     size_t mediaItems{};
     size_t inputBytes{};
     size_t inputTokens{};
-    size_t const limit = std::min(maxBatchSize, inputs.size());
-    while (batchSize < limit)
+    for (size_t index{}; index < inputs.size() && indices.size() < maxBatchSize; ++index)
     {
-        PhaseVisionEncoderInput const& candidate = inputs[batchSize];
+        PhaseVisionEncoderInput const& candidate = inputs[index];
+        if (requireHomogeneousGeometry && index > 0 && candidate.mediaGeometry != inputs.front().mediaGeometry)
+        {
+            continue;
+        }
         bool const mediaOverflow
             = maxMediaItems > 0 && candidate.mediaItems > maxMediaItems - std::min(mediaItems, maxMediaItems);
         bool const byteOverflow
             = maxInputBytes > 0 && candidate.inputBytes > maxInputBytes - std::min(inputBytes, maxInputBytes);
         bool const tokenOverflow
             = maxInputTokens > 0 && candidate.inputTokens > maxInputTokens - std::min(inputTokens, maxInputTokens);
-        if (batchSize > 0 && (mediaOverflow || byteOverflow || tokenOverflow))
+        if (!indices.empty() && (mediaOverflow || byteOverflow || tokenOverflow))
         {
             break;
         }
         mediaItems += candidate.mediaItems;
         inputBytes += candidate.inputBytes;
         inputTokens += candidate.inputTokens;
-        ++batchSize;
+        indices.push_back(index);
     }
-    return batchSize;
+    return indices;
+}
+
+size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
+    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens, bool requireHomogeneousGeometry)
+{
+    return phaseVisionEncoderBatchIndices(
+        inputs, maxBatchSize, maxMediaItems, maxInputBytes, maxInputTokens, requireHomogeneousGeometry)
+        .size();
 }
 
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
@@ -321,7 +334,8 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
         mTpotTargets.insert(scheduling.tpotTargetUs);
     }
     size_t const inputTokens = mVision.estimateInputTokens(request);
-    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens});
+    std::vector<int64_t> const geometry = mediaGeometry(request);
+    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, geometry});
     recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
     bool const started = !mConfig.enableEncoderDispatchArbitration && startNextEncoder();
     bool const encodingThisRequest = started
@@ -507,7 +521,8 @@ bool PhaseThreeCoordinator::startNextEncoder()
         }
         return false;
     }
-    size_t const batchSize = nextEncoderBatchSize();
+    std::vector<size_t> const batchIndices = nextEncoderBatchIndices();
+    size_t const batchSize = batchIndices.size();
     if (batchSize == 0)
     {
         return false;
@@ -531,18 +546,20 @@ bool PhaseThreeCoordinator::startNextEncoder()
         mLastForcedEncoderStart = now;
         ++mEncoderAgeForcedStarts;
     }
-    for (size_t index = 0; index < batchSize; ++index)
+    for (size_t selectedIndex = 0; selectedIndex < batchSize; ++selectedIndex)
     {
-        size_t const requestInputBytes = mediaInputBytes(mPending.front());
+        size_t const pendingIndex = batchIndices[selectedIndex] - selectedIndex;
+        PendingVisionRequest pending = std::move(mPending[pendingIndex]);
+        mPending.erase(mPending.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
+        size_t const requestInputBytes = mediaInputBytes(pending);
         encoderInputBytes = requestInputBytes > std::numeric_limits<size_t>::max() - encoderInputBytes
             ? std::numeric_limits<size_t>::max()
             : encoderInputBytes + requestInputBytes;
-        size_t const requestInputTokens = mPending.front().inputTokens;
+        size_t const requestInputTokens = pending.inputTokens;
         encoderInputTokens = requestInputTokens > std::numeric_limits<size_t>::max() - encoderInputTokens
             ? std::numeric_limits<size_t>::max()
             : encoderInputTokens + requestInputTokens;
-        mEncoding.push_back(std::move(mPending.front()));
-        mPending.pop_front();
+        mEncoding.push_back(std::move(pending));
         PendingVisionRequest& encoding = mEncoding.back();
         double const queueWaitUs
             = std::chrono::duration<double, std::micro>(now - encoding.scheduling.submittedAt).count();
@@ -688,25 +705,27 @@ void PhaseThreeCoordinator::recordTimeline(
     }
 }
 
-size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
+std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices() const
 {
-    size_t const limit = std::min(mConfig.maxEncoderBatchSize, mPending.size());
-    std::vector<PhaseVisionEncoderInput> inputs;
-    inputs.reserve(limit);
-    for (size_t index = 0; index < limit; ++index)
+    size_t capacityLimit{};
+    while (capacityLimit < mConfig.maxEncoderBatchSize && encoderCapacityAvailable(capacityLimit + 1U))
     {
-        if (!encoderCapacityAvailable(index + 1U))
-        {
-            break;
-        }
-        inputs.push_back(
-            {mediaItemCount(mPending[index]), mediaInputBytes(mPending[index]), mPending[index].inputTokens});
+        ++capacityLimit;
     }
-    size_t const batchSize = phaseVisionEncoderBatchSize(inputs, mConfig.maxEncoderBatchSize,
-        mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens);
+    std::vector<PhaseVisionEncoderInput> inputs;
+    inputs.reserve(mPending.size());
+    for (PendingVisionRequest const& pending : mPending)
+    {
+        inputs.push_back(
+            {mediaItemCount(pending), mediaInputBytes(pending), pending.inputTokens, pending.mediaGeometry});
+    }
+    std::vector<size_t> const batchIndices
+        = phaseVisionEncoderBatchIndices(inputs, capacityLimit, mConfig.maxEncoderMediaItems,
+            mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens, mConfig.enableHomogeneousEncoderBatching);
+    size_t const batchSize = batchIndices.size();
     if (batchSize == 0)
     {
-        return 0;
+        return {};
     }
 
     size_t mediaItems{};
@@ -714,9 +733,10 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
     size_t inputTokens{};
     for (size_t index = 0; index < batchSize; ++index)
     {
-        mediaItems += inputs[index].mediaItems;
-        inputBytes += inputs[index].inputBytes;
-        inputTokens += inputs[index].inputTokens;
+        PhaseVisionEncoderInput const& input = inputs[batchIndices[index]];
+        mediaItems += input.mediaItems;
+        inputBytes += input.inputBytes;
+        inputTokens += input.inputTokens;
     }
     bool const batchFull = batchSize == mConfig.maxEncoderBatchSize;
     bool const mediaFull = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
@@ -730,9 +750,9 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
     if (!batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
         && oldestWaitUs < mConfig.encoderBatchWaitUs)
     {
-        return 0;
+        return {};
     }
-    return batchSize;
+    return batchIndices;
 }
 
 PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecision() const noexcept
@@ -864,6 +884,23 @@ size_t PhaseThreeCoordinator::mediaInputBytes(PendingVisionRequest const& pendin
                 return std::numeric_limits<size_t>::max();
             }
             result += bytes;
+        }
+    }
+    return result;
+}
+
+std::vector<int64_t> PhaseThreeCoordinator::mediaGeometry(LLMGenerationRequest const& request)
+{
+    std::vector<int64_t> result;
+    result.push_back(static_cast<int64_t>(request.requests.size()));
+    for (LLMGenerationRequest::Request const& logicalRequest : request.requests)
+    {
+        result.push_back(static_cast<int64_t>(logicalRequest.imageBuffers.size()));
+        for (imageUtils::ImageData const& image : logicalRequest.imageBuffers)
+        {
+            result.insert(result.end(),
+                {image.frames, image.height, image.width, image.channels, image.doResize ? 1 : 0,
+                    image.isVideo ? 1 : 0});
         }
     }
     return result;
