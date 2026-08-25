@@ -67,6 +67,10 @@ struct PhaseThreeCoordinatorConfig
     size_t adaptivePrefillMinBatchSize{2U};
     //! Collapse adaptive P-ready admission to P1 at or above this decode pressure. Zero disables the guard.
     float prefillDecodeTpotPressureLimit{0.8F};
+    //! Temporarily defer P-ready admission instead of releasing P1 while decode is above the pressure limit.
+    bool enableDecodeProtectedPrefillDeferral{};
+    //! Bound one decode-protected deferral period to avoid starving vision TTFT. Zero disables the time bound.
+    double maxDecodeProtectedPrefillWaitUs{250000.0};
     //! Bypass batch waiting above this fraction of maxEncodedBytes. Zero disables the byte-pressure guard.
     double prefillReadyBytePressureRatio{0.8};
     //! Default end-to-end image TTFT SLO, including encoder queue and execution. Zero inherits the LLM default.
@@ -81,6 +85,8 @@ struct PhaseThreeCoordinatorMetrics
 {
     size_t pendingVisionRequests{};
     size_t pendingPrefillReadyRequests{};
+    size_t pendingPrefillReadyTokens{};
+    size_t admissionProfilePrefillTokens{};
     size_t pendingPrefillReadyBytes{};
     size_t downstreamEncodedRequests{};
     size_t downstreamEncodedBytes{};
@@ -103,6 +109,7 @@ struct PhaseThreeCoordinatorMetrics
     size_t lowLoadPrefillAdmissions{};
     size_t backlogPrefillAdmissions{};
     size_t decodeProtectedPrefillAdmissions{};
+    size_t decodeDeferredPrefillPeriods{};
     size_t capacityProtectedPrefillAdmissions{};
     size_t ageForcedPrefillAdmissions{};
     size_t byteForcedPrefillAdmissions{};
@@ -141,6 +148,7 @@ enum class PhaseVisionPrefillAdmissionReason
     kLowLoad,
     kBacklog,
     kDecodeProtection,
+    kDecodeDeferral,
     kAge,
     kBytePressure,
     kCapacity,
@@ -157,7 +165,8 @@ PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
     std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize, size_t maxBatchTokens, double oldestWaitUs,
     double batchWaitUs, bool enabled, size_t minBacklogBatchSize, size_t upstreamVisionRequests,
     size_t availableAdmissionSlots, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
-    size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio) noexcept;
+    size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio, bool enableDecodeProtectedDeferral = false,
+    double maxDecodeProtectedWaitUs = 0.0) noexcept;
 
 //! Encoder -> prefill -> decode coordinator over three independent contexts.
 class PhaseThreeCoordinator
@@ -227,6 +236,9 @@ private:
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};
     float mMaxEncoderGpuMs{};
+    size_t mReadyPrefillTokens{};
+    size_t mAdmissionProfilePrefillTokens{};
+    size_t mEstimatedPromptTokens{};
     size_t mReadyPrefillBytes{};
     size_t mPrefillAdmissionBatches{};
     size_t mLastPrefillAdmissionBatchSize{};
@@ -235,6 +247,7 @@ private:
     size_t mLowLoadPrefillAdmissions{};
     size_t mBacklogPrefillAdmissions{};
     size_t mDecodeProtectedPrefillAdmissions{};
+    size_t mDecodeDeferredPrefillPeriods{};
     size_t mCapacityProtectedPrefillAdmissions{};
     size_t mAgeForcedPrefillAdmissions{};
     size_t mByteForcedPrefillAdmissions{};
@@ -243,6 +256,7 @@ private:
     size_t mMaxEffectiveEncodedCapacity{};
     size_t mLookaheadEscalations{};
     size_t mLastEffectiveEncodedCapacity{};
+    bool mDecodePrefillDeferred{};
 };
 
 } // namespace trt_edgellm::rt

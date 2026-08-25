@@ -99,6 +99,30 @@ size_t phaseAdmissionLimitForTpotBudget(std::vector<IndependentPhaseAdmissionCos
     return result;
 }
 
+bool phaseAdmissionTpotBudgetSatisfiable(
+    std::vector<IndependentPhaseAdmissionCost> const& costs, size_t latencyLimit, double tpotBudgetUs) noexcept
+{
+    if (costs.empty() || tpotBudgetUs <= 0.0)
+    {
+        return true;
+    }
+    auto const point = std::find_if(costs.cbegin(), costs.cend(),
+        [&](IndependentPhaseAdmissionCost const& cost) { return cost.inFlightLimit >= latencyLimit; });
+    return point != costs.cend() && point->tpotP95Us <= tpotBudgetUs;
+}
+
+bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequests, size_t externalPrefillTokens,
+    double minExternalRequestFraction, size_t minExternalPrefillTokens) noexcept
+{
+    if (totalRequests == 0 || externalRequests == 0)
+    {
+        return false;
+    }
+    double const externalFraction
+        = static_cast<double>(std::min(externalRequests, totalRequests)) / static_cast<double>(totalRequests);
+    return externalFraction >= minExternalRequestFraction && externalPrefillTokens >= minExternalPrefillTokens;
+}
+
 std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes)
 {
     ELLM_CHECK(maxDecodeBatchSize > 0, "Phase serving warmup requires a positive decode batch limit");
@@ -246,13 +270,28 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
         "Stepwise admission requires valid step, dwell, page, and TPOT thresholds");
     ELLM_CHECK(std::isfinite(mConfig.adaptiveAdmissionTpotBudgetUs) && mConfig.adaptiveAdmissionTpotBudgetUs >= 0.0,
         "Predictive admission TPOT budget must be finite and non-negative");
-    size_t previousAdmissionCostLimit{};
-    for (IndependentPhaseAdmissionCost const& cost : mConfig.adaptiveAdmissionCosts)
+    auto const validateAdmissionCosts = [&](std::vector<IndependentPhaseAdmissionCost> const& costs) {
+        size_t previousAdmissionCostLimit{};
+        for (IndependentPhaseAdmissionCost const& cost : costs)
+        {
+            ELLM_CHECK(cost.inFlightLimit > previousAdmissionCostLimit
+                    && cost.inFlightLimit <= mConfig.maxInFlightRequests && std::isfinite(cost.tpotP95Us)
+                    && cost.tpotP95Us > 0.0,
+                "Predictive admission costs must have increasing valid limits and positive finite TPOT values");
+            previousAdmissionCostLimit = cost.inFlightLimit;
+        }
+    };
+    validateAdmissionCosts(mConfig.adaptiveAdmissionCosts);
+    validateAdmissionCosts(mConfig.adaptiveAdmissionExternalCosts);
+    ELLM_CHECK(std::isfinite(mConfig.adaptiveAdmissionExternalRequestFraction)
+            && mConfig.adaptiveAdmissionExternalRequestFraction >= 0.0
+            && mConfig.adaptiveAdmissionExternalRequestFraction <= 1.0,
+        "Predictive external admission request fraction must be in [0, 1]");
+    if (!mConfig.adaptiveAdmissionExternalCosts.empty())
     {
-        ELLM_CHECK(cost.inFlightLimit > previousAdmissionCostLimit && cost.inFlightLimit <= mConfig.maxInFlightRequests
-                && std::isfinite(cost.tpotP95Us) && cost.tpotP95Us > 0.0,
-            "Predictive admission costs must have increasing valid limits and positive finite TPOT values");
-        previousAdmissionCostLimit = cost.inFlightLimit;
+        ELLM_CHECK(mConfig.adaptiveAdmissionExternalRequestFraction > 0.0
+                || mConfig.adaptiveAdmissionExternalPrefillTokens > 0,
+            "Predictive external admission profile requires a positive workload threshold");
     }
     ELLM_CHECK(static_cast<bool>(mAdapter.submitSampling), "Independent phase server requires a sampling adapter");
     mCoordinator.setGraphCaptureLimits(mConfig.maxPrefillGraphs, mConfig.maxDecodeGraphs);
@@ -532,8 +571,14 @@ double IndependentPhaseAsyncServer::effectiveAdmissionTpotBudgetUs() const noexc
 
 size_t IndependentPhaseAsyncServer::costLimitedAdmissionLimit() const noexcept
 {
-    return phaseAdmissionLimitForTpotBudget(mConfig.adaptiveAdmissionCosts, mConfig.latencyInFlightRequests,
+    return phaseAdmissionLimitForTpotBudget(activeAdmissionCosts(), mConfig.latencyInFlightRequests,
         mConfig.maxInFlightRequests, effectiveAdmissionTpotBudgetUs());
+}
+
+std::vector<IndependentPhaseAdmissionCost> const& IndependentPhaseAsyncServer::activeAdmissionCosts() const noexcept
+{
+    return adaptiveAdmissionExternalProfileActive() ? mConfig.adaptiveAdmissionExternalCosts
+                                                    : mConfig.adaptiveAdmissionCosts;
 }
 
 void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
@@ -545,14 +590,25 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
     if (mConfig.enableStepwiseAdaptiveAdmission)
     {
         PhaseSchedulerTelemetry const& telemetry = mCoordinator.scheduler().telemetry();
+        bool const externalProfile = adaptiveAdmissionExternalProfileActive();
+        if (externalProfile && !mLastAdmissionExternalProfileActive)
+        {
+            ++mAdaptiveAdmissionExternalProfileSelectionCount;
+        }
+        mLastAdmissionExternalProfileActive = externalProfile;
         size_t const costLimit = costLimitedAdmissionLimit();
         double const effectiveTpotBudgetUs = effectiveAdmissionTpotBudgetUs();
-        bool const predictiveAdmission = !mConfig.adaptiveAdmissionCosts.empty() && effectiveTpotBudgetUs > 0.0;
+        bool const predictiveAdmission = !activeAdmissionCosts().empty() && effectiveTpotBudgetUs > 0.0;
         bool const predictiveFastStart
             = predictiveAdmission && mAdaptiveAdmissionLimit < costLimit && telemetry.decodeTpotSampleCount == 0;
         if (predictiveFastStart || telemetry.sampleCount < mLastAdmissionDecisionSample
             || telemetry.sampleCount - mLastAdmissionDecisionSample >= mConfig.adaptiveAdmissionDwellSamples)
         {
+            if (!phaseAdmissionTpotBudgetSatisfiable(
+                    activeAdmissionCosts(), mConfig.latencyInFlightRequests, effectiveTpotBudgetUs))
+            {
+                ++mAdaptiveAdmissionUnsatisfiableDecisionCount;
+            }
             size_t const pendingRequests = mPendingRequests.size() + mExternalPendingRequests;
             size_t next{};
             bool const observedTpotBudgetPressure = predictiveAdmission && telemetry.recentDecodeTpotP95Us > 0.0
@@ -656,10 +712,13 @@ size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
     return mPendingRequests.size();
 }
 
-void IndependentPhaseAsyncServer::setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs) noexcept
+void IndependentPhaseAsyncServer::setExternalPendingRequests(
+    size_t pendingRequests, double minTpotTargetUs, size_t externalRequests, size_t externalPrefillTokens) noexcept
 {
     mExternalPendingRequests = pendingRequests;
     mExternalMinTpotTargetUs = minTpotTargetUs;
+    mExternalRequests = externalRequests;
+    mExternalPrefillTokens = externalPrefillTokens;
 }
 
 size_t IndependentPhaseAsyncServer::availableAdmissionSlots() const noexcept
@@ -788,6 +847,45 @@ size_t IndependentPhaseAsyncServer::adaptiveAdmissionCostBlockCount() const noex
 double IndependentPhaseAsyncServer::adaptiveAdmissionTpotBudgetUs() const noexcept
 {
     return effectiveAdmissionTpotBudgetUs();
+}
+
+bool IndependentPhaseAsyncServer::adaptiveAdmissionTpotBudgetSatisfiable() const noexcept
+{
+    return phaseAdmissionTpotBudgetSatisfiable(
+        activeAdmissionCosts(), mConfig.latencyInFlightRequests, effectiveAdmissionTpotBudgetUs());
+}
+
+bool IndependentPhaseAsyncServer::adaptiveAdmissionExternalProfileActive() const noexcept
+{
+    size_t const totalRequests = mRequests.size() + mPendingRequests.size() + mExternalPendingRequests;
+    return !mConfig.adaptiveAdmissionExternalCosts.empty()
+        && phaseAdmissionUsesExternalProfile(mExternalRequests, totalRequests, mExternalPrefillTokens,
+            mConfig.adaptiveAdmissionExternalRequestFraction, mConfig.adaptiveAdmissionExternalPrefillTokens);
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionExternalProfileSelectionCount() const noexcept
+{
+    return mAdaptiveAdmissionExternalProfileSelectionCount;
+}
+
+size_t IndependentPhaseAsyncServer::adaptiveAdmissionUnsatisfiableDecisionCount() const noexcept
+{
+    return mAdaptiveAdmissionUnsatisfiableDecisionCount;
+}
+
+float IndependentPhaseAsyncServer::decodeAdmissionTpotPressure() const noexcept
+{
+    double budgetUs = mConfig.adaptiveAdmissionTpotBudgetUs;
+    if (mExternalMinTpotTargetUs > 0.0 && (budgetUs == 0.0 || mExternalMinTpotTargetUs < budgetUs))
+    {
+        budgetUs = mExternalMinTpotTargetUs;
+    }
+    double const observedUs = mCoordinator.scheduler().telemetry().recentDecodeTpotP95Us;
+    if (budgetUs > 0.0 && observedUs > 0.0)
+    {
+        return static_cast<float>(observedUs / budgetUs);
+    }
+    return decodeTpotPressure();
 }
 
 bool IndependentPhaseAsyncServer::empty() const noexcept

@@ -1250,6 +1250,18 @@ int main(int argc, char** argv)
         {
             serverConfig.adaptiveAdmissionTpotBudgetUs = std::stod(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_EXTERNAL_TPOT_COSTS"))
+        {
+            serverConfig.adaptiveAdmissionExternalCosts = parseAdmissionCosts(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_EXTERNAL_MIN_SHARE"))
+        {
+            serverConfig.adaptiveAdmissionExternalRequestFraction = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_EXTERNAL_MIN_PREFILL_TOKENS"))
+        {
+            serverConfig.adaptiveAdmissionExternalPrefillTokens = static_cast<size_t>(std::stoull(value));
+        }
         if (char const* reservation = std::getenv("TRT_EDGELLM_PAGE_RESERVATION");
             reservation != nullptr && std::string(reservation) == "headroom")
         {
@@ -1507,6 +1519,14 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_TPOT_PRESSURE_LIMIT"))
                 {
                     threePhaseConfig.prefillDecodeTpotPressureLimit = std::stof(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_DEFER_ON_TPOT"))
+                {
+                    threePhaseConfig.enableDecodeProtectedPrefillDeferral = std::stoi(value) != 0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_MAX_DEFER_US"))
+                {
+                    threePhaseConfig.maxDecodeProtectedPrefillWaitUs = std::stod(value);
                 }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_PREFILL_BYTE_PRESSURE_RATIO"))
                 {
@@ -1840,6 +1860,15 @@ int main(int argc, char** argv)
                         {"adaptive_admission_cost_limit", semanticServer.adaptiveAdmissionCostLimit()},
                         {"adaptive_admission_cost_blocks", semanticServer.adaptiveAdmissionCostBlockCount()},
                         {"adaptive_admission_tpot_budget_us", semanticServer.adaptiveAdmissionTpotBudgetUs()},
+                        {"adaptive_admission_tpot_satisfiable",
+                            semanticServer.adaptiveAdmissionTpotBudgetSatisfiable()},
+                        {"adaptive_admission_external_profile",
+                            semanticServer.adaptiveAdmissionExternalProfileActive()},
+                        {"adaptive_admission_external_profile_selections",
+                            semanticServer.adaptiveAdmissionExternalProfileSelectionCount()},
+                        {"adaptive_admission_unsatisfiable_decisions",
+                            semanticServer.adaptiveAdmissionUnsatisfiableDecisionCount()},
+                        {"decode_admission_tpot_pressure", semanticServer.decodeAdmissionTpotPressure()},
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
                         {"page_growth_waits", semanticServer.pageGrowthWaitCount()},
                         {"page_growth_pending", semanticServer.pendingPageGrowthCount()},
@@ -1856,6 +1885,8 @@ int main(int argc, char** argv)
                         {"sampling_event_reuses", samplingSlotPool.reuseCount()},
                         {"vision_pending", visionMetrics.pendingVisionRequests},
                         {"vision_prefill_ready", visionMetrics.pendingPrefillReadyRequests},
+                        {"vision_prefill_ready_tokens", visionMetrics.pendingPrefillReadyTokens},
+                        {"vision_admission_profile_prefill_tokens", visionMetrics.admissionProfilePrefillTokens},
                         {"vision_prefill_ready_bytes", visionMetrics.pendingPrefillReadyBytes},
                         {"vision_downstream", visionMetrics.downstreamEncodedRequests},
                         {"vision_downstream_bytes", visionMetrics.downstreamEncodedBytes},
@@ -1878,6 +1909,7 @@ int main(int argc, char** argv)
                         {"vision_prefill_low_load_admissions", visionMetrics.lowLoadPrefillAdmissions},
                         {"vision_prefill_backlog_admissions", visionMetrics.backlogPrefillAdmissions},
                         {"vision_prefill_decode_protected_admissions", visionMetrics.decodeProtectedPrefillAdmissions},
+                        {"vision_prefill_decode_deferred_periods", visionMetrics.decodeDeferredPrefillPeriods},
                         {"vision_prefill_capacity_protected_admissions",
                             visionMetrics.capacityProtectedPrefillAdmissions},
                         {"vision_prefill_age_forced_admissions", visionMetrics.ageForcedPrefillAdmissions},
@@ -1944,12 +1976,17 @@ int main(int argc, char** argv)
             LOG_INFO(
                 "Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s "
                 "admission_limit=%zu admission_increases=%zu admission_decreases=%zu cost_limit=%zu "
-                "cost_blocks=%zu tpot_budget_us=%.3f",
+                "cost_blocks=%zu tpot_budget_us=%.3f tpot_satisfiable=%s external_profile=%s "
+                "external_profile_selections=%zu unsatisfiable_decisions=%zu",
                 semanticServer.decodeRefillWaitCount(), semanticServer.throughputModeTransitionCount(),
                 semanticServer.throughputMode() ? "yes" : "no", semanticServer.adaptiveAdmissionLimit(),
                 semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount(),
                 semanticServer.adaptiveAdmissionCostLimit(), semanticServer.adaptiveAdmissionCostBlockCount(),
-                semanticServer.adaptiveAdmissionTpotBudgetUs());
+                semanticServer.adaptiveAdmissionTpotBudgetUs(),
+                semanticServer.adaptiveAdmissionTpotBudgetSatisfiable() ? "yes" : "no",
+                semanticServer.adaptiveAdmissionExternalProfileActive() ? "yes" : "no",
+                semanticServer.adaptiveAdmissionExternalProfileSelectionCount(),
+                semanticServer.adaptiveAdmissionUnsatisfiableDecisionCount());
             LOG_INFO(
                 "Sampling event pool: slots=%zu reuses=%zu", samplingSlotPool.size(), samplingSlotPool.reuseCount());
             LOG_INFO(
@@ -1999,7 +2036,8 @@ int main(int argc, char** argv)
                     "pending=%zu prefill_ready=%zu prefill_ready_bytes=%zu downstream=%zu bytes=%zu "
                     "prefill_admission_batches=%zu prefill_admission_last=%zu prefill_admission_max=%zu "
                     "prefill_adaptive=%zu prefill_low_load=%zu prefill_backlog=%zu prefill_decode_protected=%zu "
-                    "prefill_capacity_protected=%zu prefill_age_forced=%zu prefill_byte_forced=%zu "
+                    "prefill_decode_deferred=%zu prefill_capacity_protected=%zu prefill_age_forced=%zu "
+                    "prefill_byte_forced=%zu "
                     "available_prefill_slots=%zu "
                     "available_kv_pages=%d "
                     "prefill_releases=%zu prefill_released_bytes=%zu "
@@ -2015,12 +2053,13 @@ int main(int argc, char** argv)
                     visionMetrics.lastPrefillAdmissionBatchSize, visionMetrics.maxPrefillAdmissionBatchSize,
                     visionMetrics.adaptivePrefillAdmissions, visionMetrics.lowLoadPrefillAdmissions,
                     visionMetrics.backlogPrefillAdmissions, visionMetrics.decodeProtectedPrefillAdmissions,
-                    visionMetrics.capacityProtectedPrefillAdmissions, visionMetrics.ageForcedPrefillAdmissions,
-                    visionMetrics.byteForcedPrefillAdmissions, visionMetrics.availablePrefillAdmissionSlots,
-                    visionMetrics.availableKVPages, visionMetrics.prefillStorageReleases,
-                    visionMetrics.prefillStorageReleasedBytes, visionMetrics.lastEncoderQueueWaitUs / 1000.0,
-                    visionMetrics.maxEncoderQueueWaitUs / 1000.0, visionMetrics.lastEncoderGpuMs,
-                    visionMetrics.maxEncoderGpuMs, visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
+                    visionMetrics.decodeDeferredPrefillPeriods, visionMetrics.capacityProtectedPrefillAdmissions,
+                    visionMetrics.ageForcedPrefillAdmissions, visionMetrics.byteForcedPrefillAdmissions,
+                    visionMetrics.availablePrefillAdmissionSlots, visionMetrics.availableKVPages,
+                    visionMetrics.prefillStorageReleases, visionMetrics.prefillStorageReleasedBytes,
+                    visionMetrics.lastEncoderQueueWaitUs / 1000.0, visionMetrics.maxEncoderQueueWaitUs / 1000.0,
+                    visionMetrics.lastEncoderGpuMs, visionMetrics.maxEncoderGpuMs,
+                    visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
                     visionMetrics.decodeTpotPressure);

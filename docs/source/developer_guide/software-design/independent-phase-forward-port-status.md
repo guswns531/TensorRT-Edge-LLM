@@ -556,3 +556,49 @@ static-16 measurements were already near 60 ms. The next gate is therefore a
 profile key based on prefill pressure and vision share, explicit reporting when
 the minimum limit cannot satisfy the budget, and vision-prefill interference
 protection. Predictive admission remains opt-in.
+
+## Workload-aware admission profile
+
+Predictive admission now has an optional external-phase cost profile. Selection
+requires both a minimum external request share and a minimum estimated prefill
+token backlog. The common server does not name a model or modality. The
+three-phase vision coordinator supplies its live request count and an O(1)
+token-pressure estimate composed from ready tokens plus upstream request count
+times the largest observed encoded prompt length.
+
+```text
+TRT_EDGELLM_ADMISSION_EXTERNAL_TPOT_COSTS=16:60680,32:74090
+TRT_EDGELLM_ADMISSION_EXTERNAL_MIN_SHARE=0.5
+TRT_EDGELLM_ADMISSION_EXTERNAL_MIN_PREFILL_TOKENS=4096
+```
+
+The controller exports the active profile, profile-selection count, current
+budget satisfiability, and sticky unsatisfiable-decision count. On the
+vision-heavy profile, the 60.68 ms minimum cost exceeds the 34 ms fallback
+budget, so the controller caps admission at 16 and reports the target as
+unsatisfiable. The five-request semantic trace and text-only decode-long trace
+do not cross the token/share key and selected the external profile zero times.
+
+An independent opt-in guard can temporarily defer a completed vision prefill
+while the external profile is active, its minimum point is unsatisfiable, and
+decode service pressure is above a threshold. The delay is bounded by an age
+limit and works even when the general adaptive P-ready batching policy is off.
+
+```text
+TRT_EDGELLM_VISION_PREFILL_DEFER_ON_TPOT=1
+TRT_EDGELLM_VISION_PREFILL_TPOT_PRESSURE_LIMIT=0.3
+TRT_EDGELLM_VISION_PREFILL_MAX_DEFER_US=250000
+```
+
+The final mixed three-run result was 1532.1 token/s, 1601.7 ms TTFT p95,
+31.43 ms TPOT p95, and 2461.7 ms E2E p95. The external profile was never
+selected and all metrics remained within 1.9% of the preceding predictive
+controller.
+
+On the 75% vision trace, profile-only and 250 ms deferral measured 468.9 versus
+469.3 token/s and 51.08 versus 50.93 ms TPOT p95. TTFT p95 changed from 5473.6
+to 5525.6 ms and E2E p95 from 5858.4 to 5861.2 ms. Ten to twelve deferral
+periods occurred per run, but their aggregate effect was below 1%. The guard is
+therefore an experimental seam, not a production default. The next protection
+must use per-dispatch overlap cost and decode deadline slack instead of a fixed
+wall-clock deferral.

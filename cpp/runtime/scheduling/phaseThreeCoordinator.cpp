@@ -106,13 +106,20 @@ PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
     std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize, size_t maxBatchTokens, double oldestWaitUs,
     double batchWaitUs, bool enabled, size_t minBacklogBatchSize, size_t upstreamVisionRequests,
     size_t availableAdmissionSlots, int32_t availableKVPages, float decodeTpotPressure, float decodeTpotPressureLimit,
-    size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio) noexcept
+    size_t readyBytes, size_t maxReadyBytes, double readyBytePressureRatio, bool enableDecodeProtectedDeferral,
+    double maxDecodeProtectedWaitUs) noexcept
 {
     if (promptTokenCounts.empty() || maxBatchSize == 0 || availableAdmissionSlots == 0 || availableKVPages <= 0)
     {
         return {};
     }
     size_t const admissionLimit = std::min(maxBatchSize, availableAdmissionSlots);
+    bool const decodeProtected = decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit;
+    bool const withinDeferralBound = maxDecodeProtectedWaitUs <= 0.0 || oldestWaitUs < maxDecodeProtectedWaitUs;
+    if (enableDecodeProtectedDeferral && decodeProtected && withinDeferralBound)
+    {
+        return {0U, PhaseVisionPrefillAdmissionReason::kDecodeDeferral};
+    }
     if (!enabled)
     {
         return {phaseVisionReadyPrefillBatchSize(
@@ -120,7 +127,6 @@ PhaseVisionPrefillAdmissionDecision phaseVisionAdaptiveReadyPrefillDecision(
             PhaseVisionPrefillAdmissionReason::kLegacy};
     }
 
-    bool const decodeProtected = decodeTpotPressureLimit > 0.0F && decodeTpotPressure >= decodeTpotPressureLimit;
     if (decodeProtected)
     {
         return {phaseVisionReadyPrefillBatchSize(promptTokenCounts, 1U, maxBatchTokens, oldestWaitUs, 0.0),
@@ -204,6 +210,8 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         mConfig.adaptivePrefillMinBatchSize > 0, "Three-phase adaptive prefill minimum batch size must be positive");
     ELLM_CHECK(std::isfinite(mConfig.prefillDecodeTpotPressureLimit) && mConfig.prefillDecodeTpotPressureLimit >= 0.0F,
         "Three-phase prefill decode pressure limit must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.maxDecodeProtectedPrefillWaitUs) && mConfig.maxDecodeProtectedPrefillWaitUs >= 0.0,
+        "Three-phase decode-protected prefill wait must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.prefillReadyBytePressureRatio) && mConfig.prefillReadyBytePressureRatio >= 0.0
             && mConfig.prefillReadyBytePressureRatio <= 1.0,
         "Three-phase prefill ready byte pressure ratio must be in [0, 1]");
@@ -261,6 +269,8 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         [&](ReadyPrefillRequest const& request) { return request.requestId == requestId; });
     if (ready != mReadyPrefill.end())
     {
+        ELLM_CHECK(ready->promptTokens.size() <= mReadyPrefillTokens, "Ready prefill token accounting underflow");
+        mReadyPrefillTokens -= ready->promptTokens.size();
         ELLM_CHECK(ready->payloadBytes <= mReadyPrefillBytes, "Ready prefill byte accounting underflow");
         mReadyPrefillBytes -= ready->payloadBytes;
         mReadyPrefill.erase(ready);
@@ -289,7 +299,10 @@ bool PhaseThreeCoordinator::poll()
     progressed = startNextEncoder() || progressed;
     progressed = dispatchReadyPrefill() || progressed;
     double const minTpotTargetUs = mTpotTargets.empty() ? 0.0 : *mTpotTargets.begin();
-    mServer.setExternalPendingRequests(mPending.size() + mEncoding.size() + mReadyPrefill.size(), minTpotTargetUs);
+    size_t const upstreamRequests = mPending.size() + mEncoding.size();
+    mAdmissionProfilePrefillTokens = mReadyPrefillTokens + upstreamRequests * mEstimatedPromptTokens;
+    mServer.setExternalPendingRequests(
+        upstreamRequests + mReadyPrefill.size(), minTpotTargetUs, mRequestIds.size(), mAdmissionProfilePrefillTokens);
     progressed = mServer.poll() || progressed;
     mVision.reclaimIdleStorage();
     return progressed;
@@ -305,6 +318,8 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     PhaseThreeCoordinatorMetrics result;
     result.pendingVisionRequests = mPending.size();
     result.pendingPrefillReadyRequests = mReadyPrefill.size();
+    result.pendingPrefillReadyTokens = mReadyPrefillTokens;
+    result.admissionProfilePrefillTokens = mAdmissionProfilePrefillTokens;
     result.pendingPrefillReadyBytes = mReadyPrefillBytes;
     result.downstreamEncodedRequests = mDownstreamRequestBytes.size();
     result.downstreamEncodedBytes = mReadyPrefillBytes + mServer.visionPayloadBytes();
@@ -326,6 +341,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.lowLoadPrefillAdmissions = mLowLoadPrefillAdmissions;
     result.backlogPrefillAdmissions = mBacklogPrefillAdmissions;
     result.decodeProtectedPrefillAdmissions = mDecodeProtectedPrefillAdmissions;
+    result.decodeDeferredPrefillPeriods = mDecodeDeferredPrefillPeriods;
     result.capacityProtectedPrefillAdmissions = mCapacityProtectedPrefillAdmissions;
     result.ageForcedPrefillAdmissions = mAgeForcedPrefillAdmissions;
     result.byteForcedPrefillAdmissions = mByteForcedPrefillAdmissions;
@@ -336,7 +352,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.effectiveEncodedCapacity = effectiveEncodedCapacity();
     result.maxEffectiveEncodedCapacity = mMaxEffectiveEncodedCapacity;
     result.lookaheadEscalations = mLookaheadEscalations;
-    result.decodeTpotPressure = mServer.decodeTpotPressure();
+    result.decodeTpotPressure = mServer.decodeAdmissionTpotPressure();
     if (!mPending.empty())
     {
         result.oldestPendingAgeUs = std::chrono::duration<double, std::micro>(
@@ -439,10 +455,12 @@ bool PhaseThreeCoordinator::completeEncoder()
         auto sharedPayload = std::shared_ptr<PhaseVisionPayload>(std::move(encoded));
         size_t const encodedBytes = sharedPayload->byteSize();
         std::vector<int32_t> promptTokens = sharedPayload->tokenIds.front();
+        mEstimatedPromptTokens = std::max(mEstimatedPromptTokens, promptTokens.size());
         ELLM_CHECK(mDownstreamRequestBytes.emplace(requestId, encodedBytes).second,
             "Encoded phase request is already downstream");
         mReadyPrefill.push_back({requestId, std::move(promptTokens), std::move(sharedPayload), encoding.maxOutputTokens,
             encoding.scheduling, encodedBytes, std::chrono::steady_clock::now()});
+        mReadyPrefillTokens += mReadyPrefill.back().promptTokens.size();
         mReadyPrefillBytes += encodedBytes;
         mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
     }
@@ -456,8 +474,15 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
     size_t const batchSize = decision.batchSize;
     if (batchSize == 0)
     {
+        bool const decodeDeferred = decision.reason == PhaseVisionPrefillAdmissionReason::kDecodeDeferral;
+        if (decodeDeferred && !mDecodePrefillDeferred)
+        {
+            ++mDecodeDeferredPrefillPeriods;
+        }
+        mDecodePrefillDeferred = decodeDeferred;
         return false;
     }
+    mDecodePrefillDeferred = false;
 
     size_t submitted{};
     auto const now = std::chrono::steady_clock::now();
@@ -477,6 +502,8 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
         mLastPrefillReadyQueueWaitUs = queueWaitUs;
         mMaxPrefillReadyQueueWaitUs = std::max(mMaxPrefillReadyQueueWaitUs, queueWaitUs);
         ELLM_CHECK(ready.payloadBytes <= mReadyPrefillBytes, "Ready prefill byte accounting underflow");
+        ELLM_CHECK(ready.promptTokens.size() <= mReadyPrefillTokens, "Ready prefill token accounting underflow");
+        mReadyPrefillTokens -= ready.promptTokens.size();
         mReadyPrefillBytes -= ready.payloadBytes;
         mReadyPrefill.pop_front();
         ++submitted;
@@ -494,6 +521,7 @@ bool PhaseThreeCoordinator::dispatchReadyPrefill()
             case PhaseVisionPrefillAdmissionReason::kLowLoad: ++mLowLoadPrefillAdmissions; break;
             case PhaseVisionPrefillAdmissionReason::kBacklog: ++mBacklogPrefillAdmissions; break;
             case PhaseVisionPrefillAdmissionReason::kDecodeProtection: ++mDecodeProtectedPrefillAdmissions; break;
+            case PhaseVisionPrefillAdmissionReason::kDecodeDeferral: break;
             case PhaseVisionPrefillAdmissionReason::kCapacity: ++mCapacityProtectedPrefillAdmissions; break;
             case PhaseVisionPrefillAdmissionReason::kAge: ++mAgeForcedPrefillAdmissions; break;
             case PhaseVisionPrefillAdmissionReason::kBytePressure: ++mByteForcedPrefillAdmissions; break;
@@ -558,8 +586,11 @@ PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecis
     return phaseVisionAdaptiveReadyPrefillDecision(promptTokenCounts, mConfig.maxPrefillBatchSize,
         mConfig.maxPrefillBatchTokens, oldestWaitUs, mConfig.prefillBatchWaitUs, mConfig.enableAdaptivePrefillAdmission,
         mConfig.adaptivePrefillMinBatchSize, mPending.size() + mEncoding.size(), mServer.availableAdmissionSlots(),
-        mServer.availableKVPages(), mServer.decodeTpotPressure(), mConfig.prefillDecodeTpotPressureLimit,
-        mReadyPrefillBytes, mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio);
+        mServer.availableKVPages(), mServer.decodeAdmissionTpotPressure(), mConfig.prefillDecodeTpotPressureLimit,
+        mReadyPrefillBytes, mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio,
+        mConfig.enableDecodeProtectedPrefillDeferral && mServer.adaptiveAdmissionExternalProfileActive()
+            && !mServer.adaptiveAdmissionTpotBudgetSatisfiable(),
+        mConfig.maxDecodeProtectedPrefillWaitUs);
 }
 
 bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) const noexcept
@@ -586,7 +617,7 @@ size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept
     }
     return phaseVisionEffectiveEncodedCapacity(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight,
         mServer.throughputMode(), oldestVisionAgeUs, visionTtftTargetUs, mConfig.lookaheadEscalationRatio,
-        mServer.decodeTpotPressure(), mConfig.lookaheadDecodeTpotPressureLimit);
+        mServer.decodeAdmissionTpotPressure(), mConfig.lookaheadDecodeTpotPressureLimit);
 }
 
 void PhaseThreeCoordinator::eraseTpotTarget(uint64_t requestId)

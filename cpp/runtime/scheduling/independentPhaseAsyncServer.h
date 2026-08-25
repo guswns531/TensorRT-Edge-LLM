@@ -58,6 +58,12 @@ struct IndependentPhaseAdmissionCost
 //! Highest profiled admission limit that fits the effective TPOT budget.
 size_t phaseAdmissionLimitForTpotBudget(std::vector<IndependentPhaseAdmissionCost> const& costs, size_t latencyLimit,
     size_t throughputLimit, double tpotBudgetUs) noexcept;
+//! Whether the least expensive profiled admission point can meet the TPOT budget.
+bool phaseAdmissionTpotBudgetSatisfiable(
+    std::vector<IndependentPhaseAdmissionCost> const& costs, size_t latencyLimit, double tpotBudgetUs) noexcept;
+//! Select an external-phase profile from its live request share and ready-prefill token pressure.
+bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequests, size_t externalPrefillTokens,
+    double minExternalRequestFraction, size_t minExternalPrefillTokens) noexcept;
 //! Representative decode buckets to prime before opening a persistent serving endpoint.
 std::vector<int32_t> phaseServingWarmupBatchSizes(
     int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes = {});
@@ -169,6 +175,12 @@ struct IndependentPhaseServerConfig
     std::vector<IndependentPhaseAdmissionCost> adaptiveAdmissionCosts;
     //! Fallback budget for requests without an explicit scheduling TPOT target.
     double adaptiveAdmissionTpotBudgetUs{};
+    //! Optional profile for workloads dominated by an external producer such as a vision encoder.
+    std::vector<IndependentPhaseAdmissionCost> adaptiveAdmissionExternalCosts;
+    //! Minimum live-request share required to select adaptiveAdmissionExternalCosts.
+    double adaptiveAdmissionExternalRequestFraction{};
+    //! Minimum completed external prefill tokens required to select the external profile.
+    size_t adaptiveAdmissionExternalPrefillTokens{};
     //! Multimodal prefill remains atomic unless an engine contract explicitly proves chunk correctness.
     bool allowChunkedVisionPrefill{};
     //! Packed-prefill engines may batch multiple complete multimodal prompts without chunking them.
@@ -244,7 +256,8 @@ public:
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
     //! Include encoder and encoded-ready work that has not entered this server yet.
-    void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0) noexcept;
+    void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0, size_t externalRequests = 0U,
+        size_t externalPrefillTokens = 0U) noexcept;
     //! Stable slots that can be admitted immediately under the current latency/throughput limit.
     size_t availableAdmissionSlots() const noexcept;
     //! Physical KV pages currently free in the shared stable page pool.
@@ -267,6 +280,11 @@ public:
     size_t adaptiveAdmissionCostLimit() const noexcept;
     size_t adaptiveAdmissionCostBlockCount() const noexcept;
     double adaptiveAdmissionTpotBudgetUs() const noexcept;
+    bool adaptiveAdmissionTpotBudgetSatisfiable() const noexcept;
+    bool adaptiveAdmissionExternalProfileActive() const noexcept;
+    size_t adaptiveAdmissionExternalProfileSelectionCount() const noexcept;
+    size_t adaptiveAdmissionUnsatisfiableDecisionCount() const noexcept;
+    float decodeAdmissionTpotPressure() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
 
@@ -312,6 +330,7 @@ private:
     bool shouldWaitForDecodeRefill() const noexcept;
     size_t admissionLimit() const noexcept;
     double effectiveAdmissionTpotBudgetUs() const noexcept;
+    std::vector<IndependentPhaseAdmissionCost> const& activeAdmissionCosts() const noexcept;
     size_t costLimitedAdmissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
@@ -344,11 +363,16 @@ private:
     size_t mThroughputModeTransitionCount{};
     size_t mExternalPendingRequests{};
     double mExternalMinTpotTargetUs{};
+    size_t mExternalRequests{};
+    size_t mExternalPrefillTokens{};
     size_t mAdaptiveAdmissionLimit{};
     size_t mAdaptiveAdmissionIncreaseCount{};
     size_t mAdaptiveAdmissionDecreaseCount{};
     size_t mAdaptiveAdmissionCostBlockCount{};
+    size_t mAdaptiveAdmissionExternalProfileSelectionCount{};
+    size_t mAdaptiveAdmissionUnsatisfiableDecisionCount{};
     size_t mLastAdmissionDecisionSample{};
+    bool mLastAdmissionExternalProfileActive{};
 };
 
 } // namespace trt_edgellm::rt

@@ -1808,6 +1808,16 @@ TEST(PhaseThreeCoordinatorPolicyTest, AdaptsReadyPrefillToLoadCapacityAndDecodeP
     EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeProtection);
 
     decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 200000.0, 50000.0, false, 2, 4, 8, 256, 0.8F, 0.8F, 400, 1000, 0.8, true, 250000.0);
+    EXPECT_EQ(decision.batchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeDeferral);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 250000.0, 50000.0, true, 2, 4, 8, 256, 0.8F, 0.8F, 400, 1000, 0.8, true, 250000.0);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeProtection);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
         one, 4, 4096, 50000.0, 50000.0, true, 2, 1, 8, 256, 0.2F, 0.8F, 100, 1000, 0.8);
     EXPECT_EQ(decision.batchSize, 1U);
     EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kAge);

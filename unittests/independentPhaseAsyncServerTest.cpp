@@ -82,6 +82,24 @@ TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionDisablesWithoutCostsOrB
     EXPECT_EQ(phaseAdmissionLimitForTpotBudget(costs, 24, 64, 25000.0), 24);
 }
 
+TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionReportsUnsatisfiableBudget)
+{
+    std::vector<IndependentPhaseAdmissionCost> const costs{{16, 60680.0}, {32, 74090.0}};
+    EXPECT_FALSE(phaseAdmissionTpotBudgetSatisfiable(costs, 16, 34000.0));
+    EXPECT_TRUE(phaseAdmissionTpotBudgetSatisfiable(costs, 16, 70000.0));
+    EXPECT_TRUE(phaseAdmissionTpotBudgetSatisfiable({}, 16, 34000.0));
+    EXPECT_TRUE(phaseAdmissionTpotBudgetSatisfiable(costs, 16, 0.0));
+}
+
+TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionSelectsExternalWorkloadProfile)
+{
+    EXPECT_TRUE(phaseAdmissionUsesExternalProfile(48, 64, 0, 0.5, 0));
+    EXPECT_FALSE(phaseAdmissionUsesExternalProfile(16, 64, 0, 0.5, 0));
+    EXPECT_TRUE(phaseAdmissionUsesExternalProfile(32, 64, 2048, 0.5, 1024));
+    EXPECT_FALSE(phaseAdmissionUsesExternalProfile(32, 64, 512, 0.5, 1024));
+    EXPECT_FALSE(phaseAdmissionUsesExternalProfile(0, 0, 2048, 0.0, 1024));
+}
+
 TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuckets)
 {
     EXPECT_EQ(phaseServingWarmupBatchSizes(64), (std::vector<int32_t>{8, 16, 32, 48, 64}));
