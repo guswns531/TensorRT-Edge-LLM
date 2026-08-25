@@ -167,6 +167,12 @@ public:
     virtual bool bindExternalOutputStorage(
         rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures);
 
+    //! Estimate model-specific encoder input tokens without launching CUDA work. Zero means unavailable.
+    virtual int64_t estimateInputTokens(rt::LLMGenerationRequest const& request);
+
+    //! Return the physical encoder input-token budget. Zero means the runner does not expose one.
+    virtual int64_t maxInputTokens() const noexcept;
+
     /*!
      * @brief Validate and fill configuration from file
      * @param engineDir Path to engine directory

@@ -55,6 +55,8 @@ struct PhaseThreeCoordinatorConfig
     size_t maxEncoderMediaItems{};
     //! Optional raw image/video input byte cap for one encoder batch. Zero disables this guard.
     size_t maxEncoderInputBytes{};
+    //! Optional model-specific encoder input-token cap. Zero inherits the physical runner limit when exposed.
+    size_t maxEncoderInputTokens{};
     //! Maximum time to wait for encoder batch formation. Zero dispatches immediately.
     double encoderBatchWaitUs{};
     //! Maximum encoded requests released together into the independent prefill scheduler. Zero inherits encoder BS.
@@ -101,6 +103,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t maxEncoderBatchSize{};
     size_t lastEncoderInputBytes{};
     size_t maxEncoderInputBytes{};
+    size_t lastEncoderInputTokens{};
+    size_t maxEncoderInputTokens{};
     double oldestPendingAgeUs{};
     double lastEncoderQueueWaitUs{};
     double maxEncoderQueueWaitUs{};
@@ -145,11 +149,12 @@ struct PhaseVisionEncoderInput
 {
     size_t mediaItems{};
     size_t inputBytes{};
+    size_t inputTokens{};
 };
 
 //! Select a FIFO encoder batch bounded independently by requests, media items, and raw bytes.
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
-    size_t maxMediaItems, size_t maxInputBytes) noexcept;
+    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U) noexcept;
 
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
@@ -206,6 +211,7 @@ private:
         LLMGenerationRequest request;
         int32_t maxOutputTokens{};
         PhaseSchedulingHints scheduling;
+        size_t inputTokens{};
     };
 
     struct ReadyPrefillRequest
@@ -249,6 +255,8 @@ private:
     size_t mMaxEncoderBatchSize{};
     size_t mLastEncoderInputBytes{};
     size_t mMaxEncoderInputBytes{};
+    size_t mLastEncoderInputTokens{};
+    size_t mMaxEncoderInputTokens{};
     double mLastEncoderQueueWaitUs{};
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};

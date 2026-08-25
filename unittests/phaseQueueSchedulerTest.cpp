@@ -1813,6 +1813,8 @@ TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)
     EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 160), 2U);
     EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 1024}, {1, 16}}, 4, 1, 128), 1U);
     EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 0, 0, 0), 0U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2049}}, 4, 0, 0, 4096), 1U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2048}}, 4, 0, 0, 4096), 2U);
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, ReleasesReadyPrefillByCountTokenBudgetOrAge)

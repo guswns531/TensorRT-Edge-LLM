@@ -68,11 +68,12 @@ bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDo
 }
 
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
-    size_t maxMediaItems, size_t maxInputBytes) noexcept
+    size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens) noexcept
 {
     size_t batchSize{};
     size_t mediaItems{};
     size_t inputBytes{};
+    size_t inputTokens{};
     size_t const limit = std::min(maxBatchSize, inputs.size());
     while (batchSize < limit)
     {
@@ -81,12 +82,15 @@ size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& i
             = maxMediaItems > 0 && candidate.mediaItems > maxMediaItems - std::min(mediaItems, maxMediaItems);
         bool const byteOverflow
             = maxInputBytes > 0 && candidate.inputBytes > maxInputBytes - std::min(inputBytes, maxInputBytes);
-        if (batchSize > 0 && (mediaOverflow || byteOverflow))
+        bool const tokenOverflow
+            = maxInputTokens > 0 && candidate.inputTokens > maxInputTokens - std::min(inputTokens, maxInputTokens);
+        if (batchSize > 0 && (mediaOverflow || byteOverflow || tokenOverflow))
         {
             break;
         }
         mediaItems += candidate.mediaItems;
         inputBytes += candidate.inputBytes;
+        inputTokens += candidate.inputTokens;
         ++batchSize;
     }
     return batchSize;
@@ -221,6 +225,15 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(mConfig.maxEncoderBatchSize > 0, "Three-phase encoder batch size must be positive");
     ELLM_CHECK(mConfig.maxEncoderBatchSize <= mConfig.maxEncodedInFlight,
         "Three-phase encoder batch size cannot exceed downstream encoded capacity");
+    size_t const runnerInputTokens = mVision.maxInputTokens();
+    if (mConfig.maxEncoderInputTokens == 0)
+    {
+        mConfig.maxEncoderInputTokens = runnerInputTokens;
+    }
+    else if (runnerInputTokens > 0)
+    {
+        mConfig.maxEncoderInputTokens = std::min(mConfig.maxEncoderInputTokens, runnerInputTokens);
+    }
     if (mConfig.maxPrefillBatchSize == 0)
     {
         mConfig.maxPrefillBatchSize = mConfig.maxEncoderBatchSize;
@@ -265,7 +278,8 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
         mRequestTpotTargets.emplace(requestId, scheduling.tpotTargetUs);
         mTpotTargets.insert(scheduling.tpotTargetUs);
     }
-    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling});
+    size_t const inputTokens = mVision.estimateInputTokens(request);
+    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens});
     bool const started = startNextEncoder();
     bool const encodingThisRequest = started
         && std::any_of(mEncoding.begin(), mEncoding.end(),
@@ -358,6 +372,8 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.maxEncoderBatchSize = mMaxEncoderBatchSize;
     result.lastEncoderInputBytes = mLastEncoderInputBytes;
     result.maxEncoderInputBytes = mMaxEncoderInputBytes;
+    result.lastEncoderInputTokens = mLastEncoderInputTokens;
+    result.maxEncoderInputTokens = mMaxEncoderInputTokens;
     result.lastEncoderQueueWaitUs = mLastEncoderQueueWaitUs;
     result.maxEncoderQueueWaitUs = mMaxEncoderQueueWaitUs;
     result.lastEncoderGpuMs = mLastEncoderGpuMs;
@@ -434,6 +450,7 @@ bool PhaseThreeCoordinator::startNextEncoder()
     std::vector<PhaseVisionSubmission> submissions;
     submissions.reserve(batchSize);
     size_t encoderInputBytes{};
+    size_t encoderInputTokens{};
     auto const now = std::chrono::steady_clock::now();
     for (size_t index = 0; index < batchSize; ++index)
     {
@@ -441,6 +458,10 @@ bool PhaseThreeCoordinator::startNextEncoder()
         encoderInputBytes = requestInputBytes > std::numeric_limits<size_t>::max() - encoderInputBytes
             ? std::numeric_limits<size_t>::max()
             : encoderInputBytes + requestInputBytes;
+        size_t const requestInputTokens = mPending.front().inputTokens;
+        encoderInputTokens = requestInputTokens > std::numeric_limits<size_t>::max() - encoderInputTokens
+            ? std::numeric_limits<size_t>::max()
+            : encoderInputTokens + requestInputTokens;
         mEncoding.push_back(std::move(mPending.front()));
         mPending.pop_front();
         PendingVisionRequest& encoding = mEncoding.back();
@@ -457,6 +478,8 @@ bool PhaseThreeCoordinator::startNextEncoder()
     mMaxEncoderBatchSize = std::max(mMaxEncoderBatchSize, batchSize);
     mLastEncoderInputBytes = encoderInputBytes;
     mMaxEncoderInputBytes = std::max(mMaxEncoderInputBytes, encoderInputBytes);
+    mLastEncoderInputTokens = encoderInputTokens;
+    mMaxEncoderInputTokens = std::max(mMaxEncoderInputTokens, encoderInputTokens);
     return true;
 }
 
@@ -579,10 +602,11 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
         {
             break;
         }
-        inputs.push_back({mediaItemCount(mPending[index]), mediaInputBytes(mPending[index])});
+        inputs.push_back(
+            {mediaItemCount(mPending[index]), mediaInputBytes(mPending[index]), mPending[index].inputTokens});
     }
-    size_t const batchSize = phaseVisionEncoderBatchSize(
-        inputs, mConfig.maxEncoderBatchSize, mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes);
+    size_t const batchSize = phaseVisionEncoderBatchSize(inputs, mConfig.maxEncoderBatchSize,
+        mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens);
     if (batchSize == 0)
     {
         return 0;
@@ -590,20 +614,23 @@ size_t PhaseThreeCoordinator::nextEncoderBatchSize() const noexcept
 
     size_t mediaItems{};
     size_t inputBytes{};
+    size_t inputTokens{};
     for (size_t index = 0; index < batchSize; ++index)
     {
         mediaItems += inputs[index].mediaItems;
         inputBytes += inputs[index].inputBytes;
+        inputTokens += inputs[index].inputTokens;
     }
     bool const batchFull = batchSize == mConfig.maxEncoderBatchSize;
     bool const mediaFull = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
     bool const inputFull = mConfig.maxEncoderInputBytes > 0 && inputBytes >= mConfig.maxEncoderInputBytes;
+    bool const tokenFull = mConfig.maxEncoderInputTokens > 0 && inputTokens >= mConfig.maxEncoderInputTokens;
     bool const resourceLimited = batchSize < inputs.size();
     bool const capacityFull = !encoderCapacityAvailable(batchSize + 1U);
     double const oldestWaitUs = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - mPending.front().scheduling.submittedAt)
                                     .count();
-    if (!batchFull && !mediaFull && !inputFull && !resourceLimited && !capacityFull
+    if (!batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
         && oldestWaitUs < mConfig.encoderBatchWaitUs)
     {
         return 0;

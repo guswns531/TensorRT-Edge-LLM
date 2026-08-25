@@ -120,6 +120,8 @@ public:
     std::unique_ptr<PhaseVisionPayload> take(uint64_t requestId);
     bool cancel(uint64_t requestId);
     bool busy() const noexcept;
+    size_t estimateInputTokens(LLMGenerationRequest const& request);
+    size_t maxInputTokens() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;
     void reclaimIdleStorage();

@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstddef>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <stdexcept>
@@ -404,6 +405,38 @@ std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(int64_t const /*
 {
     return rt::imageUtils::qwenSmartResize(height, width, mConfig.patchSize, mConfig.mergeSize,
         mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage, maxRatio);
+}
+
+int64_t QwenViTRunner::estimateInputTokens(rt::LLMGenerationRequest const& request)
+{
+    int64_t result{};
+    std::vector<VisionSpan> spans;
+    for (LLMGenerationRequest::Request const& logicalRequest : request.requests)
+    {
+        for (imageUtils::ImageData const& image : logicalRequest.imageBuffers)
+        {
+            imageUtils::ImageData const view = [&]() {
+                if (!image.doResize)
+                {
+                    return image.resizedMeta(image.height, image.width);
+                }
+                auto const [height, width]
+                    = getResizedImageSize(image.frames, image.isVideo, image.height, image.width);
+                return image.resizedMeta(height, width);
+            }();
+            auto const [tokens, unusedGridT] = computeVisionSpans(view, result, spans);
+            static_cast<void>(unusedGridT);
+            ELLM_CHECK(tokens >= 0 && result <= std::numeric_limits<int64_t>::max() - tokens,
+                "Estimated Qwen visual token count overflowed int64");
+            result += tokens;
+        }
+    }
+    return result;
+}
+
+int64_t QwenViTRunner::maxInputTokens() const noexcept
+{
+    return mConfig.maxHW;
 }
 
 void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans,

@@ -277,6 +277,17 @@ bool MultimodalRunner::bindExternalOutputStorage(
     return false;
 }
 
+int64_t MultimodalRunner::estimateInputTokens(rt::LLMGenerationRequest const& request)
+{
+    static_cast<void>(request);
+    return 0;
+}
+
+int64_t MultimodalRunner::maxInputTokens() const noexcept
+{
+    return 0;
+}
+
 bool MultimodalRunner::preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,
     [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
     [[maybe_unused]] cudaStream_t stream)

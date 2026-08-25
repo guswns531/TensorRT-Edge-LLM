@@ -454,6 +454,19 @@ bool PhaseVisionAdapter::busy() const noexcept
     return !mRequests.empty();
 }
 
+size_t PhaseVisionAdapter::estimateInputTokens(LLMGenerationRequest const& request)
+{
+    int64_t const tokens = mRunner.estimateInputTokens(request);
+    ELLM_CHECK(tokens >= 0, "Vision runner returned a negative input-token estimate");
+    return static_cast<size_t>(tokens);
+}
+
+size_t PhaseVisionAdapter::maxInputTokens() const noexcept
+{
+    int64_t const tokens = mRunner.maxInputTokens();
+    return tokens > 0 ? static_cast<size_t>(tokens) : 0U;
+}
+
 CUcontext PhaseVisionAdapter::cudaContext() const noexcept
 {
     return mCudaContext;

@@ -1520,6 +1520,10 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.maxEncoderInputBytes = static_cast<size_t>(std::stoull(value));
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS"))
+                {
+                    threePhaseConfig.maxEncoderInputTokens = static_cast<size_t>(std::stoull(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US"))
                 {
                     threePhaseConfig.encoderBatchWaitUs = std::stod(value);
@@ -1928,6 +1932,8 @@ int main(int argc, char** argv)
                         {"vision_encoder_batch_max", visionMetrics.maxEncoderBatchSize},
                         {"vision_encoder_input_bytes", visionMetrics.lastEncoderInputBytes},
                         {"vision_encoder_input_bytes_max", visionMetrics.maxEncoderInputBytes},
+                        {"vision_encoder_input_tokens", visionMetrics.lastEncoderInputTokens},
+                        {"vision_encoder_input_tokens_max", visionMetrics.maxEncoderInputTokens},
                         {"vision_oldest_pending_ms", visionMetrics.oldestPendingAgeUs / 1000.0},
                         {"vision_encoder_queue_wait_ms", visionMetrics.lastEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
@@ -2065,6 +2071,7 @@ int main(int argc, char** argv)
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
                     "encoder_input_bytes_last=%zu encoder_input_bytes_max=%zu "
+                    "encoder_input_tokens_last=%zu encoder_input_tokens_max=%zu "
                     "pending=%zu prefill_ready=%zu prefill_ready_bytes=%zu downstream=%zu bytes=%zu "
                     "prefill_admission_batches=%zu prefill_admission_last=%zu prefill_admission_max=%zu "
                     "prefill_adaptive=%zu prefill_low_load=%zu prefill_backlog=%zu prefill_decode_protected=%zu "
@@ -2080,6 +2087,7 @@ int main(int argc, char** argv)
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
                     visionMetrics.lastEncoderInputBytes, visionMetrics.maxEncoderInputBytes,
+                    visionMetrics.lastEncoderInputTokens, visionMetrics.maxEncoderInputTokens,
                     visionMetrics.pendingVisionRequests, visionMetrics.pendingPrefillReadyRequests,
                     visionMetrics.pendingPrefillReadyBytes, visionMetrics.downstreamEncodedRequests,
                     visionMetrics.downstreamEncodedBytes, visionMetrics.prefillAdmissionBatches,
