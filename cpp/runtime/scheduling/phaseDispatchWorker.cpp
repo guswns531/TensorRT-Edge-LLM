@@ -206,6 +206,10 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics = PhaseDispatchMetrics{};
     mCurrentMetrics.dispatchIndex = mDispatchCount + 1;
     mCurrentMetrics.kind = mInFlight.kind;
+    if (!mInFlight.prefillBatch.empty())
+    {
+        mCurrentMetrics.prefillClass = mInFlight.prefillBatch.front().prefillClass;
+    }
     mCurrentMetrics.prefillBatchSize = static_cast<int32_t>(mInFlight.prefillBatch.size());
     mCurrentMetrics.decodeBatchSize = static_cast<int32_t>(mInFlight.decodeBatch.size());
     mCurrentMetrics.predictedPrefillGpuMs = mInFlight.predictedPrefillGpuMs;

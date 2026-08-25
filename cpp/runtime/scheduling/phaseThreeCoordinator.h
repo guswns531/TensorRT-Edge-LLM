@@ -53,6 +53,8 @@ struct PhaseThreeCoordinatorConfig
     size_t maxEncoderBatchSize{1U};
     //! Optional media-item cap for a coalesced encoder batch. Zero disables this guard.
     size_t maxEncoderMediaItems{};
+    //! Optional raw image/video input byte cap for one encoder batch. Zero disables this guard.
+    size_t maxEncoderInputBytes{};
     //! Maximum time to wait for encoder batch formation. Zero dispatches immediately.
     double encoderBatchWaitUs{};
     //! Maximum encoded requests released together into the independent prefill scheduler. Zero inherits encoder BS.
@@ -97,6 +99,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderBatches{};
     size_t lastEncoderBatchSize{};
     size_t maxEncoderBatchSize{};
+    size_t lastEncoderInputBytes{};
+    size_t maxEncoderInputBytes{};
     double oldestPendingAgeUs{};
     double lastEncoderQueueWaitUs{};
     double maxEncoderQueueWaitUs{};
@@ -136,6 +140,16 @@ PhaseSchedulingHints phaseVisionSchedulingHints(PhaseSchedulingHints scheduling,
 bool phaseVisionEncoderCapacityAvailable(size_t downstreamRequests, size_t maxDownstreamRequests,
     size_t downstreamBytes, size_t maxDownstreamBytes, size_t estimatedPayloadBytes,
     size_t additionalRequests = 1U) noexcept;
+
+struct PhaseVisionEncoderInput
+{
+    size_t mediaItems{};
+    size_t inputBytes{};
+};
+
+//! Select a FIFO encoder batch bounded independently by requests, media items, and raw bytes.
+size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
+    size_t maxMediaItems, size_t maxInputBytes) noexcept;
 
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
@@ -214,6 +228,7 @@ private:
     size_t effectiveEncodedCapacity() const noexcept;
     void eraseTpotTarget(uint64_t requestId);
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
+    static size_t mediaInputBytes(PendingVisionRequest const& pending) noexcept;
 
     PhaseVisionAdapter& mVision;
     IndependentPhaseAsyncServer& mServer;
@@ -232,6 +247,8 @@ private:
     size_t mEncoderBatches{};
     size_t mLastEncoderBatchSize{};
     size_t mMaxEncoderBatchSize{};
+    size_t mLastEncoderInputBytes{};
+    size_t mMaxEncoderInputBytes{};
     double mLastEncoderQueueWaitUs{};
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};

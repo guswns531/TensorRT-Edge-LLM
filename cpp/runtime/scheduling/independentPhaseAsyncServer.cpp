@@ -123,6 +123,12 @@ bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequ
     return externalFraction >= minExternalRequestFraction && externalPrefillTokens >= minExternalPrefillTokens;
 }
 
+double phaseAdmissionProfileTpotBudget(
+    double defaultBudgetUs, double externalBudgetUs, bool externalProfileActive) noexcept
+{
+    return externalProfileActive && externalBudgetUs > 0.0 ? externalBudgetUs : defaultBudgetUs;
+}
+
 std::vector<int32_t> phaseServingWarmupBatchSizes(int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes)
 {
     ELLM_CHECK(maxDecodeBatchSize > 0, "Phase serving warmup requires a positive decode batch limit");
@@ -270,6 +276,9 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
         "Stepwise admission requires valid step, dwell, page, and TPOT thresholds");
     ELLM_CHECK(std::isfinite(mConfig.adaptiveAdmissionTpotBudgetUs) && mConfig.adaptiveAdmissionTpotBudgetUs >= 0.0,
         "Predictive admission TPOT budget must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.adaptiveAdmissionExternalTpotBudgetUs)
+            && mConfig.adaptiveAdmissionExternalTpotBudgetUs >= 0.0,
+        "Predictive external admission TPOT budget must be finite and non-negative");
     auto const validateAdmissionCosts = [&](std::vector<IndependentPhaseAdmissionCost> const& costs) {
         size_t previousAdmissionCostLimit{};
         for (IndependentPhaseAdmissionCost const& cost : costs)
@@ -337,6 +346,8 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
 {
     bool const allowChunkedPrefill = visionPayload == nullptr || mConfig.allowChunkedVisionPrefill;
     bool const exclusivePrefill = visionPayload != nullptr && !mConfig.allowBatchedVisionPrefill;
+    PhasePrefillClass const prefillClass
+        = visionPayload == nullptr ? PhasePrefillClass::kText : PhasePrefillClass::kExternal;
     IndependentPhaseServerSubmission result{requestId};
     if (mRequests.find(requestId) != mRequests.end() || mPendingRequestIds.find(requestId) != mPendingRequestIds.end()
         || promptTokens.empty())
@@ -400,7 +411,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     int32_t const remaining = static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()) - reusedPrefixTokens;
     mCoordinator.enqueuePrefill({requestId, remaining, slot, reusedPrefixTokens,
         static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()), allowChunkedPrefill, scheduling,
-        exclusivePrefill});
+        exclusivePrefill, prefillClass});
     result.status = IndependentPhaseServerStatus::kAdmitted;
     result.kvSlotId = slot;
     result.reusedPrefixTokens = reusedPrefixTokens;
@@ -550,7 +561,8 @@ size_t IndependentPhaseAsyncServer::admissionLimit() const noexcept
 
 double IndependentPhaseAsyncServer::effectiveAdmissionTpotBudgetUs() const noexcept
 {
-    double result = mConfig.adaptiveAdmissionTpotBudgetUs;
+    double result = phaseAdmissionProfileTpotBudget(mConfig.adaptiveAdmissionTpotBudgetUs,
+        mConfig.adaptiveAdmissionExternalTpotBudgetUs, adaptiveAdmissionExternalProfileActive());
     auto includeTarget = [&](double targetUs) {
         if (targetUs > 0.0 && (result == 0.0 || targetUs < result))
         {
@@ -875,7 +887,8 @@ size_t IndependentPhaseAsyncServer::adaptiveAdmissionUnsatisfiableDecisionCount(
 
 float IndependentPhaseAsyncServer::decodeAdmissionTpotPressure() const noexcept
 {
-    double budgetUs = mConfig.adaptiveAdmissionTpotBudgetUs;
+    double budgetUs = phaseAdmissionProfileTpotBudget(mConfig.adaptiveAdmissionTpotBudgetUs,
+        mConfig.adaptiveAdmissionExternalTpotBudgetUs, adaptiveAdmissionExternalProfileActive());
     if (mExternalMinTpotTargetUs > 0.0 && (budgetUs == 0.0 || mExternalMinTpotTargetUs < budgetUs))
     {
         budgetUs = mExternalMinTpotTargetUs;

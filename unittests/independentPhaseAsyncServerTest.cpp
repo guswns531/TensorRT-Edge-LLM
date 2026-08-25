@@ -100,6 +100,13 @@ TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionSelectsExternalWorkload
     EXPECT_FALSE(phaseAdmissionUsesExternalProfile(0, 0, 2048, 0.0, 1024));
 }
 
+TEST(IndependentPhaseAsyncServerTest, PredictiveAdmissionUsesExternalFallbackBudget)
+{
+    EXPECT_DOUBLE_EQ(phaseAdmissionProfileTpotBudget(34000.0, 75000.0, true), 75000.0);
+    EXPECT_DOUBLE_EQ(phaseAdmissionProfileTpotBudget(34000.0, 75000.0, false), 34000.0);
+    EXPECT_DOUBLE_EQ(phaseAdmissionProfileTpotBudget(34000.0, 0.0, true), 34000.0);
+}
+
 TEST(IndependentPhaseAsyncServerTest, ServingWarmupCoversRepresentativeDecodeBuckets)
 {
     EXPECT_EQ(phaseServingWarmupBatchSizes(64), (std::vector<int32_t>{8, 16, 32, 48, 64}));

@@ -64,6 +64,25 @@ namespace
 constexpr int32_t kDEFAULT_STABLE_SLOTS = 80;
 constexpr size_t kDEFAULT_MAX_INFLIGHT_REQUESTS = 16U;
 
+rt::PhasePrefillClass parsePrefillClass(nlohmann::json const& point)
+{
+    std::string const value = point.value("prefill_class", std::string{"any"});
+    if (value == "any")
+    {
+        return rt::PhasePrefillClass::kAny;
+    }
+    if (value == "text")
+    {
+        return rt::PhasePrefillClass::kText;
+    }
+    if (value == "external")
+    {
+        return rt::PhasePrefillClass::kExternal;
+    }
+    ELLM_CHECK(false, "Unknown phase prefill class: " + value);
+    return rt::PhasePrefillClass::kAny;
+}
+
 std::vector<rt::IndependentPhaseAdmissionCost> parseAdmissionCosts(std::string const& value)
 {
     std::vector<rt::IndependentPhaseAdmissionCost> result;
@@ -100,16 +119,17 @@ void loadSchedulerCostModel(std::filesystem::path const& path, rt::PhaseQueueSch
         config.prefillBatchCosts.push_back({point.at("batch_size").get<int32_t>(),
             point.at("chunk_length").get<int32_t>(), point.at("max_past_kv_length").get<int32_t>(),
             point.at("max_concurrent_decode_batch_size").get<int32_t>(), point.at("initial_chunk").get<bool>(),
-            point.at("p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>()});
+            point.at("p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>(),
+            parsePrefillClass(point)});
     }
     for (nlohmann::json const& point : root.at("overlap"))
     {
-        config.overlapBatchCosts.push_back(
-            {point.at("prefill_batch_size").get<int32_t>(), point.at("decode_batch_size").get<int32_t>(),
-                point.at("chunk_length").get<int32_t>(), point.at("max_prefill_past_kv_length").get<int32_t>(),
-                point.at("max_decode_context_length").get<int32_t>(), point.at("initial_chunk").get<bool>(),
-                point.at("prefill_p95_gpu_ms").get<float>(), point.at("decode_p95_gpu_ms").get<float>(),
-                point.at("makespan_p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>()});
+        config.overlapBatchCosts.push_back({point.at("prefill_batch_size").get<int32_t>(),
+            point.at("decode_batch_size").get<int32_t>(), point.at("chunk_length").get<int32_t>(),
+            point.at("max_prefill_past_kv_length").get<int32_t>(), point.at("max_decode_context_length").get<int32_t>(),
+            point.at("initial_chunk").get<bool>(), point.at("prefill_p95_gpu_ms").get<float>(),
+            point.at("decode_p95_gpu_ms").get<float>(), point.at("makespan_p95_gpu_ms").get<float>(),
+            point.at("decode_slowdown_p95_ms").get<float>(), parsePrefillClass(point)});
     }
     ELLM_CHECK(
         !config.decodeBatchCosts.empty() && !config.prefillBatchCosts.empty() && !config.overlapBatchCosts.empty(),
@@ -1254,6 +1274,10 @@ int main(int argc, char** argv)
         {
             serverConfig.adaptiveAdmissionExternalCosts = parseAdmissionCosts(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_EXTERNAL_TPOT_BUDGET_US"))
+        {
+            serverConfig.adaptiveAdmissionExternalTpotBudgetUs = std::stod(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_EXTERNAL_MIN_SHARE"))
         {
             serverConfig.adaptiveAdmissionExternalRequestFraction = std::stod(value);
@@ -1491,6 +1515,10 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA"))
                 {
                     threePhaseConfig.maxEncoderMediaItems = static_cast<size_t>(std::stoul(value));
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_BYTES"))
+                {
+                    threePhaseConfig.maxEncoderInputBytes = static_cast<size_t>(std::stoull(value));
                 }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US"))
                 {
@@ -1841,6 +1869,7 @@ int main(int argc, char** argv)
                         = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
+                        {"prefill_class", static_cast<int32_t>(metrics.prefillClass)},
                         {"decode_batch", metrics.decodeBatchSize}, {"prefill_tokens", metrics.prefillTokens},
                         {"prefill_chunk_length", metrics.prefillCostLookupChunkLength},
                         {"prefill_initial_rows", metrics.prefillInitialRows},
@@ -1897,6 +1926,8 @@ int main(int argc, char** argv)
                         {"vision_encoder_batches", visionMetrics.encoderBatches},
                         {"vision_encoder_batch", visionMetrics.lastEncoderBatchSize},
                         {"vision_encoder_batch_max", visionMetrics.maxEncoderBatchSize},
+                        {"vision_encoder_input_bytes", visionMetrics.lastEncoderInputBytes},
+                        {"vision_encoder_input_bytes_max", visionMetrics.maxEncoderInputBytes},
                         {"vision_oldest_pending_ms", visionMetrics.oldestPendingAgeUs / 1000.0},
                         {"vision_encoder_queue_wait_ms", visionMetrics.lastEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
@@ -2033,6 +2064,7 @@ int main(int argc, char** argv)
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
+                    "encoder_input_bytes_last=%zu encoder_input_bytes_max=%zu "
                     "pending=%zu prefill_ready=%zu prefill_ready_bytes=%zu downstream=%zu bytes=%zu "
                     "prefill_admission_batches=%zu prefill_admission_last=%zu prefill_admission_max=%zu "
                     "prefill_adaptive=%zu prefill_low_load=%zu prefill_backlog=%zu prefill_decode_protected=%zu "
@@ -2047,6 +2079,7 @@ int main(int argc, char** argv)
                     "decode_tpot_pressure=%.3f",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
+                    visionMetrics.lastEncoderInputBytes, visionMetrics.maxEncoderInputBytes,
                     visionMetrics.pendingVisionRequests, visionMetrics.pendingPrefillReadyRequests,
                     visionMetrics.pendingPrefillReadyBytes, visionMetrics.downstreamEncodedRequests,
                     visionMetrics.downstreamEncodedBytes, visionMetrics.prefillAdmissionBatches,

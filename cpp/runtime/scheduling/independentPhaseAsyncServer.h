@@ -64,6 +64,9 @@ bool phaseAdmissionTpotBudgetSatisfiable(
 //! Select an external-phase profile from its live request share and ready-prefill token pressure.
 bool phaseAdmissionUsesExternalProfile(size_t externalRequests, size_t totalRequests, size_t externalPrefillTokens,
     double minExternalRequestFraction, size_t minExternalPrefillTokens) noexcept;
+//! Choose a workload-specific fallback TPOT budget without weakening an explicit per-request target.
+double phaseAdmissionProfileTpotBudget(
+    double defaultBudgetUs, double externalBudgetUs, bool externalProfileActive) noexcept;
 //! Representative decode buckets to prime before opening a persistent serving endpoint.
 std::vector<int32_t> phaseServingWarmupBatchSizes(
     int32_t maxDecodeBatchSize, std::vector<int32_t> requestedBatchSizes = {});
@@ -177,6 +180,8 @@ struct IndependentPhaseServerConfig
     double adaptiveAdmissionTpotBudgetUs{};
     //! Optional profile for workloads dominated by an external producer such as a vision encoder.
     std::vector<IndependentPhaseAdmissionCost> adaptiveAdmissionExternalCosts;
+    //! Optional fallback TPOT budget used while the external admission profile is active.
+    double adaptiveAdmissionExternalTpotBudgetUs{};
     //! Minimum live-request share required to select adaptiveAdmissionExternalCosts.
     double adaptiveAdmissionExternalRequestFraction{};
     //! Minimum completed external prefill tokens required to select the external profile.

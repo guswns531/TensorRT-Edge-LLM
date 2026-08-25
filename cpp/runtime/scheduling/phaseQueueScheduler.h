@@ -43,6 +43,15 @@ struct PhaseSchedulingHints
     std::chrono::steady_clock::time_point submittedAt;
 };
 
+//! Logical prefill producer class. TensorRT execution may remain shared while
+//! queue compatibility and profiled costs stay producer-specific.
+enum class PhasePrefillClass
+{
+    kAny,
+    kText,
+    kExternal,
+};
+
 //! A unit of phase work. For prefill, tokenCount is the remaining prompt
 //! length while queued and the dispatched chunk length while in flight.
 //! For decode it is the current KV length. kvSlotId identifies stable physical
@@ -52,7 +61,7 @@ struct PhaseWorkItem
     PhaseWorkItem() = default;
     PhaseWorkItem(uint64_t requestId, int32_t tokenCount, int32_t kvSlotId = -1, int32_t tokenOffset = 0,
         int32_t promptTokenCount = 0, bool allowChunkedPrefill = true, PhaseSchedulingHints scheduling = {},
-        bool exclusivePrefill = false)
+        bool exclusivePrefill = false, PhasePrefillClass prefillClass = PhasePrefillClass::kText)
         : requestId(requestId)
         , tokenCount(tokenCount)
         , kvSlotId(kvSlotId)
@@ -61,6 +70,7 @@ struct PhaseWorkItem
         , allowChunkedPrefill(allowChunkedPrefill)
         , scheduling(scheduling)
         , exclusivePrefill(exclusivePrefill)
+        , prefillClass(prefillClass)
     {
     }
 
@@ -74,6 +84,8 @@ struct PhaseWorkItem
     PhaseSchedulingHints scheduling;
     //! Keep this request in a one-row prefill batch while still permitting chunking.
     bool exclusivePrefill{};
+    //! Keep text and external-producer rows in separate logical prefill batches.
+    PhasePrefillClass prefillClass{PhasePrefillClass::kText};
 };
 
 enum class PhaseDispatchKind
@@ -88,6 +100,7 @@ struct PhaseDispatchMetrics
 {
     size_t dispatchIndex{};
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
+    PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
     int32_t prefillBatchSize{};
     int32_t decodeBatchSize{};
     int32_t prefillTokens{};
@@ -238,6 +251,7 @@ struct PhasePrefillBatchCost
     bool initialChunk{};
     float p95GpuMs{};
     float decodeSlowdownP95Ms{};
+    PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
 };
 
 //! Directly observed independent-context overlap cost. Shape bounds are
@@ -254,6 +268,7 @@ struct PhaseOverlapBatchCost
     float decodeP95GpuMs{};
     float makespanP95GpuMs{};
     float decodeSlowdownP95Ms{};
+    PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
 };
 
 enum class PhaseSchedulerProfile

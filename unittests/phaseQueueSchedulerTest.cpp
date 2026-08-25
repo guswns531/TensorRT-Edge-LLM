@@ -1193,6 +1193,29 @@ TEST(PhaseQueueSchedulerTest, BatchesRaggedAtomicMultimodalPrefills)
     EXPECT_EQ(plan.prefillBatch[1].tokenCount, 509);
 }
 
+TEST(PhaseQueueSchedulerTest, KeepsTextAndExternalPrefillInSeparateBatches)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem text{1, 128, 0, 0, 128};
+    PhaseWorkItem external{2, 128, 1, 0, 128};
+    external.prefillClass = PhasePrefillClass::kExternal;
+    scheduler.enqueuePrefill(text);
+    scheduler.enqueuePrefill(external);
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    EXPECT_EQ(first.prefillBatch.front().prefillClass, PhasePrefillClass::kText);
+    scheduler.completePrefill(first.prefillBatch.front(), 128, true);
+    PhaseDispatchPlan const second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch.front().prefillClass, PhasePrefillClass::kExternal);
+}
+
 TEST(PhaseQueueSchedulerTest, ChunksExclusiveMultimodalPrefillWithoutBatchingRows)
 {
     PhaseQueueSchedulerConfig config;
@@ -1359,6 +1382,25 @@ TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesLargestBatchInsideDecodeSlack)
     EXPECT_EQ(plan.prefillBatch.size(), 2U);
     EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 15.0F);
     EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 4.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesProducerSpecificCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kAny},
+        {1, 128, 0, 0, true, 20.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem external{1, 128, 0, 0, 128};
+    external.prefillClass = PhasePrefillClass::kExternal;
+    scheduler.enqueuePrefill(external);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 20.0F);
 }
 
 TEST(PhaseQueueSchedulerTest, DynamicRaggedPrefillUsesUsefulTokenEfficiency)
@@ -1759,6 +1801,18 @@ TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadByte
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 30, 100, 40, 2));
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(3, 4, 0, 0, 0, 2));
     EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 0, 0, 0));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{{1, 64}, {2, 96}, {1, 32}, {1, 16}};
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 0), 4U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 2, 0, 0), 2U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 3, 0), 2U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 159), 1U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 160), 2U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 1024}, {1, 16}}, 4, 1, 128), 1U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 0, 0, 0), 0U);
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, ReleasesReadyPrefillByCountTokenBudgetOrAge)

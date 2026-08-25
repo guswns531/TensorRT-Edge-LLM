@@ -623,6 +623,10 @@ int32_t PhaseQueueScheduler::costAwarePrefillTokens(PhaseWorkItem const& item, i
 bool PhaseQueueScheduler::isPrefillBatchCompatible(PhaseWorkItem const& item, PhaseWorkItem const& seed,
     int32_t paddedChunkLength, bool initialChunk, bool allowRaggedBatch) const noexcept
 {
+    if (item.prefillClass != seed.prefillClass)
+    {
+        return false;
+    }
     if (seed.exclusivePrefill || item.exclusivePrefill)
     {
         return seed.exclusivePrefill && item.requestId == seed.requestId;
@@ -663,6 +667,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     std::vector<Candidate> profiled;
     int32_t const firstBatchSize = std::min(available, mConfig.minDynamicPrefillBatchSize);
     int32_t const requiredConcurrentDecodeBatchSize = overlap ? plannedDecodeBatchSize : 0;
+    PhasePrefillClass const prefillClass = candidates.front()->prefillClass;
     for (int32_t batchSize = firstBatchSize; batchSize <= available; ++batchSize)
     {
         int32_t maxPastKV{};
@@ -675,14 +680,18 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         {
             if (cost.batchSize != batchSize || cost.chunkLength < chunkLength || cost.initialChunk != initialChunk
                 || cost.maxPastKVLength < maxPastKV
-                || cost.maxConcurrentDecodeBatchSize < requiredConcurrentDecodeBatchSize)
+                || cost.maxConcurrentDecodeBatchSize < requiredConcurrentDecodeBatchSize
+                || (cost.prefillClass != PhasePrefillClass::kAny && cost.prefillClass != prefillClass))
             {
                 continue;
             }
             if (selected == nullptr || cost.chunkLength < selected->chunkLength
                 || (cost.chunkLength == selected->chunkLength && cost.maxPastKVLength < selected->maxPastKVLength)
                 || (cost.chunkLength == selected->chunkLength && cost.maxPastKVLength == selected->maxPastKVLength
-                    && cost.maxConcurrentDecodeBatchSize < selected->maxConcurrentDecodeBatchSize))
+                    && cost.maxConcurrentDecodeBatchSize < selected->maxConcurrentDecodeBatchSize)
+                || (cost.chunkLength == selected->chunkLength && cost.maxPastKVLength == selected->maxPastKVLength
+                    && cost.maxConcurrentDecodeBatchSize == selected->maxConcurrentDecodeBatchSize
+                    && selected->prefillClass == PhasePrefillClass::kAny && cost.prefillClass == prefillClass))
             {
                 selected = &cost;
             }
@@ -695,7 +704,8 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
                 if (cost.prefillBatchSize != batchSize || cost.chunkLength < chunkLength
                     || cost.initialChunk != initialChunk || cost.decodeBatchSize < plannedDecodeBatchSize
                     || cost.maxPrefillPastKVLength < maxPastKV
-                    || cost.maxDecodeContextLength < plannedDecodeMaxContextLength)
+                    || cost.maxDecodeContextLength < plannedDecodeMaxContextLength
+                    || (cost.prefillClass != PhasePrefillClass::kAny && cost.prefillClass != prefillClass))
                 {
                     continue;
                 }
@@ -708,7 +718,13 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
                     || (cost.chunkLength == selectedOverlap->chunkLength
                         && cost.decodeBatchSize == selectedOverlap->decodeBatchSize
                         && cost.maxPrefillPastKVLength == selectedOverlap->maxPrefillPastKVLength
-                        && cost.maxDecodeContextLength < selectedOverlap->maxDecodeContextLength))
+                        && cost.maxDecodeContextLength < selectedOverlap->maxDecodeContextLength)
+                    || (cost.chunkLength == selectedOverlap->chunkLength
+                        && cost.decodeBatchSize == selectedOverlap->decodeBatchSize
+                        && cost.maxPrefillPastKVLength == selectedOverlap->maxPrefillPastKVLength
+                        && cost.maxDecodeContextLength == selectedOverlap->maxDecodeContextLength
+                        && selectedOverlap->prefillClass == PhasePrefillClass::kAny
+                        && cost.prefillClass == prefillClass))
                 {
                     selectedOverlap = &cost;
                 }
