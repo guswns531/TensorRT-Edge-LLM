@@ -247,6 +247,27 @@ TEST(PhaseQueueSchedulerTest, ExternalDrainPreferencePreservesExpiredSloDecision
     EXPECT_FALSE(plan.drainPreferenceApplied);
 }
 
+TEST(PhaseQueueSchedulerTest, PrefillTtftHardGuardOverridesMoreOverdueDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enablePrefillTtftHardGuard = true;
+    PhaseQueueScheduler scheduler(config);
+    auto const now = std::chrono::steady_clock::now();
+    PhaseSchedulingHints prefillScheduling;
+    prefillScheduling.ttftTargetUs = 1000.0;
+    prefillScheduling.submittedAt = now - std::chrono::milliseconds(10);
+    PhaseSchedulingHints decodeScheduling;
+    decodeScheduling.tpotTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, -1, 0, 0, true, prefillScheduling});
+    scheduler.enqueueDecode({2, 128, -1, 0, 0, true, decodeScheduling});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, ExternalPrefillDrainPreservesPagePressureGuard)
 {
     PhaseQueueSchedulerConfig config;

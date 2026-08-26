@@ -443,6 +443,9 @@ struct PhaseQueueSchedulerConfig
     int32_t decodeBurstLimit{8};
     //! Opt in to the provided queue-deadline + EWMA GPU-cost policy.
     bool enableMetricsPolicy{};
+    //! Dispatch expired prefill work before decode even when decode queue pressure is numerically larger.
+    //! This is useful when a request TTFT target is an end-to-end hard bound while the decode target is a soft goal.
+    bool enablePrefillTtftHardGuard{};
     double prefillQueueWaitTargetUs{5000.0};
     double decodeQueueWaitTargetUs{2000.0};
     float maxPredictedOverlapPrefillMs{30.0F};

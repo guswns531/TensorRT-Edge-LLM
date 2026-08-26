@@ -1262,6 +1262,8 @@ int main(int argc, char** argv)
             }
         }
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
+        semanticSchedulerConfig.enablePrefillTtftHardGuard
+            = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference
             = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;

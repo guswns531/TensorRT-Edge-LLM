@@ -1339,10 +1339,14 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 {
     refreshExternalDrainPreference();
     PhaseQueueSnapshot const state = snapshot();
-    PhaseDispatchKind const baseline = mConfig.metricsPolicy
-        ? mConfig.metricsPolicy(state, mTelemetry)
-        : (mConfig.enableMetricsPolicy ? metricsDecision(state, mTelemetry)
-                                       : (mConfig.policy ? mConfig.policy(state) : defaultDecision(state)));
+    bool const expiredPrefillHardGuard
+        = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U && state.prefillMinTtftSlackUs <= 0.0;
+    PhaseDispatchKind const baseline = expiredPrefillHardGuard
+        ? PhaseDispatchKind::kPrefill
+        : (mConfig.metricsPolicy
+                  ? mConfig.metricsPolicy(state, mTelemetry)
+                  : (mConfig.enableMetricsPolicy ? metricsDecision(state, mTelemetry)
+                                                 : (mConfig.policy ? mConfig.policy(state) : defaultDecision(state))));
     bool drainPreferenceApplied{};
     PhaseDispatchKind const kind = applyExternalDrainPreference(state, baseline, drainPreferenceApplied);
     check::check(kind != PhaseDispatchKind::kPrefill || state.prefillQueued > 0,
