@@ -333,6 +333,9 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
     }
     ELLM_CHECK(mConfig.decodeRefillBatchSize <= mConfig.maxInFlightRequests,
         "Decode refill batch cannot exceed the server in-flight capacity");
+    ELLM_CHECK(std::isfinite(mConfig.globalSamplingColdStartUs) && mConfig.globalSamplingColdStartUs > 0.0,
+        "Global sampling cold-start latency must be finite and positive");
+    ELLM_CHECK(mConfig.globalSamplingLatencyWindow > 0U, "Global sampling latency window must be positive");
     ELLM_CHECK(mConfig.prefillFormationBatchSize <= mConfig.maxInFlightRequests,
         "Prefill formation batch cannot exceed the server in-flight capacity");
     ELLM_CHECK(std::isfinite(mConfig.prefillFormationWindowUs) && mConfig.prefillFormationWindowUs >= 0.0,
@@ -707,6 +710,14 @@ void IndependentPhaseAsyncServer::setTimelineCallback(std::function<void(PhaseTi
 
 bool IndependentPhaseAsyncServer::poll()
 {
+    bool progressed = pollCompletions();
+    progressed = dispatchReady() || progressed;
+    progressed = flushEventCallbacks() || progressed;
+    return progressed;
+}
+
+bool IndependentPhaseAsyncServer::pollCompletions()
+{
     updateAdaptiveAdmissionMode();
     bool progressed = admitPendingRequests();
     progressed = resumePendingDecodeRequests() || progressed;
@@ -716,13 +727,25 @@ bool IndependentPhaseAsyncServer::poll()
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = admitPendingRequests() || progressed;
     updateAdaptiveAdmissionMode();
+    progressed = flushEventCallbacks() || progressed;
+    return progressed;
+}
+
+bool IndependentPhaseAsyncServer::dispatchReady()
+{
+    bool progressed{};
     bool const waitForDecodeRefill = shouldWaitForDecodeRefill();
     if (waitForDecodeRefill)
     {
         ++mDecodeRefillWaitCount;
     }
-    bool const waitForPrefillFormation = shouldWaitForPrefillFormation();
-    if (!mCoordinator.busy() && !mCoordinator.empty() && !waitForDecodeRefill)
+    bool const waitForPrefillFormation
+        = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive
+        ? false
+        : shouldWaitForPrefillFormation();
+    bool const phaseQueued
+        = mCoordinator.scheduler().prefillQueueSize() > 0U || mCoordinator.scheduler().decodeQueueSize() > 0U;
+    if (!mCoordinator.busy() && phaseQueued && !waitForDecodeRefill)
     {
         if (waitForPrefillFormation)
         {
@@ -734,8 +757,35 @@ bool IndependentPhaseAsyncServer::poll()
             mCoordinator.scheduler().setPrefillDispatchBlocked(false);
         }
     }
-    progressed = flushEventCallbacks() || progressed;
     return progressed;
+}
+
+std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalAction()
+{
+    if (mCoordinator.busy())
+    {
+        return std::nullopt;
+    }
+    return mCoordinator.scheduler().previewGlobalAction();
+}
+
+std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalDecodeAction()
+{
+    if (mCoordinator.busy())
+    {
+        return std::nullopt;
+    }
+    return mCoordinator.scheduler().previewGlobalDecodeAction();
+}
+
+bool IndependentPhaseAsyncServer::dispatchGlobalAction(PhaseGlobalActionCandidate candidate)
+{
+    if (mCoordinator.busy())
+    {
+        return false;
+    }
+    mCoordinator.scheduler().setNextGlobalAction(std::move(candidate));
+    return mCoordinator.dispatchNext();
 }
 
 bool IndependentPhaseAsyncServer::shouldWaitForPrefillFormation()
@@ -809,7 +859,7 @@ bool IndependentPhaseAsyncServer::shouldWaitForPrefillFormation()
     return defer;
 }
 
-bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
+bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill()
 {
     size_t const queuedDecode = mCoordinator.scheduler().decodeQueueSize();
     size_t pendingDecodeRows{};
@@ -825,12 +875,99 @@ bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
     size_t const refillTarget = !mConfig.enableAdaptiveAdmission || mThroughputMode || retainGrowthCohort
         ? mConfig.decodeRefillBatchSize
         : 0U;
-    return shouldDeferDecodeForSamplingRefill(
+    bool const legacyWait = shouldDeferDecodeForSamplingRefill(
         refillTarget, mCoordinator.scheduler().prefillQueueSize(), queuedDecode, pendingDecodeRows);
+    if (!mConfig.enableGlobalWaitActions || mSamplingTickets.empty()
+        || mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kDisabled)
+    {
+        return legacyWait;
+    }
+    if (mCoordinator.scheduler().prefillQueueSize() > 0U || queuedDecode == 0U || pendingDecodeRows == 0U)
+    {
+        return false;
+    }
+
+    std::vector<double> ordered(mSamplingLatencyUs.begin(), mSamplingLatencyUs.end());
+    std::sort(ordered.begin(), ordered.end());
+    double medianUs = mConfig.globalSamplingColdStartUs;
+    double p95Us = mConfig.globalSamplingColdStartUs * 2.0;
+    if (!ordered.empty())
+    {
+        medianUs = ordered[(ordered.size() - 1U) / 2U];
+        size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1U;
+        p95Us = ordered[std::min(p95Index, ordered.size() - 1U)];
+    }
+    auto const now = std::chrono::steady_clock::now();
+    IndependentPhaseSampleTicket const* nearest{};
+    double nearestWaitUs{std::numeric_limits<double>::infinity()};
+    double nearestUncertaintyUs{};
+    int32_t futureMaxContextLength{};
+    for (auto const& ticket : mSamplingTickets)
+    {
+        double const ageUs = ticket->submittedAt == std::chrono::steady_clock::time_point{}
+            ? 0.0
+            : std::chrono::duration<double, std::micro>(now - ticket->submittedAt).count();
+        double const remainingMedianUs = std::max(0.0, medianUs - ageUs);
+        double const remainingP95Us = std::max(remainingMedianUs, p95Us - ageUs);
+        if (remainingMedianUs < nearestWaitUs)
+        {
+            nearest = ticket.get();
+            nearestWaitUs = remainingMedianUs;
+            nearestUncertaintyUs = remainingP95Us - remainingMedianUs;
+        }
+        for (uint64_t const requestId : ticket->requestIds)
+        {
+            auto const request = mRequests.find(requestId);
+            if (request != mRequests.end())
+            {
+                futureMaxContextLength = std::max(futureMaxContextLength,
+                    static_cast<int32_t>(
+                        request->second.promptTokens.size() + request->second.generatedTokens.size() + 1U));
+            }
+        }
+    }
+    if (nearest == nullptr)
+    {
+        return false;
+    }
+    bool const globalWait = mCoordinator.scheduler().shouldWaitForDecodeEvent(
+        pendingDecodeRows, futureMaxContextLength, nearestWaitUs, nearestUncertaintyUs, nearest->sequenceId);
+    return mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kShadow ? legacyWait
+                                                                                               : globalWait;
 }
 
 size_t IndependentPhaseAsyncServer::admissionLimit() const noexcept
 {
+    if (mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive)
+    {
+        double targetUs = mConfig.adaptiveAdmissionTpotBudgetUs;
+        auto includeTarget = [&](double candidateUs) {
+            if (candidateUs > 0.0 && (targetUs == 0.0 || candidateUs < targetUs))
+            {
+                targetUs = candidateUs;
+            }
+        };
+        includeTarget(mExternalMinTpotTargetUs);
+        int32_t maxContextLength{};
+        for (auto const& request : mRequests)
+        {
+            includeTarget(request.second.scheduling.tpotTargetUs);
+            maxContextLength = std::max(maxContextLength,
+                static_cast<int32_t>(request.second.promptTokens.size()) + request.second.maxOutputTokens);
+        }
+        for (PendingRequest const& request : mPendingRequests)
+        {
+            includeTarget(request.scheduling.tpotTargetUs);
+            maxContextLength = std::max(
+                maxContextLength, static_cast<int32_t>(request.promptTokens.size()) + request.maxOutputTokens);
+        }
+        if (targetUs > 0.0)
+        {
+            size_t const decodeLimit = mCoordinator.scheduler().decodeAdmissionLimitForTpot(targetUs, maxContextLength);
+            return std::min(mConfig.maxInFlightRequests, std::max(size_t{1U}, decodeLimit));
+        }
+        return mConfig.maxInFlightRequests;
+    }
     if (mConfig.enableStepwiseAdaptiveAdmission)
     {
         return mAdaptiveAdmissionLimit;
@@ -1189,6 +1326,32 @@ size_t IndependentPhaseAsyncServer::visionPayloadBytes() const noexcept
     return result;
 }
 
+size_t IndependentPhaseAsyncServer::visionPayloadBytes(std::vector<uint64_t> const& requestIds) const noexcept
+{
+    size_t result{};
+    for (uint64_t const requestId : requestIds)
+    {
+        auto const request = mRequests.find(requestId);
+        if (request != mRequests.end() && request->second.visionPayload != nullptr)
+        {
+            result += request->second.visionPayload->byteSize();
+        }
+    }
+    return result;
+}
+
+bool IndependentPhaseAsyncServer::releasesVisionPrefillStorage() const noexcept
+{
+    return mConfig.releaseVisionPrefillStorage;
+}
+
+void IndependentPhaseAsyncServer::setGlobalMemoryHorizonSupplier(
+    std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
+        supplier)
+{
+    mCoordinator.scheduler().setGlobalMemoryHorizonSupplier(std::move(supplier));
+}
+
 size_t IndependentPhaseAsyncServer::visionPrefillReleaseCount() const noexcept
 {
     return mVisionPrefillReleaseCount;
@@ -1324,6 +1487,16 @@ bool IndependentPhaseAsyncServer::empty() const noexcept
 CUcontext IndependentPhaseAsyncServer::cudaContext() const noexcept
 {
     return mCoordinator.cudaContext();
+}
+
+PhaseGlobalSchedulerMode IndependentPhaseAsyncServer::globalSchedulerMode() const noexcept
+{
+    return mCoordinator.scheduler().globalSchedulerMode();
+}
+
+PhaseSchedulerTelemetry const& IndependentPhaseAsyncServer::schedulerTelemetry() const noexcept
+{
+    return mCoordinator.scheduler().telemetry();
 }
 
 bool IndependentPhaseAsyncServer::admitPendingRequests()
@@ -1557,7 +1730,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
                   std::unique_ptr<IndependentPhaseSampleTicket> ticket
                       = mAdapter.submitSampling(finalViews, io, stream, true);
                   ELLM_CHECK(ticket != nullptr, "Prefill sampling adapter returned no completion ticket");
-                  mSamplingTickets.push_back(std::move(ticket));
+                  enqueueSamplingTicket(std::move(ticket));
                   for (IndependentPhaseRequestView const& view : finalViews)
                   {
                       if (!mConfig.releaseVisionPrefillStorage || view.visionPayload == nullptr)
@@ -1578,7 +1751,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
               std::unique_ptr<IndependentPhaseSampleTicket> ticket
                   = mAdapter.submitSampling(makeViews(batch), io, stream, false);
               ELLM_CHECK(ticket != nullptr, "Decode sampling adapter returned no completion ticket");
-              mSamplingTickets.push_back(std::move(ticket));
+              enqueueSamplingTicket(std::move(ticket));
           };
     callbacks.isPrefillFinished = [](PhaseWorkItem const& item, int32_t) {
         return item.tokenOffset + item.tokenCount == item.promptTokenCount;
@@ -1627,6 +1800,14 @@ bool IndependentPhaseAsyncServer::isEos(int32_t tokenId) const noexcept
     return std::find(mConfig.eosTokenIds.begin(), mConfig.eosTokenIds.end(), tokenId) != mConfig.eosTokenIds.end();
 }
 
+void IndependentPhaseAsyncServer::enqueueSamplingTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket)
+{
+    ELLM_CHECK(ticket != nullptr && ticket->ready != nullptr, "Sampling adapter returned an invalid CUDA event");
+    ticket->sequenceId = mNextSamplingTicketSequence++;
+    ticket->submittedAt = std::chrono::steady_clock::now();
+    mSamplingTickets.push_back(std::move(ticket));
+}
+
 bool IndependentPhaseAsyncServer::processSamplingTickets()
 {
     std::vector<std::unique_ptr<IndependentPhaseSampleTicket>> readyTickets;
@@ -1639,6 +1820,17 @@ bool IndependentPhaseAsyncServer::processSamplingTickets()
             continue;
         }
         CUDA_CHECK(status);
+        if ((*ticket)->submittedAt != std::chrono::steady_clock::time_point{})
+        {
+            double const latencyUs
+                = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - (*ticket)->submittedAt)
+                      .count();
+            mSamplingLatencyUs.push_back(latencyUs);
+            while (mSamplingLatencyUs.size() > mConfig.globalSamplingLatencyWindow)
+            {
+                mSamplingLatencyUs.pop_front();
+            }
+        }
         readyTickets.push_back(std::move(*ticket));
         ticket = mSamplingTickets.erase(ticket);
     }

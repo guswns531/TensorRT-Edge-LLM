@@ -52,6 +52,133 @@ TEST(PhaseQueueSchedulerTest, BatchesQueuesIndependently)
     EXPECT_EQ(plan.decodeBatch[0].requestId, 3U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalShadowPreservesLegacyDispatch)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kShadow;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(plan.globalDecisionEvaluated);
+    EXPECT_FALSE(plan.globalDecisionApplied);
+    EXPECT_EQ(scheduler.telemetry().globalDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalShadowDisagreementCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(plan.globalDecisionEvaluated);
+    EXPECT_TRUE(plan.globalDecisionApplied);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const action = scheduler.previewGlobalDecodeAction();
+
+    ASSERT_TRUE(action.has_value());
+    EXPECT_EQ(action->key.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_EQ(action->requestIds, std::vector<uint64_t>{2U});
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    EXPECT_TRUE(scheduler.shouldWaitForDecodeEvent(3U, 128, 100.0, 0.0, 7U));
+    EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().lastGlobalSelectedAction, PhaseGlobalActionKind::kWait);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitShadowDoesNotDelayDispatch)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kShadow;
+    config.maxDecodeBatchSize = 4;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    EXPECT_FALSE(scheduler.shouldWaitForDecodeEvent(3U, 128, 100.0, 0.0, 7U));
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 1U);
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalAdmissionUsesCoveredDecodeP95)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 8;
+    config.decodeBatchCosts = {{1, 2048, 1.0F}, {2, 2048, 1.3F}, {4, 2048, 1.8F}, {8, 2048, 3.2F}};
+    PhaseQueueScheduler scheduler(config);
+
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 1024), 4U);
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(4000.0, 1024), 8U);
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 4096), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveDoesNotBypassMemoryFeasibility)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalMemoryHorizonSupplier = [](PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+        return PhaseActionMemoryHorizon{1U, 1U, 0U, 0U, 0U, 1U, false};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kNone);
+    EXPECT_TRUE(plan.globalDecisionApplied);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalMemoryHorizonReceivesStableRequestOwnership)
+{
+    std::vector<uint64_t> observedIds;
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalMemoryHorizonSupplier = [&](PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds) {
+        observedIds = requestIds;
+        return PhaseActionMemoryHorizon{};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({17, 32});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(observedIds, std::vector<uint64_t>{17U});
+}
+
 TEST(PhaseQueueSchedulerTest, ExternalArenaBlockExcludesOnlyPrefill)
 {
     PhaseQueueSchedulerConfig config;

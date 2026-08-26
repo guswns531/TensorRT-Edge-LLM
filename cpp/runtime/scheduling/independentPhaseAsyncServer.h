@@ -143,6 +143,9 @@ struct IndependentPhaseRequestView
 struct IndependentPhaseSampleTicket
 {
     cudaEvent_t ready{};
+    //! Filled by the server when the adapter returns the ticket.
+    uint64_t sequenceId{};
+    std::chrono::steady_clock::time_point submittedAt;
     bool fromPrefill{};
     std::vector<uint64_t> requestIds;
     std::function<std::vector<int32_t>()> collect;
@@ -197,6 +200,11 @@ struct IndependentPhaseServerConfig
     int32_t maxConcurrentPageGrowthRequests{8};
     //! Defer a partial decode tail while completed decode sampling tickets can refill this many rows.
     size_t decodeRefillBatchSize{};
+    //! Replace the fixed refill decision with a global WAIT action over one
+    //! concrete sampling event and its predicted future decode batch.
+    bool enableGlobalWaitActions{};
+    double globalSamplingColdStartUs{200.0};
+    size_t globalSamplingLatencyWindow{32U};
     //! Defer a partial prefill cohort while known upstream producers can fill this many rows.
     size_t prefillFormationBatchSize{};
     //! Maximum non-blocking residence of one partial prefill cohort. Zero disables formation.
@@ -335,6 +343,14 @@ public:
     //! Enable optional request-level host transition telemetry while the server is idle.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     bool poll();
+    //! Progress admission, CUDA completions, sampling, and callbacks without
+    //! selecting a new P/D action.
+    bool pollCompletions();
+    //! Select and enqueue at most one ready P/D action.
+    bool dispatchReady();
+    std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    bool dispatchGlobalAction(PhaseGlobalActionCandidate candidate);
     void runUntilIdle(size_t maxPolls);
 
     std::optional<IndependentPhaseServerToken> tryPopToken();
@@ -375,6 +391,11 @@ public:
     int32_t pageReservationGuaranteedPages() const;
     float decodeTpotPressure() const noexcept;
     size_t visionPayloadBytes() const noexcept;
+    size_t visionPayloadBytes(std::vector<uint64_t> const& requestIds) const noexcept;
+    bool releasesVisionPrefillStorage() const noexcept;
+    void setGlobalMemoryHorizonSupplier(
+        std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
+            supplier);
     size_t visionPrefillReleaseCount() const noexcept;
     size_t visionPrefillReleasedBytes() const noexcept;
     bool throughputMode() const noexcept;
@@ -393,6 +414,8 @@ public:
     IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot() const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
+    PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
+    PhaseSchedulerTelemetry const& schedulerTelemetry() const noexcept;
 
 private:
     struct RequestState
@@ -441,7 +464,7 @@ private:
     bool hasPageReservationCapacity(IndependentPhasePageReservation const& reservation) const;
     int32_t pageReservationBudget() const;
     void refreshPageGrowthOwners();
-    bool shouldWaitForDecodeRefill() const noexcept;
+    bool shouldWaitForDecodeRefill();
     bool shouldWaitForPrefillFormation();
     size_t admissionLimit() const noexcept;
     double effectiveAdmissionTpotBudgetUs() const noexcept;
@@ -449,6 +472,7 @@ private:
     size_t costLimitedAdmissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
+    void enqueueSamplingTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     bool flushEventCallbacks();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
@@ -469,6 +493,7 @@ private:
     std::unordered_set<uint64_t> mPendingDecodeRequestIds;
     std::unordered_set<uint64_t> mPageGrowthRequestIds;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
+    std::deque<double> mSamplingLatencyUs;
     std::deque<IndependentPhaseServerToken> mTokenEvents;
     std::deque<IndependentPhaseServerCompletion> mCompletions;
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
@@ -477,6 +502,7 @@ private:
     std::unordered_set<uint64_t> mTimelineDecodeStarted;
     std::unordered_set<uint64_t> mTimelineDecodeCompleted;
     size_t mDecodeRefillWaitCount{};
+    uint64_t mNextSamplingTicketSequence{1U};
     size_t mPrefillFormationWaitPeriodCount{};
     size_t mPrefillFormationDeferralCount{};
     size_t mPrefillFormationProfileSelectionCount{};

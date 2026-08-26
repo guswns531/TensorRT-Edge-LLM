@@ -1263,6 +1263,15 @@ int main(int argc, char** argv)
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
         semanticSchedulerConfig.maxPrefillBatchSize = config.maxSupportedPrefillBatchSize;
         semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedDecodeBatchSize;
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SCHEDULER"))
+        {
+            std::string const mode(value);
+            ELLM_CHECK(mode == "disabled" || mode == "shadow" || mode == "active",
+                "TRT_EDGELLM_GLOBAL_SCHEDULER must be disabled, shadow, or active");
+            semanticSchedulerConfig.globalSchedulerMode = mode == "active" ? rt::PhaseGlobalSchedulerMode::kActive
+                : mode == "shadow"                                         ? rt::PhaseGlobalSchedulerMode::kShadow
+                                                                           : rt::PhaseGlobalSchedulerMode::kDisabled;
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_ROW_REPLACEMENT_COST_MS"))
         {
             semanticSchedulerConfig.decodeRowReplacementCostMs = std::stof(value);
@@ -1416,6 +1425,20 @@ int main(int argc, char** argv)
         {
             loadSchedulerCostModel(value, semanticSchedulerConfig);
         }
+        if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
+        {
+            semanticSchedulerConfig.globalMemoryHorizonSupplier
+                = [&ownership](rt::PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+                      rt::StableKVPageManager::Config const& ownershipConfig = ownership.config();
+                      rt::PhaseActionMemoryHorizon horizon;
+                      horizon.managedBytes = static_cast<size_t>(ownershipConfig.numPages - ownership.availablePages());
+                      horizon.budgetBytes = static_cast<size_t>(ownershipConfig.numPages);
+                      // Request admission and growth-owner leases reserve physical
+                      // pages before a phase becomes runnable, so dispatch itself
+                      // introduces no unreserved KV allocation here.
+                      return horizon;
+                  };
+        }
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
         if (std::getenv("TRT_EDGELLM_ENABLE_PERSISTENT_DECODE_SELECT") != nullptr)
@@ -1453,6 +1476,16 @@ int main(int argc, char** argv)
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
         serverConfig.releaseVisionPrefillStorage = std::getenv("TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE") != nullptr;
         serverConfig.maxPendingRequests = 1024;
+        serverConfig.enableGlobalWaitActions
+            = semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled;
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAMPLING_COLD_START_US"))
+        {
+            serverConfig.globalSamplingColdStartUs = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAMPLING_WINDOW"))
+        {
+            serverConfig.globalSamplingLatencyWindow = static_cast<size_t>(std::stoul(value));
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_REFILL_BATCH"))
         {
             serverConfig.decodeRefillBatchSize = static_cast<size_t>(std::stoul(value));
@@ -1819,6 +1852,7 @@ int main(int argc, char** argv)
                     });
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
+                threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
                 threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
                 {
@@ -2418,6 +2452,21 @@ int main(int argc, char** argv)
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
                         {"memory_drain_preference", rt::phaseDrainPreferenceName(metrics.drainPreference)},
                         {"memory_drain_preference_applied", metrics.drainPreferenceApplied},
+                        {"global_decision_evaluated", metrics.globalDecisionEvaluated},
+                        {"global_decision_applied", metrics.globalDecisionApplied},
+                        {"global_safe_probe", metrics.globalSafeProbe},
+                        {"global_action", rt::phaseGlobalActionKindName(metrics.globalSelectedAction.kind)},
+                        {"global_decision_reason", static_cast<int32_t>(metrics.globalDecisionReason)},
+                        {"global_predicted_violation_us", metrics.globalPredictedViolationUs},
+                        {"global_service_compression", metrics.globalServiceCompression},
+                        {"global_reference_work_ms", metrics.globalReferenceWorkMs},
+                        {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
+                        {"global_active_decisions",
+                            semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
+                        {"global_shadow_disagreements",
+                            semanticCoordinator.scheduler().telemetry().globalShadowDisagreementCount},
+                        {"global_wait_decisions", semanticCoordinator.scheduler().telemetry().globalWaitDecisionCount},
+                        {"global_wait_selected", semanticCoordinator.scheduler().telemetry().globalWaitSelectedCount},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
                         {"adaptive_admission_limit", semanticServer.adaptiveAdmissionLimit()},
@@ -2508,6 +2557,13 @@ int main(int argc, char** argv)
                         {"vision_encoder_preparation_max_ms", visionMetrics.maxEncoderPreparationUs / 1000.0},
                         {"vision_encoder_exclusive_batches", visionMetrics.exclusiveEncoderBatches},
                         {"vision_encoder_exclusive_prefill_deferrals", visionMetrics.exclusiveEncoderPrefillDeferrals},
+                        {"vision_global_decisions", visionMetrics.globalDecisions},
+                        {"vision_global_shadow_disagreements", visionMetrics.globalShadowDisagreements},
+                        {"vision_global_encoder_selections", visionMetrics.globalEncoderSelections},
+                        {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
+                        {"vision_global_pd_selections", visionMetrics.globalPdSelections},
+                        {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
+                        {"vision_global_action", rt::phaseGlobalActionKindName(visionMetrics.lastGlobalAction)},
                         {"phase_memory_broker_decisions", visionMetrics.memoryBrokerDecisions},
                         {"phase_memory_encoder_reductions", visionMetrics.memoryBrokerEncoderReductions},
                         {"phase_memory_backpressure", visionMetrics.memoryBrokerBackpressure},

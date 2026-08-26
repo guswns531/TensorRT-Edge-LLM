@@ -602,3 +602,14 @@ periods occurred per run, but their aggregate effect was below 1%. The guard is
 therefore an experimental seam, not a production default. The next protection
 must use per-dispatch overlap cost and decode deadline slack instead of a fixed
 wall-clock deferral.
+
+## Profile-free global phase actions
+
+The follow-on implementation replaces the active policy authority above the
+E/P/D mechanisms with a bounded, profile-free phase-action scheduler. It ranks
+serial work, E+D/P+D overlap, and concrete-event WAIT using request slack,
+online CUDA cost, and stable ownership-aware memory horizons. Legacy and shadow
+modes remain available for exact A/B gates. See
+[Global phase-action scheduler](global-phase-action-scheduler.md) for the
+architecture, invariants, implementation boundaries, and initial Cosmos/vLLM
+real-request results.

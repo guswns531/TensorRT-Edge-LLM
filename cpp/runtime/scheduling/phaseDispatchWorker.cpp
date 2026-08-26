@@ -251,6 +251,14 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.predictedDecodeDrainGpuMs = mInFlight.predictedDecodeDrainGpuMs;
     mCurrentMetrics.predictedDecodeDrainTurns = mInFlight.predictedDecodeDrainTurns;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
+    mCurrentMetrics.globalDecisionEvaluated = mInFlight.globalDecisionEvaluated;
+    mCurrentMetrics.globalDecisionApplied = mInFlight.globalDecisionApplied;
+    mCurrentMetrics.globalSafeProbe = mInFlight.globalSafeProbe;
+    mCurrentMetrics.globalSelectedAction = mInFlight.globalSelectedAction;
+    mCurrentMetrics.globalDecisionReason = mInFlight.globalDecisionReason;
+    mCurrentMetrics.globalPredictedViolationUs = mInFlight.globalPredictedViolationUs;
+    mCurrentMetrics.globalServiceCompression = mInFlight.globalServiceCompression;
+    mCurrentMetrics.globalReferenceWorkMs = mInFlight.globalReferenceWorkMs;
     mCurrentMetrics.decodeCohortSize = static_cast<int32_t>(mScheduler.decodeCohortSize());
     int64_t prefillPastKVSum{};
     mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();

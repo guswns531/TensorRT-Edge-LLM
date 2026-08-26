@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "runtime/scheduling/phaseGlobalScheduler.h"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -182,6 +184,14 @@ struct PhaseDispatchMetrics
     float pageGrowthTpotPressure{};
     PhaseDrainPreference drainPreference{PhaseDrainPreference::kNone};
     bool drainPreferenceApplied{};
+    bool globalDecisionEvaluated{};
+    bool globalDecisionApplied{};
+    bool globalSafeProbe{};
+    PhaseGlobalActionKey globalSelectedAction{};
+    PhaseGlobalDecisionReason globalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
+    double globalPredictedViolationUs{};
+    double globalServiceCompression{};
+    double globalReferenceWorkMs{};
 };
 
 struct PhaseSchedulerTelemetry
@@ -203,6 +213,17 @@ struct PhaseSchedulerTelemetry
     size_t drainPreferenceTransitions{};
     size_t drainPreferenceAppliedDispatches{};
     PhaseDrainPreference activeDrainPreference{PhaseDrainPreference::kNone};
+    size_t globalDecisionCount{};
+    size_t globalActiveDecisionCount{};
+    size_t globalShadowDisagreementCount{};
+    size_t globalNoFeasibleDecisionCount{};
+    size_t globalSafeProbeCount{};
+    size_t globalWaitDecisionCount{};
+    size_t globalWaitSelectedCount{};
+    PhaseGlobalActionKind lastGlobalSelectedAction{PhaseGlobalActionKind::kNone};
+    PhaseGlobalDecisionReason lastGlobalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
+    double lastGlobalPredictedViolationUs{};
+    double lastGlobalServiceCompression{};
     std::optional<PhaseDispatchMetrics> lastDispatch;
 };
 
@@ -316,6 +337,22 @@ struct PhaseQueueSchedulerConfig
     //! Production presets only select scheduler policy behavior. Model and
     //! engine shape limits remain explicit in the fields below.
     PhaseSchedulerProfile profile{PhaseSchedulerProfile::kCustom};
+    //! Profile-free P/D action selection. Shadow mode observes the same queue
+    //! state without changing legacy dispatch; active mode owns the decision.
+    PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
+    PhaseGlobalSchedulerConfig globalSchedulerConfig{};
+    PhaseGlobalCostModelConfig globalCostModelConfig{};
+    //! Conservative cold-start bounds used until direct CUDA observations exist.
+    float globalColdPrefillMsPerToken{0.02F};
+    float globalColdDecodeMs{2.0F};
+    //! Permit a rate-limited unknown P+D probe only with this multiple of
+    //! robust serial cost remaining as slack. Zero disables probes.
+    float globalSafeProbeSlackMultiplier{4.0F};
+    size_t globalSafeProbeInterval{32U};
+    //! Optional ownership-aware memory horizon in one caller-defined unit.
+    //! Every field returned by one invocation must use the same unit.
+    std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
+        globalMemoryHorizonSupplier{};
     int32_t maxPrefillBatchSize{1};
     int32_t maxDecodeBatchSize{4};
     //! Optional row cap for continuation chunks (tokenOffset > 0). Zero
@@ -534,6 +571,14 @@ struct PhaseDispatchPlan
     int32_t prefillCohortSize{};
     PhaseDrainPreference drainPreference{PhaseDrainPreference::kNone};
     bool drainPreferenceApplied{};
+    bool globalDecisionEvaluated{};
+    bool globalDecisionApplied{};
+    bool globalSafeProbe{};
+    PhaseGlobalActionKey globalSelectedAction{};
+    PhaseGlobalDecisionReason globalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
+    double globalPredictedViolationUs{};
+    double globalServiceCompression{};
+    double globalReferenceWorkMs{};
 };
 
 //! Host-side two-queue batch scheduler for phase-separated, dual-stream inference.
@@ -575,6 +620,22 @@ public:
     PhaseSchedulerTelemetry const& telemetry() const noexcept;
     //! Return a read-only scheduling snapshot for an upstream phase arbiter.
     PhaseQueueSnapshot queueSnapshot() const;
+    PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
+    //! Compare dispatch-now against a concrete sampling event followed by a
+    //! denser decode batch. Shadow mode records but does not apply WAIT.
+    bool shouldWaitForDecodeEvent(size_t pendingDecodeRows, int32_t futureMaxContextLength, double predictedWaitUs,
+        double waitUncertaintyUs, uint64_t eventId);
+    //! Preview the best current P/D action without removing queue entries.
+    std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    //! Preview decode only while an external encoder is already in flight.
+    std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    //! Consume one externally selected P/D action at the next dispatch boundary.
+    void setNextGlobalAction(PhaseGlobalActionCandidate candidate);
+    void setGlobalMemoryHorizonSupplier(
+        std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
+            supplier);
+    //! Largest dense decode cohort whose covered p95 GPU step fits one TPOT target.
+    size_t decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept;
     //! Keep online decode refinement out of latency mode while retaining learned samples.
     void setOnlineDecodeCostLearningActive(bool active) noexcept;
     //! Update a scheduler-external resource drain hint. Disabled schedulers retain legacy decisions.
@@ -592,6 +653,17 @@ public:
     void resetHistory();
 
 private:
+    struct GlobalQueueSelection
+    {
+        PhaseDispatchKind kind{PhaseDispatchKind::kNone};
+        PhaseGlobalActionCandidate candidate;
+        PhaseGlobalDecision decision;
+        bool safeProbe{};
+    };
+
+    std::optional<GlobalQueueSelection> selectGlobalQueueAction(PhaseQueueSnapshot const& snapshot,
+        bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true);
+    PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
@@ -625,6 +697,8 @@ private:
     void enqueueKnownDecode(PhaseWorkItem item);
 
     PhaseQueueSchedulerConfig mConfig;
+    PhaseGlobalScheduler mGlobalScheduler;
+    PhaseGlobalCostModel mGlobalCostModel;
     std::deque<PhaseWorkItem> mPrefillQueue;
     std::deque<PhaseWorkItem> mDecodeQueue;
     std::unordered_set<uint64_t> mActiveRequestIds;
@@ -649,6 +723,9 @@ private:
     bool mPrefillDispatchBlocked{};
     bool mDispatchBlocked{};
     bool mExternalEncoderActive{};
+    size_t mGlobalDecisionSequence{};
+    size_t mLastGlobalSafeProbeSequence{};
+    std::optional<PhaseGlobalActionCandidate> mNextGlobalAction;
 };
 
 } // namespace rt

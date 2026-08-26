@@ -60,12 +60,30 @@ struct PhaseVisionEncoderBatchChoice
     bool coverageMiss{};
 };
 
+//! Direct E+D overlap point used until enough online observations exist.
+struct PhaseEncoderDecodeBatchCost
+{
+    size_t encoderBatchSize{};
+    int32_t decodeBatchSize{};
+    size_t maxEncoderInputTokens{};
+    int32_t maxDecodeContextLength{};
+    float makespanP95GpuMs{};
+};
+
 //! Select the first encoder batch that minimizes the measured cost of draining the current FIFO candidates.
 PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
     std::vector<size_t> const& candidateInputTokens, std::vector<PhaseVisionEncoderBatchCost> const& costs);
 
 struct PhaseThreeCoordinatorConfig
 {
+    PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
+    PhaseGlobalSchedulerConfig globalSchedulerConfig{};
+    PhaseGlobalCostModelConfig globalCostModelConfig{};
+    double globalVisionPrefillColdStartUs{50000.0};
+    float globalSafeProbeSlackMultiplier{4.0F};
+    size_t globalSafeProbeInterval{32U};
+    int32_t globalDecodeContextBucketTokens{512};
+    std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
     //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
@@ -236,6 +254,13 @@ struct PhaseThreeCoordinatorMetrics
     size_t memoryDrainPreferenceAppliedDispatches{};
     size_t exclusiveEncoderBatches{};
     size_t exclusiveEncoderPrefillDeferrals{};
+    size_t globalDecisions{};
+    size_t globalShadowDisagreements{};
+    size_t globalEncoderSelections{};
+    size_t globalEncoderDecodeSelections{};
+    size_t globalPdSelections{};
+    size_t globalSafeProbes{};
+    PhaseGlobalActionKind lastGlobalAction{PhaseGlobalActionKind::kNone};
 };
 
 //! One completed vision encoder batch measured by CUDA events.
@@ -399,6 +424,8 @@ private:
     };
 
     bool startNextEncoder();
+    bool dispatchGlobalAction();
+    void completeGlobalOverlapObservation();
     bool completeEncoder();
     bool completeEncoderPreparation();
     bool dispatchReadyPrefill();
@@ -421,6 +448,8 @@ private:
     PhaseVisionAdapter& mVision;
     IndependentPhaseAsyncServer& mServer;
     PhaseThreeCoordinatorConfig mConfig;
+    PhaseGlobalScheduler mGlobalScheduler;
+    PhaseGlobalCostModel mGlobalCostModel;
     PhaseMemoryBroker mMemoryBroker;
     std::deque<PendingVisionRequest> mPending;
     std::vector<PendingVisionRequest> mEncoding;
@@ -431,6 +460,16 @@ private:
     std::multiset<double> mTpotTargets;
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
+    std::optional<std::vector<size_t>> mGlobalEncoderBatchIndices;
+    std::optional<PhaseGlobalActionKey> mInFlightGlobalEncoderKey;
+    double mInFlightGlobalEncoderReferenceMs{};
+    struct PendingGlobalOverlapObservation
+    {
+        PhaseGlobalActionKey key;
+        float referenceWorkMs{};
+        float encoderGpuMs{};
+    };
+    std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
     size_t mEstimatedEncodedBytes{};
@@ -509,6 +548,15 @@ private:
     size_t mMemoryBrokerLastPredictedBytes{};
     PhaseMemoryBrokerReason mMemoryBrokerLastReason{PhaseMemoryBrokerReason::kDisabled};
     std::chrono::steady_clock::time_point mLastForcedEncoderStart;
+    size_t mGlobalDecisions{};
+    size_t mGlobalShadowDisagreements{};
+    size_t mGlobalEncoderSelections{};
+    size_t mGlobalEncoderDecodeSelections{};
+    size_t mGlobalPdSelections{};
+    size_t mGlobalSafeProbes{};
+    PhaseGlobalActionKind mLastGlobalAction{PhaseGlobalActionKind::kNone};
+    size_t mGlobalDecisionSequence{};
+    size_t mLastGlobalSafeProbeSequence{};
 };
 
 } // namespace trt_edgellm::rt
