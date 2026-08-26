@@ -236,6 +236,27 @@ void loadSchedulerCostModel(std::filesystem::path const& path, rt::PhaseQueueSch
     config.profile = rt::PhaseSchedulerProfile::kThroughputBalanced;
 }
 
+void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoordinatorConfig& config)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open phase encoder cost model: " + path.string());
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(
+        root.contains("encoder") && root.at("encoder").is_array(), "Phase encoder cost model has no encoder table");
+    config.encoderBatchCosts.clear();
+    for (nlohmann::json const& point : root.at("encoder"))
+    {
+        size_t const batchSize = point.at("batch_size").get<size_t>();
+        if (batchSize <= config.maxEncoderBatchSize)
+        {
+            config.encoderBatchCosts.push_back(
+                {batchSize, point.at("max_input_tokens").get<size_t>(), point.at("p95_gpu_ms").get<float>()});
+        }
+    }
+    ELLM_CHECK(!config.encoderBatchCosts.empty(), "Phase encoder cost table cannot be empty");
+    config.enableCostAwareEncoderBatching = true;
+}
+
 struct PhaseTiming
 {
     float prefillMs{};
@@ -1869,6 +1890,16 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.memoryBroker.safetyReserveBytes = static_cast<size_t>(std::stoull(value));
                 }
+                char const* encoderCostPath = std::getenv("TRT_EDGELLM_VISION_ENCODER_COST_JSON");
+                if (encoderCostPath == nullptr)
+                {
+                    encoderCostPath = std::getenv("TRT_EDGELLM_SCHEDULER_COST_JSON");
+                }
+                if (encoderCostPath != nullptr
+                    && std::getenv("TRT_EDGELLM_DISABLE_COST_AWARE_ENCODER_BATCHING") == nullptr)
+                {
+                    loadEncoderCostModel(encoderCostPath, threePhaseConfig);
+                }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
             }
@@ -2259,6 +2290,10 @@ int main(int argc, char** argv)
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
                         {"vision_encoder_credit_wait_periods", visionMetrics.encoderCreditWaitPeriods},
                         {"vision_encoder_credit_age_releases", visionMetrics.encoderCreditAgeReleases},
+                        {"vision_encoder_cost_aware_selections", visionMetrics.encoderCostAwareSelections},
+                        {"vision_encoder_cost_coverage_misses", visionMetrics.encoderCostCoverageMisses},
+                        {"vision_encoder_predicted_drain_gpu_ms", visionMetrics.lastPredictedEncoderDrainGpuMs},
+                        {"vision_encoder_predicted_drain_turns", visionMetrics.lastPredictedEncoderDrainTurns},
                         {"vision_encoder_preparation_starts", visionMetrics.encoderPreparationStarts},
                         {"vision_encoder_preparation_completions", visionMetrics.encoderPreparationCompletions},
                         {"vision_encoder_preparation_ms", visionMetrics.lastEncoderPreparationUs / 1000.0},

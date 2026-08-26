@@ -2135,6 +2135,30 @@ TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)
     EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2048}}, 4, 0, 0, 4096), 2U);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, SelectsMeasuredEncoderDrainInsteadOfLargestBatch)
+{
+    std::vector<PhaseVisionEncoderBatchCost> const costs{
+        {1, 2048, 23.25F}, {2, 4096, 45.75F}, {4, 8192, 90.65F}, {8, 16384, 203.25F}};
+    PhaseVisionEncoderBatchChoice const choice = phaseVisionSelectEncoderBatch(std::vector<size_t>(8, 2048U), costs);
+    EXPECT_EQ(choice.batchSize, 4U);
+    EXPECT_NEAR(choice.predictedDrainGpuMs, 181.3F, 1.0e-3F);
+    EXPECT_EQ(choice.predictedDrainTurns, 2U);
+    EXPECT_FALSE(choice.coverageMiss);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, EncoderDrainSelectionUsesVisualTokenCoverage)
+{
+    std::vector<PhaseVisionEncoderBatchCost> const costs{
+        {1, 2048, 25.0F}, {1, 4096, 50.0F}, {2, 4096, 48.0F}, {4, 8192, 94.0F}};
+    PhaseVisionEncoderBatchChoice const covered = phaseVisionSelectEncoderBatch({2048, 2048}, costs);
+    EXPECT_EQ(covered.batchSize, 2U);
+    EXPECT_FLOAT_EQ(covered.predictedDrainGpuMs, 48.0F);
+
+    PhaseVisionEncoderBatchChoice const uncovered = phaseVisionSelectEncoderBatch({9000}, costs);
+    EXPECT_EQ(uncovered.batchSize, 1U);
+    EXPECT_TRUE(uncovered.coverageMiss);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, AccumulatesEncoderCreditsWithinBound)
 {
     EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 0.0, 0.0));

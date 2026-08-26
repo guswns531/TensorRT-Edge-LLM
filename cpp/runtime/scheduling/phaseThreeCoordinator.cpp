@@ -65,6 +65,75 @@ private:
 };
 } // namespace
 
+PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
+    std::vector<size_t> const& candidateInputTokens, std::vector<PhaseVisionEncoderBatchCost> const& costs)
+{
+    PhaseVisionEncoderBatchChoice result;
+    size_t const candidateCount = candidateInputTokens.size();
+    if (candidateCount == 0U)
+    {
+        return result;
+    }
+    if (costs.empty())
+    {
+        result.batchSize = candidateCount;
+        result.coverageMiss = true;
+        return result;
+    }
+
+    std::vector<size_t> prefixTokens(candidateCount + 1U);
+    for (size_t index = 0; index < candidateCount; ++index)
+    {
+        size_t const previous = prefixTokens[index];
+        size_t const tokens = candidateInputTokens[index];
+        prefixTokens[index + 1U] = tokens > std::numeric_limits<size_t>::max() - previous
+            ? std::numeric_limits<size_t>::max()
+            : previous + tokens;
+    }
+    std::vector<float> minimumCost(candidateCount + 1U, std::numeric_limits<float>::infinity());
+    std::vector<size_t> minimumTurns(candidateCount + 1U, std::numeric_limits<size_t>::max());
+    std::vector<size_t> firstBatch(candidateCount);
+    minimumCost[candidateCount] = 0.0F;
+    minimumTurns[candidateCount] = 0U;
+    for (size_t offset = candidateCount; offset-- > 0U;)
+    {
+        for (PhaseVisionEncoderBatchCost const& cost : costs)
+        {
+            if (cost.batchSize == 0U || offset + cost.batchSize > candidateCount)
+            {
+                continue;
+            }
+            size_t const next = offset + cost.batchSize;
+            size_t const inputTokens = prefixTokens[next] == std::numeric_limits<size_t>::max()
+                ? std::numeric_limits<size_t>::max()
+                : prefixTokens[next] - prefixTokens[offset];
+            if (cost.maxInputTokens < inputTokens || !std::isfinite(minimumCost[next]))
+            {
+                continue;
+            }
+            float const totalCost = cost.p95GpuMs + minimumCost[next];
+            size_t const turns = 1U + minimumTurns[next];
+            if (totalCost < minimumCost[offset]
+                || (totalCost == minimumCost[offset] && cost.batchSize > firstBatch[offset]))
+            {
+                minimumCost[offset] = totalCost;
+                minimumTurns[offset] = turns;
+                firstBatch[offset] = cost.batchSize;
+            }
+        }
+    }
+    if (!std::isfinite(minimumCost.front()) || firstBatch.front() == 0U)
+    {
+        result.batchSize = candidateCount;
+        result.coverageMiss = true;
+        return result;
+    }
+    result.batchSize = firstBatch.front();
+    result.predictedDrainGpuMs = minimumCost.front();
+    result.predictedDrainTurns = minimumTurns.front();
+    return result;
+}
+
 PhaseSchedulingHints phaseVisionSchedulingHints(
     PhaseSchedulingHints scheduling, double defaultTtftTargetUs, std::chrono::steady_clock::time_point now)
 {
@@ -348,6 +417,14 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(mConfig.encoderCreditTargetBatchSize == 0
             || mConfig.encoderCreditTargetBatchSize <= mConfig.maxEncoderBatchSize,
         "Three-phase encoder credit target cannot exceed the encoder batch size");
+    ELLM_CHECK(!mConfig.enableCostAwareEncoderBatching || !mConfig.encoderBatchCosts.empty(),
+        "Cost-aware encoder batching requires a cost table");
+    for (PhaseVisionEncoderBatchCost const& cost : mConfig.encoderBatchCosts)
+    {
+        ELLM_CHECK(cost.batchSize > 0U && cost.batchSize <= mConfig.maxEncoderBatchSize && cost.maxInputTokens > 0U
+                && std::isfinite(cost.p95GpuMs) && cost.p95GpuMs > 0.0F,
+            "Three-phase encoder cost point is invalid");
+    }
     ELLM_CHECK(std::isfinite(mConfig.prefillBatchWaitUs) && mConfig.prefillBatchWaitUs >= 0.0,
         "Three-phase prefill batch wait must be finite and non-negative");
     ELLM_CHECK(
@@ -558,6 +635,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
     result.encoderCreditWaitPeriods = mEncoderCreditWaitPeriods;
     result.encoderCreditAgeReleases = mEncoderCreditAgeReleases;
+    result.encoderCostAwareSelections = mEncoderCostAwareSelections;
+    result.encoderCostCoverageMisses = mEncoderCostCoverageMisses;
+    result.lastPredictedEncoderDrainGpuMs = mLastPredictedEncoderDrainGpuMs;
+    result.lastPredictedEncoderDrainTurns = mLastPredictedEncoderDrainTurns;
     result.encoderPreparationStarts = mEncoderPreparationStarts;
     result.encoderPreparationCompletions = mEncoderPreparationCompletions;
     result.lastEncoderPreparationUs = mLastEncoderPreparationUs;
@@ -1039,9 +1120,11 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
 
     bool const memoryAllowsCreditWait = memoryDecision.reason == PhaseMemoryBrokerReason::kDisabled
         || memoryDecision.reason == PhaseMemoryBrokerReason::kAllowed;
+    size_t const creditTargetBatchSize
+        = mConfig.encoderCreditTargetBatchSize == 0U ? potentialBatchSize : mConfig.encoderCreditTargetBatchSize;
     bool const waitForCredits = memoryAllowsCreditWait
-        && phaseVisionShouldAccumulateEncoderCredits(batchSize, potentialBatchSize,
-            mConfig.encoderCreditTargetBatchSize, oldestWaitUs, mConfig.encoderCreditWaitUs);
+        && phaseVisionShouldAccumulateEncoderCredits(
+            batchSize, potentialBatchSize, creditTargetBatchSize, oldestWaitUs, mConfig.encoderCreditWaitUs);
     if (waitForCredits)
     {
         if (!mEncoderCreditDeferred)
@@ -1051,13 +1134,37 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
         mEncoderCreditDeferred = true;
         return {};
     }
-    size_t const creditTargetBatchSize
-        = mConfig.encoderCreditTargetBatchSize == 0U ? potentialBatchSize : mConfig.encoderCreditTargetBatchSize;
     if (mEncoderCreditDeferred && creditTargetBatchSize > batchSize && oldestWaitUs >= mConfig.encoderCreditWaitUs)
     {
         ++mEncoderCreditAgeReleases;
     }
     mEncoderCreditDeferred = false;
+
+    if (mConfig.enableCostAwareEncoderBatching)
+    {
+        std::vector<size_t> candidateInputTokens;
+        candidateInputTokens.reserve(batchIndices.size());
+        for (size_t const index : batchIndices)
+        {
+            candidateInputTokens.push_back(inputs[index].inputTokens);
+        }
+        PhaseVisionEncoderBatchChoice const encoderChoice
+            = phaseVisionSelectEncoderBatch(candidateInputTokens, mConfig.encoderBatchCosts);
+        if (encoderChoice.coverageMiss)
+        {
+            ++mEncoderCostCoverageMisses;
+        }
+        else
+        {
+            ELLM_CHECK(encoderChoice.batchSize > 0U && encoderChoice.batchSize <= batchIndices.size(),
+                "Cost-aware encoder batch selection is outside the candidate range");
+            batchIndices.resize(encoderChoice.batchSize);
+            batchSize = batchIndices.size();
+            ++mEncoderCostAwareSelections;
+            mLastPredictedEncoderDrainGpuMs = encoderChoice.predictedDrainGpuMs;
+            mLastPredictedEncoderDrainTurns = encoderChoice.predictedDrainTurns;
+        }
+    }
 
     size_t mediaItems{};
     size_t inputBytes{};

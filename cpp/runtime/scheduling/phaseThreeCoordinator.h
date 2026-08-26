@@ -44,6 +44,26 @@ enum class PhaseThreeSubmissionStatus
     kDuplicateRequest,
 };
 
+//! Conservative vision encoder cost point measured with CUDA events.
+struct PhaseVisionEncoderBatchCost
+{
+    size_t batchSize{};
+    size_t maxInputTokens{};
+    float p95GpuMs{};
+};
+
+struct PhaseVisionEncoderBatchChoice
+{
+    size_t batchSize{};
+    float predictedDrainGpuMs{};
+    size_t predictedDrainTurns{};
+    bool coverageMiss{};
+};
+
+//! Select the first encoder batch that minimizes the measured cost of draining the current FIFO candidates.
+PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
+    std::vector<size_t> const& candidateInputTokens, std::vector<PhaseVisionEncoderBatchCost> const& costs);
+
 struct PhaseThreeCoordinatorConfig
 {
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
@@ -66,6 +86,9 @@ struct PhaseThreeCoordinatorConfig
     double encoderCreditWaitUs{};
     //! Desired encoder batch size while accumulating downstream credits. Zero uses the physical candidate size.
     size_t encoderCreditTargetBatchSize{};
+    //! Choose E2/E4/E8 from profiled batch/token costs instead of always using the largest physical batch.
+    bool enableCostAwareEncoderBatching{};
+    std::vector<PhaseVisionEncoderBatchCost> encoderBatchCosts;
     //! Coalesce only requests with identical media geometry, while retaining the oldest request as the FIFO anchor.
     bool enableHomogeneousEncoderBatching{};
     //! Skip non-fitting queued requests while retaining the oldest request as the FIFO anchor.
@@ -173,6 +196,10 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderAgeForcedStarts{};
     size_t encoderCreditWaitPeriods{};
     size_t encoderCreditAgeReleases{};
+    size_t encoderCostAwareSelections{};
+    size_t encoderCostCoverageMisses{};
+    float lastPredictedEncoderDrainGpuMs{};
+    size_t lastPredictedEncoderDrainTurns{};
     size_t encoderPreparationStarts{};
     size_t encoderPreparationCompletions{};
     double lastEncoderPreparationUs{};
@@ -413,6 +440,10 @@ private:
     size_t mEncoderAgeForcedStarts{};
     size_t mEncoderCreditWaitPeriods{};
     size_t mEncoderCreditAgeReleases{};
+    size_t mEncoderCostAwareSelections{};
+    size_t mEncoderCostCoverageMisses{};
+    float mLastPredictedEncoderDrainGpuMs{};
+    size_t mLastPredictedEncoderDrainTurns{};
     size_t mEncoderPreparationStarts{};
     size_t mEncoderPreparationCompletions{};
     double mLastEncoderPreparationUs{};
