@@ -347,6 +347,16 @@ size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throug
     return !decodeProtected && (throughputMode || visionLate) ? highCapacity : latencyCapacity;
 }
 
+bool phaseVisionEncoderSerializationDue(
+    double oldestVisionAgeUs, double visionTtftTargetUs, double deadlineRatio, double predictedEncoderCostUs) noexcept
+{
+    if (oldestVisionAgeUs < 0.0 || visionTtftTargetUs <= 0.0 || deadlineRatio <= 0.0 || predictedEncoderCostUs < 0.0)
+    {
+        return false;
+    }
+    return oldestVisionAgeUs + predictedEncoderCostUs >= visionTtftTargetUs * deadlineRatio;
+}
+
 PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
     double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
     double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
@@ -457,6 +467,11 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Three-phase encoder max defer must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.encoderDispatchForcedIntervalUs) && mConfig.encoderDispatchForcedIntervalUs >= 0.0,
         "Three-phase encoder forced interval must be finite and non-negative");
+    ELLM_CHECK(
+        std::isfinite(mConfig.encoderSerializationDeadlineRatio) && mConfig.encoderSerializationDeadlineRatio > 0.0,
+        "Three-phase encoder serialization deadline ratio must be finite and positive");
+    ELLM_CHECK(
+        mConfig.encoderSerializationMaxBurst > 0, "Three-phase encoder serialization burst size must be positive");
     ELLM_CHECK(mVision.cudaContext() == mServer.cudaContext(),
         "Encoder and LLM phase server must share one CUDA primary context");
 }
@@ -557,6 +572,11 @@ bool PhaseThreeCoordinator::poll()
         mServer.setExternalDrainPreference(PhaseDrainPreference::kNone);
     }
     bool progressed = completeEncoder();
+    refreshEncoderSerializationGate();
+    if (mEncoderSerializationGate && !mServer.arbitrationSnapshot().busy)
+    {
+        progressed = startNextEncoder() || progressed;
+    }
     if (!mConfig.enableEncoderDispatchArbitration)
     {
         progressed = startNextEncoder() || progressed;
@@ -568,6 +588,11 @@ bool PhaseThreeCoordinator::poll()
     mServer.setExternalPendingRequests(
         upstreamRequests + mReadyPrefill.size(), minTpotTargetUs, mRequestIds.size(), mAdmissionProfilePrefillTokens);
     progressed = mServer.poll() || progressed;
+    if (mEncoderSerializationYieldPending)
+    {
+        mEncoderSerializationYieldPending = false;
+    }
+    refreshEncoderSerializationGate();
     if (mConfig.enableEncoderDispatchArbitration)
     {
         progressed = startNextEncoder() || progressed;
@@ -633,6 +658,9 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderPrefillGuardDeferrals = mEncoderPrefillGuardDeferrals;
     result.encoderDecodeGuardDeferrals = mEncoderDecodeGuardDeferrals;
     result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
+    result.encoderSerializedStarts = mEncoderSerializedStarts;
+    result.encoderSerializationBursts = mEncoderSerializationBursts;
+    result.encoderSerializationBoundaryWaits = mEncoderSerializationBoundaryWaits;
     result.encoderCreditWaitPeriods = mEncoderCreditWaitPeriods;
     result.encoderCreditAgeReleases = mEncoderCreditAgeReleases;
     result.encoderCostAwareSelections = mEncoderCostAwareSelections;
@@ -705,7 +733,14 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         return false;
     }
-    PhaseVisionEncoderDispatchDecision const dispatchDecision = nextEncoderDispatchDecision();
+    PhaseVisionEncoderDispatchDecision const dispatchDecision = mEncoderSerializationGate
+        ? PhaseVisionEncoderDispatchDecision{true, PhaseVisionEncoderDispatchReason::kAllowed}
+        : nextEncoderDispatchDecision();
+    if (mEncoderSerializationGate && mServer.arbitrationSnapshot().busy)
+    {
+        ++mEncoderSerializationBoundaryWaits;
+        return false;
+    }
     if (!dispatchDecision.allowed)
     {
         ++mEncoderDispatchDeferrals;
@@ -771,6 +806,16 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         mLastForcedEncoderStart = now;
         ++mEncoderAgeForcedStarts;
+    }
+    if (mEncoderSerializationGate)
+    {
+        if (mEncoderSerializationBurstSize == 0)
+        {
+            ++mEncoderSerializationBursts;
+        }
+        ++mEncoderSerializationBurstSize;
+        ++mEncoderSerializedStarts;
+        mSerializedEncoderInFlight = true;
     }
     for (size_t selectedIndex = 0; selectedIndex < batchSize; ++selectedIndex)
     {
@@ -941,6 +986,17 @@ bool PhaseThreeCoordinator::completeEncoder()
             {mEncoderBatches, batchSize, mLastEncoderInputBytes, mLastEncoderInputTokens, mLastEncoderGpuMs});
     }
     mEncoding.clear();
+    if (mSerializedEncoderInFlight)
+    {
+        mSerializedEncoderInFlight = false;
+        if (mEncoderSerializationBurstSize >= mConfig.encoderSerializationMaxBurst)
+        {
+            mEncoderSerializationGate = false;
+            mServer.setDispatchBlocked(false);
+            mEncoderSerializationBurstSize = 0;
+            mEncoderSerializationYieldPending = true;
+        }
+    }
     return true;
 }
 
@@ -1272,6 +1328,48 @@ PhaseVisionEncoderDispatchDecision PhaseThreeCoordinator::nextEncoderDispatchDec
         snapshot.oldestTextWithoutTokenAgeUs, predictedEncoderCostUs, mConfig.encoderDispatchTextGuardAgeUs,
         mServer.decodeAdmissionTpotPressure(), mConfig.encoderDispatchDecodeTpotPressureLimit, textPrefillInFlight,
         decodeInFlight, snapshot.prefillMinTtftSlackUs, prefillInFlight);
+}
+
+bool PhaseThreeCoordinator::encoderSerializationDue() const noexcept
+{
+    if (!mConfig.enableDeadlineAwareEncoderSerialization || mPending.empty() || !encoderCapacityAvailable())
+    {
+        return false;
+    }
+    PendingVisionRequest const& oldest = mPending.front();
+    auto const now = std::chrono::steady_clock::now();
+    double const oldestVisionAgeUs
+        = std::chrono::duration<double, std::micro>(now - oldest.scheduling.submittedAt).count();
+    double const targetUs
+        = oldest.scheduling.ttftTargetUs > 0.0 ? oldest.scheduling.ttftTargetUs : mConfig.visionTtftTargetUs;
+    double const predictedEncoderCostUs
+        = std::max(mConfig.encoderDispatchInitialCostUs, static_cast<double>(mLastEncoderGpuMs) * 1000.0)
+        + mConfig.encoderDispatchCostSafetyMarginUs;
+    return phaseVisionEncoderSerializationDue(
+        oldestVisionAgeUs, targetUs, mConfig.encoderSerializationDeadlineRatio, predictedEncoderCostUs);
+}
+
+void PhaseThreeCoordinator::refreshEncoderSerializationGate() noexcept
+{
+    if (!mConfig.enableDeadlineAwareEncoderSerialization)
+    {
+        return;
+    }
+    if (mSerializedEncoderInFlight || mEncoderSerializationYieldPending)
+    {
+        return;
+    }
+    bool const shouldBlock = encoderSerializationDue();
+    if (shouldBlock == mEncoderSerializationGate)
+    {
+        return;
+    }
+    mEncoderSerializationGate = shouldBlock;
+    if (!shouldBlock)
+    {
+        mEncoderSerializationBurstSize = 0;
+    }
+    mServer.setDispatchBlocked(shouldBlock);
 }
 
 size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept

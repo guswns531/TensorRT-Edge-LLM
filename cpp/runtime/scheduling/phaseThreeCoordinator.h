@@ -139,6 +139,12 @@ struct PhaseThreeCoordinatorConfig
     double encoderDispatchMaxDeferUs{500000.0};
     //! Minimum spacing between age-forced encoder batches. Zero drains the overdue FIFO.
     double encoderDispatchForcedIntervalUs{};
+    //! Serialize deadline-risked encoder work at a completed P/D boundary instead of contending with it.
+    bool enableDeadlineAwareEncoderSerialization{};
+    //! Start serialized service when predicted encoder completion crosses this TTFT fraction.
+    double encoderSerializationDeadlineRatio{1.0};
+    //! Maximum consecutive serialized encoder batches before yielding one P/D dispatch.
+    size_t encoderSerializationMaxBurst{2U};
     //! Opt-in memory-aware encoder admission coupled to the E/P/D scheduler.
     PhaseMemoryBrokerConfig memoryBroker;
     //! Above this raw encoder input-token count, the encoder exclusively owns the shared E/P arena.
@@ -194,6 +200,9 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderPrefillGuardDeferrals{};
     size_t encoderDecodeGuardDeferrals{};
     size_t encoderAgeForcedStarts{};
+    size_t encoderSerializedStarts{};
+    size_t encoderSerializationBursts{};
+    size_t encoderSerializationBoundaryWaits{};
     size_t encoderCreditWaitPeriods{};
     size_t encoderCreditAgeReleases{};
     size_t encoderCostAwareSelections{};
@@ -256,6 +265,10 @@ PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabl
 size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
     double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio, float decodeTpotPressure,
     float decodeTpotPressureLimit) noexcept;
+
+//! Return true when the oldest vision request cannot meet its TTFT fraction after one predicted encoder batch.
+bool phaseVisionEncoderSerializationDue(
+    double oldestVisionAgeUs, double visionTtftTargetUs, double deadlineRatio, double predictedEncoderCostUs) noexcept;
 
 //! Normalize image scheduling at HTTP arrival so encoder time remains part of TTFT age.
 PhaseSchedulingHints phaseVisionSchedulingHints(PhaseSchedulingHints scheduling, double defaultTtftTargetUs,
@@ -376,6 +389,8 @@ private:
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
     PhaseVisionEncoderDispatchDecision nextEncoderDispatchDecision() const noexcept;
+    bool encoderSerializationDue() const noexcept;
+    void refreshEncoderSerializationGate() noexcept;
     void eraseTpotTarget(uint64_t requestId);
     void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,
         uint64_t timestampNs = 0U) const;
@@ -438,6 +453,9 @@ private:
     size_t mEncoderPrefillGuardDeferrals{};
     size_t mEncoderDecodeGuardDeferrals{};
     size_t mEncoderAgeForcedStarts{};
+    size_t mEncoderSerializedStarts{};
+    size_t mEncoderSerializationBursts{};
+    size_t mEncoderSerializationBoundaryWaits{};
     size_t mEncoderCreditWaitPeriods{};
     size_t mEncoderCreditAgeReleases{};
     size_t mEncoderCostAwareSelections{};
@@ -452,6 +470,10 @@ private:
     size_t mExclusiveEncoderBatches{};
     size_t mExclusiveEncoderPrefillDeferrals{};
     bool mExclusiveEncoderInFlight{};
+    bool mEncoderSerializationGate{};
+    bool mSerializedEncoderInFlight{};
+    bool mEncoderSerializationYieldPending{};
+    size_t mEncoderSerializationBurstSize{};
     bool mEncoderCreditDeferred{};
     size_t mMemoryBrokerDecisions{};
     size_t mMemoryBrokerEncoderReductions{};

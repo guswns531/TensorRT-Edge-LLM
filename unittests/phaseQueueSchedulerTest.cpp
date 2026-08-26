@@ -76,6 +76,21 @@ TEST(PhaseQueueSchedulerTest, ExternalArenaBlockExcludesOnlyPrefill)
     EXPECT_EQ(prefill.prefillBatch.front().requestId, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, ExternalDeadlineBlockWaitsAtDispatchBoundary)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    scheduler.setDispatchBlocked(true);
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 1U);
+
+    scheduler.setDispatchBlocked(false);
+    EXPECT_NE(scheduler.next().kind, PhaseDispatchKind::kNone);
+}
+
 TEST(PhaseQueueSchedulerTest, DecodeReplacementCostPreservesWarmRowsWhenBatchGrowthIsTransientlyExpensive)
 {
     rt::PhaseQueueSchedulerConfig config;
@@ -2286,6 +2301,15 @@ TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGu
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, true, 0.0, 2500000.0, 0.4, 0.2F, 0.8F), 4);
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, true, 2000000.0, 2500000.0, 0.4, 0.8F, 0.8F), 2);
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 0, true, 2000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, SerializesEncoderWhenPredictedCompletionCrossesVisionDeadline)
+{
+    EXPECT_FALSE(phaseVisionEncoderSerializationDue(100000.0, 500000.0, 1.0, 50000.0));
+    EXPECT_TRUE(phaseVisionEncoderSerializationDue(450000.0, 500000.0, 1.0, 50000.0));
+    EXPECT_TRUE(phaseVisionEncoderSerializationDue(350000.0, 500000.0, 0.8, 50000.0));
+    EXPECT_FALSE(phaseVisionEncoderSerializationDue(500000.0, 0.0, 1.0, 50000.0));
+    EXPECT_FALSE(phaseVisionEncoderSerializationDue(500000.0, 500000.0, 0.0, 50000.0));
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, ArbitratesEncoderByTextDecodeDebtAndBoundedStarvation)

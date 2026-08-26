@@ -449,13 +449,18 @@ PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot() const
 
 bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
 {
-    return !(prefill && mPrefillDispatchBlocked)
+    return !mDispatchBlocked && !(prefill && mPrefillDispatchBlocked)
         && (!mConfig.eligibilityPolicy || mConfig.eligibilityPolicy(item, prefill));
 }
 
 void PhaseQueueScheduler::setPrefillDispatchBlocked(bool blocked) noexcept
 {
     mPrefillDispatchBlocked = blocked;
+}
+
+void PhaseQueueScheduler::setDispatchBlocked(bool blocked) noexcept
+{
+    mDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setExternalEncoderActive(bool active) noexcept

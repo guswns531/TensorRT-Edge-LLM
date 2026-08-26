@@ -889,6 +889,11 @@ void IndependentPhaseAsyncServer::setPrefillDispatchBlocked(bool blocked) noexce
     mCoordinator.scheduler().setPrefillDispatchBlocked(blocked);
 }
 
+void IndependentPhaseAsyncServer::setDispatchBlocked(bool blocked) noexcept
+{
+    mCoordinator.scheduler().setDispatchBlocked(blocked);
+}
+
 void IndependentPhaseAsyncServer::setExternalEncoderActive(bool active) noexcept
 {
     mCoordinator.scheduler().setExternalEncoderActive(active);

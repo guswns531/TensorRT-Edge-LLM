@@ -1864,6 +1864,16 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.encoderDispatchForcedIntervalUs = std::stod(value);
                 }
+                threePhaseConfig.enableDeadlineAwareEncoderSerialization
+                    = std::getenv("TRT_EDGELLM_VISION_ENCODER_DEADLINE_SERIALIZATION") != nullptr;
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_DEADLINE_RATIO"))
+                {
+                    threePhaseConfig.encoderSerializationDeadlineRatio = std::stod(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_SERIALIZED_BURST"))
+                {
+                    threePhaseConfig.encoderSerializationMaxBurst = static_cast<size_t>(std::stoul(value));
+                }
                 threePhaseConfig.memoryBroker.enabled = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr;
                 threePhaseConfig.memoryBroker.committedKVPages = config.kvPoolPages;
                 constexpr size_t kTOKENS_PER_KV_PAGE = 128U;
@@ -2288,6 +2298,10 @@ int main(int argc, char** argv)
                         {"vision_encoder_prefill_guard_deferrals", visionMetrics.encoderPrefillGuardDeferrals},
                         {"vision_encoder_decode_guard_deferrals", visionMetrics.encoderDecodeGuardDeferrals},
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
+                        {"vision_encoder_serialized_starts", visionMetrics.encoderSerializedStarts},
+                        {"vision_encoder_serialization_bursts", visionMetrics.encoderSerializationBursts},
+                        {"vision_encoder_serialization_boundary_waits",
+                            visionMetrics.encoderSerializationBoundaryWaits},
                         {"vision_encoder_credit_wait_periods", visionMetrics.encoderCreditWaitPeriods},
                         {"vision_encoder_credit_age_releases", visionMetrics.encoderCreditAgeReleases},
                         {"vision_encoder_cost_aware_selections", visionMetrics.encoderCostAwareSelections},

@@ -308,6 +308,8 @@ public:
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Exclude or restore prefill dispatch while an external phase owns overlapping workspace.
     void setPrefillDispatchBlocked(bool blocked) noexcept;
+    //! Exclude or restore every new prefill/decode dispatch while an external phase owns the GPU boundary.
+    void setDispatchBlocked(bool blocked) noexcept;
     //! Identify active external encoder execution for contention-aware decode cost learning.
     void setExternalEncoderActive(bool active) noexcept;
     PhaseDrainPreference activeDrainPreference() const noexcept;
