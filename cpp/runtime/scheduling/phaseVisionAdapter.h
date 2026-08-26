@@ -71,6 +71,8 @@ struct PhaseMropeStagingRange
 //! Compute the newly required M-RoPE prefix, rounded to a bounded copy granularity.
 PhaseMropeStagingRange phaseMropeStagingRange(
     bool ownerChanged, int32_t validPositions, int32_t requiredPositions, int32_t capacity, int32_t granularity);
+//! Whether the model's positional encoding supports a text-only KV prefix followed by a deferred vision suffix.
+bool phaseVisionSupportsPrefixBeforeVision(RopeType ropeType) noexcept;
 
 //! Request-owned encoder output retained until the corresponding prefill completes.
 struct PhaseVisionPayload

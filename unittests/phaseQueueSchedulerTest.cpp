@@ -2385,6 +2385,12 @@ TEST(PhaseThreeCoordinatorPolicyTest, StagesOnlyNewMropePrefix)
     EXPECT_EQ(range.validPositions, 2048);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, RejectsPrefixBeforeVisionForMrope)
+{
+    EXPECT_TRUE(phaseVisionSupportsPrefixBeforeVision(RopeType::kDefault));
+    EXPECT_FALSE(phaseVisionSupportsPrefixBeforeVision(RopeType::kMRope));
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, RetainsLegacyVisionSlabForMrope)
 {
     std::byte storage{};

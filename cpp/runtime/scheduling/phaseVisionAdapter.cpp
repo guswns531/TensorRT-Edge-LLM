@@ -190,6 +190,14 @@ PhaseMropeStagingRange phaseMropeStagingRange(
     return {copyOffset, copyEnd - copyOffset, copyEnd};
 }
 
+bool phaseVisionSupportsPrefixBeforeVision(RopeType ropeType) noexcept
+{
+    // M-RoPE coordinates are produced from the fully expanded multimodal prompt.
+    // Reusing KV written with the text-only position cache for a later vision
+    // suffix is not yet a valid runtime contract.
+    return ropeType != RopeType::kMRope;
+}
+
 PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
     LLMEngineConfig const& config, cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy)
     : mRunner(runner)
@@ -584,6 +592,10 @@ size_t PhaseVisionAdapter::estimatePayloadBytes(LLMGenerationRequest const& requ
 
 std::optional<PhaseVisionPrefixPlan> PhaseVisionAdapter::makePrefixPlan(LLMGenerationRequest const& request)
 {
+    if (!phaseVisionSupportsPrefixBeforeVision(mConfig.ropeConfig.type))
+    {
+        return std::nullopt;
+    }
     if (request.requests.size() != 1U)
     {
         return std::nullopt;
