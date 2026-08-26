@@ -734,10 +734,12 @@ bool PhaseThreeCoordinator::startNextEncoder()
         else
         {
             ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
+            mServer.setExternalEncoderActive(true);
         }
     }
     catch (...)
     {
+        mServer.setExternalEncoderActive(false);
         if (mExclusiveEncoderInFlight)
         {
             mServer.setPrefillDispatchBlocked(false);
@@ -779,9 +781,11 @@ bool PhaseThreeCoordinator::completeEncoderPreparation()
         mMaxEncoderPreparationUs = std::max(mMaxEncoderPreparationUs, mLastEncoderPreparationUs);
         ++mEncoderPreparationCompletions;
         ELLM_CHECK(mVision.submitPrepared(std::move(prepared)), "Failed to submit prepared encoder batch");
+        mServer.setExternalEncoderActive(true);
     }
     catch (...)
     {
+        mServer.setExternalEncoderActive(false);
         if (mExclusiveEncoderInFlight)
         {
             mServer.setPrefillDispatchBlocked(false);
@@ -808,6 +812,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     {
         return false;
     }
+    mServer.setExternalEncoderActive(false);
     if (mExclusiveEncoderInFlight)
     {
         // ready() is driven by the encoder CUDA completion event, so the

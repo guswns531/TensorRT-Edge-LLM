@@ -875,6 +875,64 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodePricesTheRemainderAfterOnlineCostLear
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 8U);
 }
 
+TEST(PhaseQueueSchedulerTest, DynamicDecodePricesEveryTurnNeededToServiceRunnableRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 12;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0;
+    config.decodeBatchCosts = {{1, 512, 2.0F}, {4, 512, 4.0F}, {5, 512, 5.0F}, {12, 512, 15.0F}};
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 12; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 4U);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeDrainGpuMs, 12.0F);
+    EXPECT_EQ(plan.predictedDecodeDrainTurns, 3);
+}
+
+TEST(PhaseQueueSchedulerTest, OnlineDecodeLearningSeparatesEncoderContention)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    config.enableDynamicDecodeBatching = true;
+    config.enableOnlineDecodeCostLearning = true;
+    config.onlineDecodeCostMinSamples = 2;
+    config.onlineDecodeCostWindow = 4;
+    config.decodeQueueWaitTargetUs = 1.0;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}};
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kDecode;
+    sample.decodeBatchSize = 2;
+    sample.decodeContextTokens = 512;
+    sample.plannedDecodeMaxContextLength = 256;
+    sample.decodeGpuMs = 5.0F;
+    sample.externalEncoderActive = true;
+
+    PhaseQueueScheduler isolated(config);
+    isolated.observeMetrics(sample);
+    isolated.observeMetrics(sample);
+    isolated.enqueueDecode({1, 256});
+    isolated.enqueueDecode({2, 256});
+    PhaseDispatchPlan const isolatedPlan = isolated.next();
+    EXPECT_EQ(isolatedPlan.decodeBatch.size(), 2U);
+    EXPECT_FALSE(isolatedPlan.externalEncoderActive);
+
+    PhaseQueueScheduler contended(config);
+    contended.observeMetrics(sample);
+    contended.observeMetrics(sample);
+    contended.setExternalEncoderActive(true);
+    contended.enqueueDecode({1, 256});
+    contended.enqueueDecode({2, 256});
+    PhaseDispatchPlan const contendedPlan = contended.next();
+    EXPECT_EQ(contendedPlan.decodeBatch.size(), 1U);
+    EXPECT_TRUE(contendedPlan.externalEncoderActive);
+    EXPECT_EQ(contended.telemetry().encoderContendedDecodeCostSampleCount, 2U);
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicDecodeDoesNotShrinkFromSparseContextCoverage)
 {
     PhaseQueueSchedulerConfig config;

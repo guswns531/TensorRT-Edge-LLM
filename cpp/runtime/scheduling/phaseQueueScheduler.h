@@ -165,6 +165,13 @@ struct PhaseDispatchMetrics
     float decodeGpuMs{};
     float makespanGpuMs{};
     float overlapRatio{};
+    //! External vision encoder state captured when this dispatch was selected.
+    bool externalEncoderActive{};
+    //! True when the decode cost was observed concurrently with prefill.
+    bool concurrentPrefillActive{};
+    //! Predicted cost and number of turns required to service the runnable decode rows.
+    float predictedDecodeDrainGpuMs{};
+    int32_t predictedDecodeDrainTurns{};
     //! Host page-pool snapshot after the dispatch completion; zero for linear caches.
     int32_t pagePoolTotalBundles{};
     int32_t pagePoolAllocatedBundles{};
@@ -184,6 +191,8 @@ struct PhaseSchedulerTelemetry
     size_t decodeTpotSampleCount{};
     size_t onlineDecodeCostSampleCount{};
     size_t onlineDecodeCostBucketCount{};
+    size_t encoderContendedDecodeCostSampleCount{};
+    size_t prefillContendedDecodeCostSampleCount{};
     float prefillGpuMsPerToken{};
     float decodeGpuMsPerContextToken{};
     float overlapRatio{};
@@ -358,6 +367,9 @@ struct PhaseQueueSchedulerConfig
     int32_t onlineDecodeContextBucketTokens{512};
     //! Bound an online p95 correction relative to its static prior.
     float onlineDecodeCostMaxAdjustmentRatio{0.25F};
+    //! Contended observations may be much slower than an isolated static prior.
+    //! This multiplier bounds their upper correction without polluting isolated buckets.
+    float onlineDecodeContentionCostMaxMultiplier{16.0F};
     //! Switch from deadline fitting to throughput-efficient backlog recovery
     //! before the TPOT deadline is fully exhausted.
     float decodeRecoveryPressureThreshold{1.0F};
@@ -498,6 +510,10 @@ struct PhaseDispatchPlan
     int64_t plannedDecodeContextTokens{};
     int32_t plannedDecodeMaxContextLength{};
     int32_t predictedDecodeReplacementRows{};
+    bool externalEncoderActive{};
+    bool concurrentPrefillActive{};
+    float predictedDecodeDrainGpuMs{};
+    int32_t predictedDecodeDrainTurns{};
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
@@ -561,6 +577,8 @@ public:
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Temporarily exclude prefill dispatch while an external encoder owns overlapping context memory.
     void setPrefillDispatchBlocked(bool blocked) noexcept;
+    //! Identify external vision-encoder contention for decode cost learning and selection.
+    void setExternalEncoderActive(bool active) noexcept;
     //! Reset learned scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
@@ -574,9 +592,12 @@ private:
     void refreshExternalDrainPreference() noexcept;
     PhaseDispatchKind applyExternalDrainPreference(
         PhaseQueueSnapshot const& snapshot, PhaseDispatchKind baseline, bool& applied) const noexcept;
-    int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot) const;
-    uint64_t onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept;
-    std::optional<float> onlineDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
+    int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot, bool concurrentPrefill,
+        float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const;
+    uint64_t onlineDecodeCostKey(
+        int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const noexcept;
+    std::optional<float> onlineDecodeP95(
+        int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const;
     std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const;
     std::vector<PhaseWorkItem const*> decodeCandidateRows(int32_t maxRows) const;
     int32_t decodeCandidateReplacementRows(int32_t maxRows) const;
@@ -620,6 +641,7 @@ private:
     size_t mDrainPreferenceDispatches{};
     size_t mConsecutiveDrainPreferenceDispatches{};
     bool mPrefillDispatchBlocked{};
+    bool mExternalEncoderActive{};
 };
 
 } // namespace rt

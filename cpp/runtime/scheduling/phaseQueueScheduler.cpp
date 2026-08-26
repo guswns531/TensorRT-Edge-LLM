@@ -177,6 +177,9 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(std::isfinite(mConfig.onlineDecodeCostMaxAdjustmentRatio)
             && mConfig.onlineDecodeCostMaxAdjustmentRatio >= 0.0F && mConfig.onlineDecodeCostMaxAdjustmentRatio < 1.0F,
         "Online decode cost adjustment ratio must be finite and in [0, 1)");
+    check::check(std::isfinite(mConfig.onlineDecodeContentionCostMaxMultiplier)
+            && mConfig.onlineDecodeContentionCostMaxMultiplier >= 1.0F,
+        "Online contended decode cost multiplier must be finite and at least one");
     check::check(std::isfinite(mConfig.maxPredictedDecodeDebtUs) && mConfig.maxPredictedDecodeDebtUs >= 0.0,
         "Maximum predicted decode debt must be finite and non-negative");
     check::check(mConfig.autoLongPrefillBacklogTokens > 0, "Auto-profile prefill backlog threshold must be positive");
@@ -453,6 +456,11 @@ bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) co
 void PhaseQueueScheduler::setPrefillDispatchBlocked(bool blocked) noexcept
 {
     mPrefillDispatchBlocked = blocked;
+}
+
+void PhaseQueueScheduler::setExternalEncoderActive(bool active) noexcept
+{
+    mExternalEncoderActive = active;
 }
 
 PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const& state) const noexcept
@@ -1367,8 +1375,12 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.latencySafeFallback = mLatencySafeFallback;
     plan.overlapEvaluatedByCost = kind == PhaseDispatchKind::kOverlap && mConfig.enableCostAwareOverlapAdmission
         && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
-    plan.plannedDecodeBatchSize
-        = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap ? selectDecodeBatchSize(state) : 0;
+    plan.externalEncoderActive = mExternalEncoderActive;
+    plan.concurrentPrefillActive = kind == PhaseDispatchKind::kOverlap;
+    plan.plannedDecodeBatchSize = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap
+        ? selectDecodeBatchSize(
+              state, plan.concurrentPrefillActive, plan.predictedDecodeDrainGpuMs, plan.predictedDecodeDrainTurns)
+        : 0;
     if (plan.plannedDecodeBatchSize > 0)
     {
         std::tie(plan.plannedDecodeContextTokens, plan.plannedDecodeMaxContextLength)
@@ -1386,6 +1398,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     if (kind == PhaseDispatchKind::kOverlap && plan.prefillDeferredForTpot)
     {
         plan.kind = PhaseDispatchKind::kDecode;
+        plan.concurrentPrefillActive = false;
     }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
@@ -1565,11 +1578,13 @@ int32_t PhaseQueueScheduler::decodeCandidateReplacementRows(int32_t maxRows) con
     return static_cast<int32_t>(phaseDecodeReplacementRows(selected, mPreviousDecodeSelectionIds));
 }
 
-int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state) const
+int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state, bool concurrentPrefill,
+    float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const
 {
     int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued));
     if (available <= 1 || !mConfig.enableDynamicDecodeBatching || mConfig.decodeBatchCosts.empty())
     {
+        predictedDrainTurns = available > 0 ? 1 : 0;
         return available;
     }
 
@@ -1636,6 +1651,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     }
     if (candidates.empty())
     {
+        predictedDrainTurns = available > 0 ? 1 : 0;
         return available;
     }
     bool const largestShapeCovered
@@ -1647,6 +1663,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         // A smaller batch measured at this context is not evidence that a
         // larger runnable batch is unsafe. Preserve legacy largest-available
         // behavior instead of creating a low-BS backlog from sparse profiles.
+        predictedDrainTurns = available > 0 ? 1 : 0;
         return available;
     }
 
@@ -1678,14 +1695,17 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     {
         for (Candidate& candidate : candidates)
         {
-            std::optional<float> const observed
-                = onlineDecodeP95(candidate.batchSize, maxContextLengths[static_cast<size_t>(candidate.batchSize)]);
+            std::optional<float> const observed = onlineDecodeP95(candidate.batchSize,
+                maxContextLengths[static_cast<size_t>(candidate.batchSize)], mExternalEncoderActive, concurrentPrefill);
             if (!observed.has_value())
             {
                 continue;
             }
             float const lower = candidate.p95GpuMs * (1.0F - mConfig.onlineDecodeCostMaxAdjustmentRatio);
-            float const upper = candidate.p95GpuMs * (1.0F + mConfig.onlineDecodeCostMaxAdjustmentRatio);
+            bool const contended = mExternalEncoderActive || concurrentPrefill;
+            float const upper = candidate.p95GpuMs
+                * (contended ? mConfig.onlineDecodeContentionCostMaxMultiplier
+                             : 1.0F + mConfig.onlineDecodeCostMaxAdjustmentRatio);
             candidate.p95GpuMs = std::clamp(*observed, lower, upper);
         }
     }
@@ -1699,29 +1719,38 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         }
     }
 
-    float const minimumCandidateCostMs
-        = std::min_element(candidates.begin(), candidates.end(), [](Candidate const& lhs, Candidate const& rhs) {
-              return lhs.p95GpuMs < rhs.p95GpuMs;
-          })->p95GpuMs;
-    auto estimatedDrainCostMs = [&](Candidate const& candidate) {
-        int32_t const remainingRows = available - candidate.batchSize;
-        if (remainingRows <= 0)
+    std::vector<float> minimumTailCostMs(static_cast<size_t>(available) + 1U, std::numeric_limits<float>::infinity());
+    std::vector<int32_t> minimumTailTurns(static_cast<size_t>(available) + 1U, std::numeric_limits<int32_t>::max());
+    minimumTailCostMs.front() = 0.0F;
+    minimumTailTurns.front() = 0;
+    for (int32_t rows = 1; rows <= available; ++rows)
+    {
+        for (Candidate const& candidate : candidates)
         {
-            return candidate.p95GpuMs;
-        }
-        float remainderCostMs = std::numeric_limits<float>::max();
-        for (Candidate const& remainder : candidates)
-        {
-            if (remainder.batchSize >= remainingRows)
+            int32_t const turnRows = std::min(rows, candidate.batchSize);
+            size_t const tailIndex = static_cast<size_t>(rows - turnRows);
+            if (!std::isfinite(minimumTailCostMs[tailIndex]))
             {
-                remainderCostMs = std::min(remainderCostMs, remainder.p95GpuMs);
+                continue;
+            }
+            float const costMs = candidate.p95GpuMs + minimumTailCostMs[tailIndex];
+            int32_t const turns = 1 + minimumTailTurns[tailIndex];
+            size_t const rowsIndex = static_cast<size_t>(rows);
+            if (costMs < minimumTailCostMs[rowsIndex]
+                || (costMs == minimumTailCostMs[rowsIndex] && turns < minimumTailTurns[rowsIndex]))
+            {
+                minimumTailCostMs[rowsIndex] = costMs;
+                minimumTailTurns[rowsIndex] = turns;
             }
         }
-        if (!std::isfinite(remainderCostMs) || remainderCostMs == std::numeric_limits<float>::max())
-        {
-            remainderCostMs = minimumCandidateCostMs;
-        }
-        return candidate.p95GpuMs + remainderCostMs;
+    }
+    auto estimatedDrainCostMs = [&](Candidate const& candidate) {
+        int32_t const remainingRows = available - candidate.batchSize;
+        return candidate.p95GpuMs + minimumTailCostMs[static_cast<size_t>(std::max(remainingRows, 0))];
+    };
+    auto estimatedDrainTurns = [&](Candidate const& candidate) {
+        int32_t const remainingRows = available - candidate.batchSize;
+        return 1 + minimumTailTurns[static_cast<size_t>(std::max(remainingRows, 0))];
     };
     auto const minimumDrainCandidate
         = std::min_element(candidates.begin(), candidates.end(), [&](Candidate const& lhs, Candidate const& rhs) {
@@ -1763,25 +1792,34 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     }
     if (selected != nullptr)
     {
+        predictedDrainGpuMs = estimatedDrainCostMs(*selected);
+        predictedDrainTurns = estimatedDrainTurns(*selected);
         return selected->batchSize;
     }
 
     // No shape can drain the current queue before its remaining deadline.
     // Minimize total recovery time instead of issuing the shortest first turn
     // and leaving a more expensive remainder behind.
+    predictedDrainGpuMs = estimatedDrainCostMs(*minimumDrainCandidate);
+    predictedDrainTurns = estimatedDrainTurns(*minimumDrainCandidate);
     return minimumDrainCandidate->batchSize;
 }
 
-uint64_t PhaseQueueScheduler::onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept
+uint64_t PhaseQueueScheduler::onlineDecodeCostKey(
+    int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const noexcept
 {
     int32_t const contextBucket = std::max(
         1, (maxContextLength + mConfig.onlineDecodeContextBucketTokens - 1) / mConfig.onlineDecodeContextBucketTokens);
-    return (static_cast<uint64_t>(static_cast<uint32_t>(batchSize)) << 32U) | static_cast<uint32_t>(contextBucket);
+    uint64_t const contention = (encoderActive ? 2U : 0U) | (prefillActive ? 1U : 0U);
+    return (static_cast<uint64_t>(static_cast<uint32_t>(batchSize)) << 32U)
+        | (static_cast<uint64_t>(static_cast<uint32_t>(contextBucket)) << 2U) | contention;
 }
 
-std::optional<float> PhaseQueueScheduler::onlineDecodeP95(int32_t batchSize, int32_t maxContextLength) const
+std::optional<float> PhaseQueueScheduler::onlineDecodeP95(
+    int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const
 {
-    auto const found = mOnlineDecodeGpuMs.find(onlineDecodeCostKey(batchSize, maxContextLength));
+    auto const found
+        = mOnlineDecodeGpuMs.find(onlineDecodeCostKey(batchSize, maxContextLength, encoderActive, prefillActive));
     if (found == mOnlineDecodeGpuMs.end() || found->second.size() < mConfig.onlineDecodeCostMinSamples)
     {
         return std::nullopt;
@@ -1878,17 +1916,19 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         updateEwma(mTelemetry.decodeGpuMsPerContextToken,
             metrics.decodeGpuMs / static_cast<float>(metrics.decodeContextTokens));
     }
-    if (mOnlineDecodeCostLearningActive && metrics.kind == PhaseDispatchKind::kDecode && metrics.decodeBatchSize > 0
-        && metrics.decodeGpuMs > 0.0F && metrics.plannedDecodeMaxContextLength > 0)
+    if (mOnlineDecodeCostLearningActive && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F
+        && metrics.plannedDecodeMaxContextLength > 0)
     {
-        auto& samples
-            = mOnlineDecodeGpuMs[onlineDecodeCostKey(metrics.decodeBatchSize, metrics.plannedDecodeMaxContextLength)];
+        auto& samples = mOnlineDecodeGpuMs[onlineDecodeCostKey(metrics.decodeBatchSize,
+            metrics.plannedDecodeMaxContextLength, metrics.externalEncoderActive, metrics.concurrentPrefillActive)];
         samples.push_back(metrics.decodeGpuMs);
         if (samples.size() > mConfig.onlineDecodeCostWindow)
         {
             samples.pop_front();
         }
         ++mTelemetry.onlineDecodeCostSampleCount;
+        mTelemetry.encoderContendedDecodeCostSampleCount += metrics.externalEncoderActive ? 1U : 0U;
+        mTelemetry.prefillContendedDecodeCostSampleCount += metrics.concurrentPrefillActive ? 1U : 0U;
         mTelemetry.onlineDecodeCostBucketCount = mOnlineDecodeGpuMs.size();
     }
     if (metrics.kind == PhaseDispatchKind::kOverlap && metrics.prefillBatchSize > 0 && metrics.decodeBatchSize > 0)

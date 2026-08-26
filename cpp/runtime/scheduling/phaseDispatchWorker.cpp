@@ -246,6 +246,10 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.plannedDecodeContextTokens = mInFlight.plannedDecodeContextTokens;
     mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
     mCurrentMetrics.predictedDecodeReplacementRows = mInFlight.predictedDecodeReplacementRows;
+    mCurrentMetrics.externalEncoderActive = mInFlight.externalEncoderActive;
+    mCurrentMetrics.concurrentPrefillActive = mInFlight.concurrentPrefillActive;
+    mCurrentMetrics.predictedDecodeDrainGpuMs = mInFlight.predictedDecodeDrainGpuMs;
+    mCurrentMetrics.predictedDecodeDrainTurns = mInFlight.predictedDecodeDrainTurns;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     mCurrentMetrics.decodeCohortSize = static_cast<int32_t>(mScheduler.decodeCohortSize());
     int64_t prefillPastKVSum{};
