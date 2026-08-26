@@ -159,11 +159,13 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
     int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;
     std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(graphTokens);
     if (mGraphCaptureEnabled && mCapturedPrefillShapes.find(graphShape) == mCapturedPrefillShapes.end()
-        && mCapturedPrefillShapes.size() < mMaxPrefillGraphs)
+        && mCapturedPrefillShapes.size() < mMaxPrefillGraphs
+        && ++mPrefillGraphShapeObservations[graphShape] >= mGraphCaptureMinObservations)
     {
         ELLM_CHECK(
             mExecutors.prefillExecutor().captureGraph(stream), "Independent packed prefill graph capture failed");
         mCapturedPrefillShapes.insert(graphShape);
+        mPrefillGraphShapeObservations.erase(graphShape);
     }
     ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent packed prefill execute failed");
 }
@@ -194,10 +196,12 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
         "Independent decode prepare failed");
     std::string const graphShape = std::to_string(batch.size());
     if (mGraphCaptureEnabled && mCapturedDecodeShapes.find(graphShape) == mCapturedDecodeShapes.end()
-        && mCapturedDecodeShapes.size() < mMaxDecodeGraphs)
+        && mCapturedDecodeShapes.size() < mMaxDecodeGraphs
+        && ++mDecodeGraphShapeObservations[graphShape] >= mGraphCaptureMinObservations)
     {
         ELLM_CHECK(mExecutors.decodeExecutor().captureGraph(stream), "Independent decode graph capture failed");
         mCapturedDecodeShapes.insert(graphShape);
+        mDecodeGraphShapeObservations.erase(graphShape);
     }
     ELLM_CHECK(mExecutors.decodeExecutor().execute(stream), "Independent decode execute failed");
 }
@@ -273,6 +277,14 @@ bool IndependentPhaseCoordinator::capturePreparedGraphs()
 void IndependentPhaseCoordinator::setGraphCaptureEnabled(bool enabled) noexcept
 {
     mGraphCaptureEnabled = enabled;
+}
+
+void IndependentPhaseCoordinator::setGraphCaptureMinObservations(size_t observations)
+{
+    ELLM_CHECK(observations > 0, "Graph capture promotion requires a positive observation count");
+    mGraphCaptureMinObservations = observations;
+    mPrefillGraphShapeObservations.clear();
+    mDecodeGraphShapeObservations.clear();
 }
 
 void IndependentPhaseCoordinator::setGraphCaptureLimits(size_t maxPrefillGraphs, size_t maxDecodeGraphs) noexcept

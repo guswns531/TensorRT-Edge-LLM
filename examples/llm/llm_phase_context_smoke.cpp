@@ -1699,6 +1699,15 @@ int main(int argc, char** argv)
                 // unseen production shapes on their latency-critical first request.
                 semanticCoordinator.setGraphCaptureEnabled(false);
             }
+            else if (serverConfig.enableCudaGraphs)
+            {
+                size_t graphCaptureMinObservations = 8U;
+                if (char const* value = std::getenv("TRT_EDGELLM_GRAPH_CAPTURE_MIN_OBSERVATIONS"))
+                {
+                    graphCaptureMinObservations = static_cast<size_t>(std::stoul(value));
+                }
+                semanticCoordinator.setGraphCaptureMinObservations(graphCaptureMinObservations);
+            }
             LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu", warmupBatchSizes.size(), warmedRequests);
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;

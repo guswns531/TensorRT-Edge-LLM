@@ -29,6 +29,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -83,8 +84,11 @@ public:
     //! Capture graphs for the currently prepared phase bindings. Callers must
     //! prepare both phase views with stable shapes before invoking this method.
     bool capturePreparedGraphs();
-    //! Capture a graph the first time each production phase shape is observed.
+    //! Capture recurring production phase shapes after the configured promotion threshold.
     void setGraphCaptureEnabled(bool enabled) noexcept;
+    //! Require this many observations before promoting an unseen production
+    //! shape into the graph cache. Startup-warmed shapes remain immediately reusable.
+    void setGraphCaptureMinObservations(size_t observations);
     //! Bound production graph-cache shape counts per phase.
     void setGraphCaptureLimits(size_t maxPrefillGraphs, size_t maxDecodeGraphs) noexcept;
     EngineExecutor::GraphCacheStats prefillGraphCacheStats() const noexcept;
@@ -131,7 +135,10 @@ private:
     bool mMetricsCollectionEnabled{true};
     std::unordered_set<std::string> mCapturedPrefillShapes;
     std::unordered_set<std::string> mCapturedDecodeShapes;
+    std::unordered_map<std::string, size_t> mPrefillGraphShapeObservations;
+    std::unordered_map<std::string, size_t> mDecodeGraphShapeObservations;
     bool mGraphCaptureEnabled{};
+    size_t mGraphCaptureMinObservations{1U};
     size_t mMaxPrefillGraphs{};
     size_t mMaxDecodeGraphs{};
 };
