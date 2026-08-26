@@ -2303,6 +2303,22 @@ TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGu
     EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 0, true, 2000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, HoldsEncodedCapacityBetweenDecodePressureThresholds)
+{
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(8, 8, 16, true, 0.0, 2500000.0, 0.4, 0.7F, 1.0F, 0.6F), 8);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(8, 8, 16, true, 0.0, 2500000.0, 0.4, 0.6F, 1.0F, 0.6F), 16);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(16, 8, 16, true, 0.0, 2500000.0, 0.4, 0.9F, 1.0F, 0.6F), 16);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(16, 8, 16, true, 0.0, 2500000.0, 0.4, 1.0F, 1.0F, 0.6F), 8);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(16, 8, 16, false, 0.0, 2500000.0, 0.4, 0.2F, 1.0F, 0.6F), 8);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, NormalizesDecodePressureOnlyWithAnExplicitTarget)
+{
+    EXPECT_FLOAT_EQ(phaseVisionDecodeTpotPressure(40000.0, 50000.0), 0.8F);
+    EXPECT_FLOAT_EQ(phaseVisionDecodeTpotPressure(40000.0, 0.0), 0.0F);
+    EXPECT_FLOAT_EQ(phaseVisionDecodeTpotPressure(0.0, 50000.0), 0.0F);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, SerializesEncoderWhenPredictedCompletionCrossesVisionDeadline)
 {
     EXPECT_FALSE(phaseVisionEncoderSerializationDue(100000.0, 500000.0, 1.0, 50000.0));

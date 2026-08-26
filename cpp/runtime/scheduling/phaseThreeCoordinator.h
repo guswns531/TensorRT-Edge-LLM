@@ -121,8 +121,16 @@ struct PhaseThreeCoordinatorConfig
     double visionTtftTargetUs{2500000.0};
     //! Escalate lookahead after this fraction of the oldest vision request's TTFT target. Zero disables age escalation.
     double lookaheadEscalationRatio{0.4};
-    //! Do not escalate lookahead at or above this observed decode TPOT pressure. Zero disables the guard.
+    //! Contract encoded capacity at or above this normalized decode TPOT pressure. Zero disables contraction.
     float lookaheadDecodeTpotPressureLimit{0.8F};
+    //! Recover encoded capacity at or below this normalized decode TPOT pressure. Zero allows immediate recovery.
+    float lookaheadDecodeTpotPressureRecoveryLimit{0.6F};
+    //! Fallback decode TPOT target when requests do not provide one. Zero treats pressure as unknown.
+    double encodedCapacityDecodeTpotTargetUs{};
+    //! Minimum wall-clock dwell between encoded-capacity transitions.
+    double encodedCapacityMinDwellUs{};
+    //! Latch throughput capacity at this upstream vision backlog. Zero disables backlog-triggered growth.
+    size_t encodedCapacityBacklogEnterRequests{};
     //! Move encoder enqueue behind the LLM poll and gate it by measured phase debt.
     bool enableEncoderDispatchArbitration{};
     //! Run vision preprocessing on a worker while the coordinator continues polling prefill and decode.
@@ -194,6 +202,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t effectiveEncodedCapacity{};
     size_t maxEffectiveEncodedCapacity{};
     size_t lookaheadEscalations{};
+    size_t encodedCapacityContractions{};
+    size_t encodedCapacityDwellBlocks{};
     float decodeTpotPressure{};
     size_t encoderDispatchDeferrals{};
     size_t encoderTextGuardDeferrals{};
@@ -265,6 +275,14 @@ PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabl
 size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throughputCapacity, bool throughputMode,
     double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio, float decodeTpotPressure,
     float decodeTpotPressureLimit) noexcept;
+
+//! Apply normalized decode-TPOT hysteresis to the latency/throughput encoded-capacity states.
+size_t phaseVisionNextEncodedCapacity(size_t currentCapacity, size_t latencyCapacity, size_t throughputCapacity,
+    bool throughputMode, double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio,
+    float decodeTpotPressure, float pressureEnterRatio, float pressureExitRatio) noexcept;
+
+//! Normalize an observed decode TPOT against a request or configured target. Zero means pressure is unknown.
+float phaseVisionDecodeTpotPressure(double observedTpotUs, double targetTpotUs) noexcept;
 
 //! Return true when the oldest vision request cannot meet its TTFT fraction after one predicted encoder batch.
 bool phaseVisionEncoderSerializationDue(
@@ -388,6 +406,8 @@ private:
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
+    float decodeTpotPressure() const noexcept;
+    void refreshEffectiveEncodedCapacity() noexcept;
     PhaseVisionEncoderDispatchDecision nextEncoderDispatchDecision() const noexcept;
     bool encoderSerializationDue() const noexcept;
     void refreshEncoderSerializationGate() noexcept;
@@ -446,7 +466,12 @@ private:
     double mMaxPrefillReadyQueueWaitUs{};
     size_t mMaxEffectiveEncodedCapacity{};
     size_t mLookaheadEscalations{};
-    size_t mLastEffectiveEncodedCapacity{};
+    size_t mEncodedCapacityContractions{};
+    size_t mEncodedCapacityDwellBlocks{};
+    size_t mEffectiveEncodedCapacity{};
+    std::chrono::steady_clock::time_point mEncodedCapacityLastTransition;
+    bool mEncodedCapacityDemandActive{};
+    bool mEncodedCapacityDwellDeferred{};
     bool mDecodePrefillDeferred{};
     size_t mEncoderDispatchDeferrals{};
     size_t mEncoderTextGuardDeferrals{};

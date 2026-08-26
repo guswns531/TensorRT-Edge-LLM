@@ -347,6 +347,40 @@ size_t phaseVisionEffectiveEncodedCapacity(size_t latencyCapacity, size_t throug
     return !decodeProtected && (throughputMode || visionLate) ? highCapacity : latencyCapacity;
 }
 
+size_t phaseVisionNextEncodedCapacity(size_t currentCapacity, size_t latencyCapacity, size_t throughputCapacity,
+    bool throughputMode, double oldestVisionAgeUs, double visionTtftTargetUs, double escalationRatio,
+    float decodeTpotPressure, float pressureEnterRatio, float pressureExitRatio) noexcept
+{
+    size_t const highCapacity = std::max(latencyCapacity, throughputCapacity);
+    if (highCapacity == latencyCapacity)
+    {
+        return latencyCapacity;
+    }
+    bool const visionLate = escalationRatio > 0.0 && visionTtftTargetUs > 0.0
+        && oldestVisionAgeUs >= visionTtftTargetUs * escalationRatio;
+    if (!throughputMode && !visionLate)
+    {
+        return latencyCapacity;
+    }
+    bool const highCapacityActive = currentCapacity > latencyCapacity;
+    if (highCapacityActive)
+    {
+        bool const contract = pressureEnterRatio > 0.0F && decodeTpotPressure >= pressureEnterRatio;
+        return contract ? latencyCapacity : highCapacity;
+    }
+    bool const recoveryBlocked = pressureExitRatio > 0.0F && decodeTpotPressure > pressureExitRatio;
+    return recoveryBlocked ? latencyCapacity : highCapacity;
+}
+
+float phaseVisionDecodeTpotPressure(double observedTpotUs, double targetTpotUs) noexcept
+{
+    if (!std::isfinite(observedTpotUs) || !std::isfinite(targetTpotUs) || observedTpotUs <= 0.0 || targetTpotUs <= 0.0)
+    {
+        return 0.0F;
+    }
+    return static_cast<float>(observedTpotUs / targetTpotUs);
+}
+
 bool phaseVisionEncoderSerializationDue(
     double oldestVisionAgeUs, double visionTtftTargetUs, double deadlineRatio, double predictedEncoderCostUs) noexcept
 {
@@ -453,6 +487,16 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(
         std::isfinite(mConfig.lookaheadDecodeTpotPressureLimit) && mConfig.lookaheadDecodeTpotPressureLimit >= 0.0F,
         "Three-phase lookahead decode pressure limit must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.lookaheadDecodeTpotPressureRecoveryLimit)
+            && mConfig.lookaheadDecodeTpotPressureRecoveryLimit >= 0.0F
+            && (mConfig.lookaheadDecodeTpotPressureLimit == 0.0F
+                || mConfig.lookaheadDecodeTpotPressureRecoveryLimit <= mConfig.lookaheadDecodeTpotPressureLimit),
+        "Three-phase lookahead decode pressure recovery limit must not exceed the contraction limit");
+    ELLM_CHECK(
+        std::isfinite(mConfig.encodedCapacityDecodeTpotTargetUs) && mConfig.encodedCapacityDecodeTpotTargetUs >= 0.0,
+        "Three-phase encoded-capacity decode TPOT target must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.encodedCapacityMinDwellUs) && mConfig.encodedCapacityMinDwellUs >= 0.0,
+        "Three-phase encoded-capacity dwell must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.encoderDispatchInitialCostUs) && mConfig.encoderDispatchInitialCostUs >= 0.0,
         "Three-phase encoder dispatch initial cost must be finite and non-negative");
     ELLM_CHECK(
@@ -474,6 +518,8 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         mConfig.encoderSerializationMaxBurst > 0, "Three-phase encoder serialization burst size must be positive");
     ELLM_CHECK(mVision.cudaContext() == mServer.cudaContext(),
         "Encoder and LLM phase server must share one CUDA primary context");
+    mEffectiveEncodedCapacity = mConfig.maxEncodedInFlight;
+    mMaxEffectiveEncodedCapacity = mEffectiveEncodedCapacity;
 }
 
 PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
@@ -572,6 +618,7 @@ bool PhaseThreeCoordinator::poll()
         mServer.setExternalDrainPreference(PhaseDrainPreference::kNone);
     }
     bool progressed = completeEncoder();
+    refreshEffectiveEncodedCapacity();
     refreshEncoderSerializationGate();
     if (mEncoderSerializationGate && !mServer.arbitrationSnapshot().busy)
     {
@@ -588,6 +635,7 @@ bool PhaseThreeCoordinator::poll()
     mServer.setExternalPendingRequests(
         upstreamRequests + mReadyPrefill.size(), minTpotTargetUs, mRequestIds.size(), mAdmissionProfilePrefillTokens);
     progressed = mServer.poll() || progressed;
+    refreshEffectiveEncodedCapacity();
     if (mEncoderSerializationYieldPending)
     {
         mEncoderSerializationYieldPending = false;
@@ -652,7 +700,9 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.effectiveEncodedCapacity = effectiveEncodedCapacity();
     result.maxEffectiveEncodedCapacity = mMaxEffectiveEncodedCapacity;
     result.lookaheadEscalations = mLookaheadEscalations;
-    result.decodeTpotPressure = mServer.decodeAdmissionTpotPressure();
+    result.encodedCapacityContractions = mEncodedCapacityContractions;
+    result.encodedCapacityDwellBlocks = mEncodedCapacityDwellBlocks;
+    result.decodeTpotPressure = decodeTpotPressure();
     result.encoderDispatchDeferrals = mEncoderDispatchDeferrals;
     result.encoderTextGuardDeferrals = mEncoderTextGuardDeferrals;
     result.encoderPrefillGuardDeferrals = mEncoderPrefillGuardDeferrals;
@@ -788,14 +838,6 @@ bool PhaseThreeCoordinator::startNextEncoder()
         mServer.setPrefillDispatchBlocked(true);
         mExclusiveEncoderInFlight = true;
     }
-
-    size_t const encodedCapacity = effectiveEncodedCapacity();
-    if (encodedCapacity > mLastEffectiveEncodedCapacity && mLastEffectiveEncodedCapacity > 0)
-    {
-        ++mLookaheadEscalations;
-    }
-    mLastEffectiveEncodedCapacity = encodedCapacity;
-    mMaxEffectiveEncodedCapacity = std::max(mMaxEffectiveEncodedCapacity, encodedCapacity);
 
     std::vector<PhaseVisionSubmission> submissions;
     submissions.reserve(batchSize);
@@ -1283,8 +1325,8 @@ PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecis
         mConfig.adaptivePrefillMinBatchSize, mPending.size() + mEncoding.size(),
         attachedPrefix + mServer.admissibleRequestPrefix(admissionRequests),
         attachedPrefix > 0U ? std::max(mServer.availableKVPages(), 1) : mServer.availableKVPages(),
-        mServer.decodeAdmissionTpotPressure(), mConfig.prefillDecodeTpotPressureLimit, mReadyPrefillBytes,
-        mConfig.maxEncodedBytes, mConfig.prefillReadyBytePressureRatio,
+        decodeTpotPressure(), mConfig.prefillDecodeTpotPressureLimit, mReadyPrefillBytes, mConfig.maxEncodedBytes,
+        mConfig.prefillReadyBytePressureRatio,
         mConfig.enableDecodeProtectedPrefillDeferral && mServer.adaptiveAdmissionExternalProfileActive()
             && !mServer.adaptiveAdmissionTpotBudgetSatisfiable(),
         mConfig.maxDecodeProtectedPrefillWaitUs);
@@ -1326,8 +1368,8 @@ PhaseVisionEncoderDispatchDecision PhaseThreeCoordinator::nextEncoderDispatchDec
     return phaseVisionEncoderDispatchDecision(mConfig.enableEncoderDispatchArbitration, oldestVisionAgeUs,
         sinceLastForcedStartUs, mConfig.encoderDispatchMaxDeferUs, mConfig.encoderDispatchForcedIntervalUs,
         snapshot.oldestTextWithoutTokenAgeUs, predictedEncoderCostUs, mConfig.encoderDispatchTextGuardAgeUs,
-        mServer.decodeAdmissionTpotPressure(), mConfig.encoderDispatchDecodeTpotPressureLimit, textPrefillInFlight,
-        decodeInFlight, snapshot.prefillMinTtftSlackUs, prefillInFlight);
+        decodeTpotPressure(), mConfig.encoderDispatchDecodeTpotPressureLimit, textPrefillInFlight, decodeInFlight,
+        snapshot.prefillMinTtftSlackUs, prefillInFlight);
 }
 
 bool PhaseThreeCoordinator::encoderSerializationDue() const noexcept
@@ -1374,6 +1416,18 @@ void PhaseThreeCoordinator::refreshEncoderSerializationGate() noexcept
 
 size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept
 {
+    return mEffectiveEncodedCapacity;
+}
+
+float PhaseThreeCoordinator::decodeTpotPressure() const noexcept
+{
+    double const requestTargetUs = mTpotTargets.empty() ? 0.0 : *mTpotTargets.begin();
+    double const targetUs = requestTargetUs > 0.0 ? requestTargetUs : mConfig.encodedCapacityDecodeTpotTargetUs;
+    return phaseVisionDecodeTpotPressure(mServer.arbitrationSnapshot().recentDecodeTpotP95Us, targetUs);
+}
+
+void PhaseThreeCoordinator::refreshEffectiveEncodedCapacity() noexcept
+{
     double oldestVisionAgeUs{};
     double visionTtftTargetUs = mConfig.visionTtftTargetUs;
     if (!mPending.empty())
@@ -1387,9 +1441,54 @@ size_t PhaseThreeCoordinator::effectiveEncodedCapacity() const noexcept
             visionTtftTargetUs = oldest.scheduling.ttftTargetUs;
         }
     }
-    return phaseVisionEffectiveEncodedCapacity(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight,
-        mServer.throughputMode(), oldestVisionAgeUs, visionTtftTargetUs, mConfig.lookaheadEscalationRatio,
-        mServer.decodeAdmissionTpotPressure(), mConfig.lookaheadDecodeTpotPressureLimit);
+    bool const visionLate = mConfig.lookaheadEscalationRatio > 0.0 && visionTtftTargetUs > 0.0
+        && oldestVisionAgeUs >= visionTtftTargetUs * mConfig.lookaheadEscalationRatio;
+    size_t const upstreamBacklog = mPending.size() + mEncoding.size() + mReadyPrefill.size();
+    bool const backlogDemand = mConfig.encodedCapacityBacklogEnterRequests > 0U
+        && upstreamBacklog >= mConfig.encodedCapacityBacklogEnterRequests;
+    if (mServer.throughputMode() || visionLate || backlogDemand)
+    {
+        mEncodedCapacityDemandActive = true;
+    }
+    bool const visionPipelineDrained
+        = mPending.empty() && mEncoding.empty() && mReadyPrefill.empty() && mDownstreamRequestBytes.empty();
+    if (visionPipelineDrained)
+    {
+        mEncodedCapacityDemandActive = false;
+    }
+    size_t const nextCapacity = phaseVisionNextEncodedCapacity(mEffectiveEncodedCapacity, mConfig.maxEncodedInFlight,
+        mConfig.throughputMaxEncodedInFlight, mEncodedCapacityDemandActive, oldestVisionAgeUs, visionTtftTargetUs,
+        mConfig.lookaheadEscalationRatio, decodeTpotPressure(), mConfig.lookaheadDecodeTpotPressureLimit,
+        mConfig.lookaheadDecodeTpotPressureRecoveryLimit);
+    if (nextCapacity == mEffectiveEncodedCapacity)
+    {
+        return;
+    }
+    auto const now = std::chrono::steady_clock::now();
+    double const dwellUs = mEncodedCapacityLastTransition == std::chrono::steady_clock::time_point{}
+        ? std::numeric_limits<double>::infinity()
+        : std::chrono::duration<double, std::micro>(now - mEncodedCapacityLastTransition).count();
+    if (dwellUs < mConfig.encodedCapacityMinDwellUs)
+    {
+        if (!mEncodedCapacityDwellDeferred)
+        {
+            ++mEncodedCapacityDwellBlocks;
+            mEncodedCapacityDwellDeferred = true;
+        }
+        return;
+    }
+    mEncodedCapacityDwellDeferred = false;
+    if (nextCapacity > mEffectiveEncodedCapacity)
+    {
+        ++mLookaheadEscalations;
+    }
+    else
+    {
+        ++mEncodedCapacityContractions;
+    }
+    mEffectiveEncodedCapacity = nextCapacity;
+    mMaxEffectiveEncodedCapacity = std::max(mMaxEffectiveEncodedCapacity, nextCapacity);
+    mEncodedCapacityLastTransition = now;
 }
 
 void PhaseThreeCoordinator::eraseTpotTarget(uint64_t requestId)

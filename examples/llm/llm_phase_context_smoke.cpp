@@ -1836,6 +1836,22 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.lookaheadDecodeTpotPressureLimit = std::stof(value);
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_LOOKAHEAD_TPOT_PRESSURE_RECOVERY_LIMIT"))
+                {
+                    threePhaseConfig.lookaheadDecodeTpotPressureRecoveryLimit = std::stof(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS"))
+                {
+                    threePhaseConfig.encodedCapacityDecodeTpotTargetUs = std::stod(value) * 1000.0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODED_CAPACITY_DWELL_MS"))
+                {
+                    threePhaseConfig.encodedCapacityMinDwellUs = std::stod(value) * 1000.0;
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODED_CAPACITY_BACKLOG"))
+                {
+                    threePhaseConfig.encodedCapacityBacklogEnterRequests = static_cast<size_t>(std::stoul(value));
+                }
                 threePhaseConfig.enableEncoderDispatchArbitration
                     = std::getenv("TRT_EDGELLM_VISION_ENCODER_ARBITER") != nullptr;
                 threePhaseConfig.enableAsyncEncoderPreparation
@@ -2277,6 +2293,12 @@ int main(int argc, char** argv)
                         {"vision_prefill_ready_bytes", visionMetrics.pendingPrefillReadyBytes},
                         {"vision_downstream", visionMetrics.downstreamEncodedRequests},
                         {"vision_downstream_bytes", visionMetrics.downstreamEncodedBytes},
+                        {"vision_effective_encoded_capacity", visionMetrics.effectiveEncodedCapacity},
+                        {"vision_effective_encoded_capacity_max", visionMetrics.maxEffectiveEncodedCapacity},
+                        {"vision_encoded_capacity_escalations", visionMetrics.lookaheadEscalations},
+                        {"vision_encoded_capacity_contractions", visionMetrics.encodedCapacityContractions},
+                        {"vision_encoded_capacity_dwell_blocks", visionMetrics.encodedCapacityDwellBlocks},
+                        {"vision_decode_tpot_pressure", visionMetrics.decodeTpotPressure},
                         {"vision_prefill_storage_releases", visionMetrics.prefillStorageReleases},
                         {"vision_prefill_storage_released_bytes", visionMetrics.prefillStorageReleasedBytes},
                         {"vision_encoder_starts", visionMetrics.encoderStarts},
@@ -2501,6 +2523,7 @@ int main(int argc, char** argv)
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
                     "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
+                    "capacity_contractions=%zu capacity_dwell_blocks=%zu "
                     "decode_tpot_pressure=%.3f async_preparations=%zu/%zu preparation_last=%.3f ms "
                     "preparation_max=%.3f ms exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
@@ -2522,6 +2545,7 @@ int main(int argc, char** argv)
                     visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
+                    visionMetrics.encodedCapacityContractions, visionMetrics.encodedCapacityDwellBlocks,
                     visionMetrics.decodeTpotPressure, visionMetrics.encoderPreparationStarts,
                     visionMetrics.encoderPreparationCompletions, visionMetrics.lastEncoderPreparationUs / 1000.0,
                     visionMetrics.maxEncoderPreparationUs / 1000.0, visionMetrics.exclusiveEncoderBatches,
