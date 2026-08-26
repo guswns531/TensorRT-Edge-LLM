@@ -1434,11 +1434,12 @@ std::vector<IndependentPhaseRequestView> IndependentPhaseAsyncServer::makeViews(
 {
     std::vector<IndependentPhaseRequestView> views;
     views.reserve(batch.size());
-    for (PhaseWorkItem const& work : batch)
+    for (size_t row{}; row < batch.size(); ++row)
     {
+        PhaseWorkItem const& work = batch[row];
         auto const it = mRequests.find(work.requestId);
         ELLM_CHECK(it != mRequests.end(), "Phase adapter requested an unknown request");
-        views.push_back({work.requestId, work, &it->second.promptTokens, &it->second.generatedTokens,
+        views.push_back({work.requestId, row, work, &it->second.promptTokens, &it->second.generatedTokens,
             it->second.visionPayload.get()});
     }
     return views;

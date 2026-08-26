@@ -574,6 +574,15 @@ TEST(ContextAttentionTest, pagedD128RaggedScrambledPoisonedPageTables)
         128, 8, 2, 65, 257, INT_MAX, std::nullopt, std::vector<int32_t>{33, 65}, std::vector<int32_t>{129, 257});
 }
 
+TEST(ContextAttentionTest, pagedD128FourRowsExactPageBoundary)
+{
+    // Packed prefill commonly dispatches four uniform 128-token chunks while
+    // every sequence owns exactly one live page. Keep the following logical
+    // page poisoned to catch a kernel that crosses the exact page boundary.
+    TestContextAttentionPagedAccuracy(128, 8, 1, 128, 128, INT_MAX, std::nullopt,
+        std::vector<int32_t>{128, 128, 128, 128}, std::vector<int32_t>{128, 128, 128, 128});
+}
+
 TEST(ContextAttentionTest, pagedNaNPoisonedPaddingDoesNotLeak)
 {
     // NaN/Inf in the padded rows, the padded key tail, and the unmapped pages must be masked out

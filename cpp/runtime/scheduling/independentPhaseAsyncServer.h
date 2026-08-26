@@ -104,6 +104,10 @@ bool shouldDeferPhasePageGrowthCohort(
 struct IndependentPhaseRequestView
 {
     uint64_t requestId{};
+    //! Row occupied by this request in the phase TensorRT invocation. A
+    //! completion subset keeps this index so adapters can gather the matching
+    //! logits instead of assuming completed rows form a dense prefix.
+    size_t phaseBatchRow{};
     PhaseWorkItem work;
     std::vector<int32_t> const* promptTokens{};
     std::vector<int32_t> const* generatedTokens{};

@@ -118,7 +118,12 @@ void PhaseKVActiveView::preparePrefillMetadata(
         ELLM_CHECK(resultingLength <= mOwnership.config().maxSequenceLength,
             "Phase prefill metadata exceeds the stable slot sequence capacity");
         selectTokenIndices[row] = packedTokenLayout ? packedTokenOffset + chunkLength - 1 : chunkLength - 1;
-        contextLengths[row] = resultingLength;
+        // The prefill binding carries the valid Q length for this invocation,
+        // not the resulting cumulative KV length. The attention plugin combines
+        // it with kvcache_start_index when it builds cumulative KV lengths. Using
+        // resultingLength here makes a continuation chunk overstate cuQSeqLens
+        // and can make packed multi-row FMHA read an unused page-table entry.
+        contextLengths[row] = chunkLength;
         packedTokenOffset += chunkLength;
     }
     CUDA_CHECK(cudaMemcpyAsync(io.selectTokenIndices.rawPointer(), io.hostSelectTokenIndices.rawPointer(),

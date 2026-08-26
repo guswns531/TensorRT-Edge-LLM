@@ -318,6 +318,10 @@ struct PhaseQueueSchedulerConfig
     PhaseSchedulerProfile profile{PhaseSchedulerProfile::kCustom};
     int32_t maxPrefillBatchSize{1};
     int32_t maxDecodeBatchSize{4};
+    //! Optional row cap for continuation chunks (tokenOffset > 0). Zero
+    //! inherits maxPrefillBatchSize. This keeps wide initial/atomic prefills
+    //! while bounding the higher KV-traffic cost of continuation batches.
+    int32_t maxContinuationPrefillBatchSize{};
     //! Optional row cap used only when prefill and decode execute concurrently.
     //! Zero inherits maxPrefillBatchSize. This lets a wide standalone prefill
     //! profile coexist with a smaller, memory-safe overlap shape.

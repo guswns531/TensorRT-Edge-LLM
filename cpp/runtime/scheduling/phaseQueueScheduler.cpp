@@ -106,6 +106,9 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
+    check::check(mConfig.maxContinuationPrefillBatchSize >= 0
+            && mConfig.maxContinuationPrefillBatchSize <= mConfig.maxPrefillBatchSize,
+        "maxContinuationPrefillBatchSize must be zero or no greater than maxPrefillBatchSize");
     check::check(
         mConfig.maxOverlapPrefillBatchSize >= 0 && mConfig.maxOverlapPrefillBatchSize <= mConfig.maxPrefillBatchSize,
         "maxOverlapPrefillBatchSize must be zero or no greater than maxPrefillBatchSize");
@@ -346,13 +349,17 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         [this](PhaseWorkItem const& item) { return isEligible(item, false); });
     int32_t const overlapPrefillBatchSize
         = mConfig.maxOverlapPrefillBatchSize > 0 ? mConfig.maxOverlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
-    int32_t const candidatePrefillBatchSize = hasDecodeWork ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
+    int32_t candidatePrefillBatchSize = hasDecodeWork ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
     auto const prefillSeed = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, true); });
     if (prefillSeed != mPrefillQueue.end())
     {
         int32_t const bucketTokens = dispatchedPrefillTokens(*prefillSeed);
         bool const bucketInitial = prefillSeed->tokenOffset == 0;
+        if (!bucketInitial && mConfig.maxContinuationPrefillBatchSize > 0)
+        {
+            candidatePrefillBatchSize = std::min(candidatePrefillBatchSize, mConfig.maxContinuationPrefillBatchSize);
+        }
         bool const allowRaggedBatch = prefillSeed->allowChunkedPrefill;
         int32_t bucketRows{};
         for (PhaseWorkItem const& item : mPrefillQueue)
@@ -1106,6 +1113,10 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     int32_t bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
     bool const allowRaggedBatch = bucketSeed->allowChunkedPrefill;
+    if (!bucketInitial && mConfig.maxContinuationPrefillBatchSize > 0)
+    {
+        maxBatchSize = std::min(maxBatchSize, mConfig.maxContinuationPrefillBatchSize);
+    }
     if (mConfig.enableWavefrontPrefillBatching && mPrefillCohortIds.empty())
     {
         std::vector<PhaseWorkItem const*> compatible;

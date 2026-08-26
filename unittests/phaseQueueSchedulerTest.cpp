@@ -535,6 +535,32 @@ TEST(PhaseQueueSchedulerTest, BucketsPrefillByChunkLengthAndInitialState)
     EXPECT_EQ(continuation128.prefillBatch[0].tokenOffset, 128);
 }
 
+TEST(PhaseQueueSchedulerTest, CapsContinuationWithoutNarrowingInitialPrefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxContinuationPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256});
+    }
+    PhaseDispatchPlan const initial = scheduler.next();
+    ASSERT_EQ(initial.prefillBatch.size(), 8U);
+    for (PhaseWorkItem const& item : initial.prefillBatch)
+    {
+        scheduler.completePrefill(item, 128, false);
+    }
+
+    PhaseDispatchPlan const continuation = scheduler.next();
+    ASSERT_EQ(continuation.prefillBatch.size(), 4U);
+    EXPECT_TRUE(std::all_of(continuation.prefillBatch.begin(), continuation.prefillBatch.end(),
+        [](PhaseWorkItem const& item) { return item.tokenOffset == 128; }));
+}
+
 TEST(PhaseQueueSchedulerTest, AppliesPrefillTokenBudgetWithoutChangingChunkCompatibility)
 {
     PhaseQueueSchedulerConfig config;

@@ -89,7 +89,7 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     std::vector<int32_t> prefillContextLength(1);
     CUDA_CHECK(cudaMemcpy(
         prefillContextLength.data(), prefillIO.contextLengths.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost));
-    EXPECT_EQ(prefillContextLength, (std::vector<int32_t>{128}));
+    EXPECT_EQ(prefillContextLength, (std::vector<int32_t>{32}));
 
     rt::PipelineIO decodeIO = rt::PipelineIO::createForLLM(
         [] {
@@ -139,6 +139,10 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     CUDA_CHECK(cudaMemcpy(packedSelectIndices.data(), packedIO.selectTokenIndices.rawPointer(),
         packedSelectIndices.size() * sizeof(int64_t), cudaMemcpyDeviceToHost));
     EXPECT_EQ(packedSelectIndices, (std::vector<int64_t>{2, 4}));
+    std::vector<int32_t> packedContextLengths(2);
+    CUDA_CHECK(cudaMemcpy(packedContextLengths.data(), packedIO.contextLengths.rawPointer(),
+        packedContextLengths.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(packedContextLengths, (std::vector<int32_t>{3, 2}));
     EXPECT_EQ(packedIO.selectTokenIndices.getShape()[0], 1);
     EXPECT_EQ(packedIO.selectTokenIndices.getShape()[1], 2);
     prefill.complete();

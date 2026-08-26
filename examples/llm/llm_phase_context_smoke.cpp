@@ -907,6 +907,8 @@ int main(int argc, char** argv)
             nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
         rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
+        rt::Tensor prefillCompactedLogits({config.maxSupportedPrefillBatchSize, config.outputVocabSize},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "semantic_phase_prefill_compacted_logits");
         SamplingSlotPool samplingSlotPool(maxPhaseBatch);
         std::vector<uint64_t> lastDecodeSampleRequestIds;
         size_t tokenH2DOperations{};
@@ -1185,7 +1187,24 @@ int main(int argc, char** argv)
             ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
                     && selectedIds.reshape({batchSize, 1}) && slot.hostIds.reshape({batchSize}),
                 "Semantic phase sampling reshape failed");
-            selectAllTopK(io.outputLogits, std::nullopt, selectedIds, 1, workspace, stream);
+            rt::Tensor* samplingLogits = &io.outputLogits;
+            bool const densePrefix = std::all_of(views.begin(), views.end(),
+                [row = size_t{}](auto const& view) mutable { return view.phaseBatchRow == row++; });
+            if (prefill && !densePrefix)
+            {
+                ELLM_CHECK(prefillCompactedLogits.reshape({batchSize, config.outputVocabSize}),
+                    "Semantic phase compacted prefill logits reshape failed");
+                size_t const rowBytes = static_cast<size_t>(config.outputVocabSize) * sizeof(float);
+                auto const* source = static_cast<std::byte const*>(io.outputLogits.rawPointer());
+                auto* destination = static_cast<std::byte*>(prefillCompactedLogits.rawPointer());
+                for (size_t row{}; row < views.size(); ++row)
+                {
+                    CUDA_CHECK(cudaMemcpyAsync(destination + row * rowBytes,
+                        source + views[row].phaseBatchRow * rowBytes, rowBytes, cudaMemcpyDeviceToDevice, stream));
+                }
+                samplingLogits = &prefillCompactedLogits;
+            }
+            selectAllTopK(*samplingLogits, std::nullopt, selectedIds, 1, workspace, stream);
             CUDA_CHECK(cudaMemcpyAsync(slot.hostIds.rawPointer(), selectedIds.rawPointer(),
                 static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaEventRecord(slot.ready, stream));
@@ -1232,6 +1251,10 @@ int main(int argc, char** argv)
         {
             semanticSchedulerConfig.maxPrefillBatchSize = std::stoi(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_CONTINUATION_PREFILL_BATCH"))
+        {
+            semanticSchedulerConfig.maxContinuationPrefillBatchSize = std::stoi(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_DECODE_BATCH"))
         {
             semanticSchedulerConfig.maxDecodeBatchSize = std::stoi(value);
@@ -1243,6 +1266,10 @@ int main(int argc, char** argv)
         ELLM_CHECK(semanticSchedulerConfig.maxPrefillBatchSize > 0
                 && semanticSchedulerConfig.maxPrefillBatchSize <= config.maxSupportedPrefillBatchSize,
             "Semantic prefill batch cap is outside the engine profile");
+        ELLM_CHECK(semanticSchedulerConfig.maxContinuationPrefillBatchSize >= 0
+                && semanticSchedulerConfig.maxContinuationPrefillBatchSize
+                    <= semanticSchedulerConfig.maxPrefillBatchSize,
+            "Semantic continuation prefill batch cap is outside the configured prefill limit");
         ELLM_CHECK(semanticSchedulerConfig.maxDecodeBatchSize > 0
                 && semanticSchedulerConfig.maxDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
             "Semantic decode batch cap is outside the engine profile");
@@ -1387,6 +1414,14 @@ int main(int argc, char** argv)
         }
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_PREFILL_GRAPHS"))
+        {
+            serverConfig.maxPrefillGraphs = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_DECODE_GRAPHS"))
+        {
+            serverConfig.maxDecodeGraphs = static_cast<size_t>(std::stoul(value));
+        }
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
         serverConfig.releaseVisionPrefillStorage = std::getenv("TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE") != nullptr;
         serverConfig.maxPendingRequests = 1024;
@@ -1657,7 +1692,7 @@ int main(int argc, char** argv)
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
             semanticCoordinator.scheduler().resetHistory();
-            if (serverConfig.enableCudaGraphs)
+            if (serverConfig.enableCudaGraphs && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") == nullptr)
             {
                 // Retain the primed graph cache, but do not synchronously capture
                 // unseen production shapes on their latency-critical first request.
