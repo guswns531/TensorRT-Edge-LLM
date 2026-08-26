@@ -55,6 +55,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -1992,24 +1993,72 @@ int main(int argc, char** argv)
             std::mutex pendingMutex;
             std::condition_variable inputAdapterReady;
             bool inputClosed{};
-            std::deque<std::string> outputLines;
+            using PhaseOutputRecord
+                = std::variant<std::string, rt::IndependentPhaseServerToken, rt::IndependentPhaseServerCompletion>;
+            std::deque<PhaseOutputRecord> outputRecords;
             std::mutex outputMutex;
             std::condition_variable outputReady;
             bool outputClosed{};
             size_t outputWriteBatches{};
             size_t outputWriteRecords{};
             size_t outputWriteBytes{};
+            double outputSerializationUs{};
+            std::unordered_map<int32_t, std::string> decodedTokenTextCache;
+            decodedTokenTextCache.reserve(4096U);
+            size_t decodedTokenTextCacheHits{};
+            size_t decodedTokenTextCacheMisses{};
             std::thread outputWriter([&]() {
                 while (true)
                 {
                     std::unique_lock<std::mutex> lock(outputMutex);
-                    outputReady.wait(lock, [&]() { return outputClosed || !outputLines.empty(); });
-                    std::deque<std::string> readyLines;
-                    readyLines.swap(outputLines);
+                    outputReady.wait(lock, [&]() { return outputClosed || !outputRecords.empty(); });
+                    std::deque<PhaseOutputRecord> readyRecords;
+                    readyRecords.swap(outputRecords);
                     bool const closed = outputClosed;
                     lock.unlock();
-                    if (!readyLines.empty())
+                    if (!readyRecords.empty())
                     {
+                        auto const serializationStart = std::chrono::steady_clock::now();
+                        std::vector<std::string> readyLines;
+                        readyLines.reserve(readyRecords.size());
+                        for (PhaseOutputRecord& record : readyRecords)
+                        {
+                            if (auto* line = std::get_if<std::string>(&record))
+                            {
+                                readyLines.push_back(std::move(*line));
+                            }
+                            else if (auto* token = std::get_if<rt::IndependentPhaseServerToken>(&record))
+                            {
+                                auto [decoded, inserted] = decodedTokenTextCache.try_emplace(token->tokenId);
+                                if (inserted)
+                                {
+                                    decoded->second = tokenizer.decode(std::vector<int32_t>{token->tokenId}, false);
+                                    ++decodedTokenTextCacheMisses;
+                                }
+                                else
+                                {
+                                    ++decodedTokenTextCacheHits;
+                                }
+                                nlohmann::json const event{{"type", "token"}, {"request_index", token->requestId},
+                                    {"token_id", token->tokenId}, {"text", decoded->second},
+                                    {"output_index", token->outputIndex}, {"elapsed_ms", token->elapsedMs}};
+                                readyLines.push_back("PHASE_EVENT\t" + event.dump());
+                            }
+                            else
+                            {
+                                auto& completion = std::get<rt::IndependentPhaseServerCompletion>(record);
+                                nlohmann::json const event{{"type", "completion"},
+                                    {"request_index", completion.requestId},
+                                    {"finish_reason", completion.stoppedByEos ? "end-of-sequence" : "length"},
+                                    {"prompt_tokens", completion.promptTokens},
+                                    {"output_tokens", completion.generatedTokens.size()},
+                                    {"latency_ms", completion.latencyMs}};
+                                readyLines.push_back("PHASE_EVENT\t" + event.dump());
+                            }
+                        }
+                        outputSerializationUs += std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - serializationStart)
+                                                     .count();
                         size_t bytes{};
                         for (std::string const& line : readyLines)
                         {
@@ -2025,7 +2074,7 @@ int main(int argc, char** argv)
                         std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
                         std::cout.flush();
                         ++outputWriteBatches;
-                        outputWriteRecords += readyLines.size();
+                        outputWriteRecords += readyRecords.size();
                         outputWriteBytes += payload.size();
                     }
                     if (closed)
@@ -2034,19 +2083,28 @@ int main(int argc, char** argv)
                     }
                 }
             });
-            auto emitSerializedRecords = [&](std::vector<std::string> records) {
+            auto emitOutputRecords = [&](std::vector<PhaseOutputRecord> records) {
                 if (records.empty())
                 {
                     return;
                 }
                 {
                     std::lock_guard<std::mutex> lock(outputMutex);
-                    for (std::string& record : records)
+                    for (PhaseOutputRecord& record : records)
                     {
-                        outputLines.push_back(std::move(record));
+                        outputRecords.push_back(std::move(record));
                     }
                 }
                 outputReady.notify_one();
+            };
+            auto emitSerializedRecords = [&](std::vector<std::string> records) {
+                std::vector<PhaseOutputRecord> output;
+                output.reserve(records.size());
+                for (std::string& record : records)
+                {
+                    output.emplace_back(std::move(record));
+                }
+                emitOutputRecords(std::move(output));
             };
             auto emitRecord = [&](std::string const& prefix, nlohmann::json const& event) {
                 emitSerializedRecords({prefix + event.dump()});
@@ -2423,26 +2481,19 @@ int main(int argc, char** argv)
                         {"input_tokens", metric.inputTokens}, {"gpu_ms", metric.gpuMs}};
                     serializedRecords.push_back("PHASE_ENCODER_METRIC\t" + metricEvent.dump());
                 }
+                std::vector<PhaseOutputRecord> phaseOutputRecords;
                 while (auto token = popTokenEvent())
                 {
                     madeProgress = true;
-                    nlohmann::json const tokenEvent{{"type", "token"}, {"request_index", token->requestId},
-                        {"token_id", token->tokenId},
-                        {"text", tokenizer.decode(std::vector<int32_t>{token->tokenId}, false)},
-                        {"output_index", token->outputIndex}, {"elapsed_ms", token->elapsedMs}};
-                    serializedRecords.push_back("PHASE_EVENT\t" + tokenEvent.dump());
+                    phaseOutputRecords.emplace_back(std::move(*token));
                 }
                 while (auto completion = popCompletionEvent())
                 {
                     madeProgress = true;
-                    nlohmann::json const completionEvent{{"type", "completion"},
-                        {"request_index", completion->requestId},
-                        {"finish_reason", completion->stoppedByEos ? "end-of-sequence" : "length"},
-                        {"prompt_tokens", completion->promptTokens},
-                        {"output_tokens", completion->generatedTokens.size()}, {"latency_ms", completion->latencyMs}};
-                    serializedRecords.push_back("PHASE_EVENT\t" + completionEvent.dump());
+                    phaseOutputRecords.emplace_back(std::move(*completion));
                 }
                 emitSerializedRecords(std::move(serializedRecords));
+                emitOutputRecords(std::move(phaseOutputRecords));
                 ipcSerializationUs
                     += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - serializationStart)
                            .count();
@@ -2601,13 +2652,16 @@ int main(int argc, char** argv)
             }
             outputReady.notify_one();
             outputWriter.join();
+            LOG_INFO("Phase IPC token text cache: entries=%zu hits=%zu misses=%zu", decodedTokenTextCache.size(),
+                decodedTokenTextCacheHits, decodedTokenTextCacheMisses);
             LOG_INFO(
                 "Phase IPC host cost: polls=%zu ingress=%.3f ms adapter_workers=%zu adapter_inputs=%zu "
                 "adapter=%.3f ms "
-                "poll=%.3f ms serialize=%.3f ms output_batches=%zu output_records=%zu output_bytes=%zu",
+                "poll=%.3f ms serialize=%.3f ms output_serialize=%.3f ms output_batches=%zu output_records=%zu "
+                "output_bytes=%zu",
                 ipcPollCalls, ipcIngressUs / 1000.0, asyncRequestAdapter ? requestAdapterWorkers : 0U,
                 ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, ipcPollUs / 1000.0, ipcSerializationUs / 1000.0,
-                outputWriteBatches, outputWriteRecords, outputWriteBytes);
+                outputSerializationUs / 1000.0, outputWriteBatches, outputWriteRecords, outputWriteBytes);
             auto const prefillGraphStats = semanticCoordinator.prefillGraphCacheStats();
             auto const decodeGraphStats = semanticCoordinator.decodeGraphCacheStats();
             LOG_INFO(
