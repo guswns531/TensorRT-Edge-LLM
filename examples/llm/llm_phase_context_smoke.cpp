@@ -237,6 +237,25 @@ void loadSchedulerCostModel(std::filesystem::path const& path, rt::PhaseQueueSch
     config.profile = rt::PhaseSchedulerProfile::kThroughputBalanced;
 }
 
+void loadPrefillFormationCostModel(std::filesystem::path const& path, rt::IndependentPhaseServerConfig& config)
+{
+    std::ifstream stream(path);
+    ELLM_CHECK(stream.good(), "Failed to open prefill formation cost model: " + path.string());
+    nlohmann::json const root = nlohmann::json::parse(stream);
+    ELLM_CHECK(root.contains("formation") && root.at("formation").is_array(),
+        "Prefill formation cost model has no formation table");
+    config.prefillFormationCosts.clear();
+    for (nlohmann::json const& point : root.at("formation"))
+    {
+        config.prefillFormationCosts.push_back({point.at("max_prompt_tokens").get<int32_t>(),
+            point.at("max_output_tokens").get<int32_t>(), point.at("max_decode_rows").get<size_t>(),
+            point.value("max_decode_tpot_pressure", 0.0F), point.at("target_batch_size").get<size_t>(),
+            point.at("window_us").get<double>(), point.value("ttft_target_us", 0.0),
+            point.value("ttft_guard_us", 1000.0), point.at("throughput_gain_pct").get<double>()});
+    }
+    ELLM_CHECK(!config.prefillFormationCosts.empty(), "Prefill formation cost table cannot be empty");
+}
+
 void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoordinatorConfig& config)
 {
     std::ifstream stream(path);
@@ -1458,6 +1477,10 @@ int main(int argc, char** argv)
         {
             serverConfig.prefillFormationTtftGuardUs = std::stod(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_COST_JSON"))
+        {
+            loadPrefillFormationCostModel(value, serverConfig);
+        }
         serverConfig.enableAdaptiveAdmission = std::getenv("TRT_EDGELLM_ADAPTIVE_ADMISSION") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_LATENCY_INFLIGHT"))
         {
@@ -2415,6 +2438,9 @@ int main(int argc, char** argv)
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
                         {"prefill_formation_periods", semanticServer.prefillFormationWaitPeriodCount()},
                         {"prefill_formation_deferrals", semanticServer.prefillFormationDeferralCount()},
+                        {"prefill_formation_profile_selections",
+                            semanticServer.prefillFormationProfileSelectionCount()},
+                        {"prefill_formation_profile_misses", semanticServer.prefillFormationProfileMissCount()},
                         {"page_growth_waits", semanticServer.pageGrowthWaitCount()},
                         {"page_growth_pending", semanticServer.pendingPageGrowthCount()},
                         {"page_growth_owners", semanticServer.pageGrowthOwnerCount()},
@@ -2591,12 +2617,14 @@ int main(int argc, char** argv)
             inputReader.join();
             LOG_INFO(
                 "Phase formation: decode_refill_waits=%zu prefill_wait_periods=%zu prefill_deferrals=%zu "
+                "prefill_profile_selections=%zu prefill_profile_misses=%zu "
                 "adaptive_transitions=%zu throughput_mode=%s "
                 "admission_limit=%zu admission_increases=%zu admission_decreases=%zu cost_limit=%zu "
                 "cost_blocks=%zu tpot_budget_us=%.3f tpot_satisfiable=%s external_profile=%s "
                 "external_profile_selections=%zu unsatisfiable_decisions=%zu",
                 semanticServer.decodeRefillWaitCount(), semanticServer.prefillFormationWaitPeriodCount(),
-                semanticServer.prefillFormationDeferralCount(), semanticServer.throughputModeTransitionCount(),
+                semanticServer.prefillFormationDeferralCount(), semanticServer.prefillFormationProfileSelectionCount(),
+                semanticServer.prefillFormationProfileMissCount(), semanticServer.throughputModeTransitionCount(),
                 semanticServer.throughputMode() ? "yes" : "no", semanticServer.adaptiveAdmissionLimit(),
                 semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount(),
                 semanticServer.adaptiveAdmissionCostLimit(), semanticServer.adaptiveAdmissionCostBlockCount(),

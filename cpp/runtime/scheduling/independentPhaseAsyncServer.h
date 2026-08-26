@@ -47,6 +47,24 @@ bool shouldDeferPrefillForMicrobatchFormation(size_t targetRows, size_t prefillR
     double minTtftSlackUs, double ttftGuardUs, double elapsedUs, double formationWindowUs) noexcept;
 //! Restrict formation to short-output cohorts when a positive limit is configured.
 bool phasePrefillFormationSupportsOutputLength(int32_t maxOutputTokens, int32_t cohortMaxOutputTokens) noexcept;
+
+//! One measured request-class region where bounded prefill formation improved throughput without violating latency.
+struct IndependentPhaseFormationCost
+{
+    int32_t maxPromptTokens{};
+    int32_t maxOutputTokens{};
+    size_t maxDecodeRows{};
+    float maxDecodeTpotPressure{};
+    size_t targetBatchSize{};
+    double windowUs{};
+    double ttftTargetUs{};
+    double ttftGuardUs{1000.0};
+    double throughputGainPct{};
+};
+
+//! Select the highest-gain measured formation region containing the current live workload.
+std::optional<size_t> phasePrefillFormationCostIndex(std::vector<IndependentPhaseFormationCost> const& costs,
+    int32_t maxPromptTokens, int32_t maxOutputTokens, size_t decodeRows, float decodeTpotPressure) noexcept;
 //! Hysteretic queue-pressure transition for adaptive admission.
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept;
@@ -189,6 +207,8 @@ struct IndependentPhaseServerConfig
     int32_t prefillFormationMaxOutputTokens{};
     //! Do not defer when the minimum remaining TTFT slack reaches this guard band.
     double prefillFormationTtftGuardUs{1000.0};
+    //! Measured request-class regions. When non-empty, these replace the fixed formation parameters above.
+    std::vector<IndependentPhaseFormationCost> prefillFormationCosts;
     //! Switch between latencyInFlightRequests/refill-off and maxInFlightRequests/refill-on from pending backlog.
     bool enableAdaptiveAdmission{};
     size_t latencyInFlightRequests{};
@@ -346,6 +366,8 @@ public:
     size_t decodeRefillWaitCount() const noexcept;
     size_t prefillFormationWaitPeriodCount() const noexcept;
     size_t prefillFormationDeferralCount() const noexcept;
+    size_t prefillFormationProfileSelectionCount() const noexcept;
+    size_t prefillFormationProfileMissCount() const noexcept;
     size_t pageGrowthWaitCount() const noexcept;
     size_t pendingPageGrowthCount() const noexcept;
     size_t pageGrowthOwnerCount() const noexcept;
@@ -439,6 +461,7 @@ private:
     IndependentPhaseRequestAdapter mAdapter;
     PhasePrefixReuseCache* mPrefixCache{};
     std::unordered_map<uint64_t, RequestState> mRequests;
+    std::multiset<int32_t> mActivePromptTokens;
     std::multiset<int32_t> mActiveOutputTokens;
     std::deque<PendingRequest> mPendingRequests;
     std::unordered_set<uint64_t> mPendingRequestIds;
@@ -456,6 +479,8 @@ private:
     size_t mDecodeRefillWaitCount{};
     size_t mPrefillFormationWaitPeriodCount{};
     size_t mPrefillFormationDeferralCount{};
+    size_t mPrefillFormationProfileSelectionCount{};
+    size_t mPrefillFormationProfileMissCount{};
     size_t mPageGrowthWaitCount{};
     size_t mVisionPrefillReleaseCount{};
     size_t mVisionPrefillReleasedBytes{};

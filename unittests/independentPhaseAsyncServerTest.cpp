@@ -58,6 +58,29 @@ TEST(IndependentPhaseAsyncServerTest, PrefillFormationCanSelectShortOutputCohort
     EXPECT_FALSE(phasePrefillFormationSupportsOutputLength(32, 33));
 }
 
+TEST(IndependentPhaseAsyncServerTest, PrefillFormationCostSelectsHighestMeasuredGain)
+{
+    std::vector<IndependentPhaseFormationCost> const costs{
+        {256, 32, 32, 2.0F, 8, 50.0, 100000.0, 1000.0, 2.6},
+        {512, 64, 64, 3.0F, 8, 75.0, 120000.0, 1000.0, 1.1},
+        {256, 32, 32, 2.0F, 4, 25.0, 100000.0, 1000.0, 3.0},
+    };
+    EXPECT_EQ(phasePrefillFormationCostIndex(costs, 128, 16, 8, 1.0F), 2U);
+    EXPECT_EQ(phasePrefillFormationCostIndex(costs, 384, 48, 48, 2.5F), 1U);
+}
+
+TEST(IndependentPhaseAsyncServerTest, PrefillFormationCostRejectsUnprofiledOrNonPositiveRegions)
+{
+    std::vector<IndependentPhaseFormationCost> const costs{
+        {256, 32, 32, 2.0F, 8, 50.0, 100000.0, 1000.0, 2.6},
+        {1024, 128, 64, 4.0F, 8, 50.0, 100000.0, 1000.0, -1.0},
+    };
+    EXPECT_FALSE(phasePrefillFormationCostIndex(costs, 257, 32, 32, 2.0F).has_value());
+    EXPECT_FALSE(phasePrefillFormationCostIndex(costs, 256, 33, 32, 2.0F).has_value());
+    EXPECT_FALSE(phasePrefillFormationCostIndex(costs, 256, 32, 33, 2.0F).has_value());
+    EXPECT_FALSE(phasePrefillFormationCostIndex(costs, 256, 32, 32, 2.1F).has_value());
+}
+
 TEST(IndependentPhaseAsyncServerTest, AdaptiveAdmissionUsesBacklogHysteresis)
 {
     EXPECT_FALSE(nextAdaptiveThroughputMode(false, 0, 64, 64, 1));

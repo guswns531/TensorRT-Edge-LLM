@@ -54,6 +54,26 @@ bool phasePrefillFormationSupportsOutputLength(int32_t maxOutputTokens, int32_t 
     return maxOutputTokens <= 0 || cohortMaxOutputTokens <= maxOutputTokens;
 }
 
+std::optional<size_t> phasePrefillFormationCostIndex(std::vector<IndependentPhaseFormationCost> const& costs,
+    int32_t maxPromptTokens, int32_t maxOutputTokens, size_t decodeRows, float decodeTpotPressure) noexcept
+{
+    std::optional<size_t> selected;
+    for (size_t index = 0; index < costs.size(); ++index)
+    {
+        IndependentPhaseFormationCost const& cost = costs[index];
+        bool const matches = cost.throughputGainPct > 0.0 && cost.targetBatchSize > 0 && cost.windowUs > 0.0
+            && (cost.maxPromptTokens <= 0 || maxPromptTokens <= cost.maxPromptTokens)
+            && (cost.maxOutputTokens <= 0 || maxOutputTokens <= cost.maxOutputTokens)
+            && (cost.maxDecodeRows == 0 || decodeRows <= cost.maxDecodeRows)
+            && (cost.maxDecodeTpotPressure <= 0.0F || decodeTpotPressure <= cost.maxDecodeTpotPressure);
+        if (matches && (!selected || cost.throughputGainPct > costs[*selected].throughputGainPct))
+        {
+            selected = index;
+        }
+    }
+    return selected;
+}
+
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept
 {
@@ -323,6 +343,23 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
         mConfig.prefillFormationMaxOutputTokens >= 0, "Prefill formation output token limit must be non-negative");
     ELLM_CHECK(std::isfinite(mConfig.prefillFormationTtftGuardUs) && mConfig.prefillFormationTtftGuardUs >= 0.0,
         "Prefill formation TTFT guard must be finite and non-negative");
+    for (IndependentPhaseFormationCost const& cost : mConfig.prefillFormationCosts)
+    {
+        ELLM_CHECK(cost.maxPromptTokens >= 0 && cost.maxOutputTokens >= 0,
+            "Prefill formation request-class limits must be non-negative");
+        ELLM_CHECK(cost.targetBatchSize > 0 && cost.targetBatchSize <= mConfig.maxInFlightRequests,
+            "Prefill formation profiled batch must be in the server in-flight range");
+        ELLM_CHECK(std::isfinite(cost.maxDecodeTpotPressure) && cost.maxDecodeTpotPressure >= 0.0F,
+            "Prefill formation TPOT pressure must be finite and non-negative");
+        ELLM_CHECK(std::isfinite(cost.windowUs) && cost.windowUs > 0.0,
+            "Prefill formation profiled window must be finite and positive");
+        ELLM_CHECK(std::isfinite(cost.ttftTargetUs) && cost.ttftTargetUs >= 0.0,
+            "Prefill formation profiled TTFT target must be finite and non-negative");
+        ELLM_CHECK(std::isfinite(cost.ttftGuardUs) && cost.ttftGuardUs >= 0.0,
+            "Prefill formation profiled TTFT guard must be finite and non-negative");
+        ELLM_CHECK(std::isfinite(cost.throughputGainPct) && cost.throughputGainPct > 0.0,
+            "Prefill formation cost table must contain only measured positive-gain regions");
+    }
     ELLM_CHECK(!mConfig.enableAdaptiveAdmission
             || (mConfig.latencyInFlightRequests > 0 && mConfig.latencyInFlightRequests <= mConfig.maxInFlightRequests
                 && mConfig.adaptiveBacklogEnterRequests > 0),
@@ -506,6 +543,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     state.fullReservedPages = reservation.fullPages;
     state.awaitingVisionPayload = deferredVisionPrefix;
     mRequests.emplace(requestId, std::move(state));
+    mActivePromptTokens.insert(static_cast<int32_t>(mRequests.at(requestId).promptTokens.size()));
     mActiveOutputTokens.insert(maxOutputTokens);
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
@@ -533,7 +571,11 @@ void IndependentPhaseAsyncServer::activateVisionSuffix(uint64_t requestId, Reque
         ? state.maxOutputTokens
         : std::min(state.maxOutputTokens, mConfig.outputHeadroomTokens);
     mOwnership.ensureCapacity(state.kvSlotId, finalPromptTokens + reservedOutput);
+    auto const promptLength = mActivePromptTokens.find(prefixTokens);
+    ELLM_CHECK(promptLength != mActivePromptTokens.end(), "Active prompt-length index is inconsistent");
+    mActivePromptTokens.erase(promptLength);
     state.promptTokens = std::move(state.pendingVisionPromptTokens);
+    mActivePromptTokens.insert(finalPromptTokens);
     state.visionPayload = std::move(state.pendingVisionPayload);
     state.awaitingVisionPayload = false;
     bool const allowChunkedPrefill = mConfig.allowChunkedVisionPrefill;
@@ -625,6 +667,9 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
         return false;
     }
     mOwnership.release(it->second.kvSlotId);
+    auto const promptLength = mActivePromptTokens.find(static_cast<int32_t>(it->second.promptTokens.size()));
+    ELLM_CHECK(promptLength != mActivePromptTokens.end(), "Active prompt-length index is inconsistent");
+    mActivePromptTokens.erase(promptLength);
     auto const outputLength = mActiveOutputTokens.find(it->second.maxOutputTokens);
     ELLM_CHECK(outputLength != mActiveOutputTokens.end(), "Active output-length index is inconsistent");
     mActiveOutputTokens.erase(outputLength);
@@ -701,32 +746,58 @@ bool IndependentPhaseAsyncServer::shouldWaitForPrefillFormation()
     }
     PhaseQueueSnapshot const queue = mCoordinator.scheduler().queueSnapshot();
     size_t const pendingProducerRows = mExternalPendingRequests + mPendingAdapterRequests;
+    int32_t const cohortMaxPromptTokens = mActivePromptTokens.empty() ? 0 : *mActivePromptTokens.rbegin();
     int32_t const cohortMaxOutputTokens = mActiveOutputTokens.empty() ? 0 : *mActiveOutputTokens.rbegin();
-    if (!phasePrefillFormationSupportsOutputLength(mConfig.prefillFormationMaxOutputTokens, cohortMaxOutputTokens))
+    size_t targetBatchSize = mConfig.prefillFormationBatchSize;
+    double formationWindowUs = mConfig.prefillFormationWindowUs;
+    double ttftTargetUs = mConfig.prefillFormationTtftTargetUs;
+    double ttftGuardUs = mConfig.prefillFormationTtftGuardUs;
+    if (!mConfig.prefillFormationCosts.empty())
+    {
+        std::optional<size_t> const costIndex = phasePrefillFormationCostIndex(mConfig.prefillFormationCosts,
+            cohortMaxPromptTokens, cohortMaxOutputTokens, queue.decodeQueued,
+            mCoordinator.scheduler().telemetry().recentDecodeTpotPressure);
+        if (!costIndex)
+        {
+            if (queue.prefillQueued > 0 && pendingProducerRows > 0)
+            {
+                ++mPrefillFormationProfileMissCount;
+            }
+            mPrefillFormationStartedAt.reset();
+            return false;
+        }
+        IndependentPhaseFormationCost const& cost = mConfig.prefillFormationCosts[*costIndex];
+        targetBatchSize = cost.targetBatchSize;
+        formationWindowUs = cost.windowUs;
+        ttftTargetUs = cost.ttftTargetUs;
+        ttftGuardUs = cost.ttftGuardUs;
+    }
+    else if (!phasePrefillFormationSupportsOutputLength(mConfig.prefillFormationMaxOutputTokens, cohortMaxOutputTokens))
     {
         mPrefillFormationStartedAt.reset();
         return false;
     }
-    double const minTtftSlackUs = mConfig.prefillFormationTtftTargetUs > 0.0
-        ? mConfig.prefillFormationTtftTargetUs - queue.prefillOldestRequestAgeUs
-        : queue.prefillMinTtftSlackUs;
+    double const minTtftSlackUs
+        = ttftTargetUs > 0.0 ? ttftTargetUs - queue.prefillOldestRequestAgeUs : queue.prefillMinTtftSlackUs;
     auto const now = std::chrono::steady_clock::now();
     if (!mPrefillFormationStartedAt)
     {
-        bool const candidate = shouldDeferPrefillForMicrobatchFormation(mConfig.prefillFormationBatchSize,
-            queue.prefillQueued, pendingProducerRows, minTtftSlackUs, mConfig.prefillFormationTtftGuardUs, 0.0,
-            mConfig.prefillFormationWindowUs);
+        bool const candidate = shouldDeferPrefillForMicrobatchFormation(targetBatchSize, queue.prefillQueued,
+            pendingProducerRows, minTtftSlackUs, ttftGuardUs, 0.0, formationWindowUs);
         if (!candidate)
         {
             return false;
         }
         mPrefillFormationStartedAt = now;
         ++mPrefillFormationWaitPeriodCount;
+        if (!mConfig.prefillFormationCosts.empty())
+        {
+            ++mPrefillFormationProfileSelectionCount;
+        }
     }
     double const elapsedUs = std::chrono::duration<double, std::micro>(now - *mPrefillFormationStartedAt).count();
-    bool const defer = shouldDeferPrefillForMicrobatchFormation(mConfig.prefillFormationBatchSize, queue.prefillQueued,
-        pendingProducerRows, minTtftSlackUs, mConfig.prefillFormationTtftGuardUs, elapsedUs,
-        mConfig.prefillFormationWindowUs);
+    bool const defer = shouldDeferPrefillForMicrobatchFormation(targetBatchSize, queue.prefillQueued,
+        pendingProducerRows, minTtftSlackUs, ttftGuardUs, elapsedUs, formationWindowUs);
     if (defer)
     {
         ++mPrefillFormationDeferralCount;
@@ -1045,6 +1116,16 @@ size_t IndependentPhaseAsyncServer::prefillFormationWaitPeriodCount() const noex
 size_t IndependentPhaseAsyncServer::prefillFormationDeferralCount() const noexcept
 {
     return mPrefillFormationDeferralCount;
+}
+
+size_t IndependentPhaseAsyncServer::prefillFormationProfileSelectionCount() const noexcept
+{
+    return mPrefillFormationProfileSelectionCount;
+}
+
+size_t IndependentPhaseAsyncServer::prefillFormationProfileMissCount() const noexcept
+{
+    return mPrefillFormationProfileMissCount;
 }
 
 size_t IndependentPhaseAsyncServer::pageGrowthWaitCount() const noexcept
@@ -1650,6 +1731,9 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
     mCompletions.push_back({requestId, std::move(state.generatedTokens),
         static_cast<int32_t>(state.promptTokens.size()), latencyMs, stoppedByEos});
+    auto const promptLength = mActivePromptTokens.find(static_cast<int32_t>(state.promptTokens.size()));
+    ELLM_CHECK(promptLength != mActivePromptTokens.end(), "Active prompt-length index is inconsistent");
+    mActivePromptTokens.erase(promptLength);
     auto const outputLength = mActiveOutputTokens.find(state.maxOutputTokens);
     ELLM_CHECK(outputLength != mActiveOutputTokens.end(), "Active output-length index is inconsistent");
     mActiveOutputTokens.erase(outputLength);
