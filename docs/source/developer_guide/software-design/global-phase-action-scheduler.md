@@ -10,11 +10,11 @@ persistent-memory ownership.
 The initial bounded action set is:
 
 - `E`, `P`, or `D`;
-- `E+D` or `P+D` when the overlap cost is known or a safe probe is permitted; and
+- `E+P`, `E+D`, or `P+D` when the overlap cost is known or a safe probe is permitted; and
 - `WAIT` for a concrete outstanding sampling CUDA event.
 
-`E+P` and triple overlap are deliberately excluded from the first implementation. TensorRT optimization profiles remain
-shape-support mechanisms; they are not serving workload profiles.
+Triple overlap remains deliberately excluded. TensorRT optimization profiles remain shape-support mechanisms; they are
+not serving workload profiles.
 
 ## Architecture
 
@@ -54,13 +54,20 @@ Each action key contains action kind, batch sizes, chunk length, and context buc
 event makespan and isolated reference work. Selection uses median cost and an uncertainty guard equal to the larger of the
 p95-minus-median spread and a cold-start margin that shrinks with sample count.
 
-Unknown overlap is not generally eligible. It becomes a safe probe only when protected request slack exceeds a configured
-multiple of predicted serial work and the probe interval has elapsed. After enough samples, overlap remains eligible only
-when its robust makespan provides the configured gain over isolated work.
+Unknown overlap is not generally eligible. Production-request exploration is disabled by default. A controlled warm-up
+may enable a safe probe only when protected request slack exceeds a configured multiple of predicted serial work and the
+probe interval has elapsed. After enough samples, overlap remains eligible only when its robust makespan provides the
+configured gain over isolated work.
 
-P/D CUDA observations use dispatch start/end events. E uses encoder CUDA events. E+D records both streams and currently
-uses the maximum of their adjacent event spans as the cross-stream makespan estimate. A shared-origin event is the next
-measurement refinement if sub-millisecond launch skew matters.
+P/D CUDA observations use dispatch start/end events. E uses encoder CUDA events. E+P and E+D preserve the matching P/D
+duration even when another dispatch completes before E, then record the maximum of the two adjacent stream spans as the
+cross-stream makespan estimate. A shared-origin event is the next measurement refinement if sub-millisecond launch skew
+matters.
+
+An unknown safe probe is ranked using `max(E, P/D)` as its optimistic makespan while the difference to the robust serial
+upper bound is retained as uncertainty. Therefore deadline feasibility stays conservative without making exploration
+impossible. The vision encoder cost JSON may optionally contain direct `encoder_prefill` and `encoder_decode` tables;
+otherwise only the slack-gated, rate-limited online path can bootstrap those shapes.
 
 ## Stable ownership and memory horizon
 
@@ -93,9 +100,9 @@ and accepts it only after the same feasibility and deadline checks. The current 
 outstanding sampling CUDA events. Prefill-formation and encoder-credit timers remain legacy/shadow fallbacks and are bypassed
 by active mode.
 
-Completion polling and dispatch are separate operations. Empty queues are not evaluated, and an in-flight E asks for a
-decode-only preview because E+P is outside the action set. This keeps one global decision per applied P/D dispatch rather
-than spinning on an action that cannot be launched.
+Completion polling and dispatch are separate operations. Empty queues are not evaluated, and an already in-flight E asks
+for a decode-only preview because a new E+P action can only be launched when both contexts are idle. This keeps one global
+decision per applied P/D dispatch rather than spinning on an action that cannot be launched.
 
 ## Modes and observability
 
@@ -107,7 +114,7 @@ than spinning on an action that cannot be launched.
 
 The real-request harness exposes the same choices through `TRT_EDGELLM_GLOBAL_SCHEDULER=disabled|shadow|active`. Phase
 metrics include selected actions, decisions, applied decisions, shadow disagreements, safe probes, WAIT decisions,
-deadline violation, service compression, E/D action counts, CUDA group times, and stable request IDs.
+deadline violation, service compression, E+P/E+D action counts, CUDA group times, and stable request IDs.
 
 ## Initial real-request gate
 
@@ -125,7 +132,14 @@ Global active was within 0.2% of legacy for throughput, text TPOT, and text E2E,
 this sample. Relative to the same-trace vLLM run, it delivered about 7.3% more generated tokens/s, 6.8% lower text TPOT
 p95, 6.8% lower text E2E p95, and 9.2% lower vision TTFT p95.
 
-Vision TTFT p95 regressed about 11.0% versus legacy. Legacy overlapped E with a contending P even though P/D overlap was
-zero; active mode serializes that pair because E+P is intentionally absent. Therefore active remains opt-in. The next
-promotion gate is to add E+P only after direct CUDA cost coverage and a safe-probe rule, then require no more than 3%
-regression for text TPOT and vision TTFT on text-only, mixed, and vision-heavy traces.
+Vision TTFT p95 regressed about 11.0% versus legacy in this initial gate, which motivated the E+P action. A controlled E4
++ P2 safe probe subsequently measured P at 121.84 ms instead of its roughly 34 ms uncontended value. The overlap
+makespan was only slightly below the serial upper bound while the older P request completed much later. E+P is therefore
+supported but remains direct-cost and slack gated. Production-request probing is disabled by default after the broader
+gate showed that even one apparently slack-safe probe can dominate a small workload's tail.
+
+The broader 12-workload gate found that active scheduling is not ready for default promotion. It retained exact token
+identity for all five text-only traces and one late-vision trace, but decode-heavy throughput regressed because global
+WAIT/refill formed many more, smaller decode cohorts. Mixed/VLM outputs remained semantically correct but were not exact
+cross-policy token traces. The next promotion requirement is a completion-aware decode refill action that recovers legacy
+cohort density before further overlap exploration.

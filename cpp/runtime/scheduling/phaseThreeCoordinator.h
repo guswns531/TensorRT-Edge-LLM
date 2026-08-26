@@ -70,6 +70,17 @@ struct PhaseEncoderDecodeBatchCost
     float makespanP95GpuMs{};
 };
 
+//! Direct E+P overlap point used until enough online observations exist.
+struct PhaseEncoderPrefillBatchCost
+{
+    size_t encoderBatchSize{};
+    int32_t prefillBatchSize{};
+    size_t maxEncoderInputTokens{};
+    int32_t maxPrefillChunkLength{};
+    int32_t maxPrefillPastKVLength{};
+    float makespanP95GpuMs{};
+};
+
 //! Select the first encoder batch that minimizes the measured cost of draining the current FIFO candidates.
 PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
     std::vector<size_t> const& candidateInputTokens, std::vector<PhaseVisionEncoderBatchCost> const& costs);
@@ -80,9 +91,11 @@ struct PhaseThreeCoordinatorConfig
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};
     double globalVisionPrefillColdStartUs{50000.0};
-    float globalSafeProbeSlackMultiplier{4.0F};
+    //! Zero disables production-request exploration; enable only for controlled warm-up probes.
+    float globalSafeProbeSlackMultiplier{};
     size_t globalSafeProbeInterval{32U};
     int32_t globalDecodeContextBucketTokens{512};
+    std::vector<PhaseEncoderPrefillBatchCost> globalEncoderPrefillCosts;
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
@@ -257,6 +270,7 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalDecisions{};
     size_t globalShadowDisagreements{};
     size_t globalEncoderSelections{};
+    size_t globalEncoderPrefillSelections{};
     size_t globalEncoderDecodeSelections{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
@@ -468,6 +482,7 @@ private:
         PhaseGlobalActionKey key;
         float referenceWorkMs{};
         float encoderGpuMs{};
+        float phaseGpuMs{};
     };
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
@@ -551,6 +566,7 @@ private:
     size_t mGlobalDecisions{};
     size_t mGlobalShadowDisagreements{};
     size_t mGlobalEncoderSelections{};
+    size_t mGlobalEncoderPrefillSelections{};
     size_t mGlobalEncoderDecodeSelections{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};

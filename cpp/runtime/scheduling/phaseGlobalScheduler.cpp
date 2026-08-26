@@ -31,7 +31,8 @@ namespace
 
 bool isOverlap(PhaseGlobalActionKind kind) noexcept
 {
-    return kind == PhaseGlobalActionKind::kEncoderDecode || kind == PhaseGlobalActionKind::kPrefillDecode;
+    return kind == PhaseGlobalActionKind::kEncoderPrefill || kind == PhaseGlobalActionKind::kEncoderDecode
+        || kind == PhaseGlobalActionKind::kPrefillDecode;
 }
 
 size_t saturatedAdd(size_t left, size_t right) noexcept
@@ -149,6 +150,7 @@ char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept
     case PhaseGlobalActionKind::kEncoder: result = "encoder"; break;
     case PhaseGlobalActionKind::kPrefill: result = "prefill"; break;
     case PhaseGlobalActionKind::kDecode: result = "decode"; break;
+    case PhaseGlobalActionKind::kEncoderPrefill: result = "encoder_prefill"; break;
     case PhaseGlobalActionKind::kEncoderDecode: result = "encoder_decode"; break;
     case PhaseGlobalActionKind::kPrefillDecode: result = "prefill_decode"; break;
     case PhaseGlobalActionKind::kWait: result = "wait"; break;

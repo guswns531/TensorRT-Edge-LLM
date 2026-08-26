@@ -274,6 +274,29 @@ void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoord
         }
     }
     ELLM_CHECK(!config.encoderBatchCosts.empty(), "Phase encoder cost table cannot be empty");
+    config.globalEncoderPrefillCosts.clear();
+    if (root.contains("encoder_prefill"))
+    {
+        ELLM_CHECK(root.at("encoder_prefill").is_array(), "Phase E+P cost table must be an array");
+        for (nlohmann::json const& point : root.at("encoder_prefill"))
+        {
+            config.globalEncoderPrefillCosts.push_back({point.at("encoder_batch_size").get<size_t>(),
+                point.at("prefill_batch_size").get<int32_t>(), point.at("max_encoder_input_tokens").get<size_t>(),
+                point.at("max_prefill_chunk_length").get<int32_t>(),
+                point.at("max_prefill_past_kv_length").get<int32_t>(), point.at("makespan_p95_gpu_ms").get<float>()});
+        }
+    }
+    config.globalEncoderDecodeCosts.clear();
+    if (root.contains("encoder_decode"))
+    {
+        ELLM_CHECK(root.at("encoder_decode").is_array(), "Phase E+D cost table must be an array");
+        for (nlohmann::json const& point : root.at("encoder_decode"))
+        {
+            config.globalEncoderDecodeCosts.push_back({point.at("encoder_batch_size").get<size_t>(),
+                point.at("decode_batch_size").get<int32_t>(), point.at("max_encoder_input_tokens").get<size_t>(),
+                point.at("max_decode_context_length").get<int32_t>(), point.at("makespan_p95_gpu_ms").get<float>()});
+        }
+    }
     config.enableCostAwareEncoderBatching = true;
 }
 
@@ -1853,6 +1876,14 @@ int main(int argc, char** argv)
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
+                if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
+                {
+                    threePhaseConfig.globalSafeProbeSlackMultiplier = std::stof(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_INTERVAL"))
+                {
+                    threePhaseConfig.globalSafeProbeInterval = static_cast<size_t>(std::stoull(value));
+                }
                 threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
                 {
@@ -2560,6 +2591,7 @@ int main(int argc, char** argv)
                         {"vision_global_decisions", visionMetrics.globalDecisions},
                         {"vision_global_shadow_disagreements", visionMetrics.globalShadowDisagreements},
                         {"vision_global_encoder_selections", visionMetrics.globalEncoderSelections},
+                        {"vision_global_encoder_prefill_selections", visionMetrics.globalEncoderPrefillSelections},
                         {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},

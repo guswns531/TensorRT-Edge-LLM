@@ -455,8 +455,15 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(std::isfinite(mConfig.globalVisionPrefillColdStartUs) && mConfig.globalVisionPrefillColdStartUs >= 0.0,
         "Global vision-prefill cold-start cost must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.globalSafeProbeSlackMultiplier) && mConfig.globalSafeProbeSlackMultiplier >= 0.0F,
-        "Global E+D safe-probe slack multiplier must be finite and non-negative");
-    ELLM_CHECK(mConfig.globalDecodeContextBucketTokens > 0, "Global E+D decode context bucket must be positive");
+        "Global overlap safe-probe slack multiplier must be finite and non-negative");
+    ELLM_CHECK(mConfig.globalDecodeContextBucketTokens > 0, "Global overlap context bucket must be positive");
+    for (PhaseEncoderPrefillBatchCost const& cost : mConfig.globalEncoderPrefillCosts)
+    {
+        ELLM_CHECK(cost.encoderBatchSize > 0U && cost.prefillBatchSize > 0 && cost.maxEncoderInputTokens > 0U
+                && cost.maxPrefillChunkLength > 0 && cost.maxPrefillPastKVLength >= 0
+                && std::isfinite(cost.makespanP95GpuMs) && cost.makespanP95GpuMs > 0.0F,
+            "Global E+P cost point is invalid");
+    }
     for (PhaseEncoderDecodeBatchCost const& cost : mConfig.globalEncoderDecodeCosts)
     {
         ELLM_CHECK(cost.encoderBatchSize > 0U && cost.decodeBatchSize > 0 && cost.maxEncoderInputTokens > 0U
@@ -823,6 +830,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalDecisions = mGlobalDecisions;
     result.globalShadowDisagreements = mGlobalShadowDisagreements;
     result.globalEncoderSelections = mGlobalEncoderSelections;
+    result.globalEncoderPrefillSelections = mGlobalEncoderPrefillSelections;
     result.globalEncoderDecodeSelections = mGlobalEncoderDecodeSelections;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
@@ -989,6 +997,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     PhaseGlobalActionCandidate encoder;
     encoder.key = encoderKey;
+    for (size_t const index : encoderBatchIndices)
+    {
+        encoder.requestIds.push_back(mPending[index].requestId);
+    }
     encoder.predictedBlockingUs = encoderMakespanUs;
     encoder.predictedMakespanUs = encoderMakespanUs;
     encoder.uncertaintyUs = encoderUncertaintyUs;
@@ -1027,12 +1039,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     bool const encoderExclusive = mConfig.exclusiveEncoderInputTokenThreshold > 0
         && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold;
-    if (pd.has_value() && pd->key.kind == PhaseGlobalActionKind::kDecode && !encoderExclusive
-        && !mConfig.enableAsyncEncoderPreparation)
-    {
-        PhaseGlobalActionKey const overlapKey{PhaseGlobalActionKind::kEncoderDecode,
-            static_cast<int32_t>(encoderBatchIndices.size()), pd->key.primaryBatchSize, 0, encoderContextBucket,
-            pd->key.primaryContextBucket};
+    auto addEncoderOverlap = [&](PhaseGlobalActionKind kind) {
+        ELLM_CHECK(pd.has_value(), "An encoder overlap requires a P/D candidate");
+        int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? pd->key.chunkLength : 0;
+        PhaseGlobalActionKey const overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
+            pd->key.primaryBatchSize, chunkLength, encoderContextBucket, pd->key.primaryContextBucket};
         double overlapMakespanUs = encoderMakespanUs + pd->predictedMakespanUs;
         double overlapUncertaintyUs = encoderUncertaintyUs + pd->uncertaintyUs;
         bool overlapKnown{};
@@ -1044,18 +1055,39 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         else
         {
-            for (PhaseEncoderDecodeBatchCost const& cost : mConfig.globalEncoderDecodeCosts)
+            if (kind == PhaseGlobalActionKind::kEncoderPrefill)
             {
-                if (cost.encoderBatchSize >= encoderBatchIndices.size()
-                    && cost.decodeBatchSize >= pd->key.primaryBatchSize
-                    && cost.maxEncoderInputTokens >= encoderInputTokens
-                    && cost.maxDecodeContextLength
-                        >= pd->key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
-                    && static_cast<double>(cost.makespanP95GpuMs) * 1000.0 < overlapMakespanUs)
+                for (PhaseEncoderPrefillBatchCost const& cost : mConfig.globalEncoderPrefillCosts)
                 {
-                    overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
-                    overlapUncertaintyUs = 0.0;
-                    overlapKnown = true;
+                    if (cost.encoderBatchSize >= encoderBatchIndices.size()
+                        && cost.prefillBatchSize >= pd->key.primaryBatchSize
+                        && cost.maxEncoderInputTokens >= encoderInputTokens
+                        && cost.maxPrefillChunkLength >= pd->key.chunkLength
+                        && cost.maxPrefillPastKVLength
+                            >= pd->key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
+                        && static_cast<double>(cost.makespanP95GpuMs) * 1000.0 < overlapMakespanUs)
+                    {
+                        overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
+                        overlapUncertaintyUs = 0.0;
+                        overlapKnown = true;
+                    }
+                }
+            }
+            else
+            {
+                for (PhaseEncoderDecodeBatchCost const& cost : mConfig.globalEncoderDecodeCosts)
+                {
+                    if (cost.encoderBatchSize >= encoderBatchIndices.size()
+                        && cost.decodeBatchSize >= pd->key.primaryBatchSize
+                        && cost.maxEncoderInputTokens >= encoderInputTokens
+                        && cost.maxDecodeContextLength
+                            >= pd->key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
+                        && static_cast<double>(cost.makespanP95GpuMs) * 1000.0 < overlapMakespanUs)
+                    {
+                        overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
+                        overlapUncertaintyUs = 0.0;
+                        overlapKnown = true;
+                    }
                 }
             }
         }
@@ -1070,6 +1102,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
         bool const safeProbe = !overlapKnown && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
             && protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
+        if (safeProbe)
+        {
+            double const optimisticMakespanUs = std::max(encoderMakespanUs, pd->predictedMakespanUs);
+            overlapMakespanUs = optimisticMakespanUs;
+            overlapUncertaintyUs = std::max(0.0, robustSerialUs - optimisticMakespanUs);
+        }
         PhaseGlobalActionCandidate overlap;
         overlap.key = overlapKey;
         overlap.overlapCostKnown = overlapKnown;
@@ -1080,6 +1118,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.referenceWorkUs = encoderReferenceUs + pd->referenceWorkUs;
         overlap.requestServiceLagUs = std::max(encoderServiceLagUs, pd->requestServiceLagUs);
         overlap.memory = encoder.memory;
+        overlap.memory.allocateBytes = saturatedAdd(overlap.memory.allocateBytes, pd->memory.allocateBytes);
+        overlap.memory.guaranteedGrowthBytes
+            = saturatedAdd(overlap.memory.guaranteedGrowthBytes, pd->memory.guaranteedGrowthBytes);
+        overlap.memory.nearReclaimBytes = saturatedAdd(overlap.memory.nearReclaimBytes, pd->memory.nearReclaimBytes);
+        overlap.requestIds = encoder.requestIds;
+        overlap.requestIds.insert(overlap.requestIds.end(), pd->requestIds.begin(), pd->requestIds.end());
         overlap.protectedCompletions.push_back(
             {encoderSlackUs, overlapMakespanUs + mConfig.globalVisionPrefillColdStartUs, overlapUncertaintyUs});
         for (PhaseProtectedCompletion completion : pd->protectedCompletions)
@@ -1089,6 +1133,17 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             overlap.protectedCompletions.push_back(completion);
         }
         candidates.push_back(std::move(overlap));
+    };
+    if (pd.has_value() && !encoderExclusive && !mConfig.enableAsyncEncoderPreparation)
+    {
+        if (pd->key.kind == PhaseGlobalActionKind::kPrefill)
+        {
+            addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill);
+        }
+        else if (pd->key.kind == PhaseGlobalActionKind::kDecode)
+        {
+            addEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode);
+        }
     }
 
     ++mGlobalDecisionSequence;
@@ -1121,21 +1176,29 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         ++mGlobalEncoderSelections;
         return startNextEncoder();
     }
-    if (selected.key.kind == PhaseGlobalActionKind::kEncoderDecode)
+    if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+        || selected.key.kind == PhaseGlobalActionKind::kEncoderDecode)
     {
         mGlobalEncoderBatchIndices = encoderBatchIndices;
         mInFlightGlobalEncoderKey = encoderKey;
         mInFlightGlobalEncoderReferenceMs = encoderReferenceUs / 1000.0;
         mPendingGlobalOverlapObservation = PendingGlobalOverlapObservation{
-            selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F};
+            selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F, 0.0F};
         bool const encoderStarted = startNextEncoder();
-        bool const decodeStarted = encoderStarted && mServer.dispatchGlobalAction(std::move(*pd));
-        if (!encoderStarted || !decodeStarted)
+        bool const phaseStarted = encoderStarted && mServer.dispatchGlobalAction(std::move(*pd));
+        if (!encoderStarted || !phaseStarted)
         {
             mPendingGlobalOverlapObservation.reset();
         }
-        ++mGlobalEncoderDecodeSelections;
-        return encoderStarted || decodeStarted;
+        if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill)
+        {
+            ++mGlobalEncoderPrefillSelections;
+        }
+        else
+        {
+            ++mGlobalEncoderDecodeSelections;
+        }
+        return encoderStarted || phaseStarted;
     }
     ++mGlobalPdSelections;
     return mServer.dispatchGlobalAction(std::move(selected));
@@ -1143,24 +1206,43 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
 void PhaseThreeCoordinator::completeGlobalOverlapObservation()
 {
-    if (!mPendingGlobalOverlapObservation.has_value() || mPendingGlobalOverlapObservation->encoderGpuMs <= 0.0F)
+    if (!mPendingGlobalOverlapObservation.has_value())
     {
         return;
     }
     std::optional<PhaseDispatchMetrics> const& dispatch = mServer.schedulerTelemetry().lastDispatch;
-    if (!dispatch.has_value() || !dispatch->externalEncoderActive || dispatch->decodeGpuMs <= 0.0F
-        || dispatch->decodeBatchSize != mPendingGlobalOverlapObservation->key.secondaryBatchSize)
+    PhaseGlobalActionKey const& key = mPendingGlobalOverlapObservation->key;
+    if (mPendingGlobalOverlapObservation->phaseGpuMs <= 0.0F && dispatch.has_value() && dispatch->externalEncoderActive)
+    {
+        if (key.kind == PhaseGlobalActionKind::kEncoderPrefill && dispatch->prefillGpuMs > 0.0F
+            && dispatch->prefillBatchSize == key.secondaryBatchSize && dispatch->prefillPaddedTokens > 0
+            && dispatch->prefillPaddedTokens / dispatch->prefillBatchSize == key.chunkLength)
+        {
+            int32_t const contextBucket = (dispatch->prefillPastKVMax + mConfig.globalDecodeContextBucketTokens - 1)
+                / mConfig.globalDecodeContextBucketTokens;
+            if (contextBucket == key.secondaryContextBucket)
+            {
+                mPendingGlobalOverlapObservation->phaseGpuMs = dispatch->prefillGpuMs;
+            }
+        }
+        else if (key.kind == PhaseGlobalActionKind::kEncoderDecode && dispatch->decodeGpuMs > 0.0F
+            && dispatch->decodeBatchSize == key.secondaryBatchSize)
+        {
+            int32_t const contextBucket
+                = (dispatch->plannedDecodeMaxContextLength + mConfig.globalDecodeContextBucketTokens - 1)
+                / mConfig.globalDecodeContextBucketTokens;
+            if (contextBucket == key.secondaryContextBucket)
+            {
+                mPendingGlobalOverlapObservation->phaseGpuMs = dispatch->decodeGpuMs;
+            }
+        }
+    }
+    if (mPendingGlobalOverlapObservation->encoderGpuMs <= 0.0F || mPendingGlobalOverlapObservation->phaseGpuMs <= 0.0F)
     {
         return;
     }
-    int32_t const contextBucket
-        = (dispatch->plannedDecodeMaxContextLength + mConfig.globalDecodeContextBucketTokens - 1)
-        / mConfig.globalDecodeContextBucketTokens;
-    if (contextBucket != mPendingGlobalOverlapObservation->key.secondaryContextBucket)
-    {
-        return;
-    }
-    float const makespanMs = std::max(mPendingGlobalOverlapObservation->encoderGpuMs, dispatch->decodeGpuMs);
+    float const makespanMs
+        = std::max(mPendingGlobalOverlapObservation->encoderGpuMs, mPendingGlobalOverlapObservation->phaseGpuMs);
     mGlobalCostModel.observe(
         mPendingGlobalOverlapObservation->key, {mPendingGlobalOverlapObservation->referenceWorkMs, makespanMs});
     mPendingGlobalOverlapObservation.reset();

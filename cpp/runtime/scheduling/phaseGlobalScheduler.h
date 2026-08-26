@@ -36,6 +36,7 @@ enum class PhaseGlobalActionKind
     kEncoder,
     kPrefill,
     kDecode,
+    kEncoderPrefill,
     kEncoderDecode,
     kPrefillDecode,
     kWait,

@@ -145,6 +145,35 @@ TEST(PhaseGlobalSchedulerTest, UnknownOverlapRequiresExplicitSafeProbe)
     EXPECT_TRUE(scheduler.select({overlap}).selectedIndex.has_value());
 }
 
+TEST(PhaseGlobalSchedulerTest, TreatsEncoderPrefillAsMeasuredOverlap)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kEncoderPrefill, 4000.0, 2500.0, 10000.0);
+    overlap.overlapCostKnown = false;
+    EXPECT_FALSE(scheduler.select({overlap}).selectedIndex.has_value());
+    overlap.safeProbeEligible = true;
+    EXPECT_TRUE(scheduler.select({overlap}).selectedIndex.has_value());
+    EXPECT_STREQ(phaseGlobalActionKindName(overlap.key.kind), "encoder_prefill");
+}
+
+TEST(PhaseGlobalSchedulerTest, ScoresSafeProbeByOptimisticMakespanWithSerialUncertainty)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate encoder = candidate(PhaseGlobalActionKind::kEncoder, 200000.0, 94000.0, 330000.0);
+    encoder.predictedMakespanUs = 94000.0;
+    encoder.uncertaintyUs = 2000.0;
+    PhaseGlobalActionCandidate probe = candidate(PhaseGlobalActionKind::kEncoderPrefill, 260000.0, 94000.0, 330000.0);
+    probe.predictedMakespanUs = 94000.0;
+    probe.uncertaintyUs = 60000.0;
+    probe.overlapCostKnown = false;
+    probe.safeProbeEligible = true;
+
+    PhaseGlobalDecision const decision = scheduler.select({encoder, probe});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+}
+
 TEST(PhaseGlobalSchedulerTest, RejectsUnboundedCandidateExplosion)
 {
     PhaseGlobalScheduler scheduler({2U, 0.0});
@@ -175,6 +204,18 @@ TEST(PhaseGlobalCostModelTest, RejectsOverlapWithoutRobustGain)
     model.observe(key, {30.0F, 29.8F});
     model.observe(key, {30.0F, 30.2F});
     EXPECT_FALSE(model.overlapEligible(key));
+}
+
+TEST(PhaseGlobalCostModelTest, LearnsEncoderPrefillCostByFullShapeKey)
+{
+    PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
+    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kEncoderPrefill, 4, 2, 128, 8, 0};
+    model.observe(key, {120.0F, 96.0F});
+    model.observe(key, {120.0F, 98.0F});
+    EXPECT_TRUE(model.overlapEligible(key));
+
+    PhaseGlobalActionKey const differentPastKV{PhaseGlobalActionKind::kEncoderPrefill, 4, 2, 128, 8, 1};
+    EXPECT_FALSE(model.overlapEligible(differentPastKV));
 }
 
 } // namespace
