@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <set>
@@ -101,6 +102,8 @@ struct PhaseThreeCoordinatorConfig
     float lookaheadDecodeTpotPressureLimit{0.8F};
     //! Move encoder enqueue behind the LLM poll and gate it by measured phase debt.
     bool enableEncoderDispatchArbitration{};
+    //! Run vision preprocessing on a worker while the coordinator continues polling prefill and decode.
+    bool enableAsyncEncoderPreparation{};
     //! Initial encoder cost used before the first CUDA-event sample is available.
     double encoderDispatchInitialCostUs{50000.0};
     //! Margin added to the latest encoder cost when protecting text TTFT.
@@ -170,6 +173,10 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderAgeForcedStarts{};
     size_t encoderCreditWaitPeriods{};
     size_t encoderCreditAgeReleases{};
+    size_t encoderPreparationStarts{};
+    size_t encoderPreparationCompletions{};
+    double lastEncoderPreparationUs{};
+    double maxEncoderPreparationUs{};
     size_t memoryBrokerDecisions{};
     size_t memoryBrokerEncoderReductions{};
     size_t memoryBrokerBackpressure{};
@@ -335,6 +342,7 @@ private:
 
     bool startNextEncoder();
     bool completeEncoder();
+    bool completeEncoderPreparation();
     bool dispatchReadyPrefill();
     std::vector<size_t> nextEncoderBatchIndices();
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
@@ -354,6 +362,7 @@ private:
     PhaseMemoryBroker mMemoryBroker;
     std::deque<PendingVisionRequest> mPending;
     std::vector<PendingVisionRequest> mEncoding;
+    std::future<std::shared_ptr<PhaseVisionPreparedBatch>> mEncoderPreparation;
     std::deque<ReadyPrefillRequest> mReadyPrefill;
     std::unordered_set<uint64_t> mRequestIds;
     std::unordered_map<uint64_t, double> mRequestTpotTargets;
@@ -404,6 +413,11 @@ private:
     size_t mEncoderAgeForcedStarts{};
     size_t mEncoderCreditWaitPeriods{};
     size_t mEncoderCreditAgeReleases{};
+    size_t mEncoderPreparationStarts{};
+    size_t mEncoderPreparationCompletions{};
+    double mLastEncoderPreparationUs{};
+    double mMaxEncoderPreparationUs{};
+    std::chrono::steady_clock::time_point mEncoderPreparationStartedAt;
     size_t mExclusiveEncoderBatches{};
     size_t mExclusiveEncoderPrefillDeferrals{};
     bool mExclusiveEncoderInFlight{};

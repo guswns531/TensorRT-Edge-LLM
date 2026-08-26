@@ -18,6 +18,7 @@
 #include "runtime/scheduling/phaseThreeCoordinator.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaMacros.h"
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +29,41 @@
 
 namespace trt_edgellm::rt
 {
+namespace
+{
+class ScopedCudaContext
+{
+public:
+    explicit ScopedCudaContext(CUcontext context)
+        : mContext(context)
+    {
+        ELLM_CHECK(mContext != nullptr, "Async vision preparation requires a CUDA context");
+        CUcontext current{};
+        CUDA_DRIVER_CHECK(cuCtxGetCurrent(&current));
+        if (current != mContext)
+        {
+            CUDA_DRIVER_CHECK(cuCtxPushCurrent(mContext));
+            mPushed = true;
+        }
+    }
+
+    ~ScopedCudaContext() noexcept
+    {
+        if (mPushed)
+        {
+            CUcontext popped{};
+            static_cast<void>(cuCtxPopCurrent(&popped));
+        }
+    }
+
+    ScopedCudaContext(ScopedCudaContext const&) = delete;
+    ScopedCudaContext& operator=(ScopedCudaContext const&) = delete;
+
+private:
+    CUcontext mContext{};
+    bool mPushed{};
+};
+} // namespace
 
 PhaseSchedulingHints phaseVisionSchedulingHints(
     PhaseSchedulingHints scheduling, double defaultTtftTargetUs, std::chrono::steady_clock::time_point now)
@@ -459,7 +495,10 @@ bool PhaseThreeCoordinator::poll()
     {
         progressed = startNextEncoder() || progressed;
     }
-    mVision.reclaimIdleStorage();
+    if (!mEncoderPreparation.valid())
+    {
+        mVision.reclaimIdleStorage();
+    }
     return progressed;
 }
 
@@ -519,6 +558,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderAgeForcedStarts = mEncoderAgeForcedStarts;
     result.encoderCreditWaitPeriods = mEncoderCreditWaitPeriods;
     result.encoderCreditAgeReleases = mEncoderCreditAgeReleases;
+    result.encoderPreparationStarts = mEncoderPreparationStarts;
+    result.encoderPreparationCompletions = mEncoderPreparationCompletions;
+    result.lastEncoderPreparationUs = mLastEncoderPreparationUs;
+    result.maxEncoderPreparationUs = mMaxEncoderPreparationUs;
     result.memoryBrokerDecisions = mMemoryBrokerDecisions;
     result.memoryBrokerEncoderReductions = mMemoryBrokerEncoderReductions;
     result.memoryBrokerBackpressure = mMemoryBrokerBackpressure;
@@ -676,7 +719,22 @@ bool PhaseThreeCoordinator::startNextEncoder()
     }
     try
     {
-        ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
+        if (mConfig.enableAsyncEncoderPreparation)
+        {
+            ELLM_CHECK(!mEncoderPreparation.valid(), "An async encoder preparation is already active");
+            CUcontext const cudaContext = mVision.cudaContext();
+            mEncoderPreparationStartedAt = std::chrono::steady_clock::now();
+            mEncoderPreparation
+                = std::async(std::launch::async, [this, cudaContext, submissions = std::move(submissions)]() mutable {
+                      ScopedCudaContext context(cudaContext);
+                      return mVision.prepare(std::move(submissions));
+                  });
+            ++mEncoderPreparationStarts;
+        }
+        else
+        {
+            ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
+        }
     }
     catch (...)
     {
@@ -702,9 +760,45 @@ bool PhaseThreeCoordinator::startNextEncoder()
     return true;
 }
 
+bool PhaseThreeCoordinator::completeEncoderPreparation()
+{
+    if (!mEncoderPreparation.valid())
+    {
+        return true;
+    }
+    if (mEncoderPreparation.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    {
+        return false;
+    }
+    try
+    {
+        std::shared_ptr<PhaseVisionPreparedBatch> prepared = mEncoderPreparation.get();
+        mLastEncoderPreparationUs
+            = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mEncoderPreparationStartedAt)
+                  .count();
+        mMaxEncoderPreparationUs = std::max(mMaxEncoderPreparationUs, mLastEncoderPreparationUs);
+        ++mEncoderPreparationCompletions;
+        ELLM_CHECK(mVision.submitPrepared(std::move(prepared)), "Failed to submit prepared encoder batch");
+    }
+    catch (...)
+    {
+        if (mExclusiveEncoderInFlight)
+        {
+            mServer.setPrefillDispatchBlocked(false);
+            mExclusiveEncoderInFlight = false;
+        }
+        throw;
+    }
+    return true;
+}
+
 bool PhaseThreeCoordinator::completeEncoder()
 {
     if (mEncoding.empty())
+    {
+        return false;
+    }
+    if (!completeEncoderPreparation())
     {
         return false;
     }

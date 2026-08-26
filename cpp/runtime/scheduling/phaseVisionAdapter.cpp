@@ -42,6 +42,17 @@ struct PhaseVisionMropeStorage
     Tensor mropeCosSin;
 };
 
+struct PhaseVisionPreparedBatch
+{
+    std::vector<PhaseVisionSubmission> submissions;
+    LLMGenerationRequest batchedRequest;
+    std::vector<std::unique_ptr<PhaseVisionPayload>> payloads;
+    std::shared_ptr<PhaseVisionBatchStorage> storage;
+    std::shared_ptr<PhaseVisionMropeStorage> mropeStorage;
+    std::vector<std::vector<int32_t>> tokenIds;
+    std::vector<int64_t> embeddingRows;
+};
+
 namespace
 {
 void resizeTensor(Tensor& destination, Tensor const& source, std::string const& name)
@@ -265,6 +276,11 @@ bool PhaseVisionAdapter::submit(uint64_t requestId, LLMGenerationRequest const& 
 
 bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
 {
+    return submitPrepared(prepare(std::move(submissions)));
+}
+
+std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vector<PhaseVisionSubmission> submissions)
+{
     ELLM_CHECK(mRequests.empty(), "Phase vision adapter currently permits one in-flight encoder batch");
     ELLM_CHECK(!submissions.empty(), "Phase vision encoder batch cannot be empty");
     std::unordered_set<uint64_t> requestIds;
@@ -276,10 +292,13 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             "Each phase vision submission must contain exactly one logical request");
     }
 
-    LLMGenerationRequest batchedRequest = std::move(submissions.front().request);
-    for (size_t index = 1; index < submissions.size(); ++index)
+    auto prepared = std::make_shared<PhaseVisionPreparedBatch>();
+    prepared->submissions = std::move(submissions);
+    LLMGenerationRequest& batchedRequest = prepared->batchedRequest;
+    batchedRequest = std::move(prepared->submissions.front().request);
+    for (size_t index = 1; index < prepared->submissions.size(); ++index)
     {
-        LLMGenerationRequest& request = submissions[index].request;
+        LLMGenerationRequest& request = prepared->submissions[index].request;
         ELLM_CHECK(request.applyChatTemplate == batchedRequest.applyChatTemplate
                 && request.addGenerationPrompt == batchedRequest.addGenerationPrompt
                 && request.enableThinking == batchedRequest.enableThinking,
@@ -295,33 +314,29 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
                 batchedRequest.applyChatTemplate, batchedRequest.addGenerationPrompt, batchedRequest.enableThinking),
             "Failed to format phase vision request");
     }
-    mBatchedRequest.emplace(std::move(batchedRequest));
-
-    std::vector<std::unique_ptr<PhaseVisionPayload>> payloads;
-    payloads.reserve(submissions.size());
-    std::shared_ptr<PhaseVisionBatchStorage> const storage = acquireBatchStorage();
-    std::shared_ptr<PhaseVisionMropeStorage> mropeStorage;
-    Tensor* mropeCosSin = &storage->mropeCosSin;
+    prepared->payloads.reserve(prepared->submissions.size());
+    prepared->storage = acquireBatchStorage();
+    Tensor* mropeCosSin = &prepared->storage->mropeCosSin;
     if (mStoragePolicy.splitMropeLease)
     {
-        storage->mropeCosSin = Tensor{};
-        mropeStorage = std::make_shared<PhaseVisionMropeStorage>();
-        mropeCosSin = &mropeStorage->mropeCosSin;
+        prepared->storage->mropeCosSin = Tensor{};
+        prepared->mropeStorage = std::make_shared<PhaseVisionMropeStorage>();
+        mropeCosSin = &prepared->mropeStorage->mropeCosSin;
     }
     try
     {
-        for (size_t index = 0; index < submissions.size(); ++index)
+        for (size_t index = 0; index < prepared->submissions.size(); ++index)
         {
             auto payload = std::make_unique<PhaseVisionPayload>();
             CUDA_CHECK(cudaEventCreate(&payload->startEvent));
             CUDA_CHECK(cudaEventCreate(&payload->readyEvent));
             CUDA_CHECK(cudaEventRecord(payload->startEvent, mStream));
-            payloads.push_back(std::move(payload));
+            prepared->payloads.push_back(std::move(payload));
         }
 
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            int64_t const activeBatchSize = static_cast<int64_t>(submissions.size());
+            int64_t const activeBatchSize = static_cast<int64_t>(prepared->submissions.size());
             ELLM_CHECK(activeBatchSize <= mConfig.maxSupportedBatchSize,
                 "Phase vision M-RoPE batch is outside the engine profile");
             Coords const requiredShape{activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim};
@@ -343,14 +358,13 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
         }
         OptionalOutputTensor mrope
             = mropeCosSin->isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(*mropeCosSin)};
-        std::vector<std::vector<int32_t>> batchedTokenIds;
-        ELLM_CHECK(mRunner.preprocess(*mBatchedRequest, batchedTokenIds, &mTokenizer, mrope, mStream),
+        ELLM_CHECK(mRunner.preprocess(prepared->batchedRequest, prepared->tokenIds, &mTokenizer, mrope, mStream),
             "Phase vision preprocessing failed");
-        ELLM_CHECK(batchedTokenIds.size() == submissions.size(),
+        ELLM_CHECK(prepared->tokenIds.size() == prepared->submissions.size(),
             "Phase vision preprocessing returned the wrong logical batch size");
-
-        std::vector<int64_t> const embeddingRows = phaseVisionEmbeddingRows(batchedTokenIds, mConfig.imageTokenId);
-        int64_t const totalEmbeddingRows = std::accumulate(embeddingRows.begin(), embeddingRows.end(), int64_t{});
+        prepared->embeddingRows = phaseVisionEmbeddingRows(prepared->tokenIds, mConfig.imageTokenId);
+        int64_t const totalEmbeddingRows
+            = std::accumulate(prepared->embeddingRows.begin(), prepared->embeddingRows.end(), int64_t{});
         Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
         ELLM_CHECK(outputEmbedding.getShape().getNumDims() > 0 && outputEmbedding.getShape()[0] == totalEmbeddingRows,
             "Phase vision embedding rows do not match expanded image-token rows");
@@ -360,16 +374,49 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             ELLM_CHECK(feature.getShape().getNumDims() > 0 && feature.getShape()[0] == totalEmbeddingRows,
                 "Phase vision deepstack rows do not match expanded image-token rows");
         }
-        resizeTensor(storage->outputEmbedding, outputEmbedding, "phase_vision_batch_output");
-        storage->deepstackFeatures.resize(deepstackFeatures.size());
+        resizeTensor(prepared->storage->outputEmbedding, outputEmbedding, "phase_vision_batch_output");
+        prepared->storage->deepstackFeatures.resize(deepstackFeatures.size());
+        for (size_t index{}; index < deepstackFeatures.size(); ++index)
+        {
+            resizeTensor(
+                prepared->storage->deepstackFeatures[index], deepstackFeatures[index], "phase_vision_batch_deepstack");
+        }
+    }
+    catch (...)
+    {
+        static_cast<void>(cudaStreamSynchronize(mStream));
+        throw;
+    }
+    return prepared;
+}
+
+bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch> prepared)
+{
+    ELLM_CHECK(prepared != nullptr, "Phase vision prepared batch cannot be null");
+    ELLM_CHECK(mRequests.empty(), "Phase vision adapter currently permits one in-flight encoder batch");
+    ELLM_CHECK(!prepared->submissions.empty(), "Phase vision prepared batch cannot be empty");
+    ELLM_CHECK(prepared->payloads.size() == prepared->submissions.size()
+            && prepared->tokenIds.size() == prepared->submissions.size()
+            && prepared->embeddingRows.size() == prepared->submissions.size(),
+        "Phase vision prepared batch has inconsistent logical row counts");
+
+    mBatchedRequest.emplace(std::move(prepared->batchedRequest));
+    Tensor* mropeCosSin
+        = prepared->mropeStorage == nullptr ? &prepared->storage->mropeCosSin : &prepared->mropeStorage->mropeCosSin;
+    try
+    {
+        int64_t const totalEmbeddingRows
+            = std::accumulate(prepared->embeddingRows.begin(), prepared->embeddingRows.end(), int64_t{});
+        Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
+        OptionalInputTensors const deepstackFeatures = mRunner.getDeepstackFeatures();
         std::vector<std::reference_wrapper<Tensor>> externalDeepstack;
         externalDeepstack.reserve(deepstackFeatures.size());
         for (size_t index{}; index < deepstackFeatures.size(); ++index)
         {
-            resizeTensor(storage->deepstackFeatures[index], deepstackFeatures[index], "phase_vision_batch_deepstack");
-            externalDeepstack.emplace_back(storage->deepstackFeatures[index]);
+            externalDeepstack.emplace_back(prepared->storage->deepstackFeatures[index]);
         }
-        bool const directOutput = mRunner.bindExternalOutputStorage(storage->outputEmbedding, externalDeepstack);
+        bool const directOutput
+            = mRunner.bindExternalOutputStorage(prepared->storage->outputEmbedding, externalDeepstack);
         ELLM_CHECK(mRunner.infer(mStream), "Phase vision inference failed");
         if (directOutput)
         {
@@ -377,38 +424,38 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
                 return static_cast<size_t>(tensor.getShape().volume()) * utils::getTypeSize(tensor.getDataType());
             };
             ++mMemoryStats.directOutputBatches;
-            mMemoryStats.directOutputBytes += activeBytes(storage->outputEmbedding);
-            for (Tensor const& feature : storage->deepstackFeatures)
+            mMemoryStats.directOutputBytes += activeBytes(prepared->storage->outputEmbedding);
+            for (Tensor const& feature : prepared->storage->deepstackFeatures)
             {
                 mMemoryStats.directOutputBytes += activeBytes(feature);
             }
-            if (!storage->mropeCosSin.isEmpty())
+            if (!prepared->storage->mropeCosSin.isEmpty())
             {
-                mMemoryStats.directOutputBytes += activeBytes(storage->mropeCosSin);
+                mMemoryStats.directOutputBytes += activeBytes(prepared->storage->mropeCosSin);
             }
         }
         else
         {
-            copyRunnerOutputs(*storage, outputEmbedding, deepstackFeatures);
+            copyRunnerOutputs(*prepared->storage, outputEmbedding, deepstackFeatures);
         }
 
         int64_t embeddingOffset{};
         std::vector<PhaseVisionDebugSnapshot> debugSnapshots;
         if (mDebugCallback)
         {
-            debugSnapshots.reserve(submissions.size());
+            debugSnapshots.reserve(prepared->submissions.size());
         }
-        for (size_t index = 0; index < submissions.size(); ++index)
+        for (size_t index = 0; index < prepared->submissions.size(); ++index)
         {
-            int64_t const rowCount = embeddingRows[index];
+            int64_t const rowCount = prepared->embeddingRows[index];
             ELLM_CHECK(rowCount > 0, "Phase vision logical request produced no image embedding rows");
-            PhaseVisionPayload& payload = *payloads[index];
-            payload.storageOwner = storage;
-            payload.mropeStorageOwner = mropeStorage;
-            payload.tokenIds.push_back(std::move(batchedTokenIds[index]));
+            PhaseVisionPayload& payload = *prepared->payloads[index];
+            payload.storageOwner = prepared->storage;
+            payload.mropeStorageOwner = prepared->mropeStorage;
+            payload.tokenIds.push_back(std::move(prepared->tokenIds[index]));
             payload.outputEmbedding
-                = viewTensorRows(storage->outputEmbedding, embeddingOffset, rowCount, "phase_vision_output");
-            for (Tensor& feature : storage->deepstackFeatures)
+                = viewTensorRows(prepared->storage->outputEmbedding, embeddingOffset, rowCount, "phase_vision_output");
+            for (Tensor& feature : prepared->storage->deepstackFeatures)
             {
                 payload.deepstackFeatures.push_back(
                     viewTensorRows(feature, embeddingOffset, rowCount, "phase_vision_deepstack"));
@@ -421,8 +468,8 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
             if (mDebugCallback)
             {
                 PhaseVisionDebugSnapshot snapshot;
-                snapshot.requestId = submissions[index].requestId;
-                snapshot.encoderBatchSize = submissions.size();
+                snapshot.requestId = prepared->submissions[index].requestId;
+                snapshot.encoderBatchSize = prepared->submissions.size();
                 snapshot.encoderBatchIndex = index;
                 snapshot.tokenIds = payload.tokenIds.front();
                 snapshot.outputEmbedding = captureDebugTensor(payload.outputEmbedding, mStream);
@@ -449,9 +496,10 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
         throw;
     }
 
-    for (size_t index = 0; index < submissions.size(); ++index)
+    for (size_t index = 0; index < prepared->submissions.size(); ++index)
     {
-        ELLM_CHECK(mRequests.emplace(submissions[index].requestId, std::move(payloads[index])).second,
+        ELLM_CHECK(
+            mRequests.emplace(prepared->submissions[index].requestId, std::move(prepared->payloads[index])).second,
             "Failed to register phase vision batch request");
     }
     return true;

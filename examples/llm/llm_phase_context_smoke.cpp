@@ -47,6 +47,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -63,6 +64,104 @@ namespace
 
 constexpr int32_t kDEFAULT_STABLE_SLOTS = 80;
 constexpr size_t kDEFAULT_MAX_INFLIGHT_REQUESTS = 16U;
+
+struct PhaseIpcInput
+{
+    uint64_t requestId{};
+    bool cancel{};
+    bool valid{true};
+    std::string error;
+    rt::LLMGenerationRequest::Request request;
+    int32_t maxOutputTokens{};
+    rt::PhaseSchedulingHints scheduling;
+    double adapterUs{};
+};
+
+PhaseIpcInput parsePhaseIpcInput(std::string const& line, int32_t defaultMaxOutputTokens)
+{
+    PhaseIpcInput result;
+    result.maxOutputTokens = defaultMaxOutputTokens;
+    try
+    {
+        nlohmann::json const payload = nlohmann::json::parse(line);
+        result.requestId = payload.value("request_index", uint64_t{});
+        result.cancel = payload.value("type", "submit") == "cancel";
+        if (result.cancel)
+        {
+            return result;
+        }
+        nlohmann::json const requestPayload = payload.contains("request") ? payload.at("request") : payload;
+        if (requestPayload.contains("messages") && requestPayload.at("messages").is_array())
+        {
+            for (auto const& message : requestPayload.at("messages"))
+            {
+                rt::Message parsedMessage;
+                parsedMessage.role = message.value("role", "user");
+                if (message.contains("content") && message.at("content").is_string())
+                {
+                    parsedMessage.contents.push_back({"text", message.at("content").get<std::string>()});
+                }
+                else if (message.contains("content") && message.at("content").is_array())
+                {
+                    for (auto const& part : message.at("content"))
+                    {
+                        if (part.value("type", "") == "text" && part.contains("text"))
+                        {
+                            parsedMessage.contents.push_back({"text", part.at("text").get<std::string>()});
+                        }
+                        else if (part.value("type", "") == "image_url" && part.contains("image_url"))
+                        {
+                            nlohmann::json const& imageUrl = part.at("image_url");
+                            std::string path
+                                = imageUrl.is_string() ? imageUrl.get<std::string>() : imageUrl.value("url", "");
+                            std::string const fileScheme = "file://";
+                            if (path.compare(0, fileScheme.size(), fileScheme) == 0)
+                            {
+                                path.erase(0, fileScheme.size());
+                            }
+                            if (path.empty() || path.find("://") != std::string::npos)
+                            {
+                                result.valid = false;
+                                result.error = "phase backend accepts local file image_url paths";
+                                return result;
+                            }
+                            parsedMessage.contents.push_back({"image", ""});
+                            result.request.imageBuffers.push_back(rt::imageUtils::loadImageFromFile(path));
+                        }
+                    }
+                }
+                result.request.messages.push_back(std::move(parsedMessage));
+            }
+        }
+        if (requestPayload.contains("max_output_tokens"))
+        {
+            result.maxOutputTokens = requestPayload.at("max_output_tokens").get<int32_t>();
+        }
+        else if (requestPayload.contains("max_tokens"))
+        {
+            result.maxOutputTokens = requestPayload.at("max_tokens").get<int32_t>();
+        }
+        else if (requestPayload.contains("max_generate_length"))
+        {
+            result.maxOutputTokens = requestPayload.at("max_generate_length").get<int32_t>();
+        }
+        if (requestPayload.contains("metadata") && requestPayload.at("metadata").is_object())
+        {
+            nlohmann::json const& metadata = requestPayload.at("metadata");
+            nlohmann::json const& phaseScheduling
+                = metadata.contains("phase_scheduling") ? metadata.at("phase_scheduling") : metadata;
+            result.scheduling.priority = phaseScheduling.value("priority", 0);
+            result.scheduling.ttftTargetUs = phaseScheduling.value("ttft_target_ms", 0.0) * 1000.0;
+            result.scheduling.tpotTargetUs = phaseScheduling.value("tpot_target_ms", 0.0) * 1000.0;
+        }
+    }
+    catch (std::exception const& exception)
+    {
+        result.valid = false;
+        result.error = exception.what();
+    }
+    return result;
+}
 
 rt::PhasePrefillClass parsePrefillClass(nlohmann::json const& point)
 {
@@ -1716,6 +1815,8 @@ int main(int argc, char** argv)
                 }
                 threePhaseConfig.enableEncoderDispatchArbitration
                     = std::getenv("TRT_EDGELLM_VISION_ENCODER_ARBITER") != nullptr;
+                threePhaseConfig.enableAsyncEncoderPreparation
+                    = std::getenv("TRT_EDGELLM_VISION_ASYNC_PREPARATION") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_INITIAL_COST_US"))
                 {
                     threePhaseConfig.encoderDispatchInitialCostUs = std::stod(value);
@@ -1784,8 +1885,18 @@ int main(int argc, char** argv)
                     });
                 }
             }
+            bool const asyncRequestAdapter = std::getenv("TRT_EDGELLM_IPC_ASYNC_REQUEST_ADAPTER") != nullptr;
+            size_t requestAdapterWorkers = 4U;
+            if (char const* value = std::getenv("TRT_EDGELLM_IPC_REQUEST_ADAPTER_WORKERS"))
+            {
+                requestAdapterWorkers = static_cast<size_t>(std::stoull(value));
+            }
+            ELLM_CHECK(requestAdapterWorkers > 0, "IPC request adapter worker count must be positive");
             std::deque<std::string> pendingLines;
+            std::deque<PhaseIpcInput> pendingInputs;
+            std::deque<std::future<PhaseIpcInput>> pendingInputTasks;
             std::mutex pendingMutex;
+            std::condition_variable inputAdapterReady;
             bool inputClosed{};
             std::deque<std::string> outputLines;
             std::mutex outputMutex;
@@ -1885,14 +1996,35 @@ int main(int argc, char** argv)
                 nativeCompletionEvents.pop_front();
                 return event;
             };
+            double ipcRequestAdapterUs{};
+            size_t ipcRequestAdapterInputs{};
             std::thread inputReader([&]() {
                 std::string line;
                 while (std::getline(std::cin, line))
                 {
                     if (!line.empty())
                     {
-                        std::lock_guard<std::mutex> lock(pendingMutex);
-                        pendingLines.push_back(std::move(line));
+                        if (asyncRequestAdapter)
+                        {
+                            std::unique_lock<std::mutex> lock(pendingMutex);
+                            inputAdapterReady.wait(
+                                lock, [&]() { return pendingInputTasks.size() < requestAdapterWorkers; });
+                            pendingInputTasks.push_back(std::async(std::launch::async,
+                                [line = std::move(line),
+                                    defaultMaxOutputTokens = serverConfig.defaultMaxOutputTokens]() {
+                                    auto const adapterStart = std::chrono::steady_clock::now();
+                                    PhaseIpcInput input = parsePhaseIpcInput(line, defaultMaxOutputTokens);
+                                    input.adapterUs = std::chrono::duration<double, std::micro>(
+                                        std::chrono::steady_clock::now() - adapterStart)
+                                                          .count();
+                                    return input;
+                                }));
+                        }
+                        else
+                        {
+                            std::lock_guard<std::mutex> lock(pendingMutex);
+                            pendingLines.push_back(std::move(line));
+                        }
                     }
                 }
                 std::lock_guard<std::mutex> lock(pendingMutex);
@@ -1907,107 +2039,67 @@ int main(int argc, char** argv)
             while (true)
             {
                 std::deque<std::string> lines;
+                std::deque<PhaseIpcInput> inputs;
                 {
                     std::lock_guard<std::mutex> lock(pendingMutex);
                     lines.swap(pendingLines);
+                    inputs.swap(pendingInputs);
                 }
-                bool madeProgress = !lines.empty();
+                while (true)
+                {
+                    std::future<PhaseIpcInput> task;
+                    {
+                        std::lock_guard<std::mutex> lock(pendingMutex);
+                        if (pendingInputTasks.empty()
+                            || pendingInputTasks.front().wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                        {
+                            break;
+                        }
+                        task = std::move(pendingInputTasks.front());
+                        pendingInputTasks.pop_front();
+                    }
+                    inputAdapterReady.notify_one();
+                    PhaseIpcInput input = task.get();
+                    ipcRequestAdapterUs += input.adapterUs;
+                    ++ipcRequestAdapterInputs;
+                    inputs.push_back(std::move(input));
+                }
+                bool madeProgress = !lines.empty() || !inputs.empty();
                 auto const ingressStart = std::chrono::steady_clock::now();
                 size_t ingestedLines{};
-                while (!lines.empty() && ingestedLines < ipcIngressQuantum)
+                while ((!lines.empty() || !inputs.empty()) && ingestedLines < ipcIngressQuantum)
                 {
-                    nlohmann::json const payload = nlohmann::json::parse(lines.front());
-                    uint64_t const requestId = payload.value("request_index", uint64_t{});
-                    if (payload.value("type", "submit") == "cancel")
+                    PhaseIpcInput input = !inputs.empty()
+                        ? std::move(inputs.front())
+                        : parsePhaseIpcInput(lines.front(), serverConfig.defaultMaxOutputTokens);
+                    if (!inputs.empty())
+                    {
+                        inputs.pop_front();
+                    }
+                    else
+                    {
+                        lines.pop_front();
+                    }
+                    uint64_t const requestId = input.requestId;
+                    if (!input.valid)
+                    {
+                        emitEvent({{"type", "error"}, {"request_index", requestId}, {"message", input.error}});
+                        ++ingestedLines;
+                        continue;
+                    }
+                    if (input.cancel)
                     {
                         bool const cancelled = ipcThreePhase != nullptr ? ipcThreePhase->cancel(requestId)
                                                                         : semanticServer.cancel(requestId);
                         nlohmann::json const cancelEvent{
                             {"type", "cancelled"}, {"request_index", requestId}, {"cancelled", cancelled}};
                         emitEvent(cancelEvent);
-                        lines.pop_front();
                         ++ingestedLines;
                         continue;
                     }
-                    nlohmann::json const requestPayload = payload.contains("request") ? payload.at("request") : payload;
-                    rt::LLMGenerationRequest::Request request;
-                    bool validRequest{true};
-                    if (requestPayload.contains("messages") && requestPayload.at("messages").is_array())
-                    {
-                        for (auto const& message : requestPayload.at("messages"))
-                        {
-                            rt::Message parsedMessage;
-                            parsedMessage.role = message.value("role", "user");
-                            if (message.contains("content") && message.at("content").is_string())
-                            {
-                                parsedMessage.contents.push_back({"text", message.at("content").get<std::string>()});
-                            }
-                            else if (message.contains("content") && message.at("content").is_array())
-                            {
-                                for (auto const& part : message.at("content"))
-                                {
-                                    if (part.value("type", "") == "text" && part.contains("text"))
-                                    {
-                                        parsedMessage.contents.push_back({"text", part.at("text").get<std::string>()});
-                                    }
-                                    else if (part.value("type", "") == "image_url" && part.contains("image_url"))
-                                    {
-                                        nlohmann::json const& imageUrl = part.at("image_url");
-                                        std::string path = imageUrl.is_string() ? imageUrl.get<std::string>()
-                                                                                : imageUrl.value("url", std::string{});
-                                        std::string const fileScheme = "file://";
-                                        if (path.compare(0, fileScheme.size(), fileScheme) == 0)
-                                        {
-                                            path.erase(0, fileScheme.size());
-                                        }
-                                        if (path.empty() || path.find("://") != std::string::npos)
-                                        {
-                                            validRequest = false;
-                                            emitEvent({{"type", "error"}, {"request_index", requestId},
-                                                {"message", "phase backend accepts local file image_url paths"}});
-                                            break;
-                                        }
-                                        parsedMessage.contents.push_back({"image", ""});
-                                        request.imageBuffers.push_back(rt::imageUtils::loadImageFromFile(path));
-                                    }
-                                }
-                            }
-                            request.messages.push_back(std::move(parsedMessage));
-                            if (!validRequest)
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    if (!validRequest)
-                    {
-                        lines.pop_front();
-                        ++ingestedLines;
-                        continue;
-                    }
-                    int32_t maxOutputTokens = serverConfig.defaultMaxOutputTokens;
-                    if (requestPayload.contains("max_output_tokens"))
-                    {
-                        maxOutputTokens = requestPayload.at("max_output_tokens").get<int32_t>();
-                    }
-                    else if (requestPayload.contains("max_tokens"))
-                    {
-                        maxOutputTokens = requestPayload.at("max_tokens").get<int32_t>();
-                    }
-                    else if (requestPayload.contains("max_generate_length"))
-                    {
-                        maxOutputTokens = requestPayload.at("max_generate_length").get<int32_t>();
-                    }
-                    rt::PhaseSchedulingHints scheduling;
-                    if (requestPayload.contains("metadata") && requestPayload.at("metadata").is_object())
-                    {
-                        nlohmann::json const& metadata = requestPayload.at("metadata");
-                        nlohmann::json const& phaseScheduling
-                            = metadata.contains("phase_scheduling") ? metadata.at("phase_scheduling") : metadata;
-                        scheduling.priority = phaseScheduling.value("priority", 0);
-                        scheduling.ttftTargetUs = phaseScheduling.value("ttft_target_ms", 0.0) * 1000.0;
-                        scheduling.tpotTargetUs = phaseScheduling.value("tpot_target_ms", 0.0) * 1000.0;
-                    }
+                    rt::LLMGenerationRequest::Request request = std::move(input.request);
+                    int32_t const maxOutputTokens = input.maxOutputTokens;
+                    rt::PhaseSchedulingHints const scheduling = input.scheduling;
                     bool accepted{};
                     if (!request.imageBuffers.empty())
                     {
@@ -2048,9 +2140,9 @@ int main(int argc, char** argv)
                     }
                     if (!accepted)
                     {
+                        inputs.push_front(std::move(input));
                         break;
                     }
-                    lines.pop_front();
                     ++ingestedLines;
                 }
                 ipcIngressUs
@@ -2157,6 +2249,10 @@ int main(int argc, char** argv)
                         {"vision_encoder_age_forced_starts", visionMetrics.encoderAgeForcedStarts},
                         {"vision_encoder_credit_wait_periods", visionMetrics.encoderCreditWaitPeriods},
                         {"vision_encoder_credit_age_releases", visionMetrics.encoderCreditAgeReleases},
+                        {"vision_encoder_preparation_starts", visionMetrics.encoderPreparationStarts},
+                        {"vision_encoder_preparation_completions", visionMetrics.encoderPreparationCompletions},
+                        {"vision_encoder_preparation_ms", visionMetrics.lastEncoderPreparationUs / 1000.0},
+                        {"vision_encoder_preparation_max_ms", visionMetrics.maxEncoderPreparationUs / 1000.0},
                         {"vision_encoder_exclusive_batches", visionMetrics.exclusiveEncoderBatches},
                         {"vision_encoder_exclusive_prefill_deferrals", visionMetrics.exclusiveEncoderPrefillDeferrals},
                         {"phase_memory_broker_decisions", visionMetrics.memoryBrokerDecisions},
@@ -2239,13 +2335,13 @@ int main(int argc, char** argv)
                     std::lock_guard<std::mutex> lock(pendingMutex);
                     closed = inputClosed;
                 }
-                bool noPendingLines{};
+                bool noPendingInput{};
                 {
                     std::lock_guard<std::mutex> lock(pendingMutex);
-                    noPendingLines = pendingLines.empty();
+                    noPendingInput = pendingLines.empty() && pendingInputs.empty() && pendingInputTasks.empty();
                 }
                 bool const serverEmpty = ipcThreePhase != nullptr ? ipcThreePhase->empty() : semanticServer.empty();
-                if (closed && lines.empty() && noPendingLines && serverEmpty)
+                if (closed && lines.empty() && inputs.empty() && noPendingInput && serverEmpty)
                 {
                     break;
                 }
@@ -2256,6 +2352,15 @@ int main(int argc, char** argv)
                     {
                         pendingLines.push_front(std::move(lines.back()));
                         lines.pop_back();
+                    }
+                }
+                if (!inputs.empty())
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    while (!inputs.empty())
+                    {
+                        pendingInputs.push_front(std::move(inputs.back()));
+                        inputs.pop_back();
                     }
                 }
                 if (!madeProgress)
@@ -2337,7 +2442,8 @@ int main(int argc, char** argv)
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
                     "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
-                    "decode_tpot_pressure=%.3f exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
+                    "decode_tpot_pressure=%.3f async_preparations=%zu/%zu preparation_last=%.3f ms "
+                    "preparation_max=%.3f ms exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
                     visionMetrics.lastEncoderInputBytes, visionMetrics.maxEncoderInputBytes,
@@ -2357,7 +2463,9 @@ int main(int argc, char** argv)
                     visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
-                    visionMetrics.decodeTpotPressure, visionMetrics.exclusiveEncoderBatches,
+                    visionMetrics.decodeTpotPressure, visionMetrics.encoderPreparationStarts,
+                    visionMetrics.encoderPreparationCompletions, visionMetrics.lastEncoderPreparationUs / 1000.0,
+                    visionMetrics.maxEncoderPreparationUs / 1000.0, visionMetrics.exclusiveEncoderBatches,
                     visionMetrics.exclusiveEncoderPrefillDeferrals);
                 rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();
                 LOG_INFO(
@@ -2376,9 +2484,11 @@ int main(int argc, char** argv)
             outputReady.notify_one();
             outputWriter.join();
             LOG_INFO(
-                "Phase IPC host cost: polls=%zu ingress=%.3f ms poll=%.3f ms serialize=%.3f ms output_batches=%zu "
-                "output_records=%zu output_bytes=%zu",
-                ipcPollCalls, ipcIngressUs / 1000.0, ipcPollUs / 1000.0, ipcSerializationUs / 1000.0,
+                "Phase IPC host cost: polls=%zu ingress=%.3f ms adapter_workers=%zu adapter_inputs=%zu "
+                "adapter=%.3f ms "
+                "poll=%.3f ms serialize=%.3f ms output_batches=%zu output_records=%zu output_bytes=%zu",
+                ipcPollCalls, ipcIngressUs / 1000.0, asyncRequestAdapter ? requestAdapterWorkers : 0U,
+                ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, ipcPollUs / 1000.0, ipcSerializationUs / 1000.0,
                 outputWriteBatches, outputWriteRecords, outputWriteBytes);
             auto const prefillGraphStats = semanticCoordinator.prefillGraphCacheStats();
             auto const decodeGraphStats = semanticCoordinator.decodeGraphCacheStats();

@@ -35,6 +35,7 @@ namespace trt_edgellm::rt
 
 struct PhaseVisionBatchStorage;
 struct PhaseVisionMropeStorage;
+struct PhaseVisionPreparedBatch;
 
 //! High-water policy for encoder-output slabs that are no longer request-owned.
 struct PhaseVisionStoragePolicy
@@ -142,6 +143,10 @@ public:
 
     bool submit(uint64_t requestId, LLMGenerationRequest const& request);
     bool submit(std::vector<PhaseVisionSubmission> submissions);
+    //! Prepare text, image tensors, and M-RoPE state without enqueuing the encoder engine.
+    std::shared_ptr<PhaseVisionPreparedBatch> prepare(std::vector<PhaseVisionSubmission> submissions);
+    //! Bind retained outputs and enqueue an already prepared encoder batch.
+    bool submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch> prepared);
     bool ready(uint64_t requestId) const;
     std::unique_ptr<PhaseVisionPayload> take(uint64_t requestId);
     bool cancel(uint64_t requestId);
