@@ -1438,6 +1438,26 @@ int main(int argc, char** argv)
         {
             serverConfig.decodeRefillBatchSize = static_cast<size_t>(std::stoul(value));
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_BATCH"))
+        {
+            serverConfig.prefillFormationBatchSize = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_WINDOW_US"))
+        {
+            serverConfig.prefillFormationWindowUs = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_TTFT_TARGET_US"))
+        {
+            serverConfig.prefillFormationTtftTargetUs = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_MAX_OUTPUT_TOKENS"))
+        {
+            serverConfig.prefillFormationMaxOutputTokens = std::stoi(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_TTFT_GUARD_US"))
+        {
+            serverConfig.prefillFormationTtftGuardUs = std::stod(value);
+        }
         serverConfig.enableAdaptiveAdmission = std::getenv("TRT_EDGELLM_ADAPTIVE_ADMISSION") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_LATENCY_INFLIGHT"))
         {
@@ -2317,6 +2337,20 @@ int main(int argc, char** argv)
                 ipcIngressUs
                     += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ingressStart)
                            .count();
+                size_t pendingAdapterRequests = lines.size() + inputs.size();
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    pendingAdapterRequests += pendingLines.size() + pendingInputs.size() + pendingInputTasks.size();
+                    // The reader may be between publishing bounded adapter
+                    // cohorts while the long-lived ingress stream is open.
+                    // Retain its worker cohort as near-term producer capacity
+                    // across that handoff boundary.
+                    if (!inputClosed)
+                    {
+                        pendingAdapterRequests = std::max(pendingAdapterRequests, requestAdapterWorkers);
+                    }
+                }
+                semanticServer.setPendingAdapterRequests(pendingAdapterRequests);
                 auto const pollStart = std::chrono::steady_clock::now();
                 madeProgress
                     = (ipcThreePhase != nullptr ? ipcThreePhase->poll() : semanticServer.poll()) || madeProgress;
@@ -2379,6 +2413,8 @@ int main(int argc, char** argv)
                             semanticServer.adaptiveAdmissionUnsatisfiableDecisionCount()},
                         {"decode_admission_tpot_pressure", semanticServer.decodeAdmissionTpotPressure()},
                         {"decode_refill_waits", semanticServer.decodeRefillWaitCount()},
+                        {"prefill_formation_periods", semanticServer.prefillFormationWaitPeriodCount()},
+                        {"prefill_formation_deferrals", semanticServer.prefillFormationDeferralCount()},
                         {"page_growth_waits", semanticServer.pageGrowthWaitCount()},
                         {"page_growth_pending", semanticServer.pendingPageGrowthCount()},
                         {"page_growth_owners", semanticServer.pageGrowthOwnerCount()},
@@ -2554,11 +2590,13 @@ int main(int argc, char** argv)
             }
             inputReader.join();
             LOG_INFO(
-                "Sampling-aware decode refill waits: %zu adaptive_transitions=%zu throughput_mode=%s "
+                "Phase formation: decode_refill_waits=%zu prefill_wait_periods=%zu prefill_deferrals=%zu "
+                "adaptive_transitions=%zu throughput_mode=%s "
                 "admission_limit=%zu admission_increases=%zu admission_decreases=%zu cost_limit=%zu "
                 "cost_blocks=%zu tpot_budget_us=%.3f tpot_satisfiable=%s external_profile=%s "
                 "external_profile_selections=%zu unsatisfiable_decisions=%zu",
-                semanticServer.decodeRefillWaitCount(), semanticServer.throughputModeTransitionCount(),
+                semanticServer.decodeRefillWaitCount(), semanticServer.prefillFormationWaitPeriodCount(),
+                semanticServer.prefillFormationDeferralCount(), semanticServer.throughputModeTransitionCount(),
                 semanticServer.throughputMode() ? "yes" : "no", semanticServer.adaptiveAdmissionLimit(),
                 semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount(),
                 semanticServer.adaptiveAdmissionCostLimit(), semanticServer.adaptiveAdmissionCostBlockCount(),

@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,6 +42,11 @@ struct PhaseVisionPayload;
 //! Pure decision helper for sampling-aware decode-tail refill.
 bool shouldDeferDecodeForSamplingRefill(
     size_t targetRows, size_t prefillRows, size_t decodeRows, size_t pendingDecodeSamplingRows) noexcept;
+//! Bound a partial prefill cohort while known upstream producers can add rows.
+bool shouldDeferPrefillForMicrobatchFormation(size_t targetRows, size_t prefillRows, size_t pendingProducerRows,
+    double minTtftSlackUs, double ttftGuardUs, double elapsedUs, double formationWindowUs) noexcept;
+//! Restrict formation to short-output cohorts when a positive limit is configured.
+bool phasePrefillFormationSupportsOutputLength(int32_t maxOutputTokens, int32_t cohortMaxOutputTokens) noexcept;
 //! Hysteretic queue-pressure transition for adaptive admission.
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept;
@@ -173,6 +179,16 @@ struct IndependentPhaseServerConfig
     int32_t maxConcurrentPageGrowthRequests{8};
     //! Defer a partial decode tail while completed decode sampling tickets can refill this many rows.
     size_t decodeRefillBatchSize{};
+    //! Defer a partial prefill cohort while known upstream producers can fill this many rows.
+    size_t prefillFormationBatchSize{};
+    //! Maximum non-blocking residence of one partial prefill cohort. Zero disables formation.
+    double prefillFormationWindowUs{};
+    //! Optional end-to-end TTFT target used only by formation, without changing scheduler policy.
+    double prefillFormationTtftTargetUs{};
+    //! Optional maximum declared output length for a formation-eligible live cohort.
+    int32_t prefillFormationMaxOutputTokens{};
+    //! Do not defer when the minimum remaining TTFT slack reaches this guard band.
+    double prefillFormationTtftGuardUs{1000.0};
     //! Switch between latencyInFlightRequests/refill-off and maxInFlightRequests/refill-on from pending backlog.
     bool enableAdaptiveAdmission{};
     size_t latencyInFlightRequests{};
@@ -308,6 +324,8 @@ public:
     //! Include encoder and encoded-ready work that has not entered this server yet.
     void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0, size_t externalRequests = 0U,
         size_t externalPrefillTokens = 0U) noexcept;
+    //! Include text/request-adapter work that has not reached admission yet.
+    void setPendingAdapterRequests(size_t pendingRequests) noexcept;
     //! Forward a memory-broker drain preference into the common P/D scheduler.
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Exclude or restore prefill dispatch while an external phase owns overlapping workspace.
@@ -326,6 +344,8 @@ public:
     //! FIFO candidate count that can be admitted under stable-slot and page-reservation constraints.
     size_t admissibleRequestPrefix(std::vector<IndependentPhaseAdmissionRequest> const& candidates) const;
     size_t decodeRefillWaitCount() const noexcept;
+    size_t prefillFormationWaitPeriodCount() const noexcept;
+    size_t prefillFormationDeferralCount() const noexcept;
     size_t pageGrowthWaitCount() const noexcept;
     size_t pendingPageGrowthCount() const noexcept;
     size_t pageGrowthOwnerCount() const noexcept;
@@ -400,6 +420,7 @@ private:
     int32_t pageReservationBudget() const;
     void refreshPageGrowthOwners();
     bool shouldWaitForDecodeRefill() const noexcept;
+    bool shouldWaitForPrefillFormation();
     size_t admissionLimit() const noexcept;
     double effectiveAdmissionTpotBudgetUs() const noexcept;
     std::vector<IndependentPhaseAdmissionCost> const& activeAdmissionCosts() const noexcept;
@@ -418,6 +439,7 @@ private:
     IndependentPhaseRequestAdapter mAdapter;
     PhasePrefixReuseCache* mPrefixCache{};
     std::unordered_map<uint64_t, RequestState> mRequests;
+    std::multiset<int32_t> mActiveOutputTokens;
     std::deque<PendingRequest> mPendingRequests;
     std::unordered_set<uint64_t> mPendingRequestIds;
     std::deque<uint64_t> mPendingDecodeRequests;
@@ -432,12 +454,15 @@ private:
     std::unordered_set<uint64_t> mTimelineDecodeStarted;
     std::unordered_set<uint64_t> mTimelineDecodeCompleted;
     size_t mDecodeRefillWaitCount{};
+    size_t mPrefillFormationWaitPeriodCount{};
+    size_t mPrefillFormationDeferralCount{};
     size_t mPageGrowthWaitCount{};
     size_t mVisionPrefillReleaseCount{};
     size_t mVisionPrefillReleasedBytes{};
     bool mThroughputMode{};
     size_t mThroughputModeTransitionCount{};
     size_t mExternalPendingRequests{};
+    size_t mPendingAdapterRequests{};
     double mExternalMinTpotTargetUs{};
     size_t mExternalRequests{};
     size_t mExternalPrefillTokens{};
@@ -450,6 +475,7 @@ private:
     size_t mLastAdmissionDecisionSample{};
     bool mLastAdmissionExternalProfileActive{};
     std::optional<bool> mAdmissionExternalProfileEpochSelection;
+    std::optional<std::chrono::steady_clock::time_point> mPrefillFormationStartedAt;
 };
 
 } // namespace trt_edgellm::rt

@@ -241,9 +241,17 @@ def main() -> None:
         pass
     finally:
         server.server_close()
-        if broker.process.poll() is None:
+        if broker.process.stdin is not None:
+            broker.process.stdin.close()
+        try:
+            broker.process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
             broker.process.terminate()
-        broker.process.wait(timeout=30)
+            try:
+                broker.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                broker.process.kill()
+                broker.process.wait(timeout=10)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,19 @@ bool shouldDeferDecodeForSamplingRefill(
         && decodeRows + pendingDecodeSamplingRows >= targetRows;
 }
 
+bool shouldDeferPrefillForMicrobatchFormation(size_t targetRows, size_t prefillRows, size_t pendingProducerRows,
+    double minTtftSlackUs, double ttftGuardUs, double elapsedUs, double formationWindowUs) noexcept
+{
+    return targetRows > 0 && prefillRows > 0 && prefillRows < targetRows
+        && pendingProducerRows >= targetRows - prefillRows && formationWindowUs > 0.0 && elapsedUs < formationWindowUs
+        && minTtftSlackUs > ttftGuardUs;
+}
+
+bool phasePrefillFormationSupportsOutputLength(int32_t maxOutputTokens, int32_t cohortMaxOutputTokens) noexcept
+{
+    return maxOutputTokens <= 0 || cohortMaxOutputTokens <= maxOutputTokens;
+}
+
 bool nextAdaptiveThroughputMode(bool currentThroughputMode, size_t pendingRequests, size_t activeRequests,
     size_t latencyInFlightLimit, size_t backlogEnterThreshold) noexcept
 {
@@ -300,6 +313,16 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
     }
     ELLM_CHECK(mConfig.decodeRefillBatchSize <= mConfig.maxInFlightRequests,
         "Decode refill batch cannot exceed the server in-flight capacity");
+    ELLM_CHECK(mConfig.prefillFormationBatchSize <= mConfig.maxInFlightRequests,
+        "Prefill formation batch cannot exceed the server in-flight capacity");
+    ELLM_CHECK(std::isfinite(mConfig.prefillFormationWindowUs) && mConfig.prefillFormationWindowUs >= 0.0,
+        "Prefill formation window must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.prefillFormationTtftTargetUs) && mConfig.prefillFormationTtftTargetUs >= 0.0,
+        "Prefill formation TTFT target must be finite and non-negative");
+    ELLM_CHECK(
+        mConfig.prefillFormationMaxOutputTokens >= 0, "Prefill formation output token limit must be non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.prefillFormationTtftGuardUs) && mConfig.prefillFormationTtftGuardUs >= 0.0,
+        "Prefill formation TTFT guard must be finite and non-negative");
     ELLM_CHECK(!mConfig.enableAdaptiveAdmission
             || (mConfig.latencyInFlightRequests > 0 && mConfig.latencyInFlightRequests <= mConfig.maxInFlightRequests
                 && mConfig.adaptiveBacklogEnterRequests > 0),
@@ -483,6 +506,7 @@ IndependentPhaseServerSubmission IndependentPhaseAsyncServer::submitImpl(uint64_
     state.fullReservedPages = reservation.fullPages;
     state.awaitingVisionPayload = deferredVisionPrefix;
     mRequests.emplace(requestId, std::move(state));
+    mActiveOutputTokens.insert(maxOutputTokens);
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
         refreshPageGrowthOwners();
@@ -601,6 +625,9 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
         return false;
     }
     mOwnership.release(it->second.kvSlotId);
+    auto const outputLength = mActiveOutputTokens.find(it->second.maxOutputTokens);
+    ELLM_CHECK(outputLength != mActiveOutputTokens.end(), "Active output-length index is inconsistent");
+    mActiveOutputTokens.erase(outputLength);
     mRequests.erase(it);
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
@@ -649,12 +676,66 @@ bool IndependentPhaseAsyncServer::poll()
     {
         ++mDecodeRefillWaitCount;
     }
+    bool const waitForPrefillFormation = shouldWaitForPrefillFormation();
     if (!mCoordinator.busy() && !mCoordinator.empty() && !waitForDecodeRefill)
     {
+        if (waitForPrefillFormation)
+        {
+            mCoordinator.scheduler().setPrefillDispatchBlocked(true);
+        }
         progressed = mCoordinator.dispatchNext() || progressed;
+        if (waitForPrefillFormation)
+        {
+            mCoordinator.scheduler().setPrefillDispatchBlocked(false);
+        }
     }
     progressed = flushEventCallbacks() || progressed;
     return progressed;
+}
+
+bool IndependentPhaseAsyncServer::shouldWaitForPrefillFormation()
+{
+    if (mCoordinator.busy())
+    {
+        return false;
+    }
+    PhaseQueueSnapshot const queue = mCoordinator.scheduler().queueSnapshot();
+    size_t const pendingProducerRows = mExternalPendingRequests + mPendingAdapterRequests;
+    int32_t const cohortMaxOutputTokens = mActiveOutputTokens.empty() ? 0 : *mActiveOutputTokens.rbegin();
+    if (!phasePrefillFormationSupportsOutputLength(mConfig.prefillFormationMaxOutputTokens, cohortMaxOutputTokens))
+    {
+        mPrefillFormationStartedAt.reset();
+        return false;
+    }
+    double const minTtftSlackUs = mConfig.prefillFormationTtftTargetUs > 0.0
+        ? mConfig.prefillFormationTtftTargetUs - queue.prefillOldestRequestAgeUs
+        : queue.prefillMinTtftSlackUs;
+    auto const now = std::chrono::steady_clock::now();
+    if (!mPrefillFormationStartedAt)
+    {
+        bool const candidate = shouldDeferPrefillForMicrobatchFormation(mConfig.prefillFormationBatchSize,
+            queue.prefillQueued, pendingProducerRows, minTtftSlackUs, mConfig.prefillFormationTtftGuardUs, 0.0,
+            mConfig.prefillFormationWindowUs);
+        if (!candidate)
+        {
+            return false;
+        }
+        mPrefillFormationStartedAt = now;
+        ++mPrefillFormationWaitPeriodCount;
+    }
+    double const elapsedUs = std::chrono::duration<double, std::micro>(now - *mPrefillFormationStartedAt).count();
+    bool const defer = shouldDeferPrefillForMicrobatchFormation(mConfig.prefillFormationBatchSize, queue.prefillQueued,
+        pendingProducerRows, minTtftSlackUs, mConfig.prefillFormationTtftGuardUs, elapsedUs,
+        mConfig.prefillFormationWindowUs);
+    if (defer)
+    {
+        ++mPrefillFormationDeferralCount;
+    }
+    else
+    {
+        mPrefillFormationStartedAt.reset();
+    }
+    return defer;
 }
 
 bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill() const noexcept
@@ -879,6 +960,11 @@ void IndependentPhaseAsyncServer::setExternalPendingRequests(
     }
 }
 
+void IndependentPhaseAsyncServer::setPendingAdapterRequests(size_t pendingRequests) noexcept
+{
+    mPendingAdapterRequests = pendingRequests;
+}
+
 void IndependentPhaseAsyncServer::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
 {
     mCoordinator.scheduler().setExternalDrainPreference(preference);
@@ -949,6 +1035,16 @@ size_t IndependentPhaseAsyncServer::admissibleRequestPrefix(
 size_t IndependentPhaseAsyncServer::decodeRefillWaitCount() const noexcept
 {
     return mDecodeRefillWaitCount;
+}
+
+size_t IndependentPhaseAsyncServer::prefillFormationWaitPeriodCount() const noexcept
+{
+    return mPrefillFormationWaitPeriodCount;
+}
+
+size_t IndependentPhaseAsyncServer::prefillFormationDeferralCount() const noexcept
+{
+    return mPrefillFormationDeferralCount;
 }
 
 size_t IndependentPhaseAsyncServer::pageGrowthWaitCount() const noexcept
@@ -1554,6 +1650,9 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
     mCompletions.push_back({requestId, std::move(state.generatedTokens),
         static_cast<int32_t>(state.promptTokens.size()), latencyMs, stoppedByEos});
+    auto const outputLength = mActiveOutputTokens.find(state.maxOutputTokens);
+    ELLM_CHECK(outputLength != mActiveOutputTokens.end(), "Active output-length index is inconsistent");
+    mActiveOutputTokens.erase(outputLength);
     mRequests.erase(it);
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {

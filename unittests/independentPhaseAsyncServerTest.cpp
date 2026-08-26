@@ -33,6 +33,31 @@ TEST(IndependentPhaseAsyncServerTest, DefersOnlyARefillableDecodeTail)
     EXPECT_FALSE(shouldDeferDecodeForSamplingRefill(64, 0, 16, 47));
 }
 
+TEST(IndependentPhaseAsyncServerTest, PrefillFormationRequiresKnownUpstreamRows)
+{
+    EXPECT_TRUE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 4000.0, 1000.0, 100.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 5, 4000.0, 1000.0, 100.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(0, 2, 6, 4000.0, 1000.0, 100.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 0, 6, 4000.0, 1000.0, 100.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 8, 6, 4000.0, 1000.0, 100.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 0, 4000.0, 1000.0, 100.0, 250.0));
+}
+
+TEST(IndependentPhaseAsyncServerTest, PrefillFormationHonorsWindowAndTtftGuard)
+{
+    EXPECT_TRUE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 4000.0, 1000.0, 249.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 4000.0, 1000.0, 250.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 1000.0, 1000.0, 100.0, 250.0));
+    EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 4000.0, 1000.0, 0.0, 0.0));
+}
+
+TEST(IndependentPhaseAsyncServerTest, PrefillFormationCanSelectShortOutputCohorts)
+{
+    EXPECT_TRUE(phasePrefillFormationSupportsOutputLength(0, 128));
+    EXPECT_TRUE(phasePrefillFormationSupportsOutputLength(32, 32));
+    EXPECT_FALSE(phasePrefillFormationSupportsOutputLength(32, 33));
+}
+
 TEST(IndependentPhaseAsyncServerTest, AdaptiveAdmissionUsesBacklogHysteresis)
 {
     EXPECT_FALSE(nextAdaptiveThroughputMode(false, 0, 64, 64, 1));
