@@ -1295,6 +1295,10 @@ int main(int argc, char** argv)
                 : mode == "shadow"                                         ? rt::PhaseGlobalSchedulerMode::kShadow
                                                                            : rt::PhaseGlobalSchedulerMode::kDisabled;
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
+        {
+            semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_ROW_REPLACEMENT_COST_MS"))
         {
             semanticSchedulerConfig.decodeRowReplacementCostMs = std::stof(value);
@@ -2498,6 +2502,20 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalShadowDisagreementCount},
                         {"global_wait_decisions", semanticCoordinator.scheduler().telemetry().globalWaitDecisionCount},
                         {"global_wait_selected", semanticCoordinator.scheduler().telemetry().globalWaitSelectedCount},
+                        {"global_wait_candidates",
+                            semanticCoordinator.scheduler().telemetry().globalWaitCandidateCount},
+                        {"global_wait_future_rows", semanticCoordinator.scheduler().telemetry().globalWaitFutureRows},
+                        {"global_wait_graph_bucket", semanticCoordinator.scheduler().telemetry().globalWaitGraphBucket},
+                        {"global_wait_event_id", semanticCoordinator.scheduler().telemetry().globalWaitEventId},
+                        {"global_wait_request_ids", semanticCoordinator.scheduler().telemetry().globalWaitRequestIds},
+                        {"global_wait_preview_blocking_us",
+                            semanticCoordinator.scheduler().telemetry().globalWaitPreviewBlockingUs},
+                        {"global_wait_preview_uncertainty_us",
+                            semanticCoordinator.scheduler().telemetry().globalWaitPreviewUncertaintyUs},
+                        {"global_wait_preview_slack_us",
+                            semanticCoordinator.scheduler().telemetry().globalWaitPreviewSlackUs},
+                        {"global_wait_preview_compression",
+                            semanticCoordinator.scheduler().telemetry().globalWaitPreviewCompression},
                         {"adaptive_throughput_mode", semanticServer.throughputMode()},
                         {"adaptive_transitions", semanticServer.throughputModeTransitionCount()},
                         {"adaptive_admission_limit", semanticServer.adaptiveAdmissionLimit()},

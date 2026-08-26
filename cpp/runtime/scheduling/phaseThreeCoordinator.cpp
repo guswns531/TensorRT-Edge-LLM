@@ -889,6 +889,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     {
         return false;
     }
+    if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && mServer.shouldWaitForGlobalDecodeRefill())
+    {
+        return false;
+    }
 
     if (!mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid())
     {

@@ -244,6 +244,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(mConfig.decodeBurstLimit > 0, "decodeBurstLimit must be positive");
     check::check(mConfig.prefillQueueWaitTargetUs > 0.0, "prefillQueueWaitTargetUs must be positive");
     check::check(mConfig.decodeQueueWaitTargetUs > 0.0, "decodeQueueWaitTargetUs must be positive");
+    check::check(std::isfinite(mConfig.globalDecodeTpotTargetUs) && mConfig.globalDecodeTpotTargetUs > 0.0,
+        "globalDecodeTpotTargetUs must be finite and positive");
     check::check(mConfig.maxPredictedOverlapPrefillMs >= 0.0F, "maxPredictedOverlapPrefillMs must be non-negative");
     check::check(mConfig.minObservedOverlapRatio >= 0.0F && mConfig.minObservedOverlapRatio <= 1.0F,
         "minObservedOverlapRatio must be in [0, 1]");
@@ -417,6 +419,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     }
     auto const now = std::chrono::steady_clock::now();
     result.prefillMinTtftSlackUs = std::numeric_limits<double>::max();
+    result.decodeMinTpotSlackUs = std::numeric_limits<double>::max();
     auto summarizeQueue = [&](std::deque<PhaseWorkItem> const& queue, bool prefill, double& oldestWaitUs,
                               double& maxSloPressure, int32_t& highestPriority) {
         double waitUs{};
@@ -443,6 +446,11 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
                 result.prefillOldestRequestAgeUs = std::max(result.prefillOldestRequestAgeUs, requestAgeUs);
                 result.prefillMinTtftSlackUs = std::min(result.prefillMinTtftSlackUs, target - requestAgeUs);
             }
+            else
+            {
+                double const tpotTarget = requestTarget > 0.0 ? requestTarget : mConfig.globalDecodeTpotTargetUs;
+                result.decodeMinTpotSlackUs = std::min(result.decodeMinTpotSlackUs, tpotTarget - itemWaitUs);
+            }
             highestPriority = std::max(highestPriority, item.scheduling.priority);
         }
         oldestWaitUs = waitUs;
@@ -454,6 +462,10 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     if (result.prefillQueued == 0)
     {
         result.prefillMinTtftSlackUs = 0.0;
+    }
+    if (result.decodeQueued == 0)
+    {
+        result.decodeMinTpotSlackUs = 0.0;
     }
     return result;
 }
@@ -1496,6 +1508,12 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseDecodeBatchCost const* singleton{};
         for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {
+            if (cost.batchSize == 1 && cost.maxContextLength >= decodeMaxContext
+                && (singleton == nullptr || cost.maxContextLength < singleton->maxContextLength
+                    || (cost.maxContextLength == singleton->maxContextLength && cost.p95GpuMs < singleton->p95GpuMs)))
+            {
+                singleton = &cost;
+            }
             int64_t const totalLimit = cost.maxTotalContextTokens > 0
                 ? cost.maxTotalContextTokens
                 : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
@@ -1508,12 +1526,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
             {
                 selected = &cost;
-            }
-            if (cost.batchSize == 1
-                && (singleton == nullptr || cost.maxContextLength < singleton->maxContextLength
-                    || (cost.maxContextLength == singleton->maxContextLength && cost.p95GpuMs < singleton->p95GpuMs)))
-            {
-                singleton = &cost;
             }
         }
         double const makespanMs = selected != nullptr ? selected->p95GpuMs : mConfig.globalColdDecodeMs;
@@ -1670,16 +1682,16 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     return GlobalQueueSelection{kind, selected, decision, safeProbe};
 }
 
-bool PhaseQueueScheduler::shouldWaitForDecodeEvent(size_t pendingDecodeRows, int32_t futureMaxContextLength,
-    double predictedWaitUs, double waitUncertaintyUs, uint64_t eventId)
+bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompletionPreview> const& previews)
 {
-    if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled || pendingDecodeRows == 0U
-        || predictedWaitUs < 0.0 || waitUncertaintyUs < 0.0 || eventId == 0U)
+    constexpr size_t kMaxWaitCandidates{2U};
+    if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled || previews.empty())
     {
         return false;
     }
     PhaseQueueSnapshot const state = snapshot();
-    if (state.prefillQueued > 0U || state.decodeQueued == 0U)
+    if (state.prefillQueued > 0U || state.decodeQueued == 0U
+        || state.decodeQueued >= static_cast<size_t>(mConfig.maxDecodeBatchSize))
     {
         return false;
     }
@@ -1689,83 +1701,157 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvent(size_t pendingDecodeRows, int
         return false;
     }
 
-    int32_t const futureRows
-        = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued + pendingDecodeRows));
+    PhaseGlobalActionCandidate currentCandidate = current->candidate;
+    currentCandidate.protectedCompletions.clear();
+    currentCandidate.protectedCompletions.push_back(
+        {state.decodeMinTpotSlackUs, currentCandidate.predictedBlockingUs, currentCandidate.uncertaintyUs});
+    std::vector<PhaseGlobalActionCandidate> candidates{std::move(currentCandidate)};
+    candidates.reserve(1U + std::min(kMaxWaitCandidates, previews.size()));
     int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
-    int32_t const contextBucket = (std::max(0, futureMaxContextLength) + contextBucketTokens - 1) / contextBucketTokens;
-    PhaseGlobalActionKey const futureKey{PhaseGlobalActionKind::kDecode, futureRows, 0, 1, contextBucket, 0};
-    double futureMakespanUs = static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0;
-    double futureUncertaintyUs = static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0;
-    double futureReferenceUs = futureMakespanUs;
-    if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(futureKey))
+    mTelemetry.globalWaitPreviewBlockingUs = 0.0;
+    mTelemetry.globalWaitPreviewUncertaintyUs = 0.0;
+    mTelemetry.globalWaitPreviewSlackUs = state.decodeMinTpotSlackUs;
+    mTelemetry.globalWaitPreviewCompression = 0.0;
+    int64_t currentContextTokens{};
+    int32_t currentMaxContextLength{};
+    for (uint64_t const requestId : current->candidate.requestIds)
     {
-        futureMakespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
-        futureUncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
-        futureReferenceUs = static_cast<double>(online->referenceWorkMedianMs) * 1000.0;
+        auto const item = std::find_if(mDecodeQueue.begin(), mDecodeQueue.end(),
+            [requestId](PhaseWorkItem const& candidate) { return candidate.requestId == requestId; });
+        check::check(item != mDecodeQueue.end(), "Global decode preview contains a request outside the decode queue");
+        currentContextTokens += item->tokenCount;
+        currentMaxContextLength = std::max(currentMaxContextLength, item->tokenCount);
     }
-    else
+
+    for (PhaseDecodeCompletionPreview const& preview : previews)
     {
-        PhaseDecodeBatchCost const* selected{};
-        PhaseDecodeBatchCost const* singleton{};
-        int64_t const futureContextTokens = static_cast<int64_t>(futureRows) * futureMaxContextLength;
-        for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+        if (candidates.size() > kMaxWaitCandidates || preview.eventId == 0U || preview.predictedWaitUs < 0.0
+            || preview.waitUncertaintyUs < 0.0 || preview.requestIds.empty()
+            || preview.requestIds.size() != preview.contextLengths.size())
         {
-            int64_t const totalLimit = cost.maxTotalContextTokens > 0
-                ? cost.maxTotalContextTokens
-                : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
-            if (cost.maxContextLength < futureMaxContextLength || totalLimit < futureContextTokens)
+            continue;
+        }
+        std::vector<uint64_t> futureRequestIds = current->candidate.requestIds;
+        int64_t futureContextTokens = currentContextTokens;
+        int32_t futureMaxContextLength = currentMaxContextLength;
+        for (size_t index{}; index < preview.requestIds.size()
+            && futureRequestIds.size() < static_cast<size_t>(mConfig.maxDecodeBatchSize);
+            ++index)
+        {
+            if (preview.contextLengths[index] < 0
+                || std::find(futureRequestIds.begin(), futureRequestIds.end(), preview.requestIds[index])
+                    != futureRequestIds.end())
             {
                 continue;
             }
-            if (cost.batchSize >= futureRows
-                && (selected == nullptr || cost.batchSize < selected->batchSize
-                    || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
-            {
-                selected = &cost;
-            }
-            if (cost.batchSize == 1 && (singleton == nullptr || cost.maxContextLength < singleton->maxContextLength))
-            {
-                singleton = &cost;
-            }
+            futureRequestIds.push_back(preview.requestIds[index]);
+            futureContextTokens += preview.contextLengths[index];
+            futureMaxContextLength = std::max(futureMaxContextLength, preview.contextLengths[index]);
         }
-        if (selected != nullptr)
+        int32_t const futureRows = static_cast<int32_t>(futureRequestIds.size());
+        if (futureRows <= current->candidate.key.primaryBatchSize)
         {
-            futureMakespanUs = static_cast<double>(selected->p95GpuMs) * 1000.0;
-            futureUncertaintyUs = 0.0;
-            futureReferenceUs = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * 1000.0 * futureRows
-                                                     : futureMakespanUs;
+            continue;
         }
-    }
 
-    PhaseGlobalActionCandidate wait;
-    wait.key = {PhaseGlobalActionKind::kWait, futureRows, 0, 1, contextBucket, 0};
-    wait.concreteWaitEvent = true;
-    wait.waitEventId = eventId;
-    wait.predictedBlockingUs = predictedWaitUs + futureMakespanUs;
-    wait.predictedMakespanUs = wait.predictedBlockingUs;
-    wait.uncertaintyUs = waitUncertaintyUs + futureUncertaintyUs;
-    wait.referenceWorkUs = futureReferenceUs;
-    wait.requestServiceLagUs = state.decodeOldestWaitUs;
-    wait.requestIds = current->candidate.requestIds;
-    wait.protectedCompletions.push_back(
-        {mConfig.decodeQueueWaitTargetUs - state.decodeOldestWaitUs, wait.predictedBlockingUs, wait.uncertaintyUs});
-    if (mConfig.globalMemoryHorizonSupplier)
+        int32_t const contextBucket
+            = (std::max(0, futureMaxContextLength) + contextBucketTokens - 1) / contextBucketTokens;
+        PhaseGlobalActionKey const futureKey{PhaseGlobalActionKind::kDecode, futureRows, 0, 1, contextBucket, 0};
+        double futureMakespanUs = static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0;
+        double futureUncertaintyUs = static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0;
+        double futureReferenceUs = futureMakespanUs;
+        int32_t graphBucket = futureRows;
+        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(futureKey))
+        {
+            futureMakespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
+            futureUncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
+            futureReferenceUs = static_cast<double>(online->referenceWorkMedianMs) * 1000.0;
+        }
+        else
+        {
+            PhaseDecodeBatchCost const* selected{};
+            PhaseDecodeBatchCost const* singleton{};
+            for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+            {
+                if (cost.batchSize == 1 && cost.maxContextLength >= futureMaxContextLength
+                    && (singleton == nullptr || cost.maxContextLength < singleton->maxContextLength
+                        || (cost.maxContextLength == singleton->maxContextLength
+                            && cost.p95GpuMs < singleton->p95GpuMs)))
+                {
+                    singleton = &cost;
+                }
+                int64_t const totalLimit = cost.maxTotalContextTokens > 0
+                    ? cost.maxTotalContextTokens
+                    : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
+                if (cost.maxContextLength < futureMaxContextLength || totalLimit < futureContextTokens)
+                {
+                    continue;
+                }
+                if (cost.batchSize >= futureRows
+                    && (selected == nullptr || cost.batchSize < selected->batchSize
+                        || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
+                {
+                    selected = &cost;
+                }
+            }
+            if (selected != nullptr)
+            {
+                graphBucket = selected->batchSize;
+                futureMakespanUs = static_cast<double>(selected->p95GpuMs) * 1000.0;
+                futureUncertaintyUs = 0.0;
+                futureReferenceUs = singleton != nullptr
+                    ? static_cast<double>(singleton->p95GpuMs) * 1000.0 * futureRows
+                    : futureMakespanUs;
+            }
+        }
+
+        PhaseGlobalActionCandidate wait;
+        wait.key = {PhaseGlobalActionKind::kWait, futureRows, graphBucket, 1, contextBucket, 0};
+        wait.concreteWaitEvent = true;
+        wait.waitEventId = preview.eventId;
+        wait.predictedBlockingUs = preview.predictedWaitUs + futureMakespanUs;
+        wait.predictedMakespanUs = wait.predictedBlockingUs;
+        wait.uncertaintyUs = preview.waitUncertaintyUs + futureUncertaintyUs;
+        wait.referenceWorkUs = futureReferenceUs;
+        wait.requestServiceLagUs = state.decodeOldestWaitUs;
+        wait.requestIds = std::move(futureRequestIds);
+        wait.protectedCompletions.push_back({state.decodeMinTpotSlackUs, wait.predictedBlockingUs, wait.uncertaintyUs});
+        if (mConfig.globalMemoryHorizonSupplier)
+        {
+            wait.memory = mConfig.globalMemoryHorizonSupplier(wait.key, wait.requestIds);
+        }
+        double const compression
+            = wait.referenceWorkUs / std::max(wait.predictedMakespanUs, std::numeric_limits<double>::epsilon());
+        if (compression > mTelemetry.globalWaitPreviewCompression)
+        {
+            mTelemetry.globalWaitPreviewBlockingUs = wait.predictedBlockingUs;
+            mTelemetry.globalWaitPreviewUncertaintyUs = wait.uncertaintyUs;
+            mTelemetry.globalWaitPreviewCompression = compression;
+        }
+        candidates.push_back(std::move(wait));
+    }
+    if (candidates.size() == 1U)
     {
-        wait.memory = mConfig.globalMemoryHorizonSupplier(wait.key, wait.requestIds);
+        return false;
     }
 
-    std::vector<PhaseGlobalActionCandidate> candidates{current->candidate, wait};
     PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
     ++mTelemetry.globalWaitDecisionCount;
+    mTelemetry.globalWaitCandidateCount += candidates.size() - 1U;
     bool const selectedWait = decision.selectedIndex.has_value()
         && candidates[*decision.selectedIndex].key.kind == PhaseGlobalActionKind::kWait;
     mTelemetry.globalWaitSelectedCount += selectedWait ? 1U : 0U;
     if (selectedWait)
     {
+        PhaseGlobalActionCandidate const& selected = candidates[*decision.selectedIndex];
         mTelemetry.lastGlobalSelectedAction = PhaseGlobalActionKind::kWait;
         mTelemetry.lastGlobalDecisionReason = decision.reason;
         mTelemetry.lastGlobalPredictedViolationUs = decision.predictedViolationUs;
         mTelemetry.lastGlobalServiceCompression = decision.serviceCompression;
+        mTelemetry.globalWaitFutureRows = selected.key.primaryBatchSize;
+        mTelemetry.globalWaitGraphBucket = selected.key.secondaryBatchSize;
+        mTelemetry.globalWaitEventId = selected.waitEventId;
+        mTelemetry.globalWaitRequestIds = selected.requestIds;
     }
     return selectedWait && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive;
 }

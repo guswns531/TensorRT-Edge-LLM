@@ -220,6 +220,15 @@ struct PhaseSchedulerTelemetry
     size_t globalSafeProbeCount{};
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
+    size_t globalWaitCandidateCount{};
+    int32_t globalWaitFutureRows{};
+    int32_t globalWaitGraphBucket{};
+    uint64_t globalWaitEventId{};
+    std::vector<uint64_t> globalWaitRequestIds;
+    double globalWaitPreviewBlockingUs{};
+    double globalWaitPreviewUncertaintyUs{};
+    double globalWaitPreviewSlackUs{};
+    double globalWaitPreviewCompression{};
     PhaseGlobalActionKind lastGlobalSelectedAction{PhaseGlobalActionKind::kNone};
     PhaseGlobalDecisionReason lastGlobalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
     double lastGlobalPredictedViolationUs{};
@@ -244,6 +253,9 @@ struct PhaseQueueSnapshot
     double prefillOldestRequestAgeUs{};
     double prefillMinTtftSlackUs{};
     double decodeOldestWaitUs{};
+    //! Minimum remaining next-token slack. Request SLOs override the global
+    //! fallback used only by WAIT/refill action selection.
+    double decodeMinTpotSlackUs{};
     double prefillMaxSloPressure{};
     double decodeMaxSloPressure{};
     int32_t prefillHighestPriority{};
@@ -501,6 +513,9 @@ struct PhaseQueueSchedulerConfig
     bool enablePrefillTtftHardGuard{};
     double prefillQueueWaitTargetUs{5000.0};
     double decodeQueueWaitTargetUs{2000.0};
+    //! Default next-token deadline for bounded WAIT/refill decisions when a
+    //! request does not carry an explicit TPOT target.
+    double globalDecodeTpotTargetUs{20000.0};
     float maxPredictedOverlapPrefillMs{30.0F};
     float minObservedOverlapRatio{0.05F};
     //! At or above this page-pool pressure, prefer draining decode work when
@@ -533,6 +548,19 @@ struct PhaseQueueSchedulerConfig
     PhaseWorkEligibilityPolicy eligibilityPolicy{};
     //! Optional live page-pool/admission snapshot used by scheduling policy.
     PhaseQueueResourceSupplier resourceSupplier{};
+};
+
+//! One concrete sampling completion horizon. Request IDs are stable ownership
+//! identities expected to re-enter decode after this event. For an ordered
+//! decode stream, later previews may contain the cumulative earlier cohorts.
+struct PhaseDecodeCompletionPreview
+{
+    uint64_t eventId{};
+    double predictedWaitUs{};
+    double waitUncertaintyUs{};
+    std::vector<uint64_t> requestIds;
+    //! Next-decode context for each request ID at this completion horizon.
+    std::vector<int32_t> contextLengths;
 };
 
 struct PhaseDispatchPlan
@@ -621,10 +649,9 @@ public:
     //! Return a read-only scheduling snapshot for an upstream phase arbiter.
     PhaseQueueSnapshot queueSnapshot() const;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
-    //! Compare dispatch-now against a concrete sampling event followed by a
-    //! denser decode batch. Shadow mode records but does not apply WAIT.
-    bool shouldWaitForDecodeEvent(size_t pendingDecodeRows, int32_t futureMaxContextLength, double predictedWaitUs,
-        double waitUncertaintyUs, uint64_t eventId);
+    //! Compare D-now with at most two concrete WAIT(event)+D-future actions.
+    //! Shadow mode records the decision without delaying dispatch.
+    bool shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompletionPreview> const& previews);
     //! Preview the best current P/D action without removing queue entries.
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
     //! Preview decode only while an external encoder is already in flight.

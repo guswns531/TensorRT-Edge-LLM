@@ -350,6 +350,9 @@ public:
     bool dispatchReady();
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    //! Apply the bounded completion-aware WAIT/refill decision before an
+    //! externally coordinated global P/D dispatch.
+    bool shouldWaitForGlobalDecodeRefill();
     bool dispatchGlobalAction(PhaseGlobalActionCandidate candidate);
     void runUntilIdle(size_t maxPolls);
 
@@ -464,7 +467,6 @@ private:
     bool hasPageReservationCapacity(IndependentPhasePageReservation const& reservation) const;
     int32_t pageReservationBudget() const;
     void refreshPageGrowthOwners();
-    bool shouldWaitForDecodeRefill();
     bool shouldWaitForPrefillFormation();
     size_t admissionLimit() const noexcept;
     double effectiveAdmissionTpotBudgetUs() const noexcept;

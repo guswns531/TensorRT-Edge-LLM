@@ -734,7 +734,7 @@ bool IndependentPhaseAsyncServer::pollCompletions()
 bool IndependentPhaseAsyncServer::dispatchReady()
 {
     bool progressed{};
-    bool const waitForDecodeRefill = shouldWaitForDecodeRefill();
+    bool const waitForDecodeRefill = shouldWaitForGlobalDecodeRefill();
     if (waitForDecodeRefill)
     {
         ++mDecodeRefillWaitCount;
@@ -859,7 +859,7 @@ bool IndependentPhaseAsyncServer::shouldWaitForPrefillFormation()
     return defer;
 }
 
-bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill()
+bool IndependentPhaseAsyncServer::shouldWaitForGlobalDecodeRefill()
 {
     size_t const queuedDecode = mCoordinator.scheduler().decodeQueueSize();
     size_t pendingDecodeRows{};
@@ -898,40 +898,52 @@ bool IndependentPhaseAsyncServer::shouldWaitForDecodeRefill()
         p95Us = ordered[std::min(p95Index, ordered.size() - 1U)];
     }
     auto const now = std::chrono::steady_clock::now();
-    IndependentPhaseSampleTicket const* nearest{};
-    double nearestWaitUs{std::numeric_limits<double>::infinity()};
-    double nearestUncertaintyUs{};
-    int32_t futureMaxContextLength{};
+    std::vector<PhaseDecodeCompletionPreview> previews;
+    previews.reserve(2U);
+    std::vector<uint64_t> cumulativeRequestIds;
+    std::vector<int32_t> cumulativeContextLengths;
+    std::unordered_set<uint64_t> cumulativeOwners;
+    double cumulativeWaitUs{};
+    double cumulativeP95Us{};
     for (auto const& ticket : mSamplingTickets)
     {
+        if (ticket->fromPrefill)
+        {
+            continue;
+        }
         double const ageUs = ticket->submittedAt == std::chrono::steady_clock::time_point{}
             ? 0.0
             : std::chrono::duration<double, std::micro>(now - ticket->submittedAt).count();
         double const remainingMedianUs = std::max(0.0, medianUs - ageUs);
         double const remainingP95Us = std::max(remainingMedianUs, p95Us - ageUs);
-        if (remainingMedianUs < nearestWaitUs)
-        {
-            nearest = ticket.get();
-            nearestWaitUs = remainingMedianUs;
-            nearestUncertaintyUs = remainingP95Us - remainingMedianUs;
-        }
+        cumulativeWaitUs = std::max(cumulativeWaitUs, remainingMedianUs);
+        cumulativeP95Us = std::max(cumulativeP95Us, remainingP95Us);
         for (uint64_t const requestId : ticket->requestIds)
         {
             auto const request = mRequests.find(requestId);
-            if (request != mRequests.end())
+            if (request != mRequests.end()
+                && request->second.generatedTokens.size() + 1U < static_cast<size_t>(request->second.maxOutputTokens)
+                && cumulativeOwners.insert(requestId).second)
             {
-                futureMaxContextLength = std::max(futureMaxContextLength,
-                    static_cast<int32_t>(
-                        request->second.promptTokens.size() + request->second.generatedTokens.size() + 1U));
+                cumulativeRequestIds.push_back(requestId);
+                cumulativeContextLengths.push_back(mOwnership.length(request->second.kvSlotId));
             }
         }
+        if (!cumulativeRequestIds.empty())
+        {
+            previews.push_back({ticket->sequenceId, cumulativeWaitUs, std::max(0.0, cumulativeP95Us - cumulativeWaitUs),
+                cumulativeRequestIds, cumulativeContextLengths});
+        }
+        if (previews.size() == 2U)
+        {
+            break;
+        }
     }
-    if (nearest == nullptr)
+    if (previews.empty())
     {
         return false;
     }
-    bool const globalWait = mCoordinator.scheduler().shouldWaitForDecodeEvent(
-        pendingDecodeRows, futureMaxContextLength, nearestWaitUs, nearestUncertaintyUs, nearest->sequenceId);
+    bool const globalWait = mCoordinator.scheduler().shouldWaitForDecodeEvents(previews);
     return mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kShadow ? legacyWait
                                                                                                : globalWait;
 }
