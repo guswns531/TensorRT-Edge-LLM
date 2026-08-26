@@ -829,6 +829,52 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchToRecoverAfterD
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesEfficientBatchWhenIdleDeadlineIsImpossible)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 2000.0;
+    config.decodeBatchCosts = {{1, 512, 6.2F}, {2, 512, 6.3F}, {4, 512, 6.5F}};
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints scheduling;
+    scheduling.submittedAt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256, -1, 0, 0, true, scheduling});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodePricesTheRemainderAfterOnlineCostLearning)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 8;
+    config.enableDynamicDecodeBatching = true;
+    config.enableOnlineDecodeCostLearning = true;
+    config.onlineDecodeCostMinSamples = 2;
+    config.onlineDecodeCostWindow = 4;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 6.2F}, {2, 512, 6.3F}, {4, 512, 6.35F}, {7, 512, 6.4F}, {8, 512, 6.4F}};
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kDecode;
+    sample.decodeBatchSize = 8;
+    sample.decodeContextTokens = 2048;
+    sample.plannedDecodeMaxContextLength = 256;
+    sample.decodeGpuMs = 10.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.observeMetrics(sample);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 8U);
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicDecodeDoesNotShrinkFromSparseContextCoverage)
 {
     PhaseQueueSchedulerConfig config;

@@ -1699,36 +1699,64 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         }
     }
 
-    bool const urgent = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold;
+    float const minimumCandidateCostMs
+        = std::min_element(candidates.begin(), candidates.end(), [](Candidate const& lhs, Candidate const& rhs) {
+              return lhs.p95GpuMs < rhs.p95GpuMs;
+          })->p95GpuMs;
+    auto estimatedDrainCostMs = [&](Candidate const& candidate) {
+        int32_t const remainingRows = available - candidate.batchSize;
+        if (remainingRows <= 0)
+        {
+            return candidate.p95GpuMs;
+        }
+        float remainderCostMs = std::numeric_limits<float>::max();
+        for (Candidate const& remainder : candidates)
+        {
+            if (remainder.batchSize >= remainingRows)
+            {
+                remainderCostMs = std::min(remainderCostMs, remainder.p95GpuMs);
+            }
+        }
+        if (!std::isfinite(remainderCostMs) || remainderCostMs == std::numeric_limits<float>::max())
+        {
+            remainderCostMs = minimumCandidateCostMs;
+        }
+        return candidate.p95GpuMs + remainderCostMs;
+    };
+    auto const minimumDrainCandidate
+        = std::min_element(candidates.begin(), candidates.end(), [&](Candidate const& lhs, Candidate const& rhs) {
+              return estimatedDrainCostMs(lhs) < estimatedDrainCostMs(rhs);
+          });
+    float const minimumDrainCostMs = estimatedDrainCostMs(*minimumDrainCandidate);
+    bool const deadlineInfeasibleAtIdle
+        = static_cast<double>(minimumDrainCostMs) * 1000.0 > mConfig.decodeQueueWaitTargetUs;
+    bool const urgent
+        = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold || deadlineInfeasibleAtIdle;
     double const remainingUs = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
     Candidate const* selected{};
     for (Candidate const& candidate : candidates)
     {
-        double const costUs = static_cast<double>(candidate.p95GpuMs) * 1000.0;
+        double const drainCostUs = static_cast<double>(estimatedDrainCostMs(candidate)) * 1000.0;
         if (urgent)
         {
-            // Once the queue is already overdue, minimize work per token so
-            // overload can recover. Repeatedly choosing the shortest absolute
-            // kernel (usually BS1) makes queue growth unbounded.
-            double const efficiency = static_cast<double>(candidate.batchSize) / candidate.p95GpuMs;
-            double const selectedEfficiency
-                = selected == nullptr ? 0.0 : static_cast<double>(selected->batchSize) / selected->p95GpuMs;
-            if (selected == nullptr || efficiency > selectedEfficiency
-                || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
+            // Account for the extra TensorRT turn needed by a remainder. A
+            // slightly cheaper partial batch can otherwise alternate with a
+            // singleton forever and make queue drain slower than one dense turn.
+            if (selected == nullptr || estimatedDrainCostMs(candidate) < estimatedDrainCostMs(*selected)
+                || (estimatedDrainCostMs(candidate) == estimatedDrainCostMs(*selected)
+                    && candidate.batchSize > selected->batchSize))
             {
                 selected = &candidate;
             }
             continue;
         }
-        if (costUs > remainingUs)
+        if (drainCostUs > remainingUs)
         {
             continue;
         }
-        double const efficiency = static_cast<double>(candidate.batchSize) / candidate.p95GpuMs;
-        double const selectedEfficiency
-            = selected == nullptr ? 0.0 : static_cast<double>(selected->batchSize) / selected->p95GpuMs;
-        if (selected == nullptr || efficiency > selectedEfficiency
-            || (efficiency == selectedEfficiency && candidate.batchSize > selected->batchSize))
+        if (selected == nullptr || estimatedDrainCostMs(candidate) < estimatedDrainCostMs(*selected)
+            || (estimatedDrainCostMs(candidate) == estimatedDrainCostMs(*selected)
+                && candidate.batchSize > selected->batchSize))
         {
             selected = &candidate;
         }
@@ -1738,11 +1766,10 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         return selected->batchSize;
     }
 
-    auto const fastest
-        = std::min_element(candidates.begin(), candidates.end(), [](Candidate const& lhs, Candidate const& rhs) {
-              return lhs.p95GpuMs < rhs.p95GpuMs || (lhs.p95GpuMs == rhs.p95GpuMs && lhs.batchSize > rhs.batchSize);
-          });
-    return fastest->batchSize;
+    // No shape can drain the current queue before its remaining deadline.
+    // Minimize total recovery time instead of issuing the shortest first turn
+    // and leaving a more expensive remainder behind.
+    return minimumDrainCandidate->batchSize;
 }
 
 uint64_t PhaseQueueScheduler::onlineDecodeCostKey(int32_t batchSize, int32_t maxContextLength) const noexcept
