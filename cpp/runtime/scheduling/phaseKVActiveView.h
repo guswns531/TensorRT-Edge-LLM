@@ -44,6 +44,9 @@ struct PhaseKVMemoryStats
     size_t decodeMetadataH2DBytes{};
     size_t decodeMemsetOperations{};
     size_t decodeMemsetBytes{};
+    size_t decodeSelectZeroReuses{};
+    size_t pageBindingRowUpdates{};
+    size_t pageBindingRowReuses{};
 };
 
 //! Phase-local active-row view over shared stable paged-KV ownership.
@@ -77,6 +80,12 @@ public:
     //! Prepare select-token and context-length metadata for one-token decode rows.
     void prepareDecodeMetadata(PipelineIO& io, cudaStream_t stream) const;
 
+    //! Reuse the phase-local all-zero decode selection buffer across dispatches.
+    void setPersistentDecodeSelectEnabled(bool enabled) noexcept;
+
+    //! Reuse unchanged active-row page bindings across dispatches.
+    void setPersistentPageBindingsEnabled(bool enabled) noexcept;
+
     KVPageTable& pageTable() noexcept;
     Tensor& activeLengths() noexcept;
     std::vector<int32_t> const& activeStableSlots() const noexcept;
@@ -85,6 +94,14 @@ public:
     KVPageTableUploadStats const& pageTableUploadStats() const noexcept;
 
 private:
+    struct PageBindingSignature
+    {
+        int32_t stableSlot{-1};
+        uint64_t leaseGeneration{};
+        size_t pageCount{};
+    };
+
+    void bindActiveRows(std::vector<int32_t> const& activeStableSlots, cudaStream_t stream);
     void restoreBindings() noexcept;
 
     int32_t mMaxActiveRows{};
@@ -97,6 +114,13 @@ private:
     Tensor* mPreviousLengths{};
     Tensor* mPreviousPageTable{};
     bool mPrepared{};
+    mutable void* mZeroedDecodeSelectTokenIndices{};
+    mutable size_t mZeroedDecodeSelectTokenIndicesCapacity{};
+    bool mPersistentDecodeSelectEnabled{};
+    bool mPersistentPageBindingsEnabled{};
+    std::vector<PageBindingSignature> mPageBindingSignatures;
+    std::vector<uint64_t> mSlotSeenEpochs;
+    uint64_t mBindingEpoch{};
     mutable PhaseKVMemoryStats mMemoryStats;
 };
 

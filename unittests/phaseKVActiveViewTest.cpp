@@ -53,6 +53,8 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
 
     rt::PhaseKVActiveView prefill(2, ownership, prefillMap, "prefill");
     rt::PhaseKVActiveView decode(2, ownership, decodeMap, "decode");
+    decode.setPersistentDecodeSelectEnabled(true);
+    decode.setPersistentPageBindingsEnabled(true);
     prefill.prepare({slot2}, prefillStream);
     decode.prepare({slot0, slot1}, decodeStream);
     CUDA_CHECK(cudaStreamSynchronize(prefillStream));
@@ -108,6 +110,8 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     CUDA_CHECK(cudaMemcpy(decodeContextLengths.data(), decodeIO.contextLengths.rawPointer(), 2 * sizeof(int32_t),
         cudaMemcpyDeviceToHost));
     EXPECT_EQ(decodeContextLengths, (std::vector<int32_t>{65, 193}));
+    EXPECT_EQ(decode.memoryStats().decodeMemsetOperations, 1U);
+    EXPECT_EQ(decode.memoryStats().decodeSelectZeroReuses, 0U);
 
     prefill.commitLengths({128});
     decode.commitLengths({65, 193});
@@ -146,6 +150,24 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     EXPECT_EQ(packedIO.selectTokenIndices.getShape()[0], 1);
     EXPECT_EQ(packedIO.selectTokenIndices.getShape()[1], 2);
     prefill.complete();
+
+    decode.prepare({slot0}, decodeStream);
+    decode.prepareDecodeMetadata(decodeIO, decodeStream);
+    CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+    EXPECT_EQ(decode.memoryStats().decodeMemsetOperations, 1U);
+    EXPECT_EQ(decode.memoryStats().decodeSelectZeroReuses, 1U);
+    EXPECT_EQ(decode.memoryStats().pageBindingRowReuses, 1U);
+    decode.complete();
+
+    decode.setPersistentDecodeSelectEnabled(false);
+    decode.prepare({slot0}, decodeStream);
+    decode.prepareDecodeMetadata(decodeIO, decodeStream);
+    decode.complete();
+    decode.prepare({slot0}, decodeStream);
+    decode.prepareDecodeMetadata(decodeIO, decodeStream);
+    decode.complete();
+    EXPECT_EQ(decode.memoryStats().decodeMemsetOperations, 3U);
+    EXPECT_EQ(decode.memoryStats().decodeSelectZeroReuses, 1U);
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));

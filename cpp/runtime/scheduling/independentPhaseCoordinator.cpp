@@ -295,6 +295,17 @@ void IndependentPhaseCoordinator::setGraphCaptureLimits(size_t maxPrefillGraphs,
     static_cast<void>(mExecutors.decodeExecutor().trimGraphCache(maxDecodeGraphs));
 }
 
+void IndependentPhaseCoordinator::setPersistentDecodeSelectEnabled(bool enabled) noexcept
+{
+    mDecodeKV.setPersistentDecodeSelectEnabled(enabled);
+}
+
+void IndependentPhaseCoordinator::setPersistentPageBindingsEnabled(bool enabled) noexcept
+{
+    mPrefillKV.setPersistentPageBindingsEnabled(enabled);
+    mDecodeKV.setPersistentPageBindingsEnabled(enabled);
+}
+
 EngineExecutor::GraphCacheStats IndependentPhaseCoordinator::prefillGraphCacheStats() const noexcept
 {
     return mExecutors.prefillExecutor().graphCacheStats();

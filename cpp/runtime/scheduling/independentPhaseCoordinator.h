@@ -91,6 +91,10 @@ public:
     void setGraphCaptureMinObservations(size_t observations);
     //! Bound production graph-cache shape counts per phase.
     void setGraphCaptureLimits(size_t maxPrefillGraphs, size_t maxDecodeGraphs) noexcept;
+    //! Enable the persistent all-zero selection buffer used by one-token decode.
+    void setPersistentDecodeSelectEnabled(bool enabled) noexcept;
+    //! Enable stable signature reuse for phase-local page-table rows.
+    void setPersistentPageBindingsEnabled(bool enabled) noexcept;
     EngineExecutor::GraphCacheStats prefillGraphCacheStats() const noexcept;
     EngineExecutor::GraphCacheStats decodeGraphCacheStats() const noexcept;
 

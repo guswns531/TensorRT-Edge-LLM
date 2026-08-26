@@ -77,6 +77,8 @@ public:
     std::vector<int32_t> makeActiveLengths(std::vector<int32_t> const& activeStableSlots) const;
 
     std::vector<int32_t> const& pages(int32_t stableSlot) const;
+    //! Monotonic identity of the current lease; changes when a slot is reused.
+    uint64_t leaseGeneration(int32_t stableSlot) const;
     bool leased(int32_t stableSlot) const;
     int32_t availableSlots() const noexcept;
     int32_t availablePages() const noexcept;
@@ -93,6 +95,7 @@ private:
     std::set<int32_t> mFreeSlots;
     std::set<int32_t> mFreePages;
     std::vector<uint8_t> mLeased;
+    std::vector<uint64_t> mLeaseGenerations;
     std::vector<int32_t> mLengths;
     std::vector<std::vector<int32_t>> mSlotPages;
     std::vector<int32_t> mPageRefCounts;

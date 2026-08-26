@@ -48,6 +48,7 @@ StableKVPageManager::StableKVPageManager(Config const& config)
         mFreePages.insert(page);
     }
     mLeased.assign(static_cast<size_t>(mConfig.maxStableSlots), 0U);
+    mLeaseGenerations.assign(static_cast<size_t>(mConfig.maxStableSlots), 0U);
     mLengths.assign(static_cast<size_t>(mConfig.maxStableSlots), 0);
     mSlotPages.resize(static_cast<size_t>(mConfig.maxStableSlots));
     mPageRefCounts.assign(static_cast<size_t>(mConfig.numPages), 0);
@@ -60,6 +61,8 @@ int32_t StableKVPageManager::reserve()
     int32_t const slot = *slotIt;
     mFreeSlots.erase(slotIt);
     mLeased[static_cast<size_t>(slot)] = 1U;
+    ++mLeaseGenerations[static_cast<size_t>(slot)];
+    ELLM_CHECK(mLeaseGenerations[static_cast<size_t>(slot)] != 0U, "Stable KV lease generation overflowed");
     mLengths[static_cast<size_t>(slot)] = 0;
     return slot;
 }
@@ -206,6 +209,12 @@ std::vector<int32_t> const& StableKVPageManager::pages(int32_t stableSlot) const
 {
     validateLease(stableSlot);
     return mSlotPages[static_cast<size_t>(stableSlot)];
+}
+
+uint64_t StableKVPageManager::leaseGeneration(int32_t stableSlot) const
+{
+    validateLease(stableSlot);
+    return mLeaseGenerations[static_cast<size_t>(stableSlot)];
 }
 
 bool StableKVPageManager::leased(int32_t stableSlot) const

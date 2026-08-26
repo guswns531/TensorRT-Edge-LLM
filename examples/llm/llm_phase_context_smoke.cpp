@@ -1399,6 +1399,14 @@ int main(int argc, char** argv)
         }
         rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
+        if (std::getenv("TRT_EDGELLM_ENABLE_PERSISTENT_DECODE_SELECT") != nullptr)
+        {
+            semanticCoordinator.setPersistentDecodeSelectEnabled(true);
+        }
+        if (std::getenv("TRT_EDGELLM_ENABLE_PERSISTENT_PAGE_BINDINGS") != nullptr)
+        {
+            semanticCoordinator.setPersistentPageBindingsEnabled(true);
+        }
         rt::IndependentPhaseServerConfig serverConfig;
         size_t maxInFlightRequests = std::min(kDEFAULT_MAX_INFLIGHT_REQUESTS, static_cast<size_t>(maxStableSlots));
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_INFLIGHT"))
@@ -2577,12 +2585,14 @@ int main(int argc, char** argv)
                 LOG_INFO(
                     "Phase %s KV memory ops: prepares=%zu length_h2d_ops=%zu length_h2d_bytes=%zu "
                     "metadata_h2d_ops=%zu metadata_h2d_bytes=%zu memset_ops=%zu memset_bytes=%zu "
+                    "decode_select_zero_reuses=%zu page_binding_updates=%zu page_binding_reuses=%zu "
                     "page_calls=%zu page_uploads=%zu page_copy_ops=%zu page_copy_bytes=%zu page_host_waits=%zu "
                     "page_stream_waits=%zu",
                     phase, memory.prepareCalls, memory.lengthH2DOperations, memory.lengthH2DBytes,
                     memory.prefillMetadataH2DOperations + memory.decodeMetadataH2DOperations,
                     memory.prefillMetadataH2DBytes + memory.decodeMetadataH2DBytes, memory.decodeMemsetOperations,
-                    memory.decodeMemsetBytes, pageTable.calls, pageTable.uploads, pageTable.copyOperations,
+                    memory.decodeMemsetBytes, memory.decodeSelectZeroReuses, memory.pageBindingRowUpdates,
+                    memory.pageBindingRowReuses, pageTable.calls, pageTable.uploads, pageTable.copyOperations,
                     pageTable.copyBytes, pageTable.hostWaits, pageTable.streamWaits);
             };
             logKVMemoryOps("prefill", semanticCoordinator.prefillKVMemoryStats(),

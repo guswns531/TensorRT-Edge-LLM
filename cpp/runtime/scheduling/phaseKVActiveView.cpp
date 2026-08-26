@@ -35,6 +35,8 @@ PhaseKVActiveView::PhaseKVActiveView(
     , mPageTable(maxActiveRows, ownership.maxPagesPerSequence(), ownership.config().numPages)
     , mHostLengths({maxActiveRows}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_active_kv_lengths")
     , mDeviceLengths({maxActiveRows}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_active_kv_lengths")
+    , mPageBindingSignatures(static_cast<size_t>(maxActiveRows))
+    , mSlotSeenEpochs(static_cast<size_t>(ownership.config().maxStableSlots), 0U)
 {
     ELLM_CHECK(maxActiveRows > 0 && maxActiveRows <= ownership.config().maxActiveRows,
         "Phase KV active-row capacity is invalid");
@@ -58,7 +60,7 @@ void PhaseKVActiveView::prepare(std::vector<int32_t> const& activeStableSlots, c
     ELLM_CHECK(mPreviousLengths != nullptr && mPreviousPageTable != nullptr,
         "Phase KV active view requires existing length and page-table bindings");
 
-    mOwnership.bindActiveRows(activeStableSlots, mPageTable, stream);
+    bindActiveRows(activeStableSlots, stream);
     std::vector<int32_t> const lengths = mOwnership.makeActiveLengths(activeStableSlots);
     ELLM_CHECK(mHostLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV host length reshape failed");
     ELLM_CHECK(mDeviceLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV device length reshape failed");
@@ -106,6 +108,15 @@ void PhaseKVActiveView::preparePrefillMetadata(
     ELLM_CHECK(io.hostSelectTokenIndices.reshape(selectShape), "Phase prefill host select-token reshape failed");
     ELLM_CHECK(io.hostContextLengths.reshape({batchSize}), "Phase prefill host context-length reshape failed");
 
+    if (mZeroedDecodeSelectTokenIndices == io.selectTokenIndices.rawPointer())
+    {
+        // A phase-local view normally owns either prefill or decode IO. Invalidate
+        // the persistent-zero fact if a caller deliberately reuses one IO object
+        // across phases and prefill writes non-zero selection indices into it.
+        mZeroedDecodeSelectTokenIndices = nullptr;
+        mZeroedDecodeSelectTokenIndicesCapacity = 0U;
+    }
+
     int64_t* selectTokenIndices = io.hostSelectTokenIndices.dataPointer<int64_t>();
     int32_t* contextLengths = io.hostContextLengths.dataPointer<int32_t>();
     int64_t packedTokenOffset{};
@@ -142,10 +153,29 @@ void PhaseKVActiveView::prepareDecodeMetadata(PipelineIO& io, cudaStream_t strea
     ELLM_CHECK(io.contextLengths.reshape({batchSize}), "Phase decode context-length reshape failed");
     ELLM_CHECK(io.hostContextLengths.reshape({batchSize}), "Phase decode host context-length reshape failed");
 
-    CUDA_CHECK(cudaMemsetAsync(
-        io.selectTokenIndices.rawPointer(), 0, static_cast<size_t>(batchSize) * sizeof(int64_t), stream));
-    ++mMemoryStats.decodeMemsetOperations;
-    mMemoryStats.decodeMemsetBytes += static_cast<size_t>(batchSize) * sizeof(int64_t);
+    void* const selectTokenIndices = io.selectTokenIndices.rawPointer();
+    size_t const selectTokenIndicesCapacity = io.selectTokenIndices.getMemoryCapacity();
+    if (!mPersistentDecodeSelectEnabled || mZeroedDecodeSelectTokenIndices != selectTokenIndices
+        || mZeroedDecodeSelectTokenIndicesCapacity != selectTokenIndicesCapacity)
+    {
+        // Decode always selects position zero from its one-token input. Clear the
+        // complete phase-local allocation once so later batch reshapes can reuse it
+        // without adding a memset launch to every decode dispatch.
+        size_t const memsetBytes = mPersistentDecodeSelectEnabled ? selectTokenIndicesCapacity
+                                                                  : static_cast<size_t>(batchSize) * sizeof(int64_t);
+        CUDA_CHECK(cudaMemsetAsync(selectTokenIndices, 0, memsetBytes, stream));
+        ++mMemoryStats.decodeMemsetOperations;
+        mMemoryStats.decodeMemsetBytes += memsetBytes;
+        if (mPersistentDecodeSelectEnabled)
+        {
+            mZeroedDecodeSelectTokenIndices = selectTokenIndices;
+            mZeroedDecodeSelectTokenIndicesCapacity = selectTokenIndicesCapacity;
+        }
+    }
+    else
+    {
+        ++mMemoryStats.decodeSelectZeroReuses;
+    }
     int32_t* contextLengths = io.hostContextLengths.dataPointer<int32_t>();
     for (int32_t row = 0; row < batchSize; ++row)
     {
@@ -156,6 +186,76 @@ void PhaseKVActiveView::prepareDecodeMetadata(PipelineIO& io, cudaStream_t strea
         static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     ++mMemoryStats.decodeMetadataH2DOperations;
     mMemoryStats.decodeMetadataH2DBytes += static_cast<size_t>(batchSize) * sizeof(int32_t);
+}
+
+void PhaseKVActiveView::setPersistentDecodeSelectEnabled(bool enabled) noexcept
+{
+    mPersistentDecodeSelectEnabled = enabled;
+    mZeroedDecodeSelectTokenIndices = nullptr;
+    mZeroedDecodeSelectTokenIndicesCapacity = 0U;
+}
+
+void PhaseKVActiveView::setPersistentPageBindingsEnabled(bool enabled) noexcept
+{
+    mPersistentPageBindingsEnabled = enabled;
+    std::fill(mPageBindingSignatures.begin(), mPageBindingSignatures.end(), PageBindingSignature{});
+    mBindingEpoch = 0U;
+    std::fill(mSlotSeenEpochs.begin(), mSlotSeenEpochs.end(), 0U);
+}
+
+void PhaseKVActiveView::bindActiveRows(std::vector<int32_t> const& activeStableSlots, cudaStream_t stream)
+{
+    if (!mPersistentPageBindingsEnabled)
+    {
+        static_cast<void>(mOwnership.bindActiveRows(activeStableSlots, mPageTable, stream));
+        return;
+    }
+
+    ++mBindingEpoch;
+    if (mBindingEpoch == 0U)
+    {
+        std::fill(mSlotSeenEpochs.begin(), mSlotSeenEpochs.end(), 0U);
+        ++mBindingEpoch;
+    }
+
+    std::vector<KVPageTableRowUpdate> updates;
+    updates.reserve(mPageBindingSignatures.size());
+    for (size_t row{}; row < mPageBindingSignatures.size(); ++row)
+    {
+        PageBindingSignature& signature = mPageBindingSignatures[row];
+        if (row >= activeStableSlots.size())
+        {
+            if (signature.stableSlot >= 0)
+            {
+                updates.push_back({static_cast<int32_t>(row), nullptr, 0});
+                signature = {};
+                ++mMemoryStats.pageBindingRowUpdates;
+            }
+            continue;
+        }
+
+        int32_t const stableSlot = activeStableSlots[row];
+        ELLM_CHECK(stableSlot >= 0 && stableSlot < mOwnership.config().maxStableSlots,
+            "Phase KV active row contains an invalid stable slot");
+        ELLM_CHECK(mSlotSeenEpochs[static_cast<size_t>(stableSlot)] != mBindingEpoch,
+            "Stable KV active rows contain a duplicate slot");
+        mSlotSeenEpochs[static_cast<size_t>(stableSlot)] = mBindingEpoch;
+        std::vector<int32_t> const& pages = mOwnership.pages(stableSlot);
+        uint64_t const leaseGeneration = mOwnership.leaseGeneration(stableSlot);
+        if (signature.stableSlot == stableSlot && signature.leaseGeneration == leaseGeneration
+            && signature.pageCount == pages.size())
+        {
+            ++mMemoryStats.pageBindingRowReuses;
+            continue;
+        }
+
+        updates.push_back(
+            {static_cast<int32_t>(row), pages.empty() ? nullptr : pages.data(), static_cast<int32_t>(pages.size())});
+        signature = {stableSlot, leaseGeneration, pages.size()};
+        ++mMemoryStats.pageBindingRowUpdates;
+    }
+    mPageTable.setRows(updates);
+    static_cast<void>(mPageTable.upload(stream));
 }
 
 KVPageTable& PhaseKVActiveView::pageTable() noexcept

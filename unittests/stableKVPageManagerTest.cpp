@@ -37,6 +37,7 @@ TEST(StableKVPageManagerTest, ReusesReleasedSlotsAndPagesDeterministically)
 {
     auto manager = makeManager();
     int32_t const slot0 = manager.reserve();
+    uint64_t const firstGeneration = manager.leaseGeneration(slot0);
     int32_t const slot1 = manager.reserve();
     manager.ensureCapacity(slot0, 256);
     manager.ensureCapacity(slot1, 128);
@@ -46,6 +47,7 @@ TEST(StableKVPageManagerTest, ReusesReleasedSlotsAndPagesDeterministically)
     manager.release(slot0);
     int32_t const reusedSlot = manager.reserve();
     EXPECT_EQ(reusedSlot, slot0);
+    EXPECT_GT(manager.leaseGeneration(reusedSlot), firstGeneration);
     manager.ensureCapacity(reusedSlot, 256);
     EXPECT_EQ(manager.pages(reusedSlot), (std::vector<int32_t>{0, 1}));
 }
