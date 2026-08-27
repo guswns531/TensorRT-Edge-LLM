@@ -49,6 +49,8 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
         "Independent phase profile index is not present in the TensorRT engine");
     ELLM_CHECK(mConfig.visionPrefillProfile < profileCount,
         "External-prefill profile index is not present in the TensorRT engine");
+    ELLM_CHECK(!mConfig.sharedExecutionContext || !mConfig.dedicatedExternalPrefillContext,
+        "A dedicated external-prefill context requires independent phase execution contexts");
     validateStreams(mConfig, mCudaContext);
 
     int64_t const prefillBytes = maxPrefillContextMemoryBytes();
@@ -70,7 +72,7 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
     ELLM_CHECK(mDecodeExecutor != nullptr, "Failed to create the independent decode executor");
     ELLM_CHECK(mPrefillExecutor->getExecutionContextIdentity() != mDecodeExecutor->getExecutionContextIdentity(),
         "Independent phase executors unexpectedly share a TensorRT execution context");
-    if (mConfig.visionPrefillProfile >= 0)
+    if (mConfig.visionPrefillProfile >= 0 || mConfig.dedicatedExternalPrefillContext)
     {
         mExternalPrefillExecutor = mPrefillExecutor->createSibling();
         ELLM_CHECK(mExternalPrefillExecutor != nullptr, "Failed to create the external-prefill executor");
@@ -93,7 +95,7 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
     if (mExternalPrefillExecutor)
     {
         ELLM_CHECK(mExternalPrefillExecutor->setContextMemoryForProfile(
-                       mConfig.visionPrefillProfile, mPrefillContextMemory, mConfig.setupStream),
+                       externalPrefillProfile(), mPrefillContextMemory, mConfig.setupStream),
             "Failed to assign the external-prefill TensorRT profile workspace");
     }
     ELLM_CHECK(
@@ -156,6 +158,11 @@ EngineExecutor const& IndependentEngineExecutorPair::externalPrefillExecutor() c
 bool IndependentEngineExecutorPair::hasExternalPrefillExecutor() const noexcept
 {
     return mExternalPrefillExecutor != nullptr;
+}
+
+int32_t IndependentEngineExecutorPair::externalPrefillProfile() const noexcept
+{
+    return mConfig.visionPrefillProfile >= 0 ? mConfig.visionPrefillProfile : mConfig.prefillProfile;
 }
 
 EngineExecutor& IndependentEngineExecutorPair::decodeExecutor() noexcept
@@ -221,7 +228,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureTieredVisi
     if (mExternalPrefillExecutor)
     {
         ELLM_CHECK(mExternalPrefillExecutor->setContextMemoryForProfile(
-                       mConfig.visionPrefillProfile, mPrefillContextMemory, mConfig.setupStream),
+                       externalPrefillProfile(), mPrefillContextMemory, mConfig.setupStream),
             "Failed to rebind external prefill to the tiered E/P context arena");
     }
 
@@ -260,7 +267,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     if (mExternalPrefillExecutor)
     {
         ELLM_CHECK(mExternalPrefillExecutor->setContextMemoryForProfile(
-                       mConfig.visionPrefillProfile, mPrefillContextMemory, mConfig.setupStream),
+                       externalPrefillProfile(), mPrefillContextMemory, mConfig.setupStream),
             "Failed to rebind external prefill to the shared E/P context arena");
     }
 

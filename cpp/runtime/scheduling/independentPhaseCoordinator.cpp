@@ -185,10 +185,10 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
                    [prefillClass](PhaseWorkItem const& item) { return item.prefillClass == prefillClass; }),
         "Independent prefill batch cannot mix producer classes");
     bool const externalPrefill = prefillClass == PhasePrefillClass::kExternal;
-    ELLM_CHECK(!externalPrefill || mConfig.hasVisionPrefillProfile(),
-        "External prefill requires a dedicated TensorRT optimization profile");
+    ELLM_CHECK(!externalPrefill || mExecutors.hasExternalPrefillExecutor(),
+        "External prefill requires a dedicated serialized TensorRT execution context");
     int32_t const profileIndex
-        = externalPrefill ? mExecutors.config().visionPrefillProfile : mExecutors.config().prefillProfile;
+        = externalPrefill ? mExecutors.externalPrefillProfile() : mExecutors.config().prefillProfile;
     ELLM_CHECK(profileIndex >= 0, "Selected prefill profile is not configured");
     EngineExecutor& executor = externalPrefill ? mExecutors.externalPrefillExecutor() : mExecutors.prefillExecutor();
 
@@ -227,8 +227,9 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
     bool const initialPrefill
         = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
     InferenceDims const dims = mConfig.packedPrefill
-        ? (externalPrefill ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
-                           : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens))
+        ? (externalPrefill && mConfig.hasVisionPrefillProfile()
+                  ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
+                  : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens))
         : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);
     ELLM_CHECK(executor.prepare(profileIndex, dims, mPrefillMap, stream), "Independent prefill prepare failed");
     int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;

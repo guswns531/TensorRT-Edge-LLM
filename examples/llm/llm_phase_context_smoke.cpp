@@ -624,6 +624,8 @@ int main(int argc, char** argv)
         auto executor = rt::EngineExecutor::createForLLM(engineDir / "llm.engine", config);
         rt::IndependentEngineExecutorPairConfig pairConfig;
         pairConfig.visionPrefillProfile = config.visionPrefillProfile;
+        pairConfig.dedicatedExternalPrefillContext
+            = std::getenv("TRT_EDGELLM_DEDICATED_EXTERNAL_PREFILL_CONTEXT") != nullptr;
         pairConfig.setupStream = setupStream;
         pairConfig.prefillStream = prefillStream;
         pairConfig.decodeStream = decodeStream;
@@ -649,10 +651,8 @@ int main(int argc, char** argv)
                 "Independent phase executors must own different TensorRT contexts");
             ELLM_CHECK(pair->prefillContextMemory().rawPointer() != pair->decodeContextMemory().rawPointer(),
                 "Independent phase executors must own different workspaces");
-            if (config.hasVisionPrefillProfile())
+            if (pair->hasExternalPrefillExecutor())
             {
-                ELLM_CHECK(pair->hasExternalPrefillExecutor(),
-                    "External-prefill profile requires a dedicated execution context");
                 ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
                         != pair->externalPrefillExecutor().getExecutionContextIdentity(),
                     "Text and external prefill must own different TensorRT contexts");
@@ -771,9 +771,11 @@ int main(int argc, char** argv)
             // Activate the optional external-prefill context before the server
             // advertises readiness. Text and external prefill share one arena
             // but retain fixed profiles on distinct serialized contexts.
-            if (config.hasVisionPrefillProfile())
+            if (pair->hasExternalPrefillExecutor())
             {
-                int32_t const visionWarmupTokens = config.maxVisionPackedPrefillChunkTokens;
+                int32_t const visionWarmupTokens = config.hasVisionPrefillProfile()
+                    ? config.maxVisionPackedPrefillChunkTokens
+                    : config.maxPackedPrefillChunkTokens;
                 ownership.setLength(prefillSlot0, 0);
                 ownership.ensureCapacity(prefillSlot0, visionWarmupTokens);
                 prefillKV.prepare({prefillSlot0}, prefillStream);
@@ -787,14 +789,17 @@ int main(int argc, char** argv)
                         cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), prefillStream));
                 }
                 prefillKV.preparePrefillMetadata(*prefillIO, {visionWarmupTokens}, prefillStream, true);
-                ELLM_CHECK(pair->externalPrefillExecutor().prepare(config.visionPrefillProfile,
-                               config.visionPackedPrefillDims(1, visionWarmupTokens), prefillMap, prefillStream),
+                rt::InferenceDims const externalDims = config.hasVisionPrefillProfile()
+                    ? config.visionPackedPrefillDims(1, visionWarmupTokens)
+                    : config.packedPrefillDims(1, visionWarmupTokens);
+                ELLM_CHECK(pair->externalPrefillExecutor().prepare(
+                               pair->externalPrefillProfile(), externalDims, prefillMap, prefillStream),
                     "Failed to prepare the external-prefill profile warmup");
                 ELLM_CHECK(pair->externalPrefillExecutor().execute(prefillStream),
                     "Failed to execute the external-prefill profile warmup");
                 CUDA_CHECK(cudaStreamSynchronize(prefillStream));
                 prefillKV.complete();
-                LOG_INFO("Primed external-prefill profile %d with %d tokens", config.visionPrefillProfile,
+                LOG_INFO("Primed external-prefill profile %d with %d tokens", pair->externalPrefillProfile(),
                     visionWarmupTokens);
             }
 
@@ -1973,10 +1978,14 @@ int main(int argc, char** argv)
             std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
             if (visionEngineDir != nullptr)
             {
-                ELLM_CHECK(!config.packedPrefill
-                        || (config.hasVisionPrefillProfile()
-                            && config.maxVisionPackedPrefillChunkTokens >= config.maxSupportedInputLength),
-                    "Three-phase packed vision requires an atomic external-prefill profile covering maxInputLength");
+                bool const hasAtomicExternalPrefill = pair->hasExternalPrefillExecutor()
+                    && ((config.hasVisionPrefillProfile()
+                            && config.maxVisionPackedPrefillChunkTokens >= config.maxSupportedInputLength)
+                        || (!config.hasVisionPrefillProfile()
+                            && config.maxPackedPrefillChunkTokens >= config.maxSupportedInputLength));
+                ELLM_CHECK(!config.packedPrefill || hasAtomicExternalPrefill,
+                    "Three-phase packed vision requires a dedicated atomic external-prefill context covering "
+                    "maxInputLength");
                 if (enablePhaseStreamPriorities)
                 {
                     CUDA_CHECK(cudaStreamCreateWithPriority(&ipcEncoderStream, cudaStreamNonBlocking, leastPriority));

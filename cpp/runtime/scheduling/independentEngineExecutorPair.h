@@ -46,6 +46,9 @@ struct IndependentEngineExecutorPairConfig
     int32_t prefillProfile{0};
     int32_t decodeProfile{1};
     int32_t visionPrefillProfile{-1};
+    //! Create a serialized external-prefill context even when it reuses the
+    //! text prefill optimization profile.
+    bool dedicatedExternalPrefillContext{};
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
@@ -78,6 +81,7 @@ public:
     EngineExecutor& externalPrefillExecutor() noexcept;
     EngineExecutor const& externalPrefillExecutor() const noexcept;
     bool hasExternalPrefillExecutor() const noexcept;
+    int32_t externalPrefillProfile() const noexcept;
     EngineExecutor& decodeExecutor() noexcept;
     EngineExecutor const& decodeExecutor() const noexcept;
 

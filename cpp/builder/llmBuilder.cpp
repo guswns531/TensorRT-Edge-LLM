@@ -666,6 +666,14 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         int64_t const maxVisionPrefillBatchSize = mBuilderConfig.getMaxVisionPrefillBatchSize();
         int64_t const maxVisionPrefillChunkTokens
             = validateMaxPackedPrefillChunkTokens(mBuilderConfig.maxVisionPrefillChunkTokens);
+        if (maxVisionPrefillChunkTokens != maxPrefillChunkTokens)
+        {
+            LOG_ERROR(
+                "The attention plugin does not support profile-local packed-prefill chunk limits. Text and external "
+                "prefill profiles must use the same max chunk token count; use two execution contexts on the shared "
+                "prefill profile when only producer isolation is required.");
+            return false;
+        }
         result &= setupCommonProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
         result &= setupRopeProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
         result &= setupVanillaProfiles(

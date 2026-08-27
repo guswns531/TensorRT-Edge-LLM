@@ -750,6 +750,10 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
             ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
                     && cfg.maxVisionPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
                 "vision prefill max chunk exceeds the export or input limit.");
+            ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens == cfg.maxPackedPrefillChunkTokens,
+                "The attention plugin does not support profile-local packed-prefill chunk limits. Text and external "
+                "prefill profiles must use the same max chunk token count; use dedicated execution contexts on the "
+                "shared prefill profile instead.");
         }
     }
     else
