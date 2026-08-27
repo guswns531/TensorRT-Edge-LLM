@@ -1453,12 +1453,14 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     bool prefillInitial{};
     PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> prefillRequestIds;
+    std::vector<int32_t> prefillStableSlotIds;
     for (PhaseWorkItem const& item : prefillPlan.prefillBatch)
     {
         prefillChunk = std::max(prefillChunk, item.tokenCount);
         prefillPastKV = std::max(prefillPastKV, item.tokenOffset);
         prefillUsefulTokens += item.tokenCount;
         prefillRequestIds.push_back(item.requestId);
+        prefillStableSlotIds.push_back(item.kvSlotId);
     }
     if (!prefillPlan.prefillBatch.empty())
     {
@@ -1472,11 +1474,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     int64_t decodeContextTokens{};
     int32_t decodeMaxContext{};
     std::vector<uint64_t> decodeRequestIds;
+    std::vector<int32_t> decodeStableSlotIds;
     for (PhaseWorkItem const& item : decodePlan.decodeBatch)
     {
         decodeContextTokens += item.tokenCount;
         decodeMaxContext = std::max(decodeMaxContext, item.tokenCount);
         decodeRequestIds.push_back(item.requestId);
+        decodeStableSlotIds.push_back(item.kvSlotId);
     }
 
     PhaseGlobalActionKey prefillKey{
@@ -1497,17 +1501,21 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     PhasePrefillClass overlapPrefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> overlapPrefillRequestIds;
     std::vector<uint64_t> overlapDecodeRequestIds;
+    std::vector<int32_t> overlapPrefillStableSlotIds;
+    std::vector<int32_t> overlapDecodeStableSlotIds;
     for (PhaseWorkItem const& item : overlapPlan.prefillBatch)
     {
         overlapPrefillChunk = std::max(overlapPrefillChunk, item.tokenCount);
         overlapPrefillPastKV = std::max(overlapPrefillPastKV, item.tokenOffset);
         overlapPrefillUsefulTokens += item.tokenCount;
         overlapPrefillRequestIds.push_back(item.requestId);
+        overlapPrefillStableSlotIds.push_back(item.kvSlotId);
     }
     for (PhaseWorkItem const& item : overlapPlan.decodeBatch)
     {
         overlapDecodeMaxContext = std::max(overlapDecodeMaxContext, item.tokenCount);
         overlapDecodeRequestIds.push_back(item.requestId);
+        overlapDecodeStableSlotIds.push_back(item.kvSlotId);
     }
     if (!overlapPlan.prefillBatch.empty())
     {
@@ -1633,6 +1641,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseGlobalActionCandidate candidate;
         candidate.key = prefillKey;
         candidate.primaryRequestIds = prefillRequestIds;
+        candidate.primaryStableSlotIds = prefillStableSlotIds;
         phaseGlobalFinalizeCandidate(candidate);
         candidate.predictedBlockingUs = prefill->makespanUs;
         candidate.predictedMakespanUs = prefill->makespanUs;
@@ -1648,6 +1657,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseGlobalActionCandidate candidate;
         candidate.key = decodeKey;
         candidate.primaryRequestIds = decodeRequestIds;
+        candidate.primaryStableSlotIds = decodeStableSlotIds;
         phaseGlobalFinalizeCandidate(candidate);
         candidate.predictedBlockingUs = decode->makespanUs;
         candidate.predictedMakespanUs = decode->makespanUs;
@@ -1707,6 +1717,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.key = overlapKey;
         candidate.primaryRequestIds = overlapPrefillRequestIds;
         candidate.secondaryRequestIds = overlapDecodeRequestIds;
+        candidate.primaryStableSlotIds = overlapPrefillStableSlotIds;
+        candidate.secondaryStableSlotIds = overlapDecodeStableSlotIds;
         phaseGlobalFinalizeCandidate(candidate);
         candidate.overlapCostKnown = overlapKnown;
         candidate.safeProbeEligible = safeProbe;
@@ -2268,14 +2280,32 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
             }
             return result;
         };
+        auto stableSlotIds = [](std::vector<PhaseWorkItem> const& batch) {
+            std::vector<int32_t> result;
+            result.reserve(batch.size());
+            for (PhaseWorkItem const& item : batch)
+            {
+                result.push_back(item.kvSlotId);
+            }
+            return result;
+        };
         std::vector<uint64_t> const actualPrimary = appliedGlobalAction->key.kind == PhaseGlobalActionKind::kDecode
             ? requestIds(plan.decodeBatch)
             : requestIds(plan.prefillBatch);
         std::vector<uint64_t> const actualSecondary
             = appliedGlobalAction->key.kind == PhaseGlobalActionKind::kPrefillDecode ? requestIds(plan.decodeBatch)
                                                                                    : std::vector<uint64_t>{};
+        std::vector<int32_t> const actualPrimarySlots
+            = appliedGlobalAction->key.kind == PhaseGlobalActionKind::kDecode ? stableSlotIds(plan.decodeBatch)
+                                                                              : stableSlotIds(plan.prefillBatch);
+        std::vector<int32_t> const actualSecondarySlots
+            = appliedGlobalAction->key.kind == PhaseGlobalActionKind::kPrefillDecode
+            ? stableSlotIds(plan.decodeBatch)
+            : std::vector<int32_t>{};
         plan.globalCandidateParity = actualPrimary == appliedGlobalAction->primaryRequestIds
-            && actualSecondary == appliedGlobalAction->secondaryRequestIds;
+            && actualSecondary == appliedGlobalAction->secondaryRequestIds
+            && actualPrimarySlots == appliedGlobalAction->primaryStableSlotIds
+            && actualSecondarySlots == appliedGlobalAction->secondaryStableSlotIds;
         plan.globalActionFidelity = phaseExecutionSetForAction(appliedGlobalAction->key.kind)
             == plan.globalAllowedOutstanding;
         if (!plan.globalCandidateParity)

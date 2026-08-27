@@ -184,9 +184,9 @@ TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
     config.maxPrefillBatchTokens = 256;
     config.enableRaggedPrefillBatching = true;
     PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
-    scheduler.enqueuePrefill({2, 128});
-    scheduler.enqueuePrefill({3, 128});
+    scheduler.enqueuePrefill({1, 32, 3});
+    scheduler.enqueuePrefill({2, 128, 0});
+    scheduler.enqueuePrefill({3, 128, 2});
 
     PhaseDispatchPlan const plan = scheduler.next();
 
@@ -194,10 +194,29 @@ TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
     ASSERT_EQ(plan.prefillBatch.size(), 2U);
     EXPECT_EQ(plan.prefillBatch[0].requestId, 2U);
     EXPECT_EQ(plan.prefillBatch[1].requestId, 3U);
+    EXPECT_EQ(plan.prefillBatch[0].kvSlotId, 0);
+    EXPECT_EQ(plan.prefillBatch[1].kvSlotId, 2);
     EXPECT_TRUE(plan.globalCandidateParity);
     EXPECT_TRUE(plan.globalActionFidelity);
     EXPECT_NE(plan.globalCandidateId, 0U);
     EXPECT_EQ(scheduler.telemetry().globalCandidateParityViolationCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
+{
+    PhaseGlobalActionCandidate first;
+    first.key = {PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0};
+    first.primaryRequestIds = {1U, 2U};
+    first.primaryStableSlotIds = {3, 0};
+    phaseGlobalFinalizeCandidate(first);
+
+    PhaseGlobalActionCandidate second = first;
+    second.primaryStableSlotIds = {0, 3};
+    phaseGlobalFinalizeCandidate(second);
+
+    EXPECT_NE(first.candidateId, second.candidateId);
+    PhaseGlobalDispatchPlan const plan = phaseGlobalDispatchPlan(1U, 1U, first);
+    EXPECT_EQ(plan.primaryStableSlotIds, (std::vector<int32_t>{3, 0}));
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)

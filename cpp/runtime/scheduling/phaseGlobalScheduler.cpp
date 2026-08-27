@@ -247,17 +247,33 @@ uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noe
         result = hashCombine(result, requestId);
     }
     result = hashCombine(result, candidate.primaryRequestIds.size());
+    for (int32_t const stableSlotId : candidate.primaryStableSlotIds)
+    {
+        result = hashCombine(result, static_cast<uint64_t>(stableSlotId));
+    }
+    result = hashCombine(result, candidate.primaryStableSlotIds.size());
     for (uint64_t const requestId : candidate.secondaryRequestIds)
     {
         result = hashCombine(result, requestId);
     }
     result = hashCombine(result, candidate.secondaryRequestIds.size());
+    for (int32_t const stableSlotId : candidate.secondaryStableSlotIds)
+    {
+        result = hashCombine(result, static_cast<uint64_t>(stableSlotId));
+    }
+    result = hashCombine(result, candidate.secondaryStableSlotIds.size());
     result = hashCombine(result, candidate.waitEventId);
     return result;
 }
 
 void phaseGlobalFinalizeCandidate(PhaseGlobalActionCandidate& candidate)
 {
+    ELLM_CHECK(candidate.primaryStableSlotIds.empty()
+            || candidate.primaryStableSlotIds.size() == candidate.primaryRequestIds.size(),
+        "Global primary stable-slot rows do not match request rows");
+    ELLM_CHECK(candidate.secondaryStableSlotIds.empty()
+            || candidate.secondaryStableSlotIds.size() == candidate.secondaryRequestIds.size(),
+        "Global secondary stable-slot rows do not match request rows");
     candidate.requestIds = candidate.primaryRequestIds;
     candidate.requestIds.insert(
         candidate.requestIds.end(), candidate.secondaryRequestIds.begin(), candidate.secondaryRequestIds.end());
@@ -287,6 +303,8 @@ PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
     result.waitEventId = candidate.waitEventId;
     result.primaryRequestIds = candidate.primaryRequestIds;
     result.secondaryRequestIds = candidate.secondaryRequestIds;
+    result.primaryStableSlotIds = candidate.primaryStableSlotIds;
+    result.secondaryStableSlotIds = candidate.secondaryStableSlotIds;
     return result;
 }
 

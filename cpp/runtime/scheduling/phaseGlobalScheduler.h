@@ -186,6 +186,11 @@ struct PhaseGlobalActionCandidate
     //! Primary and secondary row vectors retain phase-local canonical order.
     std::vector<uint64_t> primaryRequestIds;
     std::vector<uint64_t> secondaryRequestIds;
+    //! Stable physical KV ownership follows the exact corresponding row order.
+    //! Encoder-only candidates may leave these vectors empty because the KV
+    //! lease is acquired at the downstream prefill transition.
+    std::vector<int32_t> primaryStableSlotIds;
+    std::vector<int32_t> secondaryStableSlotIds;
     std::vector<uint64_t> requestIds;
     //! Invariant results supplied by mechanism-only components.
     bool dependencySafe{true};
@@ -238,6 +243,8 @@ struct PhaseGlobalDispatchPlan
     uint64_t waitEventId{};
     std::vector<uint64_t> primaryRequestIds;
     std::vector<uint64_t> secondaryRequestIds;
+    std::vector<int32_t> primaryStableSlotIds;
+    std::vector<int32_t> secondaryStableSlotIds;
 
     bool permits(PhaseExecutionSet phases) const noexcept;
     bool launchMatches(PhaseExecutionSet phases) const noexcept;
