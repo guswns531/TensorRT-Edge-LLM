@@ -2044,8 +2044,13 @@ void PhaseQueueScheduler::setNextGlobalAction(
     {
         phaseGlobalFinalizeCandidate(candidate);
     }
-    planId = planId > 0U ? planId : ++mGlobalPlanSequence;
-    snapshotEpoch = snapshotEpoch > 0U ? snapshotEpoch : ++mGlobalSnapshotEpoch;
+    check::check(planId == 0U || planId > mGlobalPlanSequence, "A global dispatch plan ID is stale");
+    check::check(
+        snapshotEpoch == 0U || snapshotEpoch > mGlobalSnapshotEpoch, "A global dispatch snapshot epoch is stale");
+    planId = planId > 0U ? planId : mGlobalPlanSequence + 1U;
+    snapshotEpoch = snapshotEpoch > 0U ? snapshotEpoch : mGlobalSnapshotEpoch + 1U;
+    mGlobalPlanSequence = planId;
+    mGlobalSnapshotEpoch = snapshotEpoch;
     mNextGlobalDispatchPlan = phaseGlobalDispatchPlan(planId, snapshotEpoch, candidate);
     mNextGlobalAction = std::move(candidate);
 }

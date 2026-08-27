@@ -278,6 +278,9 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalSafeProbes{};
     size_t globalActionFidelityViolations{};
     double lastGlobalFirstTokenCriticalPathUs{};
+    size_t globalEncoderArrivalWaitPeriods{};
+    size_t globalEncoderArrivalWaitExpirations{};
+    double lastGlobalEncoderArrivalWaitUs{};
     uint64_t activeGlobalPlanId{};
     PhaseExecutionSet globalPlannedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet globalObservedOutstanding{PhaseExecutionSet::kNone};
@@ -364,6 +367,11 @@ size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& i
 //! Decide whether a partial encoder candidate should wait for queue and downstream admission credits.
 bool phaseVisionShouldAccumulateEncoderCredits(size_t admittedBatchSize, size_t candidateBatchSize,
     size_t targetBatchSize, double oldestWaitUs, double maxWaitUs) noexcept;
+
+//! Compare dispatch-now with one bounded, arrival-predicted encoder coalescing
+//! interval while protecting the oldest request's complete E->P path.
+bool phaseVisionShouldWaitForGlobalEncoderArrival(double predictedWaitUs, double oldestSlackUs,
+    double robustFutureCriticalPathUs, double dispatchNowHorizonUs, double waitHorizonUs) noexcept;
 
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
@@ -585,6 +593,13 @@ private:
     size_t mGlobalSafeProbes{};
     size_t mGlobalActionFidelityViolations{};
     double mLastGlobalFirstTokenCriticalPathUs{};
+    size_t mGlobalEncoderArrivalWaitPeriods{};
+    size_t mGlobalEncoderArrivalWaitExpirations{};
+    double mLastGlobalEncoderArrivalWaitUs{};
+    bool mGlobalEncoderArrivalWaitDeferred{};
+    std::chrono::steady_clock::time_point mLastVisionArrival;
+    double mVisionInterarrivalEwmaUs{};
+    size_t mVisionInterarrivalSamples{};
     PhaseGlobalActionKind mLastGlobalAction{PhaseGlobalActionKind::kNone};
     size_t mGlobalDecisionSequence{};
     uint64_t mGlobalPlanSequence{};

@@ -246,6 +246,18 @@ bool phaseVisionShouldAccumulateEncoderCredits(size_t admittedBatchSize, size_t 
     return admittedBatchSize < effectiveTarget;
 }
 
+bool phaseVisionShouldWaitForGlobalEncoderArrival(double predictedWaitUs, double oldestSlackUs,
+    double robustFutureCriticalPathUs, double dispatchNowHorizonUs, double waitHorizonUs) noexcept
+{
+    if (!std::isfinite(predictedWaitUs) || predictedWaitUs <= 0.0 || !std::isfinite(robustFutureCriticalPathUs)
+        || robustFutureCriticalPathUs < 0.0 || !std::isfinite(dispatchNowHorizonUs) || dispatchNowHorizonUs <= 0.0
+        || !std::isfinite(waitHorizonUs) || waitHorizonUs <= 0.0 || waitHorizonUs >= dispatchNowHorizonUs)
+    {
+        return false;
+    }
+    return !std::isfinite(oldestSlackUs) || predictedWaitUs + robustFutureCriticalPathUs <= oldestSlackUs;
+}
+
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
     size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept
 {
@@ -599,6 +611,20 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     {
         return PhaseThreeSubmissionStatus::kDuplicateRequest;
     }
+    auto const arrival = std::chrono::steady_clock::now();
+    if (mLastVisionArrival != std::chrono::steady_clock::time_point{})
+    {
+        constexpr double kInterarrivalEwmaAlpha = 0.2;
+        double const sampleUs = std::chrono::duration<double, std::micro>(arrival - mLastVisionArrival).count();
+        if (sampleUs > 0.0)
+        {
+            mVisionInterarrivalEwmaUs = mVisionInterarrivalSamples == 0U
+                ? sampleUs
+                : kInterarrivalEwmaAlpha * sampleUs + (1.0 - kInterarrivalEwmaAlpha) * mVisionInterarrivalEwmaUs;
+            ++mVisionInterarrivalSamples;
+        }
+    }
+    mLastVisionArrival = arrival;
     scheduling = phaseVisionSchedulingHints(scheduling, mConfig.visionTtftTargetUs);
     if (scheduling.tpotTargetUs > 0.0)
     {
@@ -839,6 +865,9 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalSafeProbes = mGlobalSafeProbes;
     result.globalActionFidelityViolations = mGlobalActionFidelityViolations;
     result.lastGlobalFirstTokenCriticalPathUs = mLastGlobalFirstTokenCriticalPathUs;
+    result.globalEncoderArrivalWaitPeriods = mGlobalEncoderArrivalWaitPeriods;
+    result.globalEncoderArrivalWaitExpirations = mGlobalEncoderArrivalWaitExpirations;
+    result.lastGlobalEncoderArrivalWaitUs = mLastGlobalEncoderArrivalWaitUs;
     result.activeGlobalPlanId = mGlobalExecutionLease.has_value() ? mGlobalExecutionLease->planId : 0U;
     result.globalPlannedOutstanding = mGlobalExecutionLease.has_value()
         ? mGlobalExecutionLease->allowedOutstanding
@@ -1895,6 +1924,91 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     {
         return {};
     }
+    if (globalActive && !batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
+        && batchSize == inputs.size() && mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0
+        && mLastVisionArrival != std::chrono::steady_clock::time_point{})
+    {
+        double const sinceArrivalUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - mLastVisionArrival)
+                                          .count();
+        double predictedWaitUs = mVisionInterarrivalEwmaUs - sinceArrivalUs;
+        if (mConfig.encoderBatchWaitUs > 0.0)
+        {
+            predictedWaitUs = std::min(predictedWaitUs, mConfig.encoderBatchWaitUs - oldestWaitUs);
+        }
+        auto estimateEncoder = [&](size_t rows, size_t totalInputTokens) -> std::optional<double> {
+            constexpr size_t kEncoderTokenBucket = 1024U;
+            int32_t const contextBucket
+                = static_cast<int32_t>((totalInputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
+            PhaseGlobalActionKey const key{
+                PhaseGlobalActionKind::kEncoder, static_cast<int32_t>(rows), 0, 0, contextBucket, 0};
+            if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(key))
+            {
+                return static_cast<double>(online->makespanMedianMs + online->uncertaintyMs) * 1000.0;
+            }
+            PhaseVisionEncoderBatchCost const* selected{};
+            for (PhaseVisionEncoderBatchCost const& cost : mConfig.encoderBatchCosts)
+            {
+                if (cost.batchSize >= rows && cost.maxInputTokens >= totalInputTokens
+                    && (selected == nullptr || cost.batchSize < selected->batchSize
+                        || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
+                {
+                    selected = &cost;
+                }
+            }
+            return selected != nullptr ? std::optional<double>(static_cast<double>(selected->p95GpuMs) * 1000.0)
+                                       : std::nullopt;
+        };
+        size_t const averageInputTokens = (inputTokens + batchSize - 1U) / batchSize;
+        std::optional<double> const currentEncoder = estimateEncoder(batchSize, inputTokens);
+        std::optional<double> const singletonEncoder = estimateEncoder(1U, averageInputTokens);
+        std::optional<double> const futureEncoder
+            = estimateEncoder(batchSize + 1U, inputTokens + averageInputTokens);
+        if (predictedWaitUs > 0.0 && currentEncoder.has_value() && singletonEncoder.has_value()
+            && futureEncoder.has_value())
+        {
+            size_t const estimatedPromptTokens = std::max<size_t>(1U,
+                mEstimatedPromptTokens > 0U ? mEstimatedPromptTokens : averageInputTokens);
+            int32_t const promptTokens = static_cast<int32_t>(std::min<size_t>(
+                estimatedPromptTokens, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+            PhaseGlobalCostEstimate const currentPrefill = mServer.estimateGlobalPrefillDrainCost(
+                static_cast<int32_t>(batchSize), promptTokens, PhasePrefillClass::kExternal);
+            PhaseGlobalCostEstimate const singletonPrefill
+                = mServer.estimateGlobalPrefillDrainCost(1, promptTokens, PhasePrefillClass::kExternal);
+            PhaseGlobalCostEstimate const futurePrefill = mServer.estimateGlobalPrefillDrainCost(
+                static_cast<int32_t>(batchSize + 1U), promptTokens, PhasePrefillClass::kExternal);
+            auto robustPrefillUs = [](PhaseGlobalCostEstimate const& estimate) {
+                return static_cast<double>(estimate.makespanMedianMs + estimate.uncertaintyMs) * 1000.0;
+            };
+            double const currentCriticalUs = *currentEncoder + robustPrefillUs(currentPrefill);
+            double const singletonCriticalUs = *singletonEncoder + robustPrefillUs(singletonPrefill);
+            double const futureCriticalUs = *futureEncoder + robustPrefillUs(futurePrefill);
+            PendingVisionRequest const& oldest = mPending.front();
+            double const targetUs
+                = oldest.scheduling.ttftTargetUs > 0.0 ? oldest.scheduling.ttftTargetUs : mConfig.visionTtftTargetUs;
+            double const oldestSlackUs
+                = targetUs > 0.0 ? targetUs - oldestWaitUs : std::numeric_limits<double>::infinity();
+            double const dispatchNowHorizonUs = currentCriticalUs + singletonCriticalUs;
+            double const waitHorizonUs = predictedWaitUs + futureCriticalUs;
+            if (phaseVisionShouldWaitForGlobalEncoderArrival(
+                    predictedWaitUs, oldestSlackUs, futureCriticalUs, dispatchNowHorizonUs, waitHorizonUs))
+            {
+                if (!mGlobalEncoderArrivalWaitDeferred)
+                {
+                    ++mGlobalEncoderArrivalWaitPeriods;
+                }
+                mGlobalEncoderArrivalWaitDeferred = true;
+                mLastGlobalEncoderArrivalWaitUs = predictedWaitUs;
+                mLastGlobalAction = PhaseGlobalActionKind::kWait;
+                return {};
+            }
+        }
+        if (mGlobalEncoderArrivalWaitDeferred && sinceArrivalUs >= mVisionInterarrivalEwmaUs)
+        {
+            ++mGlobalEncoderArrivalWaitExpirations;
+        }
+    }
+    mGlobalEncoderArrivalWaitDeferred = false;
     return batchIndices;
 }
 

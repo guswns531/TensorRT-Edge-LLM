@@ -92,6 +92,20 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, RejectsStaleExternalGlobalPlanEpoch)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    std::optional<PhaseGlobalActionCandidate> candidate = scheduler.previewGlobalDecodeAction();
+    ASSERT_TRUE(candidate.has_value());
+
+    scheduler.setNextGlobalAction(*candidate, 10U, 20U);
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    EXPECT_THROW(scheduler.setNextGlobalAction(*candidate, 11U, 20U), std::runtime_error);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
 {
     PhaseQueueSchedulerConfig config;
@@ -2458,6 +2472,14 @@ TEST(PhaseThreeCoordinatorPolicyTest, AccumulatesEncoderCreditsWithinBound)
     EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 2, 4, 0.0, 1000.0));
     EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 1, 4, 0.0, 1000.0));
     EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 1, 0, 0.0, 1000.0));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, GlobalEncoderArrivalWaitRequiresGainAndFirstTokenSlack)
+{
+    EXPECT_TRUE(phaseVisionShouldWaitForGlobalEncoderArrival(100.0, 10000.0, 3000.0, 5000.0, 3100.0));
+    EXPECT_FALSE(phaseVisionShouldWaitForGlobalEncoderArrival(100.0, 2500.0, 3000.0, 5000.0, 3100.0));
+    EXPECT_FALSE(phaseVisionShouldWaitForGlobalEncoderArrival(100.0, 10000.0, 3000.0, 3000.0, 3100.0));
+    EXPECT_FALSE(phaseVisionShouldWaitForGlobalEncoderArrival(0.0, 10000.0, 3000.0, 5000.0, 3000.0));
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadForHomogeneousEncoderGeometry)
