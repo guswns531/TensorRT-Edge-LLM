@@ -276,6 +276,9 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalEncoderDecodeSelections{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
+    size_t globalWarmupDecisions{};
+    size_t globalWarmupPrefillCandidates{};
+    size_t globalWarmupDecodeCandidates{};
     size_t globalActionFidelityViolations{};
     double lastGlobalFirstTokenCriticalPathUs{};
     size_t globalEncoderArrivalWaitPeriods{};
@@ -417,6 +420,8 @@ public:
     bool poll();
     bool empty() const noexcept;
     PhaseThreeCoordinatorMetrics metrics() const noexcept;
+    //! Enable controlled unknown E+P/E+D probes while the coordinator is idle.
+    void setGlobalWarmupProbeMode(bool active);
     //! Enable optional request-level encoder and prefill-handoff telemetry.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
 
@@ -591,6 +596,9 @@ private:
     size_t mGlobalEncoderDecodeSelections{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
+    size_t mGlobalWarmupDecisions{};
+    size_t mGlobalWarmupPrefillCandidates{};
+    size_t mGlobalWarmupDecodeCandidates{};
     size_t mGlobalActionFidelityViolations{};
     double mLastGlobalFirstTokenCriticalPathUs{};
     size_t mGlobalEncoderArrivalWaitPeriods{};
@@ -605,6 +613,7 @@ private:
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
+    bool mGlobalWarmupProbeMode{};
 };
 
 } // namespace trt_edgellm::rt

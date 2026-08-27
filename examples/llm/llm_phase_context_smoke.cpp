@@ -66,10 +66,18 @@ namespace
 constexpr int32_t kDEFAULT_STABLE_SLOTS = 80;
 constexpr size_t kDEFAULT_MAX_INFLIGHT_REQUESTS = 16U;
 
+enum class PhaseIpcKind
+{
+    kSubmit,
+    kCancel,
+    kCalibrationBegin,
+    kCalibrationEnd,
+};
+
 struct PhaseIpcInput
 {
     uint64_t requestId{};
-    bool cancel{};
+    PhaseIpcKind kind{PhaseIpcKind::kSubmit};
     bool valid{true};
     std::string error;
     rt::LLMGenerationRequest::Request request;
@@ -86,8 +94,20 @@ PhaseIpcInput parsePhaseIpcInput(std::string const& line, int32_t defaultMaxOutp
     {
         nlohmann::json const payload = nlohmann::json::parse(line);
         result.requestId = payload.value("request_index", uint64_t{});
-        result.cancel = payload.value("type", "submit") == "cancel";
-        if (result.cancel)
+        std::string const type = payload.value("type", "submit");
+        if (type == "cancel")
+        {
+            result.kind = PhaseIpcKind::kCancel;
+        }
+        else if (type == "calibration_begin")
+        {
+            result.kind = PhaseIpcKind::kCalibrationBegin;
+        }
+        else if (type == "calibration_end")
+        {
+            result.kind = PhaseIpcKind::kCalibrationEnd;
+        }
+        if (result.kind != PhaseIpcKind::kSubmit)
         {
             return result;
         }
@@ -1776,8 +1796,8 @@ int main(int argc, char** argv)
             std::vector<int32_t> const warmupBatchSizes = std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr
                 ? rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes))
                 : std::vector<int32_t>{};
-            bool const globalOverlapWarmup = semanticSchedulerConfig.globalSchedulerMode
-                    == rt::PhaseGlobalSchedulerMode::kActive
+            bool const globalOverlapWarmup
+                = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                 && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP") == nullptr;
             size_t globalOverlapWarmupSamples = 4U;
             if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_WARMUP_SAMPLES"))
@@ -1940,6 +1960,9 @@ int main(int argc, char** argv)
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
+                threePhaseConfig.enableGlobalEncoderPrefillAction
+                    = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
+                    && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
                 {
                     threePhaseConfig.globalSafeProbeSlackMultiplier = std::stof(value);
@@ -2373,6 +2396,7 @@ int main(int argc, char** argv)
             });
             emitEvent({{"type", "ready"}});
             size_t emittedMetrics = semanticCoordinator.metrics().size();
+            size_t measurementEpoch{};
             double ipcIngressUs{};
             double ipcPollUs{};
             double ipcSerializationUs{};
@@ -2428,7 +2452,47 @@ int main(int argc, char** argv)
                         ++ingestedLines;
                         continue;
                     }
-                    if (input.cancel)
+                    if (input.kind == PhaseIpcKind::kCalibrationBegin || input.kind == PhaseIpcKind::kCalibrationEnd)
+                    {
+                        bool const active = input.kind == PhaseIpcKind::kCalibrationBegin;
+                        bool const idle = ipcThreePhase != nullptr ? ipcThreePhase->empty() : semanticServer.empty();
+                        if (!idle)
+                        {
+                            emitEvent({{"type", "error"}, {"request_index", requestId},
+                                {"message", "calibration epoch may only change while the backend is idle"}});
+                            ++ingestedLines;
+                            continue;
+                        }
+                        rt::PhaseThreeCoordinatorMetrics const calibrationMetrics
+                            = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
+                        rt::PhaseSchedulerTelemetry const calibrationQueueMetrics
+                            = semanticCoordinator.scheduler().telemetry();
+                        semanticCoordinator.scheduler().setGlobalWarmupProbeMode(active);
+                        if (ipcThreePhase != nullptr)
+                        {
+                            ipcThreePhase->setGlobalWarmupProbeMode(active);
+                        }
+                        if (!active)
+                        {
+                            ++measurementEpoch;
+                            emittedMetrics = semanticCoordinator.metrics().size();
+                            phaseTimelineEvents.clear();
+                            encoderBatchMetrics.clear();
+                            emitRecord("PHASE_EPOCH\t", {{"epoch", measurementEpoch}, {"kind", "measurement"}});
+                        }
+                        emitEvent({{"type", "control"}, {"request_index", requestId},
+                            {"calibration", active ? "begin" : "end"}, {"epoch", measurementEpoch},
+                            {"encoder_prefill_probes", calibrationMetrics.globalEncoderPrefillSelections},
+                            {"encoder_decode_probes", calibrationMetrics.globalEncoderDecodeSelections},
+                            {"encoder_safe_probes", calibrationMetrics.globalSafeProbes},
+                            {"warmup_decisions", calibrationMetrics.globalWarmupDecisions},
+                            {"warmup_prefill_candidates", calibrationMetrics.globalWarmupPrefillCandidates},
+                            {"warmup_decode_candidates", calibrationMetrics.globalWarmupDecodeCandidates},
+                            {"prefill_decode_safe_probes", calibrationQueueMetrics.globalSafeProbeCount}});
+                        ++ingestedLines;
+                        continue;
+                    }
+                    if (input.kind == PhaseIpcKind::kCancel)
                     {
                         bool const cancelled = ipcThreePhase != nullptr ? ipcThreePhase->cancel(requestId)
                                                                         : semanticServer.cancel(requestId);

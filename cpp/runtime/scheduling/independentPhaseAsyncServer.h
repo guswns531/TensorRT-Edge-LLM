@@ -349,6 +349,7 @@ public:
     //! Select and enqueue at most one ready P/D action.
     bool dispatchReady();
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    std::optional<PhaseGlobalActionCandidate> previewGlobalPrefillAction();
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
     PhaseGlobalCostEstimate estimateGlobalPrefillCost(
         int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const;
@@ -357,14 +358,15 @@ public:
     //! Apply the bounded completion-aware WAIT/refill decision before an
     //! externally coordinated global P/D dispatch.
     bool shouldWaitForGlobalDecodeRefill();
-    bool dispatchGlobalAction(
-        PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
+    bool dispatchGlobalAction(PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
     void runUntilIdle(size_t maxPolls);
 
     std::optional<IndependentPhaseServerToken> tryPopToken();
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
     size_t inFlightCount() const noexcept;
     size_t pendingCount() const noexcept;
+    //! Return true while a concrete CUDA sampling completion can refill decode.
+    bool hasPendingSampling() const noexcept;
     //! Include encoder and encoded-ready work that has not entered this server yet.
     void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0, size_t externalRequests = 0U,
         size_t externalPrefillTokens = 0U) noexcept;

@@ -137,8 +137,7 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveIgnoresLegacyServingProfiles)
 {
     std::vector<PhaseSchedulerProfile> const profiles{PhaseSchedulerProfile::kCustom,
         PhaseSchedulerProfile::kLatencySafe, PhaseSchedulerProfile::kBalanced,
-        PhaseSchedulerProfile::kThroughputBalanced, PhaseSchedulerProfile::kLongPrefill,
-        PhaseSchedulerProfile::kAuto};
+        PhaseSchedulerProfile::kThroughputBalanced, PhaseSchedulerProfile::kLongPrefill, PhaseSchedulerProfile::kAuto};
     std::optional<PhaseGlobalActionKey> reference;
     for (PhaseSchedulerProfile const profile : profiles)
     {
@@ -167,12 +166,11 @@ TEST(PhaseQueueSchedulerTest, GlobalCostKeyUsesExecutionVariantSupplier)
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     PhaseQueueScheduler scheduler(config);
     int32_t observedTokens{};
-    scheduler.setGlobalExecutionVariantSupplier(
-        [&](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
-            EXPECT_EQ(key.kind, PhaseGlobalActionKind::kPrefill);
-            observedTokens = primaryTokenCount;
-            return PhaseExecutionVariant::kPrimaryGraph;
-        });
+    scheduler.setGlobalExecutionVariantSupplier([&](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
+        EXPECT_EQ(key.kind, PhaseGlobalActionKind::kPrefill);
+        observedTokens = primaryTokenCount;
+        return PhaseExecutionVariant::kPrimaryGraph;
+    });
     scheduler.enqueuePrefill({1, 32});
 
     PhaseDispatchPlan const plan = scheduler.next();
@@ -321,6 +319,21 @@ TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFli
     ASSERT_TRUE(action.has_value());
     EXPECT_EQ(action->key.kind, PhaseGlobalActionKind::kDecode);
     EXPECT_EQ(action->requestIds, std::vector<uint64_t>{2U});
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPrefillPreviewExcludesDecodeForBoundedEncoderOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const action = scheduler.previewGlobalPrefillAction();
+
+    ASSERT_TRUE(action.has_value());
+    EXPECT_EQ(action->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_EQ(action->requestIds, std::vector<uint64_t>{1U});
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)

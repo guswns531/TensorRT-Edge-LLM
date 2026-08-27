@@ -676,6 +676,8 @@ public:
     bool shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompletionPreview> const& previews);
     //! Preview the best current P/D action without removing queue entries.
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    //! Preview only the current prefill action for an external E+P candidate.
+    std::optional<PhaseGlobalActionCandidate> previewGlobalPrefillAction();
     //! Preview decode only while an external encoder is already in flight.
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
     //! Robust cost for a future prefill that has not entered the queue yet.
@@ -687,8 +689,7 @@ public:
     PhaseGlobalCostEstimate estimateGlobalPrefillDrainCost(
         int32_t batchSize, int32_t promptTokens, PhasePrefillClass prefillClass) const;
     //! Consume one externally selected P/D action at the next dispatch boundary.
-    void setNextGlobalAction(
-        PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
+    void setNextGlobalAction(PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
     void setGlobalMemoryHorizonSupplier(
         std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
             supplier);

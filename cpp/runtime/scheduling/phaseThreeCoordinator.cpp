@@ -867,15 +867,17 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalEncoderDecodeSelections = mGlobalEncoderDecodeSelections;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
+    result.globalWarmupDecisions = mGlobalWarmupDecisions;
+    result.globalWarmupPrefillCandidates = mGlobalWarmupPrefillCandidates;
+    result.globalWarmupDecodeCandidates = mGlobalWarmupDecodeCandidates;
     result.globalActionFidelityViolations = mGlobalActionFidelityViolations;
     result.lastGlobalFirstTokenCriticalPathUs = mLastGlobalFirstTokenCriticalPathUs;
     result.globalEncoderArrivalWaitPeriods = mGlobalEncoderArrivalWaitPeriods;
     result.globalEncoderArrivalWaitExpirations = mGlobalEncoderArrivalWaitExpirations;
     result.lastGlobalEncoderArrivalWaitUs = mLastGlobalEncoderArrivalWaitUs;
     result.activeGlobalPlanId = mGlobalExecutionLease.has_value() ? mGlobalExecutionLease->planId : 0U;
-    result.globalPlannedOutstanding = mGlobalExecutionLease.has_value()
-        ? mGlobalExecutionLease->allowedOutstanding
-        : PhaseExecutionSet::kNone;
+    result.globalPlannedOutstanding
+        = mGlobalExecutionLease.has_value() ? mGlobalExecutionLease->allowedOutstanding : PhaseExecutionSet::kNone;
     result.globalObservedOutstanding = observedGlobalExecution();
     result.lastGlobalAction = mLastGlobalAction;
     if (!mPending.empty())
@@ -885,6 +887,12 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
                                         .count();
     }
     return result;
+}
+
+void PhaseThreeCoordinator::setGlobalWarmupProbeMode(bool active)
+{
+    ELLM_CHECK(empty(), "Global encoder overlap warmup mode may only change while the coordinator is idle");
+    mGlobalWarmupProbeMode = active;
 }
 
 void PhaseThreeCoordinator::setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback)
@@ -961,8 +969,7 @@ void PhaseThreeCoordinator::refreshGlobalExecutionLease()
     }
 }
 
-PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(
-    PhaseGlobalActionCandidate const& candidate)
+PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate)
 {
     ELLM_CHECK(!mGlobalExecutionLease.has_value(), "A global execution lease is already active");
     PhaseGlobalDispatchPlan plan = phaseGlobalDispatchPlan(kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence,
@@ -1015,11 +1022,20 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     std::optional<PhaseGlobalActionCandidate> pd;
+    std::optional<PhaseGlobalActionCandidate> prefillForEncoder;
+    std::optional<PhaseGlobalActionCandidate> decodeForEncoder;
     if (serverState.prefillQueued > 0U || serverState.decodeQueued > 0U)
     {
         pd = mServer.previewGlobalAction();
     }
-
+    if (serverState.prefillQueued > 0U && mConfig.enableGlobalEncoderPrefillAction)
+    {
+        prefillForEncoder = mServer.previewGlobalPrefillAction();
+    }
+    if (serverState.decodeQueued > 0U)
+    {
+        decodeForEncoder = mServer.previewGlobalDecodeAction();
+    }
     std::vector<size_t> encoderBatchIndices;
     if (!mPending.empty())
     {
@@ -1028,6 +1044,18 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     if (encoderBatchIndices.empty() && !pd.has_value())
     {
         return false;
+    }
+    if (mGlobalWarmupProbeMode)
+    {
+        ++mGlobalWarmupDecisions;
+        mGlobalWarmupPrefillCandidates += prefillForEncoder.has_value() ? 1U : 0U;
+        mGlobalWarmupDecodeCandidates += decodeForEncoder.has_value() ? 1U : 0U;
+        if (!prefillForEncoder.has_value() && !decodeForEncoder.has_value() && mServer.hasPendingSampling())
+        {
+            // The completion event is a concrete WAIT target. Let sampling
+            // materialize its D row before choosing an otherwise serial E.
+            return false;
+        }
     }
     if (encoderBatchIndices.empty())
     {
@@ -1114,14 +1142,14 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     size_t const estimatedPromptTokensPerRequest = std::max<size_t>(1U,
-        mEstimatedPromptTokens > 0U ? mEstimatedPromptTokens
-                                    : (encoderInputTokens + encoderBatchIndices.size() - 1U)
-                / encoderBatchIndices.size());
-    PhaseGlobalCostEstimate const visionPrefill = mServer.estimateGlobalPrefillDrainCost(
-        static_cast<int32_t>(encoderBatchIndices.size()),
-        static_cast<int32_t>(std::min<size_t>(estimatedPromptTokensPerRequest,
-            static_cast<size_t>(std::numeric_limits<int32_t>::max()))),
-        PhasePrefillClass::kExternal);
+        mEstimatedPromptTokens > 0U
+            ? mEstimatedPromptTokens
+            : (encoderInputTokens + encoderBatchIndices.size() - 1U) / encoderBatchIndices.size());
+    PhaseGlobalCostEstimate const visionPrefill
+        = mServer.estimateGlobalPrefillDrainCost(static_cast<int32_t>(encoderBatchIndices.size()),
+            static_cast<int32_t>(std::min<size_t>(
+                estimatedPromptTokensPerRequest, static_cast<size_t>(std::numeric_limits<int32_t>::max()))),
+            PhasePrefillClass::kExternal);
     double const visionPrefillMakespanUs = visionPrefill.makespanMedianMs > 0.0F
         ? static_cast<double>(visionPrefill.makespanMedianMs) * 1000.0
         : mConfig.globalVisionPrefillColdStartUs;
@@ -1174,15 +1202,14 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     bool const encoderExclusive = mConfig.exclusiveEncoderInputTokenThreshold > 0
         && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold;
-    auto addEncoderOverlap = [&](PhaseGlobalActionKind kind) {
-        ELLM_CHECK(pd.has_value(), "An encoder overlap requires a P/D candidate");
-        int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? pd->key.chunkLength : 0;
+    auto addEncoderOverlap = [&](PhaseGlobalActionKind kind, PhaseGlobalActionCandidate const& phase) {
+        int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? phase.key.chunkLength : 0;
         PhaseGlobalActionKey overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
-            pd->key.primaryBatchSize, chunkLength, encoderContextBucket, pd->key.primaryContextBucket};
+            phase.key.primaryBatchSize, chunkLength, encoderContextBucket, phase.key.primaryContextBucket};
         overlapKey.executionVariant
-            = phaseExecutionVariant(false, phaseExecutionVariantUsesPrimaryGraph(pd->key.executionVariant));
-        double overlapMakespanUs = encoderMakespanUs + pd->predictedMakespanUs;
-        double overlapUncertaintyUs = encoderUncertaintyUs + pd->uncertaintyUs;
+            = phaseExecutionVariant(false, phaseExecutionVariantUsesPrimaryGraph(phase.key.executionVariant));
+        double overlapMakespanUs = encoderMakespanUs + phase.predictedMakespanUs;
+        double overlapUncertaintyUs = encoderUncertaintyUs + phase.uncertaintyUs;
         bool overlapKnown{};
         if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(overlapKey))
         {
@@ -1197,11 +1224,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 for (PhaseEncoderPrefillBatchCost const& cost : mConfig.globalEncoderPrefillCosts)
                 {
                     if (cost.encoderBatchSize >= encoderBatchIndices.size()
-                        && cost.prefillBatchSize >= pd->key.primaryBatchSize
+                        && cost.prefillBatchSize >= phase.key.primaryBatchSize
                         && cost.maxEncoderInputTokens >= encoderInputTokens
-                        && cost.maxPrefillChunkLength >= pd->key.chunkLength
+                        && cost.maxPrefillChunkLength >= phase.key.chunkLength
                         && cost.maxPrefillPastKVLength
-                            >= pd->key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
+                            >= phase.key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
                         && static_cast<double>(cost.makespanP95GpuMs) * 1000.0 < overlapMakespanUs)
                     {
                         overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
@@ -1215,10 +1242,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 for (PhaseEncoderDecodeBatchCost const& cost : mConfig.globalEncoderDecodeCosts)
                 {
                     if (cost.encoderBatchSize >= encoderBatchIndices.size()
-                        && cost.decodeBatchSize >= pd->key.primaryBatchSize
+                        && cost.decodeBatchSize >= phase.key.primaryBatchSize
                         && cost.maxEncoderInputTokens >= encoderInputTokens
                         && cost.maxDecodeContextLength
-                            >= pd->key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
+                            >= phase.key.primaryContextBucket * mConfig.globalDecodeContextBucketTokens
                         && static_cast<double>(cost.makespanP95GpuMs) * 1000.0 < overlapMakespanUs)
                     {
                         overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
@@ -1229,19 +1256,22 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             }
         }
         double protectedSlackUs = encoderSlackUs;
-        for (PhaseProtectedCompletion const& completion : pd->protectedCompletions)
+        for (PhaseProtectedCompletion const& completion : phase.protectedCompletions)
         {
             protectedSlackUs = std::min(protectedSlackUs, completion.slackUs);
         }
         double const robustSerialUs
-            = encoderMakespanUs + encoderUncertaintyUs + pd->predictedMakespanUs + pd->uncertaintyUs;
+            = encoderMakespanUs + encoderUncertaintyUs + phase.predictedMakespanUs + phase.uncertaintyUs;
         bool const probeIntervalReady = mLastGlobalSafeProbeSequence == 0U
             || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
-        bool const safeProbe = !overlapKnown && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
-            && protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
+        bool const safeProbe = !overlapKnown
+            && (mGlobalWarmupProbeMode
+                || (mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
+                    && protectedSlackUs
+                        >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs));
         if (safeProbe)
         {
-            double const optimisticMakespanUs = std::max(encoderMakespanUs, pd->predictedMakespanUs);
+            double const optimisticMakespanUs = std::max(encoderMakespanUs, phase.predictedMakespanUs);
             overlapMakespanUs = optimisticMakespanUs;
             overlapUncertaintyUs = std::max(0.0, robustSerialUs - optimisticMakespanUs);
         }
@@ -1252,19 +1282,19 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.predictedBlockingUs = overlapMakespanUs;
         overlap.predictedMakespanUs = overlapMakespanUs;
         overlap.uncertaintyUs = overlapUncertaintyUs;
-        overlap.referenceWorkUs = encoderReferenceUs + pd->referenceWorkUs;
-        overlap.requestServiceLagUs = std::max(encoderServiceLagUs, pd->requestServiceLagUs);
+        overlap.referenceWorkUs = encoderReferenceUs + phase.referenceWorkUs;
+        overlap.requestServiceLagUs = std::max(encoderServiceLagUs, phase.requestServiceLagUs);
         overlap.memory = encoder.memory;
-        overlap.memory.allocateBytes = saturatedAdd(overlap.memory.allocateBytes, pd->memory.allocateBytes);
+        overlap.memory.allocateBytes = saturatedAdd(overlap.memory.allocateBytes, phase.memory.allocateBytes);
         overlap.memory.guaranteedGrowthBytes
-            = saturatedAdd(overlap.memory.guaranteedGrowthBytes, pd->memory.guaranteedGrowthBytes);
-        overlap.memory.nearReclaimBytes = saturatedAdd(overlap.memory.nearReclaimBytes, pd->memory.nearReclaimBytes);
+            = saturatedAdd(overlap.memory.guaranteedGrowthBytes, phase.memory.guaranteedGrowthBytes);
+        overlap.memory.nearReclaimBytes = saturatedAdd(overlap.memory.nearReclaimBytes, phase.memory.nearReclaimBytes);
         overlap.primaryRequestIds = encoder.primaryRequestIds;
-        overlap.secondaryRequestIds = pd->requestIds;
+        overlap.secondaryRequestIds = phase.requestIds;
         phaseGlobalFinalizeCandidate(overlap);
         overlap.protectedCompletions.push_back({encoderSlackUs, overlapMakespanUs + visionPrefillMakespanUs,
             overlapUncertaintyUs + visionPrefillUncertaintyUs});
-        for (PhaseProtectedCompletion completion : pd->protectedCompletions)
+        for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
             completion.predictedCompletionUs = overlapMakespanUs;
             completion.uncertaintyUs = overlapUncertaintyUs;
@@ -1272,26 +1302,39 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         candidates.push_back(std::move(overlap));
     };
-    if (pd.has_value() && !encoderExclusive && !mConfig.enableAsyncEncoderPreparation)
+    if (!encoderExclusive && !mConfig.enableAsyncEncoderPreparation)
     {
-        if (pd->key.kind == PhaseGlobalActionKind::kPrefill && mConfig.enableGlobalEncoderPrefillAction)
+        if (prefillForEncoder.has_value())
         {
-            addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill);
+            addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill, *prefillForEncoder);
         }
-        else if (pd->key.kind == PhaseGlobalActionKind::kDecode)
+        if (decodeForEncoder.has_value())
         {
-            addEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode);
+            addEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode, *decodeForEncoder);
         }
     }
 
     ++mGlobalDecisionSequence;
     PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
     ++mGlobalDecisions;
-    if (!decision.selectedIndex.has_value())
+    std::optional<size_t> selectedIndex = decision.selectedIndex;
+    if (mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
+    {
+        auto const calibration = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
+            bool const encoderOverlap = candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode;
+            return encoderOverlap && candidate.safeProbeEligible && !candidate.overlapCostKnown;
+        });
+        if (calibration != candidates.end())
+        {
+            selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), calibration));
+        }
+    }
+    if (!selectedIndex.has_value())
     {
         return false;
     }
-    PhaseGlobalActionCandidate selected = candidates[*decision.selectedIndex];
+    PhaseGlobalActionCandidate selected = candidates[*selectedIndex];
     mLastGlobalAction = selected.key.kind;
     bool const safeProbe = selected.safeProbeEligible && !selected.overlapCostKnown;
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
@@ -1325,6 +1368,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
         || selected.key.kind == PhaseGlobalActionKind::kEncoderDecode)
     {
+        std::optional<PhaseGlobalActionCandidate>& phase
+            = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill ? prefillForEncoder : decodeForEncoder;
+        ELLM_CHECK(phase.has_value(), "Selected encoder overlap has no matching phase action");
         PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(selected);
         mGlobalEncoderBatchIndices = encoderBatchIndices;
         mInFlightGlobalEncoderKey = encoderKey;
@@ -1333,7 +1379,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F, 0.0F};
         bool const encoderStarted = startNextEncoder();
         bool const phaseStarted = encoderStarted
-            && mServer.dispatchGlobalAction(std::move(*pd), executionPlan.planId, executionPlan.snapshotEpoch);
+            && mServer.dispatchGlobalAction(std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
         if (!encoderStarted || !phaseStarted)
         {
             mPendingGlobalOverlapObservation.reset();
@@ -1943,9 +1989,8 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
         && batchSize == inputs.size() && mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0
         && mLastVisionArrival != std::chrono::steady_clock::time_point{})
     {
-        double const sinceArrivalUs = std::chrono::duration<double, std::micro>(
-            std::chrono::steady_clock::now() - mLastVisionArrival)
-                                          .count();
+        double const sinceArrivalUs
+            = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mLastVisionArrival).count();
         double predictedWaitUs = mVisionInterarrivalEwmaUs - sinceArrivalUs;
         if (mConfig.encoderBatchWaitUs > 0.0)
         {
@@ -1977,15 +2022,14 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
         size_t const averageInputTokens = (inputTokens + batchSize - 1U) / batchSize;
         std::optional<double> const currentEncoder = estimateEncoder(batchSize, inputTokens);
         std::optional<double> const singletonEncoder = estimateEncoder(1U, averageInputTokens);
-        std::optional<double> const futureEncoder
-            = estimateEncoder(batchSize + 1U, inputTokens + averageInputTokens);
+        std::optional<double> const futureEncoder = estimateEncoder(batchSize + 1U, inputTokens + averageInputTokens);
         if (predictedWaitUs > 0.0 && currentEncoder.has_value() && singletonEncoder.has_value()
             && futureEncoder.has_value())
         {
-            size_t const estimatedPromptTokens = std::max<size_t>(1U,
-                mEstimatedPromptTokens > 0U ? mEstimatedPromptTokens : averageInputTokens);
-            int32_t const promptTokens = static_cast<int32_t>(std::min<size_t>(
-                estimatedPromptTokens, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+            size_t const estimatedPromptTokens
+                = std::max<size_t>(1U, mEstimatedPromptTokens > 0U ? mEstimatedPromptTokens : averageInputTokens);
+            int32_t const promptTokens = static_cast<int32_t>(
+                std::min<size_t>(estimatedPromptTokens, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
             PhaseGlobalCostEstimate const currentPrefill = mServer.estimateGlobalPrefillDrainCost(
                 static_cast<int32_t>(batchSize), promptTokens, PhasePrefillClass::kExternal);
             PhaseGlobalCostEstimate const singletonPrefill

@@ -768,6 +768,15 @@ std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGl
     return mCoordinator.scheduler().previewGlobalAction();
 }
 
+std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalPrefillAction()
+{
+    if (mCoordinator.busy())
+    {
+        return std::nullopt;
+    }
+    return mCoordinator.scheduler().previewGlobalPrefillAction();
+}
+
 std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalDecodeAction()
 {
     if (mCoordinator.busy())
@@ -1164,6 +1173,11 @@ size_t IndependentPhaseAsyncServer::inFlightCount() const noexcept
 size_t IndependentPhaseAsyncServer::pendingCount() const noexcept
 {
     return mPendingRequests.size();
+}
+
+bool IndependentPhaseAsyncServer::hasPendingSampling() const noexcept
+{
+    return !mSamplingTickets.empty();
 }
 
 void IndependentPhaseAsyncServer::setExternalPendingRequests(
