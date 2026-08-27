@@ -493,6 +493,11 @@ PhaseGlobalSchedulerMode PhaseQueueScheduler::globalSchedulerMode() const noexce
     return mConfig.globalSchedulerMode;
 }
 
+PhaseGlobalSelectionMode PhaseQueueScheduler::globalSelectionMode() const noexcept
+{
+    return mConfig.globalSelectionMode;
+}
+
 bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
 {
     return !mDispatchBlocked && !(prefill && mPrefillDispatchBlocked)

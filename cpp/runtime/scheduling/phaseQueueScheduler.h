@@ -670,6 +670,7 @@ public:
     //! Return a read-only scheduling snapshot for an upstream phase arbiter.
     PhaseQueueSnapshot queueSnapshot() const;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
+    PhaseGlobalSelectionMode globalSelectionMode() const noexcept;
     //! Compare D-now with at most two concrete WAIT(event)+D-future actions.
     //! Shadow mode records the decision without delaying dispatch.
     bool shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompletionPreview> const& previews);

@@ -108,6 +108,7 @@ TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
     EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
     EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefillDecode);
     EXPECT_EQ(plan.globalDecisionReason, PhaseGlobalDecisionReason::kLegacyCompatibility);
+    EXPECT_EQ(scheduler.globalSelectionMode(), PhaseGlobalSelectionMode::kLegacyCompatibility);
     EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode);
     EXPECT_TRUE(plan.globalCandidateParity);
     EXPECT_TRUE(plan.globalActionFidelity);

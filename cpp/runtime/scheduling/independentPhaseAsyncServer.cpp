@@ -739,10 +739,9 @@ bool IndependentPhaseAsyncServer::dispatchReady()
     {
         ++mDecodeRefillWaitCount;
     }
-    bool const waitForPrefillFormation
-        = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive
-        ? false
-        : shouldWaitForPrefillFormation();
+    bool const profileFreeGlobal = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive
+        && mCoordinator.scheduler().globalSelectionMode() == PhaseGlobalSelectionMode::kProfileFree;
+    bool const waitForPrefillFormation = profileFreeGlobal ? false : shouldWaitForPrefillFormation();
     bool const phaseQueued
         = mCoordinator.scheduler().prefillQueueSize() > 0U || mCoordinator.scheduler().decodeQueueSize() > 0U;
     if (!mCoordinator.busy() && phaseQueued && !waitForDecodeRefill)
@@ -957,8 +956,9 @@ bool IndependentPhaseAsyncServer::shouldWaitForGlobalDecodeRefill()
         return false;
     }
     bool const globalWait = mCoordinator.scheduler().shouldWaitForDecodeEvents(previews);
-    return mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kShadow ? legacyWait
-                                                                                               : globalWait;
+    bool const useLegacyWait = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kShadow
+        || mCoordinator.scheduler().globalSelectionMode() == PhaseGlobalSelectionMode::kLegacyCompatibility;
+    return useLegacyWait ? legacyWait : globalWait;
 }
 
 size_t IndependentPhaseAsyncServer::admissionLimit() const noexcept
