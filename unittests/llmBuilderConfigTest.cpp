@@ -103,6 +103,20 @@ TEST(LLMBuilderConfigTest, PackedPrefillChunkLimitRoundTripsThroughJson)
     EXPECT_EQ(parsed.toJson().at("max_prefill_chunk_tokens"), 64);
 }
 
+TEST(LLMBuilderConfigTest, VisionPrefillProfileRoundTripsThroughJson)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxVisionPrefillBatchSize = 4;
+    config.maxVisionPrefillChunkTokens = 1024;
+
+    LLMBuilderConfig const parsed = LLMBuilderConfig::fromJson(config.toJson());
+
+    EXPECT_TRUE(parsed.hasVisionPrefillProfile());
+    EXPECT_EQ(parsed.getMaxVisionPrefillBatchSize(), 4);
+    EXPECT_EQ(parsed.maxVisionPrefillChunkTokens, 1024);
+    EXPECT_EQ(parsed.toJson().at("vision_prefill_profile"), 2);
+}
+
 TEST(LLMBuilderConfigTest, PoolPagesRejectDerivedVIdOverflow)
 {
     LLMBuilderConfig config = makeConfig();

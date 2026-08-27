@@ -45,6 +45,7 @@ struct IndependentEngineExecutorPairConfig
 {
     int32_t prefillProfile{0};
     int32_t decodeProfile{1};
+    int32_t visionPrefillProfile{-1};
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
@@ -72,6 +73,11 @@ public:
 
     EngineExecutor& prefillExecutor() noexcept;
     EngineExecutor const& prefillExecutor() const noexcept;
+    //! Dedicated external-prefill context when profile 2 is present. It shares
+    //! the prefill workspace, so text and external prefill remain serialized.
+    EngineExecutor& externalPrefillExecutor() noexcept;
+    EngineExecutor const& externalPrefillExecutor() const noexcept;
+    bool hasExternalPrefillExecutor() const noexcept;
     EngineExecutor& decodeExecutor() noexcept;
     EngineExecutor const& decodeExecutor() const noexcept;
 
@@ -104,12 +110,14 @@ private:
 
     static CUcontext streamContext(cudaStream_t stream);
     static void validateStreams(IndependentEngineExecutorPairConfig const& config, CUcontext& context);
+    int64_t maxPrefillContextMemoryBytes() const;
 
     //! Declared before non-owning subviews so it is destroyed after them.
     Tensor mTieredContextMemoryArena;
     Tensor mPrefillContextMemory;
     Tensor mDecodeContextMemory;
     std::unique_ptr<EngineExecutor> mPrefillExecutor;
+    std::unique_ptr<EngineExecutor> mExternalPrefillExecutor;
     std::unique_ptr<EngineExecutor> mDecodeExecutor;
     IndependentEngineExecutorPairConfig mConfig;
     CUcontext mCudaContext{};

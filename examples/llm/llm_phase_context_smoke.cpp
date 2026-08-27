@@ -623,6 +623,7 @@ int main(int argc, char** argv)
     {
         auto executor = rt::EngineExecutor::createForLLM(engineDir / "llm.engine", config);
         rt::IndependentEngineExecutorPairConfig pairConfig;
+        pairConfig.visionPrefillProfile = config.visionPrefillProfile;
         pairConfig.setupStream = setupStream;
         pairConfig.prefillStream = prefillStream;
         pairConfig.decodeStream = decodeStream;
@@ -631,6 +632,8 @@ int main(int argc, char** argv)
 
         ELLM_CHECK(&pair->prefillExecutor().getEngine() == &pair->decodeExecutor().getEngine(),
             "Phase executors must share one TensorRT engine");
+        ELLM_CHECK(&pair->prefillExecutor().getEngine() == &pair->externalPrefillExecutor().getEngine(),
+            "External-prefill executor must share the TensorRT engine");
         if (pair->sharedExecutionContext())
         {
             ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
@@ -646,6 +649,14 @@ int main(int argc, char** argv)
                 "Independent phase executors must own different TensorRT contexts");
             ELLM_CHECK(pair->prefillContextMemory().rawPointer() != pair->decodeContextMemory().rawPointer(),
                 "Independent phase executors must own different workspaces");
+            if (config.hasVisionPrefillProfile())
+            {
+                ELLM_CHECK(pair->hasExternalPrefillExecutor(),
+                    "External-prefill profile requires a dedicated execution context");
+                ELLM_CHECK(pair->prefillExecutor().getExecutionContextIdentity()
+                        != pair->externalPrefillExecutor().getExecutionContextIdentity(),
+                    "Text and external prefill must own different TensorRT contexts");
+            }
         }
 
         std::unordered_map<std::string, std::string> const emptyLoraMap;
@@ -756,6 +767,36 @@ int main(int argc, char** argv)
                 "decode_overlap=%.4f ms",
                 kITERATIONS, sequential.makespanMs, overlap.makespanMs, speedup, overlapRatio, sequential.prefillMs,
                 sequential.decodeMs, overlap.prefillMs, overlap.decodeMs);
+
+            // Activate the optional external-prefill context before the server
+            // advertises readiness. Text and external prefill share one arena
+            // but retain fixed profiles on distinct serialized contexts.
+            if (config.hasVisionPrefillProfile())
+            {
+                int32_t const visionWarmupTokens = config.maxVisionPackedPrefillChunkTokens;
+                ownership.setLength(prefillSlot0, 0);
+                ownership.ensureCapacity(prefillSlot0, visionWarmupTokens);
+                prefillKV.prepare({prefillSlot0}, prefillStream);
+                ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, visionWarmupTokens, config.hiddenSize}),
+                    "Failed to reshape external-prefill warmup embeddings");
+                CUDA_CHECK(cudaMemsetAsync(prefillIO->inputsEmbeds.rawPointer(), 0,
+                    prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
+                for (rt::Tensor& deepstack : prefillIO->deepstackEmbeds)
+                {
+                    CUDA_CHECK(
+                        cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), prefillStream));
+                }
+                prefillKV.preparePrefillMetadata(*prefillIO, {visionWarmupTokens}, prefillStream, true);
+                ELLM_CHECK(pair->externalPrefillExecutor().prepare(config.visionPrefillProfile,
+                               config.visionPackedPrefillDims(1, visionWarmupTokens), prefillMap, prefillStream),
+                    "Failed to prepare the external-prefill profile warmup");
+                ELLM_CHECK(pair->externalPrefillExecutor().execute(prefillStream),
+                    "Failed to execute the external-prefill profile warmup");
+                CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+                prefillKV.complete();
+                LOG_INFO("Primed external-prefill profile %d with %d tokens", config.visionPrefillProfile,
+                    visionWarmupTokens);
+            }
 
             // Exercise the real queue scheduler -> dispatch worker -> independent
             // TensorRT context path. Two 256-token requests advance in fixed-128
@@ -944,8 +985,9 @@ int main(int argc, char** argv)
             ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
         }
 
-        int32_t const prefillTokenCapacity
-            = config.packedPrefill ? config.maxPackedPrefillChunkTokens : config.maxSupportedInputLength;
+        int32_t const prefillTokenCapacity = config.packedPrefill
+            ? std::max(config.maxPackedPrefillChunkTokens, config.maxVisionPackedPrefillChunkTokens)
+            : config.maxSupportedInputLength;
         bool const enableBatchedVisionPrefill = std::getenv("TRT_EDGELLM_ENABLE_BATCHED_VISION_PREFILL") != nullptr;
         ELLM_CHECK(!enableBatchedVisionPrefill || config.packedPrefill,
             "Batched vision prefill requires a packed-prefill engine");
@@ -955,7 +997,13 @@ int main(int argc, char** argv)
         {
             prefillBatchTokenBudget = std::stoi(prefillBatchTokenBudgetValue);
         }
-        int32_t const profileTokenCapacity = config.maxSupportedPrefillBatchSize * prefillTokenCapacity;
+        int32_t const textProfileTokenCapacity
+            = config.maxSupportedPrefillBatchSize * config.maxPackedPrefillChunkTokens;
+        int32_t const visionProfileTokenCapacity
+            = config.maxSupportedVisionPrefillBatchSize * config.maxVisionPackedPrefillChunkTokens;
+        int32_t const profileTokenCapacity = config.packedPrefill
+            ? std::max(textProfileTokenCapacity, visionProfileTokenCapacity)
+            : config.maxSupportedPrefillBatchSize * prefillTokenCapacity;
         ELLM_CHECK(prefillBatchTokenBudget > 0 && prefillBatchTokenBudget <= profileTokenCapacity,
             "Prefill batch token budget is outside the packed-prefill profile");
         rt::Tensor hostSemanticPrefillIds({config.maxSupportedPrefillBatchSize, prefillTokenCapacity},
@@ -1925,9 +1973,10 @@ int main(int argc, char** argv)
             std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
             if (visionEngineDir != nullptr)
             {
-                ELLM_CHECK(
-                    !config.packedPrefill || config.maxPackedPrefillChunkTokens >= config.maxSupportedInputLength,
-                    "Three-phase packed vision requires an atomic packed-prefill chunk covering maxInputLength");
+                ELLM_CHECK(!config.packedPrefill
+                        || (config.hasVisionPrefillProfile()
+                            && config.maxVisionPackedPrefillChunkTokens >= config.maxSupportedInputLength),
+                    "Three-phase packed vision requires an atomic external-prefill profile covering maxInputLength");
                 if (enablePhaseStreamPriorities)
                 {
                     CUDA_CHECK(cudaStreamCreateWithPriority(&ipcEncoderStream, cudaStreamNonBlocking, leastPriority));

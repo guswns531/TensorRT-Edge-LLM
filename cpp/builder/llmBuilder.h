@@ -58,6 +58,10 @@ struct LLMBuilderConfig
     //! This mode requires a runtime allocator that leaves inactive page-table rows empty.
     bool allowKVPoolUndercommit{false};
     int64_t maxPrefillChunkTokens{128}; //!< Maximum logical row length for packed prefill
+    //! Optional atomic external-producer prefill profile. Zero disables the additional profile.
+    int64_t maxVisionPrefillChunkTokens{};
+    //! Maximum logical rows in the optional external-producer prefill profile.
+    int64_t maxVisionPrefillBatchSize{};
 
     //! Resolve the exact physical K-page count serialized into the engine binding shape.
     //! @return `maxKVPoolPages`, or the minimum active pages when it is zero
@@ -109,6 +113,12 @@ struct LLMBuilderConfig
             json["allow_kv_pool_undercommit"] = true;
         }
         json["max_prefill_chunk_tokens"] = maxPrefillChunkTokens;
+        if (hasVisionPrefillProfile())
+        {
+            json["max_vision_prefill_chunk_tokens"] = maxVisionPrefillChunkTokens;
+            json["max_vision_prefill_batch_size"] = getMaxVisionPrefillBatchSize();
+            json["vision_prefill_profile"] = 2;
+        }
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -180,6 +190,14 @@ struct LLMBuilderConfig
         {
             config.maxPrefillChunkTokens = json["max_prefill_chunk_tokens"];
         }
+        if (json.contains("max_vision_prefill_chunk_tokens"))
+        {
+            config.maxVisionPrefillChunkTokens = json["max_vision_prefill_chunk_tokens"];
+        }
+        if (json.contains("max_vision_prefill_batch_size"))
+        {
+            config.maxVisionPrefillBatchSize = json["max_vision_prefill_batch_size"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -208,6 +226,11 @@ struct LLMBuilderConfig
         oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
         oss << "  allowKVPoolUndercommit: " << (allowKVPoolUndercommit ? "true" : "false") << "\n";
         oss << "  maxPrefillChunkTokens: " << maxPrefillChunkTokens << "\n";
+        if (hasVisionPrefillProfile())
+        {
+            oss << "  maxVisionPrefillChunkTokens: " << maxVisionPrefillChunkTokens << "\n";
+            oss << "  maxVisionPrefillBatchSize: " << getMaxVisionPrefillBatchSize() << "\n";
+        }
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -228,6 +251,16 @@ struct LLMBuilderConfig
     int64_t getMaxDecodeBatchSize() const noexcept
     {
         return maxDecodeBatchSize > 0 ? maxDecodeBatchSize : maxBatchSize;
+    }
+
+    bool hasVisionPrefillProfile() const noexcept
+    {
+        return maxVisionPrefillChunkTokens > 0;
+    }
+
+    int64_t getMaxVisionPrefillBatchSize() const noexcept
+    {
+        return maxVisionPrefillBatchSize > 0 ? maxVisionPrefillBatchSize : getMaxPrefillBatchSize();
     }
 };
 
@@ -285,7 +318,8 @@ private:
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
     bool setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+        int64_t maxPrefillBatchSize);
 
     //! Set up RoPE optimization profiles for single-RoPE or dual-RoPE model inputs.
     //! Configures only the RoPE cache bindings that are present in the network.
@@ -294,18 +328,22 @@ private:
     //! @param network TensorRT network definition
     //! @return true if setup was successful, false otherwise
     bool setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+        int64_t maxPrefillBatchSize);
 
     //! Set up optimization profiles for vanilla LLM models.
     //! Configures input IDs and last token IDs for standard transformer models.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupVanillaProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens);
 
     //! Maximum logical row length encoded by a packed-prefill ONNX graph.
     int64_t getMaxPackedPrefillChunkTokens() const;
+
+    //! Validate one packed-prefill profile's logical row limit against the exported graph.
+    int64_t validateMaxPackedPrefillChunkTokens(int64_t maxPrefillChunkTokens) const;
 
     //! Effective opt-shape token count for a generation-time optimization profile.
     //!
@@ -368,7 +406,8 @@ private:
     //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
     bool setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+        int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens);
 
     //! Set up optimization profiles for Deepstack embeddings (Qwen3VL).
     //! Configures deepstack embedding inputs with the same profile as inputs_embeds.
@@ -378,7 +417,8 @@ private:
     //! @return true if setup was successful, false otherwise
     //! @throws json::type_error if JSON value types don't match expected types
     bool setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+        int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens);
 
     //! Set up optimization profiles for lm_head_weight input (CodePredictor models).
     //! CodePredictor has 15 different lm_heads for RVQ layers, and the weight is dynamically bound at runtime.

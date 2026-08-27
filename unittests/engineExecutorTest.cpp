@@ -50,6 +50,16 @@ TEST(EngineExecutorTest, BindingSnapshotEquality)
     EXPECT_TRUE(s1 == s2);
 }
 
+TEST(EngineExecutorTest, BindingSnapshotDifferentProfiles)
+{
+    EngineExecutor::BindingSnapshot s1;
+    EngineExecutor::BindingSnapshot s2;
+    s1.profileIndex = 0;
+    s2.profileIndex = 2;
+
+    EXPECT_FALSE(s1 == s2);
+}
+
 TEST(EngineExecutorTest, BindingSnapshotDifferentAddresses)
 {
     EngineExecutor::BindingSnapshot s1;

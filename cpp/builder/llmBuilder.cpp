@@ -554,6 +554,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 {
     auto* contextProfile = builder.createOptimizationProfile();
     auto* generationProfile = builder.createOptimizationProfile();
+    nvinfer1::IOptimizationProfile* visionPrefillProfile{};
 
     bool result = true;
 
@@ -602,9 +603,17 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         return true;
     }
 
+    if (mBuilderConfig.hasVisionPrefillProfile())
+    {
+        visionPrefillProfile = builder.createOptimizationProfile();
+    }
+
+    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
+    int64_t const maxPrefillChunkTokens = getMaxPackedPrefillChunkTokens();
+
     // Setup common profiles
-    result &= setupCommonProfiles(*contextProfile, *generationProfile, network);
-    result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
+    result &= setupCommonProfiles(*contextProfile, *generationProfile, network, maxPrefillBatchSize);
+    result &= setupRopeProfiles(*contextProfile, *generationProfile, network, maxPrefillBatchSize);
 
     // Setup model-specific profiles
     if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
@@ -617,7 +626,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     }
     else
     {
-        result &= setupVanillaProfiles(*contextProfile, *generationProfile);
+        result &= setupVanillaProfiles(*contextProfile, *generationProfile, maxPrefillBatchSize, maxPrefillChunkTokens);
     }
 
     // Setup hybrid state profiles for MTP/DFlash/DSpark base models.
@@ -630,10 +639,12 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     }
 
     // Setup Gemma4 PLE profiles when ple_token_embeds_* inputs are present.
-    result &= setupPleProfiles(*contextProfile, *generationProfile, network);
+    result
+        &= setupPleProfiles(*contextProfile, *generationProfile, network, maxPrefillBatchSize, maxPrefillChunkTokens);
 
     // Setup Deepstack profiles for Qwen3VL models
-    result &= setupDeepstackProfiles(*contextProfile, *generationProfile, network);
+    result &= setupDeepstackProfiles(
+        *contextProfile, *generationProfile, network, maxPrefillBatchSize, maxPrefillChunkTokens);
 
     // Setup lm_head_weight profile for CodePredictor (Qwen3-Omni)
     result &= setupLmHeadWeightProfiles(*contextProfile, *generationProfile, network);
@@ -641,6 +652,33 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     if (mBuilderConfig.maxLoraRank > 0)
     {
         result &= setupLoraProfiles(*contextProfile, *generationProfile, network);
+    }
+
+    if (visionPrefillProfile != nullptr)
+    {
+        if (!mModelConfig.value("packed_prefill", false) || mBuilderConfig.specBase || mBuilderConfig.specDraft
+            || mIsDiffusionBackbone)
+        {
+            LOG_ERROR("An additional vision prefill profile requires a packed vanilla engine.");
+            return false;
+        }
+
+        int64_t const maxVisionPrefillBatchSize = mBuilderConfig.getMaxVisionPrefillBatchSize();
+        int64_t const maxVisionPrefillChunkTokens
+            = validateMaxPackedPrefillChunkTokens(mBuilderConfig.maxVisionPrefillChunkTokens);
+        result &= setupCommonProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
+        result &= setupRopeProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
+        result &= setupVanillaProfiles(
+            *visionPrefillProfile, *generationProfile, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
+        result &= setupPleProfiles(
+            *visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
+        result &= setupDeepstackProfiles(
+            *visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
+        result &= setupLmHeadWeightProfiles(*visionPrefillProfile, *generationProfile, network);
+        if (mBuilderConfig.maxLoraRank > 0)
+        {
+            result &= setupLoraProfiles(*visionPrefillProfile, *generationProfile, network);
+        }
     }
 
     if (!result)
@@ -651,18 +689,26 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
     LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+    if (visionPrefillProfile != nullptr)
+    {
+        LOG_DEBUG("%s", printOptimizationProfile(visionPrefillProfile, "vision_prefill_profile", &network).c_str());
+    }
 
     config.addOptimizationProfile(contextProfile);
     config.addOptimizationProfile(generationProfile);
+    if (visionPrefillProfile != nullptr)
+    {
+        config.addOptimizationProfile(visionPrefillProfile);
+    }
 
     return true;
 }
 
 bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+    int64_t maxPrefillBatchSize)
 {
     bool result = true;
-    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
 
     // Context lengths
@@ -716,10 +762,10 @@ bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProf
 }
 
 bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+    int64_t maxPrefillBatchSize)
 {
     bool result = true;
-    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     auto setRopeProfile = [&](char const* bindingName, int64_t rotaryDim) {
         result &= setOptimizationProfile(&contextProfile, bindingName,
@@ -806,14 +852,13 @@ bool LLMBuilder::setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& 
     return result;
 }
 
-bool LLMBuilder::setupVanillaProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens)
 {
     bool result = true;
-    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
-    int64_t const maxPackedTokens = maxPrefillBatchSize * getMaxPackedPrefillChunkTokens();
+    int64_t const maxPackedTokens = maxPrefillBatchSize * maxPrefillChunkTokens;
 
     // Input embeddings - always dynamic
     if (packedPrefill)
@@ -864,14 +909,18 @@ int64_t LLMBuilder::getMaxPackedPrefillChunkTokens() const
     {
         return mBuilderConfig.maxInputLen;
     }
+    return validateMaxPackedPrefillChunkTokens(mBuilderConfig.maxPrefillChunkTokens);
+}
+
+int64_t LLMBuilder::validateMaxPackedPrefillChunkTokens(int64_t maxPrefillChunkTokens) const
+{
     constexpr int64_t kDEFAULT_PACKED_PREFILL_CHUNK_TOKENS = 128;
     int64_t const exportedMaxChunkTokens
         = mModelConfig.value("packed_prefill_max_chunk_tokens", kDEFAULT_PACKED_PREFILL_CHUNK_TOKENS);
-    int64_t const buildMaxChunkTokens = mBuilderConfig.maxPrefillChunkTokens;
-    ELLM_CHECK(buildMaxChunkTokens > 0 && buildMaxChunkTokens <= exportedMaxChunkTokens
-            && buildMaxChunkTokens <= mBuilderConfig.maxInputLen,
+    ELLM_CHECK(maxPrefillChunkTokens > 0 && maxPrefillChunkTokens <= exportedMaxChunkTokens
+            && maxPrefillChunkTokens <= mBuilderConfig.maxInputLen,
         "maxPrefillChunkTokens must be positive and no larger than the export and input limits");
-    return buildMaxChunkTokens;
+    return maxPrefillChunkTokens;
 }
 
 int64_t LLMBuilder::effectiveOptTokens(int64_t maxToken) const
@@ -1183,14 +1232,14 @@ bool LLMBuilder::setupDSparkDraftProfiles(
 }
 
 bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+    int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens)
 {
     bool result = true;
     bool foundPleInput = false;
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
-    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
-    int64_t const maxPackedTokens = maxPrefillBatchSize * getMaxPackedPrefillChunkTokens();
+    int64_t const maxPackedTokens = maxPrefillBatchSize * maxPrefillChunkTokens;
     std::string_view const prefix = binding_names::kPleTokenEmbedsTemplate;
 
     for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
@@ -1255,13 +1304,13 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
 }
 
 bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+    int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens)
 {
     bool result = true;
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
-    int64_t const maxPrefillBatchSize = mBuilderConfig.getMaxPrefillBatchSize();
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
-    int64_t const maxPackedTokens = maxPrefillBatchSize * getMaxPackedPrefillChunkTokens();
+    int64_t const maxPackedTokens = maxPrefillBatchSize * maxPrefillChunkTokens;
 
     // Dynamically detect all deepstack_embeds inputs in the network
     std::vector<std::string> deepstackInputs;

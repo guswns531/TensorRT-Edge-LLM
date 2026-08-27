@@ -25,6 +25,23 @@
 
 namespace trt_edgellm::rt
 {
+namespace
+{
+
+EngineExecutor::GraphCacheStats addGraphCacheStats(
+    EngineExecutor::GraphCacheStats left, EngineExecutor::GraphCacheStats const& right) noexcept
+{
+    left.executeCalls += right.executeCalls;
+    left.hits += right.hits;
+    left.misses += right.misses;
+    left.captures += right.captures;
+    left.evictions += right.evictions;
+    left.launchFailures += right.launchFailures;
+    left.entries += right.entries;
+    return left;
+}
+
+} // namespace
 
 IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& config,
     PhaseQueueSchedulerConfig schedulerConfig, IndependentEngineExecutorPair& executors, StableKVPageManager& ownership,
@@ -70,9 +87,14 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
         safety);
     mScheduler.setGlobalExecutionVariantSupplier([this](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
         int32_t const prefillGraphTokens = mConfig.packedPrefill ? primaryTokenCount : key.chunkLength;
-        bool const prefillGraph = mCapturedPrefillShapes.find(
-                                      std::to_string(key.primaryBatchSize) + ":" + std::to_string(prefillGraphTokens))
-            != mCapturedPrefillShapes.end();
+        std::string const shapeSuffix
+            = ":" + std::to_string(key.primaryBatchSize) + ":" + std::to_string(prefillGraphTokens);
+        bool const prefillGraph
+            = mCapturedPrefillShapes.find(std::to_string(mExecutors.config().prefillProfile) + shapeSuffix)
+                != mCapturedPrefillShapes.end()
+            || (mExecutors.config().visionPrefillProfile >= 0
+                && mCapturedPrefillShapes.find(std::to_string(mExecutors.config().visionPrefillProfile) + shapeSuffix)
+                    != mCapturedPrefillShapes.end());
         bool const primaryDecodeGraph
             = mCapturedDecodeShapes.find(std::to_string(key.primaryBatchSize)) != mCapturedDecodeShapes.end();
         bool const secondaryDecodeGraph
@@ -155,6 +177,21 @@ PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
 
 void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
 {
+    ELLM_CHECK(!batch.empty(), "Independent prefill enqueue requires a non-empty batch");
+    PhasePrefillClass const prefillClass = batch.front().prefillClass;
+    ELLM_CHECK(
+        prefillClass != PhasePrefillClass::kAny, "Independent prefill work must identify its concrete producer class");
+    ELLM_CHECK(std::all_of(batch.begin(), batch.end(),
+                   [prefillClass](PhaseWorkItem const& item) { return item.prefillClass == prefillClass; }),
+        "Independent prefill batch cannot mix producer classes");
+    bool const externalPrefill = prefillClass == PhasePrefillClass::kExternal;
+    ELLM_CHECK(!externalPrefill || mConfig.hasVisionPrefillProfile(),
+        "External prefill requires a dedicated TensorRT optimization profile");
+    int32_t const profileIndex
+        = externalPrefill ? mExecutors.config().visionPrefillProfile : mExecutors.config().prefillProfile;
+    ELLM_CHECK(profileIndex >= 0, "Selected prefill profile is not configured");
+    EngineExecutor& executor = externalPrefill ? mExecutors.externalPrefillExecutor() : mExecutors.prefillExecutor();
+
     std::vector<int32_t> slots;
     std::vector<int32_t> chunks;
     int32_t totalTokens{};
@@ -190,24 +227,24 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
     bool const initialPrefill
         = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
     InferenceDims const dims = mConfig.packedPrefill
-        ? mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
+        ? (externalPrefill ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
+                           : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens))
         : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);
-    ELLM_CHECK(mExecutors.prefillExecutor().prepare(mExecutors.config().prefillProfile, dims, mPrefillMap, stream),
-        "Independent prefill prepare failed");
+    ELLM_CHECK(executor.prepare(profileIndex, dims, mPrefillMap, stream), "Independent prefill prepare failed");
     int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;
-    std::string const graphShape = std::to_string(batch.size()) + ":" + std::to_string(graphTokens);
+    std::string const graphShape
+        = std::to_string(profileIndex) + ":" + std::to_string(batch.size()) + ":" + std::to_string(graphTokens);
     if (mGraphCaptureEnabled && mCapturedPrefillShapes.find(graphShape) == mCapturedPrefillShapes.end()
         && mCapturedPrefillShapes.size() < mMaxPrefillGraphs
         && ++mPrefillGraphShapeObservations[graphShape] >= mGraphCaptureMinObservations)
     {
-        ELLM_CHECK(
-            mExecutors.prefillExecutor().captureGraph(stream), "Independent packed prefill graph capture failed");
+        ELLM_CHECK(executor.captureGraph(stream), "Independent packed prefill graph capture failed");
         mCapturedPrefillShapes.insert(graphShape);
         mPrefillGraphShapeObservations.erase(graphShape);
     }
-    EngineExecutor::GraphCacheStats const beforeExecute = mExecutors.prefillExecutor().graphCacheStats();
-    ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent packed prefill execute failed");
-    EngineExecutor::GraphCacheStats const afterExecute = mExecutors.prefillExecutor().graphCacheStats();
+    EngineExecutor::GraphCacheStats const beforeExecute = executor.graphCacheStats();
+    ELLM_CHECK(executor.execute(stream), "Independent packed prefill execute failed");
+    EngineExecutor::GraphCacheStats const afterExecute = executor.graphCacheStats();
     mLastPrefillGraphReplay = afterExecute.hits > beforeExecute.hits;
 }
 
@@ -336,6 +373,10 @@ void IndependentPhaseCoordinator::setGraphCaptureLimits(size_t maxPrefillGraphs,
     mMaxPrefillGraphs = maxPrefillGraphs;
     mMaxDecodeGraphs = maxDecodeGraphs;
     static_cast<void>(mExecutors.prefillExecutor().trimGraphCache(maxPrefillGraphs));
+    if (mExecutors.hasExternalPrefillExecutor())
+    {
+        static_cast<void>(mExecutors.externalPrefillExecutor().trimGraphCache(maxPrefillGraphs));
+    }
     static_cast<void>(mExecutors.decodeExecutor().trimGraphCache(maxDecodeGraphs));
 }
 
@@ -352,7 +393,12 @@ void IndependentPhaseCoordinator::setPersistentPageBindingsEnabled(bool enabled)
 
 EngineExecutor::GraphCacheStats IndependentPhaseCoordinator::prefillGraphCacheStats() const noexcept
 {
-    return mExecutors.prefillExecutor().graphCacheStats();
+    EngineExecutor::GraphCacheStats result = mExecutors.prefillExecutor().graphCacheStats();
+    if (mExecutors.hasExternalPrefillExecutor())
+    {
+        result = addGraphCacheStats(result, mExecutors.externalPrefillExecutor().graphCacheStats());
+    }
+    return result;
 }
 
 EngineExecutor::GraphCacheStats IndependentPhaseCoordinator::decodeGraphCacheStats() const noexcept

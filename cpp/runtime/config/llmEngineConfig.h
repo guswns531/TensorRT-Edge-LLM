@@ -91,12 +91,15 @@ struct LLMEngineConfig
     int32_t diffusionStabilityWindow{2};
 
     // --- Feature flags ---
-    bool isSpecDecodeBase{false};             //!< Base engine exposes speculative decoding verification bindings
-    bool isDiffusionBackbone{false};          //!< DiffusionGemma phase-aware transformer backbone engine
-    bool diffusionUnifiedConditioning{false}; //!< Backbone engine owns DiffusionGemma self-conditioning inputs
-    bool contextMaskSelectorEnabled{false};   //!< Engine exposes context_mask_selector binding
-    bool packedPrefill{false};                //!< Pack logical prefill rows into one token carrier
-    int32_t maxPackedPrefillChunkTokens{};    //!< Maximum logical packed-prefill row length
+    bool isSpecDecodeBase{false};                 //!< Base engine exposes speculative decoding verification bindings
+    bool isDiffusionBackbone{false};              //!< DiffusionGemma phase-aware transformer backbone engine
+    bool diffusionUnifiedConditioning{false};     //!< Backbone engine owns DiffusionGemma self-conditioning inputs
+    bool contextMaskSelectorEnabled{false};       //!< Engine exposes context_mask_selector binding
+    bool packedPrefill{false};                    //!< Pack logical prefill rows into one token carrier
+    int32_t maxPackedPrefillChunkTokens{};        //!< Maximum logical packed-prefill row length
+    int32_t maxSupportedVisionPrefillBatchSize{}; //!< Maximum rows accepted by the external-prefill profile
+    int32_t maxVisionPackedPrefillChunkTokens{};  //!< Maximum logical row length for external prefill
+    int32_t visionPrefillProfile{-1};             //!< Optional external-prefill TensorRT profile index
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
@@ -251,6 +254,15 @@ struct LLMEngineConfig
     //! context lengths, page-table rows, and KV starts retain logicalBatch rows.
     InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const;
 
+    //! Packed external-producer prefill dims, using the optional wider profile.
+    InferenceDims visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const;
+
+    //! Whether this engine carries a distinct external-producer prefill profile.
+    bool hasVisionPrefillProfile() const noexcept
+    {
+        return visionPrefillProfile >= 0;
+    }
+
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).
     InferenceDims decodeDims(int64_t batch) const;
@@ -285,6 +297,10 @@ struct LLMEngineConfig
     //! even for MRope models — this matches the pre-migration behavior in
     //! both runtimes (reset is a binding placeholder, not an inference step).
     InferenceDims resetDims() const;
+
+private:
+    InferenceDims packedPrefillDimsWithLimits(
+        int64_t logicalBatch, int64_t totalTokens, int32_t batchLimit, int32_t chunkLimit) const;
 };
 
 //! Parse a `config.json` file (the same format used by the existing runtime)

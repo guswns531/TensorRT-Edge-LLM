@@ -182,6 +182,7 @@ public:
     //! @brief Snapshot of binding addresses and shapes — used for graph-cache verification.
     struct BindingSnapshot
     {
+        int32_t profileIndex{-1};
         std::vector<std::pair<uintptr_t, nvinfer1::Dims>> bindings;
 
         bool operator==(BindingSnapshot const& rhs) const noexcept;

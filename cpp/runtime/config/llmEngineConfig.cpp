@@ -613,6 +613,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     auto const& builderConfig = configJson["builder_config"];
     cfg.maxPackedPrefillChunkTokens
         = cfg.packedPrefill ? builderConfig.value("max_prefill_chunk_tokens", exportedPackedPrefillChunkTokens) : 0;
+    cfg.maxSupportedVisionPrefillBatchSize = builderConfig.value("max_vision_prefill_batch_size", 0);
+    cfg.maxVisionPackedPrefillChunkTokens = builderConfig.value("max_vision_prefill_chunk_tokens", 0);
+    cfg.visionPrefillProfile = builderConfig.value("vision_prefill_profile", -1);
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
@@ -734,6 +737,26 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
                 && cfg.maxPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
                 && cfg.maxPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
             "packed_prefill max chunk must be positive and no greater than the export and input limits.");
+        bool const hasVisionPrefillProfile = cfg.visionPrefillProfile >= 0;
+        ELLM_CHECK(hasVisionPrefillProfile == (cfg.maxSupportedVisionPrefillBatchSize > 0)
+                && hasVisionPrefillProfile == (cfg.maxVisionPackedPrefillChunkTokens > 0),
+            "vision prefill profile metadata must be jointly enabled.");
+        if (hasVisionPrefillProfile)
+        {
+            ELLM_CHECK(cfg.visionPrefillProfile == 2,
+                "vision prefill profile must follow text prefill and decode at profile index 2.");
+            ELLM_CHECK(cfg.maxSupportedVisionPrefillBatchSize <= cfg.maxSupportedBatchSize,
+                "vision prefill batch size exceeds max supported batch size.");
+            ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
+                    && cfg.maxVisionPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
+                "vision prefill max chunk exceeds the export or input limit.");
+        }
+    }
+    else
+    {
+        ELLM_CHECK(cfg.visionPrefillProfile < 0 && cfg.maxSupportedVisionPrefillBatchSize == 0
+                && cfg.maxVisionPackedPrefillChunkTokens == 0,
+            "vision prefill profile requires packed prefill.");
     }
 
     // KV sharing donors: optional array of per-attention-layer donor indices.
@@ -886,9 +909,12 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " maxDecodeBatch=" << cfg.maxSupportedDecodeBatchSize << " maxInputLen=" << cfg.maxSupportedInputLength
        << " maxKVCapacity=" << cfg.maxKVCacheCapacity << " kvPoolPages=" << cfg.kvPoolPages
        << " packedPrefill=" << cfg.packedPrefill << " maxPackedPrefillChunk=" << cfg.maxPackedPrefillChunkTokens
-       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
-       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " visionPrefillProfile=" << cfg.visionPrefillProfile
+       << " maxVisionPrefillBatch=" << cfg.maxSupportedVisionPrefillBatchSize
+       << " maxVisionPackedPrefillChunk=" << cfg.maxVisionPackedPrefillChunkTokens << " pleEnabled=" << cfg.pleEnabled
+       << " numPleInputs=" << cfg.numPleInputs << " pleHiddenSize=" << cfg.pleHiddenSize
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
@@ -1002,10 +1028,22 @@ InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t t
     ELLM_CHECK(packedPrefill, "packedPrefillDims requires a packed-prefill engine");
     int32_t const prefillBatchLimit
         = maxSupportedPrefillBatchSize > 0 ? maxSupportedPrefillBatchSize : maxSupportedBatchSize;
-    ELLM_CHECK(
-        logicalBatch > 0 && logicalBatch <= prefillBatchLimit, "packedPrefillDims logical batch is out of range");
-    ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * maxPackedPrefillChunkTokens,
-        "packedPrefillDims token carrier exceeds the configured packed-prefill limit");
+    return packedPrefillDimsWithLimits(logicalBatch, totalTokens, prefillBatchLimit, maxPackedPrefillChunkTokens);
+}
+
+InferenceDims LLMEngineConfig::visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const
+{
+    ELLM_CHECK(hasVisionPrefillProfile(), "visionPackedPrefillDims requires an external-prefill profile");
+    return packedPrefillDimsWithLimits(
+        logicalBatch, totalTokens, maxSupportedVisionPrefillBatchSize, maxVisionPackedPrefillChunkTokens);
+}
+
+InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(
+    int64_t logicalBatch, int64_t totalTokens, int32_t batchLimit, int32_t chunkLimit) const
+{
+    ELLM_CHECK(logicalBatch > 0 && logicalBatch <= batchLimit, "packed prefill logical batch is out of range");
+    ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * chunkLimit,
+        "packed prefill token carrier exceeds the configured profile limit");
     return InferenceDims{
         /*.batch=*/logicalBatch,
         /*.tokenBatch=*/1,

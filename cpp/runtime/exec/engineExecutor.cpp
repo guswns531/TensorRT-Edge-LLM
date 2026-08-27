@@ -448,7 +448,7 @@ nvinfer1::IExecutionContext const* EngineExecutor::getExecutionContextIdentity()
 
 bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) const noexcept
 {
-    if (bindings.size() != rhs.bindings.size())
+    if (profileIndex != rhs.profileIndex || bindings.size() != rhs.bindings.size())
     {
         return false;
     }
@@ -473,6 +473,7 @@ bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) con
 size_t EngineExecutor::computeBindingHash() const
 {
     size_t seed = 0;
+    hash_utils::hashCombine(seed, mCurrentProfileIndex);
     int32_t const numIO = mEngineState->engine->getNbIOTensors();
     for (int32_t i = 0; i < numIO; ++i)
     {
@@ -493,6 +494,7 @@ size_t EngineExecutor::computeBindingHash() const
 EngineExecutor::BindingSnapshot EngineExecutor::snapshotBindings() const
 {
     BindingSnapshot snap;
+    snap.profileIndex = mCurrentProfileIndex;
     int32_t const numIO = mEngineState->engine->getNbIOTensors();
     snap.bindings.reserve(numIO);
     for (int32_t i = 0; i < numIO; ++i)

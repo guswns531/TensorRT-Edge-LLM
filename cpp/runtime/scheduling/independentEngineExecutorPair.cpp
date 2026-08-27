@@ -47,9 +47,11 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
     int32_t const profileCount = mPrefillExecutor->getEngine().getNbOptimizationProfiles();
     ELLM_CHECK(mConfig.prefillProfile < profileCount && mConfig.decodeProfile < profileCount,
         "Independent phase profile index is not present in the TensorRT engine");
+    ELLM_CHECK(mConfig.visionPrefillProfile < profileCount,
+        "External-prefill profile index is not present in the TensorRT engine");
     validateStreams(mConfig, mCudaContext);
 
-    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    int64_t const prefillBytes = maxPrefillContextMemoryBytes();
     int64_t const decodeBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.decodeProfile);
     ELLM_CHECK(prefillBytes > 0 && decodeBytes > 0, "TensorRT returned an empty profile workspace for phase execution");
 
@@ -68,6 +70,17 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
     ELLM_CHECK(mDecodeExecutor != nullptr, "Failed to create the independent decode executor");
     ELLM_CHECK(mPrefillExecutor->getExecutionContextIdentity() != mDecodeExecutor->getExecutionContextIdentity(),
         "Independent phase executors unexpectedly share a TensorRT execution context");
+    if (mConfig.visionPrefillProfile >= 0)
+    {
+        mExternalPrefillExecutor = mPrefillExecutor->createSibling();
+        ELLM_CHECK(mExternalPrefillExecutor != nullptr, "Failed to create the external-prefill executor");
+        ELLM_CHECK(
+            mPrefillExecutor->getExecutionContextIdentity() != mExternalPrefillExecutor->getExecutionContextIdentity(),
+            "Text and external prefill unexpectedly share a TensorRT execution context");
+        ELLM_CHECK(
+            mDecodeExecutor->getExecutionContextIdentity() != mExternalPrefillExecutor->getExecutionContextIdentity(),
+            "Decode and external prefill unexpectedly share a TensorRT execution context");
+    }
 
     mPrefillContextMemory = Tensor({prefillBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "IndependentEngineExecutorPair::prefillContextMemory");
@@ -77,9 +90,25 @@ IndependentEngineExecutorPair::IndependentEngineExecutorPair(
     ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(
                    mConfig.prefillProfile, mPrefillContextMemory, mConfig.setupStream),
         "Failed to assign the prefill TensorRT profile workspace");
+    if (mExternalPrefillExecutor)
+    {
+        ELLM_CHECK(mExternalPrefillExecutor->setContextMemoryForProfile(
+                       mConfig.visionPrefillProfile, mPrefillContextMemory, mConfig.setupStream),
+            "Failed to assign the external-prefill TensorRT profile workspace");
+    }
     ELLM_CHECK(
         mDecodeExecutor->setContextMemoryForProfile(mConfig.decodeProfile, mDecodeContextMemory, mConfig.setupStream),
         "Failed to assign the decode TensorRT profile workspace");
+}
+
+int64_t IndependentEngineExecutorPair::maxPrefillContextMemoryBytes() const
+{
+    int64_t bytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    if (mConfig.visionPrefillProfile >= 0)
+    {
+        bytes = std::max(bytes, mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.visionPrefillProfile));
+    }
+    return bytes;
 }
 
 CUcontext IndependentEngineExecutorPair::streamContext(cudaStream_t stream)
@@ -114,6 +143,21 @@ EngineExecutor const& IndependentEngineExecutorPair::prefillExecutor() const noe
     return *mPrefillExecutor;
 }
 
+EngineExecutor& IndependentEngineExecutorPair::externalPrefillExecutor() noexcept
+{
+    return mExternalPrefillExecutor ? *mExternalPrefillExecutor : *mPrefillExecutor;
+}
+
+EngineExecutor const& IndependentEngineExecutorPair::externalPrefillExecutor() const noexcept
+{
+    return mExternalPrefillExecutor ? *mExternalPrefillExecutor : *mPrefillExecutor;
+}
+
+bool IndependentEngineExecutorPair::hasExternalPrefillExecutor() const noexcept
+{
+    return mExternalPrefillExecutor != nullptr;
+}
+
 EngineExecutor& IndependentEngineExecutorPair::decodeExecutor() noexcept
 {
     return mConfig.sharedExecutionContext ? *mPrefillExecutor : *mDecodeExecutor;
@@ -146,7 +190,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureTieredVisi
     ELLM_CHECK(smallVisionProfile != largeVisionProfile,
         "Tiered E/P context memory requires distinct small and large vision profiles");
 
-    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    int64_t const prefillBytes = maxPrefillContextMemoryBytes();
     int64_t const smallVisionBytes = vision.getRequiredContextMemorySizeForProfile(smallVisionProfile);
     int64_t const largeVisionBytes = vision.getRequiredContextMemorySizeForProfile(largeVisionProfile);
     constexpr int64_t kContextAlignment = 256;
@@ -174,6 +218,12 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureTieredVisi
     ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(
                    mConfig.prefillProfile, mPrefillContextMemory, mConfig.setupStream),
         "Failed to rebind prefill to the tiered E/P context arena");
+    if (mExternalPrefillExecutor)
+    {
+        ELLM_CHECK(mExternalPrefillExecutor->setContextMemoryForProfile(
+                       mConfig.visionPrefillProfile, mPrefillContextMemory, mConfig.setupStream),
+            "Failed to rebind external prefill to the tiered E/P context arena");
+    }
 
     return {arenaBytes, prefillBytes, smallVisionBytes, largeVisionBytes};
 }
@@ -186,7 +236,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     ELLM_CHECK(visionProfile >= 0 && visionProfile < vision.getOptimizationProfileCount(),
         "Vision optimization profile is out of range");
 
-    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    int64_t const prefillBytes = maxPrefillContextMemoryBytes();
     int64_t const visionBytes = vision.getRequiredContextMemorySizeForProfile(visionProfile);
     int64_t const arenaBytes = std::max(prefillBytes, visionBytes);
 
@@ -207,6 +257,12 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(
                    mConfig.prefillProfile, mPrefillContextMemory, mConfig.setupStream),
         "Failed to rebind prefill to the shared E/P context arena");
+    if (mExternalPrefillExecutor)
+    {
+        ELLM_CHECK(mExternalPrefillExecutor->setContextMemoryForProfile(
+                       mConfig.visionPrefillProfile, mPrefillContextMemory, mConfig.setupStream),
+            "Failed to rebind external prefill to the shared E/P context arena");
+    }
 
     return {arenaBytes, prefillBytes, visionBytes, visionBytes};
 }
