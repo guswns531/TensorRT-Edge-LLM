@@ -1661,6 +1661,7 @@ int main(int argc, char** argv)
             visionStoragePolicy.maxIdleBytes = static_cast<size_t>(std::stoull(value));
         }
         size_t tieredVisionExclusiveInputTokens{};
+        bool serializeAllEncoderPrefill{};
         auto configureVisionContextMemory = [&](rt::MultimodalRunner& runner) {
             int64_t const requiredBytes = runner.getRequiredContextMemorySize();
             LOG_INFO("Vision context workspace: required=%lld prefill_available=%zu bytes",
@@ -1668,7 +1669,16 @@ int main(int argc, char** argv)
             if (std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr)
             {
                 int32_t const profileCount = runner.getOptimizationProfileCount();
-                ELLM_CHECK(profileCount >= 2, "Tiered vision context memory requires at least two visual profiles");
+                ELLM_CHECK(profileCount > 0, "Tiered vision context memory requires a visual profile");
+                if (profileCount == 1)
+                {
+                    rt::TieredVisionContextMemoryInfo const info = pair->configureSharedVisionContextMemory(runner, 0);
+                    serializeAllEncoderPrefill = true;
+                    LOG_INFO("Shared E/P context arena: total=%lld prefill=%lld vision=%lld serialize_all_encoder=yes",
+                        static_cast<long long>(info.arenaBytes), static_cast<long long>(info.prefillBytes),
+                        static_cast<long long>(info.largeVisionBytes));
+                    return;
+                }
                 int32_t const largeProfile = profileCount - 1;
                 rt::TieredVisionContextMemoryInfo const info
                     = pair->configureTieredVisionContextMemory(runner, 0, largeProfile);
@@ -1985,6 +1995,7 @@ int main(int argc, char** argv)
                     threePhaseConfig.globalCostModelConfig.overlapMinSamples = static_cast<size_t>(std::stoull(value));
                 }
                 threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
+                threePhaseConfig.serializeAllEncoderPrefill = serializeAllEncoderPrefill;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
                 {
                     threePhaseConfig.exclusiveEncoderInputTokenThreshold = static_cast<size_t>(std::stoull(value));

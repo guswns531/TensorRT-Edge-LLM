@@ -192,6 +192,8 @@ struct PhaseThreeCoordinatorConfig
     PhaseMemoryBrokerConfig memoryBroker;
     //! Above this raw encoder input-token count, the encoder exclusively owns the shared E/P arena.
     size_t exclusiveEncoderInputTokenThreshold{};
+    //! Every encoder dispatch exclusively owns the shared E/P arena.
+    bool serializeAllEncoderPrefill{};
 };
 
 struct PhaseThreeCoordinatorMetrics

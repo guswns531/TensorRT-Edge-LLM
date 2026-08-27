@@ -87,6 +87,11 @@ public:
     TieredVisionContextMemoryInfo configureTieredVisionContextMemory(
         MultimodalRunner& vision, int32_t smallVisionProfile, int32_t largeVisionProfile);
 
+    //! Replace the independent prefill workspace with one arena shared by a
+    //! single-profile vision context. E/P dispatch must be serialized while
+    //! either context uses this arena.
+    TieredVisionContextMemoryInfo configureSharedVisionContextMemory(MultimodalRunner& vision, int32_t visionProfile);
+
     //! The CUDA context owning all three supplied streams.
     CUcontext cudaContext() const noexcept;
 

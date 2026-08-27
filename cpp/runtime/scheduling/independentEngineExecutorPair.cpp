@@ -178,6 +178,39 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureTieredVisi
     return {arenaBytes, prefillBytes, smallVisionBytes, largeVisionBytes};
 }
 
+TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisionContextMemory(
+    MultimodalRunner& vision, int32_t visionProfile)
+{
+    ELLM_CHECK(!mConfig.sharedExecutionContext,
+        "Shared E/P context memory requires independent prefill and decode execution contexts");
+    ELLM_CHECK(visionProfile >= 0 && visionProfile < vision.getOptimizationProfileCount(),
+        "Vision optimization profile is out of range");
+
+    int64_t const prefillBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.prefillProfile);
+    int64_t const visionBytes = vision.getRequiredContextMemorySizeForProfile(visionProfile);
+    int64_t const arenaBytes = std::max(prefillBytes, visionBytes);
+
+    // Release the old prefill allocation before acquiring the replacement
+    // arena so the transition does not introduce a transient memory peak.
+    mPrefillContextMemory = Tensor{};
+    mTieredContextMemoryArena = Tensor{};
+    mTieredContextMemoryArena = Tensor({arenaBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::sharedVisionContextMemory");
+    void* const arenaBase = mTieredContextMemoryArena.rawPointer();
+    mPrefillContextMemory = Tensor(arenaBase, {prefillBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::sharedPrefillContextMemory");
+    Tensor visionMemory(arenaBase, {visionBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::sharedVisionProfileContextMemory");
+
+    ELLM_CHECK(vision.setContextMemoryForProfile(visionProfile, visionMemory, mConfig.setupStream),
+        "Failed to assign the shared vision profile workspace");
+    ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(
+                   mConfig.prefillProfile, mPrefillContextMemory, mConfig.setupStream),
+        "Failed to rebind prefill to the shared E/P context arena");
+
+    return {arenaBytes, prefillBytes, visionBytes, visionBytes};
+}
+
 CUcontext IndependentEngineExecutorPair::cudaContext() const noexcept
 {
     return mCudaContext;

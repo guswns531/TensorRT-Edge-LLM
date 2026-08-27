@@ -1297,8 +1297,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             }
         }
     }
-    bool const encoderExclusive = mConfig.exclusiveEncoderInputTokenThreshold > 0
-        && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold;
+    bool const encoderExclusive = mConfig.serializeAllEncoderPrefill
+        || (mConfig.exclusiveEncoderInputTokenThreshold > 0
+            && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
     auto addEncoderOverlap = [&](PhaseGlobalActionKind kind, PhaseGlobalActionCandidate const& phase) {
         int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? phase.key.chunkLength : 0;
         PhaseGlobalActionKey overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
@@ -1801,8 +1802,9 @@ bool PhaseThreeCoordinator::startNextEncoder()
             ? std::numeric_limits<size_t>::max()
             : candidateInputTokens + requestInputTokens;
     }
-    bool const exclusiveEncoder = mConfig.exclusiveEncoderInputTokenThreshold > 0
-        && candidateInputTokens > mConfig.exclusiveEncoderInputTokenThreshold;
+    bool const exclusiveEncoder = mConfig.serializeAllEncoderPrefill
+        || (mConfig.exclusiveEncoderInputTokenThreshold > 0
+            && candidateInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
     if (exclusiveEncoder)
     {
         IndependentPhaseServerArbitrationSnapshot const snapshot = mServer.arbitrationSnapshot();
