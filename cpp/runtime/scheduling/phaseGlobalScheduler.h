@@ -109,6 +109,10 @@ struct PhaseGlobalActionKey
     bool operator==(PhaseGlobalActionKey const& other) const noexcept;
 };
 
+//! Canonicalize only overlap cost-learning dimensions. Candidate identity and
+//! TensorRT bindings retain their exact shapes.
+PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept;
+
 //! One direct CUDA-event observation for a single action key.
 struct PhaseGlobalCostObservation
 {
@@ -128,6 +132,34 @@ struct PhaseGlobalCostEstimate
     float uncertaintyMs{};
 };
 
+//! Calibration state for one overlap shape. A calibrated shape is either
+//! eligible or rejected as unprofitable; only the first two states need probes.
+enum class PhaseGlobalOverlapCostStatus
+{
+    kNoSamples,
+    kInsufficientSamples,
+    kEligible,
+    kUnprofitable,
+};
+
+struct PhaseGlobalOverlapCostDiagnostic
+{
+    PhaseGlobalOverlapCostStatus status{PhaseGlobalOverlapCostStatus::kNoSamples};
+    size_t sampleCount{};
+    float robustCompression{};
+};
+
+struct PhaseGlobalOverlapCostRecord
+{
+    PhaseGlobalActionKey key;
+    PhaseGlobalOverlapCostDiagnostic diagnostic;
+    size_t opportunityCount{};
+    bool required{};
+};
+
+//! Stable telemetry name for one overlap calibration state.
+char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status) noexcept;
+
 struct PhaseGlobalCostModelConfig
 {
     size_t windowSize{32U};
@@ -145,6 +177,7 @@ public:
 
     void observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation);
     std::optional<PhaseGlobalCostEstimate> estimate(PhaseGlobalActionKey const& key) const;
+    PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
     bool overlapEligible(PhaseGlobalActionKey const& key) const;
     void reset();
 

@@ -94,6 +94,8 @@ struct PhaseThreeCoordinatorConfig
     //! Zero disables production-request exploration; enable only for controlled warm-up probes.
     float globalSafeProbeSlackMultiplier{};
     size_t globalSafeProbeInterval{32U};
+    //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
+    size_t globalCalibrationMaxOverlapKeys{16U};
     int32_t globalDecodeContextBucketTokens{512};
     std::vector<PhaseEncoderPrefillBatchCost> globalEncoderPrefillCosts;
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
@@ -420,6 +422,8 @@ public:
     bool poll();
     bool empty() const noexcept;
     PhaseThreeCoordinatorMetrics metrics() const noexcept;
+    //! Cost-key coverage accumulated during the current or most recent calibration epoch.
+    std::vector<PhaseGlobalOverlapCostRecord> globalCalibrationDiagnostics() const;
     //! Enable controlled unknown E+P/E+D probes while the coordinator is idle.
     void setGlobalWarmupProbeMode(bool active);
     //! Enable optional request-level encoder and prefill-handoff telemetry.
@@ -511,6 +515,8 @@ private:
     };
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::optional<PhaseGlobalDispatchPlan> mGlobalExecutionLease;
+    std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;
+    std::vector<size_t> mGlobalCalibrationOpportunities;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
     size_t mEstimatedEncodedBytes{};

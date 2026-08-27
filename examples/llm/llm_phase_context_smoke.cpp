@@ -71,6 +71,7 @@ enum class PhaseIpcKind
     kSubmit,
     kCancel,
     kCalibrationBegin,
+    kCalibrationStatus,
     kCalibrationEnd,
 };
 
@@ -106,6 +107,10 @@ PhaseIpcInput parsePhaseIpcInput(std::string const& line, int32_t defaultMaxOutp
         else if (type == "calibration_end")
         {
             result.kind = PhaseIpcKind::kCalibrationEnd;
+        }
+        else if (type == "calibration_status")
+        {
+            result.kind = PhaseIpcKind::kCalibrationStatus;
         }
         if (result.kind != PhaseIpcKind::kSubmit)
         {
@@ -2452,7 +2457,8 @@ int main(int argc, char** argv)
                         ++ingestedLines;
                         continue;
                     }
-                    if (input.kind == PhaseIpcKind::kCalibrationBegin || input.kind == PhaseIpcKind::kCalibrationEnd)
+                    if (input.kind == PhaseIpcKind::kCalibrationBegin || input.kind == PhaseIpcKind::kCalibrationStatus
+                        || input.kind == PhaseIpcKind::kCalibrationEnd)
                     {
                         bool const active = input.kind == PhaseIpcKind::kCalibrationBegin;
                         bool const idle = ipcThreePhase != nullptr ? ipcThreePhase->empty() : semanticServer.empty();
@@ -2467,12 +2473,46 @@ int main(int argc, char** argv)
                             = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                         rt::PhaseSchedulerTelemetry const calibrationQueueMetrics
                             = semanticCoordinator.scheduler().telemetry();
-                        semanticCoordinator.scheduler().setGlobalWarmupProbeMode(active);
+                        std::vector<rt::PhaseGlobalOverlapCostRecord> calibrationCosts
+                            = semanticCoordinator.scheduler().globalCalibrationDiagnostics();
                         if (ipcThreePhase != nullptr)
                         {
-                            ipcThreePhase->setGlobalWarmupProbeMode(active);
+                            std::vector<rt::PhaseGlobalOverlapCostRecord> encoderCosts
+                                = ipcThreePhase->globalCalibrationDiagnostics();
+                            calibrationCosts.insert(calibrationCosts.end(), encoderCosts.begin(), encoderCosts.end());
                         }
-                        if (!active)
+                        nlohmann::json calibrationCostKeys = nlohmann::json::array();
+                        size_t calibratedCostKeys{};
+                        size_t requiredCostKeys{};
+                        for (rt::PhaseGlobalOverlapCostRecord const& cost : calibrationCosts)
+                        {
+                            bool const calibrated
+                                = cost.diagnostic.status == rt::PhaseGlobalOverlapCostStatus::kEligible
+                                || cost.diagnostic.status == rt::PhaseGlobalOverlapCostStatus::kUnprofitable;
+                            requiredCostKeys += cost.required ? 1U : 0U;
+                            calibratedCostKeys += calibrated && cost.required ? 1U : 0U;
+                            calibrationCostKeys.push_back({{"action", rt::phaseGlobalActionKindName(cost.key.kind)},
+                                {"primary_batch_size", cost.key.primaryBatchSize},
+                                {"secondary_batch_size", cost.key.secondaryBatchSize},
+                                {"chunk_length", cost.key.chunkLength},
+                                {"primary_context_bucket", cost.key.primaryContextBucket},
+                                {"secondary_context_bucket", cost.key.secondaryContextBucket},
+                                {"execution_variant", rt::phaseExecutionVariantName(cost.key.executionVariant)},
+                                {"status", rt::phaseGlobalOverlapCostStatusName(cost.diagnostic.status)},
+                                {"sample_count", cost.diagnostic.sampleCount},
+                                {"opportunity_count", cost.opportunityCount}, {"required", cost.required},
+                                {"robust_compression", cost.diagnostic.robustCompression}});
+                        }
+                        bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
+                        if (changesCalibration)
+                        {
+                            semanticCoordinator.scheduler().setGlobalWarmupProbeMode(active);
+                            if (ipcThreePhase != nullptr)
+                            {
+                                ipcThreePhase->setGlobalWarmupProbeMode(active);
+                            }
+                        }
+                        if (input.kind == PhaseIpcKind::kCalibrationEnd)
                         {
                             ++measurementEpoch;
                             emittedMetrics = semanticCoordinator.metrics().size();
@@ -2480,15 +2520,23 @@ int main(int argc, char** argv)
                             encoderBatchMetrics.clear();
                             emitRecord("PHASE_EPOCH\t", {{"epoch", measurementEpoch}, {"kind", "measurement"}});
                         }
+                        char const* calibrationAction = input.kind == PhaseIpcKind::kCalibrationBegin ? "begin"
+                            : input.kind == PhaseIpcKind::kCalibrationEnd                             ? "end"
+                                                                                                      : "status";
                         emitEvent({{"type", "control"}, {"request_index", requestId},
-                            {"calibration", active ? "begin" : "end"}, {"epoch", measurementEpoch},
+                            {"calibration", calibrationAction}, {"epoch", measurementEpoch},
                             {"encoder_prefill_probes", calibrationMetrics.globalEncoderPrefillSelections},
                             {"encoder_decode_probes", calibrationMetrics.globalEncoderDecodeSelections},
                             {"encoder_safe_probes", calibrationMetrics.globalSafeProbes},
                             {"warmup_decisions", calibrationMetrics.globalWarmupDecisions},
                             {"warmup_prefill_candidates", calibrationMetrics.globalWarmupPrefillCandidates},
                             {"warmup_decode_candidates", calibrationMetrics.globalWarmupDecodeCandidates},
-                            {"prefill_decode_safe_probes", calibrationQueueMetrics.globalSafeProbeCount}});
+                            {"prefill_decode_safe_probes", calibrationQueueMetrics.globalSafeProbeCount},
+                            {"calibration_cost_keys", std::move(calibrationCostKeys)},
+                            {"calibrated_cost_keys", calibratedCostKeys}, {"required_cost_keys", requiredCostKeys},
+                            {"calibration_target_keys", calibrationCosts.size()},
+                            {"calibration_converged",
+                                requiredCostKeys > 0U && calibratedCostKeys == requiredCostKeys}});
                         ++ingestedLines;
                         continue;
                     }

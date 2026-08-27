@@ -376,6 +376,8 @@ struct PhaseQueueSchedulerConfig
     //! robust serial cost remaining as slack. Zero disables probes.
     float globalSafeProbeSlackMultiplier{4.0F};
     size_t globalSafeProbeInterval{32U};
+    //! Maximum distinct P+D shapes targeted by one calibration epoch.
+    size_t globalCalibrationMaxOverlapKeys{16U};
     //! Optional ownership-aware memory horizon in one caller-defined unit.
     //! Every field returned by one invocation must use the same unit.
     std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
@@ -667,6 +669,8 @@ public:
     //! Update scheduling telemetry after one CUDA-complete dispatch.
     void observeMetrics(PhaseDispatchMetrics const& metrics);
     PhaseSchedulerTelemetry const& telemetry() const noexcept;
+    //! Cost-key coverage accumulated during the current or most recent calibration epoch.
+    std::vector<PhaseGlobalOverlapCostRecord> globalCalibrationDiagnostics() const;
     //! Return a read-only scheduling snapshot for an upstream phase arbiter.
     PhaseQueueSnapshot queueSnapshot() const;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
@@ -802,6 +806,8 @@ private:
     uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
     bool mGlobalWarmupProbeMode{};
+    std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;
+    std::vector<size_t> mGlobalCalibrationOpportunities;
     std::optional<PhaseGlobalActionCandidate> mNextGlobalAction;
     std::optional<PhaseGlobalDispatchPlan> mNextGlobalDispatchPlan;
     std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)>

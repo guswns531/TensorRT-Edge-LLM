@@ -272,6 +272,22 @@ TEST(PhaseGlobalCostModelTest, RejectsOverlapWithoutRobustGain)
     model.observe(key, {30.0F, 29.8F});
     model.observe(key, {30.0F, 30.2F});
     EXPECT_FALSE(model.overlapEligible(key));
+    PhaseGlobalOverlapCostDiagnostic const diagnostic = model.overlapDiagnostic(key);
+    EXPECT_EQ(diagnostic.status, PhaseGlobalOverlapCostStatus::kUnprofitable);
+    EXPECT_EQ(diagnostic.sampleCount, 2U);
+    EXPECT_LT(diagnostic.robustCompression, 1.02F);
+}
+
+TEST(PhaseGlobalCostModelTest, DistinguishesUnknownFromInsufficientOverlapCost)
+{
+    PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
+    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kEncoderPrefill, 2, 2, 128, 4, 0};
+    EXPECT_EQ(model.overlapDiagnostic(key).status, PhaseGlobalOverlapCostStatus::kNoSamples);
+    model.observe(key, {20.0F, 15.0F});
+    PhaseGlobalOverlapCostDiagnostic const diagnostic = model.overlapDiagnostic(key);
+    EXPECT_EQ(diagnostic.status, PhaseGlobalOverlapCostStatus::kInsufficientSamples);
+    EXPECT_EQ(diagnostic.sampleCount, 1U);
+    EXPECT_GT(diagnostic.robustCompression, 1.0F);
 }
 
 TEST(PhaseGlobalCostModelTest, LearnsEncoderPrefillCostByFullShapeKey)
@@ -305,6 +321,21 @@ TEST(PhaseGlobalCostModelTest, SeparatesEagerAndGraphReplaySamples)
     PhaseGlobalActionCandidate graphCandidate = eagerCandidate;
     graphCandidate.key = graph;
     EXPECT_NE(phaseGlobalCandidateId(eagerCandidate), phaseGlobalCandidateId(graphCandidate));
+}
+
+TEST(PhaseGlobalCostModelTest, SharesOverlapSamplesWithinConservativeShapeBuckets)
+{
+    PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
+    PhaseGlobalActionKey const first{PhaseGlobalActionKind::kPrefillDecode, 3, 5, 90, 0, 1};
+    PhaseGlobalActionKey const second{PhaseGlobalActionKind::kPrefillDecode, 4, 8, 128, 0, 1};
+    model.observe(first, {20.0F, 15.0F});
+    model.observe(second, {20.0F, 16.0F});
+
+    ASSERT_TRUE(model.estimate(first).has_value());
+    EXPECT_EQ(model.estimate(first)->sampleCount, 2U);
+    EXPECT_EQ(model.estimate(second)->sampleCount, 2U);
+    EXPECT_TRUE(model.overlapEligible(first));
+    EXPECT_EQ(phaseGlobalCanonicalOverlapCostKey(first), phaseGlobalCanonicalOverlapCostKey(second));
 }
 
 } // namespace

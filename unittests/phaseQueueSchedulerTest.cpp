@@ -112,6 +112,38 @@ TEST(PhaseQueueSchedulerTest, GlobalSyntheticWarmupForcesUnknownPrefillDecodePro
     EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalWarmupStopsProbingCalibratedUnprofitableOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalCostModelConfig.overlapMinSamples = 2U;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kOverlap;
+    sample.prefillBatchSize = 1;
+    sample.prefillTokens = 32;
+    sample.prefillPaddedTokens = 32;
+    sample.decodeBatchSize = 1;
+    sample.plannedDecodeMaxContextLength = 128;
+    sample.prefillGpuMs = 2.0F;
+    sample.decodeGpuMs = 1.0F;
+    sample.makespanGpuMs = 3.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.observeMetrics(sample);
+
+    scheduler.setGlobalWarmupProbeMode(true);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kOverlap);
+    ASSERT_EQ(scheduler.globalCalibrationDiagnostics().size(), 1U);
+    EXPECT_EQ(scheduler.globalCalibrationDiagnostics().front().diagnostic.status,
+        PhaseGlobalOverlapCostStatus::kUnprofitable);
+    EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 0U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
 {
     PhaseQueueSchedulerConfig config;

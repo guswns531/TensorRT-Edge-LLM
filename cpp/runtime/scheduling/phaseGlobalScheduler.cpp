@@ -35,6 +35,21 @@ bool isOverlap(PhaseGlobalActionKind kind) noexcept
         || kind == PhaseGlobalActionKind::kPrefillDecode;
 }
 
+int32_t upperPowerOfTwoBucket(int32_t value) noexcept
+{
+    if (value <= 1)
+    {
+        return std::max(0, value);
+    }
+    uint32_t bucket{1U};
+    uint32_t const target = static_cast<uint32_t>(value);
+    while (bucket < target && bucket <= std::numeric_limits<uint32_t>::max() / 2U)
+    {
+        bucket <<= 1U;
+    }
+    return static_cast<int32_t>(std::min(bucket, static_cast<uint32_t>(std::numeric_limits<int32_t>::max())));
+}
+
 uint64_t hashCombine(uint64_t seed, uint64_t value) noexcept
 {
     constexpr uint64_t kHASH_OFFSET = 0x9e3779b97f4a7c15ULL;
@@ -203,10 +218,9 @@ PhaseExecutionSet phaseExecutionSetForAction(PhaseGlobalActionKind kind) noexcep
 
 PhaseExecutionVariant phaseExecutionVariant(bool primaryGraph, bool secondaryGraph) noexcept
 {
-    uint8_t const mask = static_cast<uint8_t>(primaryGraph ? PhaseExecutionVariant::kPrimaryGraph
-                                                           : PhaseExecutionVariant::kEager)
-        | static_cast<uint8_t>(secondaryGraph ? PhaseExecutionVariant::kSecondaryGraph
-                                              : PhaseExecutionVariant::kEager);
+    uint8_t const mask
+        = static_cast<uint8_t>(primaryGraph ? PhaseExecutionVariant::kPrimaryGraph : PhaseExecutionVariant::kEager)
+        | static_cast<uint8_t>(secondaryGraph ? PhaseExecutionVariant::kSecondaryGraph : PhaseExecutionVariant::kEager);
     return static_cast<PhaseExecutionVariant>(mask);
 }
 
@@ -325,12 +339,37 @@ char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept
     return result;
 }
 
+char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status) noexcept
+{
+    char const* result = "unknown";
+    switch (status)
+    {
+    case PhaseGlobalOverlapCostStatus::kNoSamples: result = "no_samples"; break;
+    case PhaseGlobalOverlapCostStatus::kInsufficientSamples: result = "insufficient_samples"; break;
+    case PhaseGlobalOverlapCostStatus::kEligible: result = "eligible"; break;
+    case PhaseGlobalOverlapCostStatus::kUnprofitable: result = "unprofitable"; break;
+    }
+    return result;
+}
+
 bool PhaseGlobalActionKey::operator==(PhaseGlobalActionKey const& other) const noexcept
 {
     return std::tie(kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket,
                secondaryContextBucket, executionVariant)
         == std::tie(other.kind, other.primaryBatchSize, other.secondaryBatchSize, other.chunkLength,
             other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant);
+}
+
+PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept
+{
+    if (!isOverlap(key.kind))
+    {
+        return key;
+    }
+    key.primaryBatchSize = upperPowerOfTwoBucket(key.primaryBatchSize);
+    key.secondaryBatchSize = upperPowerOfTwoBucket(key.secondaryBatchSize);
+    key.chunkLength = upperPowerOfTwoBucket(key.chunkLength);
+    return key;
 }
 
 size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key) const noexcept
@@ -362,7 +401,7 @@ void PhaseGlobalCostModel::observe(PhaseGlobalActionKey const& key, PhaseGlobalC
 {
     ELLM_CHECK(observation.referenceWorkMs > 0.0F, "Global phase reference work must be positive");
     ELLM_CHECK(observation.makespanMs > 0.0F, "Global phase makespan must be positive");
-    Samples& samples = mSamples[key];
+    Samples& samples = mSamples[phaseGlobalCanonicalOverlapCostKey(key)];
     samples.values.push_back(observation);
     while (samples.values.size() > mConfig.windowSize)
     {
@@ -372,7 +411,7 @@ void PhaseGlobalCostModel::observe(PhaseGlobalActionKey const& key, PhaseGlobalC
 
 std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimate(PhaseGlobalActionKey const& key) const
 {
-    auto const found = mSamples.find(key);
+    auto const found = mSamples.find(phaseGlobalCanonicalOverlapCostKey(key));
     if (found == mSamples.end() || found->second.values.empty())
     {
         return std::nullopt;
@@ -396,18 +435,28 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimate(PhaseGloba
 
 bool PhaseGlobalCostModel::overlapEligible(PhaseGlobalActionKey const& key) const
 {
-    if (!isOverlap(key.kind))
-    {
-        return true;
-    }
+    return !isOverlap(key.kind) || overlapDiagnostic(key).status == PhaseGlobalOverlapCostStatus::kEligible;
+}
+
+PhaseGlobalOverlapCostDiagnostic PhaseGlobalCostModel::overlapDiagnostic(PhaseGlobalActionKey const& key) const
+{
     std::optional<PhaseGlobalCostEstimate> const cost = estimate(key);
-    if (!cost.has_value() || cost->sampleCount < mConfig.overlapMinSamples)
+    if (!cost.has_value())
     {
-        return false;
+        return {};
     }
     float const robustMakespan = cost->makespanMedianMs + cost->uncertaintyMs;
-    float const requiredReference = robustMakespan * (1.0F + mConfig.minimumOverlapGainRatio);
-    return cost->referenceWorkMedianMs >= requiredReference;
+    float const compression
+        = cost->referenceWorkMedianMs / std::max(robustMakespan, std::numeric_limits<float>::epsilon());
+    if (cost->sampleCount < mConfig.overlapMinSamples)
+    {
+        return {PhaseGlobalOverlapCostStatus::kInsufficientSamples, cost->sampleCount, compression};
+    }
+    float const minimumCompression = 1.0F + mConfig.minimumOverlapGainRatio;
+    PhaseGlobalOverlapCostStatus const status = compression >= minimumCompression
+        ? PhaseGlobalOverlapCostStatus::kEligible
+        : PhaseGlobalOverlapCostStatus::kUnprofitable;
+    return {status, cost->sampleCount, compression};
 }
 
 void PhaseGlobalCostModel::reset()
