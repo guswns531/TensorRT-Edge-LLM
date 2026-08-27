@@ -1740,8 +1740,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
         bool const probeSlackSafe = std::min(prefillSlack, decodeSlack)
             >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
-        bool const safeProbe
-            = !overlapKnown && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady && probeSlackSafe;
+        bool const safeProbe = !overlapKnown
+            && (mGlobalWarmupProbeMode
+                || (mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady && probeSlackSafe));
         PhaseGlobalActionCandidate candidate;
         candidate.key = overlapKey;
         candidate.primaryRequestIds = overlapPrefillRequestIds;
@@ -1765,7 +1766,27 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
 
     ++mGlobalDecisionSequence;
     PhaseGlobalDecision decision;
-    if (mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
+    if (mGlobalWarmupProbeMode)
+    {
+        decision.inputCandidates = candidates.size();
+        decision.hardFeasibleCandidates = candidates.size();
+        decision.deadlineSafeCandidates = candidates.size();
+        auto const selected = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
+            return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.safeProbeEligible;
+        });
+        if (selected != candidates.end())
+        {
+            decision.selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), selected));
+            decision.reason = PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
+            decision.serviceCompression = selected->referenceWorkUs
+                / std::max(selected->predictedMakespanUs, std::numeric_limits<double>::epsilon());
+        }
+        else
+        {
+            decision = mGlobalScheduler.select(candidates);
+        }
+    }
+    else if (mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
         && compatibilityKind.has_value())
     {
         auto candidateKind = [](PhaseGlobalActionKind kind) {
@@ -3080,6 +3101,13 @@ void PhaseQueueScheduler::resetHistory(bool preserveGlobalCostModel)
     mLastGlobalSafeProbeSequence = 0U;
     mNextGlobalAction.reset();
     mNextGlobalDispatchPlan.reset();
+}
+
+void PhaseQueueScheduler::setGlobalWarmupProbeMode(bool active)
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Global warmup probe mode can only change while the scheduler is idle");
+    mGlobalWarmupProbeMode = active;
 }
 
 } // namespace rt

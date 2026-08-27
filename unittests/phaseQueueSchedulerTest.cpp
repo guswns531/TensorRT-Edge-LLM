@@ -93,6 +93,25 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalSyntheticWarmupForcesUnknownPrefillDecodeProbe)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setGlobalWarmupProbeMode(true);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_TRUE(plan.globalSafeProbe);
+    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode);
+    EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
 {
     PhaseQueueSchedulerConfig config;

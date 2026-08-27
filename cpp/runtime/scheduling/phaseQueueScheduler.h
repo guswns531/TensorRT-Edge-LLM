@@ -718,6 +718,10 @@ public:
     //! age, fairness, and admission state.
     void resetHistory(bool preserveGlobalCostModel = false);
 
+    //! Permit deterministic synthetic startup traffic to collect unknown P+D
+    //! costs without applying production-request slack. Disable before serving.
+    void setGlobalWarmupProbeMode(bool active);
+
 private:
     struct GlobalQueueSelection
     {
@@ -796,6 +800,7 @@ private:
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
+    bool mGlobalWarmupProbeMode{};
     std::optional<PhaseGlobalActionCandidate> mNextGlobalAction;
     std::optional<PhaseGlobalDispatchPlan> mNextGlobalDispatchPlan;
     std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)>

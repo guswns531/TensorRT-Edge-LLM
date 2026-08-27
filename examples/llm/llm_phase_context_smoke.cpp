@@ -1776,15 +1776,66 @@ int main(int argc, char** argv)
             std::vector<int32_t> const warmupBatchSizes = std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr
                 ? rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes))
                 : std::vector<int32_t>{};
+            bool const globalOverlapWarmup = semanticSchedulerConfig.globalSchedulerMode
+                    == rt::PhaseGlobalSchedulerMode::kActive
+                && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP") == nullptr;
+            size_t globalOverlapWarmupSamples = 4U;
+            if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_WARMUP_SAMPLES"))
+            {
+                globalOverlapWarmupSamples = static_cast<size_t>(std::stoull(value));
+            }
+            ELLM_CHECK(!globalOverlapWarmup || globalOverlapWarmupSamples > 0U,
+                "Phase Global overlap warmup samples must be positive");
+            std::vector<int32_t> executionWarmupBatchSizes;
+            for (int32_t const batchSize : warmupBatchSizes)
+            {
+                size_t const repeats = globalOverlapWarmup ? globalOverlapWarmupSamples : 1U;
+                executionWarmupBatchSizes.insert(executionWarmupBatchSizes.end(), repeats, batchSize);
+            }
+            semanticCoordinator.scheduler().setGlobalWarmupProbeMode(globalOverlapWarmup);
             uint64_t warmupRequestId = 1000000;
             size_t warmedRequests{};
-            for (int32_t const batchSize : warmupBatchSizes)
+            for (int32_t const batchSize : executionWarmupBatchSizes)
             {
                 for (int32_t row{}; row < batchSize; ++row)
                 {
-                    auto const submission = semanticServer.submit(warmupRequestId++, semanticPrompts.at(20000), 2);
+                    int32_t const outputTokens = globalOverlapWarmup ? 4 : 2;
+                    auto const submission
+                        = semanticServer.submit(warmupRequestId++, semanticPrompts.at(20000), outputTokens);
                     ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
                         "Phase IPC shape warmup request was not admitted");
+                }
+                size_t overlapWarmupRows{};
+                if (globalOverlapWarmup)
+                {
+                    // Leave a decode cohort resident, then admit a bounded P
+                    // cohort. Synthetic requests have no user SLO, so the
+                    // scheduler can safely collect a direct P+D CUDA sample
+                    // without exploring on production traffic.
+                    size_t pollCount{};
+                    while (true)
+                    {
+                        static_cast<void>(semanticServer.poll());
+                        rt::IndependentPhaseServerArbitrationSnapshot const snapshot
+                            = semanticServer.arbitrationSnapshot();
+                        if (snapshot.busy && snapshot.inFlightKind == rt::PhaseDispatchKind::kDecode)
+                        {
+                            break;
+                        }
+                        ELLM_CHECK(!semanticServer.empty() && ++pollCount < 1000000U,
+                            "Phase Global overlap warmup did not reach decode");
+                    }
+                    size_t const availableRows = warmupAdmissionLimit > static_cast<size_t>(batchSize)
+                        ? warmupAdmissionLimit - static_cast<size_t>(batchSize)
+                        : 0U;
+                    overlapWarmupRows = std::min({availableRows, static_cast<size_t>(batchSize),
+                        static_cast<size_t>(semanticSchedulerConfig.maxPrefillBatchSize)});
+                    for (size_t row{}; row < overlapWarmupRows; ++row)
+                    {
+                        auto const submission = semanticServer.submit(warmupRequestId++, semanticPrompts.at(20000), 2);
+                        ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
+                            "Phase Global overlap warmup request was not admitted");
+                    }
                 }
                 semanticServer.runUntilIdle(1000000);
                 size_t completed{};
@@ -1799,12 +1850,14 @@ int main(int argc, char** argv)
                 {
                     semanticPrefixCache->clear();
                 }
-                ELLM_CHECK(completed == static_cast<size_t>(batchSize),
+                ELLM_CHECK(completed == static_cast<size_t>(batchSize) + overlapWarmupRows,
                     "Phase IPC shape warmup did not complete every request");
                 warmedRequests += completed;
             }
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
+            semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
+            rt::PhaseSchedulerTelemetry const warmupTelemetry = semanticCoordinator.scheduler().telemetry();
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
             semanticCoordinator.scheduler().resetHistory(
@@ -1824,7 +1877,9 @@ int main(int argc, char** argv)
                 }
                 semanticCoordinator.setGraphCaptureMinObservations(graphCaptureMinObservations);
             }
-            LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu", warmupBatchSizes.size(), warmedRequests);
+            LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
+                executionWarmupBatchSizes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
+                warmupTelemetry.globalSafeProbeCount);
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
             std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
