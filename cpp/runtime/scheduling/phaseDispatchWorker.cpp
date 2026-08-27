@@ -505,6 +505,10 @@ void PhaseDispatchWorker::recordTimeline(
 
 void PhaseDispatchWorker::collectMetrics()
 {
+    if (mCallbacks.executionVariant)
+    {
+        mCurrentMetrics.globalExecutionVariant = mCallbacks.executionVariant(mCurrentMetrics.kind);
+    }
     float phaseEndMs{};
     if (mCurrentMetrics.prefillBatchSize > 0)
     {

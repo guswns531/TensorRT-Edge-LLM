@@ -36,7 +36,11 @@ namespace
 
 void applySchedulerProfile(PhaseQueueSchedulerConfig& config)
 {
-    if (config.profile == PhaseSchedulerProfile::kCustom)
+    // Active global scheduling is deliberately profile-free. Legacy presets
+    // remain available for the legacy path and for shadow comparisons, while
+    // explicit engine/shape limits below remain common to every mode.
+    if (config.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
+        || config.profile == PhaseSchedulerProfile::kCustom)
     {
         return;
     }
@@ -1445,6 +1449,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     int32_t const prefillRows = static_cast<int32_t>(prefillPlan.prefillBatch.size());
     int32_t prefillChunk{};
     int32_t prefillPastKV{};
+    int32_t prefillUsefulTokens{};
     bool prefillInitial{};
     PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> prefillRequestIds;
@@ -1452,6 +1457,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         prefillChunk = std::max(prefillChunk, item.tokenCount);
         prefillPastKV = std::max(prefillPastKV, item.tokenOffset);
+        prefillUsefulTokens += item.tokenCount;
         prefillRequestIds.push_back(item.requestId);
     }
     if (!prefillPlan.prefillBatch.empty())
@@ -1473,9 +1479,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         decodeRequestIds.push_back(item.requestId);
     }
 
-    PhaseGlobalActionKey const prefillKey{
+    PhaseGlobalActionKey prefillKey{
         PhaseGlobalActionKind::kPrefill, prefillRows, 0, prefillChunk, contextBucket(prefillPastKV), 0};
-    PhaseGlobalActionKey const decodeKey{
+    PhaseGlobalActionKey decodeKey{
         PhaseGlobalActionKind::kDecode, decodeRows, 0, 1, contextBucket(decodeMaxContext), 0};
 
     PhaseDispatchPlan const overlapPlan = state.prefillQueued > 0U && state.decodeQueued > 0U
@@ -1486,6 +1492,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     int32_t overlapPrefillChunk{};
     int32_t overlapPrefillPastKV{};
     int32_t overlapDecodeMaxContext{};
+    int32_t overlapPrefillUsefulTokens{};
     bool overlapPrefillInitial{};
     PhasePrefillClass overlapPrefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> overlapPrefillRequestIds;
@@ -1494,6 +1501,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         overlapPrefillChunk = std::max(overlapPrefillChunk, item.tokenCount);
         overlapPrefillPastKV = std::max(overlapPrefillPastKV, item.tokenOffset);
+        overlapPrefillUsefulTokens += item.tokenCount;
         overlapPrefillRequestIds.push_back(item.requestId);
     }
     for (PhaseWorkItem const& item : overlapPlan.decodeBatch)
@@ -1506,6 +1514,14 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         overlapPrefillInitial = overlapPlan.prefillBatch.front().tokenOffset == 0;
         overlapPrefillClass = overlapPlan.prefillBatch.front().prefillClass;
     }
+
+    auto executionVariant = [&](PhaseGlobalActionKey const& key, int32_t primaryTokens) {
+        return mGlobalExecutionVariantSupplier && key.primaryBatchSize > 0
+            ? mGlobalExecutionVariantSupplier(key, primaryTokens)
+            : PhaseExecutionVariant::kEager;
+    };
+    prefillKey.executionVariant = executionVariant(prefillKey, prefillUsefulTokens);
+    decodeKey.executionVariant = executionVariant(decodeKey, 0);
 
     auto prefillPrediction = [&]() -> Prediction {
         if (std::optional<Prediction> const online = fromOnline(prefillKey))
@@ -1644,9 +1660,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     }
     if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefillRows > 0 && overlapDecodeRows > 0)
     {
-        PhaseGlobalActionKey const overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows,
+        PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows,
             overlapDecodeRows, overlapPrefillChunk, contextBucket(overlapPrefillPastKV),
             contextBucket(overlapDecodeMaxContext)};
+        overlapKey.executionVariant = executionVariant(overlapKey, overlapPrefillUsefulTokens);
         Prediction overlap{};
         bool overlapKnown{};
         if (std::optional<Prediction> const online = fromOnline(overlapKey))
@@ -1781,7 +1798,9 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
     auto predictDecode = [&](int32_t rows, int64_t totalContextTokens, int32_t maxContextLength) {
         int32_t const contextBucket
             = (std::max(0, maxContextLength) + contextBucketTokens - 1) / contextBucketTokens;
-        PhaseGlobalActionKey const key{PhaseGlobalActionKind::kDecode, rows, 0, 1, contextBucket, 0};
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, rows, 0, 1, contextBucket, 0};
+        key.executionVariant
+            = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, 0) : PhaseExecutionVariant::kEager;
         DecodePrediction prediction{static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0,
             static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0,
             static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0, rows};
@@ -2062,6 +2081,14 @@ void PhaseQueueScheduler::setGlobalMemoryHorizonSupplier(
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Global memory supplier can only change while the scheduler is idle");
     mConfig.globalMemoryHorizonSupplier = std::move(supplier);
+}
+
+void PhaseQueueScheduler::setGlobalExecutionVariantSupplier(
+    std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)> supplier)
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Global execution-variant supplier can only change while the scheduler is idle");
+    mGlobalExecutionVariantSupplier = std::move(supplier);
 }
 
 size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept
@@ -2775,17 +2802,18 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
     if (metrics.kind == PhaseDispatchKind::kOverlap)
     {
         return {PhaseGlobalActionKind::kPrefillDecode, metrics.prefillBatchSize, metrics.decodeBatchSize, chunkLength,
-            contextBucket(metrics.prefillPastKVMax), contextBucket(metrics.plannedDecodeMaxContextLength)};
+            contextBucket(metrics.prefillPastKVMax), contextBucket(metrics.plannedDecodeMaxContextLength),
+            metrics.globalExecutionVariant};
     }
     if (metrics.kind == PhaseDispatchKind::kPrefill)
     {
         return {PhaseGlobalActionKind::kPrefill, metrics.prefillBatchSize, 0, chunkLength,
-            contextBucket(metrics.prefillPastKVMax), 0};
+            contextBucket(metrics.prefillPastKVMax), 0, metrics.globalExecutionVariant};
     }
     if (metrics.kind == PhaseDispatchKind::kDecode)
     {
         return {PhaseGlobalActionKind::kDecode, metrics.decodeBatchSize, 0, 1,
-            contextBucket(metrics.plannedDecodeMaxContextLength), 0};
+            contextBucket(metrics.plannedDecodeMaxContextLength), 0, metrics.globalExecutionVariant};
     }
     return {};
 }

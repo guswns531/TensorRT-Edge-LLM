@@ -92,6 +92,54 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalActiveIgnoresLegacyServingProfiles)
+{
+    std::vector<PhaseSchedulerProfile> const profiles{PhaseSchedulerProfile::kCustom,
+        PhaseSchedulerProfile::kLatencySafe, PhaseSchedulerProfile::kBalanced,
+        PhaseSchedulerProfile::kThroughputBalanced, PhaseSchedulerProfile::kLongPrefill,
+        PhaseSchedulerProfile::kAuto};
+    std::optional<PhaseGlobalActionKey> reference;
+    for (PhaseSchedulerProfile const profile : profiles)
+    {
+        PhaseQueueSchedulerConfig config;
+        config.profile = profile;
+        config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+        config.globalSafeProbeSlackMultiplier = 0.0F;
+        PhaseQueueScheduler scheduler(config);
+        scheduler.enqueuePrefill({1, 32});
+
+        PhaseDispatchPlan const plan = scheduler.next();
+
+        ASSERT_TRUE(plan.globalDecisionApplied);
+        if (!reference.has_value())
+        {
+            reference = plan.globalSelectedAction;
+        }
+        EXPECT_EQ(plan.globalSelectedAction, *reference);
+        EXPECT_EQ(plan.prefillBatch.size(), 1U);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalCostKeyUsesExecutionVariantSupplier)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    int32_t observedTokens{};
+    scheduler.setGlobalExecutionVariantSupplier(
+        [&](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
+            EXPECT_EQ(key.kind, PhaseGlobalActionKind::kPrefill);
+            observedTokens = primaryTokenCount;
+            return PhaseExecutionVariant::kPrimaryGraph;
+        });
+    scheduler.enqueuePrefill({1, 32});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(observedTokens, 32);
+    EXPECT_EQ(plan.globalSelectedAction.executionVariant, PhaseExecutionVariant::kPrimaryGraph);
+}
+
 TEST(PhaseQueueSchedulerTest, RejectsStaleExternalGlobalPlanEpoch)
 {
     PhaseQueueSchedulerConfig config;

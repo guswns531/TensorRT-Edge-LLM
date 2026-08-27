@@ -1164,8 +1164,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     auto addEncoderOverlap = [&](PhaseGlobalActionKind kind) {
         ELLM_CHECK(pd.has_value(), "An encoder overlap requires a P/D candidate");
         int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? pd->key.chunkLength : 0;
-        PhaseGlobalActionKey const overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
+        PhaseGlobalActionKey overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
             pd->key.primaryBatchSize, chunkLength, encoderContextBucket, pd->key.primaryContextBucket};
+        overlapKey.executionVariant
+            = phaseExecutionVariant(false, phaseExecutionVariantUsesPrimaryGraph(pd->key.executionVariant));
         double overlapMakespanUs = encoderMakespanUs + pd->predictedMakespanUs;
         double overlapUncertaintyUs = encoderUncertaintyUs + pd->uncertaintyUs;
         bool overlapKnown{};

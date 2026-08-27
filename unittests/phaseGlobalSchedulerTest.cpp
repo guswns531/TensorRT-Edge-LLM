@@ -211,6 +211,16 @@ TEST(PhaseGlobalSchedulerTest, MapsActionsToExplicitOutstandingSets)
     EXPECT_FALSE(phaseExecutionSetIsSubset(PhaseExecutionSet::kPrefill, encoderDecode));
 }
 
+TEST(PhaseGlobalSchedulerTest, MapsPrimaryAndSecondaryGraphVariants)
+{
+    PhaseExecutionVariant const both = phaseExecutionVariant(true, true);
+    EXPECT_EQ(both, PhaseExecutionVariant::kBothGraph);
+    EXPECT_TRUE(phaseExecutionVariantUsesPrimaryGraph(both));
+    EXPECT_TRUE(phaseExecutionVariantUsesSecondaryGraph(both));
+    EXPECT_FALSE(phaseExecutionVariantUsesSecondaryGraph(PhaseExecutionVariant::kPrimaryGraph));
+    EXPECT_STREQ(phaseExecutionVariantName(both), "both_graph");
+}
+
 TEST(PhaseGlobalSchedulerTest, MaterializesStableDispatchLease)
 {
     PhaseGlobalActionCandidate action = candidate(PhaseGlobalActionKind::kPrefillDecode, 2000.0, 1500.0, 10000.0);
@@ -274,6 +284,27 @@ TEST(PhaseGlobalCostModelTest, LearnsEncoderPrefillCostByFullShapeKey)
 
     PhaseGlobalActionKey const differentPastKV{PhaseGlobalActionKind::kEncoderPrefill, 4, 2, 128, 8, 1};
     EXPECT_FALSE(model.overlapEligible(differentPastKV));
+}
+
+TEST(PhaseGlobalCostModelTest, SeparatesEagerAndGraphReplaySamples)
+{
+    PhaseGlobalCostModel model;
+    PhaseGlobalActionKey eager{PhaseGlobalActionKind::kDecode, 16, 0, 1, 4, 0};
+    PhaseGlobalActionKey graph = eager;
+    graph.executionVariant = PhaseExecutionVariant::kPrimaryGraph;
+
+    model.observe(eager, {8.0F, 7.0F});
+    model.observe(graph, {8.0F, 5.0F});
+
+    ASSERT_TRUE(model.estimate(eager).has_value());
+    ASSERT_TRUE(model.estimate(graph).has_value());
+    EXPECT_FLOAT_EQ(model.estimate(eager)->makespanMedianMs, 7.0F);
+    EXPECT_FLOAT_EQ(model.estimate(graph)->makespanMedianMs, 5.0F);
+    PhaseGlobalActionCandidate eagerCandidate = candidate(PhaseGlobalActionKind::kDecode, 1.0, 1.0, 10.0);
+    eagerCandidate.key = eager;
+    PhaseGlobalActionCandidate graphCandidate = eagerCandidate;
+    graphCandidate.key = graph;
+    EXPECT_NE(phaseGlobalCandidateId(eagerCandidate), phaseGlobalCandidateId(graphCandidate));
 }
 
 } // namespace

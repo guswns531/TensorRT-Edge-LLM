@@ -201,6 +201,38 @@ PhaseExecutionSet phaseExecutionSetForAction(PhaseGlobalActionKind kind) noexcep
     return result;
 }
 
+PhaseExecutionVariant phaseExecutionVariant(bool primaryGraph, bool secondaryGraph) noexcept
+{
+    uint8_t const mask = static_cast<uint8_t>(primaryGraph ? PhaseExecutionVariant::kPrimaryGraph
+                                                           : PhaseExecutionVariant::kEager)
+        | static_cast<uint8_t>(secondaryGraph ? PhaseExecutionVariant::kSecondaryGraph
+                                              : PhaseExecutionVariant::kEager);
+    return static_cast<PhaseExecutionVariant>(mask);
+}
+
+bool phaseExecutionVariantUsesPrimaryGraph(PhaseExecutionVariant variant) noexcept
+{
+    return (static_cast<uint8_t>(variant) & static_cast<uint8_t>(PhaseExecutionVariant::kPrimaryGraph)) != 0U;
+}
+
+bool phaseExecutionVariantUsesSecondaryGraph(PhaseExecutionVariant variant) noexcept
+{
+    return (static_cast<uint8_t>(variant) & static_cast<uint8_t>(PhaseExecutionVariant::kSecondaryGraph)) != 0U;
+}
+
+char const* phaseExecutionVariantName(PhaseExecutionVariant variant) noexcept
+{
+    char const* result = "unknown";
+    switch (variant)
+    {
+    case PhaseExecutionVariant::kEager: result = "eager"; break;
+    case PhaseExecutionVariant::kPrimaryGraph: result = "primary_graph"; break;
+    case PhaseExecutionVariant::kSecondaryGraph: result = "secondary_graph"; break;
+    case PhaseExecutionVariant::kBothGraph: result = "both_graph"; break;
+    }
+    return result;
+}
+
 uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noexcept
 {
     uint64_t result = static_cast<uint64_t>(candidate.key.kind);
@@ -209,6 +241,7 @@ uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noe
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.chunkLength));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryContextBucket));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.secondaryContextBucket));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.executionVariant));
     for (uint64_t const requestId : candidate.primaryRequestIds)
     {
         result = hashCombine(result, requestId);
@@ -276,10 +309,10 @@ char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept
 
 bool PhaseGlobalActionKey::operator==(PhaseGlobalActionKey const& other) const noexcept
 {
-    return std::tie(
-               kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket, secondaryContextBucket)
+    return std::tie(kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket,
+               secondaryContextBucket, executionVariant)
         == std::tie(other.kind, other.primaryBatchSize, other.secondaryBatchSize, other.chunkLength,
-            other.primaryContextBucket, other.secondaryContextBucket);
+            other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant);
 }
 
 size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key) const noexcept
@@ -294,6 +327,7 @@ size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key
     combine(key.chunkLength);
     combine(key.primaryContextBucket);
     combine(key.secondaryContextBucket);
+    combine(static_cast<int32_t>(key.executionVariant));
     return result;
 }
 

@@ -66,6 +66,23 @@ enum class PhaseGlobalSchedulerMode
     kActive,
 };
 
+//! CUDA launch path used by one action. Primary and secondary refer to the
+//! corresponding row vectors in PhaseGlobalActionCandidate. Keeping graph
+//! replay in the cost key prevents eager warmup samples from contaminating
+//! steady-state replay estimates.
+enum class PhaseExecutionVariant : uint8_t
+{
+    kEager = 0U,
+    kPrimaryGraph = 1U,
+    kSecondaryGraph = 2U,
+    kBothGraph = 3U,
+};
+
+PhaseExecutionVariant phaseExecutionVariant(bool primaryGraph, bool secondaryGraph) noexcept;
+bool phaseExecutionVariantUsesPrimaryGraph(PhaseExecutionVariant variant) noexcept;
+bool phaseExecutionVariantUsesSecondaryGraph(PhaseExecutionVariant variant) noexcept;
+char const* phaseExecutionVariantName(PhaseExecutionVariant variant) noexcept;
+
 //! Stable telemetry name for a global action kind.
 char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept;
 
@@ -78,6 +95,7 @@ struct PhaseGlobalActionKey
     int32_t chunkLength{};
     int32_t primaryContextBucket{};
     int32_t secondaryContextBucket{};
+    PhaseExecutionVariant executionVariant{PhaseExecutionVariant::kEager};
 
     bool operator==(PhaseGlobalActionKey const& other) const noexcept;
 };

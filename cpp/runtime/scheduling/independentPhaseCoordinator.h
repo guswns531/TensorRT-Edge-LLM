@@ -146,6 +146,8 @@ private:
     size_t mGraphCaptureMinObservations{1U};
     size_t mMaxPrefillGraphs{};
     size_t mMaxDecodeGraphs{};
+    bool mLastPrefillGraphReplay{};
+    bool mLastDecodeGraphReplay{};
 };
 
 } // namespace trt_edgellm::rt

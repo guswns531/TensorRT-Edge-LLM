@@ -2491,6 +2491,7 @@ int main(int argc, char** argv)
                         {"global_decision_applied", metrics.globalDecisionApplied},
                         {"global_safe_probe", metrics.globalSafeProbe},
                         {"global_action", rt::phaseGlobalActionKindName(metrics.globalSelectedAction.kind)},
+                        {"global_execution_variant", rt::phaseExecutionVariantName(metrics.globalExecutionVariant)},
                         {"global_decision_reason", static_cast<int32_t>(metrics.globalDecisionReason)},
                         {"global_predicted_violation_us", metrics.globalPredictedViolationUs},
                         {"global_service_compression", metrics.globalServiceCompression},

@@ -70,6 +70,8 @@ struct PhaseDispatchWorkerCallbacks
     std::function<void(PhaseDispatchMetrics const&)> onMetrics;
     //! Optional request-level host transition telemetry. Empty keeps the hot path allocation-free.
     std::function<void(PhaseTimelineEvent const&)> onTimeline;
+    //! Exact eager/graph replay path observed by the executor for this plan.
+    std::function<PhaseExecutionVariant(PhaseDispatchKind kind)> executionVariant;
 };
 
 //! Controls whether phase enqueues may overlap across streams.

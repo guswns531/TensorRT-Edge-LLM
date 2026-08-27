@@ -194,6 +194,7 @@ struct PhaseDispatchMetrics
     PhaseExecutionSet globalAllowedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet globalLaunched{PhaseExecutionSet::kNone};
     bool globalActionFidelity{};
+    PhaseExecutionVariant globalExecutionVariant{PhaseExecutionVariant::kEager};
     PhaseGlobalActionKey globalSelectedAction{};
     PhaseGlobalDecisionReason globalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
     double globalPredictedViolationUs{};
@@ -685,6 +686,11 @@ public:
     void setGlobalMemoryHorizonSupplier(
         std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
             supplier);
+    //! Resolve whether the exact P/D action shape is expected to use an
+    //! already-captured CUDA graph. This is a mechanism capability, not a
+    //! workload policy input.
+    void setGlobalExecutionVariantSupplier(
+        std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)> supplier);
     //! Largest dense decode cohort whose covered p95 GPU step fits one TPOT target.
     size_t decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept;
     //! Keep online decode refinement out of latency mode while retaining learned samples.
@@ -781,6 +787,8 @@ private:
     size_t mLastGlobalSafeProbeSequence{};
     std::optional<PhaseGlobalActionCandidate> mNextGlobalAction;
     std::optional<PhaseGlobalDispatchPlan> mNextGlobalDispatchPlan;
+    std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)>
+        mGlobalExecutionVariantSupplier;
 };
 
 } // namespace rt

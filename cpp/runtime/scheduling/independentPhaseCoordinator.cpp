@@ -68,6 +68,29 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     mWorker = std::make_unique<PhaseDispatchWorker>(mScheduler, makeWorkerCallbacks(), mPrefillStream, mDecodeStream,
         sharedContext ? PhaseTensorRTContextMode::kSharedSerialized : PhaseTensorRTContextMode::kIndependentConcurrent,
         safety);
+    mScheduler.setGlobalExecutionVariantSupplier([this](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
+        int32_t const prefillGraphTokens = mConfig.packedPrefill ? primaryTokenCount : key.chunkLength;
+        bool const prefillGraph = mCapturedPrefillShapes.find(
+                                      std::to_string(key.primaryBatchSize) + ":" + std::to_string(prefillGraphTokens))
+            != mCapturedPrefillShapes.end();
+        bool const primaryDecodeGraph
+            = mCapturedDecodeShapes.find(std::to_string(key.primaryBatchSize)) != mCapturedDecodeShapes.end();
+        bool const secondaryDecodeGraph
+            = mCapturedDecodeShapes.find(std::to_string(key.secondaryBatchSize)) != mCapturedDecodeShapes.end();
+        if (key.kind == PhaseGlobalActionKind::kPrefill)
+        {
+            return phaseExecutionVariant(prefillGraph, false);
+        }
+        if (key.kind == PhaseGlobalActionKind::kDecode)
+        {
+            return phaseExecutionVariant(primaryDecodeGraph, false);
+        }
+        if (key.kind == PhaseGlobalActionKind::kPrefillDecode)
+        {
+            return phaseExecutionVariant(prefillGraph, secondaryDecodeGraph);
+        }
+        return PhaseExecutionVariant::kEager;
+    });
 }
 
 void IndependentPhaseCoordinator::setCallbacks(IndependentPhaseCoordinatorCallbacks callbacks)
@@ -111,6 +134,21 @@ PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
         {
             mCallbacks.onTimeline(event);
         }
+    };
+    callbacks.executionVariant = [this](PhaseDispatchKind kind) {
+        if (kind == PhaseDispatchKind::kPrefill)
+        {
+            return phaseExecutionVariant(mLastPrefillGraphReplay, false);
+        }
+        if (kind == PhaseDispatchKind::kDecode)
+        {
+            return phaseExecutionVariant(mLastDecodeGraphReplay, false);
+        }
+        if (kind == PhaseDispatchKind::kOverlap)
+        {
+            return phaseExecutionVariant(mLastPrefillGraphReplay, mLastDecodeGraphReplay);
+        }
+        return PhaseExecutionVariant::kEager;
     };
     return callbacks;
 }
@@ -167,7 +205,10 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         mCapturedPrefillShapes.insert(graphShape);
         mPrefillGraphShapeObservations.erase(graphShape);
     }
+    EngineExecutor::GraphCacheStats const beforeExecute = mExecutors.prefillExecutor().graphCacheStats();
     ELLM_CHECK(mExecutors.prefillExecutor().execute(stream), "Independent packed prefill execute failed");
+    EngineExecutor::GraphCacheStats const afterExecute = mExecutors.prefillExecutor().graphCacheStats();
+    mLastPrefillGraphReplay = afterExecute.hits > beforeExecute.hits;
 }
 
 void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
@@ -203,7 +244,10 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
         mCapturedDecodeShapes.insert(graphShape);
         mDecodeGraphShapeObservations.erase(graphShape);
     }
+    EngineExecutor::GraphCacheStats const beforeExecute = mExecutors.decodeExecutor().graphCacheStats();
     ELLM_CHECK(mExecutors.decodeExecutor().execute(stream), "Independent decode execute failed");
+    EngineExecutor::GraphCacheStats const afterExecute = mExecutors.decodeExecutor().graphCacheStats();
+    mLastDecodeGraphReplay = afterExecute.hits > beforeExecute.hits;
 }
 
 void IndependentPhaseCoordinator::completePrefillBatch(std::vector<PhaseWorkItem> const& batch)
