@@ -1034,7 +1034,16 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
         {
             ++mGlobalPdSelections;
-            return mServer.dispatchGlobalAction(std::move(*pd));
+            PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(*pd);
+            bool const started
+                = mServer.dispatchGlobalAction(std::move(*pd), executionPlan.planId, executionPlan.snapshotEpoch);
+            if (!started)
+            {
+                abandonGlobalExecutionLease();
+                return false;
+            }
+            validateGlobalExecutionLaunch();
+            return true;
         }
         return false;
     }
