@@ -92,6 +92,26 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSelectionMode = PhaseGlobalSelectionMode::kLegacyCompatibility;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 3});
+    scheduler.enqueueDecode({2, 128, 0});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_EQ(plan.globalDecisionReason, PhaseGlobalDecisionReason::kLegacyCompatibility);
+    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode);
+    EXPECT_TRUE(plan.globalCandidateParity);
+    EXPECT_TRUE(plan.globalActionFidelity);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalActiveIgnoresLegacyServingProfiles)
 {
     std::vector<PhaseSchedulerProfile> const profiles{PhaseSchedulerProfile::kCustom,

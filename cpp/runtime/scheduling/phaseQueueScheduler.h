@@ -362,6 +362,8 @@ struct PhaseQueueSchedulerConfig
     //! Profile-free P/D action selection. Shadow mode observes the same queue
     //! state without changing legacy dispatch; active mode owns the decision.
     PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
+    //! Evaluation-only policy control over the common deterministic builders.
+    PhaseGlobalSelectionMode globalSelectionMode{PhaseGlobalSelectionMode::kProfileFree};
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};
     //! Conservative cold-start bounds used until direct CUDA observations exist.
@@ -719,8 +721,10 @@ private:
     };
 
     std::optional<GlobalQueueSelection> selectGlobalQueueAction(PhaseQueueSnapshot const& snapshot,
-        bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true);
+        bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true,
+        std::optional<PhaseDispatchKind> compatibilityKind = std::nullopt);
     PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
+    PhaseDispatchKind legacyQueueDecision(PhaseQueueSnapshot const& snapshot) const;
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(

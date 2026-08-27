@@ -66,6 +66,15 @@ enum class PhaseGlobalSchedulerMode
     kActive,
 };
 
+//! Selection authority used after the common deterministic builders run.
+//! Compatibility mode is an evaluation control and never classifies a
+//! workload; it replays the legacy P/D phase choice on the same snapshot.
+enum class PhaseGlobalSelectionMode
+{
+    kProfileFree,
+    kLegacyCompatibility,
+};
+
 //! CUDA launch path used by one action. Primary and secondary refer to the
 //! corresponding row vectors in PhaseGlobalActionCandidate. Keeping graph
 //! replay in the cost key prevents eager warmup samples from contaminating
@@ -260,6 +269,7 @@ enum class PhaseGlobalDecisionReason
     kNoHardFeasibleCandidate,
     kDeadlineSafeEfficiency,
     kMinimumViolation,
+    kLegacyCompatibility,
 };
 
 //! Result of one bounded global scheduling decision.

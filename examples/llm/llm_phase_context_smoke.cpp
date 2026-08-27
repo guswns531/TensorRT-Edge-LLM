@@ -1295,6 +1295,10 @@ int main(int argc, char** argv)
                 : mode == "shadow"                                         ? rt::PhaseGlobalSchedulerMode::kShadow
                                                                            : rt::PhaseGlobalSchedulerMode::kDisabled;
         }
+        if (std::getenv("TRT_EDGELLM_GLOBAL_LEGACY_COMPATIBILITY") != nullptr)
+        {
+            semanticSchedulerConfig.globalSelectionMode = rt::PhaseGlobalSelectionMode::kLegacyCompatibility;
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value);

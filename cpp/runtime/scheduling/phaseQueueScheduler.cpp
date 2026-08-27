@@ -1415,7 +1415,8 @@ PhaseDispatchPlan PhaseQueueScheduler::previewMechanismPlan(PhaseDispatchKind ki
 }
 
 std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::selectGlobalQueueAction(
-    PhaseQueueSnapshot const& state, bool allowPrefill, bool allowDecode, bool allowOverlap)
+    PhaseQueueSnapshot const& state, bool allowPrefill, bool allowDecode, bool allowOverlap,
+    std::optional<PhaseDispatchKind> compatibilityKind)
 {
     if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled)
     {
@@ -1734,7 +1735,52 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     }
 
     ++mGlobalDecisionSequence;
-    PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
+    PhaseGlobalDecision decision;
+    if (mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
+        && compatibilityKind.has_value())
+    {
+        auto candidateKind = [](PhaseGlobalActionKind kind) {
+            PhaseDispatchKind result{PhaseDispatchKind::kNone};
+            switch (kind)
+            {
+            case PhaseGlobalActionKind::kPrefill: result = PhaseDispatchKind::kPrefill; break;
+            case PhaseGlobalActionKind::kDecode: result = PhaseDispatchKind::kDecode; break;
+            case PhaseGlobalActionKind::kPrefillDecode: result = PhaseDispatchKind::kOverlap; break;
+            case PhaseGlobalActionKind::kNone:
+            case PhaseGlobalActionKind::kEncoder:
+            case PhaseGlobalActionKind::kEncoderPrefill:
+            case PhaseGlobalActionKind::kEncoderDecode:
+            case PhaseGlobalActionKind::kWait: break;
+            }
+            return result;
+        };
+        decision.inputCandidates = candidates.size();
+        decision.hardFeasibleCandidates = candidates.size();
+        decision.deadlineSafeCandidates = candidates.size();
+        auto const selected = std::find_if(candidates.begin(), candidates.end(), [&](auto const& candidate) {
+            return candidateKind(candidate.key.kind) == *compatibilityKind;
+        });
+        if (selected != candidates.end())
+        {
+            decision.selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), selected));
+            decision.reason = PhaseGlobalDecisionReason::kLegacyCompatibility;
+            double const makespanUs = selected->predictedHorizonUs > 0.0 ? selected->predictedHorizonUs
+                                                                         : selected->predictedMakespanUs;
+            double const referenceUs = selected->horizonReferenceWorkUs > 0.0
+                ? selected->horizonReferenceWorkUs
+                : selected->referenceWorkUs;
+            decision.serviceCompression
+                = referenceUs / std::max(makespanUs, std::numeric_limits<double>::epsilon());
+        }
+        else
+        {
+            decision.reason = PhaseGlobalDecisionReason::kNoHardFeasibleCandidate;
+        }
+    }
+    else
+    {
+        decision = mGlobalScheduler.select(candidates);
+    }
     ++mTelemetry.globalDecisionCount;
     mTelemetry.lastGlobalDecisionReason = decision.reason;
     mTelemetry.lastGlobalPredictedViolationUs = decision.predictedViolationUs;
@@ -1976,13 +2022,19 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
 
 std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalAction()
 {
-    std::optional<GlobalQueueSelection> const selection = selectGlobalQueueAction(snapshot());
+    PhaseQueueSnapshot const state = snapshot();
+    std::optional<GlobalQueueSelection> const selection = selectGlobalQueueAction(
+        state, true, true, true,
+        mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
+            ? std::optional<PhaseDispatchKind>(legacyQueueDecision(state))
+            : std::nullopt);
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
 }
 
 std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalDecodeAction()
 {
-    std::optional<GlobalQueueSelection> const selection = selectGlobalQueueAction(snapshot(), false, true, false);
+    std::optional<GlobalQueueSelection> const selection
+        = selectGlobalQueueAction(snapshot(), false, true, false, PhaseDispatchKind::kDecode);
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
 }
 
@@ -2143,14 +2195,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 {
     refreshExternalDrainPreference();
     PhaseQueueSnapshot const state = snapshot();
-    bool const expiredPrefillHardGuard
-        = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U && state.prefillMinTtftSlackUs <= 0.0;
-    PhaseDispatchKind const baseline = expiredPrefillHardGuard
-        ? PhaseDispatchKind::kPrefill
-        : (mConfig.metricsPolicy
-                  ? mConfig.metricsPolicy(state, mTelemetry)
-                  : (mConfig.enableMetricsPolicy ? metricsDecision(state, mTelemetry)
-                                                 : (mConfig.policy ? mConfig.policy(state) : defaultDecision(state))));
+    PhaseDispatchKind const baseline = legacyQueueDecision(state);
     bool drainPreferenceApplied{};
     PhaseDispatchKind const legacyKind = applyExternalDrainPreference(state, baseline, drainPreferenceApplied);
     PhaseDispatchKind kind = legacyKind;
@@ -2187,7 +2232,11 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         ++mTelemetry.globalActiveDecisionCount;
         drainPreferenceApplied = false;
     }
-    else if (std::optional<GlobalQueueSelection> const global = selectGlobalQueueAction(state))
+    else if (std::optional<GlobalQueueSelection> const global = selectGlobalQueueAction(
+                 state, true, true, true,
+                 mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
+                     ? std::optional<PhaseDispatchKind>(legacyKind)
+                     : std::nullopt))
     {
         plan.globalDecisionEvaluated = true;
         plan.globalSelectedAction = global->candidate.key;
@@ -2354,6 +2403,18 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     mTelemetry.activeDrainPreference = mActiveDrainPreference;
     return plan;
+}
+
+PhaseDispatchKind PhaseQueueScheduler::legacyQueueDecision(PhaseQueueSnapshot const& state) const
+{
+    if (mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U && state.prefillMinTtftSlackUs <= 0.0)
+    {
+        return PhaseDispatchKind::kPrefill;
+    }
+    return mConfig.metricsPolicy
+        ? mConfig.metricsPolicy(state, mTelemetry)
+        : (mConfig.enableMetricsPolicy ? metricsDecision(state, mTelemetry)
+                                       : (mConfig.policy ? mConfig.policy(state) : defaultDecision(state)));
 }
 
 void PhaseQueueScheduler::refreshExternalDrainPreference() noexcept
