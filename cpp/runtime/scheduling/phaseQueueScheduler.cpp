@@ -448,7 +448,16 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
             if (prefill)
             {
                 result.prefillOldestRequestAgeUs = std::max(result.prefillOldestRequestAgeUs, requestAgeUs);
-                result.prefillMinTtftSlackUs = std::min(result.prefillMinTtftSlackUs, target - requestAgeUs);
+                double const slackUs = target - requestAgeUs;
+                if (slackUs < result.prefillMinTtftSlackUs
+                    || (slackUs == result.prefillMinTtftSlackUs
+                        && (result.prefillMinimumSlackRequestId == 0U
+                            || item.requestId < result.prefillMinimumSlackRequestId)))
+                {
+                    result.prefillMinTtftSlackUs = slackUs;
+                    result.prefillMinimumSlackRequestId = item.requestId;
+                    result.prefillCriticalPathRemainingTokens = item.tokenCount;
+                }
             }
             else
             {
@@ -1619,12 +1628,26 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         return mConfig.globalMemoryHorizonSupplier ? mConfig.globalMemoryHorizonSupplier(key, requestIds)
                                                    : PhaseActionMemoryHorizon{};
     };
-    auto protect = [&](PhaseGlobalActionCandidate& candidate, bool advancesPrefill, Prediction const& action) {
+    auto protectedPrefillAdvance = [&](std::vector<PhaseWorkItem> const& batch) {
+        auto const selected = std::find_if(batch.begin(), batch.end(), [&](PhaseWorkItem const& item) {
+            return item.requestId == state.prefillMinimumSlackRequestId;
+        });
+        return selected != batch.end() ? selected->tokenCount : 0;
+    };
+    auto protectedPrefillCompletion = [&](Prediction const& action, int32_t advancedTokens) {
+        int32_t const remainingTokens
+            = std::max(0, state.prefillCriticalPathRemainingTokens - std::max(0, advancedTokens));
+        int32_t const futureChunkTokens = std::max(1, mConfig.maxPrefillChunkTokens);
+        int32_t const residualTurns = (remainingTokens + futureChunkTokens - 1) / futureChunkTokens;
+        return PhaseProtectedCompletion{prefillSlack,
+            action.makespanUs + static_cast<double>(residualTurns) * prefill->makespanUs,
+            action.uncertaintyUs + static_cast<double>(residualTurns) * prefill->uncertaintyUs};
+    };
+    auto protect = [&](PhaseGlobalActionCandidate& candidate, int32_t advancedPrefillTokens,
+                       Prediction const& action) {
         if (prefill.has_value())
         {
-            double const completion = action.makespanUs + (advancesPrefill ? 0.0 : prefill->makespanUs);
-            double const uncertainty = action.uncertaintyUs + (advancesPrefill ? 0.0 : prefill->uncertaintyUs);
-            candidate.protectedCompletions.push_back({prefillSlack, completion, uncertainty});
+            candidate.protectedCompletions.push_back(protectedPrefillCompletion(action, advancedPrefillTokens));
         }
         if (decode.has_value())
         {
@@ -1650,7 +1673,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.referenceWorkUs = prefill->referenceWorkUs;
         candidate.requestServiceLagUs = state.prefillOldestRequestAgeUs;
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
-        protect(candidate, true, *prefill);
+        protect(candidate, protectedPrefillAdvance(prefillPlan.prefillBatch), *prefill);
         candidates.push_back(std::move(candidate));
     }
     if (allowDecode && decode.has_value())
@@ -1666,7 +1689,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.referenceWorkUs = decode->referenceWorkUs;
         candidate.requestServiceLagUs = state.decodeOldestWaitUs;
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
-        protect(candidate, false, *decode);
+        protect(candidate, 0, *decode);
         candidates.push_back(std::move(candidate));
     }
     if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefillRows > 0 && overlapDecodeRows > 0)
@@ -1729,7 +1752,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.referenceWorkUs = overlap.referenceWorkUs;
         candidate.requestServiceLagUs = std::max(state.prefillOldestRequestAgeUs, state.decodeOldestWaitUs);
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
-        candidate.protectedCompletions.push_back({prefillSlack, overlap.makespanUs, overlap.uncertaintyUs});
+        candidate.protectedCompletions.push_back(
+            protectedPrefillCompletion(overlap, protectedPrefillAdvance(overlapPlan.prefillBatch)));
         candidate.protectedCompletions.push_back({decodeSlack, overlap.makespanUs, overlap.uncertaintyUs});
         candidates.push_back(std::move(candidate));
     }

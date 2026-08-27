@@ -262,6 +262,9 @@ struct PhaseQueueSnapshot
     double prefillOldestWaitUs{};
     double prefillOldestRequestAgeUs{};
     double prefillMinTtftSlackUs{};
+    //! Request and remaining prompt path owning the minimum first-token slack.
+    uint64_t prefillMinimumSlackRequestId{};
+    int32_t prefillCriticalPathRemainingTokens{};
     double decodeOldestWaitUs{};
     //! Minimum remaining next-token slack. Request SLOs override the global
     //! fallback used only by WAIT/refill action selection.

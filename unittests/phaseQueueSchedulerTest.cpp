@@ -75,6 +75,7 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
     PhaseQueueScheduler scheduler(config);
     scheduler.enqueuePrefill({1, 32});
     scheduler.enqueueDecode({2, 128});
@@ -237,6 +238,32 @@ TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
     EXPECT_NE(first.candidateId, second.candidateId);
     PhaseGlobalDispatchPlan const plan = phaseGlobalDispatchPlan(1U, 1U, first);
     EXPECT_EQ(plan.primaryStableSlotIds, (std::vector<int32_t>{3, 0}));
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDeadlineProtectsCompleteRemainingPrefillPath)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillChunkTokens = 128;
+    config.prefillQueueWaitTargetUs = 5000.0;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.globalColdPrefillMsPerToken = 0.01F;
+    config.globalColdDecodeMs = 2.0F;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints urgent;
+    urgent.submittedAt = std::chrono::steady_clock::now();
+    urgent.ttftTargetUs = 5000.0;
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512, true, urgent});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseQueueSnapshot const snapshot = scheduler.queueSnapshot();
+    EXPECT_EQ(snapshot.prefillMinimumSlackRequestId, 1U);
+    EXPECT_EQ(snapshot.prefillCriticalPathRemainingTokens, 512);
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefill);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)
