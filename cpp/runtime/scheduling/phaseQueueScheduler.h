@@ -228,6 +228,8 @@ struct PhaseSchedulerTelemetry
     size_t globalSafeProbeCount{};
     size_t globalCandidateParityViolationCount{};
     size_t globalActionFidelityViolationCount{};
+    size_t globalPrefillFormationOpportunityCount{};
+    size_t globalPrefillFormationDecodeSelectionCount{};
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
     size_t globalWaitCandidateCount{};

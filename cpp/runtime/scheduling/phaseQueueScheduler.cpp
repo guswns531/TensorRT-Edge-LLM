@@ -1674,6 +1674,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             if (combined.directlyKnown && residual.directlyKnown)
             {
                 prefillFormation = PrefillFormationPrediction{combined, residual};
+                ++mTelemetry.globalPrefillFormationOpportunityCount;
             }
         }
     }
@@ -1966,6 +1967,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         return std::nullopt;
     }
     PhaseGlobalActionCandidate const& selected = candidates[*decision.selectedIndex];
+    if (prefillFormation.has_value() && selected.key.kind == PhaseGlobalActionKind::kDecode)
+    {
+        ++mTelemetry.globalPrefillFormationDecodeSelectionCount;
+    }
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
     switch (selected.key.kind)
     {

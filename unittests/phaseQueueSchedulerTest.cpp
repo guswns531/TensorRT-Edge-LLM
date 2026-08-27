@@ -319,6 +319,8 @@ TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillForma
     EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kDecode);
     EXPECT_NEAR(candidate->predictedHorizonUs, 12000.0, 1.0e-3);
     EXPECT_NEAR(candidate->horizonReferenceWorkUs, 21000.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationDecodeSelectionCount, 1U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDoesNotSpeculateOnUnmeasuredPrefillFormation)
@@ -342,6 +344,8 @@ TEST(PhaseQueueSchedulerTest, GlobalDoesNotSpeculateOnUnmeasuredPrefillFormation
     ASSERT_TRUE(candidate.has_value());
     EXPECT_NEAR(candidate->predictedHorizonUs, 11000.0, 1.0e-3);
     EXPECT_NEAR(candidate->horizonReferenceWorkUs, 11000.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationDecodeSelectionCount, 0U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
