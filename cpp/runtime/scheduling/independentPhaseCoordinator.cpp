@@ -351,6 +351,11 @@ PhaseQueueScheduler& IndependentPhaseCoordinator::scheduler() noexcept
     return mScheduler;
 }
 
+PhaseQueueScheduler const& IndependentPhaseCoordinator::scheduler() const noexcept
+{
+    return mScheduler;
+}
+
 std::vector<PhaseDispatchMetrics> const& IndependentPhaseCoordinator::metrics() const noexcept
 {
     return mMetrics;

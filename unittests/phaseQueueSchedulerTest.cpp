@@ -85,7 +85,37 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_TRUE(plan.globalDecisionEvaluated);
     EXPECT_TRUE(plan.globalDecisionApplied);
     EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_NE(plan.globalPlanId, 0U);
+    EXPECT_NE(plan.globalSnapshotEpoch, 0U);
+    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kDecode);
+    EXPECT_TRUE(plan.globalActionFidelity);
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 256;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueuePrefill({2, 128});
+    scheduler.enqueuePrefill({3, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    ASSERT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(plan.prefillBatch[1].requestId, 3U);
+    EXPECT_TRUE(plan.globalCandidateParity);
+    EXPECT_TRUE(plan.globalActionFidelity);
+    EXPECT_NE(plan.globalCandidateId, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalCandidateParityViolationCount, 0U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)
@@ -121,6 +151,23 @@ TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)
     EXPECT_EQ(scheduler.telemetry().globalWaitFutureRows, 4);
     EXPECT_EQ(scheduler.telemetry().globalWaitGraphBucket, 4);
     EXPECT_EQ(scheduler.telemetry().globalWaitRequestIds, (std::vector<uint64_t>{1U, 2U, 3U, 4U}));
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitIncludesResidualDecodeAfterDispatchNow)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {3, 4096, 2.1F}, {4, 4096, 4.2F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {2U, 3U, 4U}, {128, 128, 128}};
+
+    EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 0U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalWaitShadowDoesNotDelayDispatch)
@@ -200,6 +247,24 @@ TEST(PhaseQueueSchedulerTest, GlobalAdmissionUsesCoveredDecodeP95)
     EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 1024), 4U);
     EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(4000.0, 1024), 8U);
     EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 4096), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalFuturePrefillEstimateCoversCompleteChunkedCriticalPath)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.prefillBatchCosts = {
+        {2, 128, 0, 0, true, 3.0F, 0.0F, PhasePrefillClass::kExternal},
+        {2, 128, 256, 0, false, 4.0F, 0.0F, PhasePrefillClass::kExternal},
+    };
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseGlobalCostEstimate const estimate
+        = scheduler.estimateGlobalPrefillDrainCost(2, 256, PhasePrefillClass::kExternal);
+
+    EXPECT_FLOAT_EQ(estimate.makespanMedianMs, 7.0F);
+    EXPECT_FLOAT_EQ(estimate.makespanP95Ms, 7.0F);
+    EXPECT_FLOAT_EQ(estimate.uncertaintyMs, 0.0F);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalActiveDoesNotBypassMemoryFeasibility)

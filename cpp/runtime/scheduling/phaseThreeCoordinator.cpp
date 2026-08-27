@@ -689,6 +689,7 @@ bool PhaseThreeCoordinator::poll()
         mServer.setExternalDrainPreference(PhaseDrainPreference::kNone);
     }
     bool progressed = completeEncoder();
+    refreshGlobalExecutionLease();
     // Consume the E+D sample before a newly dispatched D action can replace the
     // server's last completed dispatch telemetry.
     completeGlobalOverlapObservation();
@@ -710,6 +711,7 @@ bool PhaseThreeCoordinator::poll()
     mServer.setExternalPendingRequests(
         upstreamRequests + mReadyPrefill.size(), minTpotTargetUs, mRequestIds.size(), mAdmissionProfilePrefillTokens);
     progressed = (globalScheduling ? mServer.pollCompletions() : mServer.poll()) || progressed;
+    refreshGlobalExecutionLease();
     refreshEffectiveEncodedCapacity();
     if (mEncoderSerializationYieldPending)
     {
@@ -742,6 +744,7 @@ bool PhaseThreeCoordinator::poll()
         mVision.reclaimIdleStorage();
     }
     completeGlobalOverlapObservation();
+    refreshGlobalExecutionLease();
     return progressed;
 }
 
@@ -834,6 +837,13 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalEncoderDecodeSelections = mGlobalEncoderDecodeSelections;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
+    result.globalActionFidelityViolations = mGlobalActionFidelityViolations;
+    result.lastGlobalFirstTokenCriticalPathUs = mLastGlobalFirstTokenCriticalPathUs;
+    result.activeGlobalPlanId = mGlobalExecutionLease.has_value() ? mGlobalExecutionLease->planId : 0U;
+    result.globalPlannedOutstanding = mGlobalExecutionLease.has_value()
+        ? mGlobalExecutionLease->allowedOutstanding
+        : PhaseExecutionSet::kNone;
+    result.globalObservedOutstanding = observedGlobalExecution();
     result.lastGlobalAction = mLastGlobalAction;
     if (!mPending.empty())
     {
@@ -878,9 +888,81 @@ std::optional<IndependentPhaseServerCompletion> PhaseThreeCoordinator::tryPopCom
     return completion;
 }
 
+PhaseExecutionSet PhaseThreeCoordinator::observedGlobalExecution() const noexcept
+{
+    PhaseExecutionSet result{PhaseExecutionSet::kNone};
+    if (!mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid())
+    {
+        result = result | PhaseExecutionSet::kEncoder;
+    }
+    IndependentPhaseServerArbitrationSnapshot const server = mServer.arbitrationSnapshot();
+    if (server.busy)
+    {
+        if (server.inFlightKind == PhaseDispatchKind::kPrefill || server.inFlightKind == PhaseDispatchKind::kOverlap)
+        {
+            result = result | PhaseExecutionSet::kPrefill;
+        }
+        if (server.inFlightKind == PhaseDispatchKind::kDecode || server.inFlightKind == PhaseDispatchKind::kOverlap)
+        {
+            result = result | PhaseExecutionSet::kDecode;
+        }
+    }
+    return result;
+}
+
+void PhaseThreeCoordinator::refreshGlobalExecutionLease()
+{
+    if (!mGlobalExecutionLease.has_value())
+    {
+        return;
+    }
+    PhaseExecutionSet const observed = observedGlobalExecution();
+    if (!mGlobalExecutionLease->permits(observed))
+    {
+        ++mGlobalActionFidelityViolations;
+        ELLM_CHECK(false, "Observed phases exceed the active global execution lease");
+    }
+    if (observed == PhaseExecutionSet::kNone)
+    {
+        mGlobalExecutionLease.reset();
+    }
+}
+
+PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(
+    PhaseGlobalActionCandidate const& candidate)
+{
+    ELLM_CHECK(!mGlobalExecutionLease.has_value(), "A global execution lease is already active");
+    PhaseGlobalDispatchPlan plan
+        = phaseGlobalDispatchPlan(++mGlobalPlanSequence, ++mGlobalSnapshotEpoch, candidate);
+    ELLM_CHECK(plan.allowedOutstanding != PhaseExecutionSet::kNone, "A dispatch lease requires executable phases");
+    mGlobalExecutionLease = plan;
+    return plan;
+}
+
+void PhaseThreeCoordinator::validateGlobalExecutionLaunch()
+{
+    ELLM_CHECK(mGlobalExecutionLease.has_value(), "Global execution launch has no active lease");
+    PhaseExecutionSet const observed = observedGlobalExecution();
+    if (!mGlobalExecutionLease->launchMatches(observed))
+    {
+        ++mGlobalActionFidelityViolations;
+        ELLM_CHECK(false, "Global action does not match the launched outstanding phase set");
+    }
+}
+
+void PhaseThreeCoordinator::abandonGlobalExecutionLease() noexcept
+{
+    mGlobalExecutionLease.reset();
+}
+
 bool PhaseThreeCoordinator::dispatchGlobalAction()
 {
     if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled)
+    {
+        return false;
+    }
+    refreshGlobalExecutionLease();
+    if (mGlobalExecutionLease.has_value())
     {
         return false;
     }
@@ -896,16 +978,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     if (!mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid())
     {
-        if (serverState.decodeQueued == 0U)
-        {
-            return false;
-        }
-        std::optional<PhaseGlobalActionCandidate> decode = mServer.previewGlobalDecodeAction();
-        if (decode.has_value() && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
-        {
-            ++mGlobalPdSelections;
-            return mServer.dispatchGlobalAction(std::move(*decode));
-        }
         return false;
     }
 
@@ -999,19 +1071,36 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
     }
 
+    size_t const estimatedPromptTokensPerRequest = std::max<size_t>(1U,
+        mEstimatedPromptTokens > 0U ? mEstimatedPromptTokens
+                                    : (encoderInputTokens + encoderBatchIndices.size() - 1U)
+                / encoderBatchIndices.size());
+    PhaseGlobalCostEstimate const visionPrefill = mServer.estimateGlobalPrefillDrainCost(
+        static_cast<int32_t>(encoderBatchIndices.size()),
+        static_cast<int32_t>(std::min<size_t>(estimatedPromptTokensPerRequest,
+            static_cast<size_t>(std::numeric_limits<int32_t>::max()))),
+        PhasePrefillClass::kExternal);
+    double const visionPrefillMakespanUs = visionPrefill.makespanMedianMs > 0.0F
+        ? static_cast<double>(visionPrefill.makespanMedianMs) * 1000.0
+        : mConfig.globalVisionPrefillColdStartUs;
+    double const visionPrefillUncertaintyUs = static_cast<double>(visionPrefill.uncertaintyMs) * 1000.0;
+    mLastGlobalFirstTokenCriticalPathUs
+        = encoderMakespanUs + encoderUncertaintyUs + visionPrefillMakespanUs + visionPrefillUncertaintyUs;
+
     PhaseGlobalActionCandidate encoder;
     encoder.key = encoderKey;
     for (size_t const index : encoderBatchIndices)
     {
-        encoder.requestIds.push_back(mPending[index].requestId);
+        encoder.primaryRequestIds.push_back(mPending[index].requestId);
     }
+    phaseGlobalFinalizeCandidate(encoder);
     encoder.predictedBlockingUs = encoderMakespanUs;
     encoder.predictedMakespanUs = encoderMakespanUs;
     encoder.uncertaintyUs = encoderUncertaintyUs;
     encoder.referenceWorkUs = encoderReferenceUs;
     encoder.requestServiceLagUs = encoderServiceLagUs;
-    encoder.protectedCompletions.push_back(
-        {encoderSlackUs, encoderMakespanUs + mConfig.globalVisionPrefillColdStartUs, encoderUncertaintyUs});
+    encoder.protectedCompletions.push_back({encoderSlackUs, encoderMakespanUs + visionPrefillMakespanUs,
+        encoderUncertaintyUs + visionPrefillUncertaintyUs});
     PhaseMemoryBrokerConfig const& memoryConfig = mMemoryBroker.config();
     size_t const committedKVBytes = memoryConfig.bytesPerKVPage > 0U
         ? saturatedMultiply(static_cast<size_t>(memoryConfig.committedKVPages), memoryConfig.bytesPerKVPage)
@@ -1031,8 +1120,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             encoder.protectedCompletions.push_back(completion);
         }
         pd->protectedCompletions.push_back(
-            {encoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + mConfig.globalVisionPrefillColdStartUs,
-                pd->uncertaintyUs + encoderUncertaintyUs});
+            {encoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
+                pd->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs});
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -1126,10 +1215,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.memory.guaranteedGrowthBytes
             = saturatedAdd(overlap.memory.guaranteedGrowthBytes, pd->memory.guaranteedGrowthBytes);
         overlap.memory.nearReclaimBytes = saturatedAdd(overlap.memory.nearReclaimBytes, pd->memory.nearReclaimBytes);
-        overlap.requestIds = encoder.requestIds;
-        overlap.requestIds.insert(overlap.requestIds.end(), pd->requestIds.begin(), pd->requestIds.end());
-        overlap.protectedCompletions.push_back(
-            {encoderSlackUs, overlapMakespanUs + mConfig.globalVisionPrefillColdStartUs, overlapUncertaintyUs});
+        overlap.primaryRequestIds = encoder.primaryRequestIds;
+        overlap.secondaryRequestIds = pd->requestIds;
+        phaseGlobalFinalizeCandidate(overlap);
+        overlap.protectedCompletions.push_back({encoderSlackUs, overlapMakespanUs + visionPrefillMakespanUs,
+            overlapUncertaintyUs + visionPrefillUncertaintyUs});
         for (PhaseProtectedCompletion completion : pd->protectedCompletions)
         {
             completion.predictedCompletionUs = overlapMakespanUs;
@@ -1140,7 +1230,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     };
     if (pd.has_value() && !encoderExclusive && !mConfig.enableAsyncEncoderPreparation)
     {
-        if (pd->key.kind == PhaseGlobalActionKind::kPrefill)
+        if (pd->key.kind == PhaseGlobalActionKind::kPrefill && mConfig.enableGlobalEncoderPrefillAction)
         {
             addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill);
         }
@@ -1174,26 +1264,44 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     if (selected.key.kind == PhaseGlobalActionKind::kEncoder)
     {
+        static_cast<void>(beginGlobalExecutionLease(selected));
         mGlobalEncoderBatchIndices = encoderBatchIndices;
         mInFlightGlobalEncoderKey = encoderKey;
         mInFlightGlobalEncoderReferenceMs = encoderReferenceUs / 1000.0;
         ++mGlobalEncoderSelections;
-        return startNextEncoder();
+        bool const started = startNextEncoder();
+        if (!started)
+        {
+            abandonGlobalExecutionLease();
+            return false;
+        }
+        validateGlobalExecutionLaunch();
+        return true;
     }
     if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
         || selected.key.kind == PhaseGlobalActionKind::kEncoderDecode)
     {
+        PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(selected);
         mGlobalEncoderBatchIndices = encoderBatchIndices;
         mInFlightGlobalEncoderKey = encoderKey;
         mInFlightGlobalEncoderReferenceMs = encoderReferenceUs / 1000.0;
         mPendingGlobalOverlapObservation = PendingGlobalOverlapObservation{
             selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F, 0.0F};
         bool const encoderStarted = startNextEncoder();
-        bool const phaseStarted = encoderStarted && mServer.dispatchGlobalAction(std::move(*pd));
+        bool const phaseStarted = encoderStarted
+            && mServer.dispatchGlobalAction(std::move(*pd), executionPlan.planId, executionPlan.snapshotEpoch);
         if (!encoderStarted || !phaseStarted)
         {
             mPendingGlobalOverlapObservation.reset();
+            if (!encoderStarted)
+            {
+                abandonGlobalExecutionLease();
+                return false;
+            }
+            ++mGlobalActionFidelityViolations;
+            ELLM_CHECK(false, "Global overlap launched only a subset of the selected phases");
         }
+        validateGlobalExecutionLaunch();
         if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill)
         {
             ++mGlobalEncoderPrefillSelections;
@@ -1202,10 +1310,19 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         {
             ++mGlobalEncoderDecodeSelections;
         }
-        return encoderStarted || phaseStarted;
+        return true;
     }
     ++mGlobalPdSelections;
-    return mServer.dispatchGlobalAction(std::move(selected));
+    PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(selected);
+    bool const started
+        = mServer.dispatchGlobalAction(std::move(selected), executionPlan.planId, executionPlan.snapshotEpoch);
+    if (!started)
+    {
+        abandonGlobalExecutionLease();
+        return false;
+    }
+    validateGlobalExecutionLaunch();
+    return true;
 }
 
 void PhaseThreeCoordinator::completeGlobalOverlapObservation()

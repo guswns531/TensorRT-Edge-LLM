@@ -105,6 +105,7 @@ public:
     TensorMap& prefillTensorMap() noexcept;
     TensorMap& decodeTensorMap() noexcept;
     PhaseQueueScheduler& scheduler() noexcept;
+    PhaseQueueScheduler const& scheduler() const noexcept;
     std::vector<PhaseDispatchMetrics> const& metrics() const noexcept;
     //! Enable external metric retention; scheduler telemetry remains active either way.
     void setMetricsCollectionEnabled(bool enabled) noexcept;

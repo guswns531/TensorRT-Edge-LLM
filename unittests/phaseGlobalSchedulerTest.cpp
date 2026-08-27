@@ -125,6 +125,26 @@ TEST(PhaseGlobalSchedulerTest, UsesConstituentReferenceWorkForBatchCompression)
     EXPECT_GT(decision.serviceCompression, 40.0);
 }
 
+TEST(PhaseGlobalSchedulerTest, UsesEqualWorkHorizonForWaitComparison)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate now = candidate(PhaseGlobalActionKind::kDecode, 2000.0, 2000.0, 10000.0);
+    now.predictedMakespanUs = 2000.0;
+    now.predictedHorizonUs = 4100.0;
+    now.horizonReferenceWorkUs = 8000.0;
+    PhaseGlobalActionCandidate wait = candidate(PhaseGlobalActionKind::kWait, 8000.0, 4300.0, 10000.0);
+    wait.predictedMakespanUs = 4300.0;
+    wait.predictedHorizonUs = 4300.0;
+    wait.horizonReferenceWorkUs = 8000.0;
+    wait.concreteWaitEvent = true;
+    wait.waitEventId = 7U;
+
+    PhaseGlobalDecision const decision = scheduler.select({now, wait});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+}
+
 TEST(PhaseGlobalSchedulerTest, RequiresConcreteWaitEvent)
 {
     PhaseGlobalScheduler scheduler;
@@ -179,6 +199,44 @@ TEST(PhaseGlobalSchedulerTest, RejectsUnboundedCandidateExplosion)
     PhaseGlobalScheduler scheduler({2U, 0.0});
     std::vector<PhaseGlobalActionCandidate> candidates(3U, candidate(PhaseGlobalActionKind::kDecode, 1.0, 1.0, 10.0));
     EXPECT_THROW(scheduler.select(candidates), std::runtime_error);
+}
+
+TEST(PhaseGlobalSchedulerTest, MapsActionsToExplicitOutstandingSets)
+{
+    PhaseExecutionSet const encoderDecode = phaseExecutionSetForAction(PhaseGlobalActionKind::kEncoderDecode);
+    EXPECT_TRUE(phaseExecutionSetContains(encoderDecode, PhaseExecutionSet::kEncoder));
+    EXPECT_TRUE(phaseExecutionSetContains(encoderDecode, PhaseExecutionSet::kDecode));
+    EXPECT_FALSE(phaseExecutionSetContains(encoderDecode, PhaseExecutionSet::kPrefill));
+    EXPECT_TRUE(phaseExecutionSetIsSubset(PhaseExecutionSet::kEncoder, encoderDecode));
+    EXPECT_FALSE(phaseExecutionSetIsSubset(PhaseExecutionSet::kPrefill, encoderDecode));
+}
+
+TEST(PhaseGlobalSchedulerTest, MaterializesStableDispatchLease)
+{
+    PhaseGlobalActionCandidate action = candidate(PhaseGlobalActionKind::kPrefillDecode, 2000.0, 1500.0, 10000.0);
+    action.primaryRequestIds = {3U, 1U};
+    action.secondaryRequestIds = {8U, 5U};
+    action.requestIds = {3U, 1U, 8U, 5U};
+    action.candidateId = phaseGlobalCandidateId(action);
+
+    PhaseGlobalDispatchPlan const plan = phaseGlobalDispatchPlan(7U, 11U, action);
+    EXPECT_EQ(plan.planId, 7U);
+    EXPECT_EQ(plan.snapshotEpoch, 11U);
+    EXPECT_EQ(plan.candidateId, action.candidateId);
+    EXPECT_TRUE(plan.launchMatches(PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode));
+    EXPECT_FALSE(plan.permits(PhaseExecutionSet::kEncoder));
+    EXPECT_EQ(plan.primaryRequestIds, action.primaryRequestIds);
+    EXPECT_EQ(plan.secondaryRequestIds, action.secondaryRequestIds);
+}
+
+TEST(PhaseGlobalSchedulerTest, CandidateIdentityPreservesCanonicalRowOrder)
+{
+    PhaseGlobalActionCandidate first = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, 10000.0);
+    first.primaryRequestIds = {1U, 2U, 3U};
+    PhaseGlobalActionCandidate second = first;
+    second.primaryRequestIds = {2U, 1U, 3U};
+    EXPECT_NE(phaseGlobalCandidateId(first), phaseGlobalCandidateId(second));
+    EXPECT_EQ(phaseGlobalCandidateId(first), phaseGlobalCandidateId(first));
 }
 
 TEST(PhaseGlobalCostModelTest, LearnsRobustDirectOverlapEligibility)

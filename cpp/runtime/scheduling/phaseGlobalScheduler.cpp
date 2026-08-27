@@ -35,6 +35,13 @@ bool isOverlap(PhaseGlobalActionKind kind) noexcept
         || kind == PhaseGlobalActionKind::kPrefillDecode;
 }
 
+uint64_t hashCombine(uint64_t seed, uint64_t value) noexcept
+{
+    constexpr uint64_t kHASH_OFFSET = 0x9e3779b97f4a7c15ULL;
+    seed ^= value + kHASH_OFFSET + (seed << 6U) + (seed >> 2U);
+    return seed;
+}
+
 size_t saturatedAdd(size_t left, size_t right) noexcept
 {
     return right > std::numeric_limits<size_t>::max() - left ? std::numeric_limits<size_t>::max() : left + right;
@@ -67,6 +74,16 @@ double actionMakespanUs(PhaseGlobalActionCandidate const& candidate) noexcept
     return std::max(0.0, makespan);
 }
 
+double selectionHorizonUs(PhaseGlobalActionCandidate const& candidate) noexcept
+{
+    return candidate.predictedHorizonUs > 0.0 ? candidate.predictedHorizonUs : actionMakespanUs(candidate);
+}
+
+double selectionReferenceWorkUs(PhaseGlobalActionCandidate const& candidate) noexcept
+{
+    return candidate.horizonReferenceWorkUs > 0.0 ? candidate.horizonReferenceWorkUs : candidate.referenceWorkUs;
+}
+
 double predictedViolationUs(PhaseGlobalActionCandidate const& candidate, double deadlineGuardUs) noexcept
 {
     double violation{};
@@ -93,8 +110,8 @@ double predictedViolationUs(PhaseGlobalActionCandidate const& candidate, double 
 
 double serviceCompression(PhaseGlobalActionCandidate const& candidate) noexcept
 {
-    double const makespan = std::max(actionMakespanUs(candidate), std::numeric_limits<double>::epsilon());
-    return std::max(0.0, candidate.referenceWorkUs) / makespan;
+    double const makespan = std::max(selectionHorizonUs(candidate), std::numeric_limits<double>::epsilon());
+    return std::max(0.0, selectionReferenceWorkUs(candidate)) / makespan;
 }
 
 bool hardFeasible(PhaseGlobalActionCandidate const& candidate) noexcept
@@ -122,11 +139,11 @@ bool dominates(
     double const rightViolation = predictedViolationUs(right, deadlineGuardUs);
     size_t const leftPeak = hardPeakManagedBytes(left.memory);
     size_t const rightPeak = hardPeakManagedBytes(right.memory);
-    bool const noWorse = leftViolation <= rightViolation && actionMakespanUs(left) <= actionMakespanUs(right)
-        && left.referenceWorkUs >= right.referenceWorkUs && leftPeak <= rightPeak
+    bool const noWorse = leftViolation <= rightViolation && selectionHorizonUs(left) <= selectionHorizonUs(right)
+        && selectionReferenceWorkUs(left) >= selectionReferenceWorkUs(right) && leftPeak <= rightPeak
         && left.uncertaintyUs <= right.uncertaintyUs;
-    bool const strictlyBetter = leftViolation < rightViolation || actionMakespanUs(left) < actionMakespanUs(right)
-        || left.referenceWorkUs > right.referenceWorkUs || leftPeak < rightPeak
+    bool const strictlyBetter = leftViolation < rightViolation || selectionHorizonUs(left) < selectionHorizonUs(right)
+        || selectionReferenceWorkUs(left) > selectionReferenceWorkUs(right) || leftPeak < rightPeak
         || left.uncertaintyUs < right.uncertaintyUs;
     return noWorse && strictlyBetter;
 }
@@ -140,6 +157,105 @@ float percentile(std::vector<float> values, float fraction)
 }
 
 } // namespace
+
+PhaseExecutionSet operator|(PhaseExecutionSet left, PhaseExecutionSet right) noexcept
+{
+    return static_cast<PhaseExecutionSet>(static_cast<uint8_t>(left) | static_cast<uint8_t>(right));
+}
+
+PhaseExecutionSet operator&(PhaseExecutionSet left, PhaseExecutionSet right) noexcept
+{
+    return static_cast<PhaseExecutionSet>(static_cast<uint8_t>(left) & static_cast<uint8_t>(right));
+}
+
+bool phaseExecutionSetContains(PhaseExecutionSet set, PhaseExecutionSet phase) noexcept
+{
+    return (set & phase) == phase;
+}
+
+bool phaseExecutionSetIsSubset(PhaseExecutionSet subset, PhaseExecutionSet superset) noexcept
+{
+    return (subset & superset) == subset;
+}
+
+PhaseExecutionSet phaseExecutionSetForAction(PhaseGlobalActionKind kind) noexcept
+{
+    PhaseExecutionSet result{PhaseExecutionSet::kNone};
+    switch (kind)
+    {
+    case PhaseGlobalActionKind::kEncoder: result = PhaseExecutionSet::kEncoder; break;
+    case PhaseGlobalActionKind::kPrefill: result = PhaseExecutionSet::kPrefill; break;
+    case PhaseGlobalActionKind::kDecode: result = PhaseExecutionSet::kDecode; break;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+        result = PhaseExecutionSet::kEncoder | PhaseExecutionSet::kPrefill;
+        break;
+    case PhaseGlobalActionKind::kEncoderDecode:
+        result = PhaseExecutionSet::kEncoder | PhaseExecutionSet::kDecode;
+        break;
+    case PhaseGlobalActionKind::kPrefillDecode:
+        result = PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode;
+        break;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: result = PhaseExecutionSet::kNone; break;
+    }
+    return result;
+}
+
+uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noexcept
+{
+    uint64_t result = static_cast<uint64_t>(candidate.key.kind);
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryBatchSize));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.secondaryBatchSize));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.chunkLength));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryContextBucket));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.secondaryContextBucket));
+    for (uint64_t const requestId : candidate.primaryRequestIds)
+    {
+        result = hashCombine(result, requestId);
+    }
+    result = hashCombine(result, candidate.primaryRequestIds.size());
+    for (uint64_t const requestId : candidate.secondaryRequestIds)
+    {
+        result = hashCombine(result, requestId);
+    }
+    result = hashCombine(result, candidate.secondaryRequestIds.size());
+    result = hashCombine(result, candidate.waitEventId);
+    return result;
+}
+
+void phaseGlobalFinalizeCandidate(PhaseGlobalActionCandidate& candidate)
+{
+    candidate.requestIds = candidate.primaryRequestIds;
+    candidate.requestIds.insert(
+        candidate.requestIds.end(), candidate.secondaryRequestIds.begin(), candidate.secondaryRequestIds.end());
+    candidate.candidateId = phaseGlobalCandidateId(candidate);
+}
+
+bool PhaseGlobalDispatchPlan::permits(PhaseExecutionSet phases) const noexcept
+{
+    return phaseExecutionSetIsSubset(phases, allowedOutstanding);
+}
+
+bool PhaseGlobalDispatchPlan::launchMatches(PhaseExecutionSet phases) const noexcept
+{
+    return phases == launched && permits(phases);
+}
+
+PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
+    uint64_t planId, uint64_t snapshotEpoch, PhaseGlobalActionCandidate const& candidate)
+{
+    PhaseGlobalDispatchPlan result;
+    result.planId = planId;
+    result.snapshotEpoch = snapshotEpoch;
+    result.candidateId = candidate.candidateId != 0U ? candidate.candidateId : phaseGlobalCandidateId(candidate);
+    result.action = candidate.key.kind;
+    result.allowedOutstanding = phaseExecutionSetForAction(candidate.key.kind);
+    result.launched = result.allowedOutstanding;
+    result.waitEventId = candidate.waitEventId;
+    result.primaryRequestIds = candidate.primaryRequestIds;
+    result.secondaryRequestIds = candidate.secondaryRequestIds;
+    return result;
+}
 
 char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept
 {
@@ -321,8 +437,15 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
             lhs.memory.immediateReclaimObserved ? lhs.memory.immediateReclaimBytes : 0U, lhs.memory.nearReclaimBytes);
         size_t const rhsReclaim = saturatedAdd(
             rhs.memory.immediateReclaimObserved ? rhs.memory.immediateReclaimBytes : 0U, rhs.memory.nearReclaimBytes);
-        return std::tie(lhsCompression, lhsReclaim, lhs.requestServiceLagUs)
-            > std::tie(rhsCompression, rhsReclaim, rhs.requestServiceLagUs);
+        auto const lhsRank = std::tie(lhsCompression, lhsReclaim, lhs.requestServiceLagUs);
+        auto const rhsRank = std::tie(rhsCompression, rhsReclaim, rhs.requestServiceLagUs);
+        if (lhsRank != rhsRank)
+        {
+            return lhsRank > rhsRank;
+        }
+        uint64_t const lhsId = lhs.candidateId != 0U ? lhs.candidateId : phaseGlobalCandidateId(lhs);
+        uint64_t const rhsId = rhs.candidateId != 0U ? rhs.candidateId : phaseGlobalCandidateId(rhs);
+        return lhsId < rhsId;
     };
     auto betterViolation = [&](size_t left, size_t right) {
         PhaseGlobalActionCandidate const& lhs = candidates[left];
@@ -337,7 +460,15 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
         {
             return lhs.requestServiceLagUs > rhs.requestServiceLagUs;
         }
-        return serviceCompression(lhs) > serviceCompression(rhs);
+        double const lhsCompression = serviceCompression(lhs);
+        double const rhsCompression = serviceCompression(rhs);
+        if (lhsCompression != rhsCompression)
+        {
+            return lhsCompression > rhsCompression;
+        }
+        uint64_t const lhsId = lhs.candidateId != 0U ? lhs.candidateId : phaseGlobalCandidateId(lhs);
+        uint64_t const rhsId = rhs.candidateId != 0U ? rhs.candidateId : phaseGlobalCandidateId(rhs);
+        return lhsId < rhsId;
     };
 
     size_t selected = pruned.front();

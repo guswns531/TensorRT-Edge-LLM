@@ -204,6 +204,19 @@ bool PhaseDispatchWorker::dispatchNext()
         }
     }
     mCurrentMetrics = PhaseDispatchMetrics{};
+    PhaseExecutionSet launched{PhaseExecutionSet::kNone};
+    if (mHasPrefill)
+    {
+        launched = launched | PhaseExecutionSet::kPrefill;
+    }
+    if (mHasDecode)
+    {
+        launched = launched | PhaseExecutionSet::kDecode;
+    }
+    bool const actionFidelity = !mInFlight.globalDecisionApplied
+        || (phaseExecutionSetIsSubset(launched, mInFlight.globalAllowedOutstanding)
+            && launched == phaseExecutionSetForAction(mInFlight.globalSelectedAction.kind));
+    check::check(actionFidelity, "Global P/D plan does not match the launched phase set");
     mCurrentMetrics.dispatchIndex = mDispatchCount + 1;
     mCurrentMetrics.kind = mInFlight.kind;
     mCurrentMetrics.hostDispatchStartNs = phaseTimelineNowNs();
@@ -254,6 +267,13 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.globalDecisionEvaluated = mInFlight.globalDecisionEvaluated;
     mCurrentMetrics.globalDecisionApplied = mInFlight.globalDecisionApplied;
     mCurrentMetrics.globalSafeProbe = mInFlight.globalSafeProbe;
+    mCurrentMetrics.globalCandidateId = mInFlight.globalCandidateId;
+    mCurrentMetrics.globalCandidateParity = mInFlight.globalCandidateParity;
+    mCurrentMetrics.globalPlanId = mInFlight.globalPlanId;
+    mCurrentMetrics.globalSnapshotEpoch = mInFlight.globalSnapshotEpoch;
+    mCurrentMetrics.globalAllowedOutstanding = mInFlight.globalAllowedOutstanding;
+    mCurrentMetrics.globalLaunched = launched;
+    mCurrentMetrics.globalActionFidelity = actionFidelity;
     mCurrentMetrics.globalSelectedAction = mInFlight.globalSelectedAction;
     mCurrentMetrics.globalDecisionReason = mInFlight.globalDecisionReason;
     mCurrentMetrics.globalPredictedViolationUs = mInFlight.globalPredictedViolationUs;

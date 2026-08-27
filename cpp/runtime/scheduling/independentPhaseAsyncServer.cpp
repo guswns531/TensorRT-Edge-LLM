@@ -778,13 +778,26 @@ std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGl
     return mCoordinator.scheduler().previewGlobalDecodeAction();
 }
 
-bool IndependentPhaseAsyncServer::dispatchGlobalAction(PhaseGlobalActionCandidate candidate)
+PhaseGlobalCostEstimate IndependentPhaseAsyncServer::estimateGlobalPrefillCost(
+    int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const
+{
+    return mCoordinator.scheduler().estimateGlobalPrefillCost(batchSize, chunkLength, pastKVLength, prefillClass);
+}
+
+PhaseGlobalCostEstimate IndependentPhaseAsyncServer::estimateGlobalPrefillDrainCost(
+    int32_t batchSize, int32_t promptTokens, PhasePrefillClass prefillClass) const
+{
+    return mCoordinator.scheduler().estimateGlobalPrefillDrainCost(batchSize, promptTokens, prefillClass);
+}
+
+bool IndependentPhaseAsyncServer::dispatchGlobalAction(
+    PhaseGlobalActionCandidate candidate, uint64_t planId, uint64_t snapshotEpoch)
 {
     if (mCoordinator.busy())
     {
         return false;
     }
-    mCoordinator.scheduler().setNextGlobalAction(std::move(candidate));
+    mCoordinator.scheduler().setNextGlobalAction(std::move(candidate), planId, snapshotEpoch);
     return mCoordinator.dispatchNext();
 }
 

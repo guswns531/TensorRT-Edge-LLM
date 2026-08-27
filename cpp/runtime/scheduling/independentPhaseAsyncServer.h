@@ -350,10 +350,15 @@ public:
     bool dispatchReady();
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    PhaseGlobalCostEstimate estimateGlobalPrefillCost(
+        int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const;
+    PhaseGlobalCostEstimate estimateGlobalPrefillDrainCost(
+        int32_t batchSize, int32_t promptTokens, PhasePrefillClass prefillClass) const;
     //! Apply the bounded completion-aware WAIT/refill decision before an
     //! externally coordinated global P/D dispatch.
     bool shouldWaitForGlobalDecodeRefill();
-    bool dispatchGlobalAction(PhaseGlobalActionCandidate candidate);
+    bool dispatchGlobalAction(
+        PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
     void runUntilIdle(size_t maxPolls);
 
     std::optional<IndependentPhaseServerToken> tryPopToken();

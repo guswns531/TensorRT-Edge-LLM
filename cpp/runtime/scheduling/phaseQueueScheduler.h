@@ -187,6 +187,13 @@ struct PhaseDispatchMetrics
     bool globalDecisionEvaluated{};
     bool globalDecisionApplied{};
     bool globalSafeProbe{};
+    uint64_t globalCandidateId{};
+    bool globalCandidateParity{};
+    uint64_t globalPlanId{};
+    uint64_t globalSnapshotEpoch{};
+    PhaseExecutionSet globalAllowedOutstanding{PhaseExecutionSet::kNone};
+    PhaseExecutionSet globalLaunched{PhaseExecutionSet::kNone};
+    bool globalActionFidelity{};
     PhaseGlobalActionKey globalSelectedAction{};
     PhaseGlobalDecisionReason globalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
     double globalPredictedViolationUs{};
@@ -218,6 +225,8 @@ struct PhaseSchedulerTelemetry
     size_t globalShadowDisagreementCount{};
     size_t globalNoFeasibleDecisionCount{};
     size_t globalSafeProbeCount{};
+    size_t globalCandidateParityViolationCount{};
+    size_t globalActionFidelityViolationCount{};
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
     size_t globalWaitCandidateCount{};
@@ -602,6 +611,12 @@ struct PhaseDispatchPlan
     bool globalDecisionEvaluated{};
     bool globalDecisionApplied{};
     bool globalSafeProbe{};
+    uint64_t globalCandidateId{};
+    bool globalCandidateParity{};
+    uint64_t globalPlanId{};
+    uint64_t globalSnapshotEpoch{};
+    PhaseExecutionSet globalAllowedOutstanding{PhaseExecutionSet::kNone};
+    bool globalActionFidelity{};
     PhaseGlobalActionKey globalSelectedAction{};
     PhaseGlobalDecisionReason globalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
     double globalPredictedViolationUs{};
@@ -656,8 +671,17 @@ public:
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
     //! Preview decode only while an external encoder is already in flight.
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    //! Robust cost for a future prefill that has not entered the queue yet.
+    //! This lets an upstream encoder protect the complete E->P first-token path
+    //! without a workload label or a separate offline-only policy.
+    PhaseGlobalCostEstimate estimateGlobalPrefillCost(
+        int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const;
+    //! Sum the robust per-turn costs required to reach the first decode token.
+    PhaseGlobalCostEstimate estimateGlobalPrefillDrainCost(
+        int32_t batchSize, int32_t promptTokens, PhasePrefillClass prefillClass) const;
     //! Consume one externally selected P/D action at the next dispatch boundary.
-    void setNextGlobalAction(PhaseGlobalActionCandidate candidate);
+    void setNextGlobalAction(
+        PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
     void setGlobalMemoryHorizonSupplier(
         std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
             supplier);
@@ -690,6 +714,7 @@ private:
 
     std::optional<GlobalQueueSelection> selectGlobalQueueAction(PhaseQueueSnapshot const& snapshot,
         bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true);
+    PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(
@@ -751,8 +776,11 @@ private:
     bool mDispatchBlocked{};
     bool mExternalEncoderActive{};
     size_t mGlobalDecisionSequence{};
+    uint64_t mGlobalPlanSequence{};
+    uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
     std::optional<PhaseGlobalActionCandidate> mNextGlobalAction;
+    std::optional<PhaseGlobalDispatchPlan> mNextGlobalDispatchPlan;
 };
 
 } // namespace rt

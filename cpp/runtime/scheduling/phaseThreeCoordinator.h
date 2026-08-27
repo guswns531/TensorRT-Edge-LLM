@@ -97,6 +97,8 @@ struct PhaseThreeCoordinatorConfig
     int32_t globalDecodeContextBucketTokens{512};
     std::vector<PhaseEncoderPrefillBatchCost> globalEncoderPrefillCosts;
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
+    //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
+    bool enableGlobalEncoderPrefillAction{};
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
     //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
@@ -274,6 +276,11 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalEncoderDecodeSelections{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
+    size_t globalActionFidelityViolations{};
+    double lastGlobalFirstTokenCriticalPathUs{};
+    uint64_t activeGlobalPlanId{};
+    PhaseExecutionSet globalPlannedOutstanding{PhaseExecutionSet::kNone};
+    PhaseExecutionSet globalObservedOutstanding{PhaseExecutionSet::kNone};
     PhaseGlobalActionKind lastGlobalAction{PhaseGlobalActionKind::kNone};
 };
 
@@ -439,6 +446,11 @@ private:
 
     bool startNextEncoder();
     bool dispatchGlobalAction();
+    PhaseExecutionSet observedGlobalExecution() const noexcept;
+    void refreshGlobalExecutionLease();
+    PhaseGlobalDispatchPlan beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate);
+    void validateGlobalExecutionLaunch();
+    void abandonGlobalExecutionLease() noexcept;
     void completeGlobalOverlapObservation();
     bool completeEncoder();
     bool completeEncoderPreparation();
@@ -485,6 +497,7 @@ private:
         float phaseGpuMs{};
     };
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
+    std::optional<PhaseGlobalDispatchPlan> mGlobalExecutionLease;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
     size_t mEstimatedEncodedBytes{};
@@ -570,8 +583,12 @@ private:
     size_t mGlobalEncoderDecodeSelections{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
+    size_t mGlobalActionFidelityViolations{};
+    double mLastGlobalFirstTokenCriticalPathUs{};
     PhaseGlobalActionKind mLastGlobalAction{PhaseGlobalActionKind::kNone};
     size_t mGlobalDecisionSequence{};
+    uint64_t mGlobalPlanSequence{};
+    uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
 };
 

@@ -42,6 +42,21 @@ enum class PhaseGlobalActionKind
     kWait,
 };
 
+//! Independently outstanding TensorRT phase contexts represented as a bit set.
+enum class PhaseExecutionSet : uint8_t
+{
+    kNone = 0U,
+    kEncoder = 1U,
+    kPrefill = 2U,
+    kDecode = 4U,
+};
+
+PhaseExecutionSet operator|(PhaseExecutionSet left, PhaseExecutionSet right) noexcept;
+PhaseExecutionSet operator&(PhaseExecutionSet left, PhaseExecutionSet right) noexcept;
+bool phaseExecutionSetContains(PhaseExecutionSet set, PhaseExecutionSet phase) noexcept;
+bool phaseExecutionSetIsSubset(PhaseExecutionSet subset, PhaseExecutionSet superset) noexcept;
+PhaseExecutionSet phaseExecutionSetForAction(PhaseGlobalActionKind kind) noexcept;
+
 //! Staged activation keeps legacy serving behavior available while a global
 //! decision stream is validated against the same live queue snapshots.
 enum class PhaseGlobalSchedulerMode
@@ -147,7 +162,12 @@ struct PhaseProtectedCompletion
 //! A phase-local candidate after compatibility batching but before global selection.
 struct PhaseGlobalActionCandidate
 {
+    //! Stable identity derived from the action shape and ordered request rows.
+    uint64_t candidateId{};
     PhaseGlobalActionKey key;
+    //! Primary and secondary row vectors retain phase-local canonical order.
+    std::vector<uint64_t> primaryRequestIds;
+    std::vector<uint64_t> secondaryRequestIds;
     std::vector<uint64_t> requestIds;
     //! Invariant results supplied by mechanism-only components.
     bool dependencySafe{true};
@@ -167,11 +187,47 @@ struct PhaseGlobalActionCandidate
     double uncertaintyUs{};
     //! GPU makespan of this action only. Zero falls back to predictedBlockingUs.
     double predictedMakespanUs{};
+    //! Bounded decision-horizon cost. WAIT comparisons use the same future work
+    //! on both NOW and WAIT alternatives so dispatching work now is not treated
+    //! as if it left no residual work. Zero falls back to the action makespan.
+    double predictedHorizonUs{};
     std::vector<PhaseProtectedCompletion> protectedCompletions;
     double referenceWorkUs{};
+    //! Reference work covered by predictedHorizonUs. Zero falls back to
+    //! referenceWorkUs and therefore preserves ordinary one-action selection.
+    double horizonReferenceWorkUs{};
     double requestServiceLagUs{};
     PhaseActionMemoryHorizon memory;
 };
+
+//! Return a deterministic identity without changing phase-local row order.
+uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noexcept;
+
+//! Rebuild the aggregate ownership vector and stable identity after phase-local
+//! row vectors have been finalized.
+void phaseGlobalFinalizeCandidate(PhaseGlobalActionCandidate& candidate);
+
+//! An execution lease remains authoritative until its launched phases complete
+//! or a newer snapshot explicitly replaces it before enqueue.
+struct PhaseGlobalDispatchPlan
+{
+    uint64_t planId{};
+    uint64_t snapshotEpoch{};
+    uint64_t candidateId{};
+    PhaseGlobalActionKind action{PhaseGlobalActionKind::kNone};
+    PhaseExecutionSet allowedOutstanding{PhaseExecutionSet::kNone};
+    PhaseExecutionSet launched{PhaseExecutionSet::kNone};
+    uint64_t waitEventId{};
+    std::vector<uint64_t> primaryRequestIds;
+    std::vector<uint64_t> secondaryRequestIds;
+
+    bool permits(PhaseExecutionSet phases) const noexcept;
+    bool launchMatches(PhaseExecutionSet phases) const noexcept;
+};
+
+//! Materialize one selected candidate into an explicit execution lease.
+PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
+    uint64_t planId, uint64_t snapshotEpoch, PhaseGlobalActionCandidate const& candidate);
 
 enum class PhaseGlobalDecisionReason
 {
