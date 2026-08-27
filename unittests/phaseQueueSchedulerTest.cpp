@@ -154,6 +154,26 @@ TEST(PhaseQueueSchedulerTest, RejectsStaleExternalGlobalPlanEpoch)
     EXPECT_THROW(scheduler.setNextGlobalAction(*candidate, 11U, 20U), std::runtime_error);
 }
 
+TEST(PhaseQueueSchedulerTest, AcceptsCoordinatorPlanNamespaceAfterLocalWarmup)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    PhaseDispatchPlan const warmup = scheduler.next();
+    scheduler.completeDecode(warmup.decodeBatch.front(), 129, true);
+
+    scheduler.enqueueDecode({2, 128});
+    std::optional<PhaseGlobalActionCandidate> candidate = scheduler.previewGlobalDecodeAction();
+    ASSERT_TRUE(candidate.has_value());
+    constexpr uint64_t kCoordinatorNamespace = uint64_t{1U} << 63U;
+    scheduler.setNextGlobalAction(*candidate, kCoordinatorNamespace | 1U, kCoordinatorNamespace | 1U);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.globalPlanId, kCoordinatorNamespace | 1U);
+    EXPECT_EQ(plan.globalSnapshotEpoch, kCoordinatorNamespace | 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
 {
     PhaseQueueSchedulerConfig config;

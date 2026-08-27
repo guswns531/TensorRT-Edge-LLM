@@ -31,6 +31,10 @@ namespace trt_edgellm::rt
 {
 namespace
 {
+
+//! Keep coordinator-owned E/P/D leases disjoint from P/D-only plans created
+//! during engine warmup or standalone server operation.
+constexpr uint64_t kTHREE_PHASE_PLAN_NAMESPACE = uint64_t{1U} << 63U;
 class ScopedCudaContext
 {
 public:
@@ -961,8 +965,8 @@ PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(
     PhaseGlobalActionCandidate const& candidate)
 {
     ELLM_CHECK(!mGlobalExecutionLease.has_value(), "A global execution lease is already active");
-    PhaseGlobalDispatchPlan plan
-        = phaseGlobalDispatchPlan(++mGlobalPlanSequence, ++mGlobalSnapshotEpoch, candidate);
+    PhaseGlobalDispatchPlan plan = phaseGlobalDispatchPlan(kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence,
+        kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch, candidate);
     ELLM_CHECK(plan.allowedOutstanding != PhaseExecutionSet::kNone, "A dispatch lease requires executable phases");
     mGlobalExecutionLease = plan;
     return plan;
