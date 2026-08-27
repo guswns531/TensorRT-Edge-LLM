@@ -490,6 +490,68 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimate(PhaseGloba
         found->second.values.size(), percentile(reference, 0.5F), median, p95, std::max(p95 - median, sampleMargin)};
 }
 
+std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolatedPrimaryBatch(
+    PhaseGlobalActionKey const& key) const
+{
+    if (std::optional<PhaseGlobalCostEstimate> const direct = estimate(key))
+    {
+        return direct;
+    }
+    PhaseGlobalActionKey const target = phaseGlobalCanonicalOverlapCostKey(key);
+    std::optional<std::pair<PhaseGlobalActionKey, PhaseGlobalCostEstimate>> lower;
+    std::optional<std::pair<PhaseGlobalActionKey, PhaseGlobalCostEstimate>> upper;
+    for (auto const& [observedKey, samples] : mSamples)
+    {
+        if (samples.values.empty() || observedKey.kind != target.kind
+            || observedKey.secondaryBatchSize != target.secondaryBatchSize
+            || observedKey.chunkLength != target.chunkLength
+            || observedKey.primaryContextBucket != target.primaryContextBucket
+            || observedKey.secondaryContextBucket != target.secondaryContextBucket
+            || observedKey.executionVariant != target.executionVariant
+            || observedKey.residualAugmentation != target.residualAugmentation)
+        {
+            continue;
+        }
+        std::optional<PhaseGlobalCostEstimate> const observed = estimate(observedKey);
+        if (!observed.has_value())
+        {
+            continue;
+        }
+        if (observedKey.primaryBatchSize < target.primaryBatchSize
+            && (!lower.has_value() || observedKey.primaryBatchSize > lower->first.primaryBatchSize))
+        {
+            lower = std::make_pair(observedKey, *observed);
+        }
+        if (observedKey.primaryBatchSize > target.primaryBatchSize
+            && (!upper.has_value() || observedKey.primaryBatchSize < upper->first.primaryBatchSize))
+        {
+            upper = std::make_pair(observedKey, *observed);
+        }
+    }
+    if (!lower.has_value() || !upper.has_value())
+    {
+        return std::nullopt;
+    }
+
+    float const batchSpan = static_cast<float>(upper->first.primaryBatchSize - lower->first.primaryBatchSize);
+    float const alpha = static_cast<float>(target.primaryBatchSize - lower->first.primaryBatchSize) / batchSpan;
+    auto interpolate = [alpha](float lowerValue, float upperValue) {
+        return lowerValue + alpha * (upperValue - lowerValue);
+    };
+    PhaseGlobalCostEstimate result;
+    result.sampleCount = std::min(lower->second.sampleCount, upper->second.sampleCount);
+    result.referenceWorkMedianMs
+        = interpolate(lower->second.referenceWorkMedianMs, upper->second.referenceWorkMedianMs);
+    result.makespanMedianMs = interpolate(lower->second.makespanMedianMs, upper->second.makespanMedianMs);
+    float const interpolatedP95 = interpolate(lower->second.makespanP95Ms, upper->second.makespanP95Ms);
+    float const endpointUncertainty = std::max(lower->second.uncertaintyMs, upper->second.uncertaintyMs);
+    float const interpolationUncertainty
+        = std::abs(upper->second.makespanMedianMs - lower->second.makespanMedianMs) * alpha * (1.0F - alpha);
+    result.uncertaintyMs = endpointUncertainty + interpolationUncertainty;
+    result.makespanP95Ms = std::max(interpolatedP95, result.makespanMedianMs + result.uncertaintyMs);
+    return result;
+}
+
 bool PhaseGlobalCostModel::overlapEligible(PhaseGlobalActionKey const& key) const
 {
     return !isOverlap(key.kind) || overlapDiagnostic(key).status == PhaseGlobalOverlapCostStatus::kEligible;

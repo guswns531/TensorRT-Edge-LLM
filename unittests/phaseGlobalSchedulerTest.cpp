@@ -418,6 +418,33 @@ TEST(PhaseGlobalCostModelTest, SeparatesEagerAndGraphReplaySamples)
     EXPECT_NE(phaseGlobalCandidateId(eagerCandidate), phaseGlobalCandidateId(graphCandidate));
 }
 
+TEST(PhaseGlobalCostModelTest, InterpolatesOnlyBetweenCompatibleObservedBatchSizes)
+{
+    PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
+    PhaseGlobalActionKey lower{PhaseGlobalActionKind::kPrefill, 1, 0, 128, 0, 0};
+    PhaseGlobalActionKey upper = lower;
+    upper.primaryBatchSize = 3;
+    model.observe(lower, {10.0F, 10.0F});
+    model.observe(upper, {24.0F, 12.0F});
+
+    PhaseGlobalActionKey middle = lower;
+    middle.primaryBatchSize = 2;
+    std::optional<PhaseGlobalCostEstimate> const estimate = model.estimateInterpolatedPrimaryBatch(middle);
+
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->referenceWorkMedianMs, 17.0F);
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 11.0F);
+    EXPECT_FLOAT_EQ(estimate->uncertaintyMs, 0.5F);
+    EXPECT_FLOAT_EQ(estimate->makespanP95Ms, 11.5F);
+
+    PhaseGlobalActionKey outside = upper;
+    outside.primaryBatchSize = 4;
+    EXPECT_FALSE(model.estimateInterpolatedPrimaryBatch(outside).has_value());
+    PhaseGlobalActionKey differentChunk = middle;
+    differentChunk.chunkLength = 64;
+    EXPECT_FALSE(model.estimateInterpolatedPrimaryBatch(differentChunk).has_value());
+}
+
 TEST(PhaseGlobalCostModelTest, SharesOverlapSamplesWithinConservativeShapeBuckets)
 {
     PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});

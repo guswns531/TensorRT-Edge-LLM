@@ -308,19 +308,50 @@ TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillForma
         {1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
     config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
     PhaseQueueScheduler scheduler(config);
-    scheduler.setPendingPrefillProducerRows(1U);
+    scheduler.setPendingPrefillProducerRows(1U, 0U, 2000.0, 500.0, 7U);
     scheduler.enqueuePrefill({1, 128});
     scheduler.enqueueDecode({2, 128});
 
     EXPECT_EQ(scheduler.queueSnapshot().prefillPendingProducerRows, 1U);
+    EXPECT_EQ(scheduler.queueSnapshot().prefillPendingTextProducerRows, 1U);
+    EXPECT_DOUBLE_EQ(scheduler.queueSnapshot().prefillProducerReadyWaitUs, 2000.0);
+    EXPECT_EQ(scheduler.queueSnapshot().prefillProducerReadyEventId, 7U);
     std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
 
     ASSERT_TRUE(candidate.has_value());
     EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kDecode);
-    EXPECT_NEAR(candidate->predictedHorizonUs, 12000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 13000.0, 1.0e-3);
     EXPECT_NEAR(candidate->horizonReferenceWorkUs, 21000.0, 1.0e-3);
     EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 1U);
     EXPECT_EQ(scheduler.telemetry().globalPrefillFormationDecodeSelectionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationProducerSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationCombinedCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationResidualCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationMaxPendingRows, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPrefillFormationRequiresCompatibleProducerClass)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {
+        {1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setPendingPrefillProducerRows(0U, 1U, 100.0, 10.0, 9U);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationProducerSnapshotCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 0U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDoesNotSpeculateOnUnmeasuredPrefillFormation)
@@ -346,6 +377,9 @@ TEST(PhaseQueueSchedulerTest, GlobalDoesNotSpeculateOnUnmeasuredPrefillFormation
     EXPECT_NEAR(candidate->horizonReferenceWorkUs, 11000.0, 1.0e-3);
     EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 0U);
     EXPECT_EQ(scheduler.telemetry().globalPrefillFormationDecodeSelectionCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationProducerSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationCombinedCostHitCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationResidualCostHitCount, 1U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)

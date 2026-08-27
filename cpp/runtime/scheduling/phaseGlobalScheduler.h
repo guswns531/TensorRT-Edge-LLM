@@ -179,6 +179,10 @@ public:
 
     void observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation);
     std::optional<PhaseGlobalCostEstimate> estimate(PhaseGlobalActionKey const& key) const;
+    //! Interpolate a missing primary batch size only when direct observations
+    //! with otherwise identical execution keys bracket it on both sides.
+    std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(
+        PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
     bool overlapEligible(PhaseGlobalActionKey const& key) const;
     void reset();

@@ -734,7 +734,97 @@ bool IndependentPhaseAsyncServer::pollCompletions()
 bool IndependentPhaseAsyncServer::dispatchReady()
 {
     bool progressed{};
-    mCoordinator.scheduler().setPendingPrefillProducerRows(mExternalPendingRequests + mPendingAdapterRequests);
+    size_t producerTextRows{};
+    size_t producerExternalRows{};
+    double producerWaitUs{};
+    double producerUncertaintyUs{};
+    uint64_t producerEventId{};
+    // Only a length-certain decode completion can turn an admission-waiting
+    // request into a concrete future P row. Adapter backlog and possible EOS
+    // completions are intentionally excluded. Prefix sharing and incremental
+    // page reservation require a refcount/reservation-aware forecast, so this
+    // first implementation remains disabled for those mechanisms.
+    if (!mPendingRequests.empty() && !mConfig.enablePrefixReuse
+        && mConfig.pageReservationMode == IndependentPhasePageReservationMode::kFull)
+    {
+        std::vector<double> ordered(mSamplingLatencyUs.begin(), mSamplingLatencyUs.end());
+        std::sort(ordered.begin(), ordered.end());
+        double samplingMedianUs = mConfig.globalSamplingColdStartUs;
+        double samplingP95Us = mConfig.globalSamplingColdStartUs * 2.0;
+        if (!ordered.empty())
+        {
+            samplingMedianUs = ordered[(ordered.size() - 1U) / 2U];
+            size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1U;
+            samplingP95Us = ordered[std::min(p95Index, ordered.size() - 1U)];
+        }
+        auto const now = std::chrono::steady_clock::now();
+        for (auto const& ticket : mSamplingTickets)
+        {
+            std::vector<int32_t> completingSlots;
+            for (uint64_t const requestId : ticket->requestIds)
+            {
+                auto const request = mRequests.find(requestId);
+                if (request != mRequests.end()
+                    && request->second.generatedTokens.size() + 1U
+                        >= static_cast<size_t>(request->second.maxOutputTokens))
+                {
+                    completingSlots.push_back(request->second.kvSlotId);
+                }
+            }
+            double const ageUs = ticket->submittedAt == std::chrono::steady_clock::time_point{}
+                ? 0.0
+                : std::chrono::duration<double, std::micro>(now - ticket->submittedAt).count();
+            producerWaitUs = std::max(producerWaitUs, std::max(0.0, samplingMedianUs - ageUs));
+            double const producerP95Us = std::max(producerWaitUs, samplingP95Us - ageUs);
+            producerUncertaintyUs = std::max(producerUncertaintyUs, producerP95Us - producerWaitUs);
+            if (completingSlots.empty())
+            {
+                continue;
+            }
+
+            size_t const activeAfterCompletion = mRequests.size() - completingSlots.size();
+            size_t const admissionCapacity
+                = admissionLimit() > activeAfterCompletion ? admissionLimit() - activeAfterCompletion : 0U;
+            size_t const physicalCapacity = static_cast<size_t>(mOwnership.availableSlots()) + completingSlots.size();
+            size_t remainingRows = std::min({mPendingRequests.size(), admissionCapacity, physicalCapacity});
+            int32_t availablePages = mOwnership.availablePages();
+            for (int32_t const slot : completingSlots)
+            {
+                availablePages += static_cast<int32_t>(mOwnership.pages(slot).size());
+            }
+            int32_t const tokensPerPage = mOwnership.config().tokensPerPage;
+            for (PendingRequest const& request : mPendingRequests)
+            {
+                if (remainingRows == 0U)
+                {
+                    break;
+                }
+                int32_t const maxOutputTokens
+                    = request.maxOutputTokens > 0 ? request.maxOutputTokens : mConfig.defaultMaxOutputTokens;
+                int32_t const requestedTokens
+                    = static_cast<int32_t>(request.promptTokens.size()) + maxOutputTokens;
+                int32_t const requestedPages = (requestedTokens + tokensPerPage - 1) / tokensPerPage;
+                if (requestedPages > availablePages)
+                {
+                    break;
+                }
+                availablePages -= requestedPages;
+                if (request.visionPayload == nullptr)
+                {
+                    ++producerTextRows;
+                }
+                else
+                {
+                    ++producerExternalRows;
+                }
+                --remainingRows;
+            }
+            producerEventId = ticket->sequenceId;
+            break;
+        }
+    }
+    mCoordinator.scheduler().setPendingPrefillProducerRows(
+        producerTextRows, producerExternalRows, producerWaitUs, producerUncertaintyUs, producerEventId);
     bool const waitForDecodeRefill = shouldWaitForGlobalDecodeRefill();
     if (waitForDecodeRefill)
     {

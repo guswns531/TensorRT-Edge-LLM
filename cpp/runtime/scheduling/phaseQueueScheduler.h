@@ -230,6 +230,10 @@ struct PhaseSchedulerTelemetry
     size_t globalActionFidelityViolationCount{};
     size_t globalPrefillFormationOpportunityCount{};
     size_t globalPrefillFormationDecodeSelectionCount{};
+    size_t globalPrefillFormationProducerSnapshotCount{};
+    size_t globalPrefillFormationCombinedCostHitCount{};
+    size_t globalPrefillFormationResidualCostHitCount{};
+    size_t globalPrefillFormationMaxPendingRows{};
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
     size_t globalWaitCandidateCount{};
@@ -255,6 +259,12 @@ struct PhaseQueueSnapshot
     //! Requests already known to the serving facade whose host-side producer
     //! may make another prefill row ready after the current GPU action.
     size_t prefillPendingProducerRows{};
+    size_t prefillPendingTextProducerRows{};
+    size_t prefillPendingExternalProducerRows{};
+    double prefillProducerReadyWaitUs{};
+    double prefillProducerReadyUncertaintyUs{};
+    uint64_t prefillProducerReadyEventId{};
+    bool prefillProducerRowsClassified{};
     size_t decodeQueued{};
     int32_t prefillCandidateTokens{};
     int64_t prefillRemainingTokens{};
@@ -722,6 +732,9 @@ public:
     //! Publish known host-side producers so Global can price a bounded
     //! D-first prefill-formation opportunity without a workload label.
     void setPendingPrefillProducerRows(size_t rows) noexcept;
+    //! Publish only producer rows unlocked by one concrete completion event.
+    void setPendingPrefillProducerRows(size_t textRows, size_t externalRows, double predictedWaitUs,
+        double waitUncertaintyUs, uint64_t eventId) noexcept;
     //! Reset learned scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
@@ -810,6 +823,12 @@ private:
     bool mDispatchBlocked{};
     bool mExternalEncoderActive{};
     size_t mPendingPrefillProducerRows{};
+    size_t mPendingTextPrefillProducerRows{};
+    size_t mPendingExternalPrefillProducerRows{};
+    double mPendingPrefillProducerWaitUs{};
+    double mPendingPrefillProducerUncertaintyUs{};
+    uint64_t mPendingPrefillProducerEventId{};
+    bool mPendingPrefillProducerRowsClassified{};
     size_t mGlobalDecisionSequence{};
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};
