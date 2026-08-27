@@ -713,7 +713,10 @@ public:
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
     //! cannot invalidate fairness or overlap debt for active requests.
-    void resetHistory();
+    //! Reset queue-policy history between serving epochs. Shape warmup may
+    //! preserve direct Global CUDA observations while still clearing request
+    //! age, fairness, and admission state.
+    void resetHistory(bool preserveGlobalCostModel = false);
 
 private:
     struct GlobalQueueSelection

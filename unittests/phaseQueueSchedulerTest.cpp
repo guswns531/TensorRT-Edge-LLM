@@ -267,6 +267,28 @@ TEST(PhaseQueueSchedulerTest, GlobalDeadlineProtectsCompleteRemainingPrefillPath
     EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefill);
 }
 
+TEST(PhaseQueueSchedulerTest, ServingEpochResetCanPreserveGlobalWarmupCosts)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kPrefill;
+    sample.prefillClass = PhasePrefillClass::kText;
+    sample.prefillBatchSize = 1;
+    sample.prefillTokens = 128;
+    sample.prefillPaddedTokens = 128;
+    sample.prefillGpuMs = 3.0F;
+    sample.makespanGpuMs = 3.0F;
+    scheduler.observeMetrics(sample);
+
+    ASSERT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
+    scheduler.resetHistory(true);
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
+    scheduler.resetHistory();
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 0U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)
 {
     PhaseQueueSchedulerConfig config;

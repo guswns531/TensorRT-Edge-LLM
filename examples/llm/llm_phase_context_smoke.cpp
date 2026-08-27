@@ -1807,7 +1807,8 @@ int main(int argc, char** argv)
                 "Phase IPC shape warmup did not release every stable slot");
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
-            semanticCoordinator.scheduler().resetHistory();
+            semanticCoordinator.scheduler().resetHistory(
+                semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive);
             if (serverConfig.enableCudaGraphs && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") == nullptr)
             {
                 // Retain the primed graph cache, but do not synchronously capture

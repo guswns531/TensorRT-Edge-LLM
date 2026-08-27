@@ -3051,14 +3051,17 @@ void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference prefer
     mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
 }
 
-void PhaseQueueScheduler::resetHistory()
+void PhaseQueueScheduler::resetHistory(bool preserveGlobalCostModel)
 {
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Scheduling history can only be reset while the scheduler is idle");
     mTelemetry = {};
     mRecentDecodeTpotUs.clear();
     mOnlineDecodeGpuMs.clear();
-    mGlobalCostModel.reset();
+    if (!preserveGlobalCostModel)
+    {
+        mGlobalCostModel.reset();
+    }
     mLatencySafeFallback = false;
     mConsecutiveDecodeBatches = 0;
     mConsecutiveOverlapBatches = 0;
