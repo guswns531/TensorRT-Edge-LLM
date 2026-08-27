@@ -1328,6 +1328,10 @@ int main(int argc, char** argv)
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_MIN_SAMPLES"))
+        {
+            semanticSchedulerConfig.globalCostModelConfig.overlapMinSamples = static_cast<size_t>(std::stoull(value));
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_DECODE_ROW_REPLACEMENT_COST_MS"))
         {
             semanticSchedulerConfig.decodeRowReplacementCostMs = std::stof(value);
@@ -1976,6 +1980,10 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.globalSafeProbeInterval = static_cast<size_t>(std::stoull(value));
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_MIN_SAMPLES"))
+                {
+                    threePhaseConfig.globalCostModelConfig.overlapMinSamples = static_cast<size_t>(std::stoull(value));
+                }
                 threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
                 {
@@ -2096,6 +2104,12 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS"))
                 {
                     threePhaseConfig.encodedCapacityDecodeTpotTargetUs = std::stod(value) * 1000.0;
+                }
+                else if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
+                {
+                    // The global queue scheduler and residual E+D protection
+                    // must use the same profile-free decode service target.
+                    threePhaseConfig.encodedCapacityDecodeTpotTargetUs = std::stod(value);
                 }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODED_CAPACITY_DWELL_MS"))
                 {
@@ -2526,6 +2540,14 @@ int main(int argc, char** argv)
                         emitEvent({{"type", "control"}, {"request_index", requestId},
                             {"calibration", calibrationAction}, {"epoch", measurementEpoch},
                             {"encoder_prefill_probes", calibrationMetrics.globalEncoderPrefillSelections},
+                            {"residual_augmentation_opportunities",
+                                calibrationMetrics.globalResidualAugmentationOpportunities},
+                            {"residual_encoder_prefill_selections",
+                                calibrationMetrics.globalResidualEncoderPrefillSelections},
+                            {"residual_encoder_decode_selections",
+                                calibrationMetrics.globalResidualEncoderDecodeSelections},
+                            {"residual_unknown_cost_rejects",
+                                calibrationMetrics.globalResidualAugmentationUnknownCostRejects},
                             {"encoder_decode_probes", calibrationMetrics.globalEncoderDecodeSelections},
                             {"encoder_safe_probes", calibrationMetrics.globalSafeProbes},
                             {"warmup_decisions", calibrationMetrics.globalWarmupDecisions},
@@ -2783,9 +2805,22 @@ int main(int argc, char** argv)
                         {"vision_global_shadow_disagreements", visionMetrics.globalShadowDisagreements},
                         {"vision_global_encoder_selections", visionMetrics.globalEncoderSelections},
                         {"vision_global_encoder_prefill_selections", visionMetrics.globalEncoderPrefillSelections},
+                        {"vision_global_residual_augmentation_opportunities",
+                            visionMetrics.globalResidualAugmentationOpportunities},
+                        {"vision_global_residual_encoder_prefill_selections",
+                            visionMetrics.globalResidualEncoderPrefillSelections},
+                        {"vision_global_residual_encoder_decode_selections",
+                            visionMetrics.globalResidualEncoderDecodeSelections},
+                        {"vision_global_residual_unknown_cost_rejects",
+                            visionMetrics.globalResidualAugmentationUnknownCostRejects},
                         {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
+                        {"vision_global_action_fidelity_violations", visionMetrics.globalActionFidelityViolations},
+                        {"vision_global_planned_outstanding",
+                            static_cast<uint8_t>(visionMetrics.globalPlannedOutstanding)},
+                        {"vision_global_observed_outstanding",
+                            static_cast<uint8_t>(visionMetrics.globalObservedOutstanding)},
                         {"vision_global_action", rt::phaseGlobalActionKindName(visionMetrics.lastGlobalAction)},
                         {"phase_memory_broker_decisions", visionMetrics.memoryBrokerDecisions},
                         {"phase_memory_encoder_reductions", visionMetrics.memoryBrokerEncoderReductions},

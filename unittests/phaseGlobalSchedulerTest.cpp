@@ -239,6 +239,101 @@ TEST(PhaseGlobalSchedulerTest, MaterializesStableDispatchLease)
     EXPECT_EQ(plan.secondaryRequestIds, action.secondaryRequestIds);
 }
 
+TEST(PhaseGlobalSchedulerTest, ComputesRobustResidualWithoutChangingRows)
+{
+    PhaseGlobalActionCandidate action = candidate(PhaseGlobalActionKind::kDecode, 8000.0, 6000.0, 10000.0);
+    action.predictedMakespanUs = 6000.0;
+    action.uncertaintyUs = 1000.0;
+    action.primaryRequestIds = {3U, 1U};
+    action.primaryStableSlotIds = {4, 2};
+    action.protectedCompletions = {{9000.0, 8000.0, 1000.0}};
+    phaseGlobalFinalizeCandidate(action);
+
+    PhaseGlobalActionCandidate const residual = phaseGlobalResidualCandidate(action, 2500.0);
+
+    EXPECT_DOUBLE_EQ(residual.predictedMakespanUs, 3500.0);
+    EXPECT_DOUBLE_EQ(residual.uncertaintyUs, 1000.0);
+    EXPECT_DOUBLE_EQ(residual.referenceWorkUs, 8000.0 * 4500.0 / 7000.0);
+    ASSERT_EQ(residual.protectedCompletions.size(), 1U);
+    EXPECT_DOUBLE_EQ(residual.protectedCompletions.front().predictedCompletionUs, 5500.0);
+    EXPECT_EQ(residual.primaryRequestIds, action.primaryRequestIds);
+    EXPECT_EQ(residual.primaryStableSlotIds, action.primaryStableSlotIds);
+}
+
+TEST(PhaseGlobalSchedulerTest, UpgradesOnlySinglePdLeaseToMatchingEncoderOverlap)
+{
+    PhaseGlobalActionCandidate decode = candidate(PhaseGlobalActionKind::kDecode, 8000.0, 6000.0, 10000.0);
+    decode.primaryRequestIds = {9U, 5U};
+    decode.primaryStableSlotIds = {3, 1};
+    phaseGlobalFinalizeCandidate(decode);
+    PhaseGlobalDispatchPlan const active = phaseGlobalDispatchPlan(4U, 7U, decode);
+
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kEncoderDecode, 18000.0, 9000.0, 10000.0);
+    overlap.primaryRequestIds = {20U};
+    overlap.secondaryRequestIds = decode.primaryRequestIds;
+    overlap.secondaryStableSlotIds = decode.primaryStableSlotIds;
+    phaseGlobalFinalizeCandidate(overlap);
+
+    std::optional<PhaseGlobalDispatchPlan> const upgraded = phaseGlobalAugmentedDispatchPlan(5U, 8U, active, overlap);
+    ASSERT_TRUE(upgraded.has_value());
+    EXPECT_EQ(upgraded->action, PhaseGlobalActionKind::kEncoderDecode);
+    EXPECT_TRUE(upgraded->launchMatches(PhaseExecutionSet::kEncoder | PhaseExecutionSet::kDecode));
+    EXPECT_FALSE(upgraded->permits(PhaseExecutionSet::kPrefill));
+
+    overlap.key.kind = PhaseGlobalActionKind::kEncoderPrefill;
+    phaseGlobalFinalizeCandidate(overlap);
+    EXPECT_FALSE(phaseGlobalAugmentedDispatchPlan(6U, 9U, active, overlap).has_value());
+}
+
+TEST(PhaseGlobalSchedulerTest, RejectsTriplePhaseLeaseAugmentation)
+{
+    PhaseGlobalActionCandidate pd = candidate(PhaseGlobalActionKind::kPrefillDecode, 8000.0, 6000.0, 10000.0);
+    pd.primaryRequestIds = {9U};
+    pd.secondaryRequestIds = {5U};
+    phaseGlobalFinalizeCandidate(pd);
+    PhaseGlobalDispatchPlan const active = phaseGlobalDispatchPlan(4U, 7U, pd);
+
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kEncoderDecode, 18000.0, 9000.0, 10000.0);
+    overlap.primaryRequestIds = {20U};
+    overlap.secondaryRequestIds = {5U};
+    phaseGlobalFinalizeCandidate(overlap);
+    EXPECT_FALSE(phaseGlobalAugmentedDispatchPlan(5U, 8U, active, overlap).has_value());
+}
+
+TEST(PhaseGlobalSchedulerTest, SelectsKnownResidualAugmentationForFirstTokenDeadline)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate continuation = candidate(PhaseGlobalActionKind::kDecode, 4000.0, 4000.0, 10000.0);
+    continuation.predictedMakespanUs = 4000.0;
+    continuation.protectedCompletions = {{5000.0, 11000.0, 0.0}};
+    PhaseGlobalActionCandidate augmentation
+        = candidate(PhaseGlobalActionKind::kEncoderDecode, 14000.0, 7000.0, 10000.0);
+    augmentation.key.residualAugmentation = true;
+    augmentation.predictedMakespanUs = 7000.0;
+    augmentation.protectedCompletions = {{5000.0, 7000.0, 0.0}};
+
+    PhaseGlobalDecision const decision = scheduler.select({continuation, augmentation});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kMinimumViolation);
+}
+
+TEST(PhaseGlobalSchedulerTest, KeepsActivePhaseWhenResidualOverlapCostIsUnknown)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate continuation = candidate(PhaseGlobalActionKind::kPrefill, 4000.0, 4000.0, 10000.0);
+    PhaseGlobalActionCandidate augmentation
+        = candidate(PhaseGlobalActionKind::kEncoderPrefill, 14000.0, 7000.0, 10000.0);
+    augmentation.key.residualAugmentation = true;
+    augmentation.overlapCostKnown = false;
+
+    PhaseGlobalDecision const decision = scheduler.select({continuation, augmentation});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+}
+
 TEST(PhaseGlobalSchedulerTest, CandidateIdentityPreservesCanonicalRowOrder)
 {
     PhaseGlobalActionCandidate first = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, 10000.0);

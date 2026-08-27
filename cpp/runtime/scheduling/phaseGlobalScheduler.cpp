@@ -256,6 +256,7 @@ uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noe
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryContextBucket));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.secondaryContextBucket));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.executionVariant));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.residualAugmentation));
     for (uint64_t const requestId : candidate.primaryRequestIds)
     {
         result = hashCombine(result, requestId);
@@ -322,6 +323,60 @@ PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
     return result;
 }
 
+PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
+    PhaseGlobalActionCandidate const& launched, double elapsedUs) noexcept
+{
+    PhaseGlobalActionCandidate result = launched;
+    elapsedUs = std::max(0.0, elapsedUs);
+    double const fullMakespanUs
+        = launched.predictedMakespanUs > 0.0 ? launched.predictedMakespanUs : launched.predictedBlockingUs;
+    double const fullRobustUs = std::max(0.0, fullMakespanUs) + std::max(0.0, launched.uncertaintyUs);
+    double const residualRobustUs = std::max(0.0, fullRobustUs - elapsedUs);
+    double const residualMakespanUs = std::max(0.0, fullMakespanUs - elapsedUs);
+    result.predictedBlockingUs = residualMakespanUs;
+    result.predictedMakespanUs = residualMakespanUs;
+    result.uncertaintyUs = std::max(0.0, residualRobustUs - residualMakespanUs);
+    if (launched.predictedHorizonUs > 0.0)
+    {
+        result.predictedHorizonUs = std::max(0.0, launched.predictedHorizonUs - elapsedUs);
+    }
+    double const residualRatio = fullRobustUs > 0.0 ? residualRobustUs / fullRobustUs : 0.0;
+    result.referenceWorkUs *= residualRatio;
+    result.horizonReferenceWorkUs *= residualRatio;
+    for (PhaseProtectedCompletion& completion : result.protectedCompletions)
+    {
+        double const fullCompletionUs
+            = std::max(0.0, completion.predictedCompletionUs) + std::max(0.0, completion.uncertaintyUs);
+        double const residualCompletionUs = std::max(0.0, fullCompletionUs - elapsedUs);
+        completion.predictedCompletionUs = std::max(0.0, completion.predictedCompletionUs - elapsedUs);
+        completion.uncertaintyUs = std::max(0.0, residualCompletionUs - completion.predictedCompletionUs);
+    }
+    phaseGlobalFinalizeCandidate(result);
+    return result;
+}
+
+std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
+    PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept
+{
+    PhaseGlobalActionKind const expected = active.action == PhaseGlobalActionKind::kPrefill
+        ? PhaseGlobalActionKind::kEncoderPrefill
+        : active.action == PhaseGlobalActionKind::kDecode ? PhaseGlobalActionKind::kEncoderDecode
+                                                          : PhaseGlobalActionKind::kNone;
+    if (augmentation.key.kind != expected || active.launched != phaseExecutionSetForAction(active.action)
+        || active.allowedOutstanding != active.launched || augmentation.secondaryRequestIds != active.primaryRequestIds
+        || augmentation.secondaryStableSlotIds != active.primaryStableSlotIds)
+    {
+        return std::nullopt;
+    }
+    PhaseGlobalDispatchPlan result = phaseGlobalDispatchPlan(planId, snapshotEpoch, augmentation);
+    if (phaseExecutionSetContains(result.allowedOutstanding, PhaseExecutionSet::kPrefill)
+        && phaseExecutionSetContains(result.allowedOutstanding, PhaseExecutionSet::kDecode))
+    {
+        return std::nullopt;
+    }
+    return result;
+}
+
 char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept
 {
     char const* result = "unknown";
@@ -355,9 +410,10 @@ char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status
 bool PhaseGlobalActionKey::operator==(PhaseGlobalActionKey const& other) const noexcept
 {
     return std::tie(kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket,
-               secondaryContextBucket, executionVariant)
+               secondaryContextBucket, executionVariant, residualAugmentation)
         == std::tie(other.kind, other.primaryBatchSize, other.secondaryBatchSize, other.chunkLength,
-            other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant);
+            other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant,
+            other.residualAugmentation);
 }
 
 PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept
@@ -385,6 +441,7 @@ size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key
     combine(key.primaryContextBucket);
     combine(key.secondaryContextBucket);
     combine(static_cast<int32_t>(key.executionVariant));
+    combine(static_cast<int32_t>(key.residualAugmentation));
     return result;
 }
 

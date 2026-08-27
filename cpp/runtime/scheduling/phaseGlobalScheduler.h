@@ -105,6 +105,8 @@ struct PhaseGlobalActionKey
     int32_t primaryContextBucket{};
     int32_t secondaryContextBucket{};
     PhaseExecutionVariant executionVariant{PhaseExecutionVariant::kEager};
+    //! Distinguish overlap that begins after the primary phase has already consumed work.
+    bool residualAugmentation{};
 
     bool operator==(PhaseGlobalActionKey const& other) const noexcept;
 };
@@ -295,6 +297,14 @@ struct PhaseGlobalDispatchPlan
 //! Materialize one selected candidate into an explicit execution lease.
 PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
     uint64_t planId, uint64_t snapshotEpoch, PhaseGlobalActionCandidate const& candidate);
+
+//! Return the unfinished portion of an already launched single-phase action.
+PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
+    PhaseGlobalActionCandidate const& launched, double elapsedUs) noexcept;
+
+//! Upgrade a live P or D lease to E+P or E+D without authorizing a third phase.
+std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
+    PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept;
 
 enum class PhaseGlobalDecisionReason
 {

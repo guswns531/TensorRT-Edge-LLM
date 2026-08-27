@@ -1627,8 +1627,12 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         = decodeRows > 0 ? std::optional<Prediction>(decodePrediction()) : std::nullopt;
     double const prefillSlack
         = state.prefillQueued > 0U ? state.prefillMinTtftSlackUs : std::numeric_limits<double>::infinity();
-    double const decodeSlack = state.decodeQueued > 0U ? mConfig.decodeQueueWaitTargetUs - state.decodeOldestWaitUs
-                                                       : std::numeric_limits<double>::infinity();
+    // Queue formation latency controls when a D cohort is released; it is not
+    // the request's next-token deadline. Global E/P/D selection must protect
+    // the explicit per-request TPOT slack summarized in the snapshot, just as
+    // the bounded WAIT comparison below does.
+    double const decodeSlack
+        = state.decodeQueued > 0U ? state.decodeMinTpotSlackUs : std::numeric_limits<double>::infinity();
 
     auto memoryFor = [&](PhaseGlobalActionKey const& key, std::vector<uint64_t> const& requestIds) {
         return mConfig.globalMemoryHorizonSupplier ? mConfig.globalMemoryHorizonSupplier(key, requestIds)
@@ -1695,6 +1699,26 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
         protect(candidate, 0, *decode);
         candidates.push_back(std::move(candidate));
+    }
+    if (allowPrefill && allowDecode && prefill.has_value() && decode.has_value())
+    {
+        // Compare serial P and D choices over the same bounded amount of work.
+        // One-action compression is not comparable when the alternatives
+        // advance different phases: it can prefer a locally efficient small
+        // launch even though that choice fragments the other phase's next
+        // cohort. The common two-action horizon changes only ranking; request
+        // rows, deadline protection, and the dispatched action remain exact.
+        double const serialHorizonUs = prefill->makespanUs + decode->makespanUs;
+        double const serialReferenceWorkUs = prefill->referenceWorkUs + decode->referenceWorkUs;
+        for (PhaseGlobalActionCandidate& candidate : candidates)
+        {
+            if (candidate.key.kind == PhaseGlobalActionKind::kPrefill
+                || candidate.key.kind == PhaseGlobalActionKind::kDecode)
+            {
+                candidate.predictedHorizonUs = serialHorizonUs;
+                candidate.horizonReferenceWorkUs = serialReferenceWorkUs;
+            }
+        }
     }
     if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefillRows > 0 && overlapDecodeRows > 0)
     {

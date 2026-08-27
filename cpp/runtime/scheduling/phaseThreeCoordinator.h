@@ -276,6 +276,10 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalEncoderSelections{};
     size_t globalEncoderPrefillSelections{};
     size_t globalEncoderDecodeSelections{};
+    size_t globalResidualAugmentationOpportunities{};
+    size_t globalResidualEncoderPrefillSelections{};
+    size_t globalResidualEncoderDecodeSelections{};
+    size_t globalResidualAugmentationUnknownCostRejects{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
     size_t globalWarmupDecisions{};
@@ -512,9 +516,22 @@ private:
         float referenceWorkMs{};
         float encoderGpuMs{};
         float phaseGpuMs{};
+        float phaseElapsedMs{};
+        bool residualAugmentation{};
+    };
+    struct ActiveGlobalPdExecution
+    {
+        PhaseGlobalActionCandidate candidate;
+        std::chrono::steady_clock::time_point startedAt;
+        //! A residual E augmentation is evaluated once per distinct encoder
+        //! cohort while this P/D lease remains outstanding. Tight host polling
+        //! must not turn one GPU decision boundary into thousands of policy
+        //! evaluations.
+        std::vector<uint64_t> lastResidualEncoderRequestIds;
     };
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::optional<PhaseGlobalDispatchPlan> mGlobalExecutionLease;
+    std::optional<ActiveGlobalPdExecution> mActiveGlobalPdExecution;
     std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;
     std::vector<size_t> mGlobalCalibrationOpportunities;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
@@ -600,6 +617,10 @@ private:
     size_t mGlobalEncoderSelections{};
     size_t mGlobalEncoderPrefillSelections{};
     size_t mGlobalEncoderDecodeSelections{};
+    size_t mGlobalResidualAugmentationOpportunities{};
+    size_t mGlobalResidualEncoderPrefillSelections{};
+    size_t mGlobalResidualEncoderDecodeSelections{};
+    size_t mGlobalResidualAugmentationUnknownCostRejects{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
     size_t mGlobalWarmupDecisions{};

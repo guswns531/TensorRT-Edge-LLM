@@ -866,6 +866,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalEncoderSelections = mGlobalEncoderSelections;
     result.globalEncoderPrefillSelections = mGlobalEncoderPrefillSelections;
     result.globalEncoderDecodeSelections = mGlobalEncoderDecodeSelections;
+    result.globalResidualAugmentationOpportunities = mGlobalResidualAugmentationOpportunities;
+    result.globalResidualEncoderPrefillSelections = mGlobalResidualEncoderPrefillSelections;
+    result.globalResidualEncoderDecodeSelections = mGlobalResidualEncoderDecodeSelections;
+    result.globalResidualAugmentationUnknownCostRejects = mGlobalResidualAugmentationUnknownCostRejects;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
     result.globalWarmupDecisions = mGlobalWarmupDecisions;
@@ -978,6 +982,11 @@ void PhaseThreeCoordinator::refreshGlobalExecutionLease()
         return;
     }
     PhaseExecutionSet const observed = observedGlobalExecution();
+    if (!phaseExecutionSetContains(observed, PhaseExecutionSet::kPrefill)
+        && !phaseExecutionSetContains(observed, PhaseExecutionSet::kDecode))
+    {
+        mActiveGlobalPdExecution.reset();
+    }
     if (!mGlobalExecutionLease->permits(observed))
     {
         ++mGlobalActionFidelityViolations;
@@ -1022,16 +1031,22 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         return false;
     }
     refreshGlobalExecutionLease();
-    if (mGlobalExecutionLease.has_value())
-    {
-        return false;
-    }
     IndependentPhaseServerArbitrationSnapshot const serverState = mServer.arbitrationSnapshot();
-    if (serverState.busy)
+    bool const residualAugmentation = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
+        && mGlobalExecutionLease.has_value() && mActiveGlobalPdExecution.has_value() && serverState.busy
+        && !mPending.empty() && mEncoding.empty() && !mVision.busy() && !mEncoderPreparation.valid()
+        && (mActiveGlobalPdExecution->candidate.key.kind == PhaseGlobalActionKind::kPrefill
+            || mActiveGlobalPdExecution->candidate.key.kind == PhaseGlobalActionKind::kDecode);
+    if (mGlobalExecutionLease.has_value() && !residualAugmentation)
     {
         return false;
     }
-    if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && mServer.shouldWaitForGlobalDecodeRefill())
+    if (serverState.busy && !residualAugmentation)
+    {
+        return false;
+    }
+    if (!residualAugmentation && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
+        && mServer.shouldWaitForGlobalDecodeRefill())
     {
         return false;
     }
@@ -1044,15 +1059,30 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     std::optional<PhaseGlobalActionCandidate> pd;
     std::optional<PhaseGlobalActionCandidate> prefillForEncoder;
     std::optional<PhaseGlobalActionCandidate> decodeForEncoder;
-    if (serverState.prefillQueued > 0U || serverState.decodeQueued > 0U)
+    if (residualAugmentation)
+    {
+        double const elapsedUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
+                                     .count();
+        pd = phaseGlobalResidualCandidate(mActiveGlobalPdExecution->candidate, elapsedUs);
+        if (pd->key.kind == PhaseGlobalActionKind::kPrefill)
+        {
+            prefillForEncoder = *pd;
+        }
+        else
+        {
+            decodeForEncoder = *pd;
+        }
+    }
+    else if (serverState.prefillQueued > 0U || serverState.decodeQueued > 0U)
     {
         pd = mServer.previewGlobalAction();
     }
-    if (serverState.prefillQueued > 0U && mConfig.enableGlobalEncoderPrefillAction)
+    if (!residualAugmentation && serverState.prefillQueued > 0U && mConfig.enableGlobalEncoderPrefillAction)
     {
         prefillForEncoder = mServer.previewGlobalPrefillAction();
     }
-    if (serverState.decodeQueued > 0U)
+    if (!residualAugmentation && serverState.decodeQueued > 0U)
     {
         decodeForEncoder = mServer.previewGlobalDecodeAction();
     }
@@ -1079,10 +1109,16 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     if (encoderBatchIndices.empty())
     {
+        if (residualAugmentation)
+        {
+            return false;
+        }
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
         {
             ++mGlobalPdSelections;
             PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(*pd);
+            PhaseGlobalActionCandidate launched = *pd;
+            auto const launchedAt = std::chrono::steady_clock::now();
             bool const started
                 = mServer.dispatchGlobalAction(std::move(*pd), executionPlan.planId, executionPlan.snapshotEpoch);
             if (!started)
@@ -1090,10 +1126,31 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 abandonGlobalExecutionLease();
                 return false;
             }
+            if (launched.key.kind == PhaseGlobalActionKind::kPrefill
+                || launched.key.kind == PhaseGlobalActionKind::kDecode)
+            {
+                mActiveGlobalPdExecution = ActiveGlobalPdExecution{std::move(launched), launchedAt, {}};
+            }
             validateGlobalExecutionLaunch();
             return true;
         }
         return false;
+    }
+
+    if (residualAugmentation)
+    {
+        std::vector<uint64_t> encoderRequestIds;
+        encoderRequestIds.reserve(encoderBatchIndices.size());
+        for (size_t const index : encoderBatchIndices)
+        {
+            encoderRequestIds.push_back(mPending[index].requestId);
+        }
+        if (encoderRequestIds == mActiveGlobalPdExecution->lastResidualEncoderRequestIds)
+        {
+            return false;
+        }
+        mActiveGlobalPdExecution->lastResidualEncoderRequestIds = std::move(encoderRequestIds);
+        ++mGlobalResidualAugmentationOpportunities;
     }
 
     size_t encoderInputTokens{};
@@ -1215,10 +1272,30 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
-    candidates.push_back(encoder);
+    if (!residualAugmentation)
+    {
+        candidates.push_back(encoder);
+    }
     if (pd.has_value())
     {
         candidates.push_back(*pd);
+    }
+    if (!residualAugmentation && pd.has_value())
+    {
+        // E and the current P/D action advance different request-DAG nodes.
+        // Rank their serial alternatives over the same bounded E + P/D work
+        // rather than comparing unrelated one-action compression ratios. This
+        // preserves exact batch builders and changes only the global choice.
+        double const serialHorizonUs = encoder.predictedMakespanUs + pd->predictedMakespanUs;
+        double const serialReferenceWorkUs = encoder.referenceWorkUs + pd->referenceWorkUs;
+        for (PhaseGlobalActionCandidate& candidate : candidates)
+        {
+            if (candidate.key.kind == PhaseGlobalActionKind::kEncoder || candidate.key.kind == pd->key.kind)
+            {
+                candidate.predictedHorizonUs = serialHorizonUs;
+                candidate.horizonReferenceWorkUs = serialReferenceWorkUs;
+            }
+        }
     }
     bool const encoderExclusive = mConfig.exclusiveEncoderInputTokenThreshold > 0
         && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold;
@@ -1226,17 +1303,31 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? phase.key.chunkLength : 0;
         PhaseGlobalActionKey overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
             phase.key.primaryBatchSize, chunkLength, encoderContextBucket, phase.key.primaryContextBucket};
+        overlapKey.residualAugmentation = residualAugmentation;
         overlapKey.executionVariant
             = phaseExecutionVariant(false, phaseExecutionVariantUsesPrimaryGraph(phase.key.executionVariant));
         double overlapMakespanUs = encoderMakespanUs + phase.predictedMakespanUs;
         double overlapUncertaintyUs = encoderUncertaintyUs + phase.uncertaintyUs;
         bool overlapKnown{};
         bool directOfflineCost{};
-        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(overlapKey))
+        double phaseOverlapCompletionUs{};
+        double phaseOverlapCompletionUncertaintyUs{};
+        bool residualDerivedFromFullCost{};
+        std::optional<PhaseGlobalCostEstimate> online = mGlobalCostModel.estimate(overlapKey);
+        if (!online.has_value() && residualAugmentation)
+        {
+            PhaseGlobalActionKey fullKey = overlapKey;
+            fullKey.residualAugmentation = false;
+            online = mGlobalCostModel.estimate(fullKey);
+            residualDerivedFromFullCost = online.has_value();
+        }
+        if (online.has_value())
         {
             overlapMakespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
             overlapUncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
-            overlapKnown = mGlobalCostModel.overlapEligible(overlapKey);
+            PhaseGlobalActionKey eligibilityKey = overlapKey;
+            eligibilityKey.residualAugmentation = residualAugmentation && !residualDerivedFromFullCost;
+            overlapKnown = mGlobalCostModel.overlapEligible(eligibilityKey);
         }
         else
         {
@@ -1278,6 +1369,17 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 }
             }
         }
+        if (residualAugmentation && overlapKnown)
+        {
+            double const fullPhaseUs = mActiveGlobalPdExecution->candidate.predictedMakespanUs > 0.0
+                ? mActiveGlobalPdExecution->candidate.predictedMakespanUs
+                : mActiveGlobalPdExecution->candidate.predictedBlockingUs;
+            double const residualPhaseUs = phase.predictedMakespanUs;
+            double const interferenceUs = std::max(0.0, overlapMakespanUs - std::max(encoderMakespanUs, fullPhaseUs));
+            overlapMakespanUs = std::max(encoderMakespanUs, residualPhaseUs) + interferenceUs;
+            phaseOverlapCompletionUs = residualPhaseUs + interferenceUs;
+            phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
+        }
         PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostModel.overlapDiagnostic(overlapKey);
         bool const needsCalibration = diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
@@ -1309,16 +1411,55 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             = encoderMakespanUs + encoderUncertaintyUs + phase.predictedMakespanUs + phase.uncertaintyUs;
         bool const probeIntervalReady = mLastGlobalSafeProbeSequence == 0U
             || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
+        double phaseProtectedSlackUs = std::numeric_limits<double>::infinity();
+        for (PhaseProtectedCompletion const& completion : phase.protectedCompletions)
+        {
+            phaseProtectedSlackUs = std::min(phaseProtectedSlackUs, completion.slackUs);
+        }
+        if (residualAugmentation && phase.key.kind == PhaseGlobalActionKind::kDecode)
+        {
+            // The decode candidate's original protection is its queue-formation
+            // deadline. Once that candidate is already running, reuse it only
+            // for the residual cost and protect the continuation with the
+            // request TPOT deadline instead. Otherwise a 1--2 ms batching wait
+            // target permanently prevents a safe E+D calibration probe even
+            // when the serving SLO has tens of milliseconds of headroom.
+            double const requestTpotTargetUs = mTpotTargets.empty() ? 0.0 : *mTpotTargets.begin();
+            double const continuationTargetUs
+                = requestTpotTargetUs > 0.0 ? requestTpotTargetUs : mConfig.encodedCapacityDecodeTpotTargetUs;
+            if (continuationTargetUs > 0.0)
+            {
+                double const elapsedUs = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
+                                             .count();
+                phaseProtectedSlackUs = std::max(0.0, continuationTargetUs - elapsedUs);
+            }
+        }
+        double const residualPhaseProbeUs
+            = phase.predictedMakespanUs + phase.uncertaintyUs + mConfig.encoderDispatchCostSafetyMarginUs;
+        bool const residualProbeSafe = residualAugmentation && probeIntervalReady
+            && mConfig.globalSafeProbeSlackMultiplier > 0.0F
+            && encoderSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier)
+                    * (encoderMakespanUs + encoderUncertaintyUs)
+            && phaseProtectedSlackUs
+                >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * residualPhaseProbeUs;
         bool const safeProbe = !overlapKnown && needsCalibration
             && ((mGlobalWarmupProbeMode && calibrationTarget)
                 || (mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
-                    && protectedSlackUs
-                        >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs));
+                    && protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs)
+                || residualProbeSafe);
         if (safeProbe)
         {
             double const optimisticMakespanUs = std::max(encoderMakespanUs, phase.predictedMakespanUs);
             overlapMakespanUs = optimisticMakespanUs;
             overlapUncertaintyUs = std::max(0.0, robustSerialUs - optimisticMakespanUs);
+            if (residualAugmentation)
+            {
+                overlapUncertaintyUs
+                    = std::max(encoderUncertaintyUs, phase.uncertaintyUs) + mConfig.encoderDispatchCostSafetyMarginUs;
+                phaseOverlapCompletionUs = residualPhaseProbeUs;
+                phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
+            }
         }
         PhaseGlobalActionCandidate overlap;
         overlap.key = overlapKey;
@@ -1336,13 +1477,15 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.memory.nearReclaimBytes = saturatedAdd(overlap.memory.nearReclaimBytes, phase.memory.nearReclaimBytes);
         overlap.primaryRequestIds = encoder.primaryRequestIds;
         overlap.secondaryRequestIds = phase.requestIds;
+        overlap.secondaryStableSlotIds = phase.primaryStableSlotIds;
         phaseGlobalFinalizeCandidate(overlap);
         overlap.protectedCompletions.push_back({encoderSlackUs, overlapMakespanUs + visionPrefillMakespanUs,
             overlapUncertaintyUs + visionPrefillUncertaintyUs});
         for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
-            completion.predictedCompletionUs = overlapMakespanUs;
-            completion.uncertaintyUs = overlapUncertaintyUs;
+            completion.predictedCompletionUs = residualAugmentation ? phaseOverlapCompletionUs : overlapMakespanUs;
+            completion.uncertaintyUs
+                = residualAugmentation ? phaseOverlapCompletionUncertaintyUs : overlapUncertaintyUs;
             overlap.protectedCompletions.push_back(completion);
         }
         candidates.push_back(std::move(overlap));
@@ -1386,8 +1529,39 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             }
         }
     }
+    if (residualAugmentation && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
+    {
+        auto const probe = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
+            return candidate.key.residualAugmentation && candidate.safeProbeEligible && !candidate.overlapCostKnown;
+        });
+        if (probe != candidates.end())
+        {
+            selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), probe));
+        }
+    }
+    else if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
+    {
+        // An unseen production shape cannot become measurable if robust
+        // uncertainty always makes its serial alternative win selection.
+        // Admit exactly the candidate that already passed the shared slack and
+        // rate-limit gate; direct observations will then either promote or
+        // reject this canonical overlap bucket.
+        auto const probe = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
+            bool const encoderOverlap = candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode;
+            return encoderOverlap && candidate.safeProbeEligible && !candidate.overlapCostKnown;
+        });
+        if (probe != candidates.end())
+        {
+            selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), probe));
+        }
+    }
     if (!selectedIndex.has_value())
     {
+        if (residualAugmentation)
+        {
+            ++mGlobalResidualAugmentationUnknownCostRejects;
+        }
         return false;
     }
     PhaseGlobalActionCandidate selected = candidates[*selectedIndex];
@@ -1403,6 +1577,55 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PhaseGlobalActionKind const legacyAction = pd.has_value() ? pd->key.kind : PhaseGlobalActionKind::kEncoder;
         mGlobalShadowDisagreements += selected.key.kind != legacyAction ? 1U : 0U;
         return false;
+    }
+
+    if (residualAugmentation)
+    {
+        if (selected.key.kind == PhaseGlobalActionKind::kPrefill || selected.key.kind == PhaseGlobalActionKind::kDecode)
+        {
+            bool const overlapKnown = std::any_of(candidates.begin(), candidates.end(), [](auto const& candidate) {
+                return (candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                           || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode)
+                    && (candidate.overlapCostKnown || candidate.safeProbeEligible);
+            });
+            mGlobalResidualAugmentationUnknownCostRejects += overlapKnown ? 0U : 1U;
+            return false;
+        }
+        ELLM_CHECK(selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                || selected.key.kind == PhaseGlobalActionKind::kEncoderDecode,
+            "Residual lease augmentation selected an unsupported action");
+        ELLM_CHECK(mGlobalExecutionLease.has_value() && mActiveGlobalPdExecution.has_value(),
+            "Residual lease augmentation lost its active phase");
+        std::optional<PhaseGlobalDispatchPlan> const augmented
+            = phaseGlobalAugmentedDispatchPlan(kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence,
+                kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch, *mGlobalExecutionLease, selected);
+        ELLM_CHECK(augmented.has_value(), "Residual lease augmentation does not match the active phase rows");
+        mGlobalEncoderBatchIndices = encoderBatchIndices;
+        mInFlightGlobalEncoderKey = encoderKey;
+        mInFlightGlobalEncoderReferenceMs = encoderReferenceUs / 1000.0;
+        double const phaseElapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
+                                          .count();
+        mPendingGlobalOverlapObservation
+            = PendingGlobalOverlapObservation{selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F,
+                0.0F, static_cast<float>(phaseElapsedMs), true};
+        bool const started = startNextEncoder();
+        if (!started)
+        {
+            mPendingGlobalOverlapObservation.reset();
+            return false;
+        }
+        mGlobalExecutionLease = *augmented;
+        validateGlobalExecutionLaunch();
+        if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill)
+        {
+            ++mGlobalResidualEncoderPrefillSelections;
+        }
+        else
+        {
+            ++mGlobalResidualEncoderDecodeSelections;
+        }
+        return true;
     }
 
     if (selected.key.kind == PhaseGlobalActionKind::kEncoder)
@@ -1432,7 +1655,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         mInFlightGlobalEncoderKey = encoderKey;
         mInFlightGlobalEncoderReferenceMs = encoderReferenceUs / 1000.0;
         mPendingGlobalOverlapObservation = PendingGlobalOverlapObservation{
-            selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F, 0.0F};
+            selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F, 0.0F, 0.0F, false};
         bool const encoderStarted = startNextEncoder();
         bool const phaseStarted = encoderStarted
             && mServer.dispatchGlobalAction(std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
@@ -1460,12 +1683,18 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     ++mGlobalPdSelections;
     PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(selected);
+    PhaseGlobalActionCandidate launched = selected;
+    auto const launchedAt = std::chrono::steady_clock::now();
     bool const started
         = mServer.dispatchGlobalAction(std::move(selected), executionPlan.planId, executionPlan.snapshotEpoch);
     if (!started)
     {
         abandonGlobalExecutionLease();
         return false;
+    }
+    if (launched.key.kind == PhaseGlobalActionKind::kPrefill || launched.key.kind == PhaseGlobalActionKind::kDecode)
+    {
+        mActiveGlobalPdExecution = ActiveGlobalPdExecution{std::move(launched), launchedAt, {}};
     }
     validateGlobalExecutionLaunch();
     return true;
@@ -1479,7 +1708,8 @@ void PhaseThreeCoordinator::completeGlobalOverlapObservation()
     }
     std::optional<PhaseDispatchMetrics> const& dispatch = mServer.schedulerTelemetry().lastDispatch;
     PhaseGlobalActionKey const& key = mPendingGlobalOverlapObservation->key;
-    if (mPendingGlobalOverlapObservation->phaseGpuMs <= 0.0F && dispatch.has_value() && dispatch->externalEncoderActive)
+    if (mPendingGlobalOverlapObservation->phaseGpuMs <= 0.0F && dispatch.has_value()
+        && (dispatch->externalEncoderActive || mPendingGlobalOverlapObservation->residualAugmentation))
     {
         if (key.kind == PhaseGlobalActionKind::kEncoderPrefill && dispatch->prefillGpuMs > 0.0F
             && dispatch->prefillBatchSize == key.secondaryBatchSize && dispatch->prefillPaddedTokens > 0
@@ -1489,7 +1719,8 @@ void PhaseThreeCoordinator::completeGlobalOverlapObservation()
                 / mConfig.globalDecodeContextBucketTokens;
             if (contextBucket == key.secondaryContextBucket)
             {
-                mPendingGlobalOverlapObservation->phaseGpuMs = dispatch->prefillGpuMs;
+                mPendingGlobalOverlapObservation->phaseGpuMs
+                    = std::max(0.0F, dispatch->prefillGpuMs - mPendingGlobalOverlapObservation->phaseElapsedMs);
             }
         }
         else if (key.kind == PhaseGlobalActionKind::kEncoderDecode && dispatch->decodeGpuMs > 0.0F
@@ -1500,12 +1731,17 @@ void PhaseThreeCoordinator::completeGlobalOverlapObservation()
                 / mConfig.globalDecodeContextBucketTokens;
             if (contextBucket == key.secondaryContextBucket)
             {
-                mPendingGlobalOverlapObservation->phaseGpuMs = dispatch->decodeGpuMs;
+                mPendingGlobalOverlapObservation->phaseGpuMs
+                    = std::max(0.0F, dispatch->decodeGpuMs - mPendingGlobalOverlapObservation->phaseElapsedMs);
             }
         }
     }
     if (mPendingGlobalOverlapObservation->encoderGpuMs <= 0.0F || mPendingGlobalOverlapObservation->phaseGpuMs <= 0.0F)
     {
+        if (observedGlobalExecution() == PhaseExecutionSet::kNone)
+        {
+            mPendingGlobalOverlapObservation.reset();
+        }
         return;
     }
     float const makespanMs
