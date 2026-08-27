@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -51,6 +52,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -332,6 +334,14 @@ struct PhaseTiming
     float makespanMs{};
 };
 
+struct ExecutorTiming
+{
+    float meanMs{};
+    float medianMs{};
+    float p95Ms{};
+    float maxMs{};
+};
+
 class CudaEventAccumulator
 {
 public:
@@ -572,6 +582,42 @@ PhaseTiming measureSequential(rt::EngineExecutor& prefillExecutor, rt::EngineExe
     return total;
 }
 
+ExecutorTiming measureExecutor(rt::EngineExecutor& executor, cudaStream_t stream, int32_t warmup, int32_t iterations)
+{
+    ELLM_CHECK(warmup >= 0 && iterations > 0, "Executor timing requires non-negative warmup and positive iterations");
+    cudaEvent_t start{};
+    cudaEvent_t end{};
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&end));
+
+    std::vector<float> samples;
+    samples.reserve(static_cast<size_t>(iterations));
+    int32_t const totalIterations = warmup + iterations;
+    for (int32_t iteration = 0; iteration < totalIterations; ++iteration)
+    {
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        ELLM_CHECK(executor.execute(stream), "Isolated engine execution failed");
+        CUDA_CHECK(cudaEventRecord(end, stream));
+        CUDA_CHECK(cudaEventSynchronize(end));
+        if (iteration >= warmup)
+        {
+            float elapsedMs{};
+            CUDA_CHECK(cudaEventElapsedTime(&elapsedMs, start, end));
+            samples.push_back(elapsedMs);
+        }
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(end));
+    std::sort(samples.begin(), samples.end());
+    float const sum = std::accumulate(samples.begin(), samples.end(), 0.0F);
+    size_t const medianIndex = samples.size() / 2U;
+    size_t const p95Index = std::min(
+        samples.size() - 1U, static_cast<size_t>(std::ceil(static_cast<double>(samples.size()) * 0.95)) - 1U);
+    return ExecutorTiming{
+        sum / static_cast<float>(samples.size()), samples[medianIndex], samples[p95Index], samples.back()};
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -802,6 +848,41 @@ int main(int argc, char** argv)
                 prefillKV.complete();
                 LOG_INFO("Primed external-prefill profile %d with %d tokens", pair->externalPrefillProfile(),
                     visionWarmupTokens);
+
+                if (char const* value = std::getenv("TRT_EDGELLM_EXTERNAL_PREFILL_BENCH_TOKENS"))
+                {
+                    constexpr int32_t kDEFAULT_BENCH_WARMUP = 20;
+                    constexpr int32_t kDEFAULT_BENCH_ITERATIONS = 100;
+                    int32_t const benchTokens = std::stoi(value);
+                    int32_t const benchWarmup = std::getenv("TRT_EDGELLM_EXTERNAL_PREFILL_BENCH_WARMUP") != nullptr
+                        ? std::stoi(std::getenv("TRT_EDGELLM_EXTERNAL_PREFILL_BENCH_WARMUP"))
+                        : kDEFAULT_BENCH_WARMUP;
+                    int32_t const benchIterations
+                        = std::getenv("TRT_EDGELLM_EXTERNAL_PREFILL_BENCH_ITERATIONS") != nullptr
+                        ? std::stoi(std::getenv("TRT_EDGELLM_EXTERNAL_PREFILL_BENCH_ITERATIONS"))
+                        : kDEFAULT_BENCH_ITERATIONS;
+                    ELLM_CHECK(benchTokens > 0 && benchTokens <= visionWarmupTokens,
+                        "External-prefill benchmark tokens exceed the selected profile limit");
+                    ownership.setLength(prefillSlot0, 0);
+                    prefillKV.prepare({prefillSlot0}, prefillStream);
+                    ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, benchTokens, config.hiddenSize}),
+                        "Failed to reshape isolated external-prefill embeddings");
+                    prefillKV.preparePrefillMetadata(*prefillIO, {benchTokens}, prefillStream, true);
+                    rt::InferenceDims const benchDims = config.hasVisionPrefillProfile()
+                        ? config.visionPackedPrefillDims(1, benchTokens, benchTokens)
+                        : config.packedPrefillDims(1, benchTokens, benchTokens);
+                    ELLM_CHECK(pair->externalPrefillExecutor().prepare(
+                                   pair->externalPrefillProfile(), benchDims, prefillMap, prefillStream),
+                        "Failed to prepare the isolated external-prefill benchmark");
+                    ExecutorTiming const timing
+                        = measureExecutor(pair->externalPrefillExecutor(), prefillStream, benchWarmup, benchIterations);
+                    prefillKV.complete();
+                    LOG_INFO(
+                        "External-prefill isolated timing: profile=%d tokens=%d warmup=%d iterations=%d "
+                        "mean=%.4f ms median=%.4f ms p95=%.4f ms max=%.4f ms",
+                        pair->externalPrefillProfile(), benchTokens, benchWarmup, benchIterations, timing.meanMs,
+                        timing.medianMs, timing.p95Ms, timing.maxMs);
+                }
             }
 
             // Exercise the real queue scheduler -> dispatch worker -> independent
