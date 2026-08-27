@@ -430,6 +430,7 @@ class AttentionPluginRunner:
                  enable_vision_block_attention: bool = False,
                  enable_packed_prefill: bool = False,
                  packed_prefill_max_chunk_tokens: int = 128,
+                 enable_profile_local_packed_prefill: bool = False,
                  expect_unsupported: bool = False,
                  shuffle_pages: bool = False):
         self.p = p
@@ -442,6 +443,7 @@ class AttentionPluginRunner:
         self.context_mask_selector = enable_context_mask_selector
         self.packed_prefill = enable_packed_prefill
         self.packed_prefill_max_chunk_tokens = packed_prefill_max_chunk_tokens
+        self.profile_local_packed_prefill = enable_profile_local_packed_prefill
         self.expect_unsupported = expect_unsupported
         # shuffle_pages: give each slot non-contiguous physical pages so the
         # page table stops being identity -- proves the kernel follows it.
@@ -533,6 +535,13 @@ class AttentionPluginRunner:
             plugin_input_order += ["tree_mask", "position_ids"]
         if self.vision:
             plugin_input_order.append("vision_block_ids")
+        if self.profile_local_packed_prefill:
+            input_specs.append(("packed_prefill_chunk_limit", trt.int8,
+                                (-1, )))
+            profiles["packed_prefill_chunk_limit"] = (
+                (1, ), (max(1, self.packed_prefill_max_chunk_tokens // 2), ),
+                (self.packed_prefill_max_chunk_tokens, ))
+            plugin_input_order.append("packed_prefill_chunk_limit")
 
         fields = [
             pf_int32("num_q_heads", p.num_q_heads),
@@ -547,6 +556,8 @@ class AttentionPluginRunner:
             pf_int32("enable_packed_prefill", int(self.packed_prefill)),
             pf_int32("packed_prefill_max_chunk_tokens",
                      self.packed_prefill_max_chunk_tokens),
+            pf_int32("enable_profile_local_packed_prefill",
+                     int(self.profile_local_packed_prefill)),
             pf_int32("enable_fp8_kv_cache", int(p.enable_fp8_kv_cache)),
             pf_int32("sliding_window_size", p.sliding_window_size),
         ]
@@ -673,6 +684,12 @@ class AttentionPluginRunner:
             tensors["context_mask_selector"] = context_mask_selector
         if self.vision:
             tensors["vision_block_ids"] = vision_block_ids
+        if self.profile_local_packed_prefill:
+            packed_prefill = qkv.shape[0] == 1 and qkv.shape[1] > 1
+            max_row_tokens = self.packed_prefill_max_chunk_tokens \
+                if packed_prefill else 1
+            tensors["packed_prefill_chunk_limit"] = torch.empty(
+                max_row_tokens, dtype=torch.int8, device=DEV)
         self.runner.execute(tensors, input_shapes)
         # Gather the (possibly updated) pool back into the logical cache.
         if self.shuffle_pages:
@@ -1697,6 +1714,46 @@ def test_packed_prefill_matches_padded_batch():
                  packed_out)
     assert_close("packed-prefill-k-cache", ref_k, plugin_k)
     assert_close("packed-prefill-v-cache", ref_v, plugin_v)
+
+
+def test_profile_local_packed_prefill_chunk_carrier():
+    """The runtime shape carrier selects the fixed local profile limit."""
+    p = AttentionParams(batch_size=3, seq_len=8, is_prefill=True, **BASE)
+    gen = torch.Generator().manual_seed(20260827)
+    runner = AttentionPluginRunner(
+        p,
+        enable_packed_prefill=True,
+        packed_prefill_max_chunk_tokens=16,
+        enable_profile_local_packed_prefill=True)
+    cos, sin, combined = _make_rope(p, gen)
+    ref_k, ref_v, plugin_kv = _empty_caches(p)
+    qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV)
+    position_ids = torch.arange(p.seq_len, dtype=torch.int32,
+                                device=DEV)[None].repeat(p.batch_size, 1)
+    cache_indices = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    context_lengths = torch.full((p.batch_size, ),
+                                 p.seq_len,
+                                 dtype=torch.int32,
+                                 device=DEV)
+    mask = sliding_window_mask(p.seq_len, p.seq_len, -1, DEV)
+    ref_out, ref_k, ref_v = compute_attention(qkv, ref_k, ref_v, cos, sin,
+                                              position_ids, cache_indices, p,
+                                              mask)
+    empty_indices, prefill_shapes = _empty_cache_indices(p)
+    packed_qkv = qkv.to(torch.float16).reshape(1, -1, p.qkv_hidden_size)
+    packed_out, plugin_kv = runner.run(packed_qkv,
+                                       plugin_kv,
+                                       context_lengths,
+                                       combined,
+                                       empty_indices,
+                                       input_shapes=prefill_shapes)
+    plugin_k, plugin_v = _plugin_kv_to_ref(plugin_kv, p)
+    assert_close("profile-local-packed-output", ref_out.reshape_as(packed_out),
+                 packed_out)
+    assert_close("profile-local-packed-k-cache", ref_k, plugin_k)
+    assert_close("profile-local-packed-v-cache", ref_v, plugin_v)
 
 
 # FP8 KV cache + normal prefill: the fresh-prefill kernel never READS the FP8

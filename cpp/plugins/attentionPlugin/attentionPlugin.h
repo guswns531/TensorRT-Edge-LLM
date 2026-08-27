@@ -75,7 +75,7 @@ public:
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
         int32_t enableContextMaskSelector, int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
         std::optional<float> attentionScale = std::nullopt, int32_t enablePackedPrefill = 0,
-        int32_t packedPrefillMaxChunkTokens = 128);
+        int32_t packedPrefillMaxChunkTokens = 128, int32_t enableProfileLocalPackedPrefill = 0);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -176,6 +176,8 @@ protected:
     int32_t mEnablePackedPrefill{};
     //! Maximum per-request chunk represented by a packed prefill engine profile.
     int32_t mPackedPrefillMaxChunkTokens{128};
+    //! Whether a shape-only input carries the selected profile's packed-prefill chunk limit.
+    int32_t mEnableProfileLocalPackedPrefill{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

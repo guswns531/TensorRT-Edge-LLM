@@ -203,6 +203,8 @@ bool LLMBuilder::build()
     {
         return false;
     }
+    mBuilderConfig.profileLocalPackedPrefillChunkLimit
+        = hasInputBinding(*network, binding_names::kPackedPrefillChunkLimit);
 
     // DFlash/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
     // (capPadded / kTOKENS_PER_PAGE) to split its pool-shaped past_key_value binding's
@@ -626,7 +628,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     }
     else
     {
-        result &= setupVanillaProfiles(*contextProfile, *generationProfile, maxPrefillBatchSize, maxPrefillChunkTokens);
+        result &= setupVanillaProfiles(
+            *contextProfile, *generationProfile, network, maxPrefillBatchSize, maxPrefillChunkTokens);
     }
 
     // Setup hybrid state profiles for MTP/DFlash/DSpark base models.
@@ -666,7 +669,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         int64_t const maxVisionPrefillBatchSize = mBuilderConfig.getMaxVisionPrefillBatchSize();
         int64_t const maxVisionPrefillChunkTokens
             = validateMaxPackedPrefillChunkTokens(mBuilderConfig.maxVisionPrefillChunkTokens);
-        if (maxVisionPrefillChunkTokens != maxPrefillChunkTokens)
+        if (maxVisionPrefillChunkTokens != maxPrefillChunkTokens
+            && !mBuilderConfig.profileLocalPackedPrefillChunkLimit)
         {
             LOG_ERROR(
                 "The attention plugin does not support profile-local packed-prefill chunk limits. Text and external "
@@ -676,8 +680,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         }
         result &= setupCommonProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
         result &= setupRopeProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
-        result &= setupVanillaProfiles(
-            *visionPrefillProfile, *generationProfile, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
+        result &= setupVanillaProfiles(*visionPrefillProfile, *generationProfile, network,
+            maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
         result &= setupPleProfiles(
             *visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
         result &= setupDeepstackProfiles(
@@ -861,12 +865,21 @@ bool LLMBuilder::setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& 
 }
 
 bool LLMBuilder::setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-    nvinfer1::IOptimizationProfile& generationProfile, int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens)
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+    int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens)
 {
     bool result = true;
     int64_t const maxDecodeBatchSize = mBuilderConfig.getMaxDecodeBatchSize();
     bool const packedPrefill = mModelConfig.value("packed_prefill", false);
     int64_t const maxPackedTokens = maxPrefillBatchSize * maxPrefillChunkTokens;
+
+    if (hasInputBinding(network, binding_names::kPackedPrefillChunkLimit))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kPackedPrefillChunkLimit, createDims({1}),
+            createDims({std::max<int64_t>(1, maxPrefillChunkTokens / 2)}), createDims({maxPrefillChunkTokens}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kPackedPrefillChunkLimit,
+            createDims({1}), createDims({1}), createDims({1}));
+    }
 
     // Input embeddings - always dynamic
     if (packedPrefill)

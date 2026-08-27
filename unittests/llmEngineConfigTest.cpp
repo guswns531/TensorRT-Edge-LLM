@@ -164,11 +164,12 @@ TEST_F(LLMEngineConfigTest, ParsesPackedPrefillContractAndDims)
     LLMEngineConfig const config = parseEngineConfig(path);
     EXPECT_TRUE(config.packedPrefill);
     EXPECT_EQ(config.maxPackedPrefillChunkTokens, 64);
-    InferenceDims const dims = config.packedPrefillDims(2, 96);
+    InferenceDims const dims = config.packedPrefillDims(2, 96, 64);
     EXPECT_EQ(dims.batch, 2);
     EXPECT_EQ(dims.tokenBatch, 1);
     EXPECT_EQ(dims.seqLen, 96);
     EXPECT_EQ(dims.selectLen, 2);
+    EXPECT_EQ(dims.attnMaskSeqLen, 64);
     EXPECT_EQ(dims.startIndexLen, 2);
 }
 
@@ -195,13 +196,13 @@ TEST_F(LLMEngineConfigTest, ParsesDedicatedVisionPrefillProfileAndDims)
     EXPECT_EQ(config.visionPrefillProfile, 2);
     EXPECT_EQ(config.maxSupportedVisionPrefillBatchSize, 4);
     EXPECT_EQ(config.maxVisionPackedPrefillChunkTokens, 1024);
-    EXPECT_EQ(config.packedPrefillDims(8, 1024).seqLen, 1024);
-    EXPECT_EQ(config.visionPackedPrefillDims(4, 4096).seqLen, 4096);
-    EXPECT_THROW(config.packedPrefillDims(1, 1025), std::runtime_error);
-    EXPECT_THROW(config.visionPackedPrefillDims(5, 1024), std::runtime_error);
+    EXPECT_EQ(config.packedPrefillDims(8, 1024, 128).seqLen, 1024);
+    EXPECT_EQ(config.visionPackedPrefillDims(4, 4096, 1024).seqLen, 4096);
+    EXPECT_THROW(config.packedPrefillDims(1, 1025, 1025), std::runtime_error);
+    EXPECT_THROW(config.visionPackedPrefillDims(5, 1024, 1024), std::runtime_error);
 }
 
-TEST_F(LLMEngineConfigTest, RejectsProfileLocalPackedPrefillChunkLimits)
+TEST_F(LLMEngineConfigTest, RejectsProfileLocalPackedPrefillChunkLimitsWithoutCarrier)
 {
     Json json = makeMinimalConfig();
     json["head_dim"] = 128;
@@ -219,6 +220,30 @@ TEST_F(LLMEngineConfigTest, RejectsProfileLocalPackedPrefillChunkLimits)
     auto const path = writeJsonToTempFile(json);
 
     EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, ParsesProfileLocalPackedPrefillChunkLimits)
+{
+    Json json = makeMinimalConfig();
+    json["head_dim"] = 128;
+    json["packed_prefill"] = true;
+    json["packed_prefill_max_chunk_tokens"] = 1024;
+    json["builder_config"]["max_batch_size"] = 8;
+    json["builder_config"]["max_prefill_batch_size"] = 8;
+    json["builder_config"]["max_kv_cache_capacity"] = 1024;
+    json["builder_config"]["max_kv_pool_pages"] = 64;
+    json["builder_config"]["max_input_len"] = 1024;
+    json["builder_config"]["max_prefill_chunk_tokens"] = 128;
+    json["builder_config"]["max_vision_prefill_batch_size"] = 4;
+    json["builder_config"]["max_vision_prefill_chunk_tokens"] = 1024;
+    json["builder_config"]["vision_prefill_profile"] = 2;
+    json["builder_config"]["profile_local_packed_prefill_chunk_limit"] = true;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const config = parseEngineConfig(path);
+    EXPECT_TRUE(config.profileLocalPackedPrefillChunkLimit);
+    EXPECT_EQ(config.packedPrefillDims(8, 768, 96).attnMaskSeqLen, 128);
+    EXPECT_EQ(config.visionPackedPrefillDims(4, 3072, 768).attnMaskSeqLen, 1024);
 }
 
 TEST_F(LLMEngineConfigTest, RejectsPartialVisionPrefillProfileMetadata)

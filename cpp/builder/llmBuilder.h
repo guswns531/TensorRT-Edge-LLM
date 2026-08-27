@@ -62,6 +62,8 @@ struct LLMBuilderConfig
     int64_t maxVisionPrefillChunkTokens{};
     //! Maximum logical rows in the optional external-producer prefill profile.
     int64_t maxVisionPrefillBatchSize{};
+    //! ONNX exposes the shape-only carrier required for profile-local packed row limits.
+    bool profileLocalPackedPrefillChunkLimit{};
 
     //! Resolve the exact physical K-page count serialized into the engine binding shape.
     //! @return `maxKVPoolPages`, or the minimum active pages when it is zero
@@ -113,6 +115,10 @@ struct LLMBuilderConfig
             json["allow_kv_pool_undercommit"] = true;
         }
         json["max_prefill_chunk_tokens"] = maxPrefillChunkTokens;
+        if (profileLocalPackedPrefillChunkLimit)
+        {
+            json["profile_local_packed_prefill_chunk_limit"] = true;
+        }
         if (hasVisionPrefillProfile())
         {
             json["max_vision_prefill_chunk_tokens"] = maxVisionPrefillChunkTokens;
@@ -197,6 +203,10 @@ struct LLMBuilderConfig
         if (json.contains("max_vision_prefill_batch_size"))
         {
             config.maxVisionPrefillBatchSize = json["max_vision_prefill_batch_size"];
+        }
+        if (json.contains("profile_local_packed_prefill_chunk_limit"))
+        {
+            config.profileLocalPackedPrefillChunkLimit = json["profile_local_packed_prefill_chunk_limit"];
         }
         if (json.contains("max_verify_tree_size"))
         {
@@ -337,7 +347,8 @@ private:
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
     bool setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
-        nvinfer1::IOptimizationProfile& generationProfile, int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens);
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
+        int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens);
 
     //! Maximum logical row length encoded by a packed-prefill ONNX graph.
     int64_t getMaxPackedPrefillChunkTokens() const;

@@ -315,6 +315,10 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
     {
         map.set(binding_names::kSkipSoftmaxScale, io.skipSoftmaxScale);
     }
+    if (!io.packedPrefillChunkLimit.isEmpty())
+    {
+        map.set(binding_names::kPackedPrefillChunkLimit, io.packedPrefillChunkLimit);
+    }
     if (!io.specTreeParentIds.isEmpty())
     {
         map.set(binding_names::kTreeParentIds, io.specTreeParentIds);
@@ -479,6 +483,10 @@ PipelineIO PipelineIO::createForLLMPhase(
     // Runtime skip-softmax override carrier (shape-only).
     io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
+    io.packedPrefillChunkLimit
+        = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::packedPrefillChunkLimit");
+    CUDA_CHECK(cudaMemsetAsync(io.packedPrefillChunkLimit.rawPointer(), 0,
+        io.packedPrefillChunkLimit.getMemoryCapacity(), stream));
 
     return io;
 }
@@ -564,6 +572,10 @@ PipelineIO PipelineIO::createForSpecDecode(
 
     io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
+    io.packedPrefillChunkLimit
+        = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::packedPrefillChunkLimit");
+    CUDA_CHECK(cudaMemsetAsync(io.packedPrefillChunkLimit.rawPointer(), 0,
+        io.packedPrefillChunkLimit.getMemoryCapacity(), stream));
 
     bool const useSpecTree
         = (bundle.specDecodeMode() == SpecDecodeMode::kDFlash || bundle.specDecodeMode() == SpecDecodeMode::kMTP)

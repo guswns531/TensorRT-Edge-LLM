@@ -142,6 +142,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
     reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+    if (cfg.profileLocalPackedPrefillChunkLimit)
+    {
+        reg.addTensor({binding_names::kPackedPrefillChunkLimit, TensorIO::kInput, nvinfer1::DataType::kINT8,
+            {sym(&InferenceDims::attnMaskSeqLen)}});
+    }
 
     if (cfg.useVisionBidirectionalAttention)
     {

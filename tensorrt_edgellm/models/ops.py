@@ -120,6 +120,10 @@ def attention_plugin(
     enable_packed_prefill: int = 0,
     # Maximum logical row length compiled into the packed attention kernel.
     packed_prefill_max_chunk_tokens: int = 128,
+    # Shape-only INT8 carrier. Its runtime length is the selected profile's
+    # fixed packed chunk limit, allowing one engine to use asymmetric profiles
+    # without relying on an unavailable runtime profile index.
+    packed_prefill_chunk_limit: Optional[torch.Tensor] = None,
     # Runtime skip-softmax override carrier: 1-D INT8 dummy whose LENGTH encodes the
     # runtime scale-factor override (0 = keep the engine default). Default None so
     # torch.export strips it for models that do not wire the runtime knob.
@@ -226,6 +230,7 @@ def _(
     enable_kv_shared=0,
     enable_packed_prefill=0,
     packed_prefill_max_chunk_tokens=128,
+    packed_prefill_chunk_limit=None,
     skip_softmax_scale=None,
 ):
     batch_size, seq_len, _ = qkv.shape

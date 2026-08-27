@@ -204,6 +204,7 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
     }
     mPrefillKV.prepare(slots, stream);
     int32_t const chunkLength = chunks.front();
+    int32_t const maxRowTokens = *std::max_element(chunks.begin(), chunks.end());
     if (!mConfig.packedPrefill)
     {
         ELLM_CHECK(
@@ -228,8 +229,9 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
     InferenceDims const dims = mConfig.packedPrefill
         ? (externalPrefill && mConfig.hasVisionPrefillProfile()
-                  ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens)
-                  : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens))
+                  ? mConfig.visionPackedPrefillDims(
+                      static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens)
+                  : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens))
         : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);
     ELLM_CHECK(executor.prepare(profileIndex, dims, mPrefillMap, stream), "Independent prefill prepare failed");
     int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;

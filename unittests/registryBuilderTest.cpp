@@ -771,7 +771,8 @@ TEST(RegistryBuilderTest, PackedPrefillSeparatesLogicalAndTokenCarrierBatch)
     ASSERT_NE(inputs, specs.end());
     ASSERT_NE(contexts, specs.end());
 
-    InferenceDims const dims = cfg.packedPrefillDims(/*logicalBatch=*/4, /*totalTokens=*/384);
+    InferenceDims const dims
+        = cfg.packedPrefillDims(/*logicalBatch=*/4, /*totalTokens=*/384, /*maxRowTokens=*/128);
     nvinfer1::Dims const inputShape = reg.resolveShape(inputs->shape, dims);
     nvinfer1::Dims const contextShape = reg.resolveShape(contexts->shape, dims);
     EXPECT_EQ(inputShape.d[0], 1);

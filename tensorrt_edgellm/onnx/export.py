@@ -265,7 +265,8 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     _CONTEXT_MASK_SELECTOR_POSITION = 8
     _ATTENTION_MASK_POSITION = 9
     _ATTENTION_POS_ID_POSITION = 10
-    _SKIP_SCALE_POSITION = 11
+    _PACKED_CHUNK_LIMIT_POSITION = 11
+    _SKIP_SCALE_POSITION = 12
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
     dropped_gamma_tensors: set = set()
@@ -284,6 +285,10 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         vision_block_attn = next(
             (a.i for a in node.attribute
              if a.name == "enable_vision_block_attention"),
+            0,
+        )
+        packed_prefill = next(
+            (a.i for a in node.attribute if a.name == "enable_packed_prefill"),
             0,
         )
         qk_norm = next(
@@ -315,6 +320,10 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             ])
         elif vision_block_attn:
             new_inputs.append(get_input(_ATTENTION_MASK_POSITION))
+        if packed_prefill:
+            packed_chunk_input = get_input(_PACKED_CHUNK_LIMIT_POSITION)
+            if packed_chunk_input:
+                new_inputs.append(packed_chunk_input)
         # Trailing runtime skip-softmax override carrier (shape-only INT8 input),
         # emitted last by the translation; kept iff skip-softmax is enabled
         # (scale factor > 0).

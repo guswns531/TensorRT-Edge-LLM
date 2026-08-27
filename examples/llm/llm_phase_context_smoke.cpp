@@ -730,7 +730,8 @@ int main(int argc, char** argv)
             decodeKV.prepareDecodeMetadata(*decodeIO, decodeStream);
 
             rt::InferenceDims const prefillDims = config.packedPrefill
-                ? config.packedPrefillDims(static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens)
+                ? config.packedPrefillDims(
+                      static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens, /*maxRowTokens=*/96)
                 : config.prefillDims(1, prefillTotalTokens, false);
             ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
                 "Failed to bind the stable paged-KV prefill view");
@@ -790,8 +791,8 @@ int main(int argc, char** argv)
                 }
                 prefillKV.preparePrefillMetadata(*prefillIO, {visionWarmupTokens}, prefillStream, true);
                 rt::InferenceDims const externalDims = config.hasVisionPrefillProfile()
-                    ? config.visionPackedPrefillDims(1, visionWarmupTokens)
-                    : config.packedPrefillDims(1, visionWarmupTokens);
+                    ? config.visionPackedPrefillDims(1, visionWarmupTokens, visionWarmupTokens)
+                    : config.packedPrefillDims(1, visionWarmupTokens, visionWarmupTokens);
                 ELLM_CHECK(pair->externalPrefillExecutor().prepare(
                                pair->externalPrefillProfile(), externalDims, prefillMap, prefillStream),
                     "Failed to prepare the external-prefill profile warmup");

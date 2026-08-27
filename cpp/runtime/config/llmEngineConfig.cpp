@@ -616,6 +616,8 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.maxSupportedVisionPrefillBatchSize = builderConfig.value("max_vision_prefill_batch_size", 0);
     cfg.maxVisionPackedPrefillChunkTokens = builderConfig.value("max_vision_prefill_chunk_tokens", 0);
     cfg.visionPrefillProfile = builderConfig.value("vision_prefill_profile", -1);
+    cfg.profileLocalPackedPrefillChunkLimit
+        = builderConfig.value("profile_local_packed_prefill_chunk_limit", false);
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
@@ -750,10 +752,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
             ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
                     && cfg.maxVisionPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
                 "vision prefill max chunk exceeds the export or input limit.");
-            ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens == cfg.maxPackedPrefillChunkTokens,
-                "The attention plugin does not support profile-local packed-prefill chunk limits. Text and external "
-                "prefill profiles must use the same max chunk token count; use dedicated execution contexts on the "
-                "shared prefill profile instead.");
+            ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens == cfg.maxPackedPrefillChunkTokens
+                    || cfg.profileLocalPackedPrefillChunkLimit,
+                "Asymmetric packed-prefill profiles require the profile-local chunk-limit carrier.");
         }
     }
     else
@@ -1027,34 +1028,43 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     };
 }
 
-InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const
+InferenceDims LLMEngineConfig::packedPrefillDims(
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const
 {
     ELLM_CHECK(packedPrefill, "packedPrefillDims requires a packed-prefill engine");
     int32_t const prefillBatchLimit
         = maxSupportedPrefillBatchSize > 0 ? maxSupportedPrefillBatchSize : maxSupportedBatchSize;
-    return packedPrefillDimsWithLimits(logicalBatch, totalTokens, prefillBatchLimit, maxPackedPrefillChunkTokens);
+    return packedPrefillDimsWithLimits(
+        logicalBatch, totalTokens, maxRowTokens, prefillBatchLimit, maxPackedPrefillChunkTokens);
 }
 
-InferenceDims LLMEngineConfig::visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const
+InferenceDims LLMEngineConfig::visionPackedPrefillDims(
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const
 {
     ELLM_CHECK(hasVisionPrefillProfile(), "visionPackedPrefillDims requires an external-prefill profile");
-    return packedPrefillDimsWithLimits(
-        logicalBatch, totalTokens, maxSupportedVisionPrefillBatchSize, maxVisionPackedPrefillChunkTokens);
+    return packedPrefillDimsWithLimits(logicalBatch, totalTokens, maxRowTokens,
+        maxSupportedVisionPrefillBatchSize, maxVisionPackedPrefillChunkTokens);
 }
 
 InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(
-    int64_t logicalBatch, int64_t totalTokens, int32_t batchLimit, int32_t chunkLimit) const
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const
 {
     ELLM_CHECK(logicalBatch > 0 && logicalBatch <= batchLimit, "packed prefill logical batch is out of range");
     ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * chunkLimit,
         "packed prefill token carrier exceeds the configured profile limit");
+    ELLM_CHECK(maxRowTokens > 0 && maxRowTokens <= chunkLimit && maxRowTokens <= totalTokens,
+        "packed prefill maximum row length is out of range");
     return InferenceDims{
         /*.batch=*/logicalBatch,
         /*.tokenBatch=*/1,
         /*.seqLen=*/totalTokens,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/logicalBatch,
-        /*.attnMaskSeqLen=*/1,
+        // This shape-only carrier communicates the fixed contract of the
+        // selected optimization profile.  Keep it stable across dispatches;
+        // using the observed row length here changes dense-FMHA runner
+        // selection and breaks cross-engine greedy determinism.
+        /*.attnMaskSeqLen=*/chunkLimit,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? logicalBatch : 1,
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,
@@ -1277,6 +1287,10 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
 {
     validatePagedKVBindings(config, executor, engineLabel);
     validatePageTableBinding(config, executor, engineLabel);
+    bool const engineHasPackedChunkLimit = executor.hasIOTensor(binding_names::kPackedPrefillChunkLimit);
+    ELLM_CHECK(engineHasPackedChunkLimit == config.profileLocalPackedPrefillChunkLimit,
+        std::string("Packed-prefill profile-local chunk contract mismatch (") + engineLabel
+            + "): engine binding and builder metadata disagree; rebuild the engine and config together.");
 
     if (isDFlashDraftConfig(config))
     {

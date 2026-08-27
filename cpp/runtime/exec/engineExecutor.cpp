@@ -106,6 +106,12 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
         mRegistry.addTensor({binding_names::kSkipSoftmaxScale, TensorIO::kInput, nvinfer1::DataType::kINT8,
             {sym(&InferenceDims::skipSoftmaxScaleLen)}});
     }
+    if (engineHasInputTensor(*mEngineState->engine, binding_names::kPackedPrefillChunkLimit)
+        && !mRegistry.contains(binding_names::kPackedPrefillChunkLimit))
+    {
+        mRegistry.addTensor({binding_names::kPackedPrefillChunkLimit, TensorIO::kInput, nvinfer1::DataType::kINT8,
+            {sym(&InferenceDims::attnMaskSeqLen)}});
+    }
 
     LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngineState->engine->getNbIOTensors());
 }

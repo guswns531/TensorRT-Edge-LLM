@@ -100,6 +100,7 @@ struct LLMEngineConfig
     int32_t maxSupportedVisionPrefillBatchSize{}; //!< Maximum rows accepted by the external-prefill profile
     int32_t maxVisionPackedPrefillChunkTokens{};  //!< Maximum logical row length for external prefill
     int32_t visionPrefillProfile{-1};             //!< Optional external-prefill TensorRT profile index
+    bool profileLocalPackedPrefillChunkLimit{};   //!< Engine carries the selected profile's packed chunk limit
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
@@ -252,10 +253,10 @@ struct LLMEngineConfig
 
     //! Packed text prefill dims. Tokens use a [1,totalTokens,*] carrier while
     //! context lengths, page-table rows, and KV starts retain logicalBatch rows.
-    InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const;
+    InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
 
     //! Packed external-producer prefill dims, using the optional wider profile.
-    InferenceDims visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens) const;
+    InferenceDims visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
 
     //! Whether this engine carries a distinct external-producer prefill profile.
     bool hasVisionPrefillProfile() const noexcept
@@ -300,7 +301,7 @@ struct LLMEngineConfig
 
 private:
     InferenceDims packedPrefillDimsWithLimits(
-        int64_t logicalBatch, int64_t totalTokens, int32_t batchLimit, int32_t chunkLimit) const;
+        int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const;
 };
 
 //! Parse a `config.json` file (the same format used by the existing runtime)

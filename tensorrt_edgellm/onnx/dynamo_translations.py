@@ -78,6 +78,7 @@ def _attention_plugin_translation(
     enable_kv_shared: int = 0,
     enable_packed_prefill: int = 0,
     packed_prefill_max_chunk_tokens: int = 128,
+    packed_prefill_chunk_limit: onnxscript.INT8 = None,
     skip_softmax_scale: onnxscript.INT8 = None,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
@@ -110,6 +111,7 @@ def _attention_plugin_translation(
         context_mask_selector,
         attention_mask,
         attention_pos_id,
+        packed_prefill_chunk_limit,
         skip_softmax_scale,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -126,6 +128,7 @@ def _attention_plugin_translation(
         enable_qk_norm=enable_qk_norm,
         enable_kv_shared=enable_kv_shared,
         enable_packed_prefill=enable_packed_prefill,
+        enable_profile_local_packed_prefill=enable_packed_prefill,
         packed_prefill_max_chunk_tokens=packed_prefill_max_chunk_tokens,
         _outputs=2,
     )

@@ -1901,7 +1901,7 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context,
     // runtime-dynamic; prefillDims uses it to set InferenceDims::startIndexLen
     // (0 for the "initial prefill" sentinel, else batch).
     auto const prefillDims = packedPrefill
-        ? mDeployment.base.packedPrefillDims(activeBatchSize, totalInputTokens)
+        ? mDeployment.base.packedPrefillDims(activeBatchSize, totalInputTokens, inputIdsLength)
         : mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
 
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),

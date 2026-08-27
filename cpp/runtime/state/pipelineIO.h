@@ -110,6 +110,8 @@ struct PipelineIO
     //! Shape-only runtime skip-softmax override carrier (data never read); bound
     //! with shape [S] where S comes from LLMEngineConfig::skipSoftmaxScaleOverride.
     Tensor skipSoftmaxScale;
+    //! Shape-only selected-profile packed-prefill chunk-limit carrier. Data is never read.
+    Tensor packedPrefillChunkLimit;
     //! DDTree parent node ids, [batch, proposalSize] INT32. Runtime-owned
     //! metadata for tree attention and hybrid state plugin bindings.
     Tensor specTreeParentIds;

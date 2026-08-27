@@ -105,6 +105,7 @@ constexpr int32_t kNUM_QK_NORM_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
+constexpr int32_t kNUM_PACKED_PREFILL_CHUNK_LIMIT_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_SKIP_SCALE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
@@ -132,6 +133,16 @@ constexpr int32_t attnPosIdInputIdx(bool enableQKNorm, bool enableContextMaskSel
     return attnMaskInputIdx(enableQKNorm, enableContextMaskSelector) + 1;
 }
 constexpr int32_t skipSoftmaxScaleInputIdx(
+    bool enableQKNorm, bool enableContextMaskSelector, bool enableTreeAttention, bool enableVisionBlock,
+    bool enableProfileLocalPackedPrefill)
+{
+    return attnMaskInputIdx(enableQKNorm, enableContextMaskSelector)
+        + (enableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (enableVisionBlock ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
+        + (enableProfileLocalPackedPrefill ? kNUM_PACKED_PREFILL_CHUNK_LIMIT_OPTIONAL_INPUTS : 0);
+}
+
+constexpr int32_t packedPrefillChunkLimitInputIdx(
     bool enableQKNorm, bool enableContextMaskSelector, bool enableTreeAttention, bool enableVisionBlock)
 {
     return attnMaskInputIdx(enableQKNorm, enableContextMaskSelector)
@@ -467,7 +478,8 @@ void AttentionPlugin::enforceVisionBlockKernelSupport() const
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
     int32_t enableContextMaskSelector, int32_t slidingWindowSize, std::vector<float> const& qkvScales,
-    std::optional<float> attentionScale, int32_t enablePackedPrefill, int32_t packedPrefillMaxChunkTokens)
+    std::optional<float> attentionScale, int32_t enablePackedPrefill, int32_t packedPrefillMaxChunkTokens,
+    int32_t enableProfileLocalPackedPrefill)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
@@ -477,6 +489,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mEnableVisionBlockAttention(enableVisionBlockAttention)
     , mEnablePackedPrefill(enablePackedPrefill)
     , mPackedPrefillMaxChunkTokens(packedPrefillMaxChunkTokens)
+    , mEnableProfileLocalPackedPrefill(enableProfileLocalPackedPrefill)
     , mEnableFp8KVCache(enableFp8KVCache)
     , mEnableContextMaskSelector(enableContextMaskSelector)
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
@@ -499,6 +512,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         "Packed prefill v1 does not support sliding-window attention.");
     ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
         "Packed prefill maximum chunk length must be positive.");
+    ELLM_CHECK(!mEnableProfileLocalPackedPrefill || mEnablePackedPrefill,
+        "Profile-local packed-prefill chunk input requires packed prefill.");
     ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
         "Vision block attention does not support an FP8 KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || mQkvScales.size() == 3,
@@ -589,6 +604,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mEnableKVShared(parsePluginScalarField<int32_t>("enable_kv_shared", fc).value_or(0))
     , mEnablePackedPrefill(parsePluginScalarField<int32_t>("enable_packed_prefill", fc).value_or(0))
     , mPackedPrefillMaxChunkTokens(parsePluginScalarField<int32_t>("packed_prefill_max_chunk_tokens", fc).value_or(128))
+    , mEnableProfileLocalPackedPrefill(
+          parsePluginScalarField<int32_t>("enable_profile_local_packed_prefill", fc).value_or(0))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
     , mSkipSoftmaxScaleFactor(parsePluginScalarField<float>("skip_softmax_scale_factor", fc).value_or(0.f))
@@ -612,6 +629,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         "Packed prefill v1 does not support sliding-window attention.");
     ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
         "Packed prefill maximum chunk length must be positive.");
+    ELLM_CHECK(!mEnableProfileLocalPackedPrefill || mEnablePackedPrefill,
+        "Profile-local packed-prefill chunk input requires packed prefill.");
     ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
         "Vision block attention does not support an FP8 KV cache.");
 
@@ -730,7 +749,7 @@ IPluginV3* AttentionPlugin::clone() noexcept
         // by construction.
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
             mEnableFp8KVCache, mEnableVisionBlockAttention, mEnableContextMaskSelector, mSlidingWindowSize, mQkvScales,
-            mAttentionScale, mEnablePackedPrefill, mPackedPrefillMaxChunkTokens);
+            mAttentionScale, mEnablePackedPrefill, mPackedPrefillMaxChunkTokens, mEnableProfileLocalPackedPrefill);
         p->mEnableQKNorm = mEnableQKNorm;
         p->mEnableKVShared = mEnableKVShared;
         p->mRmsNormEps = mRmsNormEps;
@@ -964,6 +983,7 @@ bool AttentionPlugin::supportsFormatCombination(
         + (mEnableContextMaskSelector ? kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS : 0)
         + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
+        + (mEnableProfileLocalPackedPrefill ? kNUM_PACKED_PREFILL_CHUNK_LIMIT_OPTIONAL_INPUTS : 0)
         + (mSkipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
@@ -1032,6 +1052,17 @@ bool AttentionPlugin::supportsFormatCombination(
                     result = checkVisionBlockIds(inOut[pos].desc);
                 }
                 currentOptionalInputIdx += kNUM_VISION_BLOCK_OPTIONAL_INPUTS;
+            }
+            if (mEnableProfileLocalPackedPrefill)
+            {
+                if (pos == currentOptionalInputIdx)
+                {
+                    // Shape-only carrier: its length is the selected profile's
+                    // packed-prefill chunk limit. The payload is ignored.
+                    result = inOut[pos].desc.type == DataType::kINT8
+                        && inOut[pos].desc.format == TensorFormat::kLINEAR && inOut[pos].desc.dims.nbDims == 1;
+                }
+                currentOptionalInputIdx += kNUM_PACKED_PREFILL_CHUNK_LIMIT_OPTIONAL_INPUTS;
             }
             if (mSkipSoftmaxScaleFactor > 0.F && pos == currentOptionalInputIdx)
             {
@@ -1168,6 +1199,17 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     bool const packedPrefill = mEnablePackedPrefill && physicalBatchSize == 1 && runtimeSeqLen > 1 && !sharedKV;
     int32_t const runtimeBatchSize
         = packedPrefill ? static_cast<int32_t>(contextLengthInputDesc.dims.d[0]) : physicalBatchSize;
+    int32_t packedPrefillChunkLimit = mPackedPrefillMaxChunkTokens;
+    if (packedPrefill && mEnableProfileLocalPackedPrefill)
+    {
+        int32_t const chunkLimitIdx = packedPrefillChunkLimitInputIdx(mEnableQKNorm != 0,
+            mEnableContextMaskSelector != 0, mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0);
+        packedPrefillChunkLimit = static_cast<int32_t>(inputDesc[chunkLimitIdx].dims.d[0]);
+        check::check(packedPrefillChunkLimit > 0,
+            "Packed prefill requires a positive profile-local chunk limit.");
+        check::check(packedPrefillChunkLimit <= mPackedPrefillMaxChunkTokens,
+            "Packed prefill runtime chunk limit exceeds the exported maximum.");
+    }
 
     rt::Tensor packedQKVTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
         rt::Coords{physicalBatchSize, runtimeSeqLen, combinedHeads, mHeadSize}, rt::DeviceType::kGPU,
@@ -1194,7 +1236,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     if (packedPrefill)
     {
         check::check(physicalBatchSize == 1, "Packed prefill QKV must have shape [1,totalTokens,C].");
-        check::check(runtimeSeqLen <= runtimeBatchSize * mPackedPrefillMaxChunkTokens,
+        check::check(runtimeSeqLen <= runtimeBatchSize * packedPrefillChunkLimit,
             "Packed prefill total tokens exceed logical batch times the configured maximum chunk length.");
     }
 
@@ -1267,7 +1309,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     if (mSkipSoftmaxScaleFactor > 0.F)
     {
         int32_t const skipScaleIdx = skipSoftmaxScaleInputIdx(mEnableQKNorm != 0, mEnableContextMaskSelector != 0,
-            mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0);
+            mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0, mEnableProfileLocalPackedPrefill != 0);
         int64_t const overrideS = inputDesc[skipScaleIdx].dims.d[0];
         if (overrideS > 0)
         {
@@ -1573,7 +1615,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             int32_t const preflightKVSeqLen
                 = useNativePagedFMHA ? kvCacheCapacity : (useSmallD64 ? runtimeSeqLen : kvCacheCapacity);
             int32_t const runnerSeqLen
-                = packedPrefill ? std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens) : runtimeSeqLen;
+                = packedPrefill ? std::min(runtimeSeqLen, packedPrefillChunkLimit) : runtimeSeqLen;
             CuteDslFMHAV2Runner runner(
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runnerSeqLen, preflightKVSeqLen, useSmallD64);
             int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
@@ -1791,7 +1833,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
             // FMHA-v2 always reads the RoPE-transformed Q from scratch.
             int32_t const denseSeqLen
-                = packedPrefill ? std::min(runtimeSeqLen, mPackedPrefillMaxChunkTokens) : runtimeSeqLen;
+                = packedPrefill ? std::min(runtimeSeqLen, packedPrefillChunkLimit) : runtimeSeqLen;
             qInputTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, denseSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             if (packedPrefill)
@@ -2011,6 +2053,8 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("enable_packed_prefill", &mEnablePackedPrefill, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "packed_prefill_max_chunk_tokens", &mPackedPrefillMaxChunkTokens, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_profile_local_packed_prefill", &mEnableProfileLocalPackedPrefill,
+        PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "enable_vision_block_attention", &mEnableVisionBlockAttention, PluginFieldType::kINT32, 1);
@@ -2050,6 +2094,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_kv_shared", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_packed_prefill", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("packed_prefill_max_chunk_tokens", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(
+        PluginField("enable_profile_local_packed_prefill", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_vision_block_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_context_mask_selector", nullptr, PluginFieldType::kINT32, 0));
