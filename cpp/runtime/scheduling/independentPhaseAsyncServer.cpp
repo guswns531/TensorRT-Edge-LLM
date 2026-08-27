@@ -734,6 +734,7 @@ bool IndependentPhaseAsyncServer::pollCompletions()
 bool IndependentPhaseAsyncServer::dispatchReady()
 {
     bool progressed{};
+    mCoordinator.scheduler().setPendingPrefillProducerRows(mExternalPendingRequests + mPendingAdapterRequests);
     bool const waitForDecodeRefill = shouldWaitForGlobalDecodeRefill();
     if (waitForDecodeRefill)
     {

@@ -295,6 +295,55 @@ TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
     EXPECT_NEAR(candidate->horizonReferenceWorkUs, 3280.0, 1.0e-3);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {
+        {1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setPendingPrefillProducerRows(1U);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    EXPECT_EQ(scheduler.queueSnapshot().prefillPendingProducerRows, 1U);
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 12000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 21000.0, 1.0e-3);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDoesNotSpeculateOnUnmeasuredPrefillFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setPendingPrefillProducerRows(1U);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_NEAR(candidate->predictedHorizonUs, 11000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 11000.0, 1.0e-3);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
 {
     PhaseGlobalActionCandidate first;
@@ -336,6 +385,47 @@ TEST(PhaseQueueSchedulerTest, GlobalDeadlineProtectsCompleteRemainingPrefillPath
 
     EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
     EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalExpiredTtftPreservesPackedPrefillFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.enablePrefillTtftHardGuard = true;
+    config.enableRaggedPrefillBatching = true;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints expired;
+    expired.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(10);
+    expired.ttftTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, expired});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({3, 128, 2, 0, 128});
+    scheduler.enqueueDecode({4, 128, 3});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kDecode);
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(plan.prefillBatch[1].requestId, 3U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalExpiredTtftSuppressesDecodeOnlyPreview)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enablePrefillTtftHardGuard = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints expired;
+    expired.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(10);
+    expired.ttftTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, expired});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    EXPECT_FALSE(scheduler.previewGlobalDecodeAction().has_value());
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalSelectionProtectsDecodeTpotInsteadOfFormationWait)

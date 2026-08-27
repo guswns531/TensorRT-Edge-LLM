@@ -250,6 +250,9 @@ struct PhaseSchedulerTelemetry
 struct PhaseQueueSnapshot
 {
     size_t prefillQueued{};
+    //! Requests already known to the serving facade whose host-side producer
+    //! may make another prefill row ready after the current GPU action.
+    size_t prefillPendingProducerRows{};
     size_t decodeQueued{};
     int32_t prefillCandidateTokens{};
     int64_t prefillRemainingTokens{};
@@ -714,6 +717,9 @@ public:
     void setDispatchBlocked(bool blocked) noexcept;
     //! Identify external vision-encoder contention for decode cost learning and selection.
     void setExternalEncoderActive(bool active) noexcept;
+    //! Publish known host-side producers so Global can price a bounded
+    //! D-first prefill-formation opportunity without a workload label.
+    void setPendingPrefillProducerRows(size_t rows) noexcept;
     //! Reset learned scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
@@ -801,6 +807,7 @@ private:
     bool mPrefillDispatchBlocked{};
     bool mDispatchBlocked{};
     bool mExternalEncoderActive{};
+    size_t mPendingPrefillProducerRows{};
     size_t mGlobalDecisionSequence{};
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};

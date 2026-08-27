@@ -360,6 +360,7 @@ void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
 PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
 {
     PhaseQueueSnapshot result{};
+    result.prefillPendingProducerRows = mPendingPrefillProducerRows;
     result.consecutiveDecodeBatches = mConsecutiveDecodeBatches;
     bool const hasDecodeWork = std::any_of(mDecodeQueue.begin(), mDecodeQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, false); });
@@ -518,6 +519,11 @@ void PhaseQueueScheduler::setDispatchBlocked(bool blocked) noexcept
 void PhaseQueueScheduler::setExternalEncoderActive(bool active) noexcept
 {
     mExternalEncoderActive = active;
+}
+
+void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t rows) noexcept
+{
+    mPendingPrefillProducerRows = rows;
 }
 
 PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const& state) const noexcept
@@ -1460,6 +1466,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         return (std::max(0, tokens) + contextBucketTokens - 1) / contextBucketTokens;
     };
 
+    bool const prefillDeadlineExpired = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U
+        && state.prefillMinTtftSlackUs <= 0.0;
     PhaseDispatchPlan const prefillPlan
         = state.prefillQueued > 0U ? previewMechanismPlan(PhaseDispatchKind::kPrefill) : PhaseDispatchPlan{};
     int32_t const prefillRows = static_cast<int32_t>(prefillPlan.prefillBatch.size());
@@ -1547,8 +1555,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     prefillKey.executionVariant = executionVariant(prefillKey, prefillUsefulTokens);
     decodeKey.executionVariant = executionVariant(decodeKey, 0);
 
-    auto prefillPrediction = [&]() -> Prediction {
-        if (std::optional<Prediction> const online = fromOnline(prefillKey))
+    auto predictPrefill = [&](PhaseGlobalActionKey const& key, int32_t rows, int32_t chunk, int32_t pastKV,
+                              bool initial, PhasePrefillClass phaseClass, int32_t candidateTokens) -> Prediction {
+        if (std::optional<Prediction> const online = fromOnline(key))
         {
             return *online;
         }
@@ -1557,13 +1566,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
         {
             bool const classCompatible
-                = cost.prefillClass == PhasePrefillClass::kAny || cost.prefillClass == prefillClass;
-            if (!classCompatible || cost.initialChunk != prefillInitial || cost.chunkLength < prefillChunk
-                || cost.maxPastKVLength < prefillPastKV || cost.maxConcurrentDecodeBatchSize != 0)
+                = cost.prefillClass == PhasePrefillClass::kAny || cost.prefillClass == phaseClass;
+            if (!classCompatible || cost.initialChunk != initial || cost.chunkLength < chunk
+                || cost.maxPastKVLength < pastKV || cost.maxConcurrentDecodeBatchSize != 0)
             {
                 continue;
             }
-            if (cost.batchSize >= prefillRows
+            if (cost.batchSize >= rows
                 && (selected == nullptr || cost.batchSize < selected->batchSize
                     || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
             {
@@ -1578,10 +1587,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         }
         double const fallbackMs = std::max(0.001,
             static_cast<double>(mConfig.globalColdPrefillMsPerToken)
-                * static_cast<double>(std::max(1, state.prefillCandidateTokens)));
+                * static_cast<double>(std::max(1, candidateTokens)));
         double const makespanMs = selected != nullptr ? selected->p95GpuMs : fallbackMs;
         double const referenceMs
-            = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * prefillRows : makespanMs;
+            = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * rows : makespanMs;
         double const uncertaintyMs = selected != nullptr ? 0.0 : mConfig.globalCostModelConfig.coldStartUncertaintyMs;
         return {makespanMs * 1000.0, uncertaintyMs * 1000.0, referenceMs * 1000.0, selected != nullptr};
     };
@@ -1621,10 +1630,53 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         return {makespanMs * 1000.0, uncertaintyMs * 1000.0, referenceMs * 1000.0, selected != nullptr};
     };
 
-    std::optional<Prediction> const prefill
-        = prefillRows > 0 ? std::optional<Prediction>(prefillPrediction()) : std::nullopt;
+    std::optional<Prediction> const prefill = prefillRows > 0
+        ? std::optional<Prediction>(predictPrefill(prefillKey, prefillRows, prefillChunk, prefillPastKV, prefillInitial,
+            prefillClass, prefillUsefulTokens))
+        : std::nullopt;
     std::optional<Prediction> const decode
         = decodeRows > 0 ? std::optional<Prediction>(decodePrediction()) : std::nullopt;
+    struct PrefillFormationPrediction
+    {
+        Prediction combined;
+        Prediction residual;
+    };
+    std::optional<PrefillFormationPrediction> prefillFormation;
+    if (prefill.has_value() && decode.has_value() && state.prefillPendingProducerRows > 0U)
+    {
+        int32_t formationCapacityRows = mConfig.maxPrefillBatchSize;
+        if (mConfig.maxPrefillBatchTokens > 0)
+        {
+            int32_t const tokenCapacityRows
+                = std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, prefillChunk));
+            formationCapacityRows = std::min(formationCapacityRows, tokenCapacityRows);
+        }
+        size_t const boundedPendingRows
+            = std::min(state.prefillPendingProducerRows, static_cast<size_t>(std::numeric_limits<int32_t>::max()));
+        int32_t const pendingRows = static_cast<int32_t>(boundedPendingRows);
+        int32_t const combinedRows = std::min(formationCapacityRows, prefillRows + pendingRows);
+        int32_t const residualRows = combinedRows - prefillRows;
+        if (residualRows > 0)
+        {
+            PhaseGlobalActionKey combinedKey = prefillKey;
+            combinedKey.primaryBatchSize = combinedRows;
+            int32_t const combinedTokens = prefillUsefulTokens + residualRows * std::max(1, prefillChunk);
+            combinedKey.executionVariant = executionVariant(combinedKey, combinedTokens);
+            Prediction const combined = predictPrefill(combinedKey, combinedRows, prefillChunk, prefillPastKV,
+                prefillInitial, prefillClass, combinedTokens);
+
+            PhaseGlobalActionKey residualKey = prefillKey;
+            residualKey.primaryBatchSize = residualRows;
+            int32_t const residualTokens = residualRows * std::max(1, prefillChunk);
+            residualKey.executionVariant = executionVariant(residualKey, residualTokens);
+            Prediction const residual = predictPrefill(residualKey, residualRows, prefillChunk, prefillPastKV,
+                prefillInitial, prefillClass, residualTokens);
+            if (combined.directlyKnown && residual.directlyKnown)
+            {
+                prefillFormation = PrefillFormationPrediction{combined, residual};
+            }
+        }
+    }
     double const prefillSlack
         = state.prefillQueued > 0U ? state.prefillMinTtftSlackUs : std::numeric_limits<double>::infinity();
     // Queue formation latency controls when a D cohort is released; it is not
@@ -1684,7 +1736,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         protect(candidate, protectedPrefillAdvance(prefillPlan.prefillBatch), *prefill);
         candidates.push_back(std::move(candidate));
     }
-    if (allowDecode && decode.has_value())
+    if (allowDecode && decode.has_value() && !prefillDeadlineExpired)
     {
         PhaseGlobalActionCandidate candidate;
         candidate.key = decodeKey;
@@ -1708,15 +1760,46 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         // launch even though that choice fragments the other phase's next
         // cohort. The common two-action horizon changes only ranking; request
         // rows, deadline protection, and the dispatched action remain exact.
-        double const serialHorizonUs = prefill->makespanUs + decode->makespanUs;
-        double const serialReferenceWorkUs = prefill->referenceWorkUs + decode->referenceWorkUs;
+        double prefillFirstHorizonUs = prefill->makespanUs + decode->makespanUs;
+        double decodeFirstHorizonUs = prefillFirstHorizonUs;
+        double serialReferenceWorkUs = prefill->referenceWorkUs + decode->referenceWorkUs;
+        if (prefillFormation.has_value())
+        {
+            // A known host-side producer can make more compatible rows ready
+            // while D is useful GPU work. Compare the same rows in both
+            // orders: P-now + D + residual-P versus D + combined-P. Unknown
+            // shapes retain the ordinary two-action horizon.
+            prefillFirstHorizonUs += prefillFormation->residual.makespanUs;
+            decodeFirstHorizonUs = decode->makespanUs + prefillFormation->combined.makespanUs;
+            serialReferenceWorkUs = decode->referenceWorkUs
+                + std::max(prefill->referenceWorkUs + prefillFormation->residual.referenceWorkUs,
+                    prefillFormation->combined.referenceWorkUs);
+        }
         for (PhaseGlobalActionCandidate& candidate : candidates)
         {
-            if (candidate.key.kind == PhaseGlobalActionKind::kPrefill
-                || candidate.key.kind == PhaseGlobalActionKind::kDecode)
+            if (candidate.key.kind == PhaseGlobalActionKind::kPrefill)
             {
-                candidate.predictedHorizonUs = serialHorizonUs;
+                candidate.predictedHorizonUs = prefillFirstHorizonUs;
                 candidate.horizonReferenceWorkUs = serialReferenceWorkUs;
+            }
+            else if (candidate.key.kind == PhaseGlobalActionKind::kDecode)
+            {
+                candidate.predictedHorizonUs = decodeFirstHorizonUs;
+                candidate.horizonReferenceWorkUs = serialReferenceWorkUs;
+                if (prefillFormation.has_value() && !candidate.protectedCompletions.empty())
+                {
+                    int32_t const futureChunkTokens = std::max(1, mConfig.maxPrefillChunkTokens);
+                    int32_t const residualTokens
+                        = std::max(0, state.prefillCriticalPathRemainingTokens - futureChunkTokens);
+                    int32_t const residualTurns
+                        = (residualTokens + futureChunkTokens - 1) / futureChunkTokens;
+                    candidate.protectedCompletions.front().predictedCompletionUs = decode->makespanUs
+                        + prefillFormation->combined.makespanUs
+                        + static_cast<double>(residualTurns) * prefill->makespanUs;
+                    candidate.protectedCompletions.front().uncertaintyUs = decode->uncertaintyUs
+                        + prefillFormation->combined.uncertaintyUs
+                        + static_cast<double>(residualTurns) * prefill->uncertaintyUs;
+                }
             }
         }
     }
