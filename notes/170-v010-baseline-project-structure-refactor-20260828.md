@@ -405,3 +405,10 @@ text-heavy의 전체 TTFT p95만 `+3.63%`였지만, class별 text와 vision TTFT
 나머지 9개 single control에서 처리량 최악은 poisson `-0.52%`였고, 모든 latency p95는 gate 안이었다.
 12개 workload 모두 completion, golden token hash와 peak-memory contract를 유지했다. trace와 HTTP 계약이
 같으므로 vLLM fresh 결과는 다시 실행하지 않았다.
+
+후속 R2c에서 async server/admission 옵션 140줄도 두 번째 statement fragment로 옮겼으나 승인하지 않았다.
+민감 workload 3회 측정에서 R2b 대비 long-prefill 처리량 `-3.41%`, E2E p95 `+4.73%`가 나타났고, R2c를
+되돌린 직후 R2b를 다시 측정한 adjacent control에서도 처리량 차이 `-3.44%`, E2E p95 `+3.65%`가
+재현됐다. 따라서 이는 장기 환경 drift가 아니라 두 번째 include boundary가 만든 executable layout
+민감성으로 판정했다. server/admission 옵션은 현재 composition root에 남기고, hot loop가 독립된 안정
+object 경계를 가진 뒤 다시 분리한다.
