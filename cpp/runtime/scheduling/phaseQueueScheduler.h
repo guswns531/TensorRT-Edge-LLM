@@ -241,10 +241,17 @@ struct PhaseSchedulerTelemetry
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
     size_t globalWaitCandidateCount{};
+    int32_t globalWaitCurrentRows{};
     int32_t globalWaitFutureRows{};
+    int32_t globalWaitFutureFirstBatchRows{};
+    int32_t globalWaitNowResidualRows{};
+    int32_t globalWaitNowDrainTurns{};
+    int32_t globalWaitFutureDrainTurns{};
     int32_t globalWaitGraphBucket{};
     uint64_t globalWaitEventId{};
     std::vector<uint64_t> globalWaitRequestIds;
+    double globalWaitNowHorizonUs{};
+    double globalWaitFutureHorizonUs{};
     double globalWaitPreviewBlockingUs{};
     double globalWaitPreviewUncertaintyUs{};
     double globalWaitPreviewSlackUs{};
@@ -552,6 +559,11 @@ struct PhaseQueueSchedulerConfig
     //! the current wavefront cohort, so a more accurate cost can increase
     //! prefill urgency without improving batch density.
     bool enableGlobalPrefillContinuationHorizon{};
+    //! Experimentally compare D-now and completion-event WAIT over every
+    //! currently runnable row plus at most one decode-capacity of completed
+    //! rows. Disabled by default until the longer horizon recovers the
+    //! completion-cohort density of the one-step refill policy.
+    bool enableGlobalIncrementalDecodeDrainHorizon{};
     double prefillQueueWaitTargetUs{5000.0};
     double decodeQueueWaitTargetUs{2000.0};
     //! Default next-token deadline for bounded WAIT/refill decisions when a
@@ -602,6 +614,10 @@ struct PhaseDecodeCompletionPreview
     std::vector<uint64_t> requestIds;
     //! Next-decode context for each request ID at this completion horizon.
     std::vector<int32_t> contextLengths;
+    //! Optional stable ownership and original request scheduling metadata.
+    //! Empty vectors preserve the synthetic/unit-test preview contract.
+    std::vector<int32_t> stableSlotIds;
+    std::vector<PhaseSchedulingHints> schedulingHints;
 };
 
 struct PhaseDispatchPlan

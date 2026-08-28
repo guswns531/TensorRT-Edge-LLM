@@ -605,6 +605,7 @@ TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)
 {
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableGlobalIncrementalDecodeDrainHorizon = true;
     config.maxDecodeBatchSize = 4;
     config.decodeQueueWaitTargetUs = 10000.0;
     config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
@@ -617,6 +618,12 @@ TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)
     EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 1U);
     EXPECT_EQ(scheduler.telemetry().lastGlobalSelectedAction, PhaseGlobalActionKind::kWait);
     EXPECT_EQ(scheduler.telemetry().globalWaitFutureRows, 4);
+    EXPECT_EQ(scheduler.telemetry().globalWaitCurrentRows, 1);
+    EXPECT_EQ(scheduler.telemetry().globalWaitFutureFirstBatchRows, 4);
+    EXPECT_EQ(scheduler.telemetry().globalWaitNowResidualRows, 3);
+    EXPECT_EQ(scheduler.telemetry().globalWaitNowDrainTurns, 1);
+    EXPECT_EQ(scheduler.telemetry().globalWaitFutureDrainTurns, 1);
+    EXPECT_LT(scheduler.telemetry().globalWaitFutureHorizonUs, scheduler.telemetry().globalWaitNowHorizonUs);
     EXPECT_EQ(scheduler.telemetry().globalWaitGraphBucket, 4);
     EXPECT_EQ(scheduler.telemetry().globalWaitRequestIds, (std::vector<uint64_t>{1U, 2U, 3U, 4U}));
 }
@@ -636,6 +643,49 @@ TEST(PhaseQueueSchedulerTest, GlobalWaitIncludesResidualDecodeAfterDispatchNow)
     EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
     EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
     EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitIncludesUnselectedQueuedRowsInBothDrainHorizons)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableGlobalIncrementalDecodeDrainHorizon = true;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.globalDecodeTpotTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 0.9F}, {2, 4096, 2.0F}, {3, 4096, 2.5F}, {4, 4096, 10.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {3U, 4U}, {128, 128}};
+
+    EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitCurrentRows, 2);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitDrainsBeyondOneDecodeCapacityWithoutAStaleCohort)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableGlobalIncrementalDecodeDrainHorizon = true;
+    config.maxDecodeBatchSize = 4;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.globalDecodeTpotTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 3; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {5U, 6U, 7U, 8U}, {128, 128, 128, 128}};
+
+    EXPECT_NO_THROW(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitCurrentRows, 3);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalWaitShadowDoesNotDelayDispatch)

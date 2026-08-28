@@ -1538,6 +1538,8 @@ int main(int argc, char** argv)
             = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;
         semanticSchedulerConfig.enableGlobalPrefillContinuationHorizon
             = std::getenv("TRT_EDGELLM_GLOBAL_PREFILL_CONTINUATION_HORIZON") != nullptr;
+        semanticSchedulerConfig.enableGlobalIncrementalDecodeDrainHorizon
+            = std::getenv("TRT_EDGELLM_GLOBAL_INCREMENTAL_DECODE_DRAIN_HORIZON") != nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference
             = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;
@@ -2872,10 +2874,23 @@ int main(int argc, char** argv)
                         {"global_wait_selected", semanticCoordinator.scheduler().telemetry().globalWaitSelectedCount},
                         {"global_wait_candidates",
                             semanticCoordinator.scheduler().telemetry().globalWaitCandidateCount},
+                        {"global_wait_current_rows", semanticCoordinator.scheduler().telemetry().globalWaitCurrentRows},
                         {"global_wait_future_rows", semanticCoordinator.scheduler().telemetry().globalWaitFutureRows},
+                        {"global_wait_future_first_batch_rows",
+                            semanticCoordinator.scheduler().telemetry().globalWaitFutureFirstBatchRows},
+                        {"global_wait_now_residual_rows",
+                            semanticCoordinator.scheduler().telemetry().globalWaitNowResidualRows},
+                        {"global_wait_now_drain_turns",
+                            semanticCoordinator.scheduler().telemetry().globalWaitNowDrainTurns},
+                        {"global_wait_future_drain_turns",
+                            semanticCoordinator.scheduler().telemetry().globalWaitFutureDrainTurns},
                         {"global_wait_graph_bucket", semanticCoordinator.scheduler().telemetry().globalWaitGraphBucket},
                         {"global_wait_event_id", semanticCoordinator.scheduler().telemetry().globalWaitEventId},
                         {"global_wait_request_ids", semanticCoordinator.scheduler().telemetry().globalWaitRequestIds},
+                        {"global_wait_now_horizon_us",
+                            semanticCoordinator.scheduler().telemetry().globalWaitNowHorizonUs},
+                        {"global_wait_future_horizon_us",
+                            semanticCoordinator.scheduler().telemetry().globalWaitFutureHorizonUs},
                         {"global_wait_preview_blocking_us",
                             semanticCoordinator.scheduler().telemetry().globalWaitPreviewBlockingUs},
                         {"global_wait_preview_uncertainty_us",

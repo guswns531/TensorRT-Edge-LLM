@@ -801,8 +801,7 @@ bool IndependentPhaseAsyncServer::dispatchReady()
                 }
                 int32_t const maxOutputTokens
                     = request.maxOutputTokens > 0 ? request.maxOutputTokens : mConfig.defaultMaxOutputTokens;
-                int32_t const requestedTokens
-                    = static_cast<int32_t>(request.promptTokens.size()) + maxOutputTokens;
+                int32_t const requestedTokens = static_cast<int32_t>(request.promptTokens.size()) + maxOutputTokens;
                 int32_t const requestedPages = (requestedTokens + tokensPerPage - 1) / tokensPerPage;
                 if (requestedPages > availablePages)
                 {
@@ -1014,6 +1013,8 @@ bool IndependentPhaseAsyncServer::shouldWaitForGlobalDecodeRefill()
     previews.reserve(2U);
     std::vector<uint64_t> cumulativeRequestIds;
     std::vector<int32_t> cumulativeContextLengths;
+    std::vector<int32_t> cumulativeStableSlotIds;
+    std::vector<PhaseSchedulingHints> cumulativeSchedulingHints;
     std::unordered_set<uint64_t> cumulativeOwners;
     double cumulativeWaitUs{};
     double cumulativeP95Us{};
@@ -1039,12 +1040,14 @@ bool IndependentPhaseAsyncServer::shouldWaitForGlobalDecodeRefill()
             {
                 cumulativeRequestIds.push_back(requestId);
                 cumulativeContextLengths.push_back(mOwnership.length(request->second.kvSlotId));
+                cumulativeStableSlotIds.push_back(request->second.kvSlotId);
+                cumulativeSchedulingHints.push_back(request->second.scheduling);
             }
         }
         if (!cumulativeRequestIds.empty())
         {
             previews.push_back({ticket->sequenceId, cumulativeWaitUs, std::max(0.0, cumulativeP95Us - cumulativeWaitUs),
-                cumulativeRequestIds, cumulativeContextLengths});
+                cumulativeRequestIds, cumulativeContextLengths, cumulativeStableSlotIds, cumulativeSchedulingHints});
         }
         if (previews.size() == 2U)
         {
