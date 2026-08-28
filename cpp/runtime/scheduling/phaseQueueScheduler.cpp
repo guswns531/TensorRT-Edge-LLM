@@ -2693,9 +2693,14 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
 {
     refreshExternalDrainPreference();
     PhaseQueueSnapshot const state = snapshot();
-    PhaseDispatchKind const baseline = legacyQueueDecision(state);
+    bool const profileFreeProduction = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
+        && mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kProfileFree
+        && !mConfig.enableExternalDrainPreference;
+    PhaseDispatchKind const baseline = profileFreeProduction ? PhaseDispatchKind::kNone : legacyQueueDecision(state);
     bool drainPreferenceApplied{};
-    PhaseDispatchKind const legacyKind = applyExternalDrainPreference(state, baseline, drainPreferenceApplied);
+    PhaseDispatchKind const legacyKind = profileFreeProduction
+        ? PhaseDispatchKind::kNone
+        : applyExternalDrainPreference(state, baseline, drainPreferenceApplied);
     PhaseDispatchKind kind = legacyKind;
     PhaseDispatchPlan plan;
     std::optional<PhaseGlobalActionCandidate> appliedGlobalAction;
@@ -2746,7 +2751,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     {
         // Keep mechanism formation, canonical row ordering, and online cost
         // observation unchanged. Only the vacuous policy comparison is elided.
-        kind = legacyKind;
+        kind = state.prefillQueued > 0U ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
         drainPreferenceApplied = false;
     }
     else if (std::optional<GlobalQueueSelection> const global = selectGlobalQueueAction(state, true, true, true,

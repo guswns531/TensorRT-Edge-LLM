@@ -72,10 +72,15 @@ TEST(PhaseQueueSchedulerTest, GlobalShadowPreservesLegacyDispatch)
 
 TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
 {
+    size_t legacyPolicyCalls{};
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     config.globalSafeProbeSlackMultiplier = 0.0F;
     config.prefillQueueWaitTargetUs = 1.0e9;
+    config.policy = [&](PhaseQueueSnapshot const&) {
+        ++legacyPolicyCalls;
+        return PhaseDispatchKind::kDecode;
+    };
     PhaseQueueScheduler scheduler(config);
     scheduler.enqueuePrefill({1, 32});
     scheduler.enqueueDecode({2, 128});
@@ -91,6 +96,7 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill);
     EXPECT_TRUE(plan.globalActionFidelity);
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
+    EXPECT_EQ(legacyPolicyCalls, 0U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalActiveElidesVacuousSinglePhaseDecision)

@@ -52,6 +52,7 @@ vLLM 전체 fresh 비교를 실행한다.
 | 0 | fresh golden baseline | 기존 182 focused tests 기준 | 12/12 exact | 고정 |
 | 1 | rejected P continuation, full D-drain, E queue horizon 제거 | 4 suites, 192 tests pass | 12종 x1 완료, 의심 6종 x3 재검증 | 성능 승격, VLM repeat hash 변동 추적 |
 | 2A | full scheduler copy를 selective mechanism scratch로 교체 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
+| 3A | profile-free Global hot path에서 Legacy policy 평가 생략 | 4 suites, 192 tests pass | 12종 x1 + 의심 3종 x3 | 승격 |
 
 ## Stage 1 — Rejected Horizon 제거
 
@@ -159,3 +160,69 @@ Stage 2A는 성능 gate를 통과하지 못해 코드에서 되돌렸다. 다음
 명시적으로 만들고, 같은 epoch 동안 host 속도와 무관하게 동일 candidate를 유지해야 한다. 이 결과는
 삭제하지 않고 `.local/current-only-cleanup-20260828/stage2-mechanism-projection-12x1`과
 `stage2-suspects-4x3`에 보존한다.
+
+## Stage 3A — Global-only hot path
+
+### 변경 범위
+
+production 설정인 `Global active + profile-free + external drain preference OFF`에서는 더 이상
+`legacyQueueDecision()`과 `applyExternalDrainPreference()`를 먼저 실행한 뒤 결과를 버리지 않는다.
+Global shadow, disabled, legacy compatibility, external drain preference 경로는 그대로 남겼다. 따라서
+이번 단계는 enum이나 compatibility 구현을 삭제하는 구조 변경이 아니라, Current production hot path의
+중복 policy 평가만 제거한 것이다.
+
+단일 runnable phase는 candidate 비교 결과가 자명하므로 queue snapshot에서 P 또는 D를 직접 고른다.
+batch preview, canonical row ordering, execution lease, online CUDA-event cost learning과 실제 batch
+materialization은 전혀 바꾸지 않았다. unit test에는 active/profile-free 경로에서 injected Legacy policy가
+한 번도 호출되지 않는 검사를 추가했다.
+
+### 검증 결과
+
+GPU container build와 다음 네 focused suite의 `192`개 test가 모두 통과했다.
+
+```text
+PhaseQueueSchedulerTest.*
+PhaseGlobalSchedulerTest.*
+PhaseThreeCoordinatorPolicyTest.*
+IndependentPhaseAsyncServerTest.*
+```
+
+전체 12개 workload를 각각 한 번 실행했다. 단발 변동이 컸던 text-heavy, multi-image, bimodal은
+각각 3회 재실행했고 아래 표에는 이 세 workload의 3회 중앙값을 사용했다. 나머지는 단일 결과다.
+비교 기준은 Note 167의 최종 Current 3회 중앙값이다.
+
+| workload | Stage 3A tok/s | 처리량 변화 | TTFT p95 변화 | TPOT p95 변화 | E2E p95 변화 |
+|---|---:|---:|---:|---:|---:|
+| short | 2,499.20 | +0.91% | -2.41% | -1.56% | -0.88% |
+| balanced | 4,591.94 | +0.64% | +0.02% | -1.65% | -0.14% |
+| decode-heavy | 5,283.19 | +0.26% | -3.74% | -0.71% | -0.76% |
+| long-prefill | 1,222.82 | +2.20% | -4.85% | -0.37% | -2.55% |
+| bimodal | 1,939.55 | -0.29% | +2.25% | +0.01% | +0.62% |
+| text-heavy | 1,972.99 | +0.77% | -5.31% | +0.75% | -0.73% |
+| mixed | 1,142.39 | +0.42% | -2.49% | -0.10% | -0.43% |
+| vision-heavy | 687.82 | -0.79% | +1.86% | +1.01% | +0.72% |
+| poisson | 1,985.24 | +0.67% | -0.13% | -0.32% | -0.48% |
+| wave/drain | 96.78 | +0.00% | -9.31% | -2.52% | +0.01% |
+| multi-image | 306.20 | +4.58% | -9.64% | +2.51% | -4.86% |
+| late-vision D24 | 2,540.30 | -0.15% | +0.30% | -0.01% | +0.13% |
+
+모든 workload가 output completion과 correctness gate를 통과했다. text workload의 3회 token hash는
+모두 동일했다. peak VRAM은 `9,313--9,471 MiB` 범위로 기존과 같았다. 단발 bimodal은
+`1,914.23 tok/s`였지만 3회 중앙값은 `1,939.55 tok/s`로 최종 Current 대비 `-0.29%`였다. 단발
+multi-image도 `258.00 tok/s`에서 반복 중앙값 `306.20 tok/s`로 회복해 비동기 E formation 경계의
+변동임을 재확인했다.
+
+### Stage 3A 결정
+
+12개 모두 공통 승격 조건을 통과하므로 변경을 유지한다. 이 단계로 production hot path의 policy
+authority는 Global selector 하나가 갖게 됐다. 다만 Legacy enum, shadow/compatibility path와 scheduler
+full-copy preview는 아직 남아 있다. Stage 2A가 보여 준 것처럼 preview 복사 방식을 단순 경량화하면
+host timing이 batch 경계를 바꿀 수 있으므로, 다음 구조 제거는 immutable snapshot과 one-shot
+materialization을 먼저 만든 뒤 진행한다.
+
+결과 위치:
+
+- `.local/current-only-cleanup-20260828/stage3a-global-only-hotpath-7x1`
+- `.local/current-only-cleanup-20260828/stage3a-global-only-hotpath-remaining-5x1`
+- `.local/current-only-cleanup-20260828/stage3a-suspects-2x3`
+- `.local/current-only-cleanup-20260828/stage3a-bimodal-x3`
