@@ -2126,6 +2126,8 @@ int main(int argc, char** argv)
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
+                threePhaseConfig.enableGlobalEncoderQueueHorizon
+                    = std::getenv("TRT_EDGELLM_GLOBAL_ENCODER_QUEUE_HORIZON") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
                 {
                     threePhaseConfig.globalSafeProbeSlackMultiplier = std::stof(value);
@@ -3005,6 +3007,10 @@ int main(int argc, char** argv)
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
                         {"vision_global_action_fidelity_violations", visionMetrics.globalActionFidelityViolations},
+                        {"vision_global_encoder_queue_horizon_previews",
+                            visionMetrics.globalEncoderQueueHorizonPreviews},
+                        {"vision_global_encoder_queue_critical_path_ms",
+                            visionMetrics.lastGlobalEncoderQueueCriticalPathUs / 1000.0},
                         {"vision_global_planned_outstanding",
                             static_cast<uint8_t>(visionMetrics.globalPlannedOutstanding)},
                         {"vision_global_observed_outstanding",

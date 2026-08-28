@@ -230,6 +230,41 @@ std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncode
     return indices;
 }
 
+std::vector<size_t> phaseVisionNextQueuedEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
+    std::vector<size_t> const& selectedIndices, size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes,
+    size_t maxInputTokens, bool requireHomogeneousGeometry, bool enableFitLookahead, size_t maxLookahead)
+{
+    std::vector<bool> selected(inputs.size());
+    for (size_t const index : selectedIndices)
+    {
+        ELLM_CHECK(index < inputs.size(), "Selected encoder queue index is outside the pending input range");
+        selected[index] = true;
+    }
+
+    std::vector<PhaseVisionEncoderInput> remainingInputs;
+    std::vector<size_t> remainingIndices;
+    remainingInputs.reserve(inputs.size());
+    remainingIndices.reserve(inputs.size());
+    for (size_t index{}; index < inputs.size(); ++index)
+    {
+        if (!selected[index])
+        {
+            remainingInputs.push_back(inputs[index]);
+            remainingIndices.push_back(index);
+        }
+    }
+
+    std::vector<size_t> const relativeIndices = phaseVisionEncoderBatchIndices(remainingInputs, maxBatchSize,
+        maxMediaItems, maxInputBytes, maxInputTokens, requireHomogeneousGeometry, enableFitLookahead, maxLookahead);
+    std::vector<size_t> result;
+    result.reserve(relativeIndices.size());
+    for (size_t const relativeIndex : relativeIndices)
+    {
+        result.push_back(remainingIndices[relativeIndex]);
+    }
+    return result;
+}
+
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
     size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens, bool requireHomogeneousGeometry,
     bool enableFitLookahead, size_t maxLookahead)
@@ -877,6 +912,8 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalWarmupDecodeCandidates = mGlobalWarmupDecodeCandidates;
     result.globalActionFidelityViolations = mGlobalActionFidelityViolations;
     result.lastGlobalFirstTokenCriticalPathUs = mLastGlobalFirstTokenCriticalPathUs;
+    result.globalEncoderQueueHorizonPreviews = mGlobalEncoderQueueHorizonPreviews;
+    result.lastGlobalEncoderQueueCriticalPathUs = mLastGlobalEncoderQueueCriticalPathUs;
     result.globalEncoderArrivalWaitPeriods = mGlobalEncoderArrivalWaitPeriods;
     result.globalEncoderArrivalWaitExpirations = mGlobalEncoderArrivalWaitExpirations;
     result.lastGlobalEncoderArrivalWaitUs = mLastGlobalEncoderArrivalWaitUs;
@@ -1171,33 +1208,40 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             = std::min(encoderSlackUs, targetUs > 0.0 ? targetUs - ageUs : std::numeric_limits<double>::infinity());
         encoderServiceLagUs = std::max(encoderServiceLagUs, ageUs);
     }
+    struct EncoderCostPrediction
+    {
+        PhaseGlobalActionKey key;
+        double makespanUs{};
+        double uncertaintyUs{};
+        double referenceUs{};
+    };
     constexpr size_t kEncoderTokenBucket = 1024U;
-    int32_t const encoderContextBucket
-        = static_cast<int32_t>((encoderInputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
-    PhaseGlobalActionKey const encoderKey{PhaseGlobalActionKind::kEncoder,
-        static_cast<int32_t>(encoderBatchIndices.size()), 0, 0, encoderContextBucket, 0};
+    auto const predictEncoderCost = [&](size_t batchSize, size_t inputTokens) {
+        int32_t const contextBucket
+            = static_cast<int32_t>((inputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
+        EncoderCostPrediction prediction{
+            {PhaseGlobalActionKind::kEncoder, static_cast<int32_t>(batchSize), 0, 0, contextBucket, 0},
+            mLastEncoderGpuMs > 0.0F ? static_cast<double>(mLastEncoderGpuMs) * 1000.0
+                                     : mConfig.encoderDispatchInitialCostUs,
+            static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0, 0.0};
+        prediction.referenceUs = prediction.makespanUs;
+        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(prediction.key))
+        {
+            prediction.makespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
+            prediction.uncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
+            prediction.referenceUs = static_cast<double>(online->referenceWorkMedianMs) * 1000.0;
+            return prediction;
+        }
 
-    double encoderMakespanUs = mLastEncoderGpuMs > 0.0F ? static_cast<double>(mLastEncoderGpuMs) * 1000.0
-                                                        : mConfig.encoderDispatchInitialCostUs;
-    double encoderUncertaintyUs = static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0;
-    double encoderReferenceUs = encoderMakespanUs;
-    if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(encoderKey))
-    {
-        encoderMakespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
-        encoderUncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
-        encoderReferenceUs = static_cast<double>(online->referenceWorkMedianMs) * 1000.0;
-    }
-    else
-    {
         PhaseVisionEncoderBatchCost const* selected{};
         PhaseVisionEncoderBatchCost const* singleton{};
         for (PhaseVisionEncoderBatchCost const& cost : mConfig.encoderBatchCosts)
         {
-            if (cost.maxInputTokens < encoderInputTokens)
+            if (cost.maxInputTokens < inputTokens)
             {
                 continue;
             }
-            if (cost.batchSize >= encoderBatchIndices.size()
+            if (cost.batchSize >= batchSize
                 && (selected == nullptr || cost.batchSize < selected->batchSize
                     || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
             {
@@ -1210,13 +1254,20 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         if (selected != nullptr)
         {
-            encoderMakespanUs = static_cast<double>(selected->p95GpuMs) * 1000.0;
-            encoderUncertaintyUs = 0.0;
-            encoderReferenceUs = singleton != nullptr
-                ? static_cast<double>(singleton->p95GpuMs) * 1000.0 * encoderBatchIndices.size()
-                : encoderMakespanUs;
+            prediction.makespanUs = static_cast<double>(selected->p95GpuMs) * 1000.0;
+            prediction.uncertaintyUs = 0.0;
+            prediction.referenceUs = singleton != nullptr
+                ? static_cast<double>(singleton->p95GpuMs) * 1000.0 * batchSize
+                : prediction.makespanUs;
         }
-    }
+        return prediction;
+    };
+    EncoderCostPrediction const encoderPrediction = predictEncoderCost(encoderBatchIndices.size(), encoderInputTokens);
+    PhaseGlobalActionKey const encoderKey = encoderPrediction.key;
+    double const encoderMakespanUs = encoderPrediction.makespanUs;
+    double const encoderUncertaintyUs = encoderPrediction.uncertaintyUs;
+    double const encoderReferenceUs = encoderPrediction.referenceUs;
+    int32_t const encoderContextBucket = encoderKey.primaryContextBucket;
 
     size_t const estimatedPromptTokensPerRequest = std::max<size_t>(1U,
         mEstimatedPromptTokens > 0U
@@ -1234,6 +1285,77 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     mLastGlobalFirstTokenCriticalPathUs
         = encoderMakespanUs + encoderUncertaintyUs + visionPrefillMakespanUs + visionPrefillUncertaintyUs;
 
+    double queuedEncoderSlackUs{std::numeric_limits<double>::infinity()};
+    double queuedEncoderSuffixUs{};
+    double queuedEncoderSuffixUncertaintyUs{};
+    mLastGlobalEncoderQueueCriticalPathUs = 0.0;
+    if (mConfig.enableGlobalEncoderQueueHorizon && encoderBatchIndices.size() < mPending.size())
+    {
+        std::vector<PhaseVisionEncoderInput> pendingInputs;
+        pendingInputs.reserve(mPending.size());
+        for (PendingVisionRequest const& pending : mPending)
+        {
+            pendingInputs.push_back(
+                {mediaItemCount(pending), mediaInputBytes(pending), pending.inputTokens, pending.mediaGeometry});
+        }
+        std::vector<size_t> queuedBatchIndices = phaseVisionNextQueuedEncoderBatchIndices(pendingInputs,
+            encoderBatchIndices, mConfig.maxEncoderBatchSize, mConfig.maxEncoderMediaItems,
+            mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens, mConfig.enableHomogeneousEncoderBatching,
+            mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
+        if (mConfig.enableCostAwareEncoderBatching && !queuedBatchIndices.empty())
+        {
+            std::vector<size_t> candidateInputTokens;
+            candidateInputTokens.reserve(queuedBatchIndices.size());
+            for (size_t const index : queuedBatchIndices)
+            {
+                candidateInputTokens.push_back(pendingInputs[index].inputTokens);
+            }
+            PhaseVisionEncoderBatchChoice const queuedChoice
+                = phaseVisionSelectEncoderBatch(candidateInputTokens, mConfig.encoderBatchCosts);
+            if (!queuedChoice.coverageMiss)
+            {
+                ELLM_CHECK(queuedChoice.batchSize > 0U && queuedChoice.batchSize <= queuedBatchIndices.size(),
+                    "Queued encoder cost selection is outside the candidate range");
+                queuedBatchIndices.resize(queuedChoice.batchSize);
+            }
+        }
+        if (!queuedBatchIndices.empty())
+        {
+            size_t queuedEncoderInputTokens{};
+            for (size_t const index : queuedBatchIndices)
+            {
+                PendingVisionRequest const& request = mPending[index];
+                queuedEncoderInputTokens += request.inputTokens;
+                double const ageUs
+                    = std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count();
+                double const targetUs = request.scheduling.ttftTargetUs > 0.0 ? request.scheduling.ttftTargetUs
+                                                                              : mConfig.visionTtftTargetUs;
+                queuedEncoderSlackUs = std::min(
+                    queuedEncoderSlackUs, targetUs > 0.0 ? targetUs - ageUs : std::numeric_limits<double>::infinity());
+            }
+            EncoderCostPrediction const queuedEncoderPrediction
+                = predictEncoderCost(queuedBatchIndices.size(), queuedEncoderInputTokens);
+            size_t const queuedPromptTokensPerRequest = std::max<size_t>(1U,
+                mEstimatedPromptTokens > 0U
+                    ? mEstimatedPromptTokens
+                    : (queuedEncoderInputTokens + queuedBatchIndices.size() - 1U) / queuedBatchIndices.size());
+            PhaseGlobalCostEstimate const queuedPrefill
+                = mServer.estimateGlobalPrefillDrainCost(static_cast<int32_t>(queuedBatchIndices.size()),
+                    static_cast<int32_t>(std::min<size_t>(
+                        queuedPromptTokensPerRequest, static_cast<size_t>(std::numeric_limits<int32_t>::max()))),
+                    PhasePrefillClass::kExternal);
+            double const queuedPrefillMakespanUs = queuedPrefill.makespanMedianMs > 0.0F
+                ? static_cast<double>(queuedPrefill.makespanMedianMs) * 1000.0
+                : mConfig.globalVisionPrefillColdStartUs;
+            queuedEncoderSuffixUs = queuedEncoderPrediction.makespanUs + queuedPrefillMakespanUs;
+            queuedEncoderSuffixUncertaintyUs
+                = queuedEncoderPrediction.uncertaintyUs + static_cast<double>(queuedPrefill.uncertaintyMs) * 1000.0;
+            mLastGlobalEncoderQueueCriticalPathUs
+                = encoderMakespanUs + encoderUncertaintyUs + queuedEncoderSuffixUs + queuedEncoderSuffixUncertaintyUs;
+            ++mGlobalEncoderQueueHorizonPreviews;
+        }
+    }
+
     PhaseGlobalActionCandidate encoder;
     encoder.key = encoderKey;
     for (size_t const index : encoderBatchIndices)
@@ -1248,6 +1370,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     encoder.requestServiceLagUs = encoderServiceLagUs;
     encoder.protectedCompletions.push_back({encoderSlackUs, encoderMakespanUs + visionPrefillMakespanUs,
         encoderUncertaintyUs + visionPrefillUncertaintyUs});
+    if (queuedEncoderSuffixUs > 0.0)
+    {
+        encoder.protectedCompletions.push_back({queuedEncoderSlackUs, encoderMakespanUs + queuedEncoderSuffixUs,
+            encoderUncertaintyUs + queuedEncoderSuffixUncertaintyUs});
+    }
     PhaseMemoryBrokerConfig const& memoryConfig = mMemoryBroker.config();
     size_t const committedKVBytes = memoryConfig.bytesPerKVPage > 0U
         ? saturatedMultiply(static_cast<size_t>(memoryConfig.committedKVPages), memoryConfig.bytesPerKVPage)
@@ -1269,6 +1396,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         pd->protectedCompletions.push_back(
             {encoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
                 pd->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs});
+        if (queuedEncoderSuffixUs > 0.0)
+        {
+            pd->protectedCompletions.push_back(
+                {queuedEncoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + queuedEncoderSuffixUs,
+                    pd->uncertaintyUs + encoderUncertaintyUs + queuedEncoderSuffixUncertaintyUs});
+        }
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -1482,6 +1615,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         phaseGlobalFinalizeCandidate(overlap);
         overlap.protectedCompletions.push_back({encoderSlackUs, overlapMakespanUs + visionPrefillMakespanUs,
             overlapUncertaintyUs + visionPrefillUncertaintyUs});
+        if (queuedEncoderSuffixUs > 0.0)
+        {
+            overlap.protectedCompletions.push_back({queuedEncoderSlackUs, overlapMakespanUs + queuedEncoderSuffixUs,
+                overlapUncertaintyUs + queuedEncoderSuffixUncertaintyUs});
+        }
         for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
             completion.predictedCompletionUs = residualAugmentation ? phaseOverlapCompletionUs : overlapMakespanUs;

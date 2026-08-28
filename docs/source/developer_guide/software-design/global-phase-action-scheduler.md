@@ -104,6 +104,21 @@ Completion polling and dispatch are separate operations. Empty queues are not ev
 for a decode-only preview because a new E+P action can only be launched when both contexts are idle. This keeps one global
 decision per applied P/D dispatch rather than spinning on an action that cannot be launched.
 
+## Bounded encoder-queue horizon
+
+`TRT_EDGELLM_GLOBAL_ENCODER_QUEUE_HORIZON=1` enables an experimental, workload-label-free extension. When the current
+encoder candidate does not cover the complete pending queue, the coordinator removes the selected indices, forms exactly
+one additional FIFO-compatible E cohort, and predicts that cohort's E-to-P first-token path. Serial E, serial P/D, and
+known E+P/E+D candidates then protect the oldest request in that bounded cohort with the same robust deadline mechanism.
+The horizon deliberately stops after one cohort; it does not estimate a complete queue drain.
+
+The feature remains disabled by default. A three-run Cosmos gate improved vision-heavy throughput by 1.05% and TTFT p95
+by 1.32%, but reduced text-heavy throughput by 0.62% and increased its TTFT p95 by 0.85%. A wave-arrival smoke reduced the
+maximum encoder queue wait while increasing TTFT p95, because earlier E service fragmented the downstream decode cohort.
+The gate also exposed the next mechanism boundary: when downstream encoded ownership reaches its capacity, no E candidate
+is feasible and an E-only queue horizon cannot influence the decision. Capacity-blocked E service must therefore be
+coupled to ownership-aware P admission/reclamation rather than promoted through a workload-specific threshold.
+
 ## Modes and observability
 
 `globalSchedulerMode` supports:

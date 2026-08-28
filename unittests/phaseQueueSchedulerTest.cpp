@@ -2999,6 +2999,19 @@ TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadForHomogeneousEncoderGeometry)
     EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 0, false), (std::vector<size_t>{0, 1, 2}));
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, SelectsOneQueuedEncoderCohortAfterCurrentLookaheadBatch)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+    };
+    EXPECT_EQ(phaseVisionNextQueuedEncoderBatchIndices(inputs, {0, 2}, 2, 0, 0, 0, true), (std::vector<size_t>{1, 3}));
+    EXPECT_EQ(phaseVisionNextQueuedEncoderBatchIndices(inputs, {0, 2}, 2, 0, 0, 768, true), (std::vector<size_t>{1}));
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadPastNonFittingEncoderRequests)
 {
     std::vector<PhaseVisionEncoderInput> const inputs{

@@ -101,6 +101,8 @@ struct PhaseThreeCoordinatorConfig
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
     bool enableGlobalEncoderPrefillAction{};
+    //! Protect the oldest request in the next unselected encoder cohort over one bounded E->P horizon.
+    bool enableGlobalEncoderQueueHorizon{};
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
     //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
@@ -289,6 +291,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalWarmupDecodeCandidates{};
     size_t globalActionFidelityViolations{};
     double lastGlobalFirstTokenCriticalPathUs{};
+    size_t globalEncoderQueueHorizonPreviews{};
+    double lastGlobalEncoderQueueCriticalPathUs{};
     size_t globalEncoderArrivalWaitPeriods{};
     size_t globalEncoderArrivalWaitExpirations{};
     double lastGlobalEncoderArrivalWaitUs{};
@@ -369,6 +373,12 @@ struct PhaseVisionEncoderInput
 std::vector<size_t> phaseVisionEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
     size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes, size_t maxInputTokens = 0U,
     bool requireHomogeneousGeometry = false, bool enableFitLookahead = false, size_t maxLookahead = 0U);
+
+//! Select the next encoder cohort after removing the indices already assigned to the current execution.
+std::vector<size_t> phaseVisionNextQueuedEncoderBatchIndices(std::vector<PhaseVisionEncoderInput> const& inputs,
+    std::vector<size_t> const& selectedIndices, size_t maxBatchSize, size_t maxMediaItems, size_t maxInputBytes,
+    size_t maxInputTokens = 0U, bool requireHomogeneousGeometry = false, bool enableFitLookahead = false,
+    size_t maxLookahead = 0U);
 
 //! Select an encoder batch bounded independently by requests, media items, and raw bytes.
 size_t phaseVisionEncoderBatchSize(std::vector<PhaseVisionEncoderInput> const& inputs, size_t maxBatchSize,
@@ -630,6 +640,8 @@ private:
     size_t mGlobalWarmupDecodeCandidates{};
     size_t mGlobalActionFidelityViolations{};
     double mLastGlobalFirstTokenCriticalPathUs{};
+    size_t mGlobalEncoderQueueHorizonPreviews{};
+    double mLastGlobalEncoderQueueCriticalPathUs{};
     size_t mGlobalEncoderArrivalWaitPeriods{};
     size_t mGlobalEncoderArrivalWaitExpirations{};
     double mLastGlobalEncoderArrivalWaitUs{};
