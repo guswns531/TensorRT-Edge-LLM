@@ -64,12 +64,13 @@ PhaseGlobalActionKey decodeKey(int32_t batchSize = 32)
 
 PhaseCostBundle bundle(PhaseCostBundleSource source, float makespanMs)
 {
+    uint64_t const now = phaseCostUnixTimeNs();
     PhaseCostBundle result;
     result.bundleVersion = "test-v1";
     result.source = source;
     result.deployment = fingerprint();
-    result.createdAtUnixNs = 123U;
-    result.records.push_back({decodeKey(), {{10.0F, makespanMs}, {10.0F, makespanMs + 1.0F}}, 122U});
+    result.createdAtUnixNs = now;
+    result.records.push_back({decodeKey(), {{10.0F, makespanMs}, {10.0F, makespanMs + 1.0F}}, now});
     return result;
 }
 
@@ -187,7 +188,7 @@ TEST(PhaseCostKnowledgeTest, StartupAnchorsAdaptPriorWithoutAWorkloadMode)
     PhaseCostRecord larger{decodeKey(64), {{20.0F, 20.0F}, {20.0F, 20.0F}}, 122U};
     prior.records.push_back(larger);
     oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kCompatible);
-    oracle.setAnchorCollectionActive(true);
+    oracle.setCalibrationActive(true);
 
     oracle.observe(decodeKey(), {10.0F, 12.0F});
     EXPECT_FLOAT_EQ(oracle.anchorState().scale.decode, 1.0F);
@@ -212,7 +213,7 @@ TEST(PhaseCostKnowledgeTest, StartupAnchorsRejectImplausibleScaleAndResetCleanly
     PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
     prior.records.front().observations = {{10.0F, 10.0F}};
     oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
-    oracle.setAnchorCollectionActive(true);
+    oracle.setCalibrationActive(true);
 
     oracle.observe(decodeKey(), {10.0F, 100.0F});
     EXPECT_EQ(oracle.anchorState().decodeSamples, 0U);
@@ -241,6 +242,76 @@ TEST(PhaseCostKnowledgeTest, ProductionObservationsDoNotRetunePortablePhaseScale
     EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 20.0F);
 }
 
+TEST(PhaseCostKnowledgeTest, ExpiredPortablePriorFallsBackButExactBuildRemainsUsable)
+{
+    PhaseCostOracleConfig config;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.drift.portablePriorTtl = std::chrono::nanoseconds{1};
+    PhaseCostOracle oracle(config);
+    PhaseCostBundle fleet = bundle(PhaseCostBundleSource::kFleet, 10.0F);
+    fleet.createdAtUnixNs = 1U;
+    oracle.loadPrior(std::move(fleet), PhaseCostCompatibility::kCompatible);
+
+    EXPECT_FALSE(oracle.estimate(decodeKey()).has_value());
+    EXPECT_TRUE(oracle.healthState().fleetPriorExpired);
+
+    PhaseCostBundle build = bundle(PhaseCostBundleSource::kBuild, 9.0F);
+    build.createdAtUnixNs = 1U;
+    oracle.loadPrior(std::move(build), PhaseCostCompatibility::kExact);
+    ASSERT_TRUE(oracle.estimate(decodeKey()).has_value());
+    EXPECT_FALSE(oracle.healthState().buildPriorExpired);
+}
+
+TEST(PhaseCostKnowledgeTest, SustainedDriftDisablesOnlyTheAffectedPhasePrior)
+{
+    PhaseCostOracleConfig config;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.sufficientLocalSamples = 4U;
+    config.drift.minimumSamplesPerPhase = 3U;
+    config.drift.maxSamplesPerPhase = 3U;
+    PhaseCostOracle oracle(config);
+    PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+    prior.records.front().observations = {{10.0F, 10.0F}};
+    prior.records.push_back({decodeKey(64), {{20.0F, 20.0F}}, phaseCostUnixTimeNs()});
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+
+    for (size_t index{}; index < 3U; ++index)
+    {
+        oracle.observe(decodeKey(), {10.0F, 15.0F});
+    }
+    EXPECT_TRUE(oracle.healthState().drift.decode.localOnly);
+    EXPECT_FALSE(oracle.estimate(decodeKey(64)).has_value());
+    ASSERT_TRUE(oracle.estimate(decodeKey()).has_value());
+    EXPECT_FLOAT_EQ(oracle.estimate(decodeKey())->makespanMedianMs, 15.0F);
+
+    for (size_t index{}; index < 3U; ++index)
+    {
+        oracle.observe(decodeKey(), {10.0F, 10.0F});
+    }
+    EXPECT_FALSE(oracle.healthState().drift.decode.localOnly);
+    ASSERT_TRUE(oracle.estimate(decodeKey(64)).has_value());
+    EXPECT_FLOAT_EQ(oracle.estimate(decodeKey(64))->makespanMedianMs, 20.0F);
+}
+
+TEST(PhaseCostKnowledgeTest, FreshControlledAnchorClearsPersistedPhaseDrift)
+{
+    PhaseCostOracleConfig config;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.anchor.minimumSamplesPerPhase = 1U;
+    config.drift.minimumSamplesPerPhase = 1U;
+    PhaseCostOracle oracle(config);
+    PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+    prior.records.front().observations = {{10.0F, 10.0F}};
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+    oracle.observe(decodeKey(), {10.0F, 15.0F});
+    ASSERT_TRUE(oracle.healthState().drift.decode.localOnly);
+
+    oracle.setCalibrationActive(true);
+    oracle.observe(decodeKey(), {10.0F, 11.0F});
+    EXPECT_FALSE(oracle.healthState().drift.decode.localOnly);
+    EXPECT_FLOAT_EQ(oracle.anchorState().scale.decode, 1.1F);
+}
+
 TEST(PhaseCostKnowledgeTest, NodeJournalPersistsOutsideObservationHotPath)
 {
     std::filesystem::path const directory = temporaryDirectory();
@@ -264,6 +335,36 @@ TEST(PhaseCostKnowledgeTest, NodeJournalPersistsOutsideObservationHotPath)
     oracle.restoreNode(restored);
     ASSERT_TRUE(oracle.estimate(decodeKey()).has_value());
     EXPECT_FLOAT_EQ(oracle.estimate(decodeKey())->makespanMedianMs, 6.0F);
+    std::filesystem::remove_all(directory);
+}
+
+TEST(PhaseCostKnowledgeTest, NodeJournalPersistsRecentDriftState)
+{
+    std::filesystem::path const directory = temporaryDirectory();
+    {
+        PhaseNodeCostJournalConfig journalConfig;
+        journalConfig.directory = directory;
+        journalConfig.snapshotEveryObservations = 1U;
+        journalConfig.flushInterval = std::chrono::hours(1);
+        auto journal = std::make_shared<PhaseNodeCostJournal>(journalConfig, fingerprint());
+        PhaseCostOracleConfig oracleConfig;
+        oracleConfig.model.coldStartUncertaintyMs = 0.0F;
+        oracleConfig.drift.minimumSamplesPerPhase = 1U;
+        PhaseCostOracle oracle(oracleConfig);
+        PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+        prior.records.front().observations = {{10.0F, 10.0F}};
+        oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+        oracle.attachJournal(journal);
+        oracle.observe(decodeKey(), {10.0F, 15.0F});
+        journal->flush();
+
+        PhaseCostBundle const restored = phaseLoadCostBundle(journal->snapshotPath());
+        ASSERT_TRUE(restored.driftState.has_value());
+        EXPECT_TRUE(restored.driftState->decode.localOnly);
+        PhaseCostOracle restarted(oracleConfig);
+        restarted.restoreNode(restored);
+        EXPECT_TRUE(restarted.healthState().drift.decode.localOnly);
+    }
     std::filesystem::remove_all(directory);
 }
 

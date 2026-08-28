@@ -109,6 +109,52 @@ float actionRelativeUncertainty(PhaseGlobalActionKind kind, PhaseCostAnchorState
     return 0.0F;
 }
 
+PhaseCostPhaseDriftState* phaseDriftState(PhaseCostDriftState& state, PhaseGlobalActionKind kind) noexcept
+{
+    switch (kind)
+    {
+    case PhaseGlobalActionKind::kEncoder: return &state.encoder;
+    case PhaseGlobalActionKind::kPrefill: return &state.prefill;
+    case PhaseGlobalActionKind::kDecode: return &state.decode;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+    case PhaseGlobalActionKind::kEncoderDecode:
+    case PhaseGlobalActionKind::kPrefillDecode: return &state.overlap;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: return nullptr;
+    }
+    return nullptr;
+}
+
+PhaseCostPhaseDriftState const* phaseDriftState(PhaseCostDriftState const& state, PhaseGlobalActionKind kind) noexcept
+{
+    switch (kind)
+    {
+    case PhaseGlobalActionKind::kEncoder: return &state.encoder;
+    case PhaseGlobalActionKind::kPrefill: return &state.prefill;
+    case PhaseGlobalActionKind::kDecode: return &state.decode;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+    case PhaseGlobalActionKind::kEncoderDecode:
+    case PhaseGlobalActionKind::kPrefillDecode: return &state.overlap;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: return nullptr;
+    }
+    return nullptr;
+}
+
+bool olderThan(uint64_t timestamp, std::chrono::nanoseconds ttl, uint64_t now) noexcept
+{
+    if (ttl.count() <= 0)
+    {
+        return false;
+    }
+    if (timestamp == 0U)
+    {
+        return true;
+    }
+    uint64_t const ttlNs = static_cast<uint64_t>(ttl.count());
+    return now > timestamp && now - timestamp > ttlNs;
+}
+
 float median(std::deque<float> const& values)
 {
     ELLM_CHECK(!values.empty(), "Cannot compute an empty phase anchor median");
@@ -298,6 +344,38 @@ PhaseDeploymentFingerprint parseDeployment(Json const& value)
     return result;
 }
 
+Json driftPhaseJson(PhaseCostPhaseDriftState const& state)
+{
+    return {{"local_only", state.localOnly}, {"sample_count", state.sampleCount}, {"median_ratio", state.medianRatio},
+        {"observed_at_unix_ns", state.observedAtUnixNs}};
+}
+
+PhaseCostPhaseDriftState parseDriftPhase(Json const& value)
+{
+    PhaseCostPhaseDriftState result;
+    result.localOnly = value.value("local_only", false);
+    result.sampleCount = value.value("sample_count", size_t{});
+    result.medianRatio = value.value("median_ratio", 1.0F);
+    result.observedAtUnixNs = value.value("observed_at_unix_ns", uint64_t{});
+    return result;
+}
+
+Json driftStateJson(PhaseCostDriftState const& state)
+{
+    return {{"encoder", driftPhaseJson(state.encoder)}, {"prefill", driftPhaseJson(state.prefill)},
+        {"decode", driftPhaseJson(state.decode)}, {"overlap", driftPhaseJson(state.overlap)}};
+}
+
+PhaseCostDriftState parseDriftState(Json const& value)
+{
+    PhaseCostDriftState result;
+    result.encoder = parseDriftPhase(value.at("encoder"));
+    result.prefill = parseDriftPhase(value.at("prefill"));
+    result.decode = parseDriftPhase(value.at("decode"));
+    result.overlap = parseDriftPhase(value.at("overlap"));
+    return result;
+}
+
 Json bundleJson(PhaseCostBundle const& bundle)
 {
     Json records = Json::array();
@@ -312,9 +390,14 @@ Json bundleJson(PhaseCostBundle const& bundle)
         records.push_back({{"key", keyJson(record.key)}, {"observed_at_unix_ns", record.observedAtUnixNs},
             {"observations", observations}});
     }
-    return {{"schema_version", bundle.schemaVersion}, {"bundle_version", bundle.bundleVersion},
+    Json result = {{"schema_version", bundle.schemaVersion}, {"bundle_version", bundle.bundleVersion},
         {"source", phaseCostBundleSourceName(bundle.source)}, {"created_at_unix_ns", bundle.createdAtUnixNs},
         {"deployment", deploymentJson(bundle.deployment)}, {"records", records}};
+    if (bundle.driftState.has_value())
+    {
+        result["drift_state"] = driftStateJson(*bundle.driftState);
+    }
+    return result;
 }
 
 PhaseCostRecord* findRecord(std::vector<PhaseCostRecord>& records, PhaseGlobalActionKey const& key)
@@ -428,6 +511,10 @@ PhaseCostBundle phaseLoadCostBundle(std::filesystem::path const& path)
         ELLM_CHECK(!record.observations.empty(), "Phase cost record has no observations");
         result.records.push_back(std::move(record));
     }
+    if (root.contains("drift_state"))
+    {
+        result.driftState = parseDriftState(root.at("drift_state"));
+    }
     return result;
 }
 
@@ -484,16 +571,29 @@ PhaseCostOracle::PhaseCostOracle(PhaseCostOracleConfig config)
         "Phase anchor applied scale range is invalid");
     ELLM_CHECK(mConfig.anchor.minimumRelativeUncertainty >= 0.0F,
         "Phase anchor minimum relative uncertainty must be non-negative");
+    ELLM_CHECK(mConfig.drift.minimumSamplesPerPhase > 0U, "Phase drift minimum sample count must be positive");
+    ELLM_CHECK(mConfig.drift.maxSamplesPerPhase >= mConfig.drift.minimumSamplesPerPhase,
+        "Phase drift sample window must cover the minimum sample count");
+    ELLM_CHECK(mConfig.drift.enterRelativeError > 0.0F && mConfig.drift.exitRelativeError >= 0.0F
+            && mConfig.drift.exitRelativeError < mConfig.drift.enterRelativeError,
+        "Phase drift hysteresis must satisfy 0 <= exit < enter");
+    ELLM_CHECK(mConfig.drift.minimumAcceptedRatio > 0.0F
+            && mConfig.drift.maximumAcceptedRatio >= mConfig.drift.minimumAcceptedRatio,
+        "Phase drift accepted ratio range is invalid");
+    ELLM_CHECK(mConfig.drift.portablePriorTtl.count() >= 0 && mConfig.drift.nodeObservationTtl.count() >= 0
+            && mConfig.drift.restoredDriftStateTtl.count() >= 0,
+        "Phase cost TTL values must be non-negative");
 }
 
 void PhaseCostOracle::observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation)
 {
     observeAnchor(key, observation);
+    observeDrift(key, observation);
     mLocal.observe(key, observation);
     mergeObservation(mLocalRecords, key, observation, phaseCostUnixTimeNs(), mConfig.model.windowSize);
     if (mJournal != nullptr)
     {
-        mJournal->enqueue(key, observation);
+        mJournal->enqueue(key, observation, mHealthState.drift);
     }
 }
 
@@ -563,7 +663,13 @@ bool PhaseCostOracle::overlapEligible(PhaseGlobalActionKey const& key) const
 void PhaseCostOracle::loadPrior(PhaseCostBundle bundle, PhaseCostCompatibility compatibility, PhaseCostScale scale)
 {
     ELLM_CHECK(compatibility != PhaseCostCompatibility::kIncompatible, "Cannot load an incompatible phase cost prior");
-    PriorLayer layer{PhaseGlobalCostModel(mConfig.model), compatibility, scale};
+    ELLM_CHECK(bundle.source == PhaseCostBundleSource::kBuild || bundle.source == PhaseCostBundleSource::kFleet,
+        "Only build or fleet bundles can be loaded as a portable prior");
+    bool const exactBuild
+        = bundle.source == PhaseCostBundleSource::kBuild && compatibility == PhaseCostCompatibility::kExact;
+    bool const expired
+        = !exactBuild && olderThan(bundle.createdAtUnixNs, mConfig.drift.portablePriorTtl, phaseCostUnixTimeNs());
+    PriorLayer layer{PhaseGlobalCostModel(mConfig.model), compatibility, scale, expired};
     for (PhaseCostRecord const& record : bundle.records)
     {
         for (PhaseGlobalCostObservation const& observation : record.observations)
@@ -573,10 +679,12 @@ void PhaseCostOracle::loadPrior(PhaseCostBundle bundle, PhaseCostCompatibility c
     }
     if (bundle.source == PhaseCostBundleSource::kFleet)
     {
+        mHealthState.fleetPriorExpired = expired;
         mFleet = std::move(layer);
     }
     else
     {
+        mHealthState.buildPriorExpired = expired;
         mBuild = std::move(layer);
     }
 }
@@ -584,13 +692,32 @@ void PhaseCostOracle::loadPrior(PhaseCostBundle bundle, PhaseCostCompatibility c
 void PhaseCostOracle::restoreNode(PhaseCostBundle const& bundle)
 {
     ELLM_CHECK(bundle.source == PhaseCostBundleSource::kNode, "Only node cost bundles can restore local observations");
+    uint64_t const now = phaseCostUnixTimeNs();
     for (PhaseCostRecord const& record : bundle.records)
     {
+        if (olderThan(record.observedAtUnixNs, mConfig.drift.nodeObservationTtl, now))
+        {
+            ++mHealthState.staleNodeRecords;
+            continue;
+        }
         for (PhaseGlobalCostObservation const& observation : record.observations)
         {
             mLocal.observe(record.key, observation);
             mergeObservation(mLocalRecords, record.key, observation, record.observedAtUnixNs, mConfig.model.windowSize);
         }
+    }
+    if (bundle.driftState.has_value())
+    {
+        auto restorePhase = [&](PhaseCostPhaseDriftState& destination, PhaseCostPhaseDriftState const& source) {
+            if (!olderThan(source.observedAtUnixNs, mConfig.drift.restoredDriftStateTtl, now))
+            {
+                destination = source;
+            }
+        };
+        restorePhase(mHealthState.drift.encoder, bundle.driftState->encoder);
+        restorePhase(mHealthState.drift.prefill, bundle.driftState->prefill);
+        restorePhase(mHealthState.drift.decode, bundle.driftState->decode);
+        restorePhase(mHealthState.drift.overlap, bundle.driftState->overlap);
     }
 }
 
@@ -603,6 +730,10 @@ PhaseCostBundle PhaseCostOracle::snapshot(PhaseCostBundleSource source, PhaseDep
     result.deployment = std::move(deployment);
     result.createdAtUnixNs = createdAtUnixNs != 0U ? createdAtUnixNs : phaseCostUnixTimeNs();
     result.records = mLocalRecords;
+    if (source == PhaseCostBundleSource::kNode)
+    {
+        result.driftState = mHealthState.drift;
+    }
     return result;
 }
 
@@ -626,11 +757,17 @@ void PhaseCostOracle::resetLocal()
     mDecodeAnchors.ratios.clear();
     mOverlapAnchors.ratios.clear();
     mAnchorState = {};
+    mEncoderDrift.ratios.clear();
+    mPrefillDrift.ratios.clear();
+    mDecodeDrift.ratios.clear();
+    mOverlapDrift.ratios.clear();
+    mHealthState.drift = {};
+    mHealthState.staleNodeRecords = 0U;
 }
 
-void PhaseCostOracle::setAnchorCollectionActive(bool active) noexcept
+void PhaseCostOracle::setCalibrationActive(bool active) noexcept
 {
-    mAnchorCollectionActive = active;
+    mCalibrationActive = active;
 }
 
 PhaseCostAnchorState PhaseCostOracle::anchorState() const
@@ -638,10 +775,16 @@ PhaseCostAnchorState PhaseCostOracle::anchorState() const
     return mAnchorState;
 }
 
-std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrior(
-    std::optional<PriorLayer> const& layer, PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor) const
+PhaseCostHealthState PhaseCostOracle::healthState() const
 {
-    if (!layer.has_value())
+    return mHealthState;
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrior(std::optional<PriorLayer> const& layer,
+    PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor, bool ignoreDrift) const
+{
+    PhaseCostPhaseDriftState const* drift = phaseDriftState(mHealthState.drift, key.kind);
+    if (!layer.has_value() || layer->expired || (!ignoreDrift && drift != nullptr && drift->localOnly))
     {
         return std::nullopt;
     }
@@ -698,16 +841,16 @@ PhaseGlobalCostEstimate PhaseCostOracle::scaledEstimate(PhaseGlobalCostEstimate 
 
 void PhaseCostOracle::observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation)
 {
-    if (!mConfig.anchor.enabled || !mAnchorCollectionActive || !std::isfinite(observation.referenceWorkMs)
+    if (!mConfig.anchor.enabled || !mCalibrationActive || !std::isfinite(observation.referenceWorkMs)
         || observation.referenceWorkMs <= 0.0F || !std::isfinite(observation.makespanMs)
         || observation.makespanMs <= 0.0F)
     {
         return;
     }
-    std::optional<PhaseGlobalCostEstimate> prior = estimatePrior(mFleet, key, false, false);
+    std::optional<PhaseGlobalCostEstimate> prior = estimatePrior(mFleet, key, false, false, true);
     if (!prior.has_value())
     {
-        prior = estimatePrior(mBuild, key, false, false);
+        prior = estimatePrior(mBuild, key, false, false, true);
     }
     if (!prior.has_value() || !std::isfinite(prior->makespanMedianMs)
         || prior->makespanMedianMs <= std::numeric_limits<float>::epsilon())
@@ -722,6 +865,8 @@ void PhaseCostOracle::observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobal
     }
 
     AnchorSamples* samples{};
+    DriftSamples* driftSamples{};
+    PhaseCostPhaseDriftState* driftState{};
     float* scale{};
     float* uncertainty{};
     size_t* sampleCount{};
@@ -729,18 +874,24 @@ void PhaseCostOracle::observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobal
     {
     case PhaseGlobalActionKind::kEncoder:
         samples = &mEncoderAnchors;
+        driftSamples = &mEncoderDrift;
+        driftState = &mHealthState.drift.encoder;
         scale = &mAnchorState.scale.encoder;
         uncertainty = &mAnchorState.encoderRelativeUncertainty;
         sampleCount = &mAnchorState.encoderSamples;
         break;
     case PhaseGlobalActionKind::kPrefill:
         samples = &mPrefillAnchors;
+        driftSamples = &mPrefillDrift;
+        driftState = &mHealthState.drift.prefill;
         scale = &mAnchorState.scale.prefill;
         uncertainty = &mAnchorState.prefillRelativeUncertainty;
         sampleCount = &mAnchorState.prefillSamples;
         break;
     case PhaseGlobalActionKind::kDecode:
         samples = &mDecodeAnchors;
+        driftSamples = &mDecodeDrift;
+        driftState = &mHealthState.drift.decode;
         scale = &mAnchorState.scale.decode;
         uncertainty = &mAnchorState.decodeRelativeUncertainty;
         sampleCount = &mAnchorState.decodeSamples;
@@ -749,6 +900,8 @@ void PhaseCostOracle::observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobal
     case PhaseGlobalActionKind::kEncoderDecode:
     case PhaseGlobalActionKind::kPrefillDecode:
         samples = &mOverlapAnchors;
+        driftSamples = &mOverlapDrift;
+        driftState = &mHealthState.drift.overlap;
         scale = &mAnchorState.scale.overlap;
         uncertainty = &mAnchorState.overlapRelativeUncertainty;
         sampleCount = &mAnchorState.overlapSamples;
@@ -772,6 +925,69 @@ void PhaseCostOracle::observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobal
     float const relativeMad = kNormalMadScale * medianAbsoluteDeviation(samples->ratios, center)
         / std::max(center, std::numeric_limits<float>::epsilon());
     *uncertainty = std::max(mConfig.anchor.minimumRelativeUncertainty, relativeMad);
+    driftSamples->ratios.clear();
+    *driftState = {};
+}
+
+void PhaseCostOracle::observeDrift(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation)
+{
+    if (!mConfig.drift.enabled || mCalibrationActive || !std::isfinite(observation.makespanMs)
+        || observation.makespanMs <= 0.0F)
+    {
+        return;
+    }
+    std::optional<PhaseGlobalCostEstimate> prior = estimatePrior(mFleet, key, false, true, true);
+    if (!prior.has_value())
+    {
+        prior = estimatePrior(mBuild, key, false, true, true);
+    }
+    if (!prior.has_value() || !std::isfinite(prior->makespanMedianMs)
+        || prior->makespanMedianMs <= std::numeric_limits<float>::epsilon())
+    {
+        return;
+    }
+    float const ratio = observation.makespanMs / prior->makespanMedianMs;
+    if (!std::isfinite(ratio) || ratio < mConfig.drift.minimumAcceptedRatio
+        || ratio > mConfig.drift.maximumAcceptedRatio)
+    {
+        return;
+    }
+
+    DriftSamples* samples{};
+    PhaseCostPhaseDriftState* state = phaseDriftState(mHealthState.drift, key.kind);
+    switch (key.kind)
+    {
+    case PhaseGlobalActionKind::kEncoder: samples = &mEncoderDrift; break;
+    case PhaseGlobalActionKind::kPrefill: samples = &mPrefillDrift; break;
+    case PhaseGlobalActionKind::kDecode: samples = &mDecodeDrift; break;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+    case PhaseGlobalActionKind::kEncoderDecode:
+    case PhaseGlobalActionKind::kPrefillDecode: samples = &mOverlapDrift; break;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: return;
+    }
+    ELLM_CHECK(state != nullptr, "Phase drift state is missing for an executable action");
+    samples->ratios.push_back(ratio);
+    if (samples->ratios.size() > mConfig.drift.maxSamplesPerPhase)
+    {
+        samples->ratios.pop_front();
+    }
+    state->sampleCount = samples->ratios.size();
+    state->medianRatio = median(samples->ratios);
+    state->observedAtUnixNs = phaseCostUnixTimeNs();
+    if (samples->ratios.size() < mConfig.drift.minimumSamplesPerPhase)
+    {
+        return;
+    }
+    float const relativeError = std::abs(state->medianRatio - 1.0F);
+    if (!state->localOnly && relativeError > mConfig.drift.enterRelativeError)
+    {
+        state->localOnly = true;
+    }
+    else if (state->localOnly && relativeError < mConfig.drift.exitRelativeError)
+    {
+        state->localOnly = false;
+    }
 }
 
 class PhaseNodeCostJournal::Impl
@@ -781,6 +997,7 @@ public:
     {
         PhaseGlobalActionKey key;
         PhaseGlobalCostObservation observation;
+        PhaseCostDriftState driftState;
         uint64_t observedAtUnixNs{};
     };
 
@@ -824,7 +1041,8 @@ public:
         }
     }
 
-    void enqueue(PhaseGlobalActionKey key, PhaseGlobalCostObservation observation, uint64_t observedAtUnixNs)
+    void enqueue(PhaseGlobalActionKey key, PhaseGlobalCostObservation observation, PhaseCostDriftState driftState,
+        uint64_t observedAtUnixNs)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (mPending.size() >= mConfig.maxPendingObservations)
@@ -832,7 +1050,8 @@ public:
             ++mDropped;
             return;
         }
-        mPending.push_back({key, observation, observedAtUnixNs != 0U ? observedAtUnixNs : phaseCostUnixTimeNs()});
+        mPending.push_back({key, observation, std::move(driftState),
+            observedAtUnixNs != 0U ? observedAtUnixNs : phaseCostUnixTimeNs()});
         mCondition.notify_one();
     }
 
@@ -869,6 +1088,10 @@ private:
             && phaseCostCompatibility(mDeployment, restored.deployment) == PhaseCostCompatibility::kExact)
         {
             mRecords = std::move(restored.records);
+            if (restored.driftState.has_value())
+            {
+                mDriftState = *restored.driftState;
+            }
         }
         while (true)
         {
@@ -891,6 +1114,7 @@ private:
                     mergeObservation(
                         mRecords, value.key, value.observation, value.observedAtUnixNs, mConfig.maxSamplesPerKey);
                 }
+                mDriftState = pending.back().driftState;
                 mSinceSnapshot += pending.size();
             }
             if ((mSinceSnapshot >= mConfig.snapshotEveryObservations || flushRequest > mFlushComplete || stop)
@@ -932,12 +1156,14 @@ private:
         bundle.deployment = mDeployment;
         bundle.createdAtUnixNs = phaseCostUnixTimeNs();
         bundle.records = mRecords;
+        bundle.driftState = mDriftState;
         phaseWriteCostBundleAtomic(bundle, snapshotPath());
     }
 
     PhaseNodeCostJournalConfig mConfig;
     PhaseDeploymentFingerprint mDeployment;
     std::vector<PhaseCostRecord> mRecords;
+    PhaseCostDriftState mDriftState;
     std::deque<Pending> mPending;
     mutable std::mutex mMutex;
     std::condition_variable mCondition;
@@ -958,10 +1184,10 @@ PhaseNodeCostJournal::PhaseNodeCostJournal(PhaseNodeCostJournalConfig config, Ph
 
 PhaseNodeCostJournal::~PhaseNodeCostJournal() noexcept = default;
 
-void PhaseNodeCostJournal::enqueue(
-    PhaseGlobalActionKey key, PhaseGlobalCostObservation observation, uint64_t observedAtUnixNs)
+void PhaseNodeCostJournal::enqueue(PhaseGlobalActionKey key, PhaseGlobalCostObservation observation,
+    PhaseCostDriftState driftState, uint64_t observedAtUnixNs)
 {
-    mImpl->enqueue(key, observation, observedAtUnixNs);
+    mImpl->enqueue(key, observation, std::move(driftState), observedAtUnixNs);
 }
 
 void PhaseNodeCostJournal::flush()

@@ -74,6 +74,33 @@ discarded. Until the minimum sample count is reached the scale remains one.
 Unknown overlap remains ineligible unless the existing safe-probe contract
 permits a bounded calibration probe.
 
+## TTL and drift fallback
+
+Portable fleet and non-exact build timing expires after 30 days by default.
+An exact build prior remains tied to its engine/plugin fingerprint and is kept;
+startup anchors and runtime drift still guard node-level changes. Node-local
+action records expire after seven days.
+
+Outside a controlled calibration epoch, the oracle compares direct CUDA
+makespan with the already anchor-scaled prior for the same action key. A bounded
+phase-level window uses hysteresis:
+
+```text
+8 samples and median relative error > 20% -> phase portable timing local-only
+median relative error < 10%              -> portable timing eligible again
+fresh controlled phase anchor            -> clear that phase's drift state
+```
+
+Local-only affects only E, P, D, or overlap timing for the drifted phase. It
+does not disable other phases, discard exact-key local samples, or alter memory
+feasibility. If no local estimate exists, the caller reaches its existing
+analytical/static fallback. Production observations cannot retune the portable
+phase-wide scale.
+
+The asynchronous node snapshot persists the latest drift state. A restarted
+process restores it only while it is fresh; stale drift state is ignored so a
+temporary interference incident cannot permanently quarantine a prior.
+
 Memory feasibility is unchanged. Predicted completion or reclaim time may
 rank actions but cannot create hard memory capacity.
 
@@ -111,6 +138,11 @@ TRT_EDGELLM_PHASE_COST_SCALE_OVERLAP
 TRT_EDGELLM_PHASE_COST_ANCHOR_MIN_SAMPLES
 TRT_EDGELLM_DISABLE_PHASE_COST_AUTO_ANCHOR
 TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE
+TRT_EDGELLM_PHASE_COST_DRIFT_MIN_SAMPLES
+TRT_EDGELLM_PHASE_COST_DRIFT_ENTER_RATIO
+TRT_EDGELLM_PHASE_COST_DRIFT_EXIT_RATIO
+TRT_EDGELLM_PHASE_COST_PRIOR_TTL_HOURS
+TRT_EDGELLM_PHASE_COST_NODE_TTL_HOURS
 ```
 
 Optional hash/signature fields use the `TRT_EDGELLM_PHASE_*_HASH` variables in
@@ -154,11 +186,9 @@ steps:
    generated build bundle after decision-identity validation;
 2. extend startup coverage with explicit E anchors when the normal VLM warmup
    does not exercise every encoder shape;
-3. add TTL/drift state and local-only fallback when recent observations exceed
-   a robust prior bound;
-4. schedule uncertainty-guided overlap probes only during controlled warmup or
+3. schedule uncertainty-guided overlap probes only during controlled warmup or
    verified idle windows;
-5. connect upload/download transport to a versioned external registry. Remote
+4. connect upload/download transport to a versioned external registry. Remote
    access must remain outside inference.
 
 These steps do not introduce workload modes. The registry distributes GPU

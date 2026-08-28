@@ -97,6 +97,22 @@ enum class PhaseCostBundleSource
 
 char const* phaseCostBundleSourceName(PhaseCostBundleSource source) noexcept;
 
+struct PhaseCostPhaseDriftState
+{
+    bool localOnly{};
+    size_t sampleCount{};
+    float medianRatio{1.0F};
+    uint64_t observedAtUnixNs{};
+};
+
+struct PhaseCostDriftState
+{
+    PhaseCostPhaseDriftState encoder;
+    PhaseCostPhaseDriftState prefill;
+    PhaseCostPhaseDriftState decode;
+    PhaseCostPhaseDriftState overlap;
+};
+
 struct PhaseCostRecord
 {
     PhaseGlobalActionKey key;
@@ -113,6 +129,7 @@ struct PhaseCostBundle
     PhaseDeploymentFingerprint deployment;
     uint64_t createdAtUnixNs{};
     std::vector<PhaseCostRecord> records;
+    std::optional<PhaseCostDriftState> driftState;
 };
 
 PhaseCostBundle phaseLoadCostBundle(std::filesystem::path const& path);
@@ -152,10 +169,33 @@ struct PhaseCostAnchorState
     size_t overlapSamples{};
 };
 
+struct PhaseCostDriftConfig
+{
+    bool enabled{true};
+    size_t minimumSamplesPerPhase{8U};
+    size_t maxSamplesPerPhase{16U};
+    float enterRelativeError{0.20F};
+    float exitRelativeError{0.10F};
+    float minimumAcceptedRatio{0.25F};
+    float maximumAcceptedRatio{4.0F};
+    std::chrono::nanoseconds portablePriorTtl{std::chrono::hours{24 * 30}};
+    std::chrono::nanoseconds nodeObservationTtl{std::chrono::hours{24 * 7}};
+    std::chrono::nanoseconds restoredDriftStateTtl{std::chrono::hours{1}};
+};
+
+struct PhaseCostHealthState
+{
+    PhaseCostDriftState drift;
+    bool buildPriorExpired{};
+    bool fleetPriorExpired{};
+    size_t staleNodeRecords{};
+};
+
 struct PhaseCostOracleConfig
 {
     PhaseGlobalCostModelConfig model;
     PhaseCostAnchorConfig anchor;
+    PhaseCostDriftConfig drift;
     size_t sufficientLocalSamples{4U};
     float compatibleUncertaintyMultiplier{2.0F};
     float shapeOnlyUncertaintyMultiplier{4.0F};
@@ -183,8 +223,9 @@ public:
         PhaseDeploymentFingerprint deployment, std::string bundleVersion, uint64_t createdAtUnixNs = 0U) const;
     void attachJournal(std::shared_ptr<PhaseNodeCostJournal> journal);
     void resetLocal();
-    void setAnchorCollectionActive(bool active) noexcept;
+    void setCalibrationActive(bool active) noexcept;
     PhaseCostAnchorState anchorState() const;
+    PhaseCostHealthState healthState() const;
 
 private:
     struct PriorLayer
@@ -192,15 +233,22 @@ private:
         PhaseGlobalCostModel model;
         PhaseCostCompatibility compatibility{PhaseCostCompatibility::kIncompatible};
         PhaseCostScale scale;
+        bool expired{};
     };
 
     std::optional<PhaseGlobalCostEstimate> estimatePrior(std::optional<PriorLayer> const& layer,
-        PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor = true) const;
+        PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor = true, bool ignoreDrift = false) const;
     static PhaseGlobalCostEstimate scaledEstimate(PhaseGlobalCostEstimate estimate, PhaseGlobalActionKey const& key,
         PhaseCostScale const& scale, float uncertaintyMultiplier, float relativeUncertainty = 0.0F) noexcept;
     void observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation);
+    void observeDrift(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation);
 
     struct AnchorSamples
+    {
+        std::deque<float> ratios;
+    };
+
+    struct DriftSamples
     {
         std::deque<float> ratios;
     };
@@ -215,7 +263,12 @@ private:
     AnchorSamples mDecodeAnchors;
     AnchorSamples mOverlapAnchors;
     PhaseCostAnchorState mAnchorState;
-    bool mAnchorCollectionActive{};
+    DriftSamples mEncoderDrift;
+    DriftSamples mPrefillDrift;
+    DriftSamples mDecodeDrift;
+    DriftSamples mOverlapDrift;
+    PhaseCostHealthState mHealthState;
+    bool mCalibrationActive{};
     std::shared_ptr<PhaseNodeCostJournal> mJournal;
 };
 
@@ -238,7 +291,8 @@ public:
     PhaseNodeCostJournal(PhaseNodeCostJournal const&) = delete;
     PhaseNodeCostJournal& operator=(PhaseNodeCostJournal const&) = delete;
 
-    void enqueue(PhaseGlobalActionKey key, PhaseGlobalCostObservation observation, uint64_t observedAtUnixNs = 0U);
+    void enqueue(PhaseGlobalActionKey key, PhaseGlobalCostObservation observation, PhaseCostDriftState driftState,
+        uint64_t observedAtUnixNs = 0U);
     void flush();
     size_t droppedObservations() const noexcept;
     std::filesystem::path snapshotPath() const;

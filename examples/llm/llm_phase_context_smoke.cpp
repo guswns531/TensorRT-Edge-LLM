@@ -386,8 +386,13 @@ void loadPhaseCostPrior(std::filesystem::path const& path, rt::PhaseDeploymentFi
         LOG_WARNING("Ignoring incompatible phase cost bundle %s", path.c_str());
         return;
     }
+    rt::PhaseCostBundleSource const source = bundle.source;
     oracle->loadPrior(std::move(bundle), compatibility, scale);
-    LOG_INFO("Loaded %s phase cost prior from %s", rt::phaseCostCompatibilityName(compatibility), path.c_str());
+    rt::PhaseCostHealthState const health = oracle->healthState();
+    bool const expired
+        = source == rt::PhaseCostBundleSource::kFleet ? health.fleetPriorExpired : health.buildPriorExpired;
+    LOG_INFO("Loaded %s phase cost prior from %s (timing=%s)", rt::phaseCostCompatibilityName(compatibility),
+        path.c_str(), expired ? "expired-fallback" : "active");
 }
 
 void logPhaseCostAnchors(char const* stage, rt::PhaseCostAnchorState const& state)
@@ -395,6 +400,17 @@ void logPhaseCostAnchors(char const* stage, rt::PhaseCostAnchorState const& stat
     LOG_INFO("Phase cost anchors (%s): E=%.3f/%zu P=%.3f/%zu D=%.3f/%zu overlap=%.3f/%zu", stage, state.scale.encoder,
         state.encoderSamples, state.scale.prefill, state.prefillSamples, state.scale.decode, state.decodeSamples,
         state.scale.overlap, state.overlapSamples);
+}
+
+void logPhaseCostHealth(char const* stage, rt::PhaseCostHealthState const& state)
+{
+    LOG_INFO(
+        "Phase cost health (%s): build_expired=%s fleet_expired=%s local_only=E:%s/P:%s/D:%s/O:%s "
+        "stale_node_records=%zu",
+        stage, state.buildPriorExpired ? "yes" : "no", state.fleetPriorExpired ? "yes" : "no",
+        state.drift.encoder.localOnly ? "yes" : "no", state.drift.prefill.localOnly ? "yes" : "no",
+        state.drift.decode.localOnly ? "yes" : "no", state.drift.overlap.localOnly ? "yes" : "no",
+        state.staleNodeRecords);
 }
 
 struct PhaseTiming
@@ -1521,6 +1537,26 @@ int main(int argc, char** argv)
         {
             phaseCostOracleConfig.anchor.minimumSamplesPerPhase = static_cast<size_t>(std::stoull(value));
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_DRIFT_MIN_SAMPLES"))
+        {
+            phaseCostOracleConfig.drift.minimumSamplesPerPhase = static_cast<size_t>(std::stoull(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_DRIFT_ENTER_RATIO"))
+        {
+            phaseCostOracleConfig.drift.enterRelativeError = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_DRIFT_EXIT_RATIO"))
+        {
+            phaseCostOracleConfig.drift.exitRelativeError = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_PRIOR_TTL_HOURS"))
+        {
+            phaseCostOracleConfig.drift.portablePriorTtl = std::chrono::hours{std::stoll(value)};
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_NODE_TTL_HOURS"))
+        {
+            phaseCostOracleConfig.drift.nodeObservationTtl = std::chrono::hours{std::stoll(value)};
+        }
         auto phaseCostOracle = std::make_shared<rt::PhaseCostOracle>(phaseCostOracleConfig);
         rt::PhaseDeploymentFingerprint const phaseCostDeployment = phaseDeploymentFingerprint(config);
         rt::PhaseCostScale phaseCostScale;
@@ -1922,8 +1958,8 @@ int main(int argc, char** argv)
             bool const globalOverlapWarmup
                 = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                 && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP") == nullptr;
-            bool const phaseCostAnchorWarmup = phaseCostOracleConfig.anchor.enabled
-                && semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
+            bool const phaseCostCalibrationWarmup
+                = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                 && !warmupBatchSizes.empty();
             size_t globalOverlapWarmupSamples = 4U;
             if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_WARMUP_SAMPLES"))
@@ -1938,7 +1974,7 @@ int main(int argc, char** argv)
                 size_t const repeats = globalOverlapWarmup ? globalOverlapWarmupSamples : 1U;
                 executionWarmupBatchSizes.insert(executionWarmupBatchSizes.end(), repeats, batchSize);
             }
-            phaseCostOracle->setAnchorCollectionActive(phaseCostAnchorWarmup);
+            phaseCostOracle->setCalibrationActive(phaseCostCalibrationWarmup);
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(globalOverlapWarmup);
             uint64_t warmupRequestId = 1000000;
             size_t warmedRequests{};
@@ -2004,7 +2040,7 @@ int main(int argc, char** argv)
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
-            phaseCostOracle->setAnchorCollectionActive(false);
+            phaseCostOracle->setCalibrationActive(false);
             rt::PhaseSchedulerTelemetry const warmupTelemetry = semanticCoordinator.scheduler().telemetry();
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
@@ -2029,6 +2065,7 @@ int main(int argc, char** argv)
                 executionWarmupBatchSizes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
                 warmupTelemetry.globalSafeProbeCount);
             logPhaseCostAnchors("post-warmup", phaseCostOracle->anchorState());
+            logPhaseCostHealth("post-warmup", phaseCostOracle->healthState());
             if (char const* path = std::getenv("TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE"))
             {
                 rt::PhaseCostBundle const calibrated = phaseCostOracle->snapshot(
@@ -2650,7 +2687,7 @@ int main(int argc, char** argv)
                         bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
                         if (changesCalibration)
                         {
-                            phaseCostOracle->setAnchorCollectionActive(active);
+                            phaseCostOracle->setCalibrationActive(active);
                             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(active);
                             if (ipcThreePhase != nullptr)
                             {
@@ -2829,6 +2866,14 @@ int main(int argc, char** argv)
                         {"phase_cost_anchor_decode_samples", phaseCostOracle->anchorState().decodeSamples},
                         {"phase_cost_anchor_overlap_scale", phaseCostOracle->anchorState().scale.overlap},
                         {"phase_cost_anchor_overlap_samples", phaseCostOracle->anchorState().overlapSamples},
+                        {"phase_cost_build_prior_expired", phaseCostOracle->healthState().buildPriorExpired},
+                        {"phase_cost_fleet_prior_expired", phaseCostOracle->healthState().fleetPriorExpired},
+                        {"phase_cost_encoder_local_only", phaseCostOracle->healthState().drift.encoder.localOnly},
+                        {"phase_cost_prefill_local_only", phaseCostOracle->healthState().drift.prefill.localOnly},
+                        {"phase_cost_decode_local_only", phaseCostOracle->healthState().drift.decode.localOnly},
+                        {"phase_cost_overlap_local_only", phaseCostOracle->healthState().drift.overlap.localOnly},
+                        {"phase_cost_decode_drift_ratio", phaseCostOracle->healthState().drift.decode.medianRatio},
+                        {"phase_cost_decode_drift_samples", phaseCostOracle->healthState().drift.decode.sampleCount},
                         {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
                         {"global_active_decisions",
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
