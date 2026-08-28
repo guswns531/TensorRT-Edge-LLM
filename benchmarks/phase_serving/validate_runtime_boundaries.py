@@ -32,9 +32,11 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _git_paths(repo: Path, baseline_ref: str) -> set[str]:
-    command = ["git", "diff", "--name-only", f"{baseline_ref}...HEAD"]
-    result = subprocess.run(command, cwd=repo, check=True, capture_output=True, text=True)
-    return {line for line in result.stdout.splitlines() if line}
+    diff_command = ["git", "diff", "--name-only", f"{baseline_ref}...HEAD"]
+    diff = subprocess.run(diff_command, cwd=repo, check=True, capture_output=True, text=True)
+    untracked_command = ["git", "ls-files", "--others", "--exclude-standard"]
+    untracked = subprocess.run(untracked_command, cwd=repo, check=True, capture_output=True, text=True)
+    return {line for output in (diff.stdout, untracked.stdout) for line in output.splitlines() if line}
 
 
 def _is_excluded(path: str, patterns: list[str]) -> bool:

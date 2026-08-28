@@ -16,6 +16,24 @@
  */
 
 #pragma once
+#include <cstddef>
 
-// Compatibility forwarding header. New code should include the canonical phase boundary directly.
-#include "runtime/phase/policy/phaseGlobalScheduler.h"
+namespace trt_edgellm::rt
+{
+
+//! Ownership changes caused by one action. Near reclaim is a ranking signal and
+//! never contributes to hard feasibility until its completion event is observed.
+struct PhaseActionMemoryHorizon
+{
+    size_t managedBytes{};
+    size_t allocateBytes{};
+    size_t immediateReclaimBytes{};
+    size_t guaranteedGrowthBytes{};
+    size_t nearReclaimBytes{};
+    size_t budgetBytes{};
+    bool immediateReclaimObserved{};
+};
+
+
+} // namespace trt_edgellm::rt
+

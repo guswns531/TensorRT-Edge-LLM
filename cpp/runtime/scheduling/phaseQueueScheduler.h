@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "runtime/scheduling/phaseGlobalScheduler.h"
-#include "runtime/scheduling/phaseReadySnapshot.h"
+#include "runtime/phase/mechanism/phaseReadySnapshot.h"
+#include "runtime/phase/policy/phaseGlobalScheduler.h"
 
 #include <chrono>
 #include <cstddef>

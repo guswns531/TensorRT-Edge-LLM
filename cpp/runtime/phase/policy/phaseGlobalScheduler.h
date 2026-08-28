@@ -1,0 +1,81 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "runtime/phase/execution/phaseActionPlan.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+namespace trt_edgellm::rt
+{
+
+enum class PhaseGlobalDecisionReason
+{
+    kNoCandidate,
+    kNoHardFeasibleCandidate,
+    kDeadlineSafeEfficiency,
+    kMinimumViolation,
+    kLegacyCompatibility,
+};
+
+//! Result of one bounded global scheduling decision.
+struct PhaseGlobalDecision
+{
+    std::optional<size_t> selectedIndex;
+    PhaseGlobalDecisionReason reason{PhaseGlobalDecisionReason::kNoCandidate};
+    size_t inputCandidates{};
+    size_t hardFeasibleCandidates{};
+    size_t deadlineSafeCandidates{};
+    size_t dominatedCandidates{};
+    double predictedViolationUs{};
+    double serviceCompression{};
+    size_t hardPeakManagedBytes{};
+};
+
+struct PhaseGlobalSchedulerConfig
+{
+    size_t maxCandidates{11U};
+    double deadlineGuardUs{};
+};
+
+//! Profile-free selector shared by text and multimodal request DAGs.
+//!
+//! Mechanism components generate a small candidate frontier. This selector
+//! enforces dependency, context, shape, ownership, and robust deadline safety
+//! before comparing reference-service compression and memory lifetime.
+class PhaseGlobalScheduler
+{
+public:
+    explicit PhaseGlobalScheduler(PhaseGlobalSchedulerConfig config = {});
+
+    PhaseGlobalDecision select(std::vector<PhaseGlobalActionCandidate> const& candidates) const;
+
+private:
+    PhaseGlobalSchedulerConfig mConfig;
+};
+
+} // namespace trt_edgellm::rt
+

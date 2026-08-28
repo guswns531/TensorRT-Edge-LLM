@@ -461,3 +461,36 @@ ownership horizon과 online cost observation이 이미 값으로 주입된다.
 추가되면 검증이 즉시 실패한다. 이 단계는 runtime build input을 변경하지 않으므로 R4 binary와 성능을
 그대로 승계한다. R2c에서 회귀한 server option 물리 추출은 hot loop를 별도 object로 안정화하기 전까지
 명시적으로 보류한다.
+
+## R6 실행 결과: canonical phase 디렉터리
+
+R3/R4에서 분리한 선언을 책임별 canonical 경로로 이동했다.
+
+```text
+cpp/runtime/phase
+├── mechanism
+│   └── phaseReadySnapshot.h
+├── policy
+│   ├── phaseDeadline.h
+│   ├── phaseGlobalCostModel.h
+│   └── phaseGlobalScheduler.h
+├── ownership
+│   └── phaseOwnershipHorizon.h
+└── execution
+    └── phaseActionPlan.h
+```
+
+기존 `runtime/scheduling/*.h` 경로는 외부 include를 깨지 않는 forwarding header로 남겼다. canonical
+`phaseActionPlan`은 policy/ownership value만 참조하고, canonical selector는 execution plan만 참조하므로
+새 경로가 R3/R4의 의존 방향을 그대로 표현한다. `phaseQueueScheduler`도 canonical mechanism/policy header를
+직접 사용한다.
+
+반면 hot implementation `.cpp`는 이동하지 않았다. R1에서 object 순서를 고정했더라도 R2a/R2c가 보여 준
+executable-layout 민감성을 고려하면 source path와 translation unit 이동은 별도 성능 변경이다. 이 파일들은
+현재 명시적 source-order 목록에 남겨 binary 안정성을 우선한다. 호환 header는 후속 public API 전환 기간에
+제거할 수 있지만 현재 v0.10.0 사용자 include를 깨지 않는다.
+
+R6 build 결과 core archive, TensorRT plugin과 server executable의 SHA-256은 R4와 모두 동일했다. 독립
+async server, Global scheduler/cost, queue scheduler와 three-phase policy를 포함한 집중 테스트도 `200/200`
+통과했다. 따라서 canonical directory 이동은 실행 코드와 성능을 바꾸지 않았으며, 최종 R7에서 전체
+12-workload를 3회씩 다시 실행한다.

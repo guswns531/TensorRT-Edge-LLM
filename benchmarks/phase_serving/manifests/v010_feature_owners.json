@@ -84,6 +84,12 @@
     "global_phase_scheduling": {
       "kind": "new_phase_runtime",
       "paths": [
+        "cpp/runtime/phase/execution/phaseActionPlan.h",
+        "cpp/runtime/phase/mechanism/phaseReadySnapshot.h",
+        "cpp/runtime/phase/ownership/phaseOwnershipHorizon.h",
+        "cpp/runtime/phase/policy/phaseDeadline.h",
+        "cpp/runtime/phase/policy/phaseGlobalCostModel.h",
+        "cpp/runtime/phase/policy/phaseGlobalScheduler.h",
         "cpp/runtime/scheduling/phaseActionPlan.h",
         "cpp/runtime/scheduling/phaseDeadline.h",
         "cpp/runtime/scheduling/phaseGlobalCostModel.h",
@@ -130,6 +136,7 @@
     "ownership_and_reuse": {
       "kind": "new_phase_runtime",
       "paths": [
+        "cpp/runtime/phase/ownership/phaseOwnershipHorizon.h",
         "cpp/runtime/state/stableKVPageManager.cpp",
         "cpp/runtime/state/stableKVPageManager.h",
         "cpp/runtime/scheduling/phaseOwnershipHorizon.h",
@@ -174,6 +181,7 @@
     }
   },
   "excluded_from_product_diff": [
+    ".local/**",
     "benchmarks/phase_serving/**",
     "docs/**",
     "notes/**",

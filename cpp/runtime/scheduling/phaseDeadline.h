@@ -16,20 +16,6 @@
  */
 
 #pragma once
-#include <limits>
 
-namespace trt_edgellm::rt
-{
-
-//! One request deadline protected while evaluating an action. Completion may
-//! include a required follow-up phase when the candidate does not advance the
-//! request owning this deadline.
-struct PhaseProtectedCompletion
-{
-    double slackUs{std::numeric_limits<double>::infinity()};
-    double predictedCompletionUs{};
-    double uncertaintyUs{};
-};
-
-
-} // namespace trt_edgellm::rt
+// Compatibility forwarding header. New code should include the canonical phase boundary directly.
+#include "runtime/phase/policy/phaseDeadline.h"
