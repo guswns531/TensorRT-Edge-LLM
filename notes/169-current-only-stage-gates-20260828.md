@@ -55,6 +55,7 @@ vLLM 전체 fresh 비교를 실행한다.
 | 3A | profile-free Global hot path에서 Legacy policy 평가 생략 | 4 suites, 192 tests pass | 12종 x1 + 의심 3종 x3 | 승격 |
 | 2B | batch formation 본체를 policy-free 함수로 추출 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave x3 | 기각 후 revert |
 | 4A | production scheduler wiring을 fixed P128로 고정 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave/multi x3 | 승격 |
+| 5A | inactive admission/memory controller production wiring 제거 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
 
 ## Stage 1 — Rejected Horizon 제거
 
@@ -324,3 +325,34 @@ Current command에서 변경 전후 최종 scheduler config가 동일하고 전�
 - `.local/current-only-cleanup-20260828/stage4a-fixed-p128-wiring-remaining-5x1`
 - `.local/current-only-cleanup-20260828/stage4a-bimodal-x3`
 - `.local/current-only-cleanup-20260828/stage4a-vlm-suspects-2x3`
+
+## Stage 5A — Inactive controller wiring 제거 시도와 기각
+
+Current에서 OFF인 adaptive/stepwise admission, delayed external profile, adaptive vision-prefill,
+decode-protected prefill deferral, phase memory broker의 production env parser와 admission cost parser
+`139`줄을 제거했다. generic server/coordinator 구현은 유지했으며 Current command의 최종 config 값도
+동일했다. GPU build와 focused `192` tests, 12개 workload의 output/correctness는 모두 통과했다.
+
+그러나 단발 변동 네 종을 3회 반복한 결과는 다음과 같았다.
+
+| workload | Stage 5A tok/s | final Current 대비 | TTFT p95 | TPOT p95 | E2E p95 |
+|---|---:|---:|---:|---:|---:|
+| short | 2,501.57 | +1.00% | 167.75 | 26.76 | 409.25 |
+| text-heavy | 1,922.21 | -1.82% | 1,137.89 | 38.79 | 1,755.53 |
+| mixed | 1,128.00 | -0.85% | 2,082.86 | 42.04 | 2,532.23 |
+| multi-image | 286.61 | -2.11% | 339.43 | 13.61 | 555.49 |
+
+text-heavy와 multi-image가 처리량 `-1%` gate를 넘었다. inactive parser는 serving loop에 없지만 큰
+translation-unit layout 변화가 host thread와 CUDA submission timing을 바꿔 E/P/D formation 경계에
+영향을 준 것으로 분류한다. 기능적으로 동일하다는 이유만으로 성능 회귀를 허용하지 않고 코드 삭제를
+전부 되돌렸다.
+
+이 결과는 production smoke 하나에서 실험 parser와 serving hot path를 함께 링크한 구조 자체가 문제임을
+보여 준다. 다음 Stage 5는 함수를 그 자리에서 삭제하지 않고 lab/compatibility wiring을 별도 translation
+unit 또는 binary로 먼저 분리해야 한다.
+
+결과 위치:
+
+- `.local/current-only-cleanup-20260828/stage5a-inactive-wiring-7x1`
+- `.local/current-only-cleanup-20260828/stage5a-inactive-wiring-remaining-5x1`
+- `.local/current-only-cleanup-20260828/stage5a-suspects-4x3`
