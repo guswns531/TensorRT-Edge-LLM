@@ -101,8 +101,6 @@ struct PhaseThreeCoordinatorConfig
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
     bool enableGlobalEncoderPrefillAction{};
-    //! Protect the oldest request in the next unselected encoder cohort over one bounded E->P horizon.
-    bool enableGlobalEncoderQueueHorizon{};
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
     //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
@@ -291,8 +289,6 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalWarmupDecodeCandidates{};
     size_t globalActionFidelityViolations{};
     double lastGlobalFirstTokenCriticalPathUs{};
-    size_t globalEncoderQueueHorizonPreviews{};
-    double lastGlobalEncoderQueueCriticalPathUs{};
     size_t globalEncoderArrivalWaitPeriods{};
     size_t globalEncoderArrivalWaitExpirations{};
     double lastGlobalEncoderArrivalWaitUs{};
@@ -644,8 +640,6 @@ private:
     size_t mGlobalWarmupDecodeCandidates{};
     size_t mGlobalActionFidelityViolations{};
     double mLastGlobalFirstTokenCriticalPathUs{};
-    size_t mGlobalEncoderQueueHorizonPreviews{};
-    double mLastGlobalEncoderQueueCriticalPathUs{};
     size_t mGlobalEncoderArrivalWaitPeriods{};
     size_t mGlobalEncoderArrivalWaitExpirations{};
     double mLastGlobalEncoderArrivalWaitUs{};

@@ -912,8 +912,6 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalWarmupDecodeCandidates = mGlobalWarmupDecodeCandidates;
     result.globalActionFidelityViolations = mGlobalActionFidelityViolations;
     result.lastGlobalFirstTokenCriticalPathUs = mLastGlobalFirstTokenCriticalPathUs;
-    result.globalEncoderQueueHorizonPreviews = mGlobalEncoderQueueHorizonPreviews;
-    result.lastGlobalEncoderQueueCriticalPathUs = mLastGlobalEncoderQueueCriticalPathUs;
     result.globalEncoderArrivalWaitPeriods = mGlobalEncoderArrivalWaitPeriods;
     result.globalEncoderArrivalWaitExpirations = mGlobalEncoderArrivalWaitExpirations;
     result.lastGlobalEncoderArrivalWaitUs = mLastGlobalEncoderArrivalWaitUs;
@@ -1301,77 +1299,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     mLastGlobalFirstTokenCriticalPathUs
         = encoderMakespanUs + encoderUncertaintyUs + visionPrefillMakespanUs + visionPrefillUncertaintyUs;
 
-    double queuedEncoderSlackUs{std::numeric_limits<double>::infinity()};
-    double queuedEncoderSuffixUs{};
-    double queuedEncoderSuffixUncertaintyUs{};
-    mLastGlobalEncoderQueueCriticalPathUs = 0.0;
-    if (mConfig.enableGlobalEncoderQueueHorizon && encoderBatchIndices.size() < mPending.size())
-    {
-        std::vector<PhaseVisionEncoderInput> pendingInputs;
-        pendingInputs.reserve(mPending.size());
-        for (PendingVisionRequest const& pending : mPending)
-        {
-            pendingInputs.push_back(
-                {mediaItemCount(pending), mediaInputBytes(pending), pending.inputTokens, pending.mediaGeometry});
-        }
-        std::vector<size_t> queuedBatchIndices = phaseVisionNextQueuedEncoderBatchIndices(pendingInputs,
-            encoderBatchIndices, mConfig.maxEncoderBatchSize, mConfig.maxEncoderMediaItems,
-            mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens, mConfig.enableHomogeneousEncoderBatching,
-            mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
-        if (mConfig.enableCostAwareEncoderBatching && !queuedBatchIndices.empty())
-        {
-            std::vector<size_t> candidateInputTokens;
-            candidateInputTokens.reserve(queuedBatchIndices.size());
-            for (size_t const index : queuedBatchIndices)
-            {
-                candidateInputTokens.push_back(pendingInputs[index].inputTokens);
-            }
-            PhaseVisionEncoderBatchChoice const queuedChoice
-                = phaseVisionSelectEncoderBatch(candidateInputTokens, mConfig.encoderBatchCosts);
-            if (!queuedChoice.coverageMiss)
-            {
-                ELLM_CHECK(queuedChoice.batchSize > 0U && queuedChoice.batchSize <= queuedBatchIndices.size(),
-                    "Queued encoder cost selection is outside the candidate range");
-                queuedBatchIndices.resize(queuedChoice.batchSize);
-            }
-        }
-        if (!queuedBatchIndices.empty())
-        {
-            size_t queuedEncoderInputTokens{};
-            for (size_t const index : queuedBatchIndices)
-            {
-                PendingVisionRequest const& request = mPending[index];
-                queuedEncoderInputTokens += request.inputTokens;
-                double const ageUs
-                    = std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count();
-                double const targetUs = request.scheduling.ttftTargetUs > 0.0 ? request.scheduling.ttftTargetUs
-                                                                              : mConfig.visionTtftTargetUs;
-                queuedEncoderSlackUs = std::min(
-                    queuedEncoderSlackUs, targetUs > 0.0 ? targetUs - ageUs : std::numeric_limits<double>::infinity());
-            }
-            EncoderCostPrediction const queuedEncoderPrediction
-                = predictEncoderCost(queuedBatchIndices.size(), queuedEncoderInputTokens);
-            size_t const queuedPromptTokensPerRequest = std::max<size_t>(1U,
-                mEstimatedPromptTokens > 0U
-                    ? mEstimatedPromptTokens
-                    : (queuedEncoderInputTokens + queuedBatchIndices.size() - 1U) / queuedBatchIndices.size());
-            PhaseGlobalCostEstimate const queuedPrefill
-                = mServer.estimateGlobalPrefillDrainCost(static_cast<int32_t>(queuedBatchIndices.size()),
-                    static_cast<int32_t>(std::min<size_t>(
-                        queuedPromptTokensPerRequest, static_cast<size_t>(std::numeric_limits<int32_t>::max()))),
-                    PhasePrefillClass::kExternal);
-            double const queuedPrefillMakespanUs = queuedPrefill.makespanMedianMs > 0.0F
-                ? static_cast<double>(queuedPrefill.makespanMedianMs) * 1000.0
-                : mConfig.globalVisionPrefillColdStartUs;
-            queuedEncoderSuffixUs = queuedEncoderPrediction.makespanUs + queuedPrefillMakespanUs;
-            queuedEncoderSuffixUncertaintyUs
-                = queuedEncoderPrediction.uncertaintyUs + static_cast<double>(queuedPrefill.uncertaintyMs) * 1000.0;
-            mLastGlobalEncoderQueueCriticalPathUs
-                = encoderMakespanUs + encoderUncertaintyUs + queuedEncoderSuffixUs + queuedEncoderSuffixUncertaintyUs;
-            ++mGlobalEncoderQueueHorizonPreviews;
-        }
-    }
-
     PhaseGlobalActionCandidate encoder;
     encoder.key = encoderKey;
     for (size_t const index : encoderBatchIndices)
@@ -1386,11 +1313,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     encoder.requestServiceLagUs = encoderServiceLagUs;
     encoder.protectedCompletions.push_back({encoderSlackUs, encoderMakespanUs + visionPrefillMakespanUs,
         encoderUncertaintyUs + visionPrefillUncertaintyUs});
-    if (queuedEncoderSuffixUs > 0.0)
-    {
-        encoder.protectedCompletions.push_back({queuedEncoderSlackUs, encoderMakespanUs + queuedEncoderSuffixUs,
-            encoderUncertaintyUs + queuedEncoderSuffixUncertaintyUs});
-    }
     PhaseMemoryBrokerConfig const& memoryConfig = mMemoryBroker.config();
     size_t const committedKVBytes = memoryConfig.bytesPerKVPage > 0U
         ? saturatedMultiply(static_cast<size_t>(memoryConfig.committedKVPages), memoryConfig.bytesPerKVPage)
@@ -1412,12 +1334,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         pd->protectedCompletions.push_back(
             {encoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
                 pd->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs});
-        if (queuedEncoderSuffixUs > 0.0)
-        {
-            pd->protectedCompletions.push_back(
-                {queuedEncoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + queuedEncoderSuffixUs,
-                    pd->uncertaintyUs + encoderUncertaintyUs + queuedEncoderSuffixUncertaintyUs});
-        }
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -1631,11 +1547,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         phaseGlobalFinalizeCandidate(overlap);
         overlap.protectedCompletions.push_back({encoderSlackUs, overlapMakespanUs + visionPrefillMakespanUs,
             overlapUncertaintyUs + visionPrefillUncertaintyUs});
-        if (queuedEncoderSuffixUs > 0.0)
-        {
-            overlap.protectedCompletions.push_back({queuedEncoderSlackUs, overlapMakespanUs + queuedEncoderSuffixUs,
-                overlapUncertaintyUs + queuedEncoderSuffixUncertaintyUs});
-        }
         for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
             completion.predictedCompletionUs = residualAugmentation ? phaseOverlapCompletionUs : overlapMakespanUs;

@@ -1536,10 +1536,6 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
         semanticSchedulerConfig.enablePrefillTtftHardGuard
             = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;
-        semanticSchedulerConfig.enableGlobalPrefillContinuationHorizon
-            = std::getenv("TRT_EDGELLM_GLOBAL_PREFILL_CONTINUATION_HORIZON") != nullptr;
-        semanticSchedulerConfig.enableGlobalIncrementalDecodeDrainHorizon
-            = std::getenv("TRT_EDGELLM_GLOBAL_INCREMENTAL_DECODE_DRAIN_HORIZON") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
         {
             semanticSchedulerConfig.globalSafeProbeSlackMultiplier = std::stof(value);
@@ -2147,8 +2143,6 @@ int main(int argc, char** argv)
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
-                threePhaseConfig.enableGlobalEncoderQueueHorizon
-                    = std::getenv("TRT_EDGELLM_GLOBAL_ENCODER_QUEUE_HORIZON") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
                 {
                     threePhaseConfig.globalSafeProbeSlackMultiplier = std::stof(value);
@@ -2880,14 +2874,6 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationResidualCostHitCount},
                         {"global_prefill_formation_max_pending_rows",
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationMaxPendingRows},
-                        {"global_prefill_continuation_previews",
-                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationPreviewCount},
-                        {"global_prefill_continuation_cost_hits",
-                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationCostHitCount},
-                        {"global_prefill_continuation_protected_paths",
-                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationProtectedPathCount},
-                        {"global_prefill_continuation_max_rows",
-                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationMaxRows},
                         {"global_wait_decisions", semanticCoordinator.scheduler().telemetry().globalWaitDecisionCount},
                         {"global_wait_selected", semanticCoordinator.scheduler().telemetry().globalWaitSelectedCount},
                         {"global_wait_candidates",
@@ -3023,10 +3009,6 @@ int main(int argc, char** argv)
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
                         {"vision_global_action_fidelity_violations", visionMetrics.globalActionFidelityViolations},
-                        {"vision_global_encoder_queue_horizon_previews",
-                            visionMetrics.globalEncoderQueueHorizonPreviews},
-                        {"vision_global_encoder_queue_critical_path_ms",
-                            visionMetrics.lastGlobalEncoderQueueCriticalPathUs / 1000.0},
                         {"vision_global_planned_outstanding",
                             static_cast<uint8_t>(visionMetrics.globalPlannedOutstanding)},
                         {"vision_global_observed_outstanding",

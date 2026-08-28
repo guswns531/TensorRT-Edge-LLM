@@ -235,10 +235,6 @@ struct PhaseSchedulerTelemetry
     size_t globalPrefillFormationCombinedCostHitCount{};
     size_t globalPrefillFormationResidualCostHitCount{};
     size_t globalPrefillFormationMaxPendingRows{};
-    size_t globalPrefillContinuationPreviewCount{};
-    size_t globalPrefillContinuationCostHitCount{};
-    size_t globalPrefillContinuationProtectedPathCount{};
-    size_t globalPrefillContinuationMaxRows{};
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
     size_t globalWaitCandidateCount{};
@@ -560,16 +556,6 @@ struct PhaseQueueSchedulerConfig
     //! Dispatch expired prefill work before decode even when decode queue pressure is numerically larger.
     //! This is useful when a request TTFT target is an end-to-end hard bound while the decode target is a soft goal.
     bool enablePrefillTtftHardGuard{};
-    //! Experimentally price the exact next legacy prefill continuation in the
-    //! global action horizon. Disabled by default: a continuation remains in
-    //! the current wavefront cohort, so a more accurate cost can increase
-    //! prefill urgency without improving batch density.
-    bool enableGlobalPrefillContinuationHorizon{};
-    //! Experimentally compare D-now and completion-event WAIT over every
-    //! currently runnable row plus at most one decode-capacity of completed
-    //! rows. Disabled by default until the longer horizon recovers the
-    //! completion-cohort density of the one-step refill policy.
-    bool enableGlobalIncrementalDecodeDrainHorizon{};
     //! Skip policy candidate construction when exactly one local phase is
     //! runnable and memory safety is either local or guaranteed by a
     //! pre-reserved ownership contract. The mechanism batch and online
@@ -785,12 +771,6 @@ public:
     void setGlobalWarmupProbeMode(bool active);
 
 private:
-    struct PrefillMechanismHorizon
-    {
-        PhaseDispatchPlan current;
-        PhaseDispatchPlan successor;
-    };
-
     struct GlobalQueueSelection
     {
         PhaseDispatchKind kind{PhaseDispatchKind::kNone};
@@ -803,7 +783,6 @@ private:
         bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true,
         std::optional<PhaseDispatchKind> compatibilityKind = std::nullopt);
     PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
-    PrefillMechanismHorizon previewPrefillMechanismHorizon(PhaseDispatchKind kind) const;
     PhaseDispatchKind legacyQueueDecision(PhaseQueueSnapshot const& snapshot) const;
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
