@@ -4,6 +4,13 @@
 
 현재 production 경로는 `fixed P128 + P8/D64 + stable indexed-paged KV + independent E/P/D contexts + profile-free Global scheduler`로 확정한다. 앞으로 workload별 profile을 다시 추가하지 않는다.
 
+2026-08-28 실행 결과, rejected horizon 제거와 Global active hot-path의 Legacy policy 평가 생략,
+production fixed-P128 wiring은 전체 성능 gate를 통과해 승격했다. 반면 batch-former 함수/clone 구조 변경,
+inactive controller wiring 삭제, direct event callback은 일부 workload에서 지속적 회귀가 발생해
+되돌렸다. 최종 12 workload x 3 및 의심 5 workload x 3 결과는
+`notes/169-current-only-stage-gates-20260828.md`에 기록했다. 따라서 아래 단계는 완료 목록이 아니라,
+성능 gate에 따라 일부만 승격된 설계 로드맵으로 읽어야 한다.
+
 코드 정리는 바로 Legacy 분기를 삭제하는 방식으로 시작하면 안 된다. 현재 Global candidate 생성은 `PhaseQueueScheduler` 전체를 복사한 뒤 `globalSchedulerMode=disabled`로 바꿔 Legacy mechanism을 재사용한다. 따라서 Legacy policy와 batch formation mechanism이 아직 구조적으로 결합되어 있다.
 
 안전한 순서는 다음과 같다.

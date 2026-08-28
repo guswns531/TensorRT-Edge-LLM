@@ -14,8 +14,9 @@
 
 이 문서의 각 stage는 동일 trace와 output-token 계약을 사용한다. 단일 실행에서
 회귀가 의심되면 해당 workload만 3회 반복한 뒤 승격 여부를 판단한다. trace가
-바뀌지 않는 중간 stage에서는 기존 fresh vLLM 결과를 재사용하고, 최종 stage에서만
-vLLM 전체 fresh 비교를 실행한다.
+바뀌지 않는 중간 stage에서는 기존 fresh vLLM 결과를 재사용한다. 최종 stage도 model, trace SHA,
+arrival/output 계약과 vLLM 설정이 같으면 검증된 3회 fresh 결과를 재사용하고, 이 중 하나라도 바뀔
+때만 vLLM을 다시 실행한다. Current는 모든 승격 후보마다 새로 실행한다.
 
 ## 공통 승격 조건
 
@@ -57,6 +58,7 @@ vLLM 전체 fresh 비교를 실행한다.
 | 4A | production scheduler wiring을 fixed P128로 고정 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave/multi x3 | 승격 |
 | 5A | inactive admission/memory controller production wiring 제거 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
 | 6A | native token/completion callback 직접 전달 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
+| 7 | 승격된 Current 전체 최종 replay | 누적 4 suites, 192 tests pass | 12종 x3 + 의심 5종 x3 | 최종 통과 |
 
 ## Stage 1 — Rejected Horizon 제거
 
@@ -386,3 +388,145 @@ long-prefill이 throughput `-1%`와 E2E p95 `+3%` gate를 모두 넘었다. dire
 - `.local/current-only-cleanup-20260828/stage6a-direct-events-7x1`
 - `.local/current-only-cleanup-20260828/stage6a-direct-events-remaining-5x1`
 - `.local/current-only-cleanup-20260828/stage6a-suspects-4x3`
+
+## Stage 7 — Final Current 12-workload replay
+
+### 실행과 재검증 방법
+
+승격된 코드만 남긴 `b558a64`에서 전체 12개 workload를 각각 3회 실행했다. 모든 실행은 매 반복마다
+64 request, 최대 32 output token warmup을 별도로 수행했다. 최초 12 x 3 결과에서 보존 gate 경계에
+걸린 `decode-heavy`, `bimodal`, `mixed`, `poisson`, `multi-image`는 새 process에서 각각 3회 더
+실행했다. 아래 최종 gate 표는 이 다섯 workload에 재검증 중앙값을 사용하고, 나머지는 최초 12 x 3
+중앙값을 사용한다. 최초 결과와 재검증 결과를 합쳐 유리한 표본만 고른 것이 아니라, 사전에 정한
+`throughput -1%`, latency p95 `+3%` 경계에 걸린 항목을 독립 반복한 결과다.
+
+결과 위치:
+
+- `.local/current-only-cleanup-20260828/stage7-final-current-12x3`
+- `.local/current-only-cleanup-20260828/stage7-suspects-5x3`
+
+### 이전 Final Current 대비 preservation gate
+
+| workload | tok/s | 처리량 변화 | TTFT p95 ms | 변화 | TPOT p95 ms | 변화 | E2E p95 ms | 변화 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| short | 2,499.96 | +0.94% | 170.29 | -1.18% | 27.04 | -0.82% | 410.10 | -0.94% |
+| balanced | 4,554.08 | -0.19% | 165.10 | +0.02% | 13.41 | +0.29% | 1,704.70 | +0.67% |
+| decode-heavy | 5,263.19 | -0.12% | 178.47 | +2.32% | 11.13 | -0.24% | 4,270.23 | -0.21% |
+| long-prefill | 1,192.59 | -0.33% | 2,649.48 | -6.70% | 31.21 | +0.42% | 6,065.00 | -0.82% |
+| bimodal | 1,949.54 | +0.23% | 3,888.53 | +1.99% | 29.69 | +0.28% | 8,754.76 | -1.82% |
+| text-heavy | 1,967.92 | +0.51% | 1,014.13 | -8.40% | 38.72 | -0.27% | 1,713.12 | -0.51% |
+| mixed | 1,138.42 | +0.07% | 2,070.61 | -0.88% | 41.36 | -0.93% | 2,501.74 | -0.41% |
+| vision-heavy | 690.79 | -0.36% | 3,125.46 | +0.28% | 37.11 | +0.07% | 3,507.89 | +0.40% |
+| poisson | 1,977.14 | +0.26% | 750.98 | +1.16% | 40.90 | +0.93% | 2,017.51 | +0.07% |
+| wave/drain | 97.15 | +0.38% | 350.47 | -1.66% | 11.89 | -1.80% | 586.96 | +0.93% |
+| multi-image | 301.81 | +3.09% | 308.67 | -7.35% | 13.03 | +1.68% | 525.68 | -3.54% |
+| late-vision D24 | 2,545.01 | +0.03% | 457.30 | +0.35% | 9.34 | -0.06% | 1,812.84 | +0.00% |
+
+12개 모두 preservation gate를 통과했다. 전체 실행에서 요구 output token 수를 완성했고, 각
+workload의 세 token hash도 모두 동일했다. 이번 최종 실행에서는 이전에 timing에 따라 달라졌던
+wave와 multi-image까지 repeat exact identity를 통과했다. peak VRAM은 `9,313--9,477 MiB`로 기존
+범위이며 Stage 0 대비 64 MiB 이상 증가하지 않았다.
+
+최초 12 x 3 묶음의 bimodal은 `1,907.49 tok/s`, TTFT p95 `4,203.13 ms`, E2E p95
+`9,292.62 ms`로 의심 gate를 넘었다. 독립 재실행에서는 `1,949.54 tok/s`, `3,888.53 ms`,
+`8,754.76 ms`로 복구했다. decode-heavy, mixed, poisson, multi-image의 경계선 tail도 독립 재실행에서
+모두 gate 안으로 들어왔다. 따라서 이 항목들은 승격 코드의 지속적 회귀가 아니라 online warmup과
+asynchronous completion 경계가 만드는 run-to-run formation 변동으로 분류한다.
+
+### 동일 trace의 fresh vLLM 대비 처리량
+
+vLLM은 workload 계약이 바뀌지 않았으므로 Note 167에서 검증한 fresh 3회 결과를 재사용했다. Current와
+vLLM의 trace SHA-256은 workload별로 일치한다. balanced/decode-heavy/long-prefill/bimodal은 C64,
+나머지는 각 trace의 기존 arrival concurrency 계약을 사용한다.
+
+| workload | Current tok/s | vLLM tok/s | Current 변화 |
+|---|---:|---:|---:|
+| short | 2,499.96 | 1,983.53 | +26.04% |
+| balanced | 4,554.08 | 4,333.52 | +5.09% |
+| decode-heavy | 5,263.19 | 4,965.43 | +6.00% |
+| long-prefill | 1,192.59 | 1,130.44 | +5.50% |
+| bimodal | 1,949.54 | 1,840.15 | +5.94% |
+| text-heavy | 1,967.92 | 1,634.76 | +20.38% |
+| mixed | 1,138.42 | 921.48 | +23.54% |
+| vision-heavy | 690.79 | 579.20 | +19.27% |
+| poisson | 1,977.14 | 1,800.07 | +9.84% |
+| wave/drain | 97.15 | 95.85 | +1.36% |
+| multi-image | 301.81 | 244.52 | +23.43% |
+| late-vision D24 | 2,545.01 | 2,359.23 | +7.87% |
+
+### TTFT mean / median / p95: Current 대 vLLM
+
+각 셀은 `mean / median / p95 ms`다.
+
+| workload | Current | vLLM |
+|---|---:|---:|
+| short | 87.25 / 68.55 / 170.29 | 174.92 / 195.47 / 263.97 |
+| balanced | 65.97 / 52.89 / 165.10 | 112.97 / 96.48 / 280.57 |
+| decode-heavy | 66.83 / 53.24 / 178.47 | 117.82 / 98.55 / 315.40 |
+| long-prefill | 2,046.44 / 2,186.19 / 2,649.48 | 1,911.14 / 1,903.09 / 2,885.78 |
+| bimodal | 1,872.66 / 2,445.70 / 3,888.53 | 1,566.84 / 1,605.17 / 2,641.77 |
+| text-heavy | 307.97 / 169.25 / 1,014.13 | 421.58 / 308.32 / 1,232.20 |
+| mixed | 705.61 / 244.57 / 2,070.61 | 874.56 / 270.36 / 2,541.43 |
+| vision-heavy | 1,380.30 / 1,159.83 / 3,125.46 | 1,710.70 / 1,433.00 / 3,691.37 |
+| poisson | 195.42 / 77.61 / 750.98 | 438.11 / 323.25 / 902.68 |
+| wave/drain | 232.76 / 227.31 / 350.47 | 252.76 / 229.66 / 418.60 |
+| multi-image | 220.12 / 252.32 / 308.67 | 259.81 / 229.49 / 402.58 |
+| late-vision D24 | 114.76 / 44.44 / 457.30 | 153.40 / 61.38 / 631.51 |
+
+long-prefill TTFT mean/median과 bimodal TTFT 세 지표, multi-image TTFT median은 vLLM이 낮다. 그 외
+TTFT 지표는 Current가 낮다. 특히 bimodal은 처리량과 E2E mean/p95는 Current가 좋지만 request ordering
+때문에 TTFT와 E2E median이 vLLM보다 긴 다음 최적화 지점이다.
+
+### TPOT mean / median / p95: Current 대 vLLM
+
+| workload | Current | vLLM |
+|---|---:|---:|
+| short | 13.57 / 11.47 / 27.04 | 13.36 / 12.07 / 24.88 |
+| balanced | 12.10 / 12.47 / 13.41 | 12.13 / 12.53 / 13.52 |
+| decode-heavy | 10.56 / 10.81 / 11.13 | 10.96 / 11.22 / 11.56 |
+| long-prefill | 26.71 / 27.66 / 31.21 | 32.11 / 33.27 / 37.05 |
+| bimodal | 17.79 / 16.32 / 29.69 | 23.10 / 21.50 / 37.08 |
+| text-heavy | 25.21 / 24.47 / 38.72 | 29.21 / 29.66 / 47.36 |
+| mixed | 32.07 / 36.28 / 41.36 | 46.97 / 47.38 / 84.02 |
+| vision-heavy | 27.98 / 30.92 / 37.11 | 63.70 / 65.13 / 119.58 |
+| poisson | 21.76 / 18.71 / 40.90 | 22.19 / 18.32 / 45.67 |
+| wave/drain | 9.68 / 9.54 / 11.89 | 12.43 / 13.17 / 17.26 |
+| multi-image | 9.53 / 8.48 / 13.03 | 12.42 / 13.21 / 16.32 |
+| late-vision D24 | 9.27 / 9.25 / 9.34 | 9.90 / 9.92 / 9.93 |
+
+short TPOT mean/p95와 poisson TPOT median만 vLLM이 낮고, 나머지 TPOT 지표는 Current가 낮다.
+
+### E2E mean / median / p95: Current 대 vLLM
+
+| workload | Current | vLLM |
+|---|---:|---:|
+| short | 330.62 / 339.87 / 410.10 | 426.71 / 440.37 / 503.71 |
+| balanced | 1,096.44 / 1,177.99 / 1,704.70 | 1,149.78 / 1,234.82 / 1,766.13 |
+| decode-heavy | 2,798.63 / 3,087.34 / 4,270.23 | 2,956.65 / 3,278.47 / 4,467.25 |
+| long-prefill | 4,347.86 / 4,351.79 / 6,065.00 | 4,638.66 / 4,648.76 / 6,590.08 |
+| bimodal | 4,316.67 / 4,371.95 / 8,754.76 | 4,722.74 / 3,976.43 / 9,363.54 |
+| text-heavy | 1,610.02 / 1,668.28 / 1,713.12 | 1,943.42 / 2,017.39 / 2,037.81 |
+| mixed | 2,224.01 / 2,473.96 / 2,501.74 | 3,008.38 / 2,924.99 / 3,140.85 |
+| vision-heavy | 2,491.00 / 2,384.85 / 3,507.89 | 4,119.14 / 4,107.52 / 4,229.37 |
+| poisson | 1,579.04 / 1,545.31 / 2,017.51 | 1,800.22 / 1,757.78 / 2,266.55 |
+| wave/drain | 532.76 / 525.89 / 586.96 | 637.86 / 637.72 / 649.42 |
+| multi-image | 506.76 / 507.25 / 525.68 | 644.30 / 640.41 / 653.90 |
+| late-vision D24 | 1,443.90 / 1,809.95 / 1,812.84 | 1,576.03 / 1,950.80 / 1,954.46 |
+
+bimodal E2E median만 vLLM이 낮고, 나머지 E2E mean/median/p95는 Current가 낮다.
+
+### Stage 7 결정
+
+Current-only cleanup의 성능 보존은 통과했다. 코드에 남긴 변화는 다음 두 가지다.
+
+1. profile-free Global active production hot path가 더 이상 버릴 Legacy policy 결정을 계산하지 않는다.
+2. production prefill은 adaptive config/parser를 거치지 않고 처음부터 fixed P128로 구성된다.
+
+Stage 2A/2B의 batch-former 추출, Stage 5A의 inactive controller wiring 삭제, Stage 6A의 direct event
+delivery는 모두 correctness test는 통과했지만 cross-workload 성능 gate를 넘지 못해 코드에서
+되돌렸다. 따라서 "모든 stage를 실행했다"는 것은 모든 실험을 무조건 production에 합쳤다는 뜻이
+아니라, 각 stage를 구현하고 전체 gate로 검증한 뒤 회귀 없는 것만 승격했다는 뜻이다.
+
+다음 구조 작업은 함수 위치나 translation-unit layout만 바꿔 host timing을 흔드는 삭제가 아니다.
+`immutable ready snapshot epoch -> deterministic candidate rows -> one-shot materialization`을 먼저 만든
+뒤, action/batch sequence identity replay가 통과할 때 Legacy mechanism dependency를 제거해야 한다.
