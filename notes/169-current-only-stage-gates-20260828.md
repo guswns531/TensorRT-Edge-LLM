@@ -53,6 +53,8 @@ vLLM 전체 fresh 비교를 실행한다.
 | 1 | rejected P continuation, full D-drain, E queue horizon 제거 | 4 suites, 192 tests pass | 12종 x1 완료, 의심 6종 x3 재검증 | 성능 승격, VLM repeat hash 변동 추적 |
 | 2A | full scheduler copy를 selective mechanism scratch로 교체 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
 | 3A | profile-free Global hot path에서 Legacy policy 평가 생략 | 4 suites, 192 tests pass | 12종 x1 + 의심 3종 x3 | 승격 |
+| 2B | batch formation 본체를 policy-free 함수로 추출 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave x3 | 기각 후 revert |
+| 4A | production scheduler wiring을 fixed P128로 고정 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave/multi x3 | 승격 |
 
 ## Stage 1 — Rejected Horizon 제거
 
@@ -226,3 +228,99 @@ materialization을 먼저 만든 뒤 진행한다.
 - `.local/current-only-cleanup-20260828/stage3a-global-only-hotpath-remaining-5x1`
 - `.local/current-only-cleanup-20260828/stage3a-suspects-2x3`
 - `.local/current-only-cleanup-20260828/stage3a-bimodal-x3`
+
+## Stage 2B — Policy-free mechanism 함수 추출 시도와 기각
+
+### 시도
+
+`next()` 안의 P/D planned shape 계산, `popBatch()`, overlap의 decode-only 전환을
+`formMechanismPlan()`으로 옮겼다. 실제 dispatch와 preview가 같은 함수를 호출하게 하되, preview의
+full scheduler copy는 유지했다. Stage 2A와 달리 복사 상태를 줄이지 않았으므로 queue/cohort/cost
+상태는 byte-for-byte 같고, preview에서 Legacy policy callback과 재귀적인 `next()` 호출만 생략하는
+중간 분리 단계였다.
+
+GPU build와 focused `192` tests는 모두 통과했다. 12개 workload도 output completion, exact text hash,
+VLM semantic gate를 통과했다. 결과는 다음 위치에 보존한다.
+
+- `.local/current-only-cleanup-20260828/stage2b-mechanism-function-7x1`
+- `.local/current-only-cleanup-20260828/stage2b-mechanism-function-remaining-5x1`
+- `.local/current-only-cleanup-20260828/stage2b-suspects-2x3`
+
+### 반복 결과와 결정
+
+단발 tail이 움직인 bimodal과 wave를 3회 재검증했다.
+
+| workload | Stage 2B tok/s | Stage 3A 대비 | TTFT p95 변화 | TPOT p95 변화 | E2E p95 변화 |
+|---|---:|---:|---:|---:|---:|
+| bimodal | 1,921.95 | -0.91% | +3.06% | +0.09% | +0.68% |
+| wave/drain | 97.25 | +0.48% | -1.18% | -1.65% | +0.24% |
+
+bimodal 처리량은 `-1%` 안이지만 TTFT p95 `3%` gate를 `0.06%p` 넘었다. 함수 추출은 계산 결과를
+바꾸지 않지만 preview host 시간이 줄면서 다음 queue arrival/completion을 관측하는 시점과 D cohort
+형성 경계가 달라졌다. Stage 2A와 같은 종류의 timing sensitivity가 더 작은 형태로 재현된 것이다.
+
+성능 하락 없는 cleanup이라는 원칙에 따라 Stage 2B 코드는 되돌렸다. Stage 2 완료 조건은 단순 함수
+추출이나 clone 최적화가 아니라, host 실행시간이 달라져도 한 snapshot epoch의 ready rows와 선택된
+candidate가 바뀌지 않는 immutable ready snapshot이다. 그 경계가 생기기 전에는 full-copy preview를
+유지한다.
+
+## Stage 4A — Production fixed-P128 wiring
+
+### 변경 범위
+
+production smoke binary는 기존에 adaptive `32/64/128` config를 먼저 만들고
+`TRT_EDGELLM_FIXED_PREFILL_CHUNK=128`을 읽어 다시 fixed config로 바꿨다. 이를 처음부터 다음 최종
+상태로 구성하도록 단순화했다.
+
+```text
+maxPrefillChunkTokens = 128
+minPrefillChunkTokens = 128
+enableAdaptivePrefillChunking = false
+adaptivePrefillChunkCandidates = {}
+maxPrefillBatchTokens = P8 * 128
+```
+
+`TRT_EDGELLM_FIXED_PREFILL_CHUNK` production parser는 제거했다. benchmark command에 남아 있는 같은
+환경 변수는 무시되며 최종 scheduler config는 변경 전과 같다. generic scheduler library의 adaptive
+기능과 unit tests는 아직 제거하지 않았다. 즉 이번 단계는 Current production wiring을 고정하는 작은
+승격이고, Stage 4 전체 삭제의 복구점이다.
+
+### 전체 gate
+
+GPU build와 focused `192` tests가 통과했다. 전체 12개 workload 단일 실행에서 output completion,
+text exact hash, VLM semantic correctness가 모두 통과했다. 단발 변동이 있던 bimodal, wave,
+multi-image는 3회 재실행했다.
+
+| workload | Stage 4A tok/s | 비교 기준 | 처리량 변화 | TTFT p95 | TPOT p95 | E2E p95 |
+|---|---:|---|---:|---:|---:|---:|
+| short | 2,516.83 | Stage 3A | +0.71% | 165.89 | 22.12 | 406.99 |
+| balanced | 4,568.50 | Stage 3A | -0.51% | 163.90 | 13.32 | 1,689.42 |
+| decode-heavy | 5,285.36 | Stage 3A | +0.04% | 170.82 | 11.04 | 4,236.58 |
+| long-prefill | 1,225.96 | Stage 3A | +0.26% | 2,598.86 | 30.04 | 5,972.26 |
+| bimodal | 1,925.40 | Stage 3A x3 | -0.73% | 3,901.64 | 29.63 | 9,180.38 |
+| text-heavy | 1,961.95 | Stage 3A x3 | -0.56% | 1,057.15 | 38.00 | 1,718.85 |
+| mixed | 1,133.17 | Stage 3A | -0.81% | 2,063.19 | 41.61 | 2,519.69 |
+| vision-heavy | 688.21 | Stage 3A | +0.06% | 3,198.31 | 37.20 | 3,515.18 |
+| poisson | 1,990.79 | Stage 3A | +0.28% | 755.08 | 40.09 | 2,005.85 |
+| wave/drain | 96.89 | final Current x3 | +0.12% | 355.69 | 12.09 | 587.61 |
+| multi-image | 295.71 | final Current x3 | +1.00% | 327.24 | 12.98 | 539.82 |
+| late-vision D24 | 2,540.85 | Stage 3A | +0.02% | 458.13 | 9.35 | 1,815.18 |
+
+wave와 multi는 직전 stage의 각각 한 번의 3회 묶음보다 느렸지만, 여러 cleanup stage에서 같은
+binary도 E formation 경계에 따라 이 범위로 움직였다. 더 안정적인 Note 167 final Current 3회
+중앙값과 비교하면 처리량은 각각 `+0.12%`, `+1.00%`다. multi의 세 hash는
+`9f80...`, `9f80...`, `f697...`였고 semantic pass는 `1.0`이다. 이는 Stage 1에서도 관찰한 기존
+FP16 E-batch numerical boundary이며 fixed-P128 config 차이가 아니다.
+
+### Stage 4A 결정
+
+Current command에서 변경 전후 최종 scheduler config가 동일하고 전체 workload 성능/메모리 gate를
+통과했으므로 승격한다. generic adaptive code 삭제는 immutable batch former와 production target
+분리가 준비된 뒤 별도 단계로 진행한다.
+
+결과 위치:
+
+- `.local/current-only-cleanup-20260828/stage4a-fixed-p128-wiring-7x1`
+- `.local/current-only-cleanup-20260828/stage4a-fixed-p128-wiring-remaining-5x1`
+- `.local/current-only-cleanup-20260828/stage4a-bimodal-x3`
+- `.local/current-only-cleanup-20260828/stage4a-vlm-suspects-2x3`

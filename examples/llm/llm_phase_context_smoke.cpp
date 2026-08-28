@@ -1511,28 +1511,12 @@ int main(int argc, char** argv)
             = std::getenv("TRT_EDGELLM_DISABLE_WAVEFRONT_PREFILL") == nullptr;
         semanticSchedulerConfig.maxPrefillCohortSize = semanticSchedulerConfig.maxPrefillBatchSize;
         semanticSchedulerConfig.maxPrefillCohortTurns = 8;
-        semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
+        semanticSchedulerConfig.enableAdaptivePrefillChunking = false;
         semanticSchedulerConfig.enableDecodeTpotTelemetry
             = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr
             || std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr
             || std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr;
-        semanticSchedulerConfig.minPrefillChunkTokens = 32;
-        semanticSchedulerConfig.prefillChunkAlignment = 8;
-        semanticSchedulerConfig.adaptivePrefillChunkCandidates = {32, 64, 128};
-        if (char const* value = std::getenv("TRT_EDGELLM_FIXED_PREFILL_CHUNK"))
-        {
-            int32_t const fixedChunk = std::stoi(value);
-            ELLM_CHECK(fixedChunk > 0 && fixedChunk <= 128, "Fixed prefill chunk is outside the engine profile");
-            semanticSchedulerConfig.maxPrefillChunkTokens = fixedChunk;
-            semanticSchedulerConfig.minPrefillChunkTokens = fixedChunk;
-            semanticSchedulerConfig.enableAdaptivePrefillChunking = false;
-            semanticSchedulerConfig.adaptivePrefillChunkCandidates.clear();
-            if (prefillBatchTokenBudgetValue == nullptr)
-            {
-                semanticSchedulerConfig.maxPrefillBatchTokens
-                    = semanticSchedulerConfig.maxPrefillBatchSize * fixedChunk;
-            }
-        }
+        semanticSchedulerConfig.minPrefillChunkTokens = semanticSchedulerConfig.maxPrefillChunkTokens;
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
         semanticSchedulerConfig.enablePrefillTtftHardGuard
             = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;
