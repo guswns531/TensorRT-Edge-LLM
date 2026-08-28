@@ -1536,6 +1536,8 @@ int main(int argc, char** argv)
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
         semanticSchedulerConfig.enablePrefillTtftHardGuard
             = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;
+        semanticSchedulerConfig.enableGlobalPrefillContinuationHorizon
+            = std::getenv("TRT_EDGELLM_GLOBAL_PREFILL_CONTINUATION_HORIZON") != nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference
             = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;
@@ -2858,6 +2860,14 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationResidualCostHitCount},
                         {"global_prefill_formation_max_pending_rows",
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationMaxPendingRows},
+                        {"global_prefill_continuation_previews",
+                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationPreviewCount},
+                        {"global_prefill_continuation_cost_hits",
+                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationCostHitCount},
+                        {"global_prefill_continuation_protected_paths",
+                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationProtectedPathCount},
+                        {"global_prefill_continuation_max_rows",
+                            semanticCoordinator.scheduler().telemetry().globalPrefillContinuationMaxRows},
                         {"global_wait_decisions", semanticCoordinator.scheduler().telemetry().globalWaitDecisionCount},
                         {"global_wait_selected", semanticCoordinator.scheduler().telemetry().globalWaitSelectedCount},
                         {"global_wait_candidates",

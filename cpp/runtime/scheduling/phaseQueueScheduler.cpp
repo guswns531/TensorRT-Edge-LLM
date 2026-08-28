@@ -538,8 +538,8 @@ void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t rows) noexcept
     mPendingPrefillProducerRowsClassified = false;
 }
 
-void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t textRows, size_t externalRows, double predictedWaitUs,
-    double waitUncertaintyUs, uint64_t eventId) noexcept
+void PhaseQueueScheduler::setPendingPrefillProducerRows(
+    size_t textRows, size_t externalRows, double predictedWaitUs, double waitUncertaintyUs, uint64_t eventId) noexcept
 {
     mPendingPrefillProducerRows = textRows + externalRows;
     mPendingTextPrefillProducerRows = textRows;
@@ -1459,6 +1459,43 @@ PhaseDispatchPlan PhaseQueueScheduler::previewMechanismPlan(PhaseDispatchKind ki
     return preview.next();
 }
 
+PhaseQueueScheduler::PrefillMechanismHorizon PhaseQueueScheduler::previewPrefillMechanismHorizon(
+    PhaseDispatchKind kind) const
+{
+    check::check(kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap,
+        "A prefill horizon requires a prefill-bearing action");
+    PhaseQueueScheduler preview = *this;
+    preview.mConfig.globalSchedulerMode = PhaseGlobalSchedulerMode::kDisabled;
+    preview.mConfig.enablePrefillTtftHardGuard = false;
+    preview.mConfig.enableMetricsPolicy = false;
+    preview.mConfig.metricsPolicy = {};
+    preview.mConfig.enableExternalDrainPreference = false;
+    preview.mConfig.policy = [kind](PhaseQueueSnapshot const&) { return kind; };
+    preview.mNextGlobalAction.reset();
+
+    PrefillMechanismHorizon result;
+    result.current = preview.next();
+    for (PhaseWorkItem const& item : result.current.prefillBatch)
+    {
+        preview.completePrefill(item, item.tokenOffset + item.tokenCount);
+    }
+    // A preview cannot know whether one sampled token will be EOS. Keeping
+    // every decode row alive is the conservative deterministic state: it
+    // preserves decode-active chunk limits without forecasting completion.
+    for (PhaseWorkItem const& item : result.current.decodeBatch)
+    {
+        preview.completeDecode(item, item.tokenCount + 1, false);
+    }
+    if (preview.prefillQueueSize() == 0U)
+    {
+        return result;
+    }
+
+    preview.mConfig.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    result.successor = preview.next();
+    return result;
+}
+
 std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::selectGlobalQueueAction(
     PhaseQueueSnapshot const& state, bool allowPrefill, bool allowDecode, bool allowOverlap,
     std::optional<PhaseDispatchKind> compatibilityKind)
@@ -1490,10 +1527,21 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         return (std::max(0, tokens) + contextBucketTokens - 1) / contextBucketTokens;
     };
 
-    bool const prefillDeadlineExpired = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U
-        && state.prefillMinTtftSlackUs <= 0.0;
-    PhaseDispatchPlan const prefillPlan
-        = state.prefillQueued > 0U ? previewMechanismPlan(PhaseDispatchKind::kPrefill) : PhaseDispatchPlan{};
+    bool const prefillDeadlineExpired
+        = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U && state.prefillMinTtftSlackUs <= 0.0;
+    PrefillMechanismHorizon prefillHorizon;
+    if (state.prefillQueued > 0U)
+    {
+        if (mConfig.enableGlobalPrefillContinuationHorizon)
+        {
+            prefillHorizon = previewPrefillMechanismHorizon(PhaseDispatchKind::kPrefill);
+        }
+        else
+        {
+            prefillHorizon.current = previewMechanismPlan(PhaseDispatchKind::kPrefill);
+        }
+    }
+    PhaseDispatchPlan const& prefillPlan = prefillHorizon.current;
     int32_t const prefillRows = static_cast<int32_t>(prefillPlan.prefillBatch.size());
     int32_t prefillChunk{};
     int32_t prefillPastKV{};
@@ -1515,6 +1563,28 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         prefillInitial = prefillPlan.prefillBatch.front().tokenOffset == 0;
         prefillClass = prefillPlan.prefillBatch.front().prefillClass;
     }
+    int32_t const successorPrefillRows = static_cast<int32_t>(prefillHorizon.successor.prefillBatch.size());
+    int32_t successorPrefillChunk{};
+    int32_t successorPrefillPastKV{};
+    int32_t successorPrefillUsefulTokens{};
+    bool successorPrefillInitial{};
+    PhasePrefillClass successorPrefillClass{PhasePrefillClass::kAny};
+    bool successorContainsProducedContinuation{};
+    std::unordered_set<uint64_t> currentPrefillRequestIds(prefillRequestIds.begin(), prefillRequestIds.end());
+    for (PhaseWorkItem const& item : prefillHorizon.successor.prefillBatch)
+    {
+        successorPrefillChunk = std::max(successorPrefillChunk, item.tokenCount);
+        successorPrefillPastKV = std::max(successorPrefillPastKV, item.tokenOffset);
+        successorPrefillUsefulTokens += item.tokenCount;
+        successorContainsProducedContinuation = successorContainsProducedContinuation
+            || (item.tokenOffset > 0
+                && currentPrefillRequestIds.find(item.requestId) != currentPrefillRequestIds.end());
+    }
+    if (!prefillHorizon.successor.prefillBatch.empty())
+    {
+        successorPrefillInitial = prefillHorizon.successor.prefillBatch.front().tokenOffset == 0;
+        successorPrefillClass = prefillHorizon.successor.prefillBatch.front().prefillClass;
+    }
 
     PhaseDispatchPlan const decodePlan
         = state.decodeQueued > 0U ? previewMechanismPlan(PhaseDispatchKind::kDecode) : PhaseDispatchPlan{};
@@ -1533,6 +1603,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
 
     PhaseGlobalActionKey prefillKey{
         PhaseGlobalActionKind::kPrefill, prefillRows, 0, prefillChunk, contextBucket(prefillPastKV), 0};
+    PhaseGlobalActionKey successorPrefillKey{PhaseGlobalActionKind::kPrefill, successorPrefillRows, 0,
+        successorPrefillChunk, contextBucket(successorPrefillPastKV), 0};
     PhaseGlobalActionKey decodeKey{
         PhaseGlobalActionKind::kDecode, decodeRows, 0, 1, contextBucket(decodeMaxContext), 0};
 
@@ -1577,6 +1649,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             : PhaseExecutionVariant::kEager;
     };
     prefillKey.executionVariant = executionVariant(prefillKey, prefillUsefulTokens);
+    successorPrefillKey.executionVariant = executionVariant(successorPrefillKey, successorPrefillUsefulTokens);
     decodeKey.executionVariant = executionVariant(decodeKey, 0);
 
     auto predictPrefill = [&](PhaseGlobalActionKey const& key, int32_t rows, int32_t chunk, int32_t pastKV,
@@ -1625,8 +1698,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             static_cast<double>(mConfig.globalColdPrefillMsPerToken)
                 * static_cast<double>(std::max(1, candidateTokens)));
         double const makespanMs = selected != nullptr ? selected->p95GpuMs : fallbackMs;
-        double const referenceMs
-            = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * rows : makespanMs;
+        double const referenceMs = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * rows : makespanMs;
         double const uncertaintyMs = selected != nullptr ? 0.0 : mConfig.globalCostModelConfig.coldStartUncertaintyMs;
         return {makespanMs * 1000.0, uncertaintyMs * 1000.0, referenceMs * 1000.0, selected != nullptr};
     };
@@ -1667,11 +1739,25 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     };
 
     std::optional<Prediction> const prefill = prefillRows > 0
-        ? std::optional<Prediction>(predictPrefill(prefillKey, prefillRows, prefillChunk, prefillPastKV, prefillInitial,
-            prefillClass, prefillUsefulTokens))
+        ? std::optional<Prediction>(predictPrefill(
+              prefillKey, prefillRows, prefillChunk, prefillPastKV, prefillInitial, prefillClass, prefillUsefulTokens))
         : std::nullopt;
     std::optional<Prediction> const decode
         = decodeRows > 0 ? std::optional<Prediction>(decodePrediction()) : std::nullopt;
+    std::optional<Prediction> successorPrefill;
+    if (successorContainsProducedContinuation && successorPrefillRows > 0)
+    {
+        ++mTelemetry.globalPrefillContinuationPreviewCount;
+        mTelemetry.globalPrefillContinuationMaxRows
+            = std::max(mTelemetry.globalPrefillContinuationMaxRows, static_cast<size_t>(successorPrefillRows));
+        Prediction const prediction = predictPrefill(successorPrefillKey, successorPrefillRows, successorPrefillChunk,
+            successorPrefillPastKV, successorPrefillInitial, successorPrefillClass, successorPrefillUsefulTokens, true);
+        if (prediction.directlyKnown)
+        {
+            successorPrefill = prediction;
+            ++mTelemetry.globalPrefillContinuationCostHitCount;
+        }
+    }
     struct PrefillFormationPrediction
     {
         Prediction combined;
@@ -1683,9 +1769,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     size_t compatibleProducerRows = state.prefillPendingProducerRows;
     if (state.prefillProducerRowsClassified)
     {
-        compatibleProducerRows = prefillClass == PhasePrefillClass::kExternal
-            ? state.prefillPendingExternalProducerRows
-            : state.prefillPendingTextProducerRows;
+        compatibleProducerRows = prefillClass == PhasePrefillClass::kExternal ? state.prefillPendingExternalProducerRows
+                                                                              : state.prefillPendingTextProducerRows;
     }
     if (prefill.has_value() && decode.has_value() && compatibleProducerRows > 0U)
     {
@@ -1695,8 +1780,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         int32_t formationCapacityRows = mConfig.maxPrefillBatchSize;
         if (mConfig.maxPrefillBatchTokens > 0)
         {
-            int32_t const tokenCapacityRows
-                = std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, prefillChunk));
+            int32_t const tokenCapacityRows = std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, prefillChunk));
             formationCapacityRows = std::min(formationCapacityRows, tokenCapacityRows);
         }
         size_t const boundedPendingRows
@@ -1723,8 +1807,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             mTelemetry.globalPrefillFormationResidualCostHitCount += residual.directlyKnown ? 1U : 0U;
             if (combined.directlyKnown && residual.directlyKnown)
             {
-                prefillFormation = PrefillFormationPrediction{combined, residual,
-                    state.prefillProducerReadyWaitUs, state.prefillProducerReadyUncertaintyUs};
+                prefillFormation = PrefillFormationPrediction{
+                    combined, residual, state.prefillProducerReadyWaitUs, state.prefillProducerReadyUncertaintyUs};
                 ++mTelemetry.globalPrefillFormationOpportunityCount;
             }
         }
@@ -1770,6 +1854,39 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             candidate.protectedCompletions.push_back({decodeSlack, completion, uncertainty});
         }
     };
+    auto continuationProtectedPrefillCompletion = [&](bool decodeFirst) -> std::optional<PhaseProtectedCompletion> {
+        if (!prefill.has_value() || !successorPrefill.has_value())
+        {
+            return std::nullopt;
+        }
+        auto protectedAdvance = [&](std::vector<PhaseWorkItem> const& batch) {
+            auto const selected = std::find_if(batch.begin(), batch.end(),
+                [&](PhaseWorkItem const& item) { return item.requestId == state.prefillMinimumSlackRequestId; });
+            return selected != batch.end() ? selected->tokenCount : 0;
+        };
+        int32_t remainingTokens = state.prefillCriticalPathRemainingTokens;
+        double completionUs{};
+        double uncertaintyUs{};
+        if (decodeFirst && decode.has_value())
+        {
+            completionUs += decode->makespanUs;
+            uncertaintyUs += decode->uncertaintyUs;
+        }
+        completionUs += prefill->makespanUs;
+        uncertaintyUs += prefill->uncertaintyUs;
+        remainingTokens = std::max(0, remainingTokens - protectedAdvance(prefillPlan.prefillBatch));
+        if (remainingTokens > 0)
+        {
+            completionUs += successorPrefill->makespanUs;
+            uncertaintyUs += successorPrefill->uncertaintyUs;
+            remainingTokens = std::max(0, remainingTokens - protectedAdvance(prefillHorizon.successor.prefillBatch));
+        }
+        int32_t const continuationChunk = std::max(1, successorPrefillChunk);
+        int32_t const residualTurns = (remainingTokens + continuationChunk - 1) / continuationChunk;
+        completionUs += static_cast<double>(residualTurns) * successorPrefill->makespanUs;
+        uncertaintyUs += static_cast<double>(residualTurns) * successorPrefill->uncertaintyUs;
+        return PhaseProtectedCompletion{prefillSlack, completionUs, uncertaintyUs};
+    };
 
     std::vector<PhaseGlobalActionCandidate> candidates;
     if (allowPrefill && prefill.has_value())
@@ -1786,6 +1903,11 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.requestServiceLagUs = state.prefillOldestRequestAgeUs;
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
         protect(candidate, protectedPrefillAdvance(prefillPlan.prefillBatch), *prefill);
+        if (std::optional<PhaseProtectedCompletion> const continuation = continuationProtectedPrefillCompletion(false))
+        {
+            candidate.protectedCompletions.front() = *continuation;
+            ++mTelemetry.globalPrefillContinuationProtectedPathCount;
+        }
         candidates.push_back(std::move(candidate));
     }
     if (allowDecode && decode.has_value() && !prefillDeadlineExpired)
@@ -1802,6 +1924,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.requestServiceLagUs = state.decodeOldestWaitUs;
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
         protect(candidate, 0, *decode);
+        if (std::optional<PhaseProtectedCompletion> const continuation = continuationProtectedPrefillCompletion(true))
+        {
+            candidate.protectedCompletions.front() = *continuation;
+        }
         candidates.push_back(std::move(candidate));
     }
     if (allowPrefill && allowDecode && prefill.has_value() && decode.has_value())
@@ -1829,6 +1955,16 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 + std::max(prefill->referenceWorkUs + prefillFormation->residual.referenceWorkUs,
                     prefillFormation->combined.referenceWorkUs);
         }
+        else if (successorPrefill.has_value())
+        {
+            // The successor is not a forecasted arrival. It is the exact
+            // next Legacy batch after completing the current chunk in a queue
+            // clone. Both serial orders cover P-now, the same continuation
+            // wavefront, and D before efficiency is compared.
+            prefillFirstHorizonUs += successorPrefill->makespanUs;
+            decodeFirstHorizonUs += successorPrefill->makespanUs;
+            serialReferenceWorkUs += successorPrefill->referenceWorkUs;
+        }
         for (PhaseGlobalActionCandidate& candidate : candidates)
         {
             if (candidate.key.kind == PhaseGlobalActionKind::kPrefill)
@@ -1845,8 +1981,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     int32_t const futureChunkTokens = std::max(1, mConfig.maxPrefillChunkTokens);
                     int32_t const residualTokens
                         = std::max(0, state.prefillCriticalPathRemainingTokens - futureChunkTokens);
-                    int32_t const residualTurns
-                        = (residualTokens + futureChunkTokens - 1) / futureChunkTokens;
+                    int32_t const residualTurns = (residualTokens + futureChunkTokens - 1) / futureChunkTokens;
                     candidate.protectedCompletions.front().predictedCompletionUs = decode->makespanUs
                         + prefillFormation->combined.makespanUs
                         + static_cast<double>(residualTurns) * prefill->makespanUs;
