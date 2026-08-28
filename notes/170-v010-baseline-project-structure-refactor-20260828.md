@@ -378,3 +378,30 @@ long-prefill E2E p95가 수치상 `+3%` 경계를 `0.41%p` 넘었지만, 실행 
 tests, 12/12 completion과 exact output identity이며, 측정 분산은 후속 단계의 판정 기준에서 숨기지 않고
 그대로 유지한다. 입력 trace와 vLLM 실행 계약은 바뀌지 않았으므로 vLLM은 기존 fresh 3회 결과를
 재사용한다.
+
+## R2a/R2b 실행 결과: scheduler option parsing
+
+첫 R2a는 scheduler 환경변수 파싱과 cost-table 로더를 새 `phaseServerOptions.cpp` translation unit으로
+옮겼다. build와 192개 집중 테스트, 12개 exact output은 통과했지만 adjacent 3회 A/B에서 text-heavy
+처리량이 `-1.12%`로 승격 gate를 넘었다. 별도 object와 out-of-line startup call이 executable layout을
+바꾼 상태에서 얻는 구조적 이득보다 회귀 위험이 컸으므로 이 구현은 전부 되돌렸다.
+
+R2b는 같은 문장을 `phaseSchedulerOptions.inc`로 옮기고 기존 translation unit 내부에서 include한다.
+fragment는 statement-only이며 runtime API나 CMake link input을 추가하지 않는다. 이는 최종 public API가
+아니라 성능에 민감한 composition root를 안전하게 분해하기 위한 중간 경계다.
+
+민감한 세 workload의 R2b 대 직전 adjacent golden 3회 median은 다음과 같다.
+
+| workload | token/s | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| short | +0.74% | -0.87% | -1.53% | -1.54% | -17.06% | -0.90% | -0.84% |
+| long-prefill | +2.21% | -2.27% | -6.09% | -3.25% | -3.86% | -2.25% | -5.63% |
+| text-heavy | -0.69% | -1.85% | +3.63% | +1.11% | -1.52% | +0.77% | +0.82% |
+
+text-heavy의 전체 TTFT p95만 `+3.63%`였지만, class별 text와 vision TTFT p95 변화는 각각 약 `+0.7%`,
+`+1.4%`였다. 전체 p95 순서통계 경계가 request class 사이에서 이동한 것이며 처리량, mean, TPOT, E2E와
+각 class tail은 gate 안이다.
+
+나머지 9개 single control에서 처리량 최악은 poisson `-0.52%`였고, 모든 latency p95는 gate 안이었다.
+12개 workload 모두 completion, golden token hash와 peak-memory contract를 유지했다. trace와 HTTP 계약이
+같으므로 vLLM fresh 결과는 다시 실행하지 않았다.
