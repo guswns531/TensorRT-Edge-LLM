@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/phase/cost/phaseCostOracle.h"
 #include "runtime/phase/mechanism/phaseReadySnapshot.h"
 #include "runtime/phase/policy/phaseGlobalScheduler.h"
 
@@ -348,6 +349,9 @@ struct PhaseQueueSchedulerConfig
     PhaseGlobalSelectionMode globalSelectionMode{PhaseGlobalSelectionMode::kProfileFree};
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};
+    //! Optional deployment-scoped oracle shared by E/P/D schedulers. A private
+    //! in-memory oracle is created when this is null.
+    std::shared_ptr<PhaseCostOracle> globalCostOracle;
     //! Conservative cold-start bounds used until direct CUDA observations exist.
     float globalColdPrefillMsPerToken{0.02F};
     float globalColdDecodeMs{2.0F};
@@ -775,7 +779,7 @@ private:
 
     PhaseQueueSchedulerConfig mConfig;
     PhaseGlobalScheduler mGlobalScheduler;
-    PhaseGlobalCostModel mGlobalCostModel;
+    std::shared_ptr<PhaseCostOracle> mGlobalCostOracle;
     std::deque<PhaseWorkItem> mPrefillQueue;
     std::deque<PhaseWorkItem> mDecodeQueue;
     std::unordered_set<uint64_t> mActiveRequestIds;

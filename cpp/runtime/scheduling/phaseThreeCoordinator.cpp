@@ -495,7 +495,9 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mServer(server)
     , mConfig(config)
     , mGlobalScheduler(mConfig.globalSchedulerConfig)
-    , mGlobalCostModel(mConfig.globalCostModelConfig)
+    , mGlobalCostOracle(mConfig.globalCostOracle != nullptr
+              ? mConfig.globalCostOracle
+              : std::make_shared<PhaseCostOracle>(PhaseCostOracleConfig{mConfig.globalCostModelConfig}))
     , mMemoryBroker(mConfig.memoryBroker)
 {
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
@@ -937,7 +939,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseThreeCoordinator::globalCalibrati
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mGlobalCostModel.overlapDiagnostic(key), opportunities,
+        result.push_back({key, mGlobalCostOracle->overlapDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;
@@ -1239,7 +1241,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                                      : mConfig.encoderDispatchInitialCostUs,
             static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0, 0.0};
         prediction.referenceUs = prediction.makespanUs;
-        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(prediction.key))
+        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(prediction.key))
         {
             prediction.makespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
             prediction.uncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
@@ -1379,12 +1381,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         double phaseOverlapCompletionUs{};
         double phaseOverlapCompletionUncertaintyUs{};
         bool residualDerivedFromFullCost{};
-        std::optional<PhaseGlobalCostEstimate> online = mGlobalCostModel.estimate(overlapKey);
+        std::optional<PhaseGlobalCostEstimate> online = mGlobalCostOracle->estimate(overlapKey);
         if (!online.has_value() && residualAugmentation)
         {
             PhaseGlobalActionKey fullKey = overlapKey;
             fullKey.residualAugmentation = false;
-            online = mGlobalCostModel.estimate(fullKey);
+            online = mGlobalCostOracle->estimate(fullKey);
             residualDerivedFromFullCost = online.has_value();
         }
         if (online.has_value())
@@ -1393,7 +1395,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             overlapUncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
             PhaseGlobalActionKey eligibilityKey = overlapKey;
             eligibilityKey.residualAugmentation = residualAugmentation && !residualDerivedFromFullCost;
-            overlapKnown = mGlobalCostModel.overlapEligible(eligibilityKey);
+            overlapKnown = mGlobalCostOracle->overlapEligible(eligibilityKey);
         }
         else
         {
@@ -1446,7 +1448,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             phaseOverlapCompletionUs = residualPhaseUs + interferenceUs;
             phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
         }
-        PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostModel.overlapDiagnostic(overlapKey);
+        PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostOracle->overlapDiagnostic(overlapKey);
         bool const needsCalibration = diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -1580,7 +1582,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                       bool const encoderOverlap = candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
                           || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode;
                       return encoderOverlap && candidate.safeProbeEligible && !candidate.overlapCostKnown
-                          ? mGlobalCostModel.overlapDiagnostic(candidate.key).sampleCount
+                          ? mGlobalCostOracle->overlapDiagnostic(candidate.key).sampleCount
                           : std::numeric_limits<size_t>::max();
                   };
                   return sampleCount(left) < sampleCount(right);
@@ -1812,7 +1814,7 @@ void PhaseThreeCoordinator::completeGlobalOverlapObservation()
     }
     float const makespanMs
         = std::max(mPendingGlobalOverlapObservation->encoderGpuMs, mPendingGlobalOverlapObservation->phaseGpuMs);
-    mGlobalCostModel.observe(
+    mGlobalCostOracle->observe(
         mPendingGlobalOverlapObservation->key, {mPendingGlobalOverlapObservation->referenceWorkMs, makespanMs});
     mPendingGlobalOverlapObservation.reset();
 }
@@ -2075,7 +2077,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     }
     if (mInFlightGlobalEncoderKey.has_value() && mLastEncoderGpuMs > 0.0F && mInFlightGlobalEncoderReferenceMs > 0.0)
     {
-        mGlobalCostModel.observe(
+        mGlobalCostOracle->observe(
             *mInFlightGlobalEncoderKey, {static_cast<float>(mInFlightGlobalEncoderReferenceMs), mLastEncoderGpuMs});
     }
     mInFlightGlobalEncoderKey.reset();
@@ -2361,7 +2363,7 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
                 = static_cast<int32_t>((totalInputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
             PhaseGlobalActionKey const key{
                 PhaseGlobalActionKind::kEncoder, static_cast<int32_t>(rows), 0, 0, contextBucket, 0};
-            if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(key))
+            if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
             {
                 return static_cast<double>(online->makespanMedianMs + online->uncertaintyMs) * 1000.0;
             }

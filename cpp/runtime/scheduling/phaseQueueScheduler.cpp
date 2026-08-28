@@ -106,7 +106,9 @@ char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mGlobalScheduler(mConfig.globalSchedulerConfig)
-    , mGlobalCostModel(mConfig.globalCostModelConfig)
+    , mGlobalCostOracle(mConfig.globalCostOracle != nullptr
+              ? mConfig.globalCostOracle
+              : std::make_shared<PhaseCostOracle>(PhaseCostOracleConfig{mConfig.globalCostModelConfig}))
     , mRecentDecodeTpotUs(std::make_shared<RecentDecodeTpot>())
     , mOnlineDecodeGpuMs(std::make_shared<OnlineDecodeGpuSamples>())
     , mOnlineDecodeCostLearningActive(mConfig.enableOnlineDecodeCostLearning)
@@ -1478,7 +1480,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         bool directlyKnown{};
     };
     auto fromOnline = [&](PhaseGlobalActionKey const& key) -> std::optional<Prediction> {
-        std::optional<PhaseGlobalCostEstimate> const estimate = mGlobalCostModel.estimate(key);
+        std::optional<PhaseGlobalCostEstimate> const estimate = mGlobalCostOracle->estimate(key);
         if (!estimate.has_value())
         {
             return std::nullopt;
@@ -1590,7 +1592,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         if (allowBatchInterpolation)
         {
             std::optional<PhaseGlobalCostEstimate> const interpolated
-                = mGlobalCostModel.estimateInterpolatedPrimaryBatch(key);
+                = mGlobalCostOracle->estimateInterpolatedPrimaryBatch(key);
             if (interpolated.has_value())
             {
                 return {static_cast<double>(interpolated->makespanMedianMs) * 1000.0,
@@ -1864,7 +1866,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         if (std::optional<Prediction> const online = fromOnline(overlapKey))
         {
             overlap = *online;
-            overlapKnown = mGlobalCostModel.overlapEligible(overlapKey);
+            overlapKnown = mGlobalCostOracle->overlapEligible(overlapKey);
         }
         else
         {
@@ -1890,7 +1892,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlapKnown = selected != nullptr;
             directOfflineCost = selected != nullptr;
         }
-        PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostModel.overlapDiagnostic(overlapKey);
+        PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostOracle->overlapDiagnostic(overlapKey);
         bool const needsCalibration = diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -2090,7 +2092,7 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
         DecodePrediction prediction{static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0,
             static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0,
             static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0, rows};
-        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(key))
+        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
         {
             prediction.makespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
             prediction.uncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
@@ -2545,7 +2547,7 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
     int32_t const contextBucket = (pastKVLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey const key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
-    if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostModel.estimate(key))
+    if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
     {
         return *online;
     }
@@ -3528,7 +3530,7 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             {
                 referenceWorkMs = static_cast<float>(metrics.globalReferenceWorkMs);
             }
-            mGlobalCostModel.observe(observedKey, {referenceWorkMs, metrics.makespanGpuMs});
+            mGlobalCostOracle->observe(observedKey, {referenceWorkMs, metrics.makespanGpuMs});
         }
     }
     ++mTelemetry.sampleCount;
@@ -3548,7 +3550,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseQueueScheduler::globalCalibration
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mGlobalCostModel.overlapDiagnostic(key), opportunities,
+        result.push_back({key, mGlobalCostOracle->overlapDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;
@@ -3573,7 +3575,7 @@ void PhaseQueueScheduler::resetHistory(bool preserveGlobalCostModel)
     mOnlineDecodeGpuMs = std::make_shared<OnlineDecodeGpuSamples>();
     if (!preserveGlobalCostModel)
     {
-        mGlobalCostModel.reset();
+        mGlobalCostOracle->resetLocal();
     }
     mLatencySafeFallback = false;
     mConsecutiveDecodeBatches = 0;

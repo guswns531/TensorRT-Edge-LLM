@@ -51,15 +51,19 @@
     },
     {
       "source": "cpp/runtime/scheduling/phaseQueueScheduler.cpp",
-      "sha256": "d2259186c8b722ab9f6bd7d3b6bbd33dcc459710e2d4fc48bb15348aec81c8ce"
+      "sha256": "e63e7b604d8da27b5203c23d346d1a3bab90246be7c890a9c460035cc59db262"
     },
     {
       "source": "cpp/runtime/scheduling/phaseThreeCoordinator.cpp",
-      "sha256": "20a4ae393c92f10d4d6af872892f7d1f0b0c992849f77b4ae89842ae49254ef1"
+      "sha256": "7c14a9ca8c0edec29f5d6817574714eb5e68d2a3b9bb0349a60f0ac69ec82e24"
     },
     {
       "source": "cpp/runtime/scheduling/phaseVisionAdapter.cpp",
       "sha256": "0092efccd0268d9b08c349983b91e183b6c2f0e3416455b35ae13dc1896e12af"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseCostKnowledge.cpp",
+      "sha256": "e0058ab4604db95858b7dcc5e59de1ca4d16973e19e3a0a1086f7531c42c5120"
     },
     {
       "source": "cpp/runtime/state/stableKVPageManager.cpp",

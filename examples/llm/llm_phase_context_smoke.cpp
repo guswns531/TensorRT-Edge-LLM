@@ -327,6 +327,69 @@ void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoord
     config.enableCostAwareEncoderBatching = true;
 }
 
+rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(rt::LLMEngineConfig const& config)
+{
+    rt::PhaseDeploymentFingerprint result;
+    auto const environment = [](char const* name) {
+        char const* value = std::getenv(name);
+        return value != nullptr ? std::string(value) : std::string{};
+    };
+    result.modelHash = environment("TRT_EDGELLM_PHASE_MODEL_HASH");
+    result.onnxHash = environment("TRT_EDGELLM_PHASE_ONNX_HASH");
+    result.engineHash = environment("TRT_EDGELLM_PHASE_ENGINE_HASH");
+    result.externalWeightHash = environment("TRT_EDGELLM_PHASE_EXTERNAL_WEIGHT_HASH");
+    result.precision = environment("TRT_EDGELLM_PHASE_PRECISION");
+    result.kvDtype = getDataTypeString(config.kvCacheDtype);
+    result.software.pluginHash = environment("TRT_EDGELLM_PHASE_PLUGIN_HASH");
+    result.software.tensorrtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
+        + std::to_string(NV_TENSORRT_PATCH);
+    int32_t cudaRuntimeVersion{};
+    int32_t cudaDriverVersion{};
+    CUDA_CHECK(cudaRuntimeGetVersion(&cudaRuntimeVersion));
+    CUDA_CHECK(cudaDriverGetVersion(&cudaDriverVersion));
+    result.software.cudaVersion = std::to_string(cudaRuntimeVersion);
+    result.software.driverVersion = std::to_string(cudaDriverVersion);
+    result.capability.maxPrefillBatchSize = config.maxSupportedPrefillBatchSize;
+    result.capability.maxDecodeBatchSize = config.maxSupportedDecodeBatchSize;
+    result.capability.prefillChunkTokens = config.maxPackedPrefillChunkTokens;
+    result.capability.maxKVCacheCapacity = config.maxKVCacheCapacity;
+    constexpr int32_t kKV_PAGE_TOKENS = 128;
+    result.capability.kvPageTokens = kKV_PAGE_TOKENS;
+    result.capability.kvBytesPerToken = static_cast<size_t>(config.numAttentionLayers) * 2U
+        * static_cast<size_t>(config.numKVHeads) * static_cast<size_t>(config.headDim)
+        * rt::utils::getTypeSize(config.kvCacheDtype);
+    int32_t device{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    result.gpu.computeCapability = std::to_string(properties.major) + "." + std::to_string(properties.minor);
+    result.gpu.smCount = properties.multiProcessorCount;
+    result.gpu.memoryBytes = properties.totalGlobalMem;
+    result.gpu.productName = properties.name;
+    result.gpuUuid = environment("TRT_EDGELLM_PHASE_GPU_UUID");
+    return result;
+}
+
+void loadPhaseCostPrior(std::filesystem::path const& path, rt::PhaseDeploymentFingerprint const& deployment,
+    std::shared_ptr<rt::PhaseCostOracle> const& oracle, rt::PhaseCostScale scale = {})
+{
+    rt::PhaseCostBundle bundle;
+    std::string error;
+    if (!rt::phaseTryLoadCostBundle(path, bundle, error))
+    {
+        LOG_WARNING("Ignoring unreadable phase cost bundle %s: %s", path.c_str(), error.c_str());
+        return;
+    }
+    rt::PhaseCostCompatibility const compatibility = rt::phaseCostCompatibility(deployment, bundle.deployment);
+    if (compatibility == rt::PhaseCostCompatibility::kIncompatible)
+    {
+        LOG_WARNING("Ignoring incompatible phase cost bundle %s", path.c_str());
+        return;
+    }
+    oracle->loadPrior(std::move(bundle), compatibility, scale);
+    LOG_INFO("Loaded %s phase cost prior from %s", rt::phaseCostCompatibilityName(compatibility), path.c_str());
+}
+
 struct PhaseTiming
 {
     float prefillMs{};
@@ -1444,6 +1507,65 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
+        rt::PhaseCostOracleConfig phaseCostOracleConfig;
+        phaseCostOracleConfig.model = semanticSchedulerConfig.globalCostModelConfig;
+        auto phaseCostOracle = std::make_shared<rt::PhaseCostOracle>(phaseCostOracleConfig);
+        rt::PhaseDeploymentFingerprint const phaseCostDeployment = phaseDeploymentFingerprint(config);
+        rt::PhaseCostScale phaseCostScale;
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_ENCODER"))
+        {
+            phaseCostScale.encoder = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_PREFILL"))
+        {
+            phaseCostScale.prefill = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_DECODE"))
+        {
+            phaseCostScale.decode = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_OVERLAP"))
+        {
+            phaseCostScale.overlap = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_BUILD_COST_BUNDLE"))
+        {
+            loadPhaseCostPrior(value, phaseCostDeployment, phaseCostOracle, phaseCostScale);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_FLEET_COST_BUNDLE"))
+        {
+            loadPhaseCostPrior(value, phaseCostDeployment, phaseCostOracle, phaseCostScale);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_NODE_COST_CACHE"))
+        {
+            rt::PhaseNodeCostJournalConfig journalConfig;
+            journalConfig.directory = value;
+            if (char const* count = std::getenv("TRT_EDGELLM_PHASE_COST_SNAPSHOT_SAMPLES"))
+            {
+                journalConfig.snapshotEveryObservations = static_cast<size_t>(std::stoull(count));
+            }
+            std::filesystem::path const snapshotPath = journalConfig.directory / "local_cost_snapshot.json";
+            if (std::filesystem::exists(snapshotPath))
+            {
+                rt::PhaseCostBundle snapshot;
+                std::string error;
+                if (rt::phaseTryLoadCostBundle(snapshotPath, snapshot, error)
+                    && rt::phaseCostCompatibility(phaseCostDeployment, snapshot.deployment)
+                        == rt::PhaseCostCompatibility::kExact)
+                {
+                    phaseCostOracle->restoreNode(snapshot);
+                    LOG_INFO("Restored node-local phase cost snapshot from %s", snapshotPath.c_str());
+                }
+                else
+                {
+                    LOG_WARNING("Ignoring stale or corrupt node-local phase cost snapshot %s: %s", snapshotPath.c_str(),
+                        error.c_str());
+                }
+            }
+            phaseCostOracle->attachJournal(
+                std::make_shared<rt::PhaseNodeCostJournal>(journalConfig, phaseCostDeployment));
+        }
+        semanticSchedulerConfig.globalCostOracle = phaseCostOracle;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
         {
             semanticSchedulerConfig.globalDispatchUsesPreReservedMemory = true;
@@ -1954,6 +2076,7 @@ int main(int argc, char** argv)
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
+                threePhaseConfig.globalCostOracle = phaseCostOracle;
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
