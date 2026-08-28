@@ -56,6 +56,7 @@ vLLM 전체 fresh 비교를 실행한다.
 | 2B | batch formation 본체를 policy-free 함수로 추출 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave x3 | 기각 후 revert |
 | 4A | production scheduler wiring을 fixed P128로 고정 | 4 suites, 192 tests pass | 12종 x1 + bimodal/wave/multi x3 | 승격 |
 | 5A | inactive admission/memory controller production wiring 제거 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
+| 6A | native token/completion callback 직접 전달 | 4 suites, 192 tests pass | 12종 x1 + 의심 4종 x3 | 기각 후 revert |
 
 ## Stage 1 — Rejected Horizon 제거
 
@@ -356,3 +357,32 @@ unit 또는 binary로 먼저 분리해야 한다.
 - `.local/current-only-cleanup-20260828/stage5a-inactive-wiring-7x1`
 - `.local/current-only-cleanup-20260828/stage5a-inactive-wiring-remaining-5x1`
 - `.local/current-only-cleanup-20260828/stage5a-suspects-4x3`
+
+## Stage 6A — Direct native event delivery 시도와 기각
+
+callback이 설정된 production 경로에서도 sampled token과 completion을 server deque에 넣고 같은
+`poll()`에서 다시 꺼냈다. 이를 callback 직접 호출로 바꿔 per-token deque operation과 임시 event
+보관을 제거했다. callback이 없는 polling API는 기존 queue를 유지했다. build, focused `192` tests,
+12개 workload correctness는 통과했다.
+
+단발에서 변동한 네 종의 3회 중앙값은 다음과 같다.
+
+| workload | Stage 6A tok/s | final Current 대비 | TTFT p95 | TPOT p95 | E2E p95 |
+|---|---:|---:|---:|---:|---:|
+| mixed | 1,142.85 | +0.46% | 2,066.81 | 41.39 | 2,501.23 |
+| long-prefill | 1,179.49 | -1.43% | 2,834.31 | 31.45 | 6,305.96 |
+| bimodal | 1,927.68 | -0.90% | 3,840.62 | 29.64 | 9,117.61 |
+| vision-heavy | 687.20 | -0.88% | 3,141.74 | 37.38 | 3,515.51 |
+
+long-prefill이 throughput `-1%`와 E2E p95 `+3%` gate를 모두 넘었다. direct callback은 단순 allocation
+최적화가 아니라 completion 관측과 다음 admission/formation을 같은 poll 안에서 앞당긴다. 이 작은
+순서 변화가 long-prefill packed-P 경계를 악화시켰으므로 롤백했다.
+
+다음 token transport 최적화는 callback 시점을 보존한 채 queue storage만 preallocated ring으로 바꿔야
+한다. 즉 event delivery decision boundary와 allocation 최적화를 분리해야 한다.
+
+결과 위치:
+
+- `.local/current-only-cleanup-20260828/stage6a-direct-events-7x1`
+- `.local/current-only-cleanup-20260828/stage6a-direct-events-remaining-5x1`
+- `.local/current-only-cleanup-20260828/stage6a-suspects-4x3`
