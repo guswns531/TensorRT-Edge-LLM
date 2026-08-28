@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "baseline_ref": "v0.10.0",
+  "baseline_commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
+  "golden_runtime_commit": "b2a01f0a8ae9216d5e2b92661c058152e253b949",
+  "current_branch": "codex/v010-phase-forward-port",
+  "rules": {
+    "allow_multiple_owners": true,
+    "new_phase_runtime": "Files owned entirely by the Current phase runtime.",
+    "upstream_integration": "Existing v0.10.0 files that must expose a narrow capability or adapter."
+  },
+  "features": {
+    "indexed_kv": {
+      "kind": "upstream_integration",
+      "paths": [
+        "cpp/common/bindingNames.h",
+        "cpp/kernels/contextAttentionKernels/utilKernels.cu",
+        "cpp/kernels/contextAttentionKernels/utilKernels.h",
+        "cpp/kernels/posEncoding/applyRopeWriteKV.cu",
+        "cpp/kernels/posEncoding/applyRopeWriteKV.h",
+        "cpp/plugins/attentionPlugin/attentionPlugin.cpp",
+        "cpp/plugins/attentionPlugin/attentionPlugin.h",
+        "cpp/runtime/config/inferenceDims.cpp",
+        "cpp/runtime/config/inferenceDims.h",
+        "cpp/runtime/config/llmEngineConfig.cpp",
+        "cpp/runtime/config/llmEngineConfig.h",
+        "cpp/runtime/decoding/dflashDecoder.cpp",
+        "cpp/runtime/decoding/dsparkDecoder.cpp",
+        "cpp/runtime/exec/registryBuilder.cpp",
+        "cpp/runtime/kvCacheManager.cpp",
+        "cpp/runtime/kvCacheManager.h",
+        "cpp/runtime/preprocess/stepPreparer.cpp",
+        "cpp/runtime/preprocess/stepPreparer.h",
+        "cpp/runtime/state/kvPageTable.cpp",
+        "cpp/runtime/state/kvPageTable.h",
+        "cpp/runtime/state/pipelineIO.cpp",
+        "cpp/runtime/state/pipelineIO.h",
+        "cpp/runtime/state/stableKVPageManager.cpp",
+        "cpp/runtime/state/stableKVPageManager.h",
+        "tensorrt_edgellm/config.py",
+        "tensorrt_edgellm/models/default/modeling_default.py",
+        "tensorrt_edgellm/models/ops.py",
+        "tensorrt_edgellm/onnx/dynamo_translations.py",
+        "tensorrt_edgellm/onnx/export.py",
+        "tensorrt_edgellm/onnx/onnx_custom_schemas.py",
+        "tensorrt_edgellm/scripts/export.py"
+      ]
+    },
+    "packed_prefill": {
+      "kind": "upstream_integration",
+      "paths": [
+        "cpp/kernels/embeddingKernels/embeddingKernels.cu",
+        "cpp/kernels/embeddingKernels/embeddingKernels.h",
+        "cpp/runtime/exec/engineExecutor.cpp",
+        "cpp/runtime/exec/engineExecutor.h",
+        "cpp/runtime/preprocess/embeddingPreprocessor.cpp",
+        "cpp/runtime/preprocess/embeddingPreprocessor.h",
+        "cpp/runtime/preprocess/stepPreparer.cpp",
+        "cpp/runtime/preprocess/stepPreparer.h",
+        "cpp/runtime/scheduling/packedPrefillActiveView.cpp",
+        "cpp/runtime/scheduling/packedPrefillActiveView.h"
+      ]
+    },
+    "independent_phase_execution": {
+      "kind": "new_phase_runtime",
+      "paths": [
+        "cpp/runtime/scheduling/independentEngineExecutorPair.cpp",
+        "cpp/runtime/scheduling/independentEngineExecutorPair.h",
+        "cpp/runtime/scheduling/independentPhaseCoordinator.cpp",
+        "cpp/runtime/scheduling/independentPhaseCoordinator.h",
+        "cpp/runtime/scheduling/modelPhaseContract.h",
+        "cpp/runtime/scheduling/phaseDispatchWorker.cpp",
+        "cpp/runtime/scheduling/phaseDispatchWorker.h",
+        "cpp/runtime/scheduling/phaseKVActiveView.cpp",
+        "cpp/runtime/scheduling/phaseKVActiveView.h",
+        "cpp/runtime/scheduling/phaseTimeline.h",
+        "cpp/runtime/llmInferenceRuntime.cpp",
+        "cpp/runtime/llmInferenceRuntime.h",
+        "cpp/runtime/llmRuntimeUtils.cpp",
+        "cpp/runtime/llmRuntimeUtils.h",
+        "cpp/runtime/state/sharedResources.cpp"
+      ]
+    },
+    "global_phase_scheduling": {
+      "kind": "new_phase_runtime",
+      "paths": [
+        "cpp/runtime/scheduling/phaseGlobalScheduler.cpp",
+        "cpp/runtime/scheduling/phaseGlobalScheduler.h",
+        "cpp/runtime/scheduling/phaseQueueScheduler.cpp",
+        "cpp/runtime/scheduling/phaseQueueScheduler.h",
+        "cpp/runtime/scheduling/phaseMemoryBroker.cpp",
+        "cpp/runtime/scheduling/phaseMemoryBroker.h"
+      ]
+    },
+    "async_server_and_coordination": {
+      "kind": "new_phase_runtime",
+      "paths": [
+        "cpp/runtime/scheduling/independentPhaseAsyncServer.cpp",
+        "cpp/runtime/scheduling/independentPhaseAsyncServer.h",
+        "cpp/runtime/scheduling/phaseAsyncServer.h",
+        "cpp/runtime/scheduling/phaseThreeCoordinator.cpp",
+        "cpp/runtime/scheduling/phaseThreeCoordinator.h",
+        "cpp/runtime/scheduling/phaseContinuousLoadGenerator.cpp",
+        "cpp/runtime/scheduling/phaseContinuousLoadGenerator.h",
+        "examples/llm/llm_phase_context_smoke.cpp",
+        "scripts/phase_openai_gateway.py"
+      ]
+    },
+    "vision_phase": {
+      "kind": "upstream_integration",
+      "paths": [
+        "cpp/builder/visualBuilder.cpp",
+        "cpp/builder/visualBuilder.h",
+        "cpp/multimodal/multimodalRunner.cpp",
+        "cpp/multimodal/multimodalRunner.h",
+        "cpp/multimodal/qwen3vlViTRunner.cpp",
+        "cpp/multimodal/qwen3vlViTRunner.h",
+        "cpp/multimodal/qwenViTRunner.cpp",
+        "cpp/multimodal/qwenViTRunner.h",
+        "cpp/runtime/scheduling/phaseVisionAdapter.cpp",
+        "cpp/runtime/scheduling/phaseVisionAdapter.h",
+        "examples/multimodal/visual_build.cpp"
+      ]
+    },
+    "ownership_and_reuse": {
+      "kind": "new_phase_runtime",
+      "paths": [
+        "cpp/runtime/state/stableKVPageManager.cpp",
+        "cpp/runtime/state/stableKVPageManager.h",
+        "cpp/runtime/scheduling/phasePrefixReuseCache.cpp",
+        "cpp/runtime/scheduling/phasePrefixReuseCache.h",
+        "cpp/runtime/scheduling/phaseMemoryBroker.cpp",
+        "cpp/runtime/scheduling/phaseMemoryBroker.h"
+      ]
+    },
+    "telemetry": {
+      "kind": "new_phase_runtime",
+      "paths": [
+        "cpp/runtime/scheduling/phaseKernelGroupRecorder.cpp",
+        "cpp/runtime/scheduling/phaseKernelGroupRecorder.h",
+        "cpp/runtime/scheduling/phaseTimeline.h"
+      ]
+    },
+    "tied_external_weights": {
+      "kind": "upstream_integration",
+      "paths": [
+        "cpp/builder/llmBuilder.cpp",
+        "cpp/builder/llmBuilder.h",
+        "cpp/runtime/state/externalWeightManager.cpp",
+        "cpp/runtime/state/externalWeightManager.h",
+        "tensorrt_edgellm/checkpoint/checkpoint_utils.py",
+        "tensorrt_edgellm/external_weights.py",
+        "tensorrt_edgellm/models/default/modeling_default.py",
+        "tensorrt_edgellm/scripts/export.py"
+      ]
+    },
+    "build_cli_and_bindings": {
+      "kind": "upstream_integration",
+      "paths": [
+        "CMakeLists.txt",
+        "examples/llm/CMakeLists.txt",
+        "examples/llm/llm_bench.cpp",
+        "examples/llm/llm_build.cpp",
+        "examples/utils/benchRunner.h",
+        "experimental/pybind/edgellm_pybind.cpp"
+      ]
+    }
+  },
+  "excluded_from_product_diff": [
+    "benchmarks/phase_serving/**",
+    "docs/**",
+    "notes/**",
+    "tests/**",
+    "unittests/**"
+  ]
+}

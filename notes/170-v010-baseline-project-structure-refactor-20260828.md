@@ -325,3 +325,20 @@ format/build/unit tests
 
 이 네 단계가 통과하면 composition root가 작아지고, 다음 리팩터링부터 v0.10.0 integration hook과
 Current phase runtime의 차이를 디렉터리와 Git diff 양쪽에서 명확하게 볼 수 있다.
+
+## R0 실행 결과
+
+동작을 바꾸지 않는 두 manifest를 추가했다.
+
+- `benchmarks/phase_serving/manifests/v010_feature_owners.json`
+- `benchmarks/phase_serving/manifests/phase_source_order.json`
+
+첫 manifest는 v0.10.0 수정 지점을 indexed KV, packed prefill, independent phase execution, Global
+scheduling, async server, vision, ownership, telemetry, tied external weights와 build/CLI로 분류한다. 하나의
+파일이 둘 이상의 contract에 속할 수 있으며, 이후 PR 분리 시 cross-feature coupling을 명시적으로
+드러낸다.
+
+두 번째 manifest는 golden binary의 `edgellmCore` link에서 관측한 phase/stable-KV object 15개의 순서와
+source SHA-256을 고정한다. R0는 runtime, CMake와 executable 파일을 변경하지 않으므로 workload 성능
+재측정 대상이 아니다. 다음 R1에서 source collection을 명시적으로 바꿀 때 이 순서와 binary map을
+보존하고 전체 gate를 실행한다.
