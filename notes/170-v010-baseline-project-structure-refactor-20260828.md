@@ -424,3 +424,19 @@ object 경계를 가진 뒤 다시 분리한다.
 구현 함수와 object source order는 이동하지 않았다. R3 전후 `libedgellmCore.a`, TensorRT plugin,
 `llm_phase_context_smoke` SHA-256이 모두 완전히 같았고, Global/queue scheduler 단위 테스트 145개도 모두
 통과했다. 실행 binary가 같으므로 R2b의 12-workload 결과와 cached fresh vLLM 비교를 그대로 승계한다.
+
+## R4 실행 결과: policy input과 ownership 분리
+
+selector 입력의 lifetime 의미를 다음 세 value header로 분리했다.
+
+- `phaseReadySnapshot.h`: poll 속도와 무관하게 한 decision epoch를 나타내는 read-only queue snapshot
+- `phaseDeadline.h`: request별 protected completion slack, predicted completion과 uncertainty
+- `phaseOwnershipHorizon.h`: managed/allocate/reclaim/growth/budget으로 표현한 ownership horizon
+
+`phaseActionPlan.h`는 이 값들을 조합한 candidate와 authoritative dispatch lease만 가진다. 따라서
+`PhaseGlobalScheduler`는 stable KV allocator, vision slab, CUDA event와 TensorRT context 구현을 직접
+소유하거나 호출하지 않고 feasibility/deadline/efficiency 값만 평가한다.
+
+R4 역시 source object와 구현 함수는 이동하지 않았다. core archive, plugin, server executable SHA-256이
+R3와 같았고 관련 단위 테스트 145개를 모두 통과했다. binary identity가 성립하므로 별도 workload와
+vLLM 재실행은 필요하지 않다.

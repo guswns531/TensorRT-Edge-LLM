@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include "runtime/scheduling/phaseDeadline.h"
 #include "runtime/scheduling/phaseGlobalCostModel.h"
+#include "runtime/scheduling/phaseOwnershipHorizon.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,29 +29,6 @@
 
 namespace trt_edgellm::rt
 {
-
-//! Ownership changes caused by one action. Near reclaim is a ranking signal and
-//! never contributes to hard feasibility until its completion event is observed.
-struct PhaseActionMemoryHorizon
-{
-    size_t managedBytes{};
-    size_t allocateBytes{};
-    size_t immediateReclaimBytes{};
-    size_t guaranteedGrowthBytes{};
-    size_t nearReclaimBytes{};
-    size_t budgetBytes{};
-    bool immediateReclaimObserved{};
-};
-
-//! One request deadline protected while evaluating an action. Completion may
-//! include a required follow-up phase when the candidate does not advance the
-//! request owning this deadline.
-struct PhaseProtectedCompletion
-{
-    double slackUs{std::numeric_limits<double>::infinity()};
-    double predictedCompletionUs{};
-    double uncertaintyUs{};
-};
 
 //! A phase-local candidate after compatibility batching but before global selection.
 struct PhaseGlobalActionCandidate

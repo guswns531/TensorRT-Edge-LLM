@@ -85,11 +85,13 @@
       "kind": "new_phase_runtime",
       "paths": [
         "cpp/runtime/scheduling/phaseActionPlan.h",
+        "cpp/runtime/scheduling/phaseDeadline.h",
         "cpp/runtime/scheduling/phaseGlobalCostModel.h",
         "cpp/runtime/scheduling/phaseGlobalScheduler.cpp",
         "cpp/runtime/scheduling/phaseGlobalScheduler.h",
         "cpp/runtime/scheduling/phaseQueueScheduler.cpp",
         "cpp/runtime/scheduling/phaseQueueScheduler.h",
+        "cpp/runtime/scheduling/phaseReadySnapshot.h",
         "cpp/runtime/scheduling/phaseMemoryBroker.cpp",
         "cpp/runtime/scheduling/phaseMemoryBroker.h"
       ]
@@ -130,6 +132,7 @@
       "paths": [
         "cpp/runtime/state/stableKVPageManager.cpp",
         "cpp/runtime/state/stableKVPageManager.h",
+        "cpp/runtime/scheduling/phaseOwnershipHorizon.h",
         "cpp/runtime/scheduling/phasePrefixReuseCache.cpp",
         "cpp/runtime/scheduling/phasePrefixReuseCache.h",
         "cpp/runtime/scheduling/phaseMemoryBroker.cpp",
