@@ -401,7 +401,9 @@ unit/build
   -> cached vLLM comparison
 ```
 
-trace/HTTP contract가 바뀌지 않으면 vLLM은 매 단계 다시 실행하지 않는다. 최종 architecture milestone에서만 fresh 전체 sweep을 실행한다.
+trace/HTTP contract와 vLLM 설정이 바뀌지 않으면 vLLM은 매 단계나 최종 cleanup stage에서 다시 실행하지
+않고 trace SHA가 검증된 fresh 3회 결과를 재사용한다. model, trace, arrival/output 계약 또는 vLLM 설정이
+바뀌는 architecture milestone에서만 fresh 전체 sweep을 실행한다.
 
 ## 삭제하면 안 되는 것
 
