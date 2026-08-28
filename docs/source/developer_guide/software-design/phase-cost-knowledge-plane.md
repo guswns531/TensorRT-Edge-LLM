@@ -66,9 +66,13 @@ at least four node-local samples
 ```
 
 Compatibility widens uncertainty, and phase-specific anchor scales can be
-injected independently for encoder, prefill, decode and overlap. Unknown
-overlap remains ineligible unless the existing safe-probe contract permits a
-bounded calibration probe.
+injected independently for encoder, prefill, decode and overlap. Direct CUDA
+observations collected during controlled startup warmup also update those four
+scales automatically. The estimator uses a bounded median ratio window and
+adds its robust dispersion to prediction uncertainty; implausible ratios are
+discarded. Until the minimum sample count is reached the scale remains one.
+Unknown overlap remains ineligible unless the existing safe-probe contract
+permits a bounded calibration probe.
 
 Memory feasibility is unchanged. Predicted completion or reclaim time may
 rank actions but cannot create hard memory capacity.
@@ -104,6 +108,9 @@ TRT_EDGELLM_PHASE_COST_SCALE_ENCODER
 TRT_EDGELLM_PHASE_COST_SCALE_PREFILL
 TRT_EDGELLM_PHASE_COST_SCALE_DECODE
 TRT_EDGELLM_PHASE_COST_SCALE_OVERLAP
+TRT_EDGELLM_PHASE_COST_ANCHOR_MIN_SAMPLES
+TRT_EDGELLM_DISABLE_PHASE_COST_AUTO_ANCHOR
+TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE
 ```
 
 Optional hash/signature fields use the `TRT_EDGELLM_PHASE_*_HASH` variables in
@@ -131,6 +138,12 @@ The aggregate command rejects heterogeneous model/precision/KV/profile shape
 contracts. It merges bounded raw observations instead of averaging per-node
 quantiles.
 
+The phase server can also write the direct controlled-warmup observations as a
+build bundle with `TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE`. This avoids
+parsing production logs and preserves the exact runtime action keys. The output
+path must be outside the immutable engine directory in normal deployment; the
+artifact pipeline may copy the validated bundle into the engine package later.
+
 ## Remaining work
 
 The first implementation establishes the data plane, persistence boundary and
@@ -139,8 +152,8 @@ steps:
 
 1. replace the compatibility composition's static decode table with a
    generated build bundle after decision-identity validation;
-2. automatically run a minimal E/P/D anchor set at startup and derive the four
-   phase scales;
+2. extend startup coverage with explicit E anchors when the normal VLM warmup
+   does not exercise every encoder shape;
 3. add TTL/drift state and local-only fallback when recent observations exceed
    a robust prior bound;
 4. schedule uncertainty-guided overlap probes only during controlled warmup or

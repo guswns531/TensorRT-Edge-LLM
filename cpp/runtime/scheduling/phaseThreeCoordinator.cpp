@@ -495,9 +495,12 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mServer(server)
     , mConfig(config)
     , mGlobalScheduler(mConfig.globalSchedulerConfig)
-    , mGlobalCostOracle(mConfig.globalCostOracle != nullptr
-              ? mConfig.globalCostOracle
-              : std::make_shared<PhaseCostOracle>(PhaseCostOracleConfig{mConfig.globalCostModelConfig}))
+    , mGlobalCostOracle(
+          mConfig.globalCostOracle != nullptr ? mConfig.globalCostOracle : std::make_shared<PhaseCostOracle>([&] {
+              PhaseCostOracleConfig config;
+              config.model = mConfig.globalCostModelConfig;
+              return config;
+          }()))
     , mMemoryBroker(mConfig.memoryBroker)
 {
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");

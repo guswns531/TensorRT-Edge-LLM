@@ -390,6 +390,13 @@ void loadPhaseCostPrior(std::filesystem::path const& path, rt::PhaseDeploymentFi
     LOG_INFO("Loaded %s phase cost prior from %s", rt::phaseCostCompatibilityName(compatibility), path.c_str());
 }
 
+void logPhaseCostAnchors(char const* stage, rt::PhaseCostAnchorState const& state)
+{
+    LOG_INFO("Phase cost anchors (%s): E=%.3f/%zu P=%.3f/%zu D=%.3f/%zu overlap=%.3f/%zu", stage, state.scale.encoder,
+        state.encoderSamples, state.scale.prefill, state.prefillSamples, state.scale.decode, state.decodeSamples,
+        state.scale.overlap, state.overlapSamples);
+}
+
 struct PhaseTiming
 {
     float prefillMs{};
@@ -1509,6 +1516,11 @@ int main(int argc, char** argv)
 #include "phaseSchedulerOptions.inc"
         rt::PhaseCostOracleConfig phaseCostOracleConfig;
         phaseCostOracleConfig.model = semanticSchedulerConfig.globalCostModelConfig;
+        phaseCostOracleConfig.anchor.enabled = std::getenv("TRT_EDGELLM_DISABLE_PHASE_COST_AUTO_ANCHOR") == nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_ANCHOR_MIN_SAMPLES"))
+        {
+            phaseCostOracleConfig.anchor.minimumSamplesPerPhase = static_cast<size_t>(std::stoull(value));
+        }
         auto phaseCostOracle = std::make_shared<rt::PhaseCostOracle>(phaseCostOracleConfig);
         rt::PhaseDeploymentFingerprint const phaseCostDeployment = phaseDeploymentFingerprint(config);
         rt::PhaseCostScale phaseCostScale;
@@ -1910,6 +1922,9 @@ int main(int argc, char** argv)
             bool const globalOverlapWarmup
                 = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                 && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP") == nullptr;
+            bool const phaseCostAnchorWarmup = phaseCostOracleConfig.anchor.enabled
+                && semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
+                && !warmupBatchSizes.empty();
             size_t globalOverlapWarmupSamples = 4U;
             if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_WARMUP_SAMPLES"))
             {
@@ -1923,6 +1938,7 @@ int main(int argc, char** argv)
                 size_t const repeats = globalOverlapWarmup ? globalOverlapWarmupSamples : 1U;
                 executionWarmupBatchSizes.insert(executionWarmupBatchSizes.end(), repeats, batchSize);
             }
+            phaseCostOracle->setAnchorCollectionActive(phaseCostAnchorWarmup);
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(globalOverlapWarmup);
             uint64_t warmupRequestId = 1000000;
             size_t warmedRequests{};
@@ -1988,6 +2004,7 @@ int main(int argc, char** argv)
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
+            phaseCostOracle->setAnchorCollectionActive(false);
             rt::PhaseSchedulerTelemetry const warmupTelemetry = semanticCoordinator.scheduler().telemetry();
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
@@ -2011,6 +2028,15 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
                 executionWarmupBatchSizes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
                 warmupTelemetry.globalSafeProbeCount);
+            logPhaseCostAnchors("post-warmup", phaseCostOracle->anchorState());
+            if (char const* path = std::getenv("TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE"))
+            {
+                rt::PhaseCostBundle const calibrated = phaseCostOracle->snapshot(
+                    rt::PhaseCostBundleSource::kBuild, phaseCostDeployment, "startup-calibration-v1");
+                ELLM_CHECK(!calibrated.records.empty(), "Startup calibration did not produce phase cost records");
+                rt::phaseWriteCostBundleAtomic(calibrated, path);
+                LOG_INFO("Wrote startup phase cost calibration bundle to %s", path);
+            }
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
             std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
@@ -2624,6 +2650,7 @@ int main(int argc, char** argv)
                         bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
                         if (changesCalibration)
                         {
+                            phaseCostOracle->setAnchorCollectionActive(active);
                             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(active);
                             if (ipcThreePhase != nullptr)
                             {
@@ -2794,6 +2821,14 @@ int main(int argc, char** argv)
                         {"global_predicted_violation_us", metrics.globalPredictedViolationUs},
                         {"global_service_compression", metrics.globalServiceCompression},
                         {"global_reference_work_ms", metrics.globalReferenceWorkMs},
+                        {"phase_cost_anchor_encoder_scale", phaseCostOracle->anchorState().scale.encoder},
+                        {"phase_cost_anchor_encoder_samples", phaseCostOracle->anchorState().encoderSamples},
+                        {"phase_cost_anchor_prefill_scale", phaseCostOracle->anchorState().scale.prefill},
+                        {"phase_cost_anchor_prefill_samples", phaseCostOracle->anchorState().prefillSamples},
+                        {"phase_cost_anchor_decode_scale", phaseCostOracle->anchorState().scale.decode},
+                        {"phase_cost_anchor_decode_samples", phaseCostOracle->anchorState().decodeSamples},
+                        {"phase_cost_anchor_overlap_scale", phaseCostOracle->anchorState().scale.overlap},
+                        {"phase_cost_anchor_overlap_samples", phaseCostOracle->anchorState().overlapSamples},
                         {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
                         {"global_active_decisions",
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},

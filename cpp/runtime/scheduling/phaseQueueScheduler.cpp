@@ -106,9 +106,12 @@ char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mGlobalScheduler(mConfig.globalSchedulerConfig)
-    , mGlobalCostOracle(mConfig.globalCostOracle != nullptr
-              ? mConfig.globalCostOracle
-              : std::make_shared<PhaseCostOracle>(PhaseCostOracleConfig{mConfig.globalCostModelConfig}))
+    , mGlobalCostOracle(
+          mConfig.globalCostOracle != nullptr ? mConfig.globalCostOracle : std::make_shared<PhaseCostOracle>([&] {
+              PhaseCostOracleConfig config;
+              config.model = mConfig.globalCostModelConfig;
+              return config;
+          }()))
     , mRecentDecodeTpotUs(std::make_shared<RecentDecodeTpot>())
     , mOnlineDecodeGpuMs(std::make_shared<OnlineDecodeGpuSamples>())
     , mOnlineDecodeCostLearningActive(mConfig.enableOnlineDecodeCostLearning)

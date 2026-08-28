@@ -23,9 +23,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -89,6 +91,41 @@ float actionScale(PhaseGlobalActionKind kind, PhaseCostScale const& scale) noexc
     case PhaseGlobalActionKind::kWait: return 1.0F;
     }
     return 1.0F;
+}
+
+float actionRelativeUncertainty(PhaseGlobalActionKind kind, PhaseCostAnchorState const& state) noexcept
+{
+    switch (kind)
+    {
+    case PhaseGlobalActionKind::kEncoder: return state.encoderRelativeUncertainty;
+    case PhaseGlobalActionKind::kPrefill: return state.prefillRelativeUncertainty;
+    case PhaseGlobalActionKind::kDecode: return state.decodeRelativeUncertainty;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+    case PhaseGlobalActionKind::kEncoderDecode:
+    case PhaseGlobalActionKind::kPrefillDecode: return state.overlapRelativeUncertainty;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: return 0.0F;
+    }
+    return 0.0F;
+}
+
+float median(std::deque<float> const& values)
+{
+    ELLM_CHECK(!values.empty(), "Cannot compute an empty phase anchor median");
+    std::vector<float> ordered(values.begin(), values.end());
+    std::sort(ordered.begin(), ordered.end());
+    size_t const middle = ordered.size() / 2U;
+    return ordered.size() % 2U == 0U ? (ordered[middle - 1U] + ordered[middle]) * 0.5F : ordered[middle];
+}
+
+float medianAbsoluteDeviation(std::deque<float> const& values, float center)
+{
+    std::deque<float> deviations;
+    for (float const value : values)
+    {
+        deviations.push_back(std::abs(value - center));
+    }
+    return median(deviations);
 }
 
 PhaseGlobalActionKind parseAction(std::string const& value)
@@ -436,10 +473,22 @@ PhaseCostOracle::PhaseCostOracle(PhaseCostOracleConfig config)
         mConfig.compatibleUncertaintyMultiplier >= 1.0F, "Compatible cost uncertainty multiplier must be at least one");
     ELLM_CHECK(mConfig.shapeOnlyUncertaintyMultiplier >= mConfig.compatibleUncertaintyMultiplier,
         "Shape-only cost uncertainty must be no smaller than compatible uncertainty");
+    ELLM_CHECK(mConfig.anchor.minimumSamplesPerPhase > 0U, "Phase anchor minimum sample count must be positive");
+    ELLM_CHECK(mConfig.anchor.maxSamplesPerPhase >= mConfig.anchor.minimumSamplesPerPhase,
+        "Phase anchor sample window must cover the minimum sample count");
+    ELLM_CHECK(mConfig.anchor.minimumAcceptedScale > 0.0F
+            && mConfig.anchor.maximumAcceptedScale >= mConfig.anchor.minimumAcceptedScale,
+        "Phase anchor accepted scale range is invalid");
+    ELLM_CHECK(mConfig.anchor.minimumAppliedScale > 0.0F
+            && mConfig.anchor.maximumAppliedScale >= mConfig.anchor.minimumAppliedScale,
+        "Phase anchor applied scale range is invalid");
+    ELLM_CHECK(mConfig.anchor.minimumRelativeUncertainty >= 0.0F,
+        "Phase anchor minimum relative uncertainty must be non-negative");
 }
 
 void PhaseCostOracle::observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation)
 {
+    observeAnchor(key, observation);
     mLocal.observe(key, observation);
     mergeObservation(mLocalRecords, key, observation, phaseCostUnixTimeNs(), mConfig.model.windowSize);
     if (mJournal != nullptr)
@@ -545,16 +594,22 @@ void PhaseCostOracle::restoreNode(PhaseCostBundle const& bundle)
     }
 }
 
-PhaseCostBundle PhaseCostOracle::snapshotNode(
-    PhaseDeploymentFingerprint deployment, std::string bundleVersion, uint64_t createdAtUnixNs) const
+PhaseCostBundle PhaseCostOracle::snapshot(PhaseCostBundleSource source, PhaseDeploymentFingerprint deployment,
+    std::string bundleVersion, uint64_t createdAtUnixNs) const
 {
     PhaseCostBundle result;
     result.bundleVersion = std::move(bundleVersion);
-    result.source = PhaseCostBundleSource::kNode;
+    result.source = source;
     result.deployment = std::move(deployment);
     result.createdAtUnixNs = createdAtUnixNs != 0U ? createdAtUnixNs : phaseCostUnixTimeNs();
     result.records = mLocalRecords;
     return result;
+}
+
+PhaseCostBundle PhaseCostOracle::snapshotNode(
+    PhaseDeploymentFingerprint deployment, std::string bundleVersion, uint64_t createdAtUnixNs) const
+{
+    return snapshot(PhaseCostBundleSource::kNode, std::move(deployment), std::move(bundleVersion), createdAtUnixNs);
 }
 
 void PhaseCostOracle::attachJournal(std::shared_ptr<PhaseNodeCostJournal> journal)
@@ -566,10 +621,25 @@ void PhaseCostOracle::resetLocal()
 {
     mLocal.reset();
     mLocalRecords.clear();
+    mEncoderAnchors.ratios.clear();
+    mPrefillAnchors.ratios.clear();
+    mDecodeAnchors.ratios.clear();
+    mOverlapAnchors.ratios.clear();
+    mAnchorState = {};
+}
+
+void PhaseCostOracle::setAnchorCollectionActive(bool active) noexcept
+{
+    mAnchorCollectionActive = active;
+}
+
+PhaseCostAnchorState PhaseCostOracle::anchorState() const
+{
+    return mAnchorState;
 }
 
 std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrior(
-    std::optional<PriorLayer> const& layer, PhaseGlobalActionKey const& key, bool interpolate) const
+    std::optional<PriorLayer> const& layer, PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor) const
 {
     if (!layer.has_value())
     {
@@ -590,19 +660,118 @@ std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrior(
     {
         uncertaintyMultiplier = mConfig.shapeOnlyUncertaintyMultiplier;
     }
-    return scaledEstimate(*estimateValue, key, layer->scale, uncertaintyMultiplier);
+    PhaseCostScale scale = layer->scale;
+    float relativeUncertainty{};
+    if (applyAnchor)
+    {
+        float const adaptive = actionScale(key.kind, mAnchorState.scale);
+        switch (key.kind)
+        {
+        case PhaseGlobalActionKind::kEncoder: scale.encoder *= adaptive; break;
+        case PhaseGlobalActionKind::kPrefill: scale.prefill *= adaptive; break;
+        case PhaseGlobalActionKind::kDecode: scale.decode *= adaptive; break;
+        case PhaseGlobalActionKind::kEncoderPrefill:
+        case PhaseGlobalActionKind::kEncoderDecode:
+        case PhaseGlobalActionKind::kPrefillDecode: scale.overlap *= adaptive; break;
+        case PhaseGlobalActionKind::kNone:
+        case PhaseGlobalActionKind::kWait: break;
+        }
+        relativeUncertainty = actionRelativeUncertainty(key.kind, mAnchorState);
+    }
+    return scaledEstimate(*estimateValue, key, scale, uncertaintyMultiplier, relativeUncertainty);
 }
 
 PhaseGlobalCostEstimate PhaseCostOracle::scaledEstimate(PhaseGlobalCostEstimate estimate,
-    PhaseGlobalActionKey const& key, PhaseCostScale const& scale, float uncertaintyMultiplier) noexcept
+    PhaseGlobalActionKey const& key, PhaseCostScale const& scale, float uncertaintyMultiplier,
+    float relativeUncertainty) noexcept
 {
     float const multiplier = actionScale(key.kind, scale);
     estimate.referenceWorkMedianMs *= multiplier;
     estimate.makespanMedianMs *= multiplier;
     estimate.makespanP95Ms *= multiplier;
     estimate.uncertaintyMs *= multiplier * uncertaintyMultiplier;
+    estimate.uncertaintyMs
+        = std::max(estimate.uncertaintyMs, estimate.makespanMedianMs * std::max(0.0F, relativeUncertainty));
     estimate.makespanP95Ms = std::max(estimate.makespanP95Ms, estimate.makespanMedianMs + estimate.uncertaintyMs);
     return estimate;
+}
+
+void PhaseCostOracle::observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation)
+{
+    if (!mConfig.anchor.enabled || !mAnchorCollectionActive || !std::isfinite(observation.referenceWorkMs)
+        || observation.referenceWorkMs <= 0.0F || !std::isfinite(observation.makespanMs)
+        || observation.makespanMs <= 0.0F)
+    {
+        return;
+    }
+    std::optional<PhaseGlobalCostEstimate> prior = estimatePrior(mFleet, key, false, false);
+    if (!prior.has_value())
+    {
+        prior = estimatePrior(mBuild, key, false, false);
+    }
+    if (!prior.has_value() || !std::isfinite(prior->makespanMedianMs)
+        || prior->makespanMedianMs <= std::numeric_limits<float>::epsilon())
+    {
+        return;
+    }
+    float const ratio = observation.makespanMs / prior->makespanMedianMs;
+    if (!std::isfinite(ratio) || ratio < mConfig.anchor.minimumAcceptedScale
+        || ratio > mConfig.anchor.maximumAcceptedScale)
+    {
+        return;
+    }
+
+    AnchorSamples* samples{};
+    float* scale{};
+    float* uncertainty{};
+    size_t* sampleCount{};
+    switch (key.kind)
+    {
+    case PhaseGlobalActionKind::kEncoder:
+        samples = &mEncoderAnchors;
+        scale = &mAnchorState.scale.encoder;
+        uncertainty = &mAnchorState.encoderRelativeUncertainty;
+        sampleCount = &mAnchorState.encoderSamples;
+        break;
+    case PhaseGlobalActionKind::kPrefill:
+        samples = &mPrefillAnchors;
+        scale = &mAnchorState.scale.prefill;
+        uncertainty = &mAnchorState.prefillRelativeUncertainty;
+        sampleCount = &mAnchorState.prefillSamples;
+        break;
+    case PhaseGlobalActionKind::kDecode:
+        samples = &mDecodeAnchors;
+        scale = &mAnchorState.scale.decode;
+        uncertainty = &mAnchorState.decodeRelativeUncertainty;
+        sampleCount = &mAnchorState.decodeSamples;
+        break;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+    case PhaseGlobalActionKind::kEncoderDecode:
+    case PhaseGlobalActionKind::kPrefillDecode:
+        samples = &mOverlapAnchors;
+        scale = &mAnchorState.scale.overlap;
+        uncertainty = &mAnchorState.overlapRelativeUncertainty;
+        sampleCount = &mAnchorState.overlapSamples;
+        break;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: return;
+    }
+    samples->ratios.push_back(ratio);
+    if (samples->ratios.size() > mConfig.anchor.maxSamplesPerPhase)
+    {
+        samples->ratios.pop_front();
+    }
+    *sampleCount = samples->ratios.size();
+    if (samples->ratios.size() < mConfig.anchor.minimumSamplesPerPhase)
+    {
+        return;
+    }
+    float const center = median(samples->ratios);
+    *scale = std::clamp(center, mConfig.anchor.minimumAppliedScale, mConfig.anchor.maximumAppliedScale);
+    constexpr float kNormalMadScale = 1.4826F;
+    float const relativeMad = kNormalMadScale * medianAbsoluteDeviation(samples->ratios, center)
+        / std::max(center, std::numeric_limits<float>::epsilon());
+    *uncertainty = std::max(mConfig.anchor.minimumRelativeUncertainty, relativeMad);
 }
 
 class PhaseNodeCostJournal::Impl

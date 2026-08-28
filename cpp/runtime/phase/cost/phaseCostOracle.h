@@ -21,6 +21,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -126,9 +127,35 @@ struct PhaseCostScale
     float overlap{1.0F};
 };
 
+struct PhaseCostAnchorConfig
+{
+    bool enabled{true};
+    size_t minimumSamplesPerPhase{2U};
+    size_t maxSamplesPerPhase{16U};
+    float minimumAcceptedScale{0.25F};
+    float maximumAcceptedScale{4.0F};
+    float minimumAppliedScale{0.5F};
+    float maximumAppliedScale{2.0F};
+    float minimumRelativeUncertainty{0.02F};
+};
+
+struct PhaseCostAnchorState
+{
+    PhaseCostScale scale;
+    float encoderRelativeUncertainty{};
+    float prefillRelativeUncertainty{};
+    float decodeRelativeUncertainty{};
+    float overlapRelativeUncertainty{};
+    size_t encoderSamples{};
+    size_t prefillSamples{};
+    size_t decodeSamples{};
+    size_t overlapSamples{};
+};
+
 struct PhaseCostOracleConfig
 {
     PhaseGlobalCostModelConfig model;
+    PhaseCostAnchorConfig anchor;
     size_t sufficientLocalSamples{4U};
     float compatibleUncertaintyMultiplier{2.0F};
     float shapeOnlyUncertaintyMultiplier{4.0F};
@@ -150,10 +177,14 @@ public:
 
     void loadPrior(PhaseCostBundle bundle, PhaseCostCompatibility compatibility, PhaseCostScale scale = {});
     void restoreNode(PhaseCostBundle const& bundle);
+    PhaseCostBundle snapshot(PhaseCostBundleSource source, PhaseDeploymentFingerprint deployment,
+        std::string bundleVersion, uint64_t createdAtUnixNs = 0U) const;
     PhaseCostBundle snapshotNode(
         PhaseDeploymentFingerprint deployment, std::string bundleVersion, uint64_t createdAtUnixNs = 0U) const;
     void attachJournal(std::shared_ptr<PhaseNodeCostJournal> journal);
     void resetLocal();
+    void setAnchorCollectionActive(bool active) noexcept;
+    PhaseCostAnchorState anchorState() const;
 
 private:
     struct PriorLayer
@@ -163,15 +194,28 @@ private:
         PhaseCostScale scale;
     };
 
-    std::optional<PhaseGlobalCostEstimate> estimatePrior(
-        std::optional<PriorLayer> const& layer, PhaseGlobalActionKey const& key, bool interpolate) const;
+    std::optional<PhaseGlobalCostEstimate> estimatePrior(std::optional<PriorLayer> const& layer,
+        PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor = true) const;
     static PhaseGlobalCostEstimate scaledEstimate(PhaseGlobalCostEstimate estimate, PhaseGlobalActionKey const& key,
-        PhaseCostScale const& scale, float uncertaintyMultiplier) noexcept;
+        PhaseCostScale const& scale, float uncertaintyMultiplier, float relativeUncertainty = 0.0F) noexcept;
+    void observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation);
+
+    struct AnchorSamples
+    {
+        std::deque<float> ratios;
+    };
+
     PhaseCostOracleConfig mConfig;
     PhaseGlobalCostModel mLocal;
     std::vector<PhaseCostRecord> mLocalRecords;
     std::optional<PriorLayer> mBuild;
     std::optional<PriorLayer> mFleet;
+    AnchorSamples mEncoderAnchors;
+    AnchorSamples mPrefillAnchors;
+    AnchorSamples mDecodeAnchors;
+    AnchorSamples mOverlapAnchors;
+    PhaseCostAnchorState mAnchorState;
+    bool mAnchorCollectionActive{};
     std::shared_ptr<PhaseNodeCostJournal> mJournal;
 };
 

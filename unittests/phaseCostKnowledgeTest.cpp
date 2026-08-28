@@ -125,11 +125,26 @@ TEST(PhaseCostKnowledgeTest, BundleRoundTripPreservesRawObservations)
     std::filesystem::remove_all(directory);
 }
 
+TEST(PhaseCostKnowledgeTest, OracleExportsControlledObservationsAsBuildPrior)
+{
+    PhaseCostOracle oracle;
+    oracle.observe(decodeKey(), {10.0F, 7.0F});
+    PhaseCostBundle const calibrated
+        = oracle.snapshot(PhaseCostBundleSource::kBuild, fingerprint(), "startup-calibration-test", 456U);
+
+    EXPECT_EQ(calibrated.source, PhaseCostBundleSource::kBuild);
+    EXPECT_EQ(calibrated.bundleVersion, "startup-calibration-test");
+    EXPECT_EQ(calibrated.createdAtUnixNs, 456U);
+    ASSERT_EQ(calibrated.records.size(), 1U);
+    EXPECT_EQ(calibrated.records.front().key, decodeKey());
+}
+
 TEST(PhaseCostKnowledgeTest, OraclePrefersFleetUntilLocalEvidenceIsSufficient)
 {
     PhaseCostOracleConfig config;
     config.sufficientLocalSamples = 3U;
     config.model.coldStartUncertaintyMs = 0.0F;
+    config.anchor.enabled = false;
     PhaseCostOracle oracle(config);
     oracle.loadPrior(bundle(PhaseCostBundleSource::kBuild, 9.0F), PhaseCostCompatibility::kExact);
     oracle.loadPrior(bundle(PhaseCostBundleSource::kFleet, 7.0F), PhaseCostCompatibility::kExact);
@@ -158,6 +173,72 @@ TEST(PhaseCostKnowledgeTest, CompatiblePriorScalesCostAndWidensUncertainty)
     EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 11.0F);
     EXPECT_FLOAT_EQ(estimate->uncertaintyMs, 2.2F);
     EXPECT_FLOAT_EQ(estimate->makespanP95Ms, 13.2F);
+}
+
+TEST(PhaseCostKnowledgeTest, StartupAnchorsAdaptPriorWithoutAWorkloadMode)
+{
+    PhaseCostOracleConfig config;
+    config.sufficientLocalSamples = 4U;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.anchor.minimumSamplesPerPhase = 2U;
+    PhaseCostOracle oracle(config);
+    PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+    prior.records.front().observations = {{10.0F, 10.0F}, {10.0F, 10.0F}};
+    PhaseCostRecord larger{decodeKey(64), {{20.0F, 20.0F}, {20.0F, 20.0F}}, 122U};
+    prior.records.push_back(larger);
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kCompatible);
+    oracle.setAnchorCollectionActive(true);
+
+    oracle.observe(decodeKey(), {10.0F, 12.0F});
+    EXPECT_FLOAT_EQ(oracle.anchorState().scale.decode, 1.0F);
+    oracle.observe(decodeKey(), {10.0F, 14.0F});
+
+    PhaseCostAnchorState const state = oracle.anchorState();
+    EXPECT_EQ(state.decodeSamples, 2U);
+    EXPECT_FLOAT_EQ(state.scale.decode, 1.3F);
+    EXPECT_GT(state.decodeRelativeUncertainty, config.anchor.minimumRelativeUncertainty);
+    std::optional<PhaseGlobalCostEstimate> const estimate = oracle.estimate(decodeKey(64));
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 26.0F);
+    EXPECT_GT(estimate->uncertaintyMs, 0.0F);
+}
+
+TEST(PhaseCostKnowledgeTest, StartupAnchorsRejectImplausibleScaleAndResetCleanly)
+{
+    PhaseCostOracleConfig config;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.anchor.minimumSamplesPerPhase = 1U;
+    PhaseCostOracle oracle(config);
+    PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+    prior.records.front().observations = {{10.0F, 10.0F}};
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+    oracle.setAnchorCollectionActive(true);
+
+    oracle.observe(decodeKey(), {10.0F, 100.0F});
+    EXPECT_EQ(oracle.anchorState().decodeSamples, 0U);
+    oracle.observe(decodeKey(), {10.0F, 12.0F});
+    EXPECT_FLOAT_EQ(oracle.anchorState().scale.decode, 1.2F);
+    oracle.resetLocal();
+    EXPECT_EQ(oracle.anchorState().decodeSamples, 0U);
+    EXPECT_FLOAT_EQ(oracle.anchorState().scale.decode, 1.0F);
+}
+
+TEST(PhaseCostKnowledgeTest, ProductionObservationsDoNotRetunePortablePhaseScale)
+{
+    PhaseCostOracleConfig config;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.anchor.minimumSamplesPerPhase = 1U;
+    PhaseCostOracle oracle(config);
+    PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+    prior.records.front().observations = {{10.0F, 10.0F}};
+    prior.records.push_back({decodeKey(64), {{20.0F, 20.0F}}, 122U});
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+
+    oracle.observe(decodeKey(), {10.0F, 12.0F});
+    EXPECT_EQ(oracle.anchorState().decodeSamples, 0U);
+    std::optional<PhaseGlobalCostEstimate> const estimate = oracle.estimate(decodeKey(64));
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 20.0F);
 }
 
 TEST(PhaseCostKnowledgeTest, NodeJournalPersistsOutsideObservationHotPath)
