@@ -84,6 +84,8 @@
     "global_phase_scheduling": {
       "kind": "new_phase_runtime",
       "paths": [
+        "cpp/runtime/scheduling/phaseActionPlan.h",
+        "cpp/runtime/scheduling/phaseGlobalCostModel.h",
         "cpp/runtime/scheduling/phaseGlobalScheduler.cpp",
         "cpp/runtime/scheduling/phaseGlobalScheduler.h",
         "cpp/runtime/scheduling/phaseQueueScheduler.cpp",
@@ -103,6 +105,7 @@
         "cpp/runtime/scheduling/phaseContinuousLoadGenerator.cpp",
         "cpp/runtime/scheduling/phaseContinuousLoadGenerator.h",
         "examples/llm/llm_phase_context_smoke.cpp",
+        "examples/llm/phaseSchedulerOptions.inc",
         "scripts/phase_openai_gateway.py"
       ]
     },
@@ -158,6 +161,7 @@
       "kind": "upstream_integration",
       "paths": [
         "CMakeLists.txt",
+        "cpp/CMakeLists.txt",
         "examples/llm/CMakeLists.txt",
         "examples/llm/llm_bench.cpp",
         "examples/llm/llm_build.cpp",

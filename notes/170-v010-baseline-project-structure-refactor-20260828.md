@@ -412,3 +412,15 @@ text-heavy의 전체 TTFT p95만 `+3.63%`였지만, class별 text와 vision TTFT
 재현됐다. 따라서 이는 장기 환경 drift가 아니라 두 번째 include boundary가 만든 executable layout
 민감성으로 판정했다. server/admission 옵션은 현재 composition root에 남기고, hot loop가 독립된 안정
 object 경계를 가진 뒤 다시 분리한다.
+
+## R3 실행 결과: immutable action boundary
+
+기존 `phaseGlobalScheduler.h`의 서로 다른 책임을 선언 수준에서 세 경계로 나눴다.
+
+- `phaseGlobalCostModel.h`: action key, execution variant, online CUDA-event cost observations
+- `phaseActionPlan.h`: ownership horizon, protected completion, immutable candidate와 dispatch lease materialization
+- `phaseGlobalScheduler.h`: feasibility/deadline/efficiency selector와 decision 결과
+
+구현 함수와 object source order는 이동하지 않았다. R3 전후 `libedgellmCore.a`, TensorRT plugin,
+`llm_phase_context_smoke` SHA-256이 모두 완전히 같았고, Global/queue scheduler 단위 테스트 145개도 모두
+통과했다. 실행 binary가 같으므로 R2b의 12-workload 결과와 cached fresh vLLM 비교를 그대로 승계한다.
