@@ -39,6 +39,10 @@ namespace trt_edgellm::rt
 
 struct PhaseVisionPayload;
 
+//! Align admission to complete decode cohorts without exceeding the requested request capacity.
+size_t phaseDecodeAlignedAdmissionCapacity(size_t requestedCapacity, size_t decodeBatchCapacity) noexcept;
+//! Expose at most one complete prefill cohort to each serving-loop arbitration point.
+size_t phaseServingIngressQuantum(size_t maxPendingRequests, size_t prefillBatchCapacity) noexcept;
 //! Pure decision helper for sampling-aware decode-tail refill.
 bool shouldDeferDecodeForSamplingRefill(
     size_t targetRows, size_t prefillRows, size_t decodeRows, size_t pendingDecodeSamplingRows) noexcept;

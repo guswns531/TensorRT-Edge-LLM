@@ -448,6 +448,9 @@ public:
     //! Observe each completed encoder batch exactly once.
     void setEncoderBatchMetricCallback(
         std::function<void(PhaseVisionEncoderBatchMetric const&)> encoderBatchMetricCallback);
+    //! Deliver server tokens and completions without an intermediate polling queue.
+    void setEventCallbacks(std::function<void(IndependentPhaseServerToken&&)> tokenCallback,
+        std::function<void(IndependentPhaseServerCompletion&&)> completionCallback);
 
     std::optional<IndependentPhaseServerToken> tryPopToken();
     std::optional<IndependentPhaseServerCompletion> tryPopCompletion();
@@ -498,6 +501,7 @@ private:
     bool encoderSerializationDue() const noexcept;
     void refreshEncoderSerializationGate() noexcept;
     void eraseTpotTarget(uint64_t requestId);
+    void observeServerCompletion(uint64_t requestId);
     void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,
         uint64_t timestampNs = 0U) const;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;

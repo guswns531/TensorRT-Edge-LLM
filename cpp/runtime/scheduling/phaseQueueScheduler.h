@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -399,8 +400,9 @@ struct PhaseQueueSchedulerConfig
     float globalColdPrefillMsPerToken{0.02F};
     float globalColdDecodeMs{2.0F};
     //! Permit a rate-limited unknown P+D probe only with this multiple of
-    //! robust serial cost remaining as slack. Zero disables probes.
-    float globalSafeProbeSlackMultiplier{4.0F};
+    //! robust serial cost remaining as slack. Production exploration is
+    //! opt-in; controlled warm-up probes remain available when this is zero.
+    float globalSafeProbeSlackMultiplier{};
     size_t globalSafeProbeInterval{32U};
     //! Maximum distinct P+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
@@ -408,6 +410,10 @@ struct PhaseQueueSchedulerConfig
     //! Every field returned by one invocation must use the same unit.
     std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
         globalMemoryHorizonSupplier{};
+    //! The caller reserves every phase allocation before work becomes
+    //! runnable. This permits a single runnable phase to bypass a vacuous
+    //! policy comparison without bypassing admission-time memory safety.
+    bool globalDispatchUsesPreReservedMemory{};
     int32_t maxPrefillBatchSize{1};
     int32_t maxDecodeBatchSize{4};
     //! Optional row cap for continuation chunks (tokenOffset > 0). Zero
@@ -564,6 +570,11 @@ struct PhaseQueueSchedulerConfig
     //! rows. Disabled by default until the longer horizon recovers the
     //! completion-cohort density of the one-step refill policy.
     bool enableGlobalIncrementalDecodeDrainHorizon{};
+    //! Skip policy candidate construction when exactly one local phase is
+    //! runnable and memory safety is either local or guaranteed by a
+    //! pre-reserved ownership contract. The mechanism batch and online
+    //! observation paths remain unchanged.
+    bool elideVacuousGlobalDecisions{};
     double prefillQueueWaitTargetUs{5000.0};
     double decodeQueueWaitTargetUs{2000.0};
     //! Default next-token deadline for bounded WAIT/refill decisions when a
@@ -836,8 +847,13 @@ private:
     std::unordered_set<uint64_t> mInFlightRequestIds;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     PhaseSchedulerTelemetry mTelemetry;
-    std::deque<double> mRecentDecodeTpotUs;
-    std::unordered_map<uint64_t, std::deque<float>> mOnlineDecodeGpuMs;
+    using RecentDecodeTpot = std::deque<double>;
+    using OnlineDecodeGpuSamples = std::unordered_map<uint64_t, std::deque<float>>;
+    //! Mechanism previews only read learned histories. Share these potentially
+    //! large windows across exact scheduler copies and detach before a real
+    //! completion observation changes them.
+    std::shared_ptr<RecentDecodeTpot> mRecentDecodeTpotUs;
+    std::shared_ptr<OnlineDecodeGpuSamples> mOnlineDecodeGpuMs;
     bool mOnlineDecodeCostLearningActive{};
     bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};

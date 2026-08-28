@@ -360,6 +360,26 @@ TEST(PhaseGlobalCostModelTest, LearnsRobustDirectOverlapEligibility)
     EXPECT_TRUE(model.overlapEligible(key));
 }
 
+TEST(PhaseGlobalCostModelTest, CopyOnWritePreservesPreviewIsolation)
+{
+    PhaseGlobalCostModel original;
+    PhaseGlobalActionKey const prefill{PhaseGlobalActionKind::kPrefill, 2, 0, 128, 0, 0};
+    original.observe(prefill, {2.0F, 1.0F});
+
+    PhaseGlobalCostModel preview = original;
+    PhaseGlobalActionKey const decode{PhaseGlobalActionKind::kDecode, 4, 0, 1, 2, 0};
+    preview.observe(decode, {4.0F, 2.0F});
+
+    EXPECT_TRUE(original.estimate(prefill).has_value());
+    EXPECT_FALSE(original.estimate(decode).has_value());
+    EXPECT_TRUE(preview.estimate(prefill).has_value());
+    EXPECT_TRUE(preview.estimate(decode).has_value());
+
+    preview.reset();
+    EXPECT_FALSE(preview.estimate(prefill).has_value());
+    EXPECT_TRUE(original.estimate(prefill).has_value());
+}
+
 TEST(PhaseGlobalCostModelTest, RejectsOverlapWithoutRobustGain)
 {
     PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});

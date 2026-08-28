@@ -22,6 +22,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -181,8 +182,7 @@ public:
     std::optional<PhaseGlobalCostEstimate> estimate(PhaseGlobalActionKey const& key) const;
     //! Interpolate a missing primary batch size only when direct observations
     //! with otherwise identical execution keys bracket it on both sides.
-    std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(
-        PhaseGlobalActionKey const& key) const;
+    std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
     bool overlapEligible(PhaseGlobalActionKey const& key) const;
     void reset();
@@ -198,8 +198,13 @@ private:
         size_t operator()(PhaseGlobalActionKey const& key) const noexcept;
     };
 
+    using SampleMap = std::unordered_map<PhaseGlobalActionKey, Samples, KeyHash>;
+
     PhaseGlobalCostModelConfig mConfig;
-    std::unordered_map<PhaseGlobalActionKey, Samples, KeyHash> mSamples;
+    //! Mechanism previews copy the complete scheduler so every hidden queue
+    //! state remains identical. Samples are read-only in those previews, so
+    //! share them until an actual observation mutates one copy.
+    std::shared_ptr<SampleMap> mSamples;
 };
 
 //! Ownership changes caused by one action. Near reclaim is a ranking signal and

@@ -969,6 +969,21 @@ void PhaseThreeCoordinator::setEncoderBatchMetricCallback(
     mEncoderBatchMetricCallback = std::move(encoderBatchMetricCallback);
 }
 
+void PhaseThreeCoordinator::setEventCallbacks(std::function<void(IndependentPhaseServerToken&&)> tokenCallback,
+    std::function<void(IndependentPhaseServerCompletion&&)> completionCallback)
+{
+    ELLM_CHECK(empty(), "Three-phase event callbacks can only change while the coordinator is idle");
+    mServer.setEventCallbacks(std::move(tokenCallback),
+        [this, completionCallback = std::move(completionCallback)](
+            IndependentPhaseServerCompletion&& completion) mutable {
+            observeServerCompletion(completion.requestId);
+            if (completionCallback)
+            {
+                completionCallback(std::move(completion));
+            }
+        });
+}
+
 std::optional<IndependentPhaseServerToken> PhaseThreeCoordinator::tryPopToken()
 {
     return mServer.tryPopToken();
@@ -979,15 +994,16 @@ std::optional<IndependentPhaseServerCompletion> PhaseThreeCoordinator::tryPopCom
     auto completion = mServer.tryPopCompletion();
     if (completion.has_value())
     {
-        mRequestIds.erase(completion->requestId);
-        eraseTpotTarget(completion->requestId);
-        auto const downstream = mDownstreamRequestBytes.find(completion->requestId);
-        if (downstream != mDownstreamRequestBytes.end())
-        {
-            mDownstreamRequestBytes.erase(downstream);
-        }
+        observeServerCompletion(completion->requestId);
     }
     return completion;
+}
+
+void PhaseThreeCoordinator::observeServerCompletion(uint64_t requestId)
+{
+    mRequestIds.erase(requestId);
+    eraseTpotTarget(requestId);
+    mDownstreamRequestBytes.erase(requestId);
 }
 
 PhaseExecutionSet PhaseThreeCoordinator::observedGlobalExecution() const noexcept

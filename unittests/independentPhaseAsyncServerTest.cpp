@@ -22,6 +22,30 @@
 namespace trt_edgellm::rt
 {
 
+TEST(IndependentPhaseAsyncServerTest, AlignsAdmissionToCompleteDecodeCohorts)
+{
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(80, 64), 64U);
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(80, 32), 64U);
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(80, 16), 80U);
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(128, 64), 128U);
+}
+
+TEST(IndependentPhaseAsyncServerTest, PreservesSubCohortAndInvalidCapacities)
+{
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(48, 64), 48U);
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(64, 64), 64U);
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(0, 64), 0U);
+    EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(80, 0), 80U);
+}
+
+TEST(IndependentPhaseAsyncServerTest, ExposesOneCompletePrefillCohortPerIngressTurn)
+{
+    EXPECT_EQ(phaseServingIngressQuantum(1024, 8), 8U);
+    EXPECT_EQ(phaseServingIngressQuantum(4, 8), 4U);
+    EXPECT_EQ(phaseServingIngressQuantum(1024, 0), 1U);
+    EXPECT_EQ(phaseServingIngressQuantum(0, 8), 0U);
+}
+
 TEST(IndependentPhaseAsyncServerTest, DefersOnlyARefillableDecodeTail)
 {
     EXPECT_TRUE(shouldDeferDecodeForSamplingRefill(64, 0, 16, 64));

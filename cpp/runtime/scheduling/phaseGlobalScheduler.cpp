@@ -447,6 +447,7 @@ size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key
 
 PhaseGlobalCostModel::PhaseGlobalCostModel(PhaseGlobalCostModelConfig config)
     : mConfig(config)
+    , mSamples(std::make_shared<SampleMap>())
 {
     ELLM_CHECK(mConfig.windowSize > 0U, "Global phase cost window must be positive");
     ELLM_CHECK(mConfig.overlapMinSamples > 0U, "Global phase overlap sample threshold must be positive");
@@ -458,7 +459,11 @@ void PhaseGlobalCostModel::observe(PhaseGlobalActionKey const& key, PhaseGlobalC
 {
     ELLM_CHECK(observation.referenceWorkMs > 0.0F, "Global phase reference work must be positive");
     ELLM_CHECK(observation.makespanMs > 0.0F, "Global phase makespan must be positive");
-    Samples& samples = mSamples[phaseGlobalCanonicalOverlapCostKey(key)];
+    if (!mSamples.unique())
+    {
+        mSamples = std::make_shared<SampleMap>(*mSamples);
+    }
+    Samples& samples = (*mSamples)[phaseGlobalCanonicalOverlapCostKey(key)];
     samples.values.push_back(observation);
     while (samples.values.size() > mConfig.windowSize)
     {
@@ -468,8 +473,8 @@ void PhaseGlobalCostModel::observe(PhaseGlobalActionKey const& key, PhaseGlobalC
 
 std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimate(PhaseGlobalActionKey const& key) const
 {
-    auto const found = mSamples.find(phaseGlobalCanonicalOverlapCostKey(key));
-    if (found == mSamples.end() || found->second.values.empty())
+    auto const found = mSamples->find(phaseGlobalCanonicalOverlapCostKey(key));
+    if (found == mSamples->end() || found->second.values.empty())
     {
         return std::nullopt;
     }
@@ -500,7 +505,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolate
     PhaseGlobalActionKey const target = phaseGlobalCanonicalOverlapCostKey(key);
     std::optional<std::pair<PhaseGlobalActionKey, PhaseGlobalCostEstimate>> lower;
     std::optional<std::pair<PhaseGlobalActionKey, PhaseGlobalCostEstimate>> upper;
-    for (auto const& [observedKey, samples] : mSamples)
+    for (auto const& [observedKey, samples] : *mSamples)
     {
         if (samples.values.empty() || observedKey.kind != target.kind
             || observedKey.secondaryBatchSize != target.secondaryBatchSize
@@ -535,9 +540,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolate
 
     float const batchSpan = static_cast<float>(upper->first.primaryBatchSize - lower->first.primaryBatchSize);
     float const alpha = static_cast<float>(target.primaryBatchSize - lower->first.primaryBatchSize) / batchSpan;
-    auto interpolate = [alpha](float lowerValue, float upperValue) {
-        return lowerValue + alpha * (upperValue - lowerValue);
-    };
+    auto interpolate
+        = [alpha](float lowerValue, float upperValue) { return lowerValue + alpha * (upperValue - lowerValue); };
     PhaseGlobalCostEstimate result;
     result.sampleCount = std::min(lower->second.sampleCount, upper->second.sampleCount);
     result.referenceWorkMedianMs
@@ -580,7 +584,14 @@ PhaseGlobalOverlapCostDiagnostic PhaseGlobalCostModel::overlapDiagnostic(PhaseGl
 
 void PhaseGlobalCostModel::reset()
 {
-    mSamples.clear();
+    if (mSamples.unique())
+    {
+        mSamples->clear();
+    }
+    else
+    {
+        mSamples = std::make_shared<SampleMap>();
+    }
 }
 
 PhaseGlobalScheduler::PhaseGlobalScheduler(PhaseGlobalSchedulerConfig config)

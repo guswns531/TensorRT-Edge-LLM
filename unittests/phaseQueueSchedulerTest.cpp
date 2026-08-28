@@ -93,6 +93,45 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalActiveElidesVacuousSinglePhaseDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.elideVacuousGlobalDecisions = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_FALSE(plan.globalDecisionEvaluated);
+    EXPECT_FALSE(plan.globalDecisionApplied);
+    EXPECT_EQ(scheduler.telemetry().globalDecisionCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveElidesPreReservedSinglePhaseDecision)
+{
+    size_t memoryQueries{};
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.elideVacuousGlobalDecisions = true;
+    config.globalDispatchUsesPreReservedMemory = true;
+    config.globalMemoryHorizonSupplier = [&](PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+        ++memoryQueries;
+        return PhaseActionMemoryHorizon{};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_FALSE(plan.globalDecisionEvaluated);
+    EXPECT_EQ(memoryQueries, 0U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalSyntheticWarmupForcesUnknownPrefillDecodeProbe)
 {
     PhaseQueueSchedulerConfig config;

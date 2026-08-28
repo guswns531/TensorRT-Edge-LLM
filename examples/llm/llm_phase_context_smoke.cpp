@@ -1540,6 +1540,16 @@ int main(int argc, char** argv)
             = std::getenv("TRT_EDGELLM_GLOBAL_PREFILL_CONTINUATION_HORIZON") != nullptr;
         semanticSchedulerConfig.enableGlobalIncrementalDecodeDrainHorizon
             = std::getenv("TRT_EDGELLM_GLOBAL_INCREMENTAL_DECODE_DRAIN_HORIZON") != nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
+        {
+            semanticSchedulerConfig.globalSafeProbeSlackMultiplier = std::stof(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_INTERVAL"))
+        {
+            semanticSchedulerConfig.globalSafeProbeInterval = static_cast<size_t>(std::stoull(value));
+        }
+        semanticSchedulerConfig.elideVacuousGlobalDecisions
+            = std::getenv("TRT_EDGELLM_DISABLE_VACUOUS_GLOBAL_ELISION") == nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference
             = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;
@@ -1626,6 +1636,7 @@ int main(int argc, char** argv)
         }
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
         {
+            semanticSchedulerConfig.globalDispatchUsesPreReservedMemory = true;
             semanticSchedulerConfig.globalMemoryHorizonSupplier
                 = [&ownership](rt::PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
                       rt::StableKVPageManager::Config const& ownershipConfig = ownership.config();
@@ -1656,6 +1667,17 @@ int main(int argc, char** argv)
         }
         ELLM_CHECK(maxInFlightRequests > 0 && maxInFlightRequests <= static_cast<size_t>(maxStableSlots),
             "Phase server in-flight capacity must be in the stable slot range");
+        if (std::getenv("TRT_EDGELLM_DISABLE_DECODE_ALIGNED_ADMISSION") == nullptr)
+        {
+            size_t const requestedCapacity = maxInFlightRequests;
+            maxInFlightRequests = rt::phaseDecodeAlignedAdmissionCapacity(
+                requestedCapacity, static_cast<size_t>(semanticSchedulerConfig.maxDecodeBatchSize));
+            if (maxInFlightRequests != requestedCapacity)
+            {
+                LOG_INFO("Decode-aligned admission: requested=%zu effective=%zu decode_batch=%d", requestedCapacity,
+                    maxInFlightRequests, semanticSchedulerConfig.maxDecodeBatchSize);
+            }
+        }
         serverConfig.maxInFlightRequests = maxInFlightRequests;
         serverConfig.defaultMaxOutputTokens = kSEMANTIC_OUTPUT_TOKENS;
         if (std::getenv("TRT_EDGELLM_IGNORE_EOS") == nullptr)
@@ -1922,12 +1944,11 @@ int main(int argc, char** argv)
         }
         else if (ipcMode)
         {
-            // Bound synchronous request parsing before polling the GPU phases. In
-            // particular, image loading must not drain an entire burst while the
-            // device is idle. Half a prefill cohort leaves enough rows for useful
-            // batching while overlapping the remaining ingress work with CUDA.
-            size_t ipcIngressQuantum = std::min(serverConfig.maxPendingRequests,
-                std::max<size_t>(1U, static_cast<size_t>(semanticSchedulerConfig.maxPrefillBatchSize) / 2U));
+            // Publish one complete prefill cohort before each arbitration point.
+            // Parsing remains asynchronous, so expensive image preparation does
+            // not drain an entire burst while the device is idle.
+            size_t ipcIngressQuantum = rt::phaseServingIngressQuantum(
+                serverConfig.maxPendingRequests, static_cast<size_t>(semanticSchedulerConfig.maxPrefillBatchSize));
             if (char const* value = std::getenv("TRT_EDGELLM_IPC_INGRESS_QUANTUM"))
             {
                 ipcIngressQuantum = static_cast<size_t>(std::stoul(value));
@@ -2500,20 +2521,20 @@ int main(int argc, char** argv)
             auto emitEvent = [&](nlohmann::json const& event) { emitRecord("PHASE_EVENT\t", event); };
             std::deque<rt::IndependentPhaseServerToken> nativeTokenEvents;
             std::deque<rt::IndependentPhaseServerCompletion> nativeCompletionEvents;
-            bool const nativeEventCallbacks = ipcThreePhase == nullptr;
-            if (nativeEventCallbacks)
+            auto tokenCallback
+                = [&](rt::IndependentPhaseServerToken&& event) { nativeTokenEvents.push_back(std::move(event)); };
+            auto completionCallback = [&](rt::IndependentPhaseServerCompletion&& event) {
+                nativeCompletionEvents.push_back(std::move(event));
+            };
+            if (ipcThreePhase != nullptr)
             {
-                semanticServer.setEventCallbacks(
-                    [&](rt::IndependentPhaseServerToken&& event) { nativeTokenEvents.push_back(std::move(event)); },
-                    [&](rt::IndependentPhaseServerCompletion&& event) {
-                        nativeCompletionEvents.push_back(std::move(event));
-                    });
+                ipcThreePhase->setEventCallbacks(std::move(tokenCallback), std::move(completionCallback));
+            }
+            else
+            {
+                semanticServer.setEventCallbacks(std::move(tokenCallback), std::move(completionCallback));
             }
             auto popTokenEvent = [&]() -> std::optional<rt::IndependentPhaseServerToken> {
-                if (!nativeEventCallbacks)
-                {
-                    return ipcThreePhase != nullptr ? ipcThreePhase->tryPopToken() : semanticServer.tryPopToken();
-                }
                 if (nativeTokenEvents.empty())
                 {
                     return std::nullopt;
@@ -2523,11 +2544,6 @@ int main(int argc, char** argv)
                 return event;
             };
             auto popCompletionEvent = [&]() -> std::optional<rt::IndependentPhaseServerCompletion> {
-                if (!nativeEventCallbacks)
-                {
-                    return ipcThreePhase != nullptr ? ipcThreePhase->tryPopCompletion()
-                                                    : semanticServer.tryPopCompletion();
-                }
                 if (nativeCompletionEvents.empty())
                 {
                     return std::nullopt;
@@ -3175,7 +3191,7 @@ int main(int argc, char** argv)
                 "decode", semanticCoordinator.decodeKVMemoryStats(), semanticCoordinator.decodePageTableUploadStats());
             LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
                 emitPhaseMetrics ? "yes" : "no");
-            LOG_INFO("Phase IPC response path: %s", nativeEventCallbacks ? "native_callback" : "polling_queue");
+            LOG_INFO("Phase IPC response path: native_callback");
             LOG_INFO(
                 "Phase page reservation: mode=%s base=%d guaranteed=%d growth_owners=%zu growth_pending=%zu "
                 "growth_waits=%zu",
@@ -3263,6 +3279,12 @@ int main(int argc, char** argv)
                 prefillGraphStats.entries, prefillGraphStats.hits, prefillGraphStats.misses, prefillGraphStats.captures,
                 prefillGraphStats.evictions, decodeGraphStats.entries, decodeGraphStats.hits, decodeGraphStats.misses,
                 decodeGraphStats.captures, decodeGraphStats.evictions);
+            if (ipcThreePhase != nullptr)
+            {
+                // PhaseThree's completion wrapper owns request-lifetime cleanup.
+                // Remove it before destroying the wrapper around the longer-lived server.
+                semanticServer.setEventCallbacks({}, {});
+            }
             ipcThreePhase.reset();
             ipcVisionAdapter.reset();
             ipcVisionRunner.reset();

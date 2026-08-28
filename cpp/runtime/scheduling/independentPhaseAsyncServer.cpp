@@ -34,6 +34,20 @@
 namespace trt_edgellm::rt
 {
 
+size_t phaseDecodeAlignedAdmissionCapacity(size_t requestedCapacity, size_t decodeBatchCapacity) noexcept
+{
+    if (requestedCapacity == 0 || decodeBatchCapacity == 0 || requestedCapacity <= decodeBatchCapacity)
+    {
+        return requestedCapacity;
+    }
+    return requestedCapacity - requestedCapacity % decodeBatchCapacity;
+}
+
+size_t phaseServingIngressQuantum(size_t maxPendingRequests, size_t prefillBatchCapacity) noexcept
+{
+    return std::min(maxPendingRequests, std::max(size_t{1U}, prefillBatchCapacity));
+}
+
 bool shouldDeferDecodeForSamplingRefill(
     size_t targetRows, size_t prefillRows, size_t decodeRows, size_t pendingDecodeSamplingRows) noexcept
 {
