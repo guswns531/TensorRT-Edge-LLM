@@ -494,3 +494,11 @@ R6 build 결과 core archive, TensorRT plugin과 server executable의 SHA-256은
 async server, Global scheduler/cost, queue scheduler와 three-phase policy를 포함한 집중 테스트도 `200/200`
 통과했다. 따라서 canonical directory 이동은 실행 코드와 성능을 바꾸지 않았으며, 최종 R7에서 전체
 12-workload를 3회씩 다시 실행한다.
+
+## R7 최종 승격 결과
+
+전체 12-workload x 3과 경계선 workload 독립 재측정을 완료했다. 선택한 결과는 12/12 exact token
+identity, Stage 7 대비 처리량 `-0.28%` 이상, latency p95 `+3%` 이내, peak VRAM `+8 MiB`로 최종 gate를
+통과했다. 동일 trace의 cached fresh vLLM 대비 처리량도 12/12에서 높다. 전체 수치, vLLM latency 비교,
+full unit suite의 Release `-O3` RoPE 수치 이슈는
+`notes/171-v010-project-refactor-final-gate-20260828.md`에 기록했다.
