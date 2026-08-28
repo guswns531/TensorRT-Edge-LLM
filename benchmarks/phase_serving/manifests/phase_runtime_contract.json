@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "purpose": "Keep workload-independent phase policy in the production runtime and compatibility controls at the composition boundary.",
+  "production_runtime": {
+    "roots": [
+      "cpp/runtime/scheduling"
+    ],
+    "configuration_inputs": [
+      "engine_capability",
+      "serving_capacity",
+      "request_slo",
+      "ready_snapshot",
+      "completion_events",
+      "ownership_horizon",
+      "online_cost_observations"
+    ],
+    "forbidden_text": [
+      "std::getenv(",
+      "TRT_EDGELLM_",
+      "text-heavy",
+      "vision-heavy",
+      "latency-profile",
+      "throughput-profile"
+    ],
+    "forbidden_include_fragments": [
+      "examples/",
+      "benchmarks/",
+      "notes/"
+    ]
+  },
+  "composition_boundary": {
+    "paths": [
+      "examples/llm/llm_phase_context_smoke.cpp",
+      "examples/llm/phaseSchedulerOptions.inc"
+    ],
+    "responsibilities": [
+      "command_and_environment_compatibility",
+      "engine_and_runtime_composition",
+      "benchmark_and_diagnostic_wiring"
+    ],
+    "environment_prefix": "TRT_EDGELLM_"
+  },
+  "lab_only_roots": [
+    "benchmarks/phase_serving",
+    "notes"
+  ],
+  "ownership_manifest": "benchmarks/phase_serving/manifests/v010_feature_owners.json"
+}

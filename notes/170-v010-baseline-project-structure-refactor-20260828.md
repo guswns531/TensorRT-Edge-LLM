@@ -440,3 +440,24 @@ selector 입력의 lifetime 의미를 다음 세 value header로 분리했다.
 R4 역시 source object와 구현 함수는 이동하지 않았다. core archive, plugin, server executable SHA-256이
 R3와 같았고 관련 단위 테스트 145개를 모두 통과했다. binary identity가 성립하므로 별도 workload와
 vLLM 재실행은 필요하지 않다.
+
+## R5 실행 결과: production/runtime과 lab 경계 고정
+
+실제 source를 검사한 결과 `cpp/runtime/scheduling`에는 `std::getenv` 또는 `TRT_EDGELLM_*` 파싱이 없다.
+환경 변수 130여 개는 `llm_phase_context_smoke.cpp`와 `phaseSchedulerOptions.inc`의 composition boundary에만
+남아 있으며, runtime policy에는 engine capability, serving capacity, request SLO, ready/completion state,
+ownership horizon과 online cost observation이 이미 값으로 주입된다.
+
+두 번째 server/admission 파싱 fragment를 물리적으로 추출하는 R2c가 long-prefill 처리량을 `3.44%`
+낮춘 사실 때문에 같은 이동을 반복하지 않았다. 대신 다음 두 파일로 경계를 실행 가능한 contract로
+고정했다.
+
+- `phase_runtime_contract.json`: production runtime 입력, 금지된 workload label/env dependency,
+  composition/lab 책임을 machine-readable하게 정의한다.
+- `validate_runtime_boundaries.py`: runtime의 env/workload-label 의존성, example/benchmark 역참조와 v0.10.0
+  product diff의 feature-owner 누락을 검사한다.
+
+따라서 새 workload별 knob가 production scheduler로 유입되거나, 새 product 파일이 feature owner 없이
+추가되면 검증이 즉시 실패한다. 이 단계는 runtime build input을 변경하지 않으므로 R4 binary와 성능을
+그대로 승계한다. R2c에서 회귀한 server option 물리 추출은 hot loop를 별도 object로 안정화하기 전까지
+명시적으로 보류한다.
