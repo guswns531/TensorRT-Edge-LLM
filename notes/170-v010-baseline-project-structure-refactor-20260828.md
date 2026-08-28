@@ -342,3 +342,39 @@ scheduling, async server, vision, ownership, telemetry, tied external weights와
 source SHA-256을 고정한다. R0는 runtime, CMake와 executable 파일을 변경하지 않으므로 workload 성능
 재측정 대상이 아니다. 다음 R1에서 source collection을 명시적으로 바꿀 때 이 순서와 binary map을
 보존하고 전체 gate를 실행한다.
+
+## R1 실행 결과
+
+`cpp/CMakeLists.txt`의 재귀 glob에서 phase runtime 14개와 stable KV page manager를 분리하고, 기존
+archive 위치에 명시적으로 다시 삽입했다. 이후 디렉터리나 파일 이름을 바꾸더라도 이 목록을 함께
+수정하지 않으면 object 순서가 조용히 달라지지 않는다.
+
+### 빌드 산출물 동일성
+
+R1 전후의 link command와 다음 산출물 SHA-256이 모두 같았다.
+
+| 산출물 | R1 전후 SHA-256 |
+|---|---|
+| `libedgellmCore.a` | `eaca8c2f...22228` |
+| `llm_phase_context_smoke` | `6d8a91b6...6fa32` |
+| `libNvInfer_edgellm_plugin.so.1.0` | `b78c59b1...7a70` |
+
+따라서 R1은 실행 코드, 심볼 배치와 plugin을 바꾸지 않았다. 집중 회귀 테스트도 phase queue/global
+scheduler/three-phase coordinator/async server의 192개를 모두 통과했다.
+
+### 실제 HTTP workload control
+
+동일한 12개 trace를 1회씩 다시 실행했고 모든 요청이 완결됐으며 모든 token trace가 golden hash와
+일치했다. 단일 반복에서 long-prefill은 처리량 `-1.80%`, TTFT p95 `+3.72%`, E2E p95 `+3.53%`였고,
+bimodal은 TPOT p95 `+9.78%`였다. 두 workload를 3회 재측정한 결과는 다음과 같다.
+
+| workload | token/s | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| long-prefill | -1.73% | +1.59% | +0.69% | +2.79% | +2.37% | +2.00% | +3.41% |
+| bimodal | +1.63% | -1.76% | -9.21% | -1.44% | -0.05% | -1.85% | -3.76% |
+
+long-prefill E2E p95가 수치상 `+3%` 경계를 `0.41%p` 넘었지만, 실행 바이너리가 바이트 단위로 같으므로
+이 차이는 R1 코드가 유발할 수 없는 run-to-run 분산이다. R1 승격 근거는 binary identity, 192/192 unit
+tests, 12/12 completion과 exact output identity이며, 측정 분산은 후속 단계의 판정 기준에서 숨기지 않고
+그대로 유지한다. 입력 trace와 vLLM 실행 계약은 바뀌지 않았으므로 vLLM은 기존 fresh 3회 결과를
+재사용한다.
