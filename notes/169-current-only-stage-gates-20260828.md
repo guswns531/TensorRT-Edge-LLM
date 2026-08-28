@@ -424,8 +424,8 @@ long-prefill이 throughput `-1%`와 E2E p95 `+3%` gate를 모두 넘었다. dire
 
 12개 모두 preservation gate를 통과했다. 전체 실행에서 요구 output token 수를 완성했고, 각
 workload의 세 token hash도 모두 동일했다. 이번 최종 실행에서는 이전에 timing에 따라 달라졌던
-wave와 multi-image까지 repeat exact identity를 통과했다. peak VRAM은 `9,313--9,477 MiB`로 기존
-범위이며 Stage 0 대비 64 MiB 이상 증가하지 않았다.
+wave와 multi-image까지 repeat exact identity를 통과했다. peak VRAM은 `9,313--9,477 MiB`이고,
+suite 전체 high-watermark는 Stage 0의 `9,469 MiB`보다 `8 MiB` 증가해 64 MiB gate 안이다.
 
 최초 12 x 3 묶음의 bimodal은 `1,907.49 tok/s`, TTFT p95 `4,203.13 ms`, E2E p95
 `9,292.62 ms`로 의심 gate를 넘었다. 독립 재실행에서는 `1,949.54 tok/s`, `3,888.53 ms`,
