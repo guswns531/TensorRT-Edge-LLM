@@ -257,6 +257,7 @@ uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noe
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryContextBucket));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.secondaryContextBucket));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.executionVariant));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryWorkClass));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.residualAugmentation));
     for (uint64_t const requestId : candidate.primaryRequestIds)
     {
@@ -411,9 +412,9 @@ char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status
 bool PhaseGlobalActionKey::operator==(PhaseGlobalActionKey const& other) const noexcept
 {
     return std::tie(kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket,
-               secondaryContextBucket, executionVariant, residualAugmentation)
+               secondaryContextBucket, executionVariant, primaryWorkClass, residualAugmentation)
         == std::tie(other.kind, other.primaryBatchSize, other.secondaryBatchSize, other.chunkLength,
-            other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant,
+            other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant, other.primaryWorkClass,
             other.residualAugmentation);
 }
 
@@ -442,6 +443,7 @@ size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key
     combine(key.primaryContextBucket);
     combine(key.secondaryContextBucket);
     combine(static_cast<int32_t>(key.executionVariant));
+    combine(key.primaryWorkClass);
     combine(static_cast<int32_t>(key.residualAugmentation));
     return result;
 }
@@ -515,6 +517,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolate
             || observedKey.primaryContextBucket != target.primaryContextBucket
             || observedKey.secondaryContextBucket != target.secondaryContextBucket
             || observedKey.executionVariant != target.executionVariant
+            || observedKey.primaryWorkClass != target.primaryWorkClass
             || observedKey.residualAugmentation != target.residualAugmentation)
         {
             continue;
@@ -581,6 +584,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryBatc
             || observedKey.primaryContextBucket < target.primaryContextBucket
             || observedKey.secondaryContextBucket != target.secondaryContextBucket
             || observedKey.executionVariant != target.executionVariant
+            || observedKey.primaryWorkClass != target.primaryWorkClass
             || observedKey.residualAugmentation != target.residualAugmentation)
         {
             continue;

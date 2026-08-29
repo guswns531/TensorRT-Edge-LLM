@@ -1,6 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Create and merge portable phase-action cost bundles.
 
 This tool performs no policy training. It converts CUDA-event observations into
@@ -45,7 +59,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n",
+                         encoding="utf-8")
     temporary.replace(path)
 
 
@@ -68,33 +83,50 @@ def _fingerprint_from_engine(args: argparse.Namespace) -> dict[str, Any]:
     config_path = engine_dir / "config.json"
     engine_path = engine_dir / "llm.engine"
     if not config_path.is_file() or not engine_path.is_file():
-        raise ValueError(f"engine directory must contain config.json and llm.engine: {engine_dir}")
+        raise ValueError(
+            f"engine directory must contain config.json and llm.engine: {engine_dir}"
+        )
     config = _read_json(config_path)
     builder = config.get("builder_config", config)
     capability = _empty_capability()
-    capability.update(
-        {
-            "max_prefill_batch_size": builder.get(
-                "max_prefill_batch_size", builder.get("max_batch_size", 0)
-            ),
-            "max_decode_batch_size": builder.get(
-                "max_decode_batch_size", builder.get("max_batch_size", 0)
-            ),
-            "max_encoder_batch_size": builder.get("max_encoder_batch_size", 0),
-            "prefill_chunk_tokens": builder.get(
-                "max_packed_prefill_chunk_tokens", builder.get("max_input_len", 0)
-            ),
-            "max_kv_cache_capacity": builder.get("max_kv_cache_capacity", 0),
-        }
-    )
+    capability.update({
+        "max_prefill_batch_size":
+        builder.get("max_prefill_batch_size", builder.get("max_batch_size",
+                                                          0)),
+        "max_decode_batch_size":
+        builder.get("max_decode_batch_size", builder.get("max_batch_size", 0)),
+        "max_encoder_batch_size":
+        builder.get("max_encoder_batch_size", 0),
+        "prefill_chunk_tokens":
+        builder.get(
+            "max_packed_prefill_chunk_tokens",
+            builder.get("max_prefill_chunk_tokens",
+                        builder.get("max_input_len", 0)),
+        ),
+        "max_kv_cache_capacity":
+        builder.get("max_kv_cache_capacity", 0),
+    })
+    if getattr(args, "max_prefill_batch_size", None) is not None:
+        capability["max_prefill_batch_size"] = args.max_prefill_batch_size
+    if getattr(args, "max_decode_batch_size", None) is not None:
+        capability["max_decode_batch_size"] = args.max_decode_batch_size
+    if getattr(args, "max_encoder_batch_size", None) is not None:
+        capability["max_encoder_batch_size"] = args.max_encoder_batch_size
     external = engine_dir / "embedding.safetensors"
     return {
         "model_hash": args.model_hash or "",
         "onnx_hash": args.onnx_hash or "",
+        "config_hash": _sha256(config_path),
         "engine_hash": _sha256(engine_path),
-        "external_weight_hash": _sha256(external) if external.is_file() else "",
+        "external_weight_hash":
+        _sha256(external) if external.is_file() else "",
         "precision": args.precision or config.get("dtype", ""),
-        "kv_dtype": config.get("kv_cache_dtype", ""),
+        "kv_dtype": {
+            "fp16": "FLOAT16",
+            "fp32": "FLOAT32",
+            "bf16": "BF16"
+        }.get(config.get("kv_cache_dtype", ""),
+              config.get("kv_cache_dtype", "")),
         "capability": capability,
         "gpu": {
             "compute_capability": args.compute_capability or "",
@@ -116,7 +148,8 @@ def _bucket(tokens: int, bucket_tokens: int) -> int:
     return (max(0, tokens) + bucket_tokens - 1) // bucket_tokens
 
 
-def _action_key(metric: dict[str, Any], context_bucket_tokens: int) -> dict[str, Any] | None:
+def _action_key(metric: dict[str, Any],
+                context_bucket_tokens: int) -> dict[str, Any] | None:
     action = metric.get("global_action", "")
     if action not in ACTION_ORDER:
         return None
@@ -124,27 +157,41 @@ def _action_key(metric: dict[str, Any], context_bucket_tokens: int) -> dict[str,
     decode_batch = int(metric.get("decode_batch", 0))
     if action == "prefill":
         primary_batch, secondary_batch = prefill_batch, 0
-        primary_context = _bucket(int(metric.get("prefill_past_kv_max", 0)), context_bucket_tokens)
+        primary_context = _bucket(int(metric.get("prefill_past_kv_max", 0)),
+                                  context_bucket_tokens)
         secondary_context = 0
     elif action == "decode":
         primary_batch, secondary_batch = decode_batch, 0
-        primary_context = _bucket(int(metric.get("decode_context_max", 0)), context_bucket_tokens)
+        primary_context = _bucket(int(metric.get("decode_context_max", 0)),
+                                  context_bucket_tokens)
         secondary_context = 0
     elif action == "prefill_decode":
         primary_batch, secondary_batch = prefill_batch, decode_batch
-        primary_context = _bucket(int(metric.get("prefill_past_kv_max", 0)), context_bucket_tokens)
-        secondary_context = _bucket(int(metric.get("decode_context_max", 0)), context_bucket_tokens)
+        primary_context = _bucket(int(metric.get("prefill_past_kv_max", 0)),
+                                  context_bucket_tokens)
+        secondary_context = _bucket(int(metric.get("decode_context_max", 0)),
+                                    context_bucket_tokens)
     else:
         return None
     return {
-        "action": action,
-        "primary_batch_size": primary_batch,
-        "secondary_batch_size": secondary_batch,
-        "chunk_length": int(metric.get("prefill_chunk_length", 0)),
-        "primary_context_bucket": primary_context,
-        "secondary_context_bucket": secondary_context,
-        "execution_variant": metric.get("global_execution_variant", "eager"),
-        "residual_augmentation": False,
+        "action":
+        action,
+        "primary_batch_size":
+        primary_batch,
+        "secondary_batch_size":
+        secondary_batch,
+        "chunk_length":
+        int(metric.get("prefill_chunk_length", 0)),
+        "primary_context_bucket":
+        primary_context,
+        "secondary_context_bucket":
+        secondary_context,
+        "execution_variant":
+        metric.get("global_execution_variant", "eager"),
+        "primary_work_class":
+        int(metric.get("prefill_class", 0)) if prefill_batch else 0,
+        "residual_augmentation":
+        False,
     }
 
 
@@ -152,7 +199,8 @@ def _canonical_key(key: dict[str, Any]) -> str:
     return json.dumps(key, sort_keys=True, separators=(",", ":"))
 
 
-def _metric_lines(paths: Iterable[Path]) -> Iterable[tuple[str, dict[str, Any]]]:
+def _metric_lines(
+        paths: Iterable[Path]) -> Iterable[tuple[str, dict[str, Any]]]:
     for path in paths:
         with path.open(encoding="utf-8") as source:
             for line in source:
@@ -164,26 +212,39 @@ def _metric_lines(paths: Iterable[Path]) -> Iterable[tuple[str, dict[str, Any]]]
                     if prefix not in {"PHASE_METRIC", "PHASE_ENCODER_METRIC"}:
                         continue
                 else:
+                    if not line.startswith("{"):
+                        continue
                     prefix, payload = "PHASE_METRIC", line
                 yield prefix, json.loads(payload)
 
 
-def _records_from_metrics(paths: list[Path], max_samples: int,
-                          context_bucket_tokens: int = 512) -> list[dict[str, Any]]:
-    observations: dict[str, deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=max_samples))
+def _records_from_metrics(
+        paths: list[Path],
+        max_samples: int,
+        context_bucket_tokens: int = 512) -> list[dict[str, Any]]:
+    observations: dict[str, deque[dict[str, float]]] = defaultdict(
+        lambda: deque(maxlen=max_samples))
     keys: dict[str, dict[str, Any]] = {}
     timestamps: dict[str, int] = {}
     for prefix, metric in _metric_lines(paths):
         if prefix == "PHASE_ENCODER_METRIC":
             key = {
-                "action": "encoder",
-                "primary_batch_size": int(metric["batch_size"]),
-                "secondary_batch_size": 0,
-                "chunk_length": 0,
-                "primary_context_bucket": _bucket(int(metric.get("input_tokens", 0)), 1024),
-                "secondary_context_bucket": 0,
-                "execution_variant": "eager",
-                "residual_augmentation": False,
+                "action":
+                "encoder",
+                "primary_batch_size":
+                int(metric["batch_size"]),
+                "secondary_batch_size":
+                0,
+                "chunk_length":
+                0,
+                "primary_context_bucket":
+                _bucket(int(metric.get("input_tokens", 0)), 1024),
+                "secondary_context_bucket":
+                0,
+                "execution_variant":
+                "eager",
+                "residual_augmentation":
+                False,
             }
             reference = makespan = float(metric["gpu_ms"])
         else:
@@ -199,17 +260,17 @@ def _records_from_metrics(paths: list[Path], max_samples: int,
         encoded = _canonical_key(key)
         keys[encoded] = key
         timestamps[encoded] = time.time_ns()
-        observations[encoded].append({"reference_work_ms": reference, "makespan_ms": makespan})
-    return [
-        {
-            "key": keys[encoded],
-            "observed_at_unix_ns": timestamps[encoded],
-            "observations": list(values),
-        }
-        for encoded, values in sorted(
-            observations.items(), key=lambda item: (ACTION_ORDER[keys[item[0]]["action"]], item[0])
-        )
-    ]
+        observations[encoded].append({
+            "reference_work_ms": reference,
+            "makespan_ms": makespan
+        })
+    return [{
+        "key": keys[encoded],
+        "observed_at_unix_ns": timestamps[encoded],
+        "observations": list(values),
+    } for encoded, values in sorted(
+        observations.items(),
+        key=lambda item: (ACTION_ORDER[keys[item[0]]["action"]], item[0]))]
 
 
 def _command_fingerprint(args: argparse.Namespace) -> None:
@@ -219,15 +280,50 @@ def _command_fingerprint(args: argparse.Namespace) -> None:
 def _command_build(args: argparse.Namespace) -> None:
     fingerprint = _read_json(args.fingerprint)
     bundle = {
-        "schema_version": SCHEMA_VERSION,
-        "bundle_version": args.bundle_version,
-        "source": args.source,
-        "created_at_unix_ns": time.time_ns(),
-        "deployment": fingerprint,
-        "records": _records_from_metrics(args.metrics, args.max_samples, args.context_bucket_tokens),
+        "schema_version":
+        SCHEMA_VERSION,
+        "bundle_version":
+        args.bundle_version,
+        "source":
+        args.source,
+        "created_at_unix_ns":
+        time.time_ns(),
+        "deployment":
+        fingerprint,
+        "records":
+        _records_from_metrics(args.metrics, args.max_samples,
+                              args.context_bucket_tokens),
+        "promotion": {
+            "decode_batching": args.promote_decode,
+            "prefill_batching": args.promote_prefill,
+            "overlap_selection": args.promote_overlap,
+        },
     }
     if not bundle["records"]:
         raise ValueError("no action-fidelity CUDA observations found")
+    _write_json(args.output, bundle)
+
+
+def _promotion(args: argparse.Namespace) -> dict[str, bool]:
+    return {
+        "decode_batching": args.promote_decode,
+        "prefill_batching": args.promote_prefill,
+        "overlap_selection": args.promote_overlap,
+    }
+
+
+def _command_promote(args: argparse.Namespace) -> None:
+    bundle = _read_json(args.input)
+    fingerprint = _read_json(args.fingerprint)
+    if _shape_contract(bundle["deployment"]) != _shape_contract(fingerprint):
+        raise ValueError(
+            "input bundle and deployment fingerprint have different shape contracts"
+        )
+    bundle["bundle_version"] = args.bundle_version
+    bundle["source"] = "build"
+    bundle["created_at_unix_ns"] = time.time_ns()
+    bundle["deployment"] = fingerprint
+    bundle["promotion"] = _promotion(args)
     _write_json(args.output, bundle)
 
 
@@ -249,27 +345,27 @@ def _command_aggregate(args: argparse.Namespace) -> None:
     bundles = [_read_json(path) for path in args.inputs]
     target = _read_json(args.fingerprint)
     target_contract = _shape_contract(target)
-    merged: dict[str, deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=args.max_samples))
+    merged: dict[str, deque[dict[str, float]]] = defaultdict(
+        lambda: deque(maxlen=args.max_samples))
     keys: dict[str, dict[str, Any]] = {}
     timestamps: dict[str, int] = {}
     for bundle in bundles:
         if bundle.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("cannot aggregate a different cost bundle schema")
         if _shape_contract(bundle["deployment"]) != target_contract:
-            raise ValueError("cannot aggregate heterogeneous phase shape contracts")
+            raise ValueError(
+                "cannot aggregate heterogeneous phase shape contracts")
         for record in bundle["records"]:
             encoded = _canonical_key(record["key"])
             keys[encoded] = record["key"]
-            timestamps[encoded] = max(timestamps.get(encoded, 0), record.get("observed_at_unix_ns", 0))
+            timestamps[encoded] = max(timestamps.get(encoded, 0),
+                                      record.get("observed_at_unix_ns", 0))
             merged[encoded].extend(record["observations"])
-    records = [
-        {
-            "key": keys[encoded],
-            "observed_at_unix_ns": timestamps[encoded],
-            "observations": list(values),
-        }
-        for encoded, values in sorted(merged.items())
-    ]
+    records = [{
+        "key": keys[encoded],
+        "observed_at_unix_ns": timestamps[encoded],
+        "observations": list(values),
+    } for encoded, values in sorted(merged.items())]
     _write_json(
         args.output,
         {
@@ -288,6 +384,9 @@ def _fingerprint_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-hash")
     parser.add_argument("--onnx-hash")
     parser.add_argument("--precision")
+    parser.add_argument("--max-prefill-batch-size", type=int)
+    parser.add_argument("--max-decode-batch-size", type=int)
+    parser.add_argument("--max-encoder-batch-size", type=int)
     parser.add_argument("--compute-capability")
     parser.add_argument("--sm-count", type=int, default=0)
     parser.add_argument("--memory-bytes", type=int, default=0)
@@ -314,8 +413,21 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--bundle-version", default="build-v1")
     build.add_argument("--max-samples", type=int, default=32)
     build.add_argument("--context-bucket-tokens", type=int, default=512)
+    build.add_argument("--promote-decode", action="store_true")
+    build.add_argument("--promote-prefill", action="store_true")
+    build.add_argument("--promote-overlap", action="store_true")
     build.add_argument("--output", type=Path, required=True)
     build.set_defaults(run=_command_build)
+
+    promote = commands.add_parser("promote")
+    promote.add_argument("--input", type=Path, required=True)
+    promote.add_argument("--fingerprint", type=Path, required=True)
+    promote.add_argument("--bundle-version", required=True)
+    promote.add_argument("--promote-decode", action="store_true")
+    promote.add_argument("--promote-prefill", action="store_true")
+    promote.add_argument("--promote-overlap", action="store_true")
+    promote.add_argument("--output", type=Path, required=True)
+    promote.set_defaults(run=_command_promote)
 
     aggregate = commands.add_parser("aggregate")
     aggregate.add_argument("--inputs", type=Path, nargs="+", required=True)

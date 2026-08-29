@@ -104,6 +104,8 @@ struct PhaseGlobalActionKey
     int32_t primaryContextBucket{};
     int32_t secondaryContextBucket{};
     PhaseExecutionVariant executionVariant{PhaseExecutionVariant::kEager};
+    //! Producer class for prefill-bearing actions: 0=unspecified, 1=text, 2=external.
+    int32_t primaryWorkClass{};
     //! Distinguish overlap that begins after the primary phase has already consumed work.
     bool residualAugmentation{};
 

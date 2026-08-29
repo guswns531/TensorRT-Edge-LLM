@@ -436,6 +436,10 @@ struct PhaseQueueSchedulerConfig
     float decodeRecoveryPressureThreshold{1.0F};
     //! Select a prefill row count from profiled p95 cost and decode slack.
     bool enableDynamicPrefillBatching{};
+    //! Use exact deployment-local prefill records for dynamic P batch formation.
+    //! Producer class is part of the cost key so text and external-prefill
+    //! observations cannot contaminate each other.
+    bool enableOraclePrefillBatching{};
     //! Minimum dynamic prefill batch while at least this many compatible rows exist.
     int32_t minDynamicPrefillBatchSize{1};
     //! Let an expired TTFT override decode interference while decode remains within SLO.
@@ -764,6 +768,8 @@ private:
     std::vector<PhaseWorkItem const*> decodeCandidateRows(int32_t maxRows) const;
     int32_t decodeCandidateReplacementRows(int32_t maxRows) const;
     std::optional<float> oracleDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
+    std::optional<float> oraclePrefillP95(int32_t batchSize, int32_t chunkLength, int32_t maxPastKVLength,
+        PhasePrefillClass prefillClass, int32_t usefulTokens) const;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,

@@ -167,6 +167,7 @@ TEST(PhaseQueueSchedulerTest, GlobalWarmupStopsProbingCalibratedUnprofitableOver
     PhaseDispatchMetrics sample;
     sample.kind = PhaseDispatchKind::kOverlap;
     sample.prefillBatchSize = 1;
+    sample.prefillClass = PhasePrefillClass::kText;
     sample.prefillTokens = 32;
     sample.prefillPaddedTokens = 32;
     sample.decodeBatchSize = 1;
@@ -1609,6 +1610,66 @@ TEST(PhaseQueueSchedulerTest, SparseOracleDecodeCoveragePreservesLargestBatch)
     }
 
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, OraclePrefillCostsPreserveProducerClassAndDenseBatch)
+{
+    PhaseCostOracleConfig oracleConfig;
+    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
+    oracleConfig.sufficientLocalSamples = 1U;
+    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    for (int32_t const batchSize : {1, 2, 4})
+    {
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, 128, 0, 0};
+        key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+        oracle->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
+    }
+
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableOraclePrefillBatching = true;
+    config.globalCostOracle = std::move(oracle);
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        PhaseWorkItem item{requestId, 128};
+        item.prefillClass = PhasePrefillClass::kText;
+        scheduler.enqueuePrefill(item);
+    }
+
+    EXPECT_EQ(scheduler.next().prefillBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, SparseOraclePrefillCoveragePreservesLargestBatch)
+{
+    PhaseCostOracleConfig oracleConfig;
+    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
+    oracleConfig.sufficientLocalSamples = 1U;
+    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    for (int32_t const batchSize : {1, 2})
+    {
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, 128, 0, 0};
+        key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+        oracle->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
+    }
+
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableOraclePrefillBatching = true;
+    config.globalCostOracle = std::move(oracle);
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        PhaseWorkItem item{requestId, 128};
+        item.prefillClass = PhasePrefillClass::kText;
+        scheduler.enqueuePrefill(item);
+    }
+
+    EXPECT_EQ(scheduler.next().prefillBatch.size(), 4U);
 }
 
 TEST(PhaseQueueSchedulerTest, ConfidentOnlineDecodeCostRefinesStaticPrior)

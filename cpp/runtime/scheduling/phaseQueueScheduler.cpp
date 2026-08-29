@@ -173,7 +173,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
                 && std::isfinite(cost.decodeSlowdownP95Ms) && cost.decodeSlowdownP95Ms >= 0.0F,
             "Overlap cost timings must be finite and non-negative");
     }
-    check::check(!mConfig.enableDynamicPrefillBatching || !mConfig.prefillBatchCosts.empty(),
+    check::check(!mConfig.enableDynamicPrefillBatching || mConfig.enableOraclePrefillBatching
+            || !mConfig.prefillBatchCosts.empty(),
         "Dynamic prefill batching requires profiled prefill costs");
     check::check(std::isfinite(mConfig.decodeRecoveryPressureThreshold)
             && mConfig.decodeRecoveryPressureThreshold > 0.0F && mConfig.decodeRecoveryPressureThreshold <= 1.0F,
@@ -802,10 +803,14 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     for (int32_t batchSize = firstBatchSize; batchSize <= available; ++batchSize)
     {
         int32_t maxPastKV{};
+        int32_t usefulTokens{};
         for (int32_t index = 0; index < batchSize; ++index)
         {
             maxPastKV = std::max(maxPastKV, candidates[static_cast<size_t>(index)]->tokenOffset);
+            usefulTokens += std::min(dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]), chunkLength);
         }
+        std::optional<float> const oracleGpuMs
+            = oraclePrefillP95(batchSize, chunkLength, maxPastKV, prefillClass, usefulTokens);
         PhasePrefillBatchCost const* selected{};
         for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
         {
@@ -861,22 +866,29 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
                 }
             }
         }
-        if (selected != nullptr && (!overlap || selectedOverlap != nullptr || !mConfig.requireDirectOverlapCost))
+        if ((selected != nullptr || oracleGpuMs.has_value())
+            && (!overlap || selectedOverlap != nullptr || !mConfig.requireDirectOverlapCost))
         {
-            int32_t usefulTokens{};
-            for (int32_t index{}; index < batchSize; ++index)
-            {
-                usefulTokens += std::min(dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]), chunkLength);
-            }
-            float const gpuMs = selectedOverlap != nullptr ? selectedOverlap->prefillP95GpuMs : selected->p95GpuMs;
+            float const isolatedPrefillMs = oracleGpuMs.has_value() ? *oracleGpuMs : selected->p95GpuMs;
+            float const gpuMs = selectedOverlap != nullptr ? selectedOverlap->prefillP95GpuMs : isolatedPrefillMs;
             float const interference = selectedOverlap != nullptr
                 ? selectedOverlap->decodeSlowdownP95Ms
-                : (overlap ? selected->decodeSlowdownP95Ms : selected->p95GpuMs);
+                : (overlap && selected != nullptr ? selected->decodeSlowdownP95Ms : isolatedPrefillMs);
             profiled.push_back({batchSize, usefulTokens, gpuMs, interference});
         }
     }
     if (profiled.empty())
     {
+        costCoverageMiss = true;
+        return overlap && mConfig.enableTpotHardGuard && mConfig.requireDirectOverlapCost ? -1 : 0;
+    }
+    bool const largestShapeCovered = std::any_of(profiled.begin(), profiled.end(),
+        [available](Candidate const& candidate) { return candidate.batchSize == available; });
+    if (mConfig.enableOraclePrefillBatching && !largestShapeCovered)
+    {
+        // Partial portable P coverage is not evidence that fragmenting a
+        // larger compatible batch is profitable. Preserve the mechanism's
+        // largest runnable shape until its direct or static cost is known.
         costCoverageMiss = true;
         return overlap && mConfig.enableTpotHardGuard && mConfig.requireDirectOverlapCost ? -1 : 0;
     }
@@ -1539,6 +1551,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
 
     PhaseGlobalActionKey prefillKey{
         PhaseGlobalActionKind::kPrefill, prefillRows, 0, prefillChunk, contextBucket(prefillPastKV), 0};
+    prefillKey.primaryWorkClass = static_cast<int32_t>(prefillClass);
     PhaseGlobalActionKey decodeKey{
         PhaseGlobalActionKind::kDecode, decodeRows, 0, 1, contextBucket(decodeMaxContext), 0};
 
@@ -1862,6 +1875,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows, overlapDecodeRows,
             overlapPrefillChunk, contextBucket(overlapPrefillPastKV), contextBucket(overlapDecodeMaxContext)};
+        overlapKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
         overlapKey.executionVariant = executionVariant(overlapKey, overlapPrefillUsefulTokens);
         Prediction overlap{};
         bool overlapKnown{};
@@ -2072,12 +2086,6 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
         return false;
     }
     std::vector<PhaseWorkItem const*> currentRows = selectedCurrentRows;
-    std::unordered_set<uint64_t> currentOwners;
-    currentOwners.reserve(currentRows.size());
-    for (PhaseWorkItem const* item : selectedCurrentRows)
-    {
-        currentOwners.insert(item->requestId);
-    }
     mTelemetry.globalWaitCurrentRows = static_cast<int32_t>(currentRows.size());
 
     struct DecodePrediction
@@ -2288,233 +2296,6 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
         }
         return selectedWait && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive;
     }
-
-    struct DecodeDrainPrediction
-    {
-        double makespanUs{};
-        double uncertaintyUs{};
-        int32_t turns{};
-        int32_t firstBatchRows{};
-        int32_t graphBucket{};
-    };
-    auto previewDrain = [&](std::vector<uint64_t> const& removedRequestIds,
-                            std::vector<PhaseWorkItem> const& futureRows) -> DecodeDrainPrediction {
-        PhaseQueueScheduler simulation = *this;
-        simulation.mConfig.globalSchedulerMode = PhaseGlobalSchedulerMode::kDisabled;
-        simulation.mConfig.enablePrefillTtftHardGuard = false;
-        simulation.mConfig.enableMetricsPolicy = false;
-        simulation.mConfig.metricsPolicy = {};
-        simulation.mConfig.enableExternalDrainPreference = false;
-        simulation.mConfig.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kDecode; };
-        simulation.mNextGlobalAction.reset();
-        for (uint64_t const requestId : removedRequestIds)
-        {
-            check::check(simulation.cancel(requestId), "Global NOW horizon cannot remove a non-queued decode row");
-        }
-        if (!removedRequestIds.empty())
-        {
-            // The residual action follows the concrete D-now dispatch, so its
-            // row-replacement cost must use that dispatch as the warm cohort.
-            simulation.mPreviousDecodeSelectionIds = removedRequestIds;
-        }
-        for (PhaseWorkItem const& item : futureRows)
-        {
-            simulation.enqueueDecode(item);
-        }
-        if (simulation.decodeQueueSize() == 0U)
-        {
-            return {};
-        }
-        DecodeDrainPrediction result;
-        while (simulation.decodeQueueSize() > 0U)
-        {
-            PhaseDispatchPlan const plan = simulation.next();
-            check::check(plan.kind == PhaseDispatchKind::kDecode && !plan.decodeBatch.empty(),
-                "Global decode drain preview did not produce a runnable decode batch");
-            int64_t contextTokens{};
-            int32_t maxContextLength{};
-            std::vector<uint64_t> selectedRequestIds;
-            selectedRequestIds.reserve(plan.decodeBatch.size());
-            for (PhaseWorkItem const& item : plan.decodeBatch)
-            {
-                contextTokens += item.tokenCount;
-                maxContextLength = std::max(maxContextLength, item.tokenCount);
-                selectedRequestIds.push_back(item.requestId);
-            }
-            DecodePrediction const turn
-                = predictDecode(static_cast<int32_t>(plan.decodeBatch.size()), contextTokens, maxContextLength);
-            if (result.turns == 0)
-            {
-                result.firstBatchRows = static_cast<int32_t>(plan.decodeBatch.size());
-                result.graphBucket = turn.graphBucket;
-            }
-            result.makespanUs += turn.makespanUs;
-            result.uncertaintyUs += turn.uncertaintyUs;
-            ++result.turns;
-            simulation.mPreviousDecodeSelectionIds = std::move(selectedRequestIds);
-            simulation.mDecodeCohortIds.clear();
-        }
-        return result;
-    };
-
-    struct WaitCandidateDiagnostics
-    {
-        int32_t futureRows{};
-        int32_t residualRows{};
-        int32_t futureFirstBatchRows{};
-        int32_t nowDrainTurns{};
-        int32_t futureDrainTurns{};
-        double nowHorizonUs{};
-        double futureHorizonUs{};
-    };
-    std::vector<WaitCandidateDiagnostics> waitDiagnostics;
-    waitDiagnostics.reserve(std::min(kMaxWaitCandidates, previews.size()));
-    size_t waitCandidates{};
-    for (PhaseDecodeCompletionPreview const& preview : previews)
-    {
-        if (waitCandidates >= kMaxWaitCandidates || preview.eventId == 0U || preview.predictedWaitUs < 0.0
-            || preview.waitUncertaintyUs < 0.0 || preview.requestIds.empty()
-            || preview.requestIds.size() != preview.contextLengths.size()
-            || (!preview.stableSlotIds.empty() && preview.requestIds.size() != preview.stableSlotIds.size())
-            || (!preview.schedulingHints.empty() && preview.requestIds.size() != preview.schedulingHints.size()))
-        {
-            continue;
-        }
-        std::vector<uint64_t> futureRequestIds;
-        std::vector<int32_t> futureStableSlotIds;
-        std::vector<int32_t> futureContextLengths;
-        size_t const horizonCapacity = static_cast<size_t>(mConfig.maxDecodeBatchSize) * 2U;
-        futureRequestIds.reserve(horizonCapacity);
-        futureStableSlotIds.reserve(horizonCapacity);
-        futureContextLengths.reserve(horizonCapacity);
-        for (PhaseWorkItem const* item : currentRows)
-        {
-            futureRequestIds.push_back(item->requestId);
-            futureStableSlotIds.push_back(item->kvSlotId);
-            futureContextLengths.push_back(item->tokenCount);
-        }
-        std::vector<PhaseWorkItem> addedRows;
-        std::unordered_set<uint64_t> futureOwners = currentOwners;
-        for (size_t index{};
-            index < preview.requestIds.size() && addedRows.size() < static_cast<size_t>(mConfig.maxDecodeBatchSize);
-            ++index)
-        {
-            if (preview.contextLengths[index] < 0 || !futureOwners.insert(preview.requestIds[index]).second)
-            {
-                continue;
-            }
-            int32_t const stableSlotId = preview.stableSlotIds.empty() ? -1 : preview.stableSlotIds[index];
-            PhaseSchedulingHints const scheduling
-                = preview.schedulingHints.empty() ? PhaseSchedulingHints{} : preview.schedulingHints[index];
-            futureRequestIds.push_back(preview.requestIds[index]);
-            futureStableSlotIds.push_back(stableSlotId);
-            futureContextLengths.push_back(preview.contextLengths[index]);
-            addedRows.emplace_back(
-                preview.requestIds[index], preview.contextLengths[index], stableSlotId, 0, 0, true, scheduling);
-        }
-        int32_t const futureRows = static_cast<int32_t>(futureRequestIds.size());
-        if (addedRows.empty())
-        {
-            continue;
-        }
-
-        DecodeDrainPrediction const nowResidual = previewDrain(currentCandidate.requestIds, addedRows);
-        DecodeDrainPrediction const futureDrain = previewDrain({}, addedRows);
-        if (nowResidual.turns == 0 || futureDrain.turns == 0)
-        {
-            continue;
-        }
-        int32_t const residualRows = futureRows - currentCandidate.key.primaryBatchSize;
-        int32_t const futureMaxContextLength
-            = *std::max_element(futureContextLengths.begin(), futureContextLengths.end());
-        int32_t const contextBucket
-            = (std::max(0, futureMaxContextLength) + contextBucketTokens - 1) / contextBucketTokens;
-        double horizonReferenceUs{};
-        for (int32_t const contextLength : futureContextLengths)
-        {
-            horizonReferenceUs += predictDecode(1, contextLength, contextLength).referenceUs;
-        }
-
-        // Compare the same bounded work horizon. Dispatching NOW consumes the
-        // selected current rows, while every unselected current row and every
-        // completion-produced row remains in the residual drain. The event may
-        // complete in parallel with the current decode action.
-        PhaseGlobalActionCandidate nowCandidate = currentCandidate;
-        nowCandidate.predictedHorizonUs
-            = std::max(nowCandidate.predictedMakespanUs, preview.predictedWaitUs) + nowResidual.makespanUs;
-        nowCandidate.horizonReferenceWorkUs = horizonReferenceUs;
-        nowCandidate.uncertaintyUs += preview.waitUncertaintyUs + nowResidual.uncertaintyUs;
-        nowCandidate.protectedCompletions.clear();
-        nowCandidate.protectedCompletions.push_back(
-            {state.decodeMinTpotSlackUs, currentCandidate.predictedBlockingUs, currentCandidate.uncertaintyUs});
-        candidates.push_back(std::move(nowCandidate));
-
-        PhaseGlobalActionCandidate wait;
-        wait.key
-            = {PhaseGlobalActionKind::kWait, futureDrain.firstBatchRows, futureDrain.graphBucket, 1, contextBucket, 0};
-        wait.concreteWaitEvent = true;
-        wait.waitEventId = preview.eventId;
-        wait.predictedBlockingUs = preview.predictedWaitUs + futureDrain.makespanUs;
-        wait.predictedMakespanUs = wait.predictedBlockingUs;
-        wait.predictedHorizonUs = wait.predictedBlockingUs;
-        wait.uncertaintyUs = preview.waitUncertaintyUs + futureDrain.uncertaintyUs;
-        wait.referenceWorkUs = horizonReferenceUs;
-        wait.horizonReferenceWorkUs = horizonReferenceUs;
-        wait.requestServiceLagUs = state.decodeOldestWaitUs;
-        wait.primaryRequestIds = futureRequestIds;
-        wait.primaryStableSlotIds = futureStableSlotIds;
-        phaseGlobalFinalizeCandidate(wait);
-        wait.protectedCompletions.push_back({state.decodeMinTpotSlackUs, wait.predictedBlockingUs, wait.uncertaintyUs});
-        if (mConfig.globalMemoryHorizonSupplier)
-        {
-            wait.memory = mConfig.globalMemoryHorizonSupplier(wait.key, wait.requestIds);
-        }
-        double const compression
-            = wait.referenceWorkUs / std::max(wait.predictedMakespanUs, std::numeric_limits<double>::epsilon());
-        if (compression > mTelemetry.globalWaitPreviewCompression)
-        {
-            mTelemetry.globalWaitPreviewBlockingUs = wait.predictedBlockingUs;
-            mTelemetry.globalWaitPreviewUncertaintyUs = wait.uncertaintyUs;
-            mTelemetry.globalWaitPreviewCompression = compression;
-        }
-        candidates.push_back(std::move(wait));
-        waitDiagnostics.push_back(
-            {futureRows, residualRows, futureDrain.firstBatchRows, nowResidual.turns, futureDrain.turns,
-                candidates[candidates.size() - 2U].predictedHorizonUs, candidates.back().predictedHorizonUs});
-        ++waitCandidates;
-    }
-    if (waitCandidates == 0U)
-    {
-        return false;
-    }
-
-    PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
-    ++mTelemetry.globalWaitDecisionCount;
-    mTelemetry.globalWaitCandidateCount += waitCandidates;
-    bool const selectedWait = decision.selectedIndex.has_value()
-        && candidates[*decision.selectedIndex].key.kind == PhaseGlobalActionKind::kWait;
-    mTelemetry.globalWaitSelectedCount += selectedWait ? 1U : 0U;
-    if (selectedWait)
-    {
-        size_t const selectedIndex = *decision.selectedIndex;
-        PhaseGlobalActionCandidate const& selected = candidates[selectedIndex];
-        WaitCandidateDiagnostics const& diagnostics = waitDiagnostics[selectedIndex / 2U];
-        mTelemetry.lastGlobalSelectedAction = PhaseGlobalActionKind::kWait;
-        mTelemetry.lastGlobalDecisionReason = decision.reason;
-        mTelemetry.lastGlobalPredictedViolationUs = decision.predictedViolationUs;
-        mTelemetry.lastGlobalServiceCompression = decision.serviceCompression;
-        mTelemetry.globalWaitFutureRows = diagnostics.futureRows;
-        mTelemetry.globalWaitFutureFirstBatchRows = diagnostics.futureFirstBatchRows;
-        mTelemetry.globalWaitNowResidualRows = diagnostics.residualRows;
-        mTelemetry.globalWaitNowDrainTurns = diagnostics.nowDrainTurns;
-        mTelemetry.globalWaitFutureDrainTurns = diagnostics.futureDrainTurns;
-        mTelemetry.globalWaitGraphBucket = selected.key.secondaryBatchSize;
-        mTelemetry.globalWaitEventId = selected.waitEventId;
-        mTelemetry.globalWaitRequestIds = selected.requestIds;
-        mTelemetry.globalWaitNowHorizonUs = diagnostics.nowHorizonUs;
-        mTelemetry.globalWaitFutureHorizonUs = diagnostics.futureHorizonUs;
-    }
-    return selectedWait && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive;
 }
 
 std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalAction()
@@ -2549,7 +2330,8 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     check::check(pastKVLength >= 0, "A future prefill estimate requires a non-negative past-KV length");
     int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
     int32_t const contextBucket = (pastKVLength + contextBucketTokens - 1) / contextBucketTokens;
-    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
+    PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
+    key.primaryWorkClass = static_cast<int32_t>(prefillClass);
     if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
     {
         return *online;
@@ -3385,6 +3167,31 @@ std::optional<float> PhaseQueueScheduler::oracleDecodeP95(int32_t batchSize, int
     return std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs);
 }
 
+std::optional<float> PhaseQueueScheduler::oraclePrefillP95(int32_t batchSize, int32_t chunkLength,
+    int32_t maxPastKVLength, PhasePrefillClass prefillClass, int32_t usefulTokens) const
+{
+    if (!mConfig.enableOraclePrefillBatching || batchSize <= 0 || chunkLength <= 0 || maxPastKVLength < 0)
+    {
+        return std::nullopt;
+    }
+    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucket = (maxPastKVLength + contextBucketTokens - 1) / contextBucketTokens;
+    PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
+    key.primaryWorkClass = static_cast<int32_t>(prefillClass);
+    key.executionVariant = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, usefulTokens)
+                                                           : PhaseExecutionVariant::kEager;
+    std::optional<PhaseGlobalCostEstimate> estimate = mGlobalCostOracle->estimate(key);
+    if (!estimate.has_value())
+    {
+        estimate = mGlobalCostOracle->estimatePrimaryBatchCoveringContext(key);
+    }
+    if (!estimate.has_value())
+    {
+        return std::nullopt;
+    }
+    return std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs);
+}
+
 uint64_t PhaseQueueScheduler::onlineDecodeCostKey(
     int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const noexcept
 {
@@ -3490,14 +3297,18 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
         = metrics.prefillBatchSize > 0 ? std::max(1, metrics.prefillPaddedTokens / metrics.prefillBatchSize) : 1;
     if (metrics.kind == PhaseDispatchKind::kOverlap)
     {
-        return {PhaseGlobalActionKind::kPrefillDecode, metrics.prefillBatchSize, metrics.decodeBatchSize, chunkLength,
-            contextBucket(metrics.prefillPastKVMax), contextBucket(metrics.plannedDecodeMaxContextLength),
-            metrics.globalExecutionVariant};
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefillDecode, metrics.prefillBatchSize,
+            metrics.decodeBatchSize, chunkLength, contextBucket(metrics.prefillPastKVMax),
+            contextBucket(metrics.plannedDecodeMaxContextLength), metrics.globalExecutionVariant};
+        key.primaryWorkClass = static_cast<int32_t>(metrics.prefillClass);
+        return key;
     }
     if (metrics.kind == PhaseDispatchKind::kPrefill)
     {
-        return {PhaseGlobalActionKind::kPrefill, metrics.prefillBatchSize, 0, chunkLength,
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, metrics.prefillBatchSize, 0, chunkLength,
             contextBucket(metrics.prefillPastKVMax), 0, metrics.globalExecutionVariant};
+        key.primaryWorkClass = static_cast<int32_t>(metrics.prefillClass);
+        return key;
     }
     if (metrics.kind == PhaseDispatchKind::kDecode)
     {

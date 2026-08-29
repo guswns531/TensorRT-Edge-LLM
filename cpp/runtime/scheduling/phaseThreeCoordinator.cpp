@@ -1403,6 +1403,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? phase.key.chunkLength : 0;
         PhaseGlobalActionKey overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
             phase.key.primaryBatchSize, chunkLength, encoderContextBucket, phase.key.primaryContextBucket};
+        overlapKey.primaryWorkClass = phase.key.primaryWorkClass;
         overlapKey.residualAugmentation = residualAugmentation;
         overlapKey.executionVariant
             = phaseExecutionVariant(false, phaseExecutionVariantUsesPrimaryGraph(phase.key.executionVariant));

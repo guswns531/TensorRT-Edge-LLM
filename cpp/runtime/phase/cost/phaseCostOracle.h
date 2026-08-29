@@ -66,6 +66,7 @@ struct PhaseDeploymentFingerprint
 {
     std::string modelHash;
     std::string onnxHash;
+    std::string configHash;
     std::string engineHash;
     std::string externalWeightHash;
     std::string precision;
@@ -75,6 +76,9 @@ struct PhaseDeploymentFingerprint
     PhaseCostSoftwareSignature software;
     std::string gpuUuid;
 };
+
+//! Return the lowercase SHA-256 digest of one deployment artifact.
+std::string phaseCostFileSha256(std::filesystem::path const& path);
 
 enum class PhaseCostCompatibility
 {
@@ -120,6 +124,16 @@ struct PhaseCostRecord
     uint64_t observedAtUnixNs{};
 };
 
+//! Optional policies that passed the deployment promotion gate for this exact artifact.
+//! Serial P/D records remain valid action-cost priors; these flags authorize
+//! dynamic batch formation and contention-sensitive overlap selection.
+struct PhaseCostPromotion
+{
+    bool decodeBatching{};
+    bool prefillBatching{};
+    bool overlapSelection{};
+};
+
 //! Versioned, portable action-cost data. Records carry bounded raw observations so quantiles remain mergeable.
 struct PhaseCostBundle
 {
@@ -129,6 +143,7 @@ struct PhaseCostBundle
     PhaseDeploymentFingerprint deployment;
     uint64_t createdAtUnixNs{};
     std::vector<PhaseCostRecord> records;
+    std::optional<PhaseCostPromotion> promotion;
     std::optional<PhaseCostDriftState> driftState;
 };
 

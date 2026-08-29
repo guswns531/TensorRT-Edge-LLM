@@ -22,13 +22,16 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 namespace trt_edgellm::rt
@@ -37,6 +40,147 @@ namespace
 {
 
 using Json = nlohmann::json;
+
+constexpr std::array<uint32_t, 64> kSHA256_ROUND_CONSTANTS{0x428A2F98U, 0x71374491U, 0xB5C0FBCFU, 0xE9B5DBA5U,
+    0x3956C25BU, 0x59F111F1U, 0x923F82A4U, 0xAB1C5ED5U, 0xD807AA98U, 0x12835B01U, 0x243185BEU, 0x550C7DC3U, 0x72BE5D74U,
+    0x80DEB1FEU, 0x9BDC06A7U, 0xC19BF174U, 0xE49B69C1U, 0xEFBE4786U, 0x0FC19DC6U, 0x240CA1CCU, 0x2DE92C6FU, 0x4A7484AAU,
+    0x5CB0A9DCU, 0x76F988DAU, 0x983E5152U, 0xA831C66DU, 0xB00327C8U, 0xBF597FC7U, 0xC6E00BF3U, 0xD5A79147U, 0x06CA6351U,
+    0x14292967U, 0x27B70A85U, 0x2E1B2138U, 0x4D2C6DFCU, 0x53380D13U, 0x650A7354U, 0x766A0ABBU, 0x81C2C92EU, 0x92722C85U,
+    0xA2BFE8A1U, 0xA81A664BU, 0xC24B8B70U, 0xC76C51A3U, 0xD192E819U, 0xD6990624U, 0xF40E3585U, 0x106AA070U, 0x19A4C116U,
+    0x1E376C08U, 0x2748774CU, 0x34B0BCB5U, 0x391C0CB3U, 0x4ED8AA4AU, 0x5B9CCA4FU, 0x682E6FF3U, 0x748F82EEU, 0x78A5636FU,
+    0x84C87814U, 0x8CC70208U, 0x90BEFFFAU, 0xA4506CEBU, 0xBEF9A3F7U, 0xC67178F2U};
+
+uint32_t rotateRight(uint32_t value, uint32_t bits) noexcept
+{
+    return (value >> bits) | (value << (32U - bits));
+}
+
+class Sha256
+{
+public:
+    void update(uint8_t const* data, size_t size)
+    {
+        mBitCount += static_cast<uint64_t>(size) * 8U;
+        while (size > 0U)
+        {
+            size_t const copied = std::min(size, mBlock.size() - mBlockSize);
+            std::copy_n(data, copied, mBlock.begin() + static_cast<std::ptrdiff_t>(mBlockSize));
+            mBlockSize += copied;
+            data += copied;
+            size -= copied;
+            if (mBlockSize == mBlock.size())
+            {
+                transform(mBlock.data());
+                mBlockSize = 0U;
+            }
+        }
+    }
+
+    std::array<uint8_t, 32> finish()
+    {
+        uint64_t const messageBits = mBitCount;
+        uint8_t const marker = 0x80U;
+        updatePadding(&marker, 1U);
+        uint8_t const zero{};
+        while (mBlockSize != 56U)
+        {
+            updatePadding(&zero, 1U);
+        }
+        std::array<uint8_t, 8> length{};
+        for (size_t index{}; index < length.size(); ++index)
+        {
+            length[length.size() - 1U - index] = static_cast<uint8_t>(messageBits >> (index * 8U));
+        }
+        updatePadding(length.data(), length.size());
+
+        std::array<uint8_t, 32> result{};
+        for (size_t index{}; index < mState.size(); ++index)
+        {
+            result[index * 4U] = static_cast<uint8_t>(mState[index] >> 24U);
+            result[index * 4U + 1U] = static_cast<uint8_t>(mState[index] >> 16U);
+            result[index * 4U + 2U] = static_cast<uint8_t>(mState[index] >> 8U);
+            result[index * 4U + 3U] = static_cast<uint8_t>(mState[index]);
+        }
+        return result;
+    }
+
+private:
+    void updatePadding(uint8_t const* data, size_t size)
+    {
+        while (size > 0U)
+        {
+            size_t const copied = std::min(size, mBlock.size() - mBlockSize);
+            std::copy_n(data, copied, mBlock.begin() + static_cast<std::ptrdiff_t>(mBlockSize));
+            mBlockSize += copied;
+            data += copied;
+            size -= copied;
+            if (mBlockSize == mBlock.size())
+            {
+                transform(mBlock.data());
+                mBlockSize = 0U;
+            }
+        }
+    }
+
+    void transform(uint8_t const* block)
+    {
+        std::array<uint32_t, 64> words{};
+        for (size_t index{}; index < 16U; ++index)
+        {
+            words[index] = static_cast<uint32_t>(block[index * 4U]) << 24U
+                | static_cast<uint32_t>(block[index * 4U + 1U]) << 16U
+                | static_cast<uint32_t>(block[index * 4U + 2U]) << 8U | static_cast<uint32_t>(block[index * 4U + 3U]);
+        }
+        for (size_t index = 16U; index < words.size(); ++index)
+        {
+            uint32_t const sigma0 = rotateRight(words[index - 15U], 7U) ^ rotateRight(words[index - 15U], 18U)
+                ^ (words[index - 15U] >> 3U);
+            uint32_t const sigma1 = rotateRight(words[index - 2U], 17U) ^ rotateRight(words[index - 2U], 19U)
+                ^ (words[index - 2U] >> 10U);
+            words[index] = words[index - 16U] + sigma0 + words[index - 7U] + sigma1;
+        }
+
+        uint32_t a = mState[0];
+        uint32_t b = mState[1];
+        uint32_t c = mState[2];
+        uint32_t d = mState[3];
+        uint32_t e = mState[4];
+        uint32_t f = mState[5];
+        uint32_t g = mState[6];
+        uint32_t h = mState[7];
+        for (size_t index{}; index < words.size(); ++index)
+        {
+            uint32_t const sum1 = rotateRight(e, 6U) ^ rotateRight(e, 11U) ^ rotateRight(e, 25U);
+            uint32_t const choose = (e & f) ^ (~e & g);
+            uint32_t const temporary1 = h + sum1 + choose + kSHA256_ROUND_CONSTANTS[index] + words[index];
+            uint32_t const sum0 = rotateRight(a, 2U) ^ rotateRight(a, 13U) ^ rotateRight(a, 22U);
+            uint32_t const majority = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t const temporary2 = sum0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temporary1;
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1 + temporary2;
+        }
+        mState[0] += a;
+        mState[1] += b;
+        mState[2] += c;
+        mState[3] += d;
+        mState[4] += e;
+        mState[5] += f;
+        mState[6] += g;
+        mState[7] += h;
+    }
+
+    std::array<uint32_t, 8> mState{
+        0x6A09E667U, 0xBB67AE85U, 0x3C6EF372U, 0xA54FF53AU, 0x510E527FU, 0x9B05688CU, 0x1F83D9ABU, 0x5BE0CD19U};
+    std::array<uint8_t, 64> mBlock{};
+    size_t mBlockSize{};
+    uint64_t mBitCount{};
+};
 
 bool sameKey(PhaseGlobalActionKey const& left, PhaseGlobalActionKey const& right) noexcept
 {
@@ -254,7 +398,7 @@ Json keyJson(PhaseGlobalActionKey const& key)
         {"secondary_batch_size", key.secondaryBatchSize}, {"chunk_length", key.chunkLength},
         {"primary_context_bucket", key.primaryContextBucket}, {"secondary_context_bucket", key.secondaryContextBucket},
         {"execution_variant", phaseExecutionVariantName(key.executionVariant)},
-        {"residual_augmentation", key.residualAugmentation}};
+        {"primary_work_class", key.primaryWorkClass}, {"residual_augmentation", key.residualAugmentation}};
 }
 
 PhaseGlobalActionKey parseKey(Json const& value)
@@ -267,6 +411,7 @@ PhaseGlobalActionKey parseKey(Json const& value)
     key.primaryContextBucket = value.value("primary_context_bucket", 0);
     key.secondaryContextBucket = value.value("secondary_context_bucket", 0);
     key.executionVariant = parseVariant(value.value("execution_variant", std::string{"eager"}));
+    key.primaryWorkClass = value.value("primary_work_class", 0);
     key.residualAugmentation = value.value("residual_augmentation", false);
     return key;
 }
@@ -308,9 +453,9 @@ PhaseCostCapability parseCapability(Json const& value)
 Json deploymentJson(PhaseDeploymentFingerprint const& deployment)
 {
     return {{"model_hash", deployment.modelHash}, {"onnx_hash", deployment.onnxHash},
-        {"engine_hash", deployment.engineHash}, {"external_weight_hash", deployment.externalWeightHash},
-        {"precision", deployment.precision}, {"kv_dtype", deployment.kvDtype},
-        {"capability", capabilityJson(deployment.capability)},
+        {"config_hash", deployment.configHash}, {"engine_hash", deployment.engineHash},
+        {"external_weight_hash", deployment.externalWeightHash}, {"precision", deployment.precision},
+        {"kv_dtype", deployment.kvDtype}, {"capability", capabilityJson(deployment.capability)},
         {"gpu",
             {{"compute_capability", deployment.gpu.computeCapability}, {"sm_count", deployment.gpu.smCount},
                 {"memory_bytes", deployment.gpu.memoryBytes}, {"product_name", deployment.gpu.productName},
@@ -325,6 +470,7 @@ PhaseDeploymentFingerprint parseDeployment(Json const& value)
     PhaseDeploymentFingerprint result;
     result.modelHash = value.value("model_hash", std::string{});
     result.onnxHash = value.value("onnx_hash", std::string{});
+    result.configHash = value.value("config_hash", std::string{});
     result.engineHash = value.value("engine_hash", std::string{});
     result.externalWeightHash = value.value("external_weight_hash", std::string{});
     result.precision = value.value("precision", std::string{});
@@ -393,6 +539,12 @@ Json bundleJson(PhaseCostBundle const& bundle)
     Json result = {{"schema_version", bundle.schemaVersion}, {"bundle_version", bundle.bundleVersion},
         {"source", phaseCostBundleSourceName(bundle.source)}, {"created_at_unix_ns", bundle.createdAtUnixNs},
         {"deployment", deploymentJson(bundle.deployment)}, {"records", records}};
+    if (bundle.promotion.has_value())
+    {
+        result["promotion"] = {{"decode_batching", bundle.promotion->decodeBatching},
+            {"prefill_batching", bundle.promotion->prefillBatching},
+            {"overlap_selection", bundle.promotion->overlapSelection}};
+    }
     if (bundle.driftState.has_value())
     {
         result["drift_state"] = driftStateJson(*bundle.driftState);
@@ -437,6 +589,32 @@ PhaseNodeCostJournalConfig validateJournalConfig(PhaseNodeCostJournalConfig conf
 
 } // namespace
 
+std::string phaseCostFileSha256(std::filesystem::path const& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    ELLM_CHECK(stream.is_open(), "Failed to open phase fingerprint artifact: " + path.string());
+    Sha256 digest;
+    constexpr size_t kREAD_BYTES = 1024U * 1024U;
+    std::vector<uint8_t> buffer(kREAD_BYTES);
+    while (stream)
+    {
+        stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        std::streamsize const bytes = stream.gcount();
+        if (bytes > 0)
+        {
+            digest.update(buffer.data(), static_cast<size_t>(bytes));
+        }
+    }
+    ELLM_CHECK(stream.eof(), "Failed while reading phase fingerprint artifact: " + path.string());
+    std::ostringstream encoded;
+    encoded << std::hex << std::setfill('0');
+    for (uint8_t const value : digest.finish())
+    {
+        encoded << std::setw(2) << static_cast<uint32_t>(value);
+    }
+    return encoded.str();
+}
+
 char const* phaseCostCompatibilityName(PhaseCostCompatibility compatibility) noexcept
 {
     switch (compatibility)
@@ -458,13 +636,16 @@ PhaseCostCompatibility phaseCostCompatibility(
     {
         return PhaseCostCompatibility::kIncompatible;
     }
-    bool const exactEngine = !local.engineHash.empty() && local.engineHash == candidate.engineHash
-        && !local.software.pluginHash.empty() && local.software.pluginHash == candidate.software.pluginHash;
+    bool const exactEngine = !local.configHash.empty() && local.configHash == candidate.configHash
+        && !local.engineHash.empty() && local.engineHash == candidate.engineHash && !local.software.pluginHash.empty()
+        && local.software.pluginHash == candidate.software.pluginHash;
+    bool const exactExternalWeights = (local.externalWeightHash.empty() && candidate.externalWeightHash.empty())
+        || (!local.externalWeightHash.empty() && local.externalWeightHash == candidate.externalWeightHash);
     bool const exactSoftware = local.software.tensorrtVersion == candidate.software.tensorrtVersion
         && local.software.cudaVersion == candidate.software.cudaVersion;
     bool const exactGpu = local.gpu.computeCapability == candidate.gpu.computeCapability
         && local.gpu.smCount == candidate.gpu.smCount && local.gpu.memoryBytes == candidate.gpu.memoryBytes;
-    if (exactEngine && exactSoftware && exactGpu)
+    if (exactEngine && exactExternalWeights && exactSoftware && exactGpu)
     {
         return PhaseCostCompatibility::kExact;
     }
@@ -510,6 +691,12 @@ PhaseCostBundle phaseLoadCostBundle(std::filesystem::path const& path)
         }
         ELLM_CHECK(!record.observations.empty(), "Phase cost record has no observations");
         result.records.push_back(std::move(record));
+    }
+    if (root.contains("promotion"))
+    {
+        Json const& promotion = root.at("promotion");
+        result.promotion = PhaseCostPromotion{promotion.value("decode_batching", false),
+            promotion.value("prefill_batching", false), promotion.value("overlap_selection", false)};
     }
     if (root.contains("drift_state"))
     {
@@ -818,9 +1005,20 @@ std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrior(std::optio
     {
         return std::nullopt;
     }
-    std::optional<PhaseGlobalCostEstimate> estimateValue = coverContext
-        ? layer->model.estimatePrimaryBatchCoveringContext(key)
-        : (interpolate ? layer->model.estimateInterpolatedPrimaryBatch(key) : layer->model.estimate(key));
+    auto estimateForKey = [&](PhaseGlobalActionKey const& lookupKey) {
+        return coverContext ? layer->model.estimatePrimaryBatchCoveringContext(lookupKey)
+                            : (interpolate ? layer->model.estimateInterpolatedPrimaryBatch(lookupKey)
+                                           : layer->model.estimate(lookupKey));
+    };
+    std::optional<PhaseGlobalCostEstimate> estimateValue = estimateForKey(key);
+    bool const containsPrefill = key.kind == PhaseGlobalActionKind::kPrefill
+        || key.kind == PhaseGlobalActionKind::kEncoderPrefill || key.kind == PhaseGlobalActionKind::kPrefillDecode;
+    if (!estimateValue.has_value() && containsPrefill && key.primaryWorkClass != 0)
+    {
+        PhaseGlobalActionKey anyClassKey = key;
+        anyClassKey.primaryWorkClass = 0;
+        estimateValue = estimateForKey(anyClassKey);
+    }
     if (!estimateValue.has_value())
     {
         return std::nullopt;

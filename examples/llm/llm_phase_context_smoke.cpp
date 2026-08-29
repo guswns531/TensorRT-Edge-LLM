@@ -327,7 +327,8 @@ void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoord
     config.enableCostAwareEncoderBatching = true;
 }
 
-rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(rt::LLMEngineConfig const& config)
+rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(
+    rt::LLMEngineConfig const& config, std::filesystem::path const& engineDir)
 {
     rt::PhaseDeploymentFingerprint result;
     auto const environment = [](char const* name) {
@@ -336,11 +337,30 @@ rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(rt::LLMEngineConfig co
     };
     result.modelHash = environment("TRT_EDGELLM_PHASE_MODEL_HASH");
     result.onnxHash = environment("TRT_EDGELLM_PHASE_ONNX_HASH");
+    std::filesystem::path const configPath = engineDir / "config.json";
+    std::filesystem::path const enginePath = engineDir / "llm.engine";
+    std::filesystem::path const externalWeightPath = engineDir / "embedding.safetensors";
+    result.configHash = rt::phaseCostFileSha256(configPath);
     result.engineHash = environment("TRT_EDGELLM_PHASE_ENGINE_HASH");
+    if (result.engineHash.empty())
+    {
+        result.engineHash = rt::phaseCostFileSha256(enginePath);
+    }
     result.externalWeightHash = environment("TRT_EDGELLM_PHASE_EXTERNAL_WEIGHT_HASH");
+    if (result.externalWeightHash.empty() && std::filesystem::is_regular_file(externalWeightPath))
+    {
+        result.externalWeightHash = rt::phaseCostFileSha256(externalWeightPath);
+    }
     result.precision = environment("TRT_EDGELLM_PHASE_PRECISION");
     result.kvDtype = getDataTypeString(config.kvCacheDtype);
     result.software.pluginHash = environment("TRT_EDGELLM_PHASE_PLUGIN_HASH");
+    std::filesystem::path const pluginPath = environment("EDGELLM_PLUGIN_PATH").empty()
+        ? std::filesystem::path{"build/libNvInfer_edgellm_plugin.so"}
+        : std::filesystem::path{environment("EDGELLM_PLUGIN_PATH")};
+    if (result.software.pluginHash.empty() && std::filesystem::is_regular_file(pluginPath))
+    {
+        result.software.pluginHash = rt::phaseCostFileSha256(pluginPath);
+    }
     result.software.tensorrtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
         + std::to_string(NV_TENSORRT_PATCH);
     int32_t cudaRuntimeVersion{};
@@ -373,7 +393,13 @@ rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(rt::LLMEngineConfig co
 struct PhaseCostPriorLoadResult
 {
     bool active{};
+    bool exact{};
+    bool decodePromoted{};
+    bool prefillPromoted{};
+    bool overlapPromoted{};
+    bool hasPrefill{};
     bool hasDecode{};
+    bool hasOverlap{};
 };
 
 PhaseCostPriorLoadResult loadPhaseCostPrior(std::filesystem::path const& path,
@@ -394,15 +420,41 @@ PhaseCostPriorLoadResult loadPhaseCostPrior(std::filesystem::path const& path,
         return {};
     }
     rt::PhaseCostBundleSource const source = bundle.source;
+    bool const decodePromoted = bundle.promotion.has_value() && bundle.promotion->decodeBatching;
+    bool const prefillPromoted = bundle.promotion.has_value() && bundle.promotion->prefillBatching;
+    bool const overlapPromoted = bundle.promotion.has_value() && bundle.promotion->overlapSelection;
+    if (source == rt::PhaseCostBundleSource::kBuild && bundle.promotion.has_value())
+    {
+        auto const firstRejected
+            = std::remove_if(bundle.records.begin(), bundle.records.end(), [&](rt::PhaseCostRecord const& record) {
+                  switch (record.key.kind)
+                  {
+                  case rt::PhaseGlobalActionKind::kEncoderPrefill:
+                  case rt::PhaseGlobalActionKind::kEncoderDecode:
+                  case rt::PhaseGlobalActionKind::kPrefillDecode: return !overlapPromoted;
+                  default: return false;
+                  }
+              });
+        bundle.records.erase(firstRejected, bundle.records.end());
+    }
     bool const hasDecode = std::any_of(bundle.records.begin(), bundle.records.end(),
         [](rt::PhaseCostRecord const& record) { return record.key.kind == rt::PhaseGlobalActionKind::kDecode; });
+    bool const hasPrefill = std::any_of(bundle.records.begin(), bundle.records.end(),
+        [](rt::PhaseCostRecord const& record) { return record.key.kind == rt::PhaseGlobalActionKind::kPrefill; });
+    bool const hasOverlap
+        = std::any_of(bundle.records.begin(), bundle.records.end(), [](rt::PhaseCostRecord const& record) {
+              return record.key.kind == rt::PhaseGlobalActionKind::kEncoderPrefill
+                  || record.key.kind == rt::PhaseGlobalActionKind::kEncoderDecode
+                  || record.key.kind == rt::PhaseGlobalActionKind::kPrefillDecode;
+          });
     oracle->loadPrior(std::move(bundle), compatibility, scale);
     rt::PhaseCostHealthState const health = oracle->healthState();
     bool const expired
         = source == rt::PhaseCostBundleSource::kFleet ? health.fleetPriorExpired : health.buildPriorExpired;
     LOG_INFO("Loaded %s phase cost prior from %s (timing=%s)", rt::phaseCostCompatibilityName(compatibility),
         path.c_str(), expired ? "expired-fallback" : "active");
-    return {!expired, hasDecode};
+    return {!expired, compatibility == rt::PhaseCostCompatibility::kExact, decodePromoted, prefillPromoted,
+        overlapPromoted, hasPrefill, hasDecode, hasOverlap};
 }
 
 void logPhaseCostAnchors(char const* stage, rt::PhaseCostAnchorState const& state)
@@ -1568,7 +1620,7 @@ int main(int argc, char** argv)
             phaseCostOracleConfig.drift.nodeObservationTtl = std::chrono::hours{std::stoll(value)};
         }
         auto phaseCostOracle = std::make_shared<rt::PhaseCostOracle>(phaseCostOracleConfig);
-        rt::PhaseDeploymentFingerprint const phaseCostDeployment = phaseDeploymentFingerprint(config);
+        rt::PhaseDeploymentFingerprint const phaseCostDeployment = phaseDeploymentFingerprint(config, engineDir);
         rt::PhaseCostScale phaseCostScale;
         if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_ENCODER"))
         {
@@ -1624,8 +1676,10 @@ int main(int argc, char** argv)
             phaseCostOracle->attachJournal(
                 std::make_shared<rt::PhaseNodeCostJournal>(journalConfig, phaseCostDeployment));
         }
-        bool const enableBuildBundleDecodeBatching
+        bool const explicitlyEnableBuildBundleDecodeBatching
             = std::getenv("TRT_EDGELLM_ENABLE_PHASE_BUNDLE_DECODE_BATCHING") != nullptr;
+        bool const enableBuildBundleDecodeBatching
+            = (buildCostBundle.exact && buildCostBundle.decodePromoted) || explicitlyEnableBuildBundleDecodeBatching;
         if (buildCostBundle.active && buildCostBundle.hasDecode && enableBuildBundleDecodeBatching
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_BUNDLE_DECODE_BATCHING") == nullptr)
         {
@@ -1644,6 +1698,25 @@ int main(int argc, char** argv)
             LOG_INFO(
                 "Keeping static decode batching costs until the build bundle passes the deployment promotion "
                 "gate");
+        }
+        bool const explicitlyEnableBuildBundlePrefillBatching
+            = std::getenv("TRT_EDGELLM_ENABLE_PHASE_BUNDLE_PREFILL_BATCHING") != nullptr;
+        bool const enableBuildBundlePrefillBatching
+            = (buildCostBundle.exact && buildCostBundle.prefillPromoted) || explicitlyEnableBuildBundlePrefillBatching;
+        if (buildCostBundle.active && buildCostBundle.hasPrefill && enableBuildBundlePrefillBatching
+            && std::getenv("TRT_EDGELLM_DISABLE_PHASE_BUNDLE_PREFILL_BATCHING") == nullptr)
+        {
+            semanticSchedulerConfig.enableOraclePrefillBatching = true;
+            LOG_INFO("Promoted exact build cost records for producer-class-aware dynamic prefill batch formation");
+        }
+        else if (buildCostBundle.active && buildCostBundle.hasPrefill)
+        {
+            LOG_INFO("Keeping static prefill formation costs until the compatible bundle passes its deployment gate");
+        }
+        if (buildCostBundle.active && buildCostBundle.hasOverlap)
+        {
+            LOG_INFO("Loaded build-local E+D/P+D action costs for Global overlap selection (%s)",
+                buildCostBundle.exact && buildCostBundle.overlapPromoted ? "exact promoted" : "explicitly enabled");
         }
         semanticSchedulerConfig.globalCostOracle = phaseCostOracle;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)

@@ -33,6 +33,7 @@ PhaseDeploymentFingerprint fingerprint(std::string computeCapability = "8.6")
     PhaseDeploymentFingerprint result;
     result.modelHash = "model";
     result.onnxHash = "onnx";
+    result.configHash = "config";
     result.engineHash = "engine";
     result.externalWeightHash = "weights";
     result.precision = "fp16";
@@ -92,6 +93,14 @@ TEST(PhaseCostKnowledgeTest, ClassifiesDeploymentCompatibilityWithoutGpuUuid)
     candidate.engineHash = "another-engine-tactic";
     EXPECT_EQ(phaseCostCompatibility(local, candidate), PhaseCostCompatibility::kCompatible);
 
+    candidate = local;
+    candidate.configHash.clear();
+    EXPECT_EQ(phaseCostCompatibility(local, candidate), PhaseCostCompatibility::kCompatible);
+
+    candidate = local;
+    candidate.externalWeightHash = "another-external-weight";
+    EXPECT_EQ(phaseCostCompatibility(local, candidate), PhaseCostCompatibility::kCompatible);
+
     candidate.gpu.computeCapability = "9.0";
     EXPECT_EQ(phaseCostCompatibility(local, candidate), PhaseCostCompatibility::kShapeOnly);
 
@@ -109,11 +118,25 @@ TEST(PhaseCostKnowledgeTest, ClassifiesDeploymentCompatibilityWithoutGpuUuid)
     EXPECT_EQ(phaseCostCompatibility(local, candidate), PhaseCostCompatibility::kIncompatible);
 }
 
+TEST(PhaseCostKnowledgeTest, ComputesStandardSha256ArtifactIdentity)
+{
+    std::filesystem::path const directory = temporaryDirectory();
+    std::filesystem::create_directories(directory);
+    std::filesystem::path const path = directory / "artifact.bin";
+    {
+        std::ofstream stream(path, std::ios::binary);
+        stream << "abc";
+    }
+    EXPECT_EQ(phaseCostFileSha256(path), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    std::filesystem::remove_all(directory);
+}
+
 TEST(PhaseCostKnowledgeTest, BundleRoundTripPreservesRawObservations)
 {
     std::filesystem::path const directory = temporaryDirectory();
     std::filesystem::path const path = directory / "bundle.json";
-    PhaseCostBundle const expected = bundle(PhaseCostBundleSource::kBuild, 7.0F);
+    PhaseCostBundle expected = bundle(PhaseCostBundleSource::kBuild, 7.0F);
+    expected.promotion = PhaseCostPromotion{true, false, true};
     phaseWriteCostBundleAtomic(expected, path);
     PhaseCostBundle const actual = phaseLoadCostBundle(path);
 
@@ -123,6 +146,10 @@ TEST(PhaseCostKnowledgeTest, BundleRoundTripPreservesRawObservations)
     EXPECT_EQ(actual.source, PhaseCostBundleSource::kBuild);
     EXPECT_EQ(actual.records.front().key, decodeKey());
     EXPECT_FLOAT_EQ(actual.records.front().observations.front().makespanMs, 7.0F);
+    ASSERT_TRUE(actual.promotion.has_value());
+    EXPECT_TRUE(actual.promotion->decodeBatching);
+    EXPECT_FALSE(actual.promotion->prefillBatching);
+    EXPECT_TRUE(actual.promotion->overlapSelection);
     std::filesystem::remove_all(directory);
 }
 
@@ -157,6 +184,29 @@ TEST(PhaseCostKnowledgeTest, OraclePrefersFleetUntilLocalEvidenceIsSufficient)
     EXPECT_FLOAT_EQ(oracle.estimate(decodeKey())->makespanMedianMs, 7.0F);
     oracle.observe(decodeKey(), {10.0F, 5.0F});
     EXPECT_FLOAT_EQ(oracle.estimate(decodeKey())->makespanMedianMs, 5.0F);
+}
+
+TEST(PhaseCostKnowledgeTest, LegacyAnyClassPrefillPriorCoversProducerSpecificRequest)
+{
+    PhaseGlobalActionKey anyClass;
+    anyClass.kind = PhaseGlobalActionKind::kPrefill;
+    anyClass.primaryBatchSize = 2;
+    anyClass.chunkLength = 128;
+    PhaseCostBundle prior;
+    prior.bundleVersion = "legacy-any-class";
+    prior.source = PhaseCostBundleSource::kBuild;
+    prior.deployment = fingerprint();
+    prior.createdAtUnixNs = phaseCostUnixTimeNs();
+    prior.records.push_back({anyClass, {{5.0F, 4.0F}}, prior.createdAtUnixNs});
+
+    PhaseCostOracle oracle;
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+    PhaseGlobalActionKey text = anyClass;
+    text.primaryWorkClass = 1;
+    std::optional<PhaseGlobalCostEstimate> const estimate = oracle.estimate(text);
+
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 4.0F);
 }
 
 TEST(PhaseCostKnowledgeTest, CompatiblePriorScalesCostAndWidensUncertainty)
