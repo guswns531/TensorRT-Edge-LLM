@@ -43,7 +43,8 @@ enum class PhaseTimelineStage
     kCompletion,
 };
 
-//! One immutable request transition. GPU durations remain in PhaseDispatchMetrics.
+//! One immutable request transition. Repeated decode dispatches are preserved;
+//! GPU durations remain in PhaseDispatchMetrics.
 struct PhaseTimelineEvent
 {
     uint64_t requestId{};

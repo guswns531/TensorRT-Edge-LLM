@@ -512,8 +512,6 @@ private:
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
     std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
-    std::unordered_set<uint64_t> mTimelineDecodeStarted;
-    std::unordered_set<uint64_t> mTimelineDecodeCompleted;
     size_t mDecodeRefillWaitCount{};
     uint64_t mNextSamplingTicketSequence{1U};
     size_t mPrefillFormationWaitPeriodCount{};

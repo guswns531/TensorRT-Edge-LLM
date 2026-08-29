@@ -1905,20 +1905,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
     };
     callbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
     callbacks.onTimeline = [this](PhaseTimelineEvent const& event) {
-        if (!mTimelineCallback)
-        {
-            return;
-        }
-        bool emit = true;
-        if (event.stage == PhaseTimelineStage::kDecodeStart)
-        {
-            emit = mTimelineDecodeStarted.insert(event.requestId).second;
-        }
-        else if (event.stage == PhaseTimelineStage::kDecodeDone)
-        {
-            emit = mTimelineDecodeCompleted.insert(event.requestId).second;
-        }
-        if (emit)
+        if (mTimelineCallback)
         {
             mTimelineCallback(event);
         }
@@ -2055,8 +2042,6 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     ELLM_CHECK(it != mRequests.end(), "Finished phase request is missing");
     RequestState& state = it->second;
     recordTimeline(requestId, PhaseTimelineStage::kCompletion, state.kvSlotId);
-    mTimelineDecodeStarted.erase(requestId);
-    mTimelineDecodeCompleted.erase(requestId);
     if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && mPrefixCache != nullptr
         && state.promptTokens.size() >= 128U)
     {
