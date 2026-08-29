@@ -76,6 +76,13 @@ discarded. Until the minimum sample count is reached the scale remains one.
 Unknown overlap remains ineligible unless the existing safe-probe contract
 permits a bounded calibration probe.
 
+Portable overlap observations are useful as a timing prior, but they do not
+prove that concurrency is profitable on the current node. Controlled warmup
+therefore checks exact node-local sample coverage separately. It remeasures a
+known portable E+D or P+D point until the local minimum is reached, while
+production traffic continues to use the normal slack and probe-interval
+guards.
+
 ## TTL and drift fallback
 
 Portable fleet and non-exact build timing expires after 30 days by default.
@@ -145,6 +152,10 @@ TRT_EDGELLM_PHASE_COST_DRIFT_ENTER_RATIO
 TRT_EDGELLM_PHASE_COST_DRIFT_EXIT_RATIO
 TRT_EDGELLM_PHASE_COST_PRIOR_TTL_HOURS
 TRT_EDGELLM_PHASE_COST_NODE_TTL_HOURS
+TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE
+TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_BATCHES
+TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_SAMPLES
+TRT_EDGELLM_DISABLE_PHASE_ENCODER_DECODE_CALIBRATION
 ```
 
 Optional hash/signature fields use the `TRT_EDGELLM_PHASE_*_HASH` variables in
@@ -153,6 +164,22 @@ variables.
 
 With none of these controls set, the scheduler constructs an in-memory oracle
 and preserves the prior behavior.
+
+`TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE` opts the IPC composition root
+into controlled E and E+D startup calibration. The default shape set is the
+power-of-two encoder batches plus the exact deployment maximum. The maximum is
+first bounded by the configured encoder capacity and by the image's measured
+input-token footprint, so calibration cannot request a shape outside the
+visual TensorRT profile. An explicit batch list is validated against that same
+physical bound.
+
+Synthetic calibration runs in a temporary three-phase coordinator. It shares
+the real execution contexts and cost oracle, then drains every synthetic
+request and resets scheduler history before the production coordinator is
+created. Consequently CUDA observations and graph state may be retained while
+synthetic queue delay, telemetry and request state cannot enter production.
+The build-bundle snapshot is written only after both P/D and optional E/E+D
+calibration have completed.
 
 ## Calibration and offline fleet aggregation tool
 
@@ -183,18 +210,15 @@ validated build bundle may be packaged beside the engine. An offline fleet
 bundle remains an optional manually generated input for controlled experiments;
 production correctness and startup do not depend on it.
 
-## Remaining work
+## Promotion state and remaining work
 
-The first implementation establishes the data plane, persistence boundary and
-offline fleet merge. The following are intentionally separate promotion
-steps:
+The data plane, node persistence, explicit E shape anchors and bounded
+controlled-warmup E+D/P+D probes are implemented. None introduces a workload
+mode: local artifacts seed GPU action cost, while the live scheduler still
+decides from request/DAG/GPU state.
 
-1. replace the compatibility composition's static decode table with a
-   generated build bundle after decision-identity validation;
-2. extend startup coverage with explicit E anchors when the normal VLM warmup
-   does not exercise every encoder shape;
-3. schedule uncertainty-guided overlap probes only during controlled warmup or
-   verified idle windows.
-
-These steps do not introduce workload modes. Local artifacts seed GPU action
-cost; the live scheduler still decides from request/DAG/GPU state.
+The remaining promotion step is to replace the compatibility composition's
+static decode table with a generated build bundle after decision-identity and
+the full workload regression gates pass. Verified-idle production probing can
+remain opt-in; startup calibration is sufficient for deployments that require
+zero exploration on user traffic.

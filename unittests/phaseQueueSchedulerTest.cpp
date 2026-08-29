@@ -189,6 +189,38 @@ TEST(PhaseQueueSchedulerTest, GlobalWarmupStopsProbingCalibratedUnprofitableOver
     EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 0U);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalWarmupRemeasuresPortableOverlapPriorLocally)
+{
+    PhaseCostOracleConfig oracleConfig;
+    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
+    oracleConfig.model.overlapMinSamples = 2U;
+    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
+    PhaseCostBundle prior;
+    prior.bundleVersion = "portable-test";
+    prior.source = PhaseCostBundleSource::kBuild;
+    prior.createdAtUnixNs = phaseCostUnixTimeNs();
+    prior.records = {{key, {{4.0F, 2.0F}, {4.0F, 2.0F}}, phaseCostUnixTimeNs()}};
+    oracle->loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalCostModelConfig.overlapMinSamples = 2U;
+    config.globalCostOracle = oracle;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setGlobalWarmupProbeMode(true);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(plan.globalSafeProbe);
+    ASSERT_EQ(scheduler.globalCalibrationDiagnostics().size(), 1U);
+    EXPECT_EQ(
+        scheduler.globalCalibrationDiagnostics().front().diagnostic.status, PhaseGlobalOverlapCostStatus::kNoSamples);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
 {
     PhaseQueueSchedulerConfig config;
@@ -268,6 +300,32 @@ TEST(PhaseQueueSchedulerTest, RejectsStaleExternalGlobalPlanEpoch)
     scheduler.setNextGlobalAction(*candidate, 10U, 20U);
     EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
     EXPECT_THROW(scheduler.setNextGlobalAction(*candidate, 11U, 20U), std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, PreservesExternalCalibrationProbeWithKnownPortableCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 3});
+    scheduler.enqueueDecode({2, 128, 4});
+    PhaseGlobalActionCandidate candidate;
+    candidate.key = {PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
+    candidate.primaryRequestIds = {1U};
+    candidate.secondaryRequestIds = {2U};
+    candidate.primaryStableSlotIds = {3};
+    candidate.secondaryStableSlotIds = {4};
+    candidate.requestIds = {1U, 2U};
+    candidate.overlapCostKnown = true;
+    candidate.safeProbeEligible = true;
+    candidate.calibrationProbe = true;
+    phaseGlobalFinalizeCandidate(candidate);
+    scheduler.setNextGlobalAction(std::move(candidate), 1U, 1U);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(plan.globalSafeProbe);
 }
 
 TEST(PhaseQueueSchedulerTest, AcceptsCoordinatorPlanNamespaceAfterLocalWarmup)
@@ -2860,6 +2918,15 @@ TEST(PhaseMemoryBrokerTest, RetainsIdleVisionWhenReclaimIsDisabled)
     EXPECT_EQ(decision.encoderBatchSize, 1U);
     EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kManagedByteLimit);
     EXPECT_FALSE(decision.reclaimIdleVision);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, BuildsBoundedRepresentativeEncoderCalibrationShapes)
+{
+    EXPECT_EQ(phaseEncoderCalibrationBatchSizes(8U), (std::vector<size_t>{1U, 2U, 4U, 8U}));
+    EXPECT_EQ(phaseEncoderCalibrationBatchSizes(6U), (std::vector<size_t>{1U, 2U, 4U, 6U}));
+    EXPECT_EQ(phaseEncoderCalibrationBatchSizes(8U, {8U, 2U, 2U}), (std::vector<size_t>{2U, 8U}));
+    EXPECT_THROW(phaseEncoderCalibrationBatchSizes(0U), std::runtime_error);
+    EXPECT_THROW(phaseEncoderCalibrationBatchSizes(8U, {9U}), std::runtime_error);
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)

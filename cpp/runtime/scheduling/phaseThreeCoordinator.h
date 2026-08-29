@@ -60,6 +60,10 @@ struct PhaseVisionEncoderBatchChoice
     bool coverageMiss{};
 };
 
+//! Power-of-two encoder shapes plus the deployment limit for controlled calibration.
+std::vector<size_t> phaseEncoderCalibrationBatchSizes(
+    size_t maxEncoderBatchSize, std::vector<size_t> requestedBatchSizes = {});
+
 //! Direct E+D overlap point used until enough online observations exist.
 struct PhaseEncoderDecodeBatchCost
 {

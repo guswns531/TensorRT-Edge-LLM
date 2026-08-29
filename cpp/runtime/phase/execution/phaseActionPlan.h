@@ -17,9 +17,9 @@
 
 #pragma once
 
+#include "runtime/phase/ownership/phaseOwnershipHorizon.h"
 #include "runtime/phase/policy/phaseDeadline.h"
 #include "runtime/phase/policy/phaseGlobalCostModel.h"
-#include "runtime/phase/ownership/phaseOwnershipHorizon.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +52,9 @@ struct PhaseGlobalActionCandidate
     //! Overlap candidates require direct observations or one explicitly safe probe.
     bool overlapCostKnown{true};
     bool safeProbeEligible{};
+    //! Controlled calibration may remeasure a portable prior until enough
+    //! exact node-local samples exist. This is never set by production policy.
+    bool calibrationProbe{};
     //! WAIT is valid only for an already outstanding completion source.
     bool concreteWaitEvent{};
     uint64_t waitEventId{};
@@ -116,4 +119,3 @@ std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t
     PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept;
 
 } // namespace trt_edgellm::rt
-

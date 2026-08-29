@@ -1791,6 +1791,7 @@ int main(int argc, char** argv)
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
         char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
         char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
+        char const* encoderCalibrationImage = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE");
         rt::PhaseVisionStoragePolicy visionStoragePolicy;
         visionStoragePolicy.splitMropeLease = serverConfig.releaseVisionPrefillStorage;
         if (char const* value = std::getenv("TRT_EDGELLM_VISION_IDLE_SLABS"))
@@ -2066,14 +2067,6 @@ int main(int argc, char** argv)
                 warmupTelemetry.globalSafeProbeCount);
             logPhaseCostAnchors("post-warmup", phaseCostOracle->anchorState());
             logPhaseCostHealth("post-warmup", phaseCostOracle->healthState());
-            if (char const* path = std::getenv("TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE"))
-            {
-                rt::PhaseCostBundle const calibrated = phaseCostOracle->snapshot(
-                    rt::PhaseCostBundleSource::kBuild, phaseCostDeployment, "startup-calibration-v1");
-                ELLM_CHECK(!calibrated.records.empty(), "Startup calibration did not produce phase cost records");
-                rt::phaseWriteCostBundleAtomic(calibrated, path);
-                LOG_INFO("Wrote startup phase cost calibration bundle to %s", path);
-            }
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
             std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
@@ -2365,8 +2358,205 @@ int main(int argc, char** argv)
                 {
                     loadEncoderCostModel(encoderCostPath, threePhaseConfig);
                 }
+                if (encoderCalibrationImage != nullptr)
+                {
+                    ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
+                        "Encoder calibration requires the active Global scheduler");
+                    std::vector<size_t> requestedEncoderBatches;
+                    if (char const* value = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_BATCHES"))
+                    {
+                        std::stringstream stream(value);
+                        std::string batchSize;
+                        while (std::getline(stream, batchSize, ','))
+                        {
+                            ELLM_CHECK(!batchSize.empty(), "Encoder calibration batch list contains an empty entry");
+                            requestedEncoderBatches.push_back(static_cast<size_t>(std::stoull(batchSize)));
+                        }
+                    }
+                    size_t encoderCalibrationSamples = std::max(phaseCostOracleConfig.anchor.minimumSamplesPerPhase,
+                        threePhaseConfig.globalCostModelConfig.overlapMinSamples);
+                    if (char const* value = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_SAMPLES"))
+                    {
+                        encoderCalibrationSamples = static_cast<size_t>(std::stoull(value));
+                    }
+                    ELLM_CHECK(encoderCalibrationSamples > 0U, "Encoder calibration sample count must be positive");
+                    bool const calibrateEncoderDecode
+                        = std::getenv("TRT_EDGELLM_DISABLE_PHASE_ENCODER_DECODE_CALIBRATION") == nullptr;
+                    rt::imageUtils::ImageData const calibrationImage
+                        = rt::imageUtils::loadImageFromFile(encoderCalibrationImage);
+                    auto makeCalibrationRequest = [&]() {
+                        rt::LLMGenerationRequest request{};
+                        rt::LLMGenerationRequest::Request logicalRequest;
+                        logicalRequest.messages.push_back(
+                            {"user", {{"image", encoderCalibrationImage}, {"text", "Describe the image briefly."}}});
+                        logicalRequest.imageBuffers.push_back(calibrationImage);
+                        request.requests.push_back(std::move(logicalRequest));
+                        request.temperature = 0.0F;
+                        request.topP = 1.0F;
+                        request.topK = 1;
+                        request.maxGenerateLength = 2;
+                        request.applyChatTemplate = true;
+                        request.addGenerationPrompt = true;
+                        return request;
+                    };
+                    size_t const encoderInputTokensPerRequest
+                        = ipcVisionAdapter->estimateInputTokens(makeCalibrationRequest());
+                    ELLM_CHECK(encoderInputTokensPerRequest > 0U,
+                        "Encoder calibration image produced no encoder input tokens");
+                    size_t encoderCalibrationLimit
+                        = std::min(threePhaseConfig.maxEncoderBatchSize, threePhaseConfig.maxEncodedInFlight);
+                    size_t const encoderInputTokenLimit = ipcVisionAdapter->maxInputTokens();
+                    if (encoderInputTokenLimit > 0U)
+                    {
+                        encoderCalibrationLimit
+                            = std::min(encoderCalibrationLimit, encoderInputTokenLimit / encoderInputTokensPerRequest);
+                    }
+                    ELLM_CHECK(encoderCalibrationLimit > 0U,
+                        "Encoder calibration image exceeds the physical encoder token profile");
+                    std::vector<size_t> const encoderCalibrationBatches
+                        = rt::phaseEncoderCalibrationBatchSizes(encoderCalibrationLimit, requestedEncoderBatches);
+                    constexpr size_t kEncoderContextBucketTokens = 1024U;
+                    constexpr int32_t kEncoderCalibrationOutputTokens = 2;
+                    constexpr int32_t kDecodeCalibrationOutputTokens = 32;
+                    uint64_t encoderCalibrationRequestId = 1100000U;
+                    size_t encoderCalibrationExecutions{};
+                    size_t encoderDecodeCalibrationExecutions{};
+                    size_t encoderCalibrationRequests{};
+                    auto drainCalibration = [&](rt::PhaseThreeCoordinator& calibration, size_t expectedCompletions) {
+                        size_t pollCount{};
+                        while (!calibration.empty())
+                        {
+                            static_cast<void>(calibration.poll());
+                            ELLM_CHECK(++pollCount < 2000000U, "Encoder calibration exceeded its poll guard");
+                        }
+                        size_t completions{};
+                        while (calibration.tryPopCompletion().has_value())
+                        {
+                            ++completions;
+                        }
+                        while (calibration.tryPopToken().has_value())
+                        {
+                        }
+                        if (semanticPrefixCache != nullptr)
+                        {
+                            semanticPrefixCache->clear();
+                        }
+                        ELLM_CHECK(completions == expectedCompletions,
+                            "Encoder calibration did not complete every synthetic request");
+                    };
+                    auto submitEncoderCalibrationBatch = [&](rt::PhaseThreeCoordinator& calibration, size_t batchSize) {
+                        for (size_t row{}; row < batchSize; ++row)
+                        {
+                            rt::PhaseThreeSubmissionStatus const submitted
+                                = calibration.submit(encoderCalibrationRequestId++, makeCalibrationRequest(),
+                                    kEncoderCalibrationOutputTokens);
+                            ELLM_CHECK(submitted != rt::PhaseThreeSubmissionStatus::kDuplicateRequest,
+                                "Encoder calibration generated a duplicate request ID");
+                        }
+                        encoderCalibrationRequests += batchSize;
+                    };
+
+                    phaseCostOracle->setCalibrationActive(true);
+                    semanticCoordinator.scheduler().setGlobalWarmupProbeMode(true);
+                    {
+                        rt::PhaseThreeCoordinator calibration(*ipcVisionAdapter, semanticServer, threePhaseConfig);
+                        calibration.setGlobalWarmupProbeMode(true);
+                        for (size_t const batchSize : encoderCalibrationBatches)
+                        {
+                            size_t const totalInputTokens = encoderInputTokensPerRequest * batchSize;
+                            int32_t const contextBucket = static_cast<int32_t>(
+                                (totalInputTokens + kEncoderContextBucketTokens - 1U) / kEncoderContextBucketTokens);
+                            rt::PhaseGlobalActionKey const encoderKey{rt::PhaseGlobalActionKind::kEncoder,
+                                static_cast<int32_t>(batchSize), 0, 0, contextBucket, 0};
+                            size_t const existingSamples = phaseCostOracle->localSampleCount(encoderKey);
+                            size_t const requiredExecutions = encoderCalibrationSamples > existingSamples
+                                ? encoderCalibrationSamples - existingSamples
+                                : 0U;
+                            for (size_t sample{}; sample < requiredExecutions; ++sample)
+                            {
+                                submitEncoderCalibrationBatch(calibration, batchSize);
+                                drainCalibration(calibration, batchSize);
+                                ++encoderCalibrationExecutions;
+                            }
+                        }
+                        if (calibrateEncoderDecode)
+                        {
+                            for (size_t const encoderBatchSize : encoderCalibrationBatches)
+                            {
+                                for (size_t sample{}; sample < encoderCalibrationSamples; ++sample)
+                                {
+                                    std::vector<rt::PhaseGlobalOverlapCostRecord> const diagnostics
+                                        = calibration.globalCalibrationDiagnostics();
+                                    bool const calibrated = std::any_of(diagnostics.begin(), diagnostics.end(),
+                                        [&](rt::PhaseGlobalOverlapCostRecord const& record) {
+                                            return record.key.kind == rt::PhaseGlobalActionKind::kEncoderDecode
+                                                && record.key.primaryBatchSize == static_cast<int32_t>(encoderBatchSize)
+                                                && (record.diagnostic.status
+                                                        == rt::PhaseGlobalOverlapCostStatus::kEligible
+                                                    || record.diagnostic.status
+                                                        == rt::PhaseGlobalOverlapCostStatus::kUnprofitable);
+                                        });
+                                    if (calibrated)
+                                    {
+                                        break;
+                                    }
+                                    size_t const decodeRows = std::max<size_t>(1U,
+                                        std::min({encoderBatchSize, warmupAdmissionLimit,
+                                            static_cast<size_t>(semanticSchedulerConfig.maxDecodeBatchSize)}));
+                                    for (size_t row{}; row < decodeRows; ++row)
+                                    {
+                                        auto const submission = semanticServer.submit(encoderCalibrationRequestId++,
+                                            semanticPrompts.at(20000), kDecodeCalibrationOutputTokens);
+                                        ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
+                                            "Encoder-decode calibration seed was not admitted");
+                                    }
+                                    size_t pollCount{};
+                                    while (true)
+                                    {
+                                        static_cast<void>(calibration.poll());
+                                        rt::IndependentPhaseServerArbitrationSnapshot const snapshot
+                                            = semanticServer.arbitrationSnapshot();
+                                        if (snapshot.busy && snapshot.inFlightKind == rt::PhaseDispatchKind::kDecode)
+                                        {
+                                            break;
+                                        }
+                                        ELLM_CHECK(!semanticServer.empty() && ++pollCount < 1000000U,
+                                            "Encoder-decode calibration did not reach decode");
+                                    }
+                                    submitEncoderCalibrationBatch(calibration, encoderBatchSize);
+                                    drainCalibration(calibration, decodeRows + encoderBatchSize);
+                                    ++encoderDecodeCalibrationExecutions;
+                                }
+                            }
+                        }
+                        calibration.setGlobalWarmupProbeMode(false);
+                    }
+                    semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
+                    phaseCostOracle->setCalibrationActive(false);
+                    semanticCoordinator.scheduler().resetHistory(true);
+                    LOG_INFO(
+                        "Phase encoder calibration: shapes=%zu isolated=%zu encoder_decode=%zu vision_requests=%zu "
+                        "E_anchor=%.3f/%zu overlap_anchor=%.3f/%zu",
+                        encoderCalibrationBatches.size(), encoderCalibrationExecutions,
+                        encoderDecodeCalibrationExecutions, encoderCalibrationRequests,
+                        phaseCostOracle->anchorState().scale.encoder, phaseCostOracle->anchorState().encoderSamples,
+                        phaseCostOracle->anchorState().scale.overlap, phaseCostOracle->anchorState().overlapSamples);
+                }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
+            }
+            else
+            {
+                ELLM_CHECK(encoderCalibrationImage == nullptr,
+                    "Encoder calibration image requires TRT_EDGELLM_VISION_ENGINE_DIR");
+            }
+            if (char const* path = std::getenv("TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE"))
+            {
+                rt::PhaseCostBundle const calibrated = phaseCostOracle->snapshot(
+                    rt::PhaseCostBundleSource::kBuild, phaseCostDeployment, "startup-calibration-v1");
+                ELLM_CHECK(!calibrated.records.empty(), "Startup calibration did not produce phase cost records");
+                rt::phaseWriteCostBundleAtomic(calibrated, path);
+                LOG_INFO("Wrote startup phase cost calibration bundle to %s", path);
             }
             std::deque<rt::PhaseTimelineEvent> phaseTimelineEvents;
             std::deque<rt::PhaseVisionEncoderBatchMetric> encoderBatchMetrics;

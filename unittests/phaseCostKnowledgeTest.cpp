@@ -242,6 +242,28 @@ TEST(PhaseCostKnowledgeTest, ProductionObservationsDoNotRetunePortablePhaseScale
     EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 20.0F);
 }
 
+TEST(PhaseCostKnowledgeTest, LocalOverlapCoverageDoesNotTrustPortablePriorSamples)
+{
+    PhaseCostOracleConfig config;
+    config.model.coldStartUncertaintyMs = 0.0F;
+    config.model.overlapMinSamples = 2U;
+    PhaseCostOracle oracle(config);
+    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
+    PhaseCostBundle prior = bundle(PhaseCostBundleSource::kBuild, 10.0F);
+    prior.records = {{key, {{4.0F, 2.0F}, {4.0F, 2.0F}}, phaseCostUnixTimeNs()}};
+    oracle.loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+
+    EXPECT_EQ(oracle.overlapDiagnostic(key).status, PhaseGlobalOverlapCostStatus::kEligible);
+    EXPECT_EQ(oracle.localOverlapDiagnostic(key).status, PhaseGlobalOverlapCostStatus::kNoSamples);
+    EXPECT_EQ(oracle.localSampleCount(key), 0U);
+
+    oracle.observe(key, {4.0F, 2.0F});
+    EXPECT_EQ(oracle.localOverlapDiagnostic(key).status, PhaseGlobalOverlapCostStatus::kInsufficientSamples);
+    EXPECT_EQ(oracle.localSampleCount(key), 1U);
+    oracle.observe(key, {4.0F, 2.0F});
+    EXPECT_EQ(oracle.localOverlapDiagnostic(key).status, PhaseGlobalOverlapCostStatus::kEligible);
+}
+
 TEST(PhaseCostKnowledgeTest, ExpiredPortablePriorFallsBackButExactBuildRemainsUsable)
 {
     PhaseCostOracleConfig config;

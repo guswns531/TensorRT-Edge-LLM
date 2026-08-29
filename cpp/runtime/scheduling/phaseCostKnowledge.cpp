@@ -653,6 +653,17 @@ PhaseGlobalOverlapCostDiagnostic PhaseCostOracle::overlapDiagnostic(PhaseGlobalA
     return {status, estimateValue->sampleCount, compression};
 }
 
+PhaseGlobalOverlapCostDiagnostic PhaseCostOracle::localOverlapDiagnostic(PhaseGlobalActionKey const& key) const
+{
+    return mLocal.overlapDiagnostic(key);
+}
+
+size_t PhaseCostOracle::localSampleCount(PhaseGlobalActionKey const& key) const
+{
+    std::optional<PhaseGlobalCostEstimate> const estimateValue = mLocal.estimate(key);
+    return estimateValue.has_value() ? estimateValue->sampleCount : 0U;
+}
+
 bool PhaseCostOracle::overlapEligible(PhaseGlobalActionKey const& key) const
 {
     bool const overlap = key.kind == PhaseGlobalActionKind::kEncoderPrefill

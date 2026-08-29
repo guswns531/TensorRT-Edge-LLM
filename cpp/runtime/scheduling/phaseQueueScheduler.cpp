@@ -1865,7 +1865,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         overlapKey.executionVariant = executionVariant(overlapKey, overlapPrefillUsefulTokens);
         Prediction overlap{};
         bool overlapKnown{};
-        bool directOfflineCost{};
         if (std::optional<Prediction> const online = fromOnline(overlapKey))
         {
             overlap = *online;
@@ -1893,13 +1892,12 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlap.referenceWorkUs = prefill->referenceWorkUs + decode->referenceWorkUs;
             overlap.directlyKnown = selected != nullptr;
             overlapKnown = selected != nullptr;
-            directOfflineCost = selected != nullptr;
         }
-        PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostOracle->overlapDiagnostic(overlapKey);
-        bool const needsCalibration = diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
-            || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
+        PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mGlobalCostOracle->localOverlapDiagnostic(overlapKey);
+        bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
+            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
-        if (mGlobalWarmupProbeMode && !directOfflineCost)
+        if (mGlobalWarmupProbeMode)
         {
             PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
             auto const tracked
@@ -1923,9 +1921,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
         bool const probeSlackSafe = std::min(prefillSlack, decodeSlack)
             >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
-        bool const safeProbe = !overlapKnown && needsCalibration
-            && ((mGlobalWarmupProbeMode && calibrationTarget)
-                || (mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady && probeSlackSafe));
+        bool const calibrationProbe = mGlobalWarmupProbeMode && calibrationTarget && needsLocalCalibration;
+        bool const safeProbe = calibrationProbe
+            || (!overlapKnown && needsLocalCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
+                && probeIntervalReady && probeSlackSafe);
         PhaseGlobalActionCandidate candidate;
         candidate.key = overlapKey;
         candidate.primaryRequestIds = overlapPrefillRequestIds;
@@ -1935,6 +1934,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         phaseGlobalFinalizeCandidate(candidate);
         candidate.overlapCostKnown = overlapKnown;
         candidate.safeProbeEligible = safeProbe;
+        candidate.calibrationProbe = calibrationProbe;
         candidate.predictedBlockingUs = overlap.makespanUs;
         candidate.predictedMakespanUs = overlap.makespanUs;
         candidate.uncertaintyUs = overlap.uncertaintyUs;
@@ -1955,7 +1955,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         decision.hardFeasibleCandidates = candidates.size();
         decision.deadlineSafeCandidates = candidates.size();
         auto const selected = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
-            return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.safeProbeEligible;
+            return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.calibrationProbe;
         });
         if (selected != candidates.end())
         {
@@ -2033,7 +2033,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     case PhaseGlobalActionKind::kPrefillDecode: kind = PhaseDispatchKind::kOverlap; break;
     default: break;
     }
-    bool const safeProbe = selected.safeProbeEligible && !selected.overlapCostKnown;
+    bool const safeProbe = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
@@ -2737,7 +2737,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
             = global.predictedMakespanUs > 0.0 ? global.predictedMakespanUs : global.predictedBlockingUs;
         plan.globalServiceCompression
             = global.referenceWorkUs / std::max(predictedMakespanUs, std::numeric_limits<double>::epsilon());
-        plan.globalSafeProbe = global.safeProbeEligible && !global.overlapCostKnown;
+        plan.globalSafeProbe = global.calibrationProbe || (global.safeProbeEligible && !global.overlapCostKnown);
         plan.globalCandidateId = global.candidateId;
         plan.globalPlanId = globalPlan.planId;
         plan.globalSnapshotEpoch = globalPlan.snapshotEpoch;
@@ -3553,7 +3553,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseQueueScheduler::globalCalibration
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mGlobalCostOracle->overlapDiagnostic(key), opportunities,
+        result.push_back({key, mGlobalCostOracle->localOverlapDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;

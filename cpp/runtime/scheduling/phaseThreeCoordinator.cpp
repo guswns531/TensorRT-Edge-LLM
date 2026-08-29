@@ -83,6 +83,35 @@ size_t saturatedMultiply(size_t left, size_t right) noexcept
 }
 } // namespace
 
+std::vector<size_t> phaseEncoderCalibrationBatchSizes(
+    size_t maxEncoderBatchSize, std::vector<size_t> requestedBatchSizes)
+{
+    ELLM_CHECK(maxEncoderBatchSize > 0U, "Phase encoder calibration requires a positive batch limit");
+    if (requestedBatchSizes.empty())
+    {
+        size_t batchSize{1U};
+        while (batchSize < maxEncoderBatchSize)
+        {
+            requestedBatchSizes.push_back(batchSize);
+            if (batchSize > maxEncoderBatchSize / 2U)
+            {
+                break;
+            }
+            batchSize *= 2U;
+        }
+        requestedBatchSizes.push_back(maxEncoderBatchSize);
+    }
+    for (size_t const batchSize : requestedBatchSizes)
+    {
+        ELLM_CHECK(batchSize > 0U && batchSize <= maxEncoderBatchSize,
+            "Phase encoder calibration batch is outside the encoder profile");
+    }
+    std::sort(requestedBatchSizes.begin(), requestedBatchSizes.end());
+    requestedBatchSizes.erase(
+        std::unique(requestedBatchSizes.begin(), requestedBatchSizes.end()), requestedBatchSizes.end());
+    return requestedBatchSizes;
+}
+
 PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
     std::vector<size_t> const& candidateInputTokens, std::vector<PhaseVisionEncoderBatchCost> const& costs)
 {
@@ -942,7 +971,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseThreeCoordinator::globalCalibrati
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mGlobalCostOracle->overlapDiagnostic(key), opportunities,
+        result.push_back({key, mGlobalCostOracle->localOverlapDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;
@@ -1380,7 +1409,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         double overlapMakespanUs = encoderMakespanUs + phase.predictedMakespanUs;
         double overlapUncertaintyUs = encoderUncertaintyUs + phase.uncertaintyUs;
         bool overlapKnown{};
-        bool directOfflineCost{};
         double phaseOverlapCompletionUs{};
         double phaseOverlapCompletionUncertaintyUs{};
         bool residualDerivedFromFullCost{};
@@ -1417,7 +1445,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
                         overlapUncertaintyUs = 0.0;
                         overlapKnown = true;
-                        directOfflineCost = true;
                     }
                 }
             }
@@ -1435,7 +1462,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
                         overlapUncertaintyUs = 0.0;
                         overlapKnown = true;
-                        directOfflineCost = true;
                     }
                 }
             }
@@ -1451,11 +1477,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             phaseOverlapCompletionUs = residualPhaseUs + interferenceUs;
             phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
         }
-        PhaseGlobalOverlapCostDiagnostic const diagnostic = mGlobalCostOracle->overlapDiagnostic(overlapKey);
-        bool const needsCalibration = diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
-            || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
+        PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mGlobalCostOracle->localOverlapDiagnostic(overlapKey);
+        bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
+            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
-        if (mGlobalWarmupProbeMode && !directOfflineCost)
+        if (mGlobalWarmupProbeMode)
         {
             PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
             auto const tracked
@@ -1514,11 +1540,13 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                     * (encoderMakespanUs + encoderUncertaintyUs)
             && phaseProtectedSlackUs
                 >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * residualPhaseProbeUs;
-        bool const safeProbe = !overlapKnown && needsCalibration
-            && ((mGlobalWarmupProbeMode && calibrationTarget)
-                || (mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
-                    && protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs)
-                || residualProbeSafe);
+        bool const calibrationProbe = mGlobalWarmupProbeMode && calibrationTarget && needsLocalCalibration;
+        bool const safeProbe = calibrationProbe
+            || (!overlapKnown && needsLocalCalibration
+                && ((mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
+                        && protectedSlackUs
+                            >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs)
+                    || residualProbeSafe));
         if (safeProbe)
         {
             double const optimisticMakespanUs = std::max(encoderMakespanUs, phase.predictedMakespanUs);
@@ -1536,6 +1564,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.key = overlapKey;
         overlap.overlapCostKnown = overlapKnown;
         overlap.safeProbeEligible = safeProbe;
+        overlap.calibrationProbe = calibrationProbe;
         overlap.predictedBlockingUs = overlapMakespanUs;
         overlap.predictedMakespanUs = overlapMakespanUs;
         overlap.uncertaintyUs = overlapUncertaintyUs;
@@ -1582,19 +1611,15 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         auto const calibration
             = std::min_element(candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
                   auto sampleCount = [&](auto const& candidate) {
-                      bool const encoderOverlap = candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-                          || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode;
-                      return encoderOverlap && candidate.safeProbeEligible && !candidate.overlapCostKnown
-                          ? mGlobalCostOracle->overlapDiagnostic(candidate.key).sampleCount
+                      return candidate.calibrationProbe
+                          ? mGlobalCostOracle->localOverlapDiagnostic(candidate.key).sampleCount
                           : std::numeric_limits<size_t>::max();
                   };
                   return sampleCount(left) < sampleCount(right);
               });
         if (calibration != candidates.end())
         {
-            bool const encoderOverlap = calibration->key.kind == PhaseGlobalActionKind::kEncoderPrefill
-                || calibration->key.kind == PhaseGlobalActionKind::kEncoderDecode;
-            if (encoderOverlap && calibration->safeProbeEligible && !calibration->overlapCostKnown)
+            if (calibration->calibrationProbe)
             {
                 selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), calibration));
             }
@@ -1637,7 +1662,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     PhaseGlobalActionCandidate selected = candidates[*selectedIndex];
     mLastGlobalAction = selected.key.kind;
-    bool const safeProbe = selected.safeProbeEligible && !selected.overlapCostKnown;
+    bool const safeProbe = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
