@@ -41,7 +41,9 @@ tests/python-unittests/test_phase_cost_bundle.py
 - 기존 static D table을 build bundle로 완전히 대체
 - 자동 startup anchor 실행과 scale 추정
 - TTL 및 drift state
-- remote fleet registry transport
 
 이 항목은 cost plane의 기본 비활성 decision identity와 기존 12-workload 성능 gate를 먼저 확인한 뒤
 순서대로 승격한다.
+
+`remote fleet registry transport`는 후속 승격 항목이 아니다. 외부 cost registry는 프로젝트 범위에서
+제외하며, build/fleet bundle은 로컬에서 명시적으로 전달하는 artifact로만 유지한다.

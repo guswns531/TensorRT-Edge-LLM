@@ -92,5 +92,11 @@ snapshot을 복원했고, post-warmup health는 `E:no/P:no/D:yes/O:no`였다. �
 이번 검증은 prior를 의도적으로 망가뜨린 safety test다. scheduler action, batch formation, KV ownership 또는
 실제 workload policy는 바꾸지 않았으므로 기존 workload/vLLM 성능 수치는 갱신하지 않는다.
 
+## 배포 범위
+
+외부 cost registry는 구현하지 않는다. 검증된 build bundle은 engine package 옆에 둘 수 있고 node snapshot은
+해당 serving node에만 남긴다. offline fleet aggregate는 필요할 때 수동으로 생성·전달할 수 있지만 uploader,
+downloader, remote lookup 또는 inference의 외부 서비스 의존성은 추가하지 않는다.
+
 다음 단계는 uncertainty와 실제 queue opportunity를 이용해 controlled warmup/idle 구간에서만 overlap
 candidate를 능동적으로 측정하는 것이다.

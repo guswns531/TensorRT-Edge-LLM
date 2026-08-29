@@ -22,7 +22,9 @@ node snapshot ───────────┘     direct CUDA events
                                       └─> async node journal
 ```
 
-No registry or filesystem access is permitted on the dispatch hot path.
+The design has no external cost registry. Build/fleet bundles are local,
+explicitly supplied artifacts, and the node snapshot stays on the serving
+node. Filesystem access is not permitted on the dispatch hot path.
 
 ## Portable bundle
 
@@ -152,7 +154,7 @@ variables.
 With none of these controls set, the scheduler constructs an in-memory oracle
 and preserves the prior behavior.
 
-## Calibration and fleet aggregation tool
+## Calibration and offline fleet aggregation tool
 
 `scripts/phase_cost_bundle.py` provides three offline operations:
 
@@ -176,6 +178,11 @@ parsing production logs and preserves the exact runtime action keys. The output
 path must be outside the immutable engine directory in normal deployment; the
 artifact pipeline may copy the validated bundle into the engine package later.
 
+There is intentionally no uploader, downloader or remote lookup service. A
+validated build bundle may be packaged beside the engine. An offline fleet
+bundle remains an optional manually generated input for controlled experiments;
+production correctness and startup do not depend on it.
+
 ## Remaining work
 
 The first implementation establishes the data plane, persistence boundary and
@@ -187,9 +194,7 @@ steps:
 2. extend startup coverage with explicit E anchors when the normal VLM warmup
    does not exercise every encoder shape;
 3. schedule uncertainty-guided overlap probes only during controlled warmup or
-   verified idle windows;
-4. connect upload/download transport to a versioned external registry. Remote
-   access must remain outside inference.
+   verified idle windows.
 
-These steps do not introduce workload modes. The registry distributes GPU
-action cost; the live scheduler still decides from request/DAG/GPU state.
+These steps do not introduce workload modes. Local artifacts seed GPU action
+cost; the live scheduler still decides from request/DAG/GPU state.
