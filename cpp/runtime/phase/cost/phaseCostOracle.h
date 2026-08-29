@@ -212,6 +212,7 @@ public:
     void observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation);
     std::optional<PhaseGlobalCostEstimate> estimate(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(PhaseGlobalActionKey const& key) const;
+    std::optional<PhaseGlobalCostEstimate> estimatePrimaryBatchCoveringContext(PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic localOverlapDiagnostic(PhaseGlobalActionKey const& key) const;
     size_t localSampleCount(PhaseGlobalActionKey const& key) const;
@@ -239,7 +240,8 @@ private:
     };
 
     std::optional<PhaseGlobalCostEstimate> estimatePrior(std::optional<PriorLayer> const& layer,
-        PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor = true, bool ignoreDrift = false) const;
+        PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor = true, bool ignoreDrift = false,
+        bool coverContext = false) const;
     static PhaseGlobalCostEstimate scaledEstimate(PhaseGlobalCostEstimate estimate, PhaseGlobalActionKey const& key,
         PhaseCostScale const& scale, float uncertaintyMultiplier, float relativeUncertainty = 0.0F) noexcept;
     void observeAnchor(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation const& observation);

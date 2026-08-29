@@ -418,6 +418,9 @@ struct PhaseQueueSchedulerConfig
     //! Zero preserves the kernel-only decode cost model.
     float decodeRowReplacementCostMs{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
+    //! Use deployment-local PhaseCostOracle decode records as the dynamic
+    //! batching cost source. Sparse coverage never shrinks the runnable batch.
+    bool enableOracleDecodeBatching{};
     //! Refine static decode costs from confident, context-bucketed decode-only observations.
     bool enableOnlineDecodeCostLearning{};
     size_t onlineDecodeCostMinSamples{8U};
@@ -760,6 +763,7 @@ private:
     std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const;
     std::vector<PhaseWorkItem const*> decodeCandidateRows(int32_t maxRows) const;
     int32_t decodeCandidateReplacementRows(int32_t maxRows) const;
+    std::optional<float> oracleDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,

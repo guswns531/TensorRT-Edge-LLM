@@ -1544,6 +1544,73 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
+TEST(PhaseQueueSchedulerTest, OracleDecodeCostsPreserveStaticDecisionIdentity)
+{
+    std::vector<PhaseDecodeBatchCost> const costs{{1, 512, 2.0F}, {2, 512, 3.0F}, {3, 512, 3.5F}, {4, 512, 4.0F}};
+    PhaseQueueSchedulerConfig staticConfig;
+    staticConfig.maxDecodeBatchSize = 4;
+    staticConfig.enableDynamicDecodeBatching = true;
+    staticConfig.decodeQueueWaitTargetUs = 1.0;
+    staticConfig.decodeBatchCosts = costs;
+
+    PhaseCostOracleConfig oracleConfig;
+    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
+    oracleConfig.sufficientLocalSamples = 1U;
+    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    for (PhaseDecodeBatchCost const& cost : costs)
+    {
+        PhaseGlobalActionKey const key{PhaseGlobalActionKind::kDecode, cost.batchSize, 0, 1, 1, 0};
+        oracle->observe(key, {cost.p95GpuMs * static_cast<float>(cost.batchSize), cost.p95GpuMs});
+    }
+    PhaseQueueSchedulerConfig oracleSchedulerConfig = staticConfig;
+    oracleSchedulerConfig.decodeBatchCosts.clear();
+    oracleSchedulerConfig.enableOracleDecodeBatching = true;
+    oracleSchedulerConfig.globalCostOracle = std::move(oracle);
+
+    PhaseQueueScheduler staticScheduler(staticConfig);
+    PhaseQueueScheduler oracleScheduler(oracleSchedulerConfig);
+    for (uint64_t requestId = 1; requestId <= 3; ++requestId)
+    {
+        staticScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
+        oracleScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
+    }
+
+    PhaseDispatchPlan const staticPlan = staticScheduler.next();
+    PhaseDispatchPlan const oraclePlan = oracleScheduler.next();
+
+    ASSERT_EQ(oraclePlan.decodeBatch.size(), staticPlan.decodeBatch.size());
+    for (size_t row{}; row < staticPlan.decodeBatch.size(); ++row)
+    {
+        EXPECT_EQ(oraclePlan.decodeBatch[row].requestId, staticPlan.decodeBatch[row].requestId);
+        EXPECT_EQ(oraclePlan.decodeBatch[row].kvSlotId, staticPlan.decodeBatch[row].kvSlotId);
+    }
+    EXPECT_FLOAT_EQ(oraclePlan.predictedDecodeDrainGpuMs, staticPlan.predictedDecodeDrainGpuMs);
+    EXPECT_EQ(oraclePlan.predictedDecodeDrainTurns, staticPlan.predictedDecodeDrainTurns);
+}
+
+TEST(PhaseQueueSchedulerTest, SparseOracleDecodeCoveragePreservesLargestBatch)
+{
+    PhaseCostOracleConfig oracleConfig;
+    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
+    oracleConfig.sufficientLocalSamples = 1U;
+    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    oracle->observe({PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0}, {2.0F, 2.0F});
+    oracle->observe({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, {4.0F, 3.0F});
+
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableOracleDecodeBatching = true;
+    config.globalCostOracle = std::move(oracle);
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
 TEST(PhaseQueueSchedulerTest, ConfidentOnlineDecodeCostRefinesStaticPrior)
 {
     PhaseQueueSchedulerConfig config;

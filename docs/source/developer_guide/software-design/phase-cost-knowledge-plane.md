@@ -156,6 +156,11 @@ TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE
 TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_BATCHES
 TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_SAMPLES
 TRT_EDGELLM_DISABLE_PHASE_ENCODER_DECODE_CALIBRATION
+TRT_EDGELLM_IPC_WARMUP_DECODE_SHAPES
+TRT_EDGELLM_IPC_WARMUP_SHAPE_SAMPLES
+TRT_EDGELLM_IPC_WARMUP_POLL_GUARD
+TRT_EDGELLM_ENABLE_PHASE_BUNDLE_DECODE_BATCHING
+TRT_EDGELLM_DISABLE_PHASE_BUNDLE_DECODE_BATCHING
 ```
 
 Optional hash/signature fields use the `TRT_EDGELLM_PHASE_*_HASH` variables in
@@ -180,6 +185,23 @@ created. Consequently CUDA observations and graph state may be retained while
 synthetic queue delay, telemetry and request state cannot enter production.
 The build-bundle snapshot is written only after both P/D and optional E/E+D
 calibration have completed.
+
+`TRT_EDGELLM_IPC_WARMUP_DECODE_SHAPES` accepts a comma-separated
+`batch:prompt_tokens` list. It measures deployment-feasible decode shapes at
+their requested context without changing the production policy. The sample
+count and long-prefill poll guard are independently bounded by the two warmup
+controls above.
+
+An active build bundle with decode records can replace the compatibility
+table's timing values by setting
+`TRT_EDGELLM_ENABLE_PHASE_BUNDLE_DECODE_BATCHING`. Missing batch sizes are
+interpolated only inside one observed context bucket; a measurement from the
+smallest longer context may conservatively cover a shorter request. Sparse
+coverage never shrinks the largest runnable cohort. The complete covering
+curve is cached and invalidated when a direct CUDA observation changes it, so
+cost lookup does not add a per-row scan to the scheduling hot path. The
+contention-aware node-local decode refinement remains active above the build
+prior.
 
 ## Calibration and offline fleet aggregation tool
 
@@ -217,8 +239,15 @@ controlled-warmup E+D/P+D probes are implemented. None introduces a workload
 mode: local artifacts seed GPU action cost, while the live scheduler still
 decides from request/DAG/GPU state.
 
-The remaining promotion step is to replace the compatibility composition's
-static decode table with a generated build bundle after decision-identity and
-the full workload regression gates pass. Verified-idle production probing can
-remain opt-in; startup calibration is sufficient for deployments that require
-zero exploration on user traffic.
+Generated decode build costs now have decision-identity, sparse-coverage and
+deployment performance gates. Promotion remains explicit because a bundle
+that is merely compatible, rather than exact, must first pass those gates on
+the target deployment. Without the enable control, the bundle still seeds the
+Global cost oracle while decode batching retains the compatibility table.
+
+The Cosmos Reason2-2B RTX 3080 validation passed the three-percent promotion
+gate after covering-curve caching. The next generalization step is to package
+exact engine/plugin hashes so identical deployment artifacts can distinguish
+exact automatic promotion from compatible opt-in promotion. Verified-idle
+production probing can remain opt-in; startup calibration is sufficient for
+deployments that require zero exploration on user traffic.

@@ -370,29 +370,39 @@ rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(rt::LLMEngineConfig co
     return result;
 }
 
-void loadPhaseCostPrior(std::filesystem::path const& path, rt::PhaseDeploymentFingerprint const& deployment,
-    std::shared_ptr<rt::PhaseCostOracle> const& oracle, rt::PhaseCostScale scale = {})
+struct PhaseCostPriorLoadResult
+{
+    bool active{};
+    bool hasDecode{};
+};
+
+PhaseCostPriorLoadResult loadPhaseCostPrior(std::filesystem::path const& path,
+    rt::PhaseDeploymentFingerprint const& deployment, std::shared_ptr<rt::PhaseCostOracle> const& oracle,
+    rt::PhaseCostScale scale = {})
 {
     rt::PhaseCostBundle bundle;
     std::string error;
     if (!rt::phaseTryLoadCostBundle(path, bundle, error))
     {
         LOG_WARNING("Ignoring unreadable phase cost bundle %s: %s", path.c_str(), error.c_str());
-        return;
+        return {};
     }
     rt::PhaseCostCompatibility const compatibility = rt::phaseCostCompatibility(deployment, bundle.deployment);
     if (compatibility == rt::PhaseCostCompatibility::kIncompatible)
     {
         LOG_WARNING("Ignoring incompatible phase cost bundle %s", path.c_str());
-        return;
+        return {};
     }
     rt::PhaseCostBundleSource const source = bundle.source;
+    bool const hasDecode = std::any_of(bundle.records.begin(), bundle.records.end(),
+        [](rt::PhaseCostRecord const& record) { return record.key.kind == rt::PhaseGlobalActionKind::kDecode; });
     oracle->loadPrior(std::move(bundle), compatibility, scale);
     rt::PhaseCostHealthState const health = oracle->healthState();
     bool const expired
         = source == rt::PhaseCostBundleSource::kFleet ? health.fleetPriorExpired : health.buildPriorExpired;
     LOG_INFO("Loaded %s phase cost prior from %s (timing=%s)", rt::phaseCostCompatibilityName(compatibility),
         path.c_str(), expired ? "expired-fallback" : "active");
+    return {!expired, hasDecode};
 }
 
 void logPhaseCostAnchors(char const* stage, rt::PhaseCostAnchorState const& state)
@@ -1576,9 +1586,10 @@ int main(int argc, char** argv)
         {
             phaseCostScale.overlap = std::stof(value);
         }
+        PhaseCostPriorLoadResult buildCostBundle;
         if (char const* value = std::getenv("TRT_EDGELLM_PHASE_BUILD_COST_BUNDLE"))
         {
-            loadPhaseCostPrior(value, phaseCostDeployment, phaseCostOracle, phaseCostScale);
+            buildCostBundle = loadPhaseCostPrior(value, phaseCostDeployment, phaseCostOracle, phaseCostScale);
         }
         if (char const* value = std::getenv("TRT_EDGELLM_PHASE_FLEET_COST_BUNDLE"))
         {
@@ -1612,6 +1623,27 @@ int main(int argc, char** argv)
             }
             phaseCostOracle->attachJournal(
                 std::make_shared<rt::PhaseNodeCostJournal>(journalConfig, phaseCostDeployment));
+        }
+        bool const enableBuildBundleDecodeBatching
+            = std::getenv("TRT_EDGELLM_ENABLE_PHASE_BUNDLE_DECODE_BATCHING") != nullptr;
+        if (buildCostBundle.active && buildCostBundle.hasDecode && enableBuildBundleDecodeBatching
+            && std::getenv("TRT_EDGELLM_DISABLE_PHASE_BUNDLE_DECODE_BATCHING") == nullptr)
+        {
+            semanticSchedulerConfig.enableOracleDecodeBatching = true;
+            semanticSchedulerConfig.decodeBatchCosts.clear();
+            LOG_INFO(
+                "Promoted the active build cost bundle as the dynamic decode cost source; preserving local "
+                "contention-aware refinement");
+        }
+        else if (buildCostBundle.active && !buildCostBundle.hasDecode)
+        {
+            LOG_INFO("Keeping static decode batching costs because the active build bundle has no decode records");
+        }
+        else if (buildCostBundle.active && buildCostBundle.hasDecode && !enableBuildBundleDecodeBatching)
+        {
+            LOG_INFO(
+                "Keeping static decode batching costs until the build bundle passes the deployment promotion "
+                "gate");
         }
         semanticSchedulerConfig.globalCostOracle = phaseCostOracle;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
@@ -1942,6 +1974,11 @@ int main(int argc, char** argv)
                 : serverConfig.maxInFlightRequests;
             int32_t const warmupBatchLimit
                 = std::min(semanticSchedulerConfig.maxDecodeBatchSize, static_cast<int32_t>(warmupAdmissionLimit));
+            struct DecodeWarmupShape
+            {
+                int32_t batchSize{};
+                int32_t promptTokens{};
+            };
             std::vector<int32_t> requestedWarmupBatchSizes;
             if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"))
             {
@@ -1953,15 +1990,41 @@ int main(int argc, char** argv)
                     requestedWarmupBatchSizes.push_back(std::stoi(batchSize));
                 }
             }
-            std::vector<int32_t> const warmupBatchSizes = std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr
-                ? rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes))
-                : std::vector<int32_t>{};
+            std::vector<DecodeWarmupShape> warmupShapes;
+            if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_DECODE_SHAPES"))
+            {
+                std::stringstream stream(value);
+                std::string shape;
+                while (std::getline(stream, shape, ','))
+                {
+                    size_t const separator = shape.find(':');
+                    ELLM_CHECK(separator != std::string::npos && separator > 0U && separator + 1U < shape.size(),
+                        "Phase IPC decode warmup shape must be batch:prompt_tokens");
+                    DecodeWarmupShape const parsed{
+                        std::stoi(shape.substr(0U, separator)), std::stoi(shape.substr(separator + 1U))};
+                    ELLM_CHECK(parsed.batchSize > 0 && parsed.batchSize <= warmupBatchLimit,
+                        "Phase IPC decode warmup batch exceeds the active admission/profile limit");
+                    ELLM_CHECK(parsed.promptTokens > 0 && parsed.promptTokens + 4 <= config.maxKVCacheCapacity,
+                        "Phase IPC decode warmup prompt exceeds the KV capacity");
+                    warmupShapes.push_back(parsed);
+                }
+                ELLM_CHECK(!warmupShapes.empty(), "Phase IPC decode warmup shape list cannot be empty");
+            }
+            else if (std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr)
+            {
+                std::vector<int32_t> const warmupBatchSizes
+                    = rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes));
+                for (int32_t const batchSize : warmupBatchSizes)
+                {
+                    warmupShapes.push_back({batchSize, 0});
+                }
+            }
             bool const globalOverlapWarmup
                 = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                 && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP") == nullptr;
             bool const phaseCostCalibrationWarmup
                 = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
-                && !warmupBatchSizes.empty();
+                && !warmupShapes.empty();
             size_t globalOverlapWarmupSamples = 4U;
             if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_WARMUP_SAMPLES"))
             {
@@ -1969,23 +2032,40 @@ int main(int argc, char** argv)
             }
             ELLM_CHECK(!globalOverlapWarmup || globalOverlapWarmupSamples > 0U,
                 "Phase Global overlap warmup samples must be positive");
-            std::vector<int32_t> executionWarmupBatchSizes;
-            for (int32_t const batchSize : warmupBatchSizes)
+            size_t shapeWarmupSamples = globalOverlapWarmup ? globalOverlapWarmupSamples : 1U;
+            if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_SHAPE_SAMPLES"))
             {
-                size_t const repeats = globalOverlapWarmup ? globalOverlapWarmupSamples : 1U;
-                executionWarmupBatchSizes.insert(executionWarmupBatchSizes.end(), repeats, batchSize);
+                shapeWarmupSamples = static_cast<size_t>(std::stoull(value));
+            }
+            ELLM_CHECK(shapeWarmupSamples > 0U, "Phase IPC warmup shape sample count must be positive");
+            std::vector<DecodeWarmupShape> executionWarmupShapes;
+            for (DecodeWarmupShape const& shape : warmupShapes)
+            {
+                executionWarmupShapes.insert(executionWarmupShapes.end(), shapeWarmupSamples, shape);
             }
             phaseCostOracle->setCalibrationActive(phaseCostCalibrationWarmup);
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(globalOverlapWarmup);
             uint64_t warmupRequestId = 1000000;
             size_t warmedRequests{};
-            for (int32_t const batchSize : executionWarmupBatchSizes)
+            size_t warmupPollGuard = 100000000U;
+            if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_POLL_GUARD"))
             {
+                warmupPollGuard = static_cast<size_t>(std::stoull(value));
+            }
+            ELLM_CHECK(warmupPollGuard > 0U, "Phase IPC warmup poll guard must be positive");
+            for (DecodeWarmupShape const& shape : executionWarmupShapes)
+            {
+                int32_t const batchSize = shape.batchSize;
+                std::vector<int32_t> warmupPrompt = semanticPrompts.at(20000);
+                if (shape.promptTokens > 0)
+                {
+                    ELLM_CHECK(!warmupPrompt.empty(), "Phase IPC warmup seed prompt cannot be empty");
+                    warmupPrompt.resize(static_cast<size_t>(shape.promptTokens), warmupPrompt.back());
+                }
                 for (int32_t row{}; row < batchSize; ++row)
                 {
                     int32_t const outputTokens = globalOverlapWarmup ? 4 : 2;
-                    auto const submission
-                        = semanticServer.submit(warmupRequestId++, semanticPrompts.at(20000), outputTokens);
+                    auto const submission = semanticServer.submit(warmupRequestId++, warmupPrompt, outputTokens);
                     ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
                         "Phase IPC shape warmup request was not admitted");
                 }
@@ -2016,12 +2096,12 @@ int main(int argc, char** argv)
                         static_cast<size_t>(semanticSchedulerConfig.maxPrefillBatchSize)});
                     for (size_t row{}; row < overlapWarmupRows; ++row)
                     {
-                        auto const submission = semanticServer.submit(warmupRequestId++, semanticPrompts.at(20000), 2);
+                        auto const submission = semanticServer.submit(warmupRequestId++, warmupPrompt, 2);
                         ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
                             "Phase Global overlap warmup request was not admitted");
                     }
                 }
-                semanticServer.runUntilIdle(1000000);
+                semanticServer.runUntilIdle(warmupPollGuard);
                 size_t completed{};
                 while (semanticServer.tryPopCompletion().has_value())
                 {
@@ -2063,7 +2143,7 @@ int main(int argc, char** argv)
                 semanticCoordinator.setGraphCaptureMinObservations(graphCaptureMinObservations);
             }
             LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
-                executionWarmupBatchSizes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
+                executionWarmupShapes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
                 warmupTelemetry.globalSafeProbeCount);
             logPhaseCostAnchors("post-warmup", phaseCostOracle->anchorState());
             logPhaseCostHealth("post-warmup", phaseCostOracle->healthState());

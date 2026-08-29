@@ -2660,7 +2660,24 @@ void PhaseQueueScheduler::setGlobalExecutionVariantSupplier(
 
 size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept
 {
-    if (targetUs <= 0.0 || mConfig.decodeBatchCosts.empty())
+    if (targetUs <= 0.0)
+    {
+        return static_cast<size_t>(mConfig.maxDecodeBatchSize);
+    }
+    if (mConfig.enableOracleDecodeBatching && oracleDecodeP95(mConfig.maxDecodeBatchSize, maxContextLength).has_value())
+    {
+        size_t limit{1U};
+        for (int32_t rows = 1; rows <= mConfig.maxDecodeBatchSize; ++rows)
+        {
+            std::optional<float> const cost = oracleDecodeP95(rows, maxContextLength);
+            if (cost.has_value() && static_cast<double>(*cost) * 1000.0 <= targetUs)
+            {
+                limit = static_cast<size_t>(rows);
+            }
+        }
+        return limit;
+    }
+    if (mConfig.decodeBatchCosts.empty())
     {
         return static_cast<size_t>(mConfig.maxDecodeBatchSize);
     }
@@ -3089,7 +3106,8 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const
 {
     int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued));
-    if (available <= 1 || !mConfig.enableDynamicDecodeBatching || mConfig.decodeBatchCosts.empty())
+    bool const hasDecodeCostSource = mConfig.enableOracleDecodeBatching || !mConfig.decodeBatchCosts.empty();
+    if (available <= 1 || !mConfig.enableDynamicDecodeBatching || !hasDecodeCostSource)
     {
         predictedDrainTurns = available > 0 ? 1 : 0;
         return available;
@@ -3115,45 +3133,77 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
             = std::max(maxContextLengths[static_cast<size_t>(runnableRows - 1)], item->tokenCount);
     }
     std::vector<Candidate> candidates;
+    bool oracleCoverage{};
+    if (mConfig.enableOracleDecodeBatching)
+    {
+        for (int32_t rows = 1; rows <= available; ++rows)
+        {
+            std::optional<float> const cost = oracleDecodeP95(rows, maxContextLengths[static_cast<size_t>(rows)]);
+            if (!cost.has_value())
+            {
+                continue;
+            }
+            candidates.push_back({rows, *cost, maxContextLengths[static_cast<size_t>(rows)],
+                contextTotals[static_cast<size_t>(rows)], rows});
+        }
+        oracleCoverage = std::any_of(candidates.begin(), candidates.end(),
+            [available](Candidate const& candidate) { return candidate.batchSize == available; });
+        if (!oracleCoverage)
+        {
+            // Sparse portable or node-local coverage is not evidence that a
+            // smaller cohort is better. Fall back to the compatibility table
+            // when present, otherwise preserve largest-available dispatch.
+            candidates.clear();
+            if (mConfig.decodeBatchCosts.empty())
+            {
+                predictedDrainTurns = available > 0 ? 1 : 0;
+                return available;
+            }
+        }
+    }
     int32_t coveringConfiguredBatch{std::numeric_limits<int32_t>::max()};
     int32_t largestConfiguredBatch{};
-    for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+    if (!oracleCoverage)
     {
-        largestConfiguredBatch = std::max(largestConfiguredBatch, cost.batchSize);
-        if (cost.batchSize >= available)
+        for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {
-            coveringConfiguredBatch = std::min(coveringConfiguredBatch, cost.batchSize);
+            largestConfiguredBatch = std::max(largestConfiguredBatch, cost.batchSize);
+            if (cost.batchSize >= available)
+            {
+                coveringConfiguredBatch = std::min(coveringConfiguredBatch, cost.batchSize);
+            }
         }
-    }
-    if (coveringConfiguredBatch == std::numeric_limits<int32_t>::max())
-    {
-        coveringConfiguredBatch = largestConfiguredBatch;
-    }
-    for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
-    {
-        int32_t const dispatchedBatchSize = std::min(cost.batchSize, available);
-        int64_t const totalContextTokens = contextTotals[static_cast<size_t>(dispatchedBatchSize)];
-        int32_t const maxContextLength = maxContextLengths[static_cast<size_t>(dispatchedBatchSize)];
-        int64_t const totalContextLimit = cost.maxTotalContextTokens > 0
-            ? cost.maxTotalContextTokens
-            : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
-        if (cost.maxContextLength < maxContextLength || totalContextLimit < totalContextTokens)
+        if (coveringConfiguredBatch == std::numeric_limits<int32_t>::max())
         {
-            continue;
+            coveringConfiguredBatch = largestConfiguredBatch;
         }
-        auto existing = std::find_if(candidates.begin(), candidates.end(),
-            [&](Candidate const& candidate) { return candidate.batchSize == dispatchedBatchSize; });
-        if (existing == candidates.end())
+        for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {
-            candidates.push_back(
-                {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, totalContextLimit, cost.batchSize});
-        }
-        else if (cost.batchSize < existing->profiledBatchLimit
-            || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength < existing->contextLimit)
-            || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength == existing->contextLimit
-                && totalContextLimit < existing->totalContextLimit))
-        {
-            *existing = {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, totalContextLimit, cost.batchSize};
+            int32_t const dispatchedBatchSize = std::min(cost.batchSize, available);
+            int64_t const totalContextTokens = contextTotals[static_cast<size_t>(dispatchedBatchSize)];
+            int32_t const maxContextLength = maxContextLengths[static_cast<size_t>(dispatchedBatchSize)];
+            int64_t const totalContextLimit = cost.maxTotalContextTokens > 0
+                ? cost.maxTotalContextTokens
+                : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
+            if (cost.maxContextLength < maxContextLength || totalContextLimit < totalContextTokens)
+            {
+                continue;
+            }
+            auto existing = std::find_if(candidates.begin(), candidates.end(),
+                [&](Candidate const& candidate) { return candidate.batchSize == dispatchedBatchSize; });
+            if (existing == candidates.end())
+            {
+                candidates.push_back(
+                    {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, totalContextLimit, cost.batchSize});
+            }
+            else if (cost.batchSize < existing->profiledBatchLimit
+                || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength < existing->contextLimit)
+                || (cost.batchSize == existing->profiledBatchLimit && cost.maxContextLength == existing->contextLimit
+                    && totalContextLimit < existing->totalContextLimit))
+            {
+                *existing
+                    = {dispatchedBatchSize, cost.p95GpuMs, cost.maxContextLength, totalContextLimit, cost.batchSize};
+            }
         }
     }
     if (candidates.empty())
@@ -3161,10 +3211,10 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         predictedDrainTurns = available > 0 ? 1 : 0;
         return available;
     }
-    bool const largestShapeCovered
-        = std::any_of(candidates.begin(), candidates.end(), [coveringConfiguredBatch](Candidate const& candidate) {
-              return candidate.profiledBatchLimit == coveringConfiguredBatch;
-          });
+    bool const largestShapeCovered = oracleCoverage
+        || std::any_of(candidates.begin(), candidates.end(), [coveringConfiguredBatch](Candidate const& candidate) {
+               return candidate.profiledBatchLimit == coveringConfiguredBatch;
+           });
     if (!largestShapeCovered)
     {
         // A smaller batch measured at this context is not evidence that a
@@ -3310,6 +3360,29 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     predictedDrainGpuMs = estimatedDrainCostMs(*minimumDrainCandidate);
     predictedDrainTurns = estimatedDrainTurns(*minimumDrainCandidate);
     return minimumDrainCandidate->batchSize;
+}
+
+std::optional<float> PhaseQueueScheduler::oracleDecodeP95(int32_t batchSize, int32_t maxContextLength) const
+{
+    if (!mConfig.enableOracleDecodeBatching || batchSize <= 0 || maxContextLength < 0)
+    {
+        return std::nullopt;
+    }
+    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucket = (maxContextLength + contextBucketTokens - 1) / contextBucketTokens;
+    PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batchSize, 0, 1, contextBucket, 0};
+    key.executionVariant
+        = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, 0) : PhaseExecutionVariant::kEager;
+    std::optional<PhaseGlobalCostEstimate> estimate = mGlobalCostOracle->estimate(key);
+    if (!estimate.has_value())
+    {
+        estimate = mGlobalCostOracle->estimatePrimaryBatchCoveringContext(key);
+    }
+    if (!estimate.has_value())
+    {
+        return std::nullopt;
+    }
+    return std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs);
 }
 
 uint64_t PhaseQueueScheduler::onlineDecodeCostKey(

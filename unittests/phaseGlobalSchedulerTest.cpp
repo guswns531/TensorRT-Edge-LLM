@@ -465,6 +465,28 @@ TEST(PhaseGlobalCostModelTest, InterpolatesOnlyBetweenCompatibleObservedBatchSiz
     EXPECT_FALSE(model.estimateInterpolatedPrimaryBatch(differentChunk).has_value());
 }
 
+TEST(PhaseGlobalCostModelTest, UsesSmallestObservedContextThatCoversDecodeRequest)
+{
+    PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
+    PhaseGlobalActionKey largerContext{PhaseGlobalActionKind::kDecode, 4, 0, 1, 4, 0};
+    PhaseGlobalActionKey largestContext = largerContext;
+    largestContext.primaryContextBucket = 8;
+    model.observe(largerContext, {8.0F, 3.0F});
+    model.observe(largestContext, {12.0F, 5.0F});
+
+    PhaseGlobalActionKey requested = largerContext;
+    requested.primaryContextBucket = 2;
+    std::optional<PhaseGlobalCostEstimate> const estimate = model.estimatePrimaryBatchCoveringContext(requested);
+
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 3.0F);
+    requested.primaryContextBucket = 5;
+    ASSERT_TRUE(model.estimatePrimaryBatchCoveringContext(requested).has_value());
+    EXPECT_FLOAT_EQ(model.estimatePrimaryBatchCoveringContext(requested)->makespanMedianMs, 5.0F);
+    requested.primaryContextBucket = 9;
+    EXPECT_FALSE(model.estimatePrimaryBatchCoveringContext(requested).has_value());
+}
+
 TEST(PhaseGlobalCostModelTest, SharesOverlapSamplesWithinConservativeShapeBuckets)
 {
     PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});

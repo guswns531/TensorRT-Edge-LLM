@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace trt_edgellm::rt
 {
@@ -180,6 +181,9 @@ public:
     //! Interpolate a missing primary batch size only when direct observations
     //! with otherwise identical execution keys bracket it on both sides.
     std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(PhaseGlobalActionKey const& key) const;
+    //! Use the smallest observed primary context bucket that conservatively
+    //! covers the requested bucket, with primary-batch interpolation inside it.
+    std::optional<PhaseGlobalCostEstimate> estimatePrimaryBatchCoveringContext(PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
     bool overlapEligible(PhaseGlobalActionKey const& key) const;
     void reset();
@@ -202,7 +206,11 @@ private:
     //! state remains identical. Samples are read-only in those previews, so
     //! share them until an actual observation mutates one copy.
     std::shared_ptr<SampleMap> mSamples;
+    //! One scheduling decision queries many decode batch sizes at the same
+    //! context. Cache that conservative covering curve until observations
+    //! change instead of rescanning every action record once per row.
+    mutable std::unordered_map<PhaseGlobalActionKey, std::vector<std::optional<PhaseGlobalCostEstimate>>, KeyHash>
+        mCoveringContextCache;
 };
 
 } // namespace trt_edgellm::rt
-

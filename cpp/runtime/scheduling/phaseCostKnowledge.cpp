@@ -634,6 +634,25 @@ std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimateInterpolatedPrim
     return local;
 }
 
+std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrimaryBatchCoveringContext(
+    PhaseGlobalActionKey const& key) const
+{
+    std::optional<PhaseGlobalCostEstimate> const local = mLocal.estimatePrimaryBatchCoveringContext(key);
+    if (local.has_value() && local->sampleCount >= mConfig.sufficientLocalSamples)
+    {
+        return local;
+    }
+    if (std::optional<PhaseGlobalCostEstimate> const fleet = estimatePrior(mFleet, key, true, true, false, true))
+    {
+        return fleet;
+    }
+    if (std::optional<PhaseGlobalCostEstimate> const build = estimatePrior(mBuild, key, true, true, false, true))
+    {
+        return build;
+    }
+    return local;
+}
+
 PhaseGlobalOverlapCostDiagnostic PhaseCostOracle::overlapDiagnostic(PhaseGlobalActionKey const& key) const
 {
     std::optional<PhaseGlobalCostEstimate> const estimateValue = estimate(key);
@@ -792,15 +811,16 @@ PhaseCostHealthState PhaseCostOracle::healthState() const
 }
 
 std::optional<PhaseGlobalCostEstimate> PhaseCostOracle::estimatePrior(std::optional<PriorLayer> const& layer,
-    PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor, bool ignoreDrift) const
+    PhaseGlobalActionKey const& key, bool interpolate, bool applyAnchor, bool ignoreDrift, bool coverContext) const
 {
     PhaseCostPhaseDriftState const* drift = phaseDriftState(mHealthState.drift, key.kind);
     if (!layer.has_value() || layer->expired || (!ignoreDrift && drift != nullptr && drift->localOnly))
     {
         return std::nullopt;
     }
-    std::optional<PhaseGlobalCostEstimate> estimateValue
-        = interpolate ? layer->model.estimateInterpolatedPrimaryBatch(key) : layer->model.estimate(key);
+    std::optional<PhaseGlobalCostEstimate> estimateValue = coverContext
+        ? layer->model.estimatePrimaryBatchCoveringContext(key)
+        : (interpolate ? layer->model.estimateInterpolatedPrimaryBatch(key) : layer->model.estimate(key));
     if (!estimateValue.has_value())
     {
         return std::nullopt;

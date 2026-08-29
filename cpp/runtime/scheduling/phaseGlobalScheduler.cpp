@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <tuple>
 
 namespace trt_edgellm::rt
@@ -469,6 +470,7 @@ void PhaseGlobalCostModel::observe(PhaseGlobalActionKey const& key, PhaseGlobalC
     {
         samples.values.pop_front();
     }
+    mCoveringContextCache.clear();
 }
 
 std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimate(PhaseGlobalActionKey const& key) const
@@ -556,6 +558,88 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolate
     return result;
 }
 
+std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryBatchCoveringContext(
+    PhaseGlobalActionKey const& key) const
+{
+    PhaseGlobalActionKey const target = phaseGlobalCanonicalOverlapCostKey(key);
+    PhaseGlobalActionKey cacheKey = target;
+    cacheKey.primaryBatchSize = 0;
+    auto const cached = mCoveringContextCache.find(cacheKey);
+    if (cached != mCoveringContextCache.end())
+    {
+        size_t const batchIndex = static_cast<size_t>(std::max(target.primaryBatchSize, 0));
+        return batchIndex < cached->second.size() ? cached->second[batchIndex] : std::nullopt;
+    }
+
+    std::map<int32_t, std::map<int32_t, PhaseGlobalCostEstimate>> estimatesByContext;
+    int32_t maxBatchSize{};
+    for (auto const& [observedKey, samples] : *mSamples)
+    {
+        if (samples.values.empty() || observedKey.kind != target.kind
+            || observedKey.secondaryBatchSize != target.secondaryBatchSize
+            || observedKey.chunkLength != target.chunkLength
+            || observedKey.primaryContextBucket < target.primaryContextBucket
+            || observedKey.secondaryContextBucket != target.secondaryContextBucket
+            || observedKey.executionVariant != target.executionVariant
+            || observedKey.residualAugmentation != target.residualAugmentation)
+        {
+            continue;
+        }
+        std::optional<PhaseGlobalCostEstimate> const observed = estimate(observedKey);
+        if (!observed.has_value())
+        {
+            continue;
+        }
+        estimatesByContext[observedKey.primaryContextBucket][observedKey.primaryBatchSize] = *observed;
+        maxBatchSize = std::max(maxBatchSize, observedKey.primaryBatchSize);
+    }
+
+    std::vector<std::optional<PhaseGlobalCostEstimate>> curve(static_cast<size_t>(maxBatchSize) + 1U);
+    for (int32_t batchSize = 1; batchSize <= maxBatchSize; ++batchSize)
+    {
+        for (auto const& [contextBucket, batchEstimates] : estimatesByContext)
+        {
+            if (contextBucket < target.primaryContextBucket)
+            {
+                continue;
+            }
+            auto const upper = batchEstimates.lower_bound(batchSize);
+            if (upper != batchEstimates.end() && upper->first == batchSize)
+            {
+                curve[static_cast<size_t>(batchSize)] = upper->second;
+                break;
+            }
+            if (upper == batchEstimates.begin() || upper == batchEstimates.end())
+            {
+                continue;
+            }
+            auto const lower = std::prev(upper);
+            float const span = static_cast<float>(upper->first - lower->first);
+            float const alpha = static_cast<float>(batchSize - lower->first) / span;
+            auto interpolate = [alpha](float lowerValue, float upperValue) {
+                return lowerValue + alpha * (upperValue - lowerValue);
+            };
+            PhaseGlobalCostEstimate interpolated;
+            interpolated.sampleCount = std::min(lower->second.sampleCount, upper->second.sampleCount);
+            interpolated.referenceWorkMedianMs
+                = interpolate(lower->second.referenceWorkMedianMs, upper->second.referenceWorkMedianMs);
+            interpolated.makespanMedianMs = interpolate(lower->second.makespanMedianMs, upper->second.makespanMedianMs);
+            float const endpointUncertainty = std::max(lower->second.uncertaintyMs, upper->second.uncertaintyMs);
+            float const interpolationUncertainty
+                = std::abs(upper->second.makespanMedianMs - lower->second.makespanMedianMs) * alpha * (1.0F - alpha);
+            interpolated.uncertaintyMs = endpointUncertainty + interpolationUncertainty;
+            interpolated.makespanP95Ms = std::max(interpolate(lower->second.makespanP95Ms, upper->second.makespanP95Ms),
+                interpolated.makespanMedianMs + interpolated.uncertaintyMs);
+            curve[static_cast<size_t>(batchSize)] = interpolated;
+            break;
+        }
+    }
+    auto const [inserted, unused] = mCoveringContextCache.emplace(cacheKey, std::move(curve));
+    static_cast<void>(unused);
+    size_t const batchIndex = static_cast<size_t>(std::max(target.primaryBatchSize, 0));
+    return batchIndex < inserted->second.size() ? inserted->second[batchIndex] : std::nullopt;
+}
+
 bool PhaseGlobalCostModel::overlapEligible(PhaseGlobalActionKey const& key) const
 {
     return !isOverlap(key.kind) || overlapDiagnostic(key).status == PhaseGlobalOverlapCostStatus::kEligible;
@@ -584,6 +668,7 @@ PhaseGlobalOverlapCostDiagnostic PhaseGlobalCostModel::overlapDiagnostic(PhaseGl
 
 void PhaseGlobalCostModel::reset()
 {
+    mCoveringContextCache.clear();
     if (mSamples.unique())
     {
         mSamples->clear();
