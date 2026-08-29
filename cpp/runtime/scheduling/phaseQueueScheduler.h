@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "runtime/phase/cost/phaseCostOracle.h"
+#include "runtime/phase/cost/phaseRuntimeCostTracker.h"
 #include "runtime/phase/mechanism/phaseReadySnapshot.h"
 #include "runtime/phase/policy/phaseGlobalScheduler.h"
 
@@ -210,8 +210,8 @@ struct PhaseSchedulerTelemetry
     size_t sampleCount{};
     size_t overlapSampleCount{};
     size_t decodeTpotSampleCount{};
-    size_t onlineDecodeCostSampleCount{};
-    size_t onlineDecodeCostBucketCount{};
+    size_t runtimeDecodeCostSampleCount{};
+    size_t runtimeDecodeCostBucketCount{};
     size_t encoderContendedDecodeCostSampleCount{};
     size_t prefillContendedDecodeCostSampleCount{};
     float prefillGpuMsPerToken{};
@@ -349,9 +349,9 @@ struct PhaseQueueSchedulerConfig
     PhaseGlobalSelectionMode globalSelectionMode{PhaseGlobalSelectionMode::kProfileFree};
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};
-    //! Optional deployment-scoped oracle shared by E/P/D schedulers. A private
-    //! in-memory oracle is created when this is null.
-    std::shared_ptr<PhaseCostOracle> globalCostOracle;
+    //! Optional process-local tracker shared by E/P/D schedulers. A private
+    //! in-memory tracker is created when this is null.
+    std::shared_ptr<PhaseRuntimeCostTracker> runtimeCostTracker;
     //! Conservative cold-start bounds used until direct CUDA observations exist.
     float globalColdPrefillMsPerToken{0.02F};
     float globalColdDecodeMs{2.0F};
@@ -418,28 +418,27 @@ struct PhaseQueueSchedulerConfig
     //! Zero preserves the kernel-only decode cost model.
     float decodeRowReplacementCostMs{};
     std::vector<PhaseDecodeBatchCost> decodeBatchCosts;
-    //! Use deployment-local PhaseCostOracle decode records as the dynamic
-    //! batching cost source. Sparse coverage never shrinks the runnable batch.
-    bool enableOracleDecodeBatching{};
-    //! Refine static decode costs from confident, context-bucketed decode-only observations.
-    bool enableOnlineDecodeCostLearning{};
-    size_t onlineDecodeCostMinSamples{8U};
-    size_t onlineDecodeCostWindow{32U};
-    int32_t onlineDecodeContextBucketTokens{512};
-    //! Bound an online p95 correction relative to its static prior.
-    float onlineDecodeCostMaxAdjustmentRatio{0.25F};
+    //! Use confident process-local decode observations as the dynamic batching
+    //! cost source. Sparse coverage never shrinks the runnable batch.
+    bool enableMeasuredDecodeBatching{};
+    //! Refine static decode costs from context-bucketed decode-component observations.
+    bool enableDecodeComponentObservation{};
+    size_t decodeComponentMinSamples{8U};
+    size_t decodeComponentWindow{32U};
+    int32_t runtimeDecodeContextBucketTokens{512};
+    //! Bound a runtime p95 correction relative to its static prior.
+    float decodeComponentMaxAdjustmentRatio{0.25F};
     //! Contended observations may be much slower than an isolated static prior.
     //! This multiplier bounds their upper correction without polluting isolated buckets.
-    float onlineDecodeContentionCostMaxMultiplier{16.0F};
+    float decodeContentionCostMaxMultiplier{16.0F};
     //! Switch from deadline fitting to throughput-efficient backlog recovery
     //! before the TPOT deadline is fully exhausted.
     float decodeRecoveryPressureThreshold{1.0F};
     //! Select a prefill row count from profiled p95 cost and decode slack.
     bool enableDynamicPrefillBatching{};
-    //! Use exact deployment-local prefill records for dynamic P batch formation.
-    //! Producer class is part of the cost key so text and external-prefill
-    //! observations cannot contaminate each other.
-    bool enableOraclePrefillBatching{};
+    //! Use confident process-local prefill observations for dynamic P batch
+    //! formation. Producer class is part of the cost key.
+    bool enableMeasuredPrefillBatching{};
     //! Minimum dynamic prefill batch while at least this many compatible rows exist.
     int32_t minDynamicPrefillBatchSize{1};
     //! Let an expired TTFT override decode interference while decode remains within SLO.
@@ -708,15 +707,15 @@ public:
         std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)> supplier);
     //! Largest dense decode cohort whose covered p95 GPU step fits one TPOT target.
     size_t decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept;
-    //! Keep online decode refinement out of latency mode while retaining learned samples.
-    void setOnlineDecodeCostLearningActive(bool active) noexcept;
+    //! Keep runtime decode refinement out of latency mode while retaining recent samples.
+    void setDecodeComponentObservationActive(bool active) noexcept;
     //! Update a scheduler-external resource drain hint. Disabled schedulers retain legacy decisions.
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Temporarily exclude prefill dispatch while an external encoder owns overlapping context memory.
     void setPrefillDispatchBlocked(bool blocked) noexcept;
     //! Temporarily exclude every new P/D dispatch while an external phase crosses a latency deadline.
     void setDispatchBlocked(bool blocked) noexcept;
-    //! Identify external vision-encoder contention for decode cost learning and selection.
+    //! Identify external vision-encoder contention for decode cost observation and selection.
     void setExternalEncoderActive(bool active) noexcept;
     //! Publish known host-side producers so Global can price a bounded
     //! D-first prefill-formation opportunity without a workload label.
@@ -724,14 +723,14 @@ public:
     //! Publish only producer rows unlocked by one concrete completion event.
     void setPendingPrefillProducerRows(size_t textRows, size_t externalRows, double predictedWaitUs,
         double waitUncertaintyUs, uint64_t eventId) noexcept;
-    //! Reset learned scheduling history between benchmark epochs.
+    //! Reset recent scheduling history between benchmark epochs.
     //!
     //! Queue ownership is unchanged. The scheduler must be idle so a reset
     //! cannot invalidate fairness or overlap debt for active requests.
     //! Reset queue-policy history between serving epochs. Shape warmup may
     //! preserve direct Global CUDA observations while still clearing request
     //! age, fairness, and admission state.
-    void resetHistory(bool preserveGlobalCostModel = false);
+    void resetHistory(bool preserveRuntimeCosts = false);
 
     //! Permit deterministic synthetic startup traffic to collect unknown P+D
     //! costs without applying production-request slack. Disable before serving.
@@ -760,15 +759,13 @@ private:
         PhaseQueueSnapshot const& snapshot, PhaseDispatchKind baseline, bool& applied) const noexcept;
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot, bool concurrentPrefill,
         float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const;
-    uint64_t onlineDecodeCostKey(
-        int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const noexcept;
-    std::optional<float> onlineDecodeP95(
+    std::optional<float> decodeComponentP95(
         int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const;
     std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const;
     std::vector<PhaseWorkItem const*> decodeCandidateRows(int32_t maxRows) const;
     int32_t decodeCandidateReplacementRows(int32_t maxRows) const;
-    std::optional<float> oracleDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
-    std::optional<float> oraclePrefillP95(int32_t batchSize, int32_t chunkLength, int32_t maxPastKVLength,
+    std::optional<float> measuredDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
+    std::optional<float> measuredPrefillP95(int32_t batchSize, int32_t chunkLength, int32_t maxPastKVLength,
         PhasePrefillClass prefillClass, int32_t usefulTokens) const;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
@@ -789,7 +786,7 @@ private:
 
     PhaseQueueSchedulerConfig mConfig;
     PhaseGlobalScheduler mGlobalScheduler;
-    std::shared_ptr<PhaseCostOracle> mGlobalCostOracle;
+    std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
     std::deque<PhaseWorkItem> mPrefillQueue;
     std::deque<PhaseWorkItem> mDecodeQueue;
     std::unordered_set<uint64_t> mActiveRequestIds;
@@ -797,13 +794,9 @@ private:
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
     PhaseSchedulerTelemetry mTelemetry;
     using RecentDecodeTpot = std::deque<double>;
-    using OnlineDecodeGpuSamples = std::unordered_map<uint64_t, std::deque<float>>;
-    //! Mechanism previews only read learned histories. Share these potentially
-    //! large windows across exact scheduler copies and detach before a real
-    //! completion observation changes them.
+    //! Mechanism previews only read recent histories through the shared tracker.
     std::shared_ptr<RecentDecodeTpot> mRecentDecodeTpotUs;
-    std::shared_ptr<OnlineDecodeGpuSamples> mOnlineDecodeGpuMs;
-    bool mOnlineDecodeCostLearningActive{};
+    bool mDecodeComponentObservationActive{};
     bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};
     int32_t mConsecutiveOverlapBatches{};

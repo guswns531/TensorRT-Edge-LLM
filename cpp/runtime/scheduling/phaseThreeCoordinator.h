@@ -94,8 +94,8 @@ struct PhaseThreeCoordinatorConfig
     PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};
-    //! Share one deployment-scoped E/P/D cost oracle with the downstream server.
-    std::shared_ptr<PhaseCostOracle> globalCostOracle;
+    //! Share one process-local E/P/D cost tracker with the downstream server.
+    std::shared_ptr<PhaseRuntimeCostTracker> runtimeCostTracker;
     double globalVisionPrefillColdStartUs{50000.0};
     //! Zero disables production-request exploration; enable only for controlled warm-up probes.
     float globalSafeProbeSlackMultiplier{};
@@ -514,7 +514,7 @@ private:
     IndependentPhaseAsyncServer& mServer;
     PhaseThreeCoordinatorConfig mConfig;
     PhaseGlobalScheduler mGlobalScheduler;
-    std::shared_ptr<PhaseCostOracle> mGlobalCostOracle;
+    std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
     PhaseMemoryBroker mMemoryBroker;
     std::deque<PendingVisionRequest> mPending;
     std::vector<PendingVisionRequest> mEncoding;

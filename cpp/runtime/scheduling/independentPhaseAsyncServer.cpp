@@ -432,7 +432,7 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
             mConfig.latencyInFlightRequests, mConfig.maxInFlightRequests, mConfig.adaptiveAdmissionTpotBudgetUs);
         mThroughputMode = mAdaptiveAdmissionLimit > mConfig.latencyInFlightRequests;
     }
-    mCoordinator.scheduler().setOnlineDecodeCostLearningActive(!mConfig.enableAdaptiveAdmission || mThroughputMode);
+    mCoordinator.scheduler().setDecodeComponentObservationActive(!mConfig.enableAdaptiveAdmission || mThroughputMode);
 }
 
 IndependentPhaseAsyncServer::~IndependentPhaseAsyncServer() noexcept
@@ -1226,7 +1226,7 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
             }
             mLastAdmissionDecisionSample = telemetry.sampleCount;
         }
-        mCoordinator.scheduler().setOnlineDecodeCostLearningActive(mThroughputMode);
+        mCoordinator.scheduler().setDecodeComponentObservationActive(mThroughputMode);
         return;
     }
     bool const next = nextAdaptiveThroughputMode(mThroughputMode, mPendingRequests.size(), mRequests.size(),
@@ -1236,7 +1236,7 @@ void IndependentPhaseAsyncServer::updateAdaptiveAdmissionMode() noexcept
         mThroughputMode = next;
         ++mThroughputModeTransitionCount;
     }
-    mCoordinator.scheduler().setOnlineDecodeCostLearningActive(mThroughputMode);
+    mCoordinator.scheduler().setDecodeComponentObservationActive(mThroughputMode);
 }
 
 void IndependentPhaseAsyncServer::runUntilIdle(size_t maxPolls)

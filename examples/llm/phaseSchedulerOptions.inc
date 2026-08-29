@@ -134,8 +134,12 @@
         bool const forceDynamicDecode = std::getenv("TRT_EDGELLM_ENABLE_DYNAMIC_DECODE") != nullptr;
         semanticSchedulerConfig.enableDynamicDecodeBatching = forceDynamicDecode
             || (config.packedPrefill && std::getenv("TRT_EDGELLM_DISABLE_DYNAMIC_DECODE") == nullptr);
-        semanticSchedulerConfig.enableOnlineDecodeCostLearning = semanticSchedulerConfig.enableDynamicDecodeBatching
-            && std::getenv("TRT_EDGELLM_DISABLE_ONLINE_COST") == nullptr;
+        semanticSchedulerConfig.enableMeasuredDecodeBatching
+            = std::getenv("TRT_EDGELLM_ENABLE_MEASURED_DECODE_BATCHING") != nullptr;
+        semanticSchedulerConfig.enableMeasuredPrefillBatching
+            = std::getenv("TRT_EDGELLM_ENABLE_MEASURED_PREFILL_BATCHING") != nullptr;
+        semanticSchedulerConfig.enableDecodeComponentObservation = semanticSchedulerConfig.enableDynamicDecodeBatching
+            && std::getenv("TRT_EDGELLM_DISABLE_RUNTIME_COST_OBSERVATION") == nullptr;
         bool const asymmetricDecodeStaging = maxStableSlots > semanticSchedulerConfig.maxDecodeBatchSize
             && semanticSchedulerConfig.maxDecodeBatchSize > semanticSchedulerConfig.maxPrefillBatchSize;
         semanticSchedulerConfig.enableDecodeCohortBatching = semanticSchedulerConfig.enableDynamicDecodeBatching

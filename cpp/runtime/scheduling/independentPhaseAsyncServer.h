@@ -382,7 +382,7 @@ public:
     void setPrefillDispatchBlocked(bool blocked) noexcept;
     //! Exclude or restore every new prefill/decode dispatch while an external phase owns the GPU boundary.
     void setDispatchBlocked(bool blocked) noexcept;
-    //! Identify active external encoder execution for contention-aware decode cost learning.
+    //! Identify active external encoder execution for contention-aware decode timing.
     void setExternalEncoderActive(bool active) noexcept;
     PhaseDrainPreference activeDrainPreference() const noexcept;
     size_t drainPreferenceTransitionCount() const noexcept;

@@ -327,154 +327,6 @@ void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoord
     config.enableCostAwareEncoderBatching = true;
 }
 
-rt::PhaseDeploymentFingerprint phaseDeploymentFingerprint(
-    rt::LLMEngineConfig const& config, std::filesystem::path const& engineDir)
-{
-    rt::PhaseDeploymentFingerprint result;
-    auto const environment = [](char const* name) {
-        char const* value = std::getenv(name);
-        return value != nullptr ? std::string(value) : std::string{};
-    };
-    result.modelHash = environment("TRT_EDGELLM_PHASE_MODEL_HASH");
-    result.onnxHash = environment("TRT_EDGELLM_PHASE_ONNX_HASH");
-    std::filesystem::path const configPath = engineDir / "config.json";
-    std::filesystem::path const enginePath = engineDir / "llm.engine";
-    std::filesystem::path const externalWeightPath = engineDir / "embedding.safetensors";
-    result.configHash = rt::phaseCostFileSha256(configPath);
-    result.engineHash = environment("TRT_EDGELLM_PHASE_ENGINE_HASH");
-    if (result.engineHash.empty())
-    {
-        result.engineHash = rt::phaseCostFileSha256(enginePath);
-    }
-    result.externalWeightHash = environment("TRT_EDGELLM_PHASE_EXTERNAL_WEIGHT_HASH");
-    if (result.externalWeightHash.empty() && std::filesystem::is_regular_file(externalWeightPath))
-    {
-        result.externalWeightHash = rt::phaseCostFileSha256(externalWeightPath);
-    }
-    result.precision = environment("TRT_EDGELLM_PHASE_PRECISION");
-    result.kvDtype = getDataTypeString(config.kvCacheDtype);
-    result.software.pluginHash = environment("TRT_EDGELLM_PHASE_PLUGIN_HASH");
-    std::filesystem::path const pluginPath = environment("EDGELLM_PLUGIN_PATH").empty()
-        ? std::filesystem::path{"build/libNvInfer_edgellm_plugin.so"}
-        : std::filesystem::path{environment("EDGELLM_PLUGIN_PATH")};
-    if (result.software.pluginHash.empty() && std::filesystem::is_regular_file(pluginPath))
-    {
-        result.software.pluginHash = rt::phaseCostFileSha256(pluginPath);
-    }
-    result.software.tensorrtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
-        + std::to_string(NV_TENSORRT_PATCH);
-    int32_t cudaRuntimeVersion{};
-    int32_t cudaDriverVersion{};
-    CUDA_CHECK(cudaRuntimeGetVersion(&cudaRuntimeVersion));
-    CUDA_CHECK(cudaDriverGetVersion(&cudaDriverVersion));
-    result.software.cudaVersion = std::to_string(cudaRuntimeVersion);
-    result.software.driverVersion = std::to_string(cudaDriverVersion);
-    result.capability.maxPrefillBatchSize = config.maxSupportedPrefillBatchSize;
-    result.capability.maxDecodeBatchSize = config.maxSupportedDecodeBatchSize;
-    result.capability.prefillChunkTokens = config.maxPackedPrefillChunkTokens;
-    result.capability.maxKVCacheCapacity = config.maxKVCacheCapacity;
-    constexpr int32_t kKV_PAGE_TOKENS = 128;
-    result.capability.kvPageTokens = kKV_PAGE_TOKENS;
-    result.capability.kvBytesPerToken = static_cast<size_t>(config.numAttentionLayers) * 2U
-        * static_cast<size_t>(config.numKVHeads) * static_cast<size_t>(config.headDim)
-        * rt::utils::getTypeSize(config.kvCacheDtype);
-    int32_t device{};
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp properties{};
-    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-    result.gpu.computeCapability = std::to_string(properties.major) + "." + std::to_string(properties.minor);
-    result.gpu.smCount = properties.multiProcessorCount;
-    result.gpu.memoryBytes = properties.totalGlobalMem;
-    result.gpu.productName = properties.name;
-    result.gpuUuid = environment("TRT_EDGELLM_PHASE_GPU_UUID");
-    return result;
-}
-
-struct PhaseCostPriorLoadResult
-{
-    bool active{};
-    bool exact{};
-    bool decodePromoted{};
-    bool prefillPromoted{};
-    bool overlapPromoted{};
-    bool hasPrefill{};
-    bool hasDecode{};
-    bool hasOverlap{};
-};
-
-PhaseCostPriorLoadResult loadPhaseCostPrior(std::filesystem::path const& path,
-    rt::PhaseDeploymentFingerprint const& deployment, std::shared_ptr<rt::PhaseCostOracle> const& oracle,
-    rt::PhaseCostScale scale = {})
-{
-    rt::PhaseCostBundle bundle;
-    std::string error;
-    if (!rt::phaseTryLoadCostBundle(path, bundle, error))
-    {
-        LOG_WARNING("Ignoring unreadable phase cost bundle %s: %s", path.c_str(), error.c_str());
-        return {};
-    }
-    rt::PhaseCostCompatibility const compatibility = rt::phaseCostCompatibility(deployment, bundle.deployment);
-    if (compatibility == rt::PhaseCostCompatibility::kIncompatible)
-    {
-        LOG_WARNING("Ignoring incompatible phase cost bundle %s", path.c_str());
-        return {};
-    }
-    rt::PhaseCostBundleSource const source = bundle.source;
-    bool const decodePromoted = bundle.promotion.has_value() && bundle.promotion->decodeBatching;
-    bool const prefillPromoted = bundle.promotion.has_value() && bundle.promotion->prefillBatching;
-    bool const overlapPromoted = bundle.promotion.has_value() && bundle.promotion->overlapSelection;
-    if (source == rt::PhaseCostBundleSource::kBuild && bundle.promotion.has_value())
-    {
-        auto const firstRejected
-            = std::remove_if(bundle.records.begin(), bundle.records.end(), [&](rt::PhaseCostRecord const& record) {
-                  switch (record.key.kind)
-                  {
-                  case rt::PhaseGlobalActionKind::kEncoderPrefill:
-                  case rt::PhaseGlobalActionKind::kEncoderDecode:
-                  case rt::PhaseGlobalActionKind::kPrefillDecode: return !overlapPromoted;
-                  default: return false;
-                  }
-              });
-        bundle.records.erase(firstRejected, bundle.records.end());
-    }
-    bool const hasDecode = std::any_of(bundle.records.begin(), bundle.records.end(),
-        [](rt::PhaseCostRecord const& record) { return record.key.kind == rt::PhaseGlobalActionKind::kDecode; });
-    bool const hasPrefill = std::any_of(bundle.records.begin(), bundle.records.end(),
-        [](rt::PhaseCostRecord const& record) { return record.key.kind == rt::PhaseGlobalActionKind::kPrefill; });
-    bool const hasOverlap
-        = std::any_of(bundle.records.begin(), bundle.records.end(), [](rt::PhaseCostRecord const& record) {
-              return record.key.kind == rt::PhaseGlobalActionKind::kEncoderPrefill
-                  || record.key.kind == rt::PhaseGlobalActionKind::kEncoderDecode
-                  || record.key.kind == rt::PhaseGlobalActionKind::kPrefillDecode;
-          });
-    oracle->loadPrior(std::move(bundle), compatibility, scale);
-    rt::PhaseCostHealthState const health = oracle->healthState();
-    bool const expired
-        = source == rt::PhaseCostBundleSource::kFleet ? health.fleetPriorExpired : health.buildPriorExpired;
-    LOG_INFO("Loaded %s phase cost prior from %s (timing=%s)", rt::phaseCostCompatibilityName(compatibility),
-        path.c_str(), expired ? "expired-fallback" : "active");
-    return {!expired, compatibility == rt::PhaseCostCompatibility::kExact, decodePromoted, prefillPromoted,
-        overlapPromoted, hasPrefill, hasDecode, hasOverlap};
-}
-
-void logPhaseCostAnchors(char const* stage, rt::PhaseCostAnchorState const& state)
-{
-    LOG_INFO("Phase cost anchors (%s): E=%.3f/%zu P=%.3f/%zu D=%.3f/%zu overlap=%.3f/%zu", stage, state.scale.encoder,
-        state.encoderSamples, state.scale.prefill, state.prefillSamples, state.scale.decode, state.decodeSamples,
-        state.scale.overlap, state.overlapSamples);
-}
-
-void logPhaseCostHealth(char const* stage, rt::PhaseCostHealthState const& state)
-{
-    LOG_INFO(
-        "Phase cost health (%s): build_expired=%s fleet_expired=%s local_only=E:%s/P:%s/D:%s/O:%s "
-        "stale_node_records=%zu",
-        stage, state.buildPriorExpired ? "yes" : "no", state.fleetPriorExpired ? "yes" : "no",
-        state.drift.encoder.localOnly ? "yes" : "no", state.drift.prefill.localOnly ? "yes" : "no",
-        state.drift.decode.localOnly ? "yes" : "no", state.drift.overlap.localOnly ? "yes" : "no",
-        state.staleNodeRecords);
-}
-
 struct PhaseTiming
 {
     float prefillMs{};
@@ -1592,133 +1444,13 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
-        rt::PhaseCostOracleConfig phaseCostOracleConfig;
-        phaseCostOracleConfig.model = semanticSchedulerConfig.globalCostModelConfig;
-        phaseCostOracleConfig.anchor.enabled = std::getenv("TRT_EDGELLM_DISABLE_PHASE_COST_AUTO_ANCHOR") == nullptr;
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_ANCHOR_MIN_SAMPLES"))
-        {
-            phaseCostOracleConfig.anchor.minimumSamplesPerPhase = static_cast<size_t>(std::stoull(value));
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_DRIFT_MIN_SAMPLES"))
-        {
-            phaseCostOracleConfig.drift.minimumSamplesPerPhase = static_cast<size_t>(std::stoull(value));
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_DRIFT_ENTER_RATIO"))
-        {
-            phaseCostOracleConfig.drift.enterRelativeError = std::stof(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_DRIFT_EXIT_RATIO"))
-        {
-            phaseCostOracleConfig.drift.exitRelativeError = std::stof(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_PRIOR_TTL_HOURS"))
-        {
-            phaseCostOracleConfig.drift.portablePriorTtl = std::chrono::hours{std::stoll(value)};
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_NODE_TTL_HOURS"))
-        {
-            phaseCostOracleConfig.drift.nodeObservationTtl = std::chrono::hours{std::stoll(value)};
-        }
-        auto phaseCostOracle = std::make_shared<rt::PhaseCostOracle>(phaseCostOracleConfig);
-        rt::PhaseDeploymentFingerprint const phaseCostDeployment = phaseDeploymentFingerprint(config, engineDir);
-        rt::PhaseCostScale phaseCostScale;
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_ENCODER"))
-        {
-            phaseCostScale.encoder = std::stof(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_PREFILL"))
-        {
-            phaseCostScale.prefill = std::stof(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_DECODE"))
-        {
-            phaseCostScale.decode = std::stof(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_COST_SCALE_OVERLAP"))
-        {
-            phaseCostScale.overlap = std::stof(value);
-        }
-        PhaseCostPriorLoadResult buildCostBundle;
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_BUILD_COST_BUNDLE"))
-        {
-            buildCostBundle = loadPhaseCostPrior(value, phaseCostDeployment, phaseCostOracle, phaseCostScale);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_FLEET_COST_BUNDLE"))
-        {
-            loadPhaseCostPrior(value, phaseCostDeployment, phaseCostOracle, phaseCostScale);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_NODE_COST_CACHE"))
-        {
-            rt::PhaseNodeCostJournalConfig journalConfig;
-            journalConfig.directory = value;
-            if (char const* count = std::getenv("TRT_EDGELLM_PHASE_COST_SNAPSHOT_SAMPLES"))
-            {
-                journalConfig.snapshotEveryObservations = static_cast<size_t>(std::stoull(count));
-            }
-            std::filesystem::path const snapshotPath = journalConfig.directory / "local_cost_snapshot.json";
-            if (std::filesystem::exists(snapshotPath))
-            {
-                rt::PhaseCostBundle snapshot;
-                std::string error;
-                if (rt::phaseTryLoadCostBundle(snapshotPath, snapshot, error)
-                    && rt::phaseCostCompatibility(phaseCostDeployment, snapshot.deployment)
-                        == rt::PhaseCostCompatibility::kExact)
-                {
-                    phaseCostOracle->restoreNode(snapshot);
-                    LOG_INFO("Restored node-local phase cost snapshot from %s", snapshotPath.c_str());
-                }
-                else
-                {
-                    LOG_WARNING("Ignoring stale or corrupt node-local phase cost snapshot %s: %s", snapshotPath.c_str(),
-                        error.c_str());
-                }
-            }
-            phaseCostOracle->attachJournal(
-                std::make_shared<rt::PhaseNodeCostJournal>(journalConfig, phaseCostDeployment));
-        }
-        bool const explicitlyEnableBuildBundleDecodeBatching
-            = std::getenv("TRT_EDGELLM_ENABLE_PHASE_BUNDLE_DECODE_BATCHING") != nullptr;
-        bool const enableBuildBundleDecodeBatching
-            = (buildCostBundle.exact && buildCostBundle.decodePromoted) || explicitlyEnableBuildBundleDecodeBatching;
-        if (buildCostBundle.active && buildCostBundle.hasDecode && enableBuildBundleDecodeBatching
-            && std::getenv("TRT_EDGELLM_DISABLE_PHASE_BUNDLE_DECODE_BATCHING") == nullptr)
-        {
-            semanticSchedulerConfig.enableOracleDecodeBatching = true;
-            semanticSchedulerConfig.decodeBatchCosts.clear();
-            LOG_INFO(
-                "Promoted the active build cost bundle as the dynamic decode cost source; preserving local "
-                "contention-aware refinement");
-        }
-        else if (buildCostBundle.active && !buildCostBundle.hasDecode)
-        {
-            LOG_INFO("Keeping static decode batching costs because the active build bundle has no decode records");
-        }
-        else if (buildCostBundle.active && buildCostBundle.hasDecode && !enableBuildBundleDecodeBatching)
-        {
-            LOG_INFO(
-                "Keeping static decode batching costs until the build bundle passes the deployment promotion "
-                "gate");
-        }
-        bool const explicitlyEnableBuildBundlePrefillBatching
-            = std::getenv("TRT_EDGELLM_ENABLE_PHASE_BUNDLE_PREFILL_BATCHING") != nullptr;
-        bool const enableBuildBundlePrefillBatching
-            = (buildCostBundle.exact && buildCostBundle.prefillPromoted) || explicitlyEnableBuildBundlePrefillBatching;
-        if (buildCostBundle.active && buildCostBundle.hasPrefill && enableBuildBundlePrefillBatching
-            && std::getenv("TRT_EDGELLM_DISABLE_PHASE_BUNDLE_PREFILL_BATCHING") == nullptr)
-        {
-            semanticSchedulerConfig.enableOraclePrefillBatching = true;
-            LOG_INFO("Promoted exact build cost records for producer-class-aware dynamic prefill batch formation");
-        }
-        else if (buildCostBundle.active && buildCostBundle.hasPrefill)
-        {
-            LOG_INFO("Keeping static prefill formation costs until the compatible bundle passes its deployment gate");
-        }
-        if (buildCostBundle.active && buildCostBundle.hasOverlap)
-        {
-            LOG_INFO("Loaded build-local E+D/P+D action costs for Global overlap selection (%s)",
-                buildCostBundle.exact && buildCostBundle.overlapPromoted ? "exact promoted" : "explicitly enabled");
-        }
-        semanticSchedulerConfig.globalCostOracle = phaseCostOracle;
+        rt::PhaseRuntimeCostTrackerConfig runtimeCostConfig;
+        runtimeCostConfig.action = semanticSchedulerConfig.globalCostModelConfig;
+        runtimeCostConfig.decodeMinimumSamples = semanticSchedulerConfig.decodeComponentMinSamples;
+        runtimeCostConfig.decodeWindowSize = semanticSchedulerConfig.decodeComponentWindow;
+        runtimeCostConfig.decodeContextBucketTokens = semanticSchedulerConfig.runtimeDecodeContextBucketTokens;
+        auto runtimeCostTracker = std::make_shared<rt::PhaseRuntimeCostTracker>(runtimeCostConfig);
+        semanticSchedulerConfig.runtimeCostTracker = runtimeCostTracker;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
         {
             semanticSchedulerConfig.globalDispatchUsesPreReservedMemory = true;
@@ -2095,9 +1827,6 @@ int main(int argc, char** argv)
             bool const globalOverlapWarmup
                 = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                 && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP") == nullptr;
-            bool const phaseCostCalibrationWarmup
-                = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
-                && !warmupShapes.empty();
             size_t globalOverlapWarmupSamples = 4U;
             if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_WARMUP_SAMPLES"))
             {
@@ -2116,7 +1845,6 @@ int main(int argc, char** argv)
             {
                 executionWarmupShapes.insert(executionWarmupShapes.end(), shapeWarmupSamples, shape);
             }
-            phaseCostOracle->setCalibrationActive(phaseCostCalibrationWarmup);
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(globalOverlapWarmup);
             uint64_t warmupRequestId = 1000000;
             size_t warmedRequests{};
@@ -2194,7 +1922,6 @@ int main(int argc, char** argv)
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
-            phaseCostOracle->setCalibrationActive(false);
             rt::PhaseSchedulerTelemetry const warmupTelemetry = semanticCoordinator.scheduler().telemetry();
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
@@ -2218,8 +1945,6 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
                 executionWarmupShapes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
                 warmupTelemetry.globalSafeProbeCount);
-            logPhaseCostAnchors("post-warmup", phaseCostOracle->anchorState());
-            logPhaseCostHealth("post-warmup", phaseCostOracle->healthState());
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
             std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
@@ -2285,7 +2010,7 @@ int main(int argc, char** argv)
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
-                threePhaseConfig.globalCostOracle = phaseCostOracle;
+                threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
@@ -2526,8 +2251,7 @@ int main(int argc, char** argv)
                             requestedEncoderBatches.push_back(static_cast<size_t>(std::stoull(batchSize)));
                         }
                     }
-                    size_t encoderCalibrationSamples = std::max(phaseCostOracleConfig.anchor.minimumSamplesPerPhase,
-                        threePhaseConfig.globalCostModelConfig.overlapMinSamples);
+                    size_t encoderCalibrationSamples = threePhaseConfig.globalCostModelConfig.overlapMinSamples;
                     if (char const* value = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_SAMPLES"))
                     {
                         encoderCalibrationSamples = static_cast<size_t>(std::stoull(value));
@@ -2609,7 +2333,6 @@ int main(int argc, char** argv)
                         encoderCalibrationRequests += batchSize;
                     };
 
-                    phaseCostOracle->setCalibrationActive(true);
                     semanticCoordinator.scheduler().setGlobalWarmupProbeMode(true);
                     {
                         rt::PhaseThreeCoordinator calibration(*ipcVisionAdapter, semanticServer, threePhaseConfig);
@@ -2621,7 +2344,7 @@ int main(int argc, char** argv)
                                 (totalInputTokens + kEncoderContextBucketTokens - 1U) / kEncoderContextBucketTokens);
                             rt::PhaseGlobalActionKey const encoderKey{rt::PhaseGlobalActionKind::kEncoder,
                                 static_cast<int32_t>(batchSize), 0, 0, contextBucket, 0};
-                            size_t const existingSamples = phaseCostOracle->localSampleCount(encoderKey);
+                            size_t const existingSamples = runtimeCostTracker->sampleCount(encoderKey);
                             size_t const requiredExecutions = encoderCalibrationSamples > existingSamples
                                 ? encoderCalibrationSamples - existingSamples
                                 : 0U;
@@ -2685,15 +2408,11 @@ int main(int argc, char** argv)
                         calibration.setGlobalWarmupProbeMode(false);
                     }
                     semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
-                    phaseCostOracle->setCalibrationActive(false);
                     semanticCoordinator.scheduler().resetHistory(true);
                     LOG_INFO(
-                        "Phase encoder calibration: shapes=%zu isolated=%zu encoder_decode=%zu vision_requests=%zu "
-                        "E_anchor=%.3f/%zu overlap_anchor=%.3f/%zu",
+                        "Phase encoder calibration: shapes=%zu isolated=%zu encoder_decode=%zu vision_requests=%zu",
                         encoderCalibrationBatches.size(), encoderCalibrationExecutions,
-                        encoderDecodeCalibrationExecutions, encoderCalibrationRequests,
-                        phaseCostOracle->anchorState().scale.encoder, phaseCostOracle->anchorState().encoderSamples,
-                        phaseCostOracle->anchorState().scale.overlap, phaseCostOracle->anchorState().overlapSamples);
+                        encoderDecodeCalibrationExecutions, encoderCalibrationRequests);
                 }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
@@ -2702,14 +2421,6 @@ int main(int argc, char** argv)
             {
                 ELLM_CHECK(encoderCalibrationImage == nullptr,
                     "Encoder calibration image requires TRT_EDGELLM_VISION_ENGINE_DIR");
-            }
-            if (char const* path = std::getenv("TRT_EDGELLM_PHASE_WRITE_BUILD_COST_BUNDLE"))
-            {
-                rt::PhaseCostBundle const calibrated = phaseCostOracle->snapshot(
-                    rt::PhaseCostBundleSource::kBuild, phaseCostDeployment, "startup-calibration-v1");
-                ELLM_CHECK(!calibrated.records.empty(), "Startup calibration did not produce phase cost records");
-                rt::phaseWriteCostBundleAtomic(calibrated, path);
-                LOG_INFO("Wrote startup phase cost calibration bundle to %s", path);
             }
             std::deque<rt::PhaseTimelineEvent> phaseTimelineEvents;
             std::deque<rt::PhaseVisionEncoderBatchMetric> encoderBatchMetrics;
@@ -3030,7 +2741,6 @@ int main(int argc, char** argv)
                         bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
                         if (changesCalibration)
                         {
-                            phaseCostOracle->setCalibrationActive(active);
                             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(active);
                             if (ipcThreePhase != nullptr)
                             {
@@ -3201,22 +2911,6 @@ int main(int argc, char** argv)
                         {"global_predicted_violation_us", metrics.globalPredictedViolationUs},
                         {"global_service_compression", metrics.globalServiceCompression},
                         {"global_reference_work_ms", metrics.globalReferenceWorkMs},
-                        {"phase_cost_anchor_encoder_scale", phaseCostOracle->anchorState().scale.encoder},
-                        {"phase_cost_anchor_encoder_samples", phaseCostOracle->anchorState().encoderSamples},
-                        {"phase_cost_anchor_prefill_scale", phaseCostOracle->anchorState().scale.prefill},
-                        {"phase_cost_anchor_prefill_samples", phaseCostOracle->anchorState().prefillSamples},
-                        {"phase_cost_anchor_decode_scale", phaseCostOracle->anchorState().scale.decode},
-                        {"phase_cost_anchor_decode_samples", phaseCostOracle->anchorState().decodeSamples},
-                        {"phase_cost_anchor_overlap_scale", phaseCostOracle->anchorState().scale.overlap},
-                        {"phase_cost_anchor_overlap_samples", phaseCostOracle->anchorState().overlapSamples},
-                        {"phase_cost_build_prior_expired", phaseCostOracle->healthState().buildPriorExpired},
-                        {"phase_cost_fleet_prior_expired", phaseCostOracle->healthState().fleetPriorExpired},
-                        {"phase_cost_encoder_local_only", phaseCostOracle->healthState().drift.encoder.localOnly},
-                        {"phase_cost_prefill_local_only", phaseCostOracle->healthState().drift.prefill.localOnly},
-                        {"phase_cost_decode_local_only", phaseCostOracle->healthState().drift.decode.localOnly},
-                        {"phase_cost_overlap_local_only", phaseCostOracle->healthState().drift.overlap.localOnly},
-                        {"phase_cost_decode_drift_ratio", phaseCostOracle->healthState().drift.decode.medianRatio},
-                        {"phase_cost_decode_drift_samples", phaseCostOracle->healthState().drift.decode.sampleCount},
                         {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
                         {"global_active_decisions",
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
@@ -3291,10 +2985,10 @@ int main(int argc, char** argv)
                         {"page_growth_owners", semanticServer.pageGrowthOwnerCount()},
                         {"page_reservation_base", semanticServer.pageReservationBasePages()},
                         {"page_reservation_guaranteed", semanticServer.pageReservationGuaranteedPages()},
-                        {"online_decode_cost_samples",
-                            semanticCoordinator.scheduler().telemetry().onlineDecodeCostSampleCount},
-                        {"online_decode_cost_buckets",
-                            semanticCoordinator.scheduler().telemetry().onlineDecodeCostBucketCount},
+                        {"runtime_decode_cost_samples",
+                            semanticCoordinator.scheduler().telemetry().runtimeDecodeCostSampleCount},
+                        {"runtime_decode_cost_buckets",
+                            semanticCoordinator.scheduler().telemetry().runtimeDecodeCostBucketCount},
                         {"encoder_contended_decode_cost_samples",
                             semanticCoordinator.scheduler().telemetry().encoderContendedDecodeCostSampleCount},
                         {"prefill_contended_decode_cost_samples",

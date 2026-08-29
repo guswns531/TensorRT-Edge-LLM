@@ -112,7 +112,7 @@ struct PhaseGlobalActionKey
     bool operator==(PhaseGlobalActionKey const& other) const noexcept;
 };
 
-//! Canonicalize only overlap cost-learning dimensions. Candidate identity and
+//! Canonicalize only overlap cost-observation dimensions. Candidate identity and
 //! TensorRT bindings retain their exact shapes.
 PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept;
 

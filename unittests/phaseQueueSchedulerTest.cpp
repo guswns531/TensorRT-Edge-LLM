@@ -190,24 +190,21 @@ TEST(PhaseQueueSchedulerTest, GlobalWarmupStopsProbingCalibratedUnprofitableOver
     EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 0U);
 }
 
-TEST(PhaseQueueSchedulerTest, GlobalWarmupRemeasuresPortableOverlapPriorLocally)
+TEST(PhaseQueueSchedulerTest, GlobalWarmupUsesProcessLocalOverlapObservations)
 {
-    PhaseCostOracleConfig oracleConfig;
-    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
-    oracleConfig.model.overlapMinSamples = 2U;
-    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
-    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
-    PhaseCostBundle prior;
-    prior.bundleVersion = "portable-test";
-    prior.source = PhaseCostBundleSource::kBuild;
-    prior.createdAtUnixNs = phaseCostUnixTimeNs();
-    prior.records = {{key, {{4.0F, 2.0F}, {4.0F, 2.0F}}, phaseCostUnixTimeNs()}};
-    oracle->loadPrior(std::move(prior), PhaseCostCompatibility::kExact);
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.action.overlapMinSamples = 2U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
+    key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+    tracker->observe(key, {4.0F, 2.0F});
+    tracker->observe(key, {4.0F, 2.0F});
 
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     config.globalCostModelConfig.overlapMinSamples = 2U;
-    config.globalCostOracle = oracle;
+    config.runtimeCostTracker = tracker;
     PhaseQueueScheduler scheduler(config);
     scheduler.setGlobalWarmupProbeMode(true);
     scheduler.enqueuePrefill({1, 32});
@@ -216,10 +213,10 @@ TEST(PhaseQueueSchedulerTest, GlobalWarmupRemeasuresPortableOverlapPriorLocally)
     PhaseDispatchPlan const plan = scheduler.next();
 
     EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_TRUE(plan.globalSafeProbe);
+    EXPECT_FALSE(plan.globalSafeProbe);
     ASSERT_EQ(scheduler.globalCalibrationDiagnostics().size(), 1U);
     EXPECT_EQ(
-        scheduler.globalCalibrationDiagnostics().front().diagnostic.status, PhaseGlobalOverlapCostStatus::kNoSamples);
+        scheduler.globalCalibrationDiagnostics().front().diagnostic.status, PhaseGlobalOverlapCostStatus::kEligible);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
@@ -1163,7 +1160,7 @@ TEST(PhaseQueueSchedulerTest, SupportsCustomMetricsPolicyAndEwmaTelemetry)
     EXPECT_FLOAT_EQ(scheduler.telemetry().lastDispatch->overlapRatio, 0.2F);
 }
 
-TEST(PhaseQueueSchedulerTest, ResetsLearnedHistoryOnlyWhileIdle)
+TEST(PhaseQueueSchedulerTest, ResetsObservedHistoryOnlyWhileIdle)
 {
     PhaseQueueScheduler scheduler;
     PhaseDispatchMetrics sample;
@@ -1545,7 +1542,7 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
-TEST(PhaseQueueSchedulerTest, OracleDecodeCostsPreserveStaticDecisionIdentity)
+TEST(PhaseQueueSchedulerTest, MeasuredDecodeCostsPreserveStaticDecisionIdentity)
 {
     std::vector<PhaseDecodeBatchCost> const costs{{1, 512, 2.0F}, {2, 512, 3.0F}, {3, 512, 3.5F}, {4, 512, 4.0F}};
     PhaseQueueSchedulerConfig staticConfig;
@@ -1554,55 +1551,55 @@ TEST(PhaseQueueSchedulerTest, OracleDecodeCostsPreserveStaticDecisionIdentity)
     staticConfig.decodeQueueWaitTargetUs = 1.0;
     staticConfig.decodeBatchCosts = costs;
 
-    PhaseCostOracleConfig oracleConfig;
-    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
-    oracleConfig.sufficientLocalSamples = 1U;
-    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
     for (PhaseDecodeBatchCost const& cost : costs)
     {
         PhaseGlobalActionKey const key{PhaseGlobalActionKind::kDecode, cost.batchSize, 0, 1, 1, 0};
-        oracle->observe(key, {cost.p95GpuMs * static_cast<float>(cost.batchSize), cost.p95GpuMs});
+        tracker->observe(key, {cost.p95GpuMs * static_cast<float>(cost.batchSize), cost.p95GpuMs});
     }
-    PhaseQueueSchedulerConfig oracleSchedulerConfig = staticConfig;
-    oracleSchedulerConfig.decodeBatchCosts.clear();
-    oracleSchedulerConfig.enableOracleDecodeBatching = true;
-    oracleSchedulerConfig.globalCostOracle = std::move(oracle);
+    PhaseQueueSchedulerConfig measuredSchedulerConfig = staticConfig;
+    measuredSchedulerConfig.decodeBatchCosts.clear();
+    measuredSchedulerConfig.enableMeasuredDecodeBatching = true;
+    measuredSchedulerConfig.runtimeCostTracker = std::move(tracker);
 
     PhaseQueueScheduler staticScheduler(staticConfig);
-    PhaseQueueScheduler oracleScheduler(oracleSchedulerConfig);
+    PhaseQueueScheduler measuredScheduler(measuredSchedulerConfig);
     for (uint64_t requestId = 1; requestId <= 3; ++requestId)
     {
         staticScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
-        oracleScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
+        measuredScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
     }
 
     PhaseDispatchPlan const staticPlan = staticScheduler.next();
-    PhaseDispatchPlan const oraclePlan = oracleScheduler.next();
+    PhaseDispatchPlan const measuredPlan = measuredScheduler.next();
 
-    ASSERT_EQ(oraclePlan.decodeBatch.size(), staticPlan.decodeBatch.size());
+    ASSERT_EQ(measuredPlan.decodeBatch.size(), staticPlan.decodeBatch.size());
     for (size_t row{}; row < staticPlan.decodeBatch.size(); ++row)
     {
-        EXPECT_EQ(oraclePlan.decodeBatch[row].requestId, staticPlan.decodeBatch[row].requestId);
-        EXPECT_EQ(oraclePlan.decodeBatch[row].kvSlotId, staticPlan.decodeBatch[row].kvSlotId);
+        EXPECT_EQ(measuredPlan.decodeBatch[row].requestId, staticPlan.decodeBatch[row].requestId);
+        EXPECT_EQ(measuredPlan.decodeBatch[row].kvSlotId, staticPlan.decodeBatch[row].kvSlotId);
     }
-    EXPECT_FLOAT_EQ(oraclePlan.predictedDecodeDrainGpuMs, staticPlan.predictedDecodeDrainGpuMs);
-    EXPECT_EQ(oraclePlan.predictedDecodeDrainTurns, staticPlan.predictedDecodeDrainTurns);
+    EXPECT_FLOAT_EQ(measuredPlan.predictedDecodeDrainGpuMs, staticPlan.predictedDecodeDrainGpuMs);
+    EXPECT_EQ(measuredPlan.predictedDecodeDrainTurns, staticPlan.predictedDecodeDrainTurns);
 }
 
-TEST(PhaseQueueSchedulerTest, SparseOracleDecodeCoveragePreservesLargestBatch)
+TEST(PhaseQueueSchedulerTest, SparseMeasuredDecodeCoveragePreservesLargestBatch)
 {
-    PhaseCostOracleConfig oracleConfig;
-    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
-    oracleConfig.sufficientLocalSamples = 1U;
-    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
-    oracle->observe({PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0}, {2.0F, 2.0F});
-    oracle->observe({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, {4.0F, 3.0F});
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    tracker->observe({PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0}, {2.0F, 2.0F});
+    tracker->observe({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, {4.0F, 3.0F});
 
     PhaseQueueSchedulerConfig config;
     config.maxDecodeBatchSize = 4;
     config.enableDynamicDecodeBatching = true;
-    config.enableOracleDecodeBatching = true;
-    config.globalCostOracle = std::move(oracle);
+    config.enableMeasuredDecodeBatching = true;
+    config.runtimeCostTracker = std::move(tracker);
     PhaseQueueScheduler scheduler(config);
     for (uint64_t requestId = 1; requestId <= 4; ++requestId)
     {
@@ -1612,25 +1609,25 @@ TEST(PhaseQueueSchedulerTest, SparseOracleDecodeCoveragePreservesLargestBatch)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
-TEST(PhaseQueueSchedulerTest, OraclePrefillCostsPreserveProducerClassAndDenseBatch)
+TEST(PhaseQueueSchedulerTest, MeasuredPrefillCostsPreserveProducerClassAndDenseBatch)
 {
-    PhaseCostOracleConfig oracleConfig;
-    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
-    oracleConfig.sufficientLocalSamples = 1U;
-    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
     for (int32_t const batchSize : {1, 2, 4})
     {
         PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, 128, 0, 0};
         key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
-        oracle->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
+        tracker->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
     }
 
     PhaseQueueSchedulerConfig config;
     config.maxPrefillBatchSize = 4;
     config.maxPrefillChunkTokens = 128;
     config.enableDynamicPrefillBatching = true;
-    config.enableOraclePrefillBatching = true;
-    config.globalCostOracle = std::move(oracle);
+    config.enableMeasuredPrefillBatching = true;
+    config.runtimeCostTracker = std::move(tracker);
     PhaseQueueScheduler scheduler(config);
     for (uint64_t requestId = 1; requestId <= 4; ++requestId)
     {
@@ -1642,25 +1639,25 @@ TEST(PhaseQueueSchedulerTest, OraclePrefillCostsPreserveProducerClassAndDenseBat
     EXPECT_EQ(scheduler.next().prefillBatch.size(), 4U);
 }
 
-TEST(PhaseQueueSchedulerTest, SparseOraclePrefillCoveragePreservesLargestBatch)
+TEST(PhaseQueueSchedulerTest, SparseMeasuredPrefillCoveragePreservesLargestBatch)
 {
-    PhaseCostOracleConfig oracleConfig;
-    oracleConfig.model.coldStartUncertaintyMs = 0.0F;
-    oracleConfig.sufficientLocalSamples = 1U;
-    auto oracle = std::make_shared<PhaseCostOracle>(oracleConfig);
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
     for (int32_t const batchSize : {1, 2})
     {
         PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, 128, 0, 0};
         key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
-        oracle->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
+        tracker->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
     }
 
     PhaseQueueSchedulerConfig config;
     config.maxPrefillBatchSize = 4;
     config.maxPrefillChunkTokens = 128;
     config.enableDynamicPrefillBatching = true;
-    config.enableOraclePrefillBatching = true;
-    config.globalCostOracle = std::move(oracle);
+    config.enableMeasuredPrefillBatching = true;
+    config.runtimeCostTracker = std::move(tracker);
     PhaseQueueScheduler scheduler(config);
     for (uint64_t requestId = 1; requestId <= 4; ++requestId)
     {
@@ -1672,15 +1669,15 @@ TEST(PhaseQueueSchedulerTest, SparseOraclePrefillCoveragePreservesLargestBatch)
     EXPECT_EQ(scheduler.next().prefillBatch.size(), 4U);
 }
 
-TEST(PhaseQueueSchedulerTest, ConfidentOnlineDecodeCostRefinesStaticPrior)
+TEST(PhaseQueueSchedulerTest, ConfidentRuntimeDecodeCostRefinesStaticPrior)
 {
     PhaseQueueSchedulerConfig config;
     config.maxDecodeBatchSize = 4;
     config.enableDynamicDecodeBatching = true;
-    config.enableOnlineDecodeCostLearning = true;
-    config.onlineDecodeCostMinSamples = 2;
-    config.onlineDecodeCostWindow = 4;
-    config.onlineDecodeCostMaxAdjustmentRatio = 0.5F;
+    config.enableDecodeComponentObservation = true;
+    config.decodeComponentMinSamples = 2;
+    config.decodeComponentWindow = 4;
+    config.decodeComponentMaxAdjustmentRatio = 0.5F;
     config.decodeQueueWaitTargetUs = 1.0e9;
     config.decodeBatchCosts = {{1, 512, 10.0F}, {2, 512, 9.0F}, {4, 512, 20.0F}};
     PhaseQueueScheduler scheduler(config);
@@ -1699,8 +1696,8 @@ TEST(PhaseQueueSchedulerTest, ConfidentOnlineDecodeCostRefinesStaticPrior)
     }
 
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
-    EXPECT_EQ(scheduler.telemetry().onlineDecodeCostSampleCount, 2U);
-    EXPECT_EQ(scheduler.telemetry().onlineDecodeCostBucketCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().runtimeDecodeCostSampleCount, 2U);
+    EXPECT_EQ(scheduler.telemetry().runtimeDecodeCostBucketCount, 1U);
 }
 
 TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
@@ -1774,14 +1771,14 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesEfficientBatchWhenIdleDeadlineIsI
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
-TEST(PhaseQueueSchedulerTest, DynamicDecodePricesTheRemainderAfterOnlineCostLearning)
+TEST(PhaseQueueSchedulerTest, DynamicDecodePricesTheRemainderAfterRuntimeObservation)
 {
     PhaseQueueSchedulerConfig config;
     config.maxDecodeBatchSize = 8;
     config.enableDynamicDecodeBatching = true;
-    config.enableOnlineDecodeCostLearning = true;
-    config.onlineDecodeCostMinSamples = 2;
-    config.onlineDecodeCostWindow = 4;
+    config.enableDecodeComponentObservation = true;
+    config.decodeComponentMinSamples = 2;
+    config.decodeComponentWindow = 4;
     config.decodeQueueWaitTargetUs = 1.0e9;
     config.decodeBatchCosts = {{1, 512, 6.2F}, {2, 512, 6.3F}, {4, 512, 6.35F}, {7, 512, 6.4F}, {8, 512, 6.4F}};
     PhaseQueueScheduler scheduler(config);
@@ -1821,14 +1818,14 @@ TEST(PhaseQueueSchedulerTest, DynamicDecodePricesEveryTurnNeededToServiceRunnabl
     EXPECT_EQ(plan.predictedDecodeDrainTurns, 3);
 }
 
-TEST(PhaseQueueSchedulerTest, OnlineDecodeLearningSeparatesEncoderContention)
+TEST(PhaseQueueSchedulerTest, RuntimeDecodeObservationSeparatesEncoderContention)
 {
     PhaseQueueSchedulerConfig config;
     config.maxDecodeBatchSize = 2;
     config.enableDynamicDecodeBatching = true;
-    config.enableOnlineDecodeCostLearning = true;
-    config.onlineDecodeCostMinSamples = 2;
-    config.onlineDecodeCostWindow = 4;
+    config.enableDecodeComponentObservation = true;
+    config.decodeComponentMinSamples = 2;
+    config.decodeComponentWindow = 4;
     config.decodeQueueWaitTargetUs = 1.0;
     config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}};
     PhaseDispatchMetrics sample;

@@ -524,12 +524,14 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mServer(server)
     , mConfig(config)
     , mGlobalScheduler(mConfig.globalSchedulerConfig)
-    , mGlobalCostOracle(
-          mConfig.globalCostOracle != nullptr ? mConfig.globalCostOracle : std::make_shared<PhaseCostOracle>([&] {
-              PhaseCostOracleConfig config;
-              config.model = mConfig.globalCostModelConfig;
-              return config;
-          }()))
+    , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
+              ? mConfig.runtimeCostTracker
+              : std::make_shared<PhaseRuntimeCostTracker>([&] {
+                    PhaseRuntimeCostTrackerConfig trackerConfig;
+                    trackerConfig.action = mConfig.globalCostModelConfig;
+                    trackerConfig.decodeContextBucketTokens = mConfig.globalDecodeContextBucketTokens;
+                    return trackerConfig;
+                }()))
     , mMemoryBroker(mConfig.memoryBroker)
 {
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
@@ -971,7 +973,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseThreeCoordinator::globalCalibrati
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mGlobalCostOracle->localOverlapDiagnostic(key), opportunities,
+        result.push_back({key, mRuntimeCostTracker->overlapDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;
@@ -1273,7 +1275,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                                      : mConfig.encoderDispatchInitialCostUs,
             static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0, 0.0};
         prediction.referenceUs = prediction.makespanUs;
-        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(prediction.key))
+        if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(prediction.key))
         {
             prediction.makespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
             prediction.uncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
@@ -1413,12 +1415,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         double phaseOverlapCompletionUs{};
         double phaseOverlapCompletionUncertaintyUs{};
         bool residualDerivedFromFullCost{};
-        std::optional<PhaseGlobalCostEstimate> online = mGlobalCostOracle->estimate(overlapKey);
+        std::optional<PhaseGlobalCostEstimate> online = mRuntimeCostTracker->estimate(overlapKey);
         if (!online.has_value() && residualAugmentation)
         {
             PhaseGlobalActionKey fullKey = overlapKey;
             fullKey.residualAugmentation = false;
-            online = mGlobalCostOracle->estimate(fullKey);
+            online = mRuntimeCostTracker->estimate(fullKey);
             residualDerivedFromFullCost = online.has_value();
         }
         if (online.has_value())
@@ -1427,7 +1429,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             overlapUncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
             PhaseGlobalActionKey eligibilityKey = overlapKey;
             eligibilityKey.residualAugmentation = residualAugmentation && !residualDerivedFromFullCost;
-            overlapKnown = mGlobalCostOracle->overlapEligible(eligibilityKey);
+            overlapKnown = mRuntimeCostTracker->overlapEligible(eligibilityKey);
         }
         else
         {
@@ -1478,7 +1480,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             phaseOverlapCompletionUs = residualPhaseUs + interferenceUs;
             phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
         }
-        PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mGlobalCostOracle->localOverlapDiagnostic(overlapKey);
+        PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mRuntimeCostTracker->overlapDiagnostic(overlapKey);
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -1613,7 +1615,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             = std::min_element(candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
                   auto sampleCount = [&](auto const& candidate) {
                       return candidate.calibrationProbe
-                          ? mGlobalCostOracle->localOverlapDiagnostic(candidate.key).sampleCount
+                          ? mRuntimeCostTracker->overlapDiagnostic(candidate.key).sampleCount
                           : std::numeric_limits<size_t>::max();
                   };
                   return sampleCount(left) < sampleCount(right);
@@ -1843,7 +1845,7 @@ void PhaseThreeCoordinator::completeGlobalOverlapObservation()
     }
     float const makespanMs
         = std::max(mPendingGlobalOverlapObservation->encoderGpuMs, mPendingGlobalOverlapObservation->phaseGpuMs);
-    mGlobalCostOracle->observe(
+    mRuntimeCostTracker->observe(
         mPendingGlobalOverlapObservation->key, {mPendingGlobalOverlapObservation->referenceWorkMs, makespanMs});
     mPendingGlobalOverlapObservation.reset();
 }
@@ -2106,7 +2108,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     }
     if (mInFlightGlobalEncoderKey.has_value() && mLastEncoderGpuMs > 0.0F && mInFlightGlobalEncoderReferenceMs > 0.0)
     {
-        mGlobalCostOracle->observe(
+        mRuntimeCostTracker->observe(
             *mInFlightGlobalEncoderKey, {static_cast<float>(mInFlightGlobalEncoderReferenceMs), mLastEncoderGpuMs});
     }
     mInFlightGlobalEncoderKey.reset();
@@ -2392,7 +2394,7 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
                 = static_cast<int32_t>((totalInputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
             PhaseGlobalActionKey const key{
                 PhaseGlobalActionKind::kEncoder, static_cast<int32_t>(rows), 0, 0, contextBucket, 0};
-            if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
+            if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(key))
             {
                 return static_cast<double>(online->makespanMedianMs + online->uncertaintyMs) * 1000.0;
             }

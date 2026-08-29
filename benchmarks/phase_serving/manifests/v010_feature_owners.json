@@ -84,7 +84,7 @@
     "global_phase_scheduling": {
       "kind": "new_phase_runtime",
       "paths": [
-        "cpp/runtime/phase/cost/phaseCostOracle.h",
+        "cpp/runtime/phase/cost/phaseRuntimeCostTracker.h",
         "cpp/runtime/phase/execution/phaseActionPlan.h",
         "cpp/runtime/phase/mechanism/phaseReadySnapshot.h",
         "cpp/runtime/phase/ownership/phaseOwnershipHorizon.h",
@@ -92,7 +92,7 @@
         "cpp/runtime/phase/policy/phaseGlobalCostModel.h",
         "cpp/runtime/phase/policy/phaseGlobalScheduler.h",
         "cpp/runtime/scheduling/phaseActionPlan.h",
-        "cpp/runtime/scheduling/phaseCostKnowledge.cpp",
+        "cpp/runtime/scheduling/phaseRuntimeCostTracker.cpp",
         "cpp/runtime/scheduling/phaseDeadline.h",
         "cpp/runtime/scheduling/phaseGlobalCostModel.h",
         "cpp/runtime/scheduling/phaseGlobalScheduler.cpp",
@@ -101,8 +101,7 @@
         "cpp/runtime/scheduling/phaseQueueScheduler.h",
         "cpp/runtime/scheduling/phaseReadySnapshot.h",
         "cpp/runtime/scheduling/phaseMemoryBroker.cpp",
-        "cpp/runtime/scheduling/phaseMemoryBroker.h",
-        "scripts/phase_cost_bundle.py"
+        "cpp/runtime/scheduling/phaseMemoryBroker.h"
       ]
     },
     "async_server_and_coordination": {

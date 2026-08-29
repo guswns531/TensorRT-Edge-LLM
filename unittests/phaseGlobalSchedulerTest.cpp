@@ -344,7 +344,7 @@ TEST(PhaseGlobalSchedulerTest, CandidateIdentityPreservesCanonicalRowOrder)
     EXPECT_EQ(phaseGlobalCandidateId(first), phaseGlobalCandidateId(first));
 }
 
-TEST(PhaseGlobalCostModelTest, LearnsRobustDirectOverlapEligibility)
+TEST(PhaseGlobalCostModelTest, RecordsRobustDirectOverlapEligibility)
 {
     PhaseGlobalCostModel model({8U, 4U, 2.0F, 0.02F});
     PhaseGlobalActionKey const key{PhaseGlobalActionKind::kEncoderDecode, 2, 16, 0, 512, 512};
@@ -405,7 +405,7 @@ TEST(PhaseGlobalCostModelTest, DistinguishesUnknownFromInsufficientOverlapCost)
     EXPECT_GT(diagnostic.robustCompression, 1.0F);
 }
 
-TEST(PhaseGlobalCostModelTest, LearnsEncoderPrefillCostByFullShapeKey)
+TEST(PhaseGlobalCostModelTest, RecordsEncoderPrefillCostByFullShapeKey)
 {
     PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
     PhaseGlobalActionKey const key{PhaseGlobalActionKind::kEncoderPrefill, 4, 2, 128, 8, 0};

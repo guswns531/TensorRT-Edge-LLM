@@ -106,15 +106,18 @@ char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mGlobalScheduler(mConfig.globalSchedulerConfig)
-    , mGlobalCostOracle(
-          mConfig.globalCostOracle != nullptr ? mConfig.globalCostOracle : std::make_shared<PhaseCostOracle>([&] {
-              PhaseCostOracleConfig config;
-              config.model = mConfig.globalCostModelConfig;
-              return config;
-          }()))
+    , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
+              ? mConfig.runtimeCostTracker
+              : std::make_shared<PhaseRuntimeCostTracker>([&] {
+                    PhaseRuntimeCostTrackerConfig trackerConfig;
+                    trackerConfig.action = mConfig.globalCostModelConfig;
+                    trackerConfig.decodeMinimumSamples = mConfig.decodeComponentMinSamples;
+                    trackerConfig.decodeWindowSize = mConfig.decodeComponentWindow;
+                    trackerConfig.decodeContextBucketTokens = mConfig.runtimeDecodeContextBucketTokens;
+                    return trackerConfig;
+                }()))
     , mRecentDecodeTpotUs(std::make_shared<RecentDecodeTpot>())
-    , mOnlineDecodeGpuMs(std::make_shared<OnlineDecodeGpuSamples>())
-    , mOnlineDecodeCostLearningActive(mConfig.enableOnlineDecodeCostLearning)
+    , mDecodeComponentObservationActive(mConfig.enableDecodeComponentObservation)
 {
     applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
@@ -173,7 +176,7 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
                 && std::isfinite(cost.decodeSlowdownP95Ms) && cost.decodeSlowdownP95Ms >= 0.0F,
             "Overlap cost timings must be finite and non-negative");
     }
-    check::check(!mConfig.enableDynamicPrefillBatching || mConfig.enableOraclePrefillBatching
+    check::check(!mConfig.enableDynamicPrefillBatching || mConfig.enableMeasuredPrefillBatching
             || !mConfig.prefillBatchCosts.empty(),
         "Dynamic prefill batching requires profiled prefill costs");
     check::check(std::isfinite(mConfig.decodeRecoveryPressureThreshold)
@@ -196,15 +199,15 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
         "TPOT hysteresis sample bounds are invalid");
     check::check(mConfig.maxConsecutiveOverlapBatches > 0, "Maximum consecutive overlap batches must be positive");
     check::check(
-        mConfig.onlineDecodeCostMinSamples > 0 && mConfig.onlineDecodeCostMinSamples <= mConfig.onlineDecodeCostWindow,
-        "Online decode cost sample bounds are invalid");
-    check::check(mConfig.onlineDecodeContextBucketTokens > 0, "Online decode context bucket must be positive");
-    check::check(std::isfinite(mConfig.onlineDecodeCostMaxAdjustmentRatio)
-            && mConfig.onlineDecodeCostMaxAdjustmentRatio >= 0.0F && mConfig.onlineDecodeCostMaxAdjustmentRatio < 1.0F,
-        "Online decode cost adjustment ratio must be finite and in [0, 1)");
-    check::check(std::isfinite(mConfig.onlineDecodeContentionCostMaxMultiplier)
-            && mConfig.onlineDecodeContentionCostMaxMultiplier >= 1.0F,
-        "Online contended decode cost multiplier must be finite and at least one");
+        mConfig.decodeComponentMinSamples > 0 && mConfig.decodeComponentMinSamples <= mConfig.decodeComponentWindow,
+        "Runtime decode cost sample bounds are invalid");
+    check::check(mConfig.runtimeDecodeContextBucketTokens > 0, "Runtime decode context bucket must be positive");
+    check::check(std::isfinite(mConfig.decodeComponentMaxAdjustmentRatio)
+            && mConfig.decodeComponentMaxAdjustmentRatio >= 0.0F && mConfig.decodeComponentMaxAdjustmentRatio < 1.0F,
+        "Runtime decode cost adjustment ratio must be finite and in [0, 1)");
+    check::check(
+        std::isfinite(mConfig.decodeContentionCostMaxMultiplier) && mConfig.decodeContentionCostMaxMultiplier >= 1.0F,
+        "Runtime contended decode cost multiplier must be finite and at least one");
     check::check(std::isfinite(mConfig.maxPredictedDecodeDebtUs) && mConfig.maxPredictedDecodeDebtUs >= 0.0,
         "Maximum predicted decode debt must be finite and non-negative");
     check::check(mConfig.autoLongPrefillBacklogTokens > 0, "Auto-profile prefill backlog threshold must be positive");
@@ -809,8 +812,8 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
             maxPastKV = std::max(maxPastKV, candidates[static_cast<size_t>(index)]->tokenOffset);
             usefulTokens += std::min(dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]), chunkLength);
         }
-        std::optional<float> const oracleGpuMs
-            = oraclePrefillP95(batchSize, chunkLength, maxPastKV, prefillClass, usefulTokens);
+        std::optional<float> const measuredGpuMs
+            = measuredPrefillP95(batchSize, chunkLength, maxPastKV, prefillClass, usefulTokens);
         PhasePrefillBatchCost const* selected{};
         for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
         {
@@ -866,10 +869,10 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
                 }
             }
         }
-        if ((selected != nullptr || oracleGpuMs.has_value())
+        if ((selected != nullptr || measuredGpuMs.has_value())
             && (!overlap || selectedOverlap != nullptr || !mConfig.requireDirectOverlapCost))
         {
-            float const isolatedPrefillMs = oracleGpuMs.has_value() ? *oracleGpuMs : selected->p95GpuMs;
+            float const isolatedPrefillMs = measuredGpuMs.has_value() ? *measuredGpuMs : selected->p95GpuMs;
             float const gpuMs = selectedOverlap != nullptr ? selectedOverlap->prefillP95GpuMs : isolatedPrefillMs;
             float const interference = selectedOverlap != nullptr
                 ? selectedOverlap->decodeSlowdownP95Ms
@@ -884,7 +887,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     }
     bool const largestShapeCovered = std::any_of(profiled.begin(), profiled.end(),
         [available](Candidate const& candidate) { return candidate.batchSize == available; });
-    if (mConfig.enableOraclePrefillBatching && !largestShapeCovered)
+    if (mConfig.enableMeasuredPrefillBatching && !largestShapeCovered)
     {
         // Partial portable P coverage is not evidence that fragmenting a
         // larger compatible batch is profitable. Preserve the mechanism's
@@ -1495,7 +1498,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         bool directlyKnown{};
     };
     auto fromOnline = [&](PhaseGlobalActionKey const& key) -> std::optional<Prediction> {
-        std::optional<PhaseGlobalCostEstimate> const estimate = mGlobalCostOracle->estimate(key);
+        std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->estimate(key);
         if (!estimate.has_value())
         {
             return std::nullopt;
@@ -1504,7 +1507,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             static_cast<double>(estimate->uncertaintyMs) * 1000.0,
             static_cast<double>(estimate->referenceWorkMedianMs) * 1000.0, true};
     };
-    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     auto contextBucket = [contextBucketTokens](int32_t tokens) {
         return (std::max(0, tokens) + contextBucketTokens - 1) / contextBucketTokens;
     };
@@ -1608,7 +1611,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         if (allowBatchInterpolation)
         {
             std::optional<PhaseGlobalCostEstimate> const interpolated
-                = mGlobalCostOracle->estimateInterpolatedPrimaryBatch(key);
+                = mRuntimeCostTracker->estimateInterpolatedPrimaryBatch(key);
             if (interpolated.has_value())
             {
                 return {static_cast<double>(interpolated->makespanMedianMs) * 1000.0,
@@ -1882,7 +1885,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         if (std::optional<Prediction> const online = fromOnline(overlapKey))
         {
             overlap = *online;
-            overlapKnown = mGlobalCostOracle->overlapEligible(overlapKey);
+            overlapKnown = mRuntimeCostTracker->overlapEligible(overlapKey);
         }
         else
         {
@@ -1907,7 +1910,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlap.directlyKnown = selected != nullptr;
             overlapKnown = selected != nullptr;
         }
-        PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mGlobalCostOracle->localOverlapDiagnostic(overlapKey);
+        PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mRuntimeCostTracker->overlapDiagnostic(overlapKey);
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -2072,7 +2075,7 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
     }
     std::vector<PhaseGlobalActionCandidate> candidates;
     candidates.reserve(2U * std::min(kMaxWaitCandidates, previews.size()));
-    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     mTelemetry.globalWaitPreviewBlockingUs = 0.0;
     mTelemetry.globalWaitPreviewUncertaintyUs = 0.0;
     mTelemetry.globalWaitPreviewSlackUs = state.decodeMinTpotSlackUs;
@@ -2103,7 +2106,7 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
         DecodePrediction prediction{static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0,
             static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0,
             static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0, rows};
-        if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
+        if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(key))
         {
             prediction.makespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
             prediction.uncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
@@ -2328,11 +2331,11 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     check::check(batchSize > 0, "A future prefill estimate requires a positive batch size");
     check::check(chunkLength > 0, "A future prefill estimate requires a positive chunk length");
     check::check(pastKVLength >= 0, "A future prefill estimate requires a non-negative past-KV length");
-    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     int32_t const contextBucket = (pastKVLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
     key.primaryWorkClass = static_cast<int32_t>(prefillClass);
-    if (std::optional<PhaseGlobalCostEstimate> const online = mGlobalCostOracle->estimate(key))
+    if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(key))
     {
         return *online;
     }
@@ -2446,12 +2449,13 @@ size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t
     {
         return static_cast<size_t>(mConfig.maxDecodeBatchSize);
     }
-    if (mConfig.enableOracleDecodeBatching && oracleDecodeP95(mConfig.maxDecodeBatchSize, maxContextLength).has_value())
+    if (mConfig.enableMeasuredDecodeBatching
+        && measuredDecodeP95(mConfig.maxDecodeBatchSize, maxContextLength).has_value())
     {
         size_t limit{1U};
         for (int32_t rows = 1; rows <= mConfig.maxDecodeBatchSize; ++rows)
         {
-            std::optional<float> const cost = oracleDecodeP95(rows, maxContextLength);
+            std::optional<float> const cost = measuredDecodeP95(rows, maxContextLength);
             if (cost.has_value() && static_cast<double>(*cost) * 1000.0 <= targetUs)
             {
                 limit = static_cast<size_t>(rows);
@@ -2553,7 +2557,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     else if (workConservingSinglePhase)
     {
-        // Keep mechanism formation, canonical row ordering, and online cost
+        // Keep mechanism formation, canonical row ordering, and runtime cost
         // observation unchanged. Only the vacuous policy comparison is elided.
         kind = state.prefillQueued > 0U ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
         drainPreferenceApplied = false;
@@ -2888,7 +2892,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const
 {
     int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued));
-    bool const hasDecodeCostSource = mConfig.enableOracleDecodeBatching || !mConfig.decodeBatchCosts.empty();
+    bool const hasDecodeCostSource = mConfig.enableMeasuredDecodeBatching || !mConfig.decodeBatchCosts.empty();
     if (available <= 1 || !mConfig.enableDynamicDecodeBatching || !hasDecodeCostSource)
     {
         predictedDrainTurns = available > 0 ? 1 : 0;
@@ -2915,12 +2919,12 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
             = std::max(maxContextLengths[static_cast<size_t>(runnableRows - 1)], item->tokenCount);
     }
     std::vector<Candidate> candidates;
-    bool oracleCoverage{};
-    if (mConfig.enableOracleDecodeBatching)
+    bool measuredCoverage{};
+    if (mConfig.enableMeasuredDecodeBatching)
     {
         for (int32_t rows = 1; rows <= available; ++rows)
         {
-            std::optional<float> const cost = oracleDecodeP95(rows, maxContextLengths[static_cast<size_t>(rows)]);
+            std::optional<float> const cost = measuredDecodeP95(rows, maxContextLengths[static_cast<size_t>(rows)]);
             if (!cost.has_value())
             {
                 continue;
@@ -2928,9 +2932,9 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
             candidates.push_back({rows, *cost, maxContextLengths[static_cast<size_t>(rows)],
                 contextTotals[static_cast<size_t>(rows)], rows});
         }
-        oracleCoverage = std::any_of(candidates.begin(), candidates.end(),
+        measuredCoverage = std::any_of(candidates.begin(), candidates.end(),
             [available](Candidate const& candidate) { return candidate.batchSize == available; });
-        if (!oracleCoverage)
+        if (!measuredCoverage)
         {
             // Sparse portable or node-local coverage is not evidence that a
             // smaller cohort is better. Fall back to the compatibility table
@@ -2945,7 +2949,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     }
     int32_t coveringConfiguredBatch{std::numeric_limits<int32_t>::max()};
     int32_t largestConfiguredBatch{};
-    if (!oracleCoverage)
+    if (!measuredCoverage)
     {
         for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {
@@ -2993,7 +2997,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         predictedDrainTurns = available > 0 ? 1 : 0;
         return available;
     }
-    bool const largestShapeCovered = oracleCoverage
+    bool const largestShapeCovered = measuredCoverage
         || std::any_of(candidates.begin(), candidates.end(), [coveringConfiguredBatch](Candidate const& candidate) {
                return candidate.profiledBatchLimit == coveringConfiguredBatch;
            });
@@ -3030,21 +3034,21 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         candidate.p95GpuMs = lower->p95GpuMs + fraction * (candidate.p95GpuMs - lower->p95GpuMs);
     }
 
-    if (mOnlineDecodeCostLearningActive)
+    if (mDecodeComponentObservationActive)
     {
         for (Candidate& candidate : candidates)
         {
-            std::optional<float> const observed = onlineDecodeP95(candidate.batchSize,
+            std::optional<float> const observed = decodeComponentP95(candidate.batchSize,
                 maxContextLengths[static_cast<size_t>(candidate.batchSize)], mExternalEncoderActive, concurrentPrefill);
             if (!observed.has_value())
             {
                 continue;
             }
-            float const lower = candidate.p95GpuMs * (1.0F - mConfig.onlineDecodeCostMaxAdjustmentRatio);
+            float const lower = candidate.p95GpuMs * (1.0F - mConfig.decodeComponentMaxAdjustmentRatio);
             bool const contended = mExternalEncoderActive || concurrentPrefill;
             float const upper = candidate.p95GpuMs
-                * (contended ? mConfig.onlineDecodeContentionCostMaxMultiplier
-                             : 1.0F + mConfig.onlineDecodeCostMaxAdjustmentRatio);
+                * (contended ? mConfig.decodeContentionCostMaxMultiplier
+                             : 1.0F + mConfig.decodeComponentMaxAdjustmentRatio);
             candidate.p95GpuMs = std::clamp(*observed, lower, upper);
         }
     }
@@ -3144,21 +3148,21 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     return minimumDrainCandidate->batchSize;
 }
 
-std::optional<float> PhaseQueueScheduler::oracleDecodeP95(int32_t batchSize, int32_t maxContextLength) const
+std::optional<float> PhaseQueueScheduler::measuredDecodeP95(int32_t batchSize, int32_t maxContextLength) const
 {
-    if (!mConfig.enableOracleDecodeBatching || batchSize <= 0 || maxContextLength < 0)
+    if (!mConfig.enableMeasuredDecodeBatching || batchSize <= 0 || maxContextLength < 0)
     {
         return std::nullopt;
     }
-    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     int32_t const contextBucket = (maxContextLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batchSize, 0, 1, contextBucket, 0};
     key.executionVariant
         = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, 0) : PhaseExecutionVariant::kEager;
-    std::optional<PhaseGlobalCostEstimate> estimate = mGlobalCostOracle->estimate(key);
+    std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->trustedEstimate(key);
     if (!estimate.has_value())
     {
-        estimate = mGlobalCostOracle->estimatePrimaryBatchCoveringContext(key);
+        estimate = mRuntimeCostTracker->trustedEstimatePrimaryBatchCoveringContext(key);
     }
     if (!estimate.has_value())
     {
@@ -3167,23 +3171,23 @@ std::optional<float> PhaseQueueScheduler::oracleDecodeP95(int32_t batchSize, int
     return std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs);
 }
 
-std::optional<float> PhaseQueueScheduler::oraclePrefillP95(int32_t batchSize, int32_t chunkLength,
+std::optional<float> PhaseQueueScheduler::measuredPrefillP95(int32_t batchSize, int32_t chunkLength,
     int32_t maxPastKVLength, PhasePrefillClass prefillClass, int32_t usefulTokens) const
 {
-    if (!mConfig.enableOraclePrefillBatching || batchSize <= 0 || chunkLength <= 0 || maxPastKVLength < 0)
+    if (!mConfig.enableMeasuredPrefillBatching || batchSize <= 0 || chunkLength <= 0 || maxPastKVLength < 0)
     {
         return std::nullopt;
     }
-    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     int32_t const contextBucket = (maxPastKVLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
     key.primaryWorkClass = static_cast<int32_t>(prefillClass);
     key.executionVariant = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, usefulTokens)
                                                            : PhaseExecutionVariant::kEager;
-    std::optional<PhaseGlobalCostEstimate> estimate = mGlobalCostOracle->estimate(key);
+    std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->trustedEstimate(key);
     if (!estimate.has_value())
     {
-        estimate = mGlobalCostOracle->estimatePrimaryBatchCoveringContext(key);
+        estimate = mRuntimeCostTracker->trustedEstimatePrimaryBatchCoveringContext(key);
     }
     if (!estimate.has_value())
     {
@@ -3192,29 +3196,10 @@ std::optional<float> PhaseQueueScheduler::oraclePrefillP95(int32_t batchSize, in
     return std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs);
 }
 
-uint64_t PhaseQueueScheduler::onlineDecodeCostKey(
-    int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const noexcept
-{
-    int32_t const contextBucket = std::max(
-        1, (maxContextLength + mConfig.onlineDecodeContextBucketTokens - 1) / mConfig.onlineDecodeContextBucketTokens);
-    uint64_t const contention = (encoderActive ? 2U : 0U) | (prefillActive ? 1U : 0U);
-    return (static_cast<uint64_t>(static_cast<uint32_t>(batchSize)) << 32U)
-        | (static_cast<uint64_t>(static_cast<uint32_t>(contextBucket)) << 2U) | contention;
-}
-
-std::optional<float> PhaseQueueScheduler::onlineDecodeP95(
+std::optional<float> PhaseQueueScheduler::decodeComponentP95(
     int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const
 {
-    auto const found
-        = mOnlineDecodeGpuMs->find(onlineDecodeCostKey(batchSize, maxContextLength, encoderActive, prefillActive));
-    if (found == mOnlineDecodeGpuMs->end() || found->second.size() < mConfig.onlineDecodeCostMinSamples)
-    {
-        return std::nullopt;
-    }
-    std::vector<float> ordered(found->second.begin(), found->second.end());
-    std::sort(ordered.begin(), ordered.end());
-    size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1U;
-    return ordered[p95Index];
+    return mRuntimeCostTracker->decodeP95(batchSize, maxContextLength, encoderActive, prefillActive);
 }
 
 void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
@@ -3289,7 +3274,7 @@ bool PhaseQueueScheduler::hasRequest(uint64_t requestId) const noexcept
 
 PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept
 {
-    int32_t const contextBucketTokens = std::max(1, mConfig.onlineDecodeContextBucketTokens);
+    int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     auto contextBucket = [contextBucketTokens](int32_t tokens) {
         return (std::max(0, tokens) + contextBucketTokens - 1) / contextBucketTokens;
     };
@@ -3334,24 +3319,15 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         updateEwma(mTelemetry.decodeGpuMsPerContextToken,
             metrics.decodeGpuMs / static_cast<float>(metrics.decodeContextTokens));
     }
-    if (mOnlineDecodeCostLearningActive && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F
+    if (mDecodeComponentObservationActive && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F
         && metrics.plannedDecodeMaxContextLength > 0)
     {
-        if (!mOnlineDecodeGpuMs.unique())
-        {
-            mOnlineDecodeGpuMs = std::make_shared<OnlineDecodeGpuSamples>(*mOnlineDecodeGpuMs);
-        }
-        auto& samples = (*mOnlineDecodeGpuMs)[onlineDecodeCostKey(metrics.decodeBatchSize,
-            metrics.plannedDecodeMaxContextLength, metrics.externalEncoderActive, metrics.concurrentPrefillActive)];
-        samples.push_back(metrics.decodeGpuMs);
-        if (samples.size() > mConfig.onlineDecodeCostWindow)
-        {
-            samples.pop_front();
-        }
-        ++mTelemetry.onlineDecodeCostSampleCount;
+        mRuntimeCostTracker->observeDecode(metrics.decodeBatchSize, metrics.plannedDecodeMaxContextLength,
+            metrics.externalEncoderActive, metrics.concurrentPrefillActive, metrics.decodeGpuMs);
+        ++mTelemetry.runtimeDecodeCostSampleCount;
         mTelemetry.encoderContendedDecodeCostSampleCount += metrics.externalEncoderActive ? 1U : 0U;
         mTelemetry.prefillContendedDecodeCostSampleCount += metrics.concurrentPrefillActive ? 1U : 0U;
-        mTelemetry.onlineDecodeCostBucketCount = mOnlineDecodeGpuMs->size();
+        mTelemetry.runtimeDecodeCostBucketCount = mRuntimeCostTracker->decodeBucketCount();
     }
     if (metrics.kind == PhaseDispatchKind::kOverlap && metrics.prefillBatchSize > 0 && metrics.decodeBatchSize > 0)
     {
@@ -3417,7 +3393,7 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             {
                 referenceWorkMs = static_cast<float>(metrics.globalReferenceWorkMs);
             }
-            mGlobalCostOracle->observe(observedKey, {referenceWorkMs, metrics.makespanGpuMs});
+            mRuntimeCostTracker->observe(observedKey, {referenceWorkMs, metrics.makespanGpuMs});
         }
     }
     ++mTelemetry.sampleCount;
@@ -3437,15 +3413,15 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseQueueScheduler::globalCalibration
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mGlobalCostOracle->localOverlapDiagnostic(key), opportunities,
+        result.push_back({key, mRuntimeCostTracker->overlapDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;
 }
 
-void PhaseQueueScheduler::setOnlineDecodeCostLearningActive(bool active) noexcept
+void PhaseQueueScheduler::setDecodeComponentObservationActive(bool active) noexcept
 {
-    mOnlineDecodeCostLearningActive = mConfig.enableOnlineDecodeCostLearning && active;
+    mDecodeComponentObservationActive = mConfig.enableDecodeComponentObservation && active;
 }
 
 void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
@@ -3453,16 +3429,15 @@ void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference prefer
     mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
 }
 
-void PhaseQueueScheduler::resetHistory(bool preserveGlobalCostModel)
+void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
 {
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Scheduling history can only be reset while the scheduler is idle");
     mTelemetry = {};
     mRecentDecodeTpotUs = std::make_shared<RecentDecodeTpot>();
-    mOnlineDecodeGpuMs = std::make_shared<OnlineDecodeGpuSamples>();
-    if (!preserveGlobalCostModel)
+    if (!preserveRuntimeCosts)
     {
-        mGlobalCostOracle->resetLocal();
+        mRuntimeCostTracker->reset();
     }
     mLatencySafeFallback = false;
     mConsecutiveDecodeBatches = 0;

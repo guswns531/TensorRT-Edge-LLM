@@ -69,9 +69,9 @@ set(PHASE_RUNTIME_CPP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseMemoryBroker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phasePrefixReuseCache.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseQueueScheduler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseRuntimeCostTracker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseThreeCoordinator.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseVisionAdapter.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseCostKnowledge.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseVisionAdapter.cpp")
 set(STABLE_KV_PAGE_MANAGER_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/state/stableKVPageManager.cpp")
 
