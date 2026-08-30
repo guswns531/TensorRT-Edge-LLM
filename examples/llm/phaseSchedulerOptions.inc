@@ -19,6 +19,7 @@
 // statement-only so option parsing remains in the established translation unit.
         rt::PhaseQueueSchedulerConfig semanticSchedulerConfig;
         semanticSchedulerConfig.maxPrefillBatchSize = config.maxSupportedPrefillBatchSize;
+        semanticSchedulerConfig.maxExternalPrefillBatchSize = config.maxSupportedVisionPrefillBatchSize;
         semanticSchedulerConfig.maxDecodeBatchSize = config.maxSupportedDecodeBatchSize;
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SCHEDULER"))
         {

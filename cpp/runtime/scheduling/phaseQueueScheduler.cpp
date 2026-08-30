@@ -121,6 +121,9 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
 {
     applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
+    check::check(
+        mConfig.maxExternalPrefillBatchSize >= 0 && mConfig.maxExternalPrefillBatchSize <= mConfig.maxPrefillBatchSize,
+        "maxExternalPrefillBatchSize must be zero or no greater than maxPrefillBatchSize");
     check::check(mConfig.maxDecodeBatchSize > 0, "maxDecodeBatchSize must be positive");
     check::check(std::isfinite(mConfig.globalColdPrefillMsPerToken) && mConfig.globalColdPrefillMsPerToken > 0.0F,
         "Global cold-start prefill cost must be finite and positive");
@@ -390,6 +393,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         [this](PhaseWorkItem const& item) { return isEligible(item, true); });
     if (prefillSeed != mPrefillQueue.end())
     {
+        candidatePrefillBatchSize = std::min(candidatePrefillBatchSize, prefillBatchLimit(prefillSeed->prefillClass));
         int32_t const bucketTokens = dispatchedPrefillTokens(*prefillSeed);
         bool const bucketInitial = prefillSeed->tokenOffset == 0;
         if (!bucketInitial && mConfig.maxContinuationPrefillBatchSize > 0)
@@ -502,6 +506,15 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
         result.decodeMinTpotSlackUs = 0.0;
     }
     return result;
+}
+
+int32_t PhaseQueueScheduler::prefillBatchLimit(PhasePrefillClass prefillClass) const noexcept
+{
+    if (prefillClass == PhasePrefillClass::kExternal && mConfig.maxExternalPrefillBatchSize > 0)
+    {
+        return mConfig.maxExternalPrefillBatchSize;
+    }
+    return mConfig.maxPrefillBatchSize;
 }
 
 PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot() const
@@ -786,7 +799,11 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, bool preferMaximumProgress,
     float& predictedGpuMs, float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept
 {
-    int32_t const available = std::min<int32_t>(mConfig.maxPrefillBatchSize, candidates.size());
+    if (candidates.empty())
+    {
+        return 0;
+    }
+    int32_t const available = std::min<int32_t>(prefillBatchLimit(candidates.front()->prefillClass), candidates.size());
     bool const evaluateOversizedOverlap = overlap && mConfig.enableCostAwareOverlapAdmission && !mLatencySafeFallback
         && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
     if (available <= 0 || (!mConfig.enableDynamicPrefillBatching && !evaluateOversizedOverlap))
@@ -1229,6 +1246,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     int32_t bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
     bool const allowRaggedBatch = bucketSeed->allowChunkedPrefill;
+    maxBatchSize = std::min(maxBatchSize, prefillBatchLimit(bucketSeed->prefillClass));
     if (!bucketInitial && mConfig.maxContinuationPrefillBatchSize > 0)
     {
         maxBatchSize = std::min(maxBatchSize, mConfig.maxContinuationPrefillBatchSize);
@@ -1311,7 +1329,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     };
     std::vector<PhaseWorkItem const*> compatible = collectCompatible(bucketTokens, false);
     int32_t batchLimit = batchLimitFor(bucketTokens, compatible.size());
-    int32_t costLookupRows = std::min<int32_t>(mConfig.maxPrefillBatchSize, compatible.size());
+    int32_t costLookupRows = std::min<int32_t>(maxBatchSize, compatible.size());
     int32_t costLookupMaxPastKVLength{};
     for (int32_t index = 0; index < costLookupRows; ++index)
     {
@@ -1719,7 +1737,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         ++mTelemetry.globalPrefillFormationProducerSnapshotCount;
         mTelemetry.globalPrefillFormationMaxPendingRows
             = std::max(mTelemetry.globalPrefillFormationMaxPendingRows, compatibleProducerRows);
-        int32_t formationCapacityRows = mConfig.maxPrefillBatchSize;
+        int32_t formationCapacityRows = prefillBatchLimit(prefillClass);
         if (mConfig.maxPrefillBatchTokens > 0)
         {
             int32_t const tokenCapacityRows = std::max(1, mConfig.maxPrefillBatchTokens / std::max(1, prefillChunk));

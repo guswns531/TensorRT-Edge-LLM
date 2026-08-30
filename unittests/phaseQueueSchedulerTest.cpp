@@ -2490,6 +2490,28 @@ TEST(PhaseQueueSchedulerTest, KeepsTextAndExternalPrefillInSeparateBatches)
     EXPECT_EQ(second.prefillBatch.front().prefillClass, PhasePrefillClass::kExternal);
 }
 
+TEST(PhaseQueueSchedulerTest, CapsExternalPrefillAtItsTensorRtProfile)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxExternalPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler textScheduler(config);
+    PhaseQueueScheduler externalScheduler(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        textScheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128});
+        PhaseWorkItem external{requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128};
+        external.prefillClass = PhasePrefillClass::kExternal;
+        externalScheduler.enqueuePrefill(external);
+    }
+
+    EXPECT_EQ(textScheduler.next().prefillBatch.size(), 8U);
+    EXPECT_EQ(externalScheduler.next().prefillBatch.size(), 4U);
+}
+
 TEST(PhaseQueueSchedulerTest, ChunksExclusiveMultimodalPrefillWithoutBatchingRows)
 {
     PhaseQueueSchedulerConfig config;

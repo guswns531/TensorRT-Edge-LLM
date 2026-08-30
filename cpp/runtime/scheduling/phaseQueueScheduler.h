@@ -388,6 +388,10 @@ struct PhaseQueueSchedulerConfig
     //! policy comparison without bypassing admission-time memory safety.
     bool globalDispatchUsesPreReservedMemory{};
     int32_t maxPrefillBatchSize{1};
+    //! Optional row cap for external-producer prefills when their TensorRT
+    //! optimization profile is narrower than the text-prefill profile. Zero
+    //! inherits maxPrefillBatchSize.
+    int32_t maxExternalPrefillBatchSize{};
     int32_t maxDecodeBatchSize{4};
     //! Optional row cap for continuation chunks (tokenOffset > 0). Zero
     //! inherits maxPrefillBatchSize. This keeps wide initial/atomic prefills
@@ -791,6 +795,7 @@ private:
         PhaseQueueSnapshot const& snapshot, bool preferMaximumProgress, float& predictedGpuMs,
         float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept;
     PhaseQueueSnapshot snapshot() const;
+    int32_t prefillBatchLimit(PhasePrefillClass prefillClass) const noexcept;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     int32_t costAwarePrefillTokens(PhaseWorkItem const& item, int32_t chunkLimit) const noexcept;
     bool isPrefillBatchCompatible(PhaseWorkItem const& item, PhaseWorkItem const& seed, int32_t paddedChunkLength,
