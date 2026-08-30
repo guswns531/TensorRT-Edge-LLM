@@ -3083,7 +3083,9 @@ int main(int argc, char** argv)
                         = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
+                        {"host_scheduler_decision_us", metrics.hostSchedulerDecisionUs},
                         {"host_dispatch_start_us", static_cast<double>(metrics.hostDispatchStartNs) / 1000.0},
+                        {"host_submission_end_us", static_cast<double>(metrics.hostSubmissionEndNs) / 1000.0},
                         {"host_completion_us", static_cast<double>(metrics.hostCompletionNs) / 1000.0},
                         {"prefill_request_ids", metrics.prefillRequestIds},
                         {"decode_request_ids", metrics.decodeRequestIds},

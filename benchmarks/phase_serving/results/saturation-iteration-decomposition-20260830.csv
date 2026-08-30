@@ -1,0 +1,50 @@
+category,scope,metric,mean,p95,max,unit,notes
+e2e,current_instrumented,raw_request_rate,37.448,,,req/s,single diagnostic run
+e2e,current_instrumented,scheduled_ttft,262.2055,673.0065,825.6870,ms,single diagnostic run
+e2e,current_instrumented,tpot,16.0170,18.0402,19.6087,ms,single diagnostic run
+e2e,current_instrumented,scheduled_e2e,1625.8009,2415.7397,2725.0760,ms,single diagnostic run
+e2e,current_frozen_5run,raw_request_rate,37.8770,,,req/s,CI95 0.1391
+e2e,current_frozen_5run,joint_slo_pass,74.9306,,,percent,CI95 2.7836 percentage points
+e2e,current_frozen_5run,request_goodput,28.3829,,,req/s,CI95 1.1337
+e2e,vllm_frozen_5run,raw_request_rate,40.9084,,,req/s,CI95 0.0288
+e2e,vllm_frozen_5run,joint_slo_pass,100.0000,,,percent,same workload frozen baseline
+e2e,vllm_frozen_5run,request_goodput,40.9084,,,req/s,CI95 0.0288
+activity,all,gpu_active_span,7688.8281,,,ms,text-only measured interval
+activity,all,epd_idle,375.7061,,,ms,4.8864 percent
+activity,prefill,active,3129.8848,,,ms,40.7069 percent of active span
+activity,decode,active,4190.2617,,,ms,54.4981 percent of active span
+activity,prefill_decode,overlap,7.0244,,,ms,0.0914 percent of active span
+dispatch,prefill,scheduler_decision,0.3042,0.6164,0.7112,ms,293 dispatches
+dispatch,prefill,host_submission,4.6935,4.9869,7.4684,ms,overlaps GPU work
+dispatch,prefill,gpu_makespan,10.6656,12.6614,16.0612,ms,CUDA events
+dispatch,prefill,realization_residual,0.0804,0.1533,0.2928,ms,wall minus GPU makespan
+dispatch,decode,scheduler_decision,0.1535,0.2721,0.4029,ms,530 dispatches
+dispatch,decode,host_submission,1.4086,2.0357,2.4638,ms,overlaps GPU work
+dispatch,decode,gpu_makespan,7.7631,8.4217,8.6587,ms,CUDA events
+dispatch,decode,realization_residual,0.0538,0.0956,0.1348,ms,wall minus GPU makespan
+request,all,client_dispatch_delay,72.4550,269.4942,438.9980,ms,scheduled arrival to send
+request,all,server_admission,167.6353,390.9668,431.4997,ms,server submit to admit
+request,all,prefill_initial_queue,3.3123,11.5307,22.3726,ms,after admission
+request,all,prefill_active,12.9005,21.3741,27.1991,ms,sum per request
+request,all,decode_inter_dispatch_gap,652.7873,1137.1671,1188.0779,ms,sum per request
+request,all,decode_ready_queue,571.2152,1060.4476,1112.4360,ms,sum per request
+request,all,token_commit_to_decode_ready,0.0284,0.0462,0.1283,ms,sum per request
+request,all,token_commit_to_slot_release,0.0008,0.0014,0.0035,ms,final token only
+sampling,prefill_ticket,submit_to_ready,0.3830,2.4700,5.0908,ms,257 unique tickets
+sampling,prefill_ticket,cuda_active,0.0248,0.0367,0.0498,ms,CUDA activity
+sampling,prefill_ticket,observation_residual,0.3700,2.4440,5.0510,ms,submit-ready minus CUDA
+sampling,decode_ticket,submit_to_ready,1.0090,5.2750,6.1530,ms,530 unique tickets
+sampling,decode_ticket,cuda_active,0.1505,0.2219,0.2803,ms,CUDA activity
+sampling,decode_ticket,observation_residual,0.8590,5.0950,6.0750,ms,submit-ready minus CUDA
+slo_group,pass,client_dispatch_delay,9.7090,99.7420,,ms,199 requests
+slo_group,pass,scheduled_ttft,114.4430,471.1900,,ms,199 requests
+slo_group,pass,server_admission,81.9550,367.9040,,ms,199 requests
+slo_group,fail,client_dispatch_delay,212.7520,362.3560,,ms,89 requests
+slo_group,fail,scheduled_ttft,592.5960,732.8590,,ms,89 requests
+slo_group,fail,server_admission,359.2120,406.8080,,ms,89 requests
+admission,current_aligned,max_active_requests,64,,,requests,configured stable slots 80
+admission,current_aligned,active64_duration,3906.1000,,,ms,measured timeline
+admission,current_aligned,blocked_submissions,162,,,requests,all submitted at active 64
+admission,current_aligned,blocked_admission_wait,298.0150,,431.4997,ms,wait greater than 1 ms
+admission,current_forced80,first_invalid_active_count,65,,,requests,diagnostic run terminated
+admission,current_forced80,termination_code,139,,,code,std::runtime_error abort

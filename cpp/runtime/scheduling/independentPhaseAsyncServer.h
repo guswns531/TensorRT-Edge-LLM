@@ -449,6 +449,8 @@ private:
         int32_t baseReservedPages{};
         int32_t fullReservedPages{};
         bool pageGrowthStarted{};
+        //! Sampling completion that most recently made this request decode-ready.
+        uint64_t decodeProducerSequenceId{};
         bool externalProducer{};
         bool awaitingVisionPayload{};
         bool visionPrefixComplete{};
@@ -497,7 +499,9 @@ private:
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     void finishRequest(uint64_t requestId, bool stoppedByEos);
     void destroyTicketEvent(IndependentPhaseSampleTicket& ticket) noexcept;
-    void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, int32_t kvSlotId = -1) const;
+    void recordSamplingTimeline(IndependentPhaseSampleTicket const& ticket, PhaseTimelineStage stage) const;
+    void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, int32_t kvSlotId = -1,
+        uint64_t correlationId = 0U, uint64_t timestampNs = 0U) const;
 
     IndependentPhaseServerConfig mConfig;
     IndependentPhaseCoordinator& mCoordinator;

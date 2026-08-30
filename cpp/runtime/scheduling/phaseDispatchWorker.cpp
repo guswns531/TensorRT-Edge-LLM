@@ -222,6 +222,7 @@ bool PhaseDispatchWorker::dispatchNext()
     check::check(actionFidelity, "Global P/D plan does not match the launched phase set");
     mCurrentMetrics.dispatchIndex = mDispatchCount + 1;
     mCurrentMetrics.kind = mInFlight.kind;
+    mCurrentMetrics.hostSchedulerDecisionUs = mInFlight.hostSchedulerDecisionUs;
     mCurrentMetrics.hostDispatchStartNs = phaseTimelineNowNs();
     mCurrentMetrics.prefillRequestIds.reserve(mInFlight.prefillBatch.size());
     for (PhaseWorkItem const& item : mInFlight.prefillBatch)
@@ -366,6 +367,7 @@ bool PhaseDispatchWorker::dispatchNext()
             CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
         }
     }
+    mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
     mBusy = true;
     ++mDispatchCount;
     return true;
@@ -421,6 +423,7 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
             mCallbacks.enqueueDecode, mDecodeStream);
         CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
     }
+    mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
     mResidualAugmentation = true;
     mergeAugmentedMetrics(additional, aggregate, planId, snapshotEpoch);
     return true;
@@ -611,6 +614,7 @@ void PhaseDispatchWorker::enqueueDeferredDecode()
     enqueueActivity(
         PhaseActivityKind::kDecode, "decode_dispatch", mInFlight.decodeBatch, mCallbacks.enqueueDecode, mDecodeStream);
     CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
+    mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
     mDecodeDeferred = false;
 }
 

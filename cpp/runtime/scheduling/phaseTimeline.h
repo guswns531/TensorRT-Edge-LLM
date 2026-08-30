@@ -37,10 +37,20 @@ enum class PhaseTimelineStage
     kServerAdmit,
     kPrefillStart,
     kPrefillDone,
+    kPrefillSamplingSubmit,
+    kPrefillSamplingReady,
+    kPrefillSamplingCollected,
+    kPrefillTokenCommitted,
     kDecodeStart,
     kDecodeDone,
+    kDecodeSamplingSubmit,
+    kDecodeSamplingReady,
+    kDecodeSamplingCollected,
+    kDecodeTokenCommitted,
+    kDecodeReady,
     kFirstToken,
     kCompletion,
+    kSlotReleased,
 };
 
 //! One immutable request transition. Repeated decode dispatches are preserved;
@@ -75,10 +85,20 @@ inline std::string_view phaseTimelineStageName(PhaseTimelineStage stage) noexcep
     case PhaseTimelineStage::kServerAdmit: return "server_admit";
     case PhaseTimelineStage::kPrefillStart: return "prefill_start";
     case PhaseTimelineStage::kPrefillDone: return "prefill_done";
+    case PhaseTimelineStage::kPrefillSamplingSubmit: return "prefill_sampling_submit";
+    case PhaseTimelineStage::kPrefillSamplingReady: return "prefill_sampling_ready";
+    case PhaseTimelineStage::kPrefillSamplingCollected: return "prefill_sampling_collected";
+    case PhaseTimelineStage::kPrefillTokenCommitted: return "prefill_token_committed";
     case PhaseTimelineStage::kDecodeStart: return "decode_start";
     case PhaseTimelineStage::kDecodeDone: return "decode_done";
+    case PhaseTimelineStage::kDecodeSamplingSubmit: return "decode_sampling_submit";
+    case PhaseTimelineStage::kDecodeSamplingReady: return "decode_sampling_ready";
+    case PhaseTimelineStage::kDecodeSamplingCollected: return "decode_sampling_collected";
+    case PhaseTimelineStage::kDecodeTokenCommitted: return "decode_token_committed";
+    case PhaseTimelineStage::kDecodeReady: return "decode_ready";
     case PhaseTimelineStage::kFirstToken: return "first_token";
     case PhaseTimelineStage::kCompletion: return "completion";
+    case PhaseTimelineStage::kSlotReleased: return "slot_released";
     }
     return "unknown";
 }

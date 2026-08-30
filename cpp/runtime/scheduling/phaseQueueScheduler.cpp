@@ -2627,6 +2627,7 @@ size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t
 
 PhaseDispatchPlan PhaseQueueScheduler::next()
 {
+    auto const decisionStart = std::chrono::steady_clock::now();
     refreshExternalDrainPreference();
     PhaseQueueSnapshot const state = snapshot();
     bool const profileFreeProduction = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
@@ -2670,6 +2671,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
             = global.referenceWorkUs / std::max(predictedMakespanUs, std::numeric_limits<double>::epsilon());
         plan.globalSafeProbe = global.calibrationProbe || (global.safeProbeEligible && !global.overlapCostKnown);
         plan.globalCandidateId = global.candidateId;
+        plan.hostSchedulerDecisionUs = global.hostDecisionUs;
         plan.globalPlanId = globalPlan.planId;
         plan.globalSnapshotEpoch = globalPlan.snapshotEpoch;
         plan.globalAllowedOutstanding = globalPlan.allowedOutstanding;
@@ -2858,6 +2860,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         mConsecutiveDrainPreferenceDispatches = 0U;
     }
     mTelemetry.activeDrainPreference = mActiveDrainPreference;
+    plan.hostSchedulerDecisionUs
+        += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - decisionStart).count();
     return plan;
 }
 

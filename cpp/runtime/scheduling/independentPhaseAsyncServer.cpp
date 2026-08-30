@@ -1790,6 +1790,7 @@ bool IndependentPhaseAsyncServer::enqueueDecodeOrWait(uint64_t requestId, Reques
     }
     mCoordinator.enqueueDecode(
         {requestId, mOwnership.length(state.kvSlotId), state.kvSlotId, 0, 0, true, state.scheduling});
+    recordTimeline(requestId, PhaseTimelineStage::kDecodeReady, state.kvSlotId, state.decodeProducerSequenceId);
     return true;
 }
 
@@ -1982,6 +1983,8 @@ void IndependentPhaseAsyncServer::enqueueSamplingTicket(std::unique_ptr<Independ
     ELLM_CHECK(ticket != nullptr && ticket->ready != nullptr, "Sampling adapter returned an invalid CUDA event");
     ticket->sequenceId = mNextSamplingTicketSequence++;
     ticket->submittedAt = std::chrono::steady_clock::now();
+    recordSamplingTimeline(*ticket,
+        ticket->fromPrefill ? PhaseTimelineStage::kPrefillSamplingSubmit : PhaseTimelineStage::kDecodeSamplingSubmit);
     mSamplingTickets.push_back(std::move(ticket));
 }
 
@@ -1997,6 +2000,9 @@ bool IndependentPhaseAsyncServer::processSamplingTickets()
             continue;
         }
         CUDA_CHECK(status);
+        recordSamplingTimeline(*(*ticket),
+            (*ticket)->fromPrefill ? PhaseTimelineStage::kPrefillSamplingReady
+                                   : PhaseTimelineStage::kDecodeSamplingReady);
         if ((*ticket)->submittedAt != std::chrono::steady_clock::time_point{})
         {
             double const latencyUs
@@ -2048,6 +2054,9 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
 {
     std::vector<int32_t> const tokens = ticket->collect();
     ELLM_CHECK(tokens.size() == ticket->requestIds.size(), "Phase sampling ticket returned an invalid row count");
+    recordSamplingTimeline(*ticket,
+        ticket->fromPrefill ? PhaseTimelineStage::kPrefillSamplingCollected
+                            : PhaseTimelineStage::kDecodeSamplingCollected);
     for (size_t index{}; index < tokens.size(); ++index)
     {
         uint64_t const requestId = ticket->requestIds[index];
@@ -2058,6 +2067,10 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         }
         RequestState& state = it->second;
         state.generatedTokens.push_back(tokens[index]);
+        recordTimeline(requestId,
+            ticket->fromPrefill ? PhaseTimelineStage::kPrefillTokenCommitted
+                                : PhaseTimelineStage::kDecodeTokenCommitted,
+            state.kvSlotId, ticket->sequenceId);
         bool const eos = isEos(tokens[index]);
         double const elapsedMs
             = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
@@ -2073,6 +2086,7 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         }
         else
         {
+            state.decodeProducerSequenceId = ticket->sequenceId;
             static_cast<void>(enqueueDecodeOrWait(requestId, state));
         }
     }
@@ -2084,7 +2098,6 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     auto it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Finished phase request is missing");
     RequestState& state = it->second;
-    recordTimeline(requestId, PhaseTimelineStage::kCompletion, state.kvSlotId);
     if (mConfig.enablePrefixReuse && mAdapter.supportsPageAlignedPrefixReuse && mPrefixCache != nullptr
         && state.promptTokens.size() >= 128U)
     {
@@ -2093,7 +2106,9 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     else
     {
         mOwnership.release(state.kvSlotId);
+        recordTimeline(requestId, PhaseTimelineStage::kSlotReleased, state.kvSlotId);
     }
+    recordTimeline(requestId, PhaseTimelineStage::kCompletion, state.kvSlotId);
     double const latencyMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state.submittedAt).count();
     mCompletions.push_back({requestId, std::move(state.generatedTokens),
@@ -2111,11 +2126,29 @@ void IndependentPhaseAsyncServer::finishRequest(uint64_t requestId, bool stopped
     }
 }
 
-void IndependentPhaseAsyncServer::recordTimeline(uint64_t requestId, PhaseTimelineStage stage, int32_t kvSlotId) const
+void IndependentPhaseAsyncServer::recordSamplingTimeline(
+    IndependentPhaseSampleTicket const& ticket, PhaseTimelineStage stage) const
+{
+    if (!mTimelineCallback)
+    {
+        return;
+    }
+    uint64_t const timestampNs = phaseTimelineNowNs();
+    for (uint64_t const requestId : ticket.requestIds)
+    {
+        auto const request = mRequests.find(requestId);
+        int32_t const kvSlotId = request == mRequests.end() ? -1 : request->second.kvSlotId;
+        recordTimeline(requestId, stage, kvSlotId, ticket.sequenceId, timestampNs);
+    }
+}
+
+void IndependentPhaseAsyncServer::recordTimeline(
+    uint64_t requestId, PhaseTimelineStage stage, int32_t kvSlotId, uint64_t correlationId, uint64_t timestampNs) const
 {
     if (mTimelineCallback)
     {
-        mTimelineCallback({requestId, stage, phaseTimelineNowNs(), 0U, 0, kvSlotId});
+        mTimelineCallback(
+            {requestId, stage, timestampNs > 0U ? timestampNs : phaseTimelineNowNs(), correlationId, 0, kvSlotId});
     }
 }
 

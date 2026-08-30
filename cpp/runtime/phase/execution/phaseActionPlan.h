@@ -35,6 +35,8 @@ struct PhaseGlobalActionCandidate
 {
     //! Stable identity derived from the action shape and ordered request rows.
     uint64_t candidateId{};
+    //! Host time already spent forming/selecting this externally staged action.
+    double hostDecisionUs{};
     PhaseGlobalActionKey key;
     //! Primary and secondary row vectors retain phase-local canonical order.
     std::vector<uint64_t> primaryRequestIds;

@@ -116,8 +116,11 @@ struct PhaseDispatchMetrics
     size_t dispatchIndex{};
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
     PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
+    //! Snapshot, candidate selection, and concrete batch materialization time.
+    double hostSchedulerDecisionUs{};
     //! Host monotonic timestamps bracketing this asynchronous dispatch plan.
     uint64_t hostDispatchStartNs{};
+    uint64_t hostSubmissionEndNs{};
     uint64_t hostCompletionNs{};
     //! Stable request membership used to join dispatch metrics with request timelines.
     std::vector<uint64_t> prefillRequestIds;
@@ -607,6 +610,8 @@ struct PhaseDecodeCompletionPreview
 struct PhaseDispatchPlan
 {
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
+    //! Snapshot, candidate selection, and concrete batch materialization time.
+    double hostSchedulerDecisionUs{};
     std::vector<PhaseWorkItem> prefillBatch;
     std::vector<PhaseWorkItem> decodeBatch;
     //! Oldest selected row's host queue residence before dispatch.

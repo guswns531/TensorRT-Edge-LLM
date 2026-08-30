@@ -1334,6 +1334,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
 
 bool PhaseThreeCoordinator::dispatchGlobalAction()
 {
+    auto const decisionStart = std::chrono::steady_clock::now();
     if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled)
     {
         return false;
@@ -1428,6 +1429,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
         {
             ++mGlobalPdSelections;
+            pd->hostDecisionUs
+                = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - decisionStart).count();
             PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(*pd);
             PhaseGlobalActionCandidate launched = *pd;
             auto const launchedAt = std::chrono::steady_clock::now();
