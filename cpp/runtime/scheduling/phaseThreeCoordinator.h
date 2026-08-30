@@ -104,6 +104,10 @@ struct PhaseThreeCoordinatorConfig
     //! Research-only exact percentage of hard-feasible residual P+D opportunities.
     //! Negative preserves production policy; zero through 100 controls the sweep.
     int32_t globalExperimentalOverlapPercent{-1};
+    //! Research-only exact percentage of hard-feasible E+P opportunities.
+    int32_t globalExperimentalEncoderPrefillOverlapPercent{-1};
+    //! Research-only exact percentage of hard-feasible E+D opportunities.
+    int32_t globalExperimentalEncoderDecodeOverlapPercent{-1};
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     int32_t globalDecodeContextBucketTokens{512};
@@ -297,6 +301,10 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalResidualPrefillDecodeUnknownCostRejects{};
     size_t globalExperimentalResidualPrefillDecodeOpportunities{};
     size_t globalExperimentalResidualPrefillDecodeSelections{};
+    size_t globalExperimentalEncoderPrefillOpportunities{};
+    size_t globalExperimentalEncoderPrefillSelections{};
+    size_t globalExperimentalEncoderDecodeOpportunities{};
+    size_t globalExperimentalEncoderDecodeSelections{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
     size_t globalEncoderOverlapOpportunities{};
@@ -669,6 +677,12 @@ private:
     size_t mGlobalExperimentalResidualPrefillDecodeOpportunities{};
     size_t mGlobalExperimentalResidualPrefillDecodeSelections{};
     size_t mGlobalExperimentalResidualPrefillDecodeAccumulator{};
+    size_t mGlobalExperimentalEncoderPrefillOpportunities{};
+    size_t mGlobalExperimentalEncoderPrefillSelections{};
+    size_t mGlobalExperimentalEncoderPrefillAccumulator{};
+    size_t mGlobalExperimentalEncoderDecodeOpportunities{};
+    size_t mGlobalExperimentalEncoderDecodeSelections{};
+    size_t mGlobalExperimentalEncoderDecodeAccumulator{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
     size_t mGlobalEncoderOverlapOpportunities{};

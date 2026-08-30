@@ -545,6 +545,15 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Global overlap safe-probe slack multiplier must be finite and non-negative");
     ELLM_CHECK(mConfig.globalExperimentalOverlapPercent >= -1 && mConfig.globalExperimentalOverlapPercent <= 100,
         "Global experimental overlap percentage must be -1 or between zero and 100");
+    ELLM_CHECK(mConfig.globalExperimentalEncoderPrefillOverlapPercent >= -1
+            && mConfig.globalExperimentalEncoderPrefillOverlapPercent <= 100,
+        "Global experimental E+P overlap percentage must be -1 or between zero and 100");
+    ELLM_CHECK(mConfig.globalExperimentalEncoderDecodeOverlapPercent >= -1
+            && mConfig.globalExperimentalEncoderDecodeOverlapPercent <= 100,
+        "Global experimental E+D overlap percentage must be -1 or between zero and 100");
+    ELLM_CHECK(mConfig.globalExperimentalEncoderPrefillOverlapPercent < 0
+            || mConfig.globalExperimentalEncoderDecodeOverlapPercent < 0,
+        "Only one experimental encoder overlap kind may be active");
     ELLM_CHECK(mConfig.globalCalibrationMaxOverlapKeys > 0U, "Global calibration overlap-key limit must be positive");
     ELLM_CHECK(mConfig.globalDecodeContextBucketTokens > 0, "Global overlap context bucket must be positive");
     for (PhaseEncoderPrefillBatchCost const& cost : mConfig.globalEncoderPrefillCosts)
@@ -948,6 +957,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalResidualPrefillDecodeUnknownCostRejects = mGlobalResidualPrefillDecodeUnknownCostRejects;
     result.globalExperimentalResidualPrefillDecodeOpportunities = mGlobalExperimentalResidualPrefillDecodeOpportunities;
     result.globalExperimentalResidualPrefillDecodeSelections = mGlobalExperimentalResidualPrefillDecodeSelections;
+    result.globalExperimentalEncoderPrefillOpportunities = mGlobalExperimentalEncoderPrefillOpportunities;
+    result.globalExperimentalEncoderPrefillSelections = mGlobalExperimentalEncoderPrefillSelections;
+    result.globalExperimentalEncoderDecodeOpportunities = mGlobalExperimentalEncoderDecodeOpportunities;
+    result.globalExperimentalEncoderDecodeSelections = mGlobalExperimentalEncoderDecodeSelections;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
     result.globalEncoderOverlapOpportunities = mGlobalEncoderOverlapOpportunities;
@@ -1799,7 +1812,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PhaseGlobalActionCandidate overlap;
         overlap.key = overlapKey;
         overlap.overlapCostKnown = overlapKnown;
-        overlap.safeProbeEligible = safeProbe;
+        int32_t const experimentalPercent = kind == PhaseGlobalActionKind::kEncoderPrefill
+            ? mConfig.globalExperimentalEncoderPrefillOverlapPercent
+            : mConfig.globalExperimentalEncoderDecodeOverlapPercent;
+        bool const experimentalMode = !mGlobalWarmupProbeMode && experimentalPercent >= 0;
+        overlap.safeProbeEligible = safeProbe || experimentalMode;
         overlap.calibrationProbe = calibrationProbe;
         overlap.predictedBlockingUs = overlapMakespanUs;
         overlap.predictedMakespanUs = overlapMakespanUs;
@@ -1888,6 +1905,54 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), probe));
         }
     }
+    auto applyExperimentalEncoderOverlap = [&](PhaseGlobalActionKind kind, int32_t percent, size_t& opportunities,
+                                               size_t& selections, size_t& accumulator) {
+        if (mGlobalWarmupProbeMode || percent < 0)
+        {
+            return;
+        }
+        auto const overlap = std::find_if(
+            candidates.begin(), candidates.end(), [kind](auto const& candidate) { return candidate.key.kind == kind; });
+        if (overlap == candidates.end())
+        {
+            return;
+        }
+        PhaseGlobalDecision const feasible = mGlobalScheduler.select({*overlap});
+        if (!feasible.selectedIndex.has_value())
+        {
+            return;
+        }
+        ++opportunities;
+        if (phaseGlobalSelectExperimentalOverlap(percent, accumulator))
+        {
+            selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), overlap));
+            ++selections;
+            return;
+        }
+
+        std::vector<PhaseGlobalActionCandidate> fallbackCandidates;
+        std::vector<size_t> fallbackIndices;
+        fallbackCandidates.reserve(candidates.size() - 1U);
+        fallbackIndices.reserve(candidates.size() - 1U);
+        for (size_t index = 0U; index < candidates.size(); ++index)
+        {
+            if (candidates[index].key.kind != kind)
+            {
+                fallbackCandidates.push_back(candidates[index]);
+                fallbackIndices.push_back(index);
+            }
+        }
+        PhaseGlobalDecision const fallback = mGlobalScheduler.select(fallbackCandidates);
+        selectedIndex = fallback.selectedIndex.has_value()
+            ? std::optional<size_t>{fallbackIndices[*fallback.selectedIndex]}
+            : std::nullopt;
+    };
+    applyExperimentalEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill,
+        mConfig.globalExperimentalEncoderPrefillOverlapPercent, mGlobalExperimentalEncoderPrefillOpportunities,
+        mGlobalExperimentalEncoderPrefillSelections, mGlobalExperimentalEncoderPrefillAccumulator);
+    applyExperimentalEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode,
+        mConfig.globalExperimentalEncoderDecodeOverlapPercent, mGlobalExperimentalEncoderDecodeOpportunities,
+        mGlobalExperimentalEncoderDecodeSelections, mGlobalExperimentalEncoderDecodeAccumulator);
     if (!selectedIndex.has_value())
     {
         if (residualAugmentation)

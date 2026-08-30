@@ -2199,6 +2199,14 @@ int main(int argc, char** argv)
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
                 threePhaseConfig.globalExperimentalOverlapPercent
                     = semanticSchedulerConfig.globalExperimentalOverlapPercent;
+                if (char const* value = std::getenv("TRT_EDGELLM_EXPERIMENTAL_ENCODER_PREFILL_OVERLAP_PERCENT"))
+                {
+                    threePhaseConfig.globalExperimentalEncoderPrefillOverlapPercent = std::stoi(value);
+                }
+                if (char const* value = std::getenv("TRT_EDGELLM_EXPERIMENTAL_ENCODER_DECODE_OVERLAP_PERCENT"))
+                {
+                    threePhaseConfig.globalExperimentalEncoderDecodeOverlapPercent = std::stoi(value);
+                }
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
@@ -3285,6 +3293,14 @@ int main(int argc, char** argv)
                             visionMetrics.globalExperimentalResidualPrefillDecodeOpportunities},
                         {"vision_global_experimental_residual_prefill_decode_selections",
                             visionMetrics.globalExperimentalResidualPrefillDecodeSelections},
+                        {"vision_global_experimental_encoder_prefill_opportunities",
+                            visionMetrics.globalExperimentalEncoderPrefillOpportunities},
+                        {"vision_global_experimental_encoder_prefill_selections",
+                            visionMetrics.globalExperimentalEncoderPrefillSelections},
+                        {"vision_global_experimental_encoder_decode_opportunities",
+                            visionMetrics.globalExperimentalEncoderDecodeOpportunities},
+                        {"vision_global_experimental_encoder_decode_selections",
+                            visionMetrics.globalExperimentalEncoderDecodeSelections},
                         {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
