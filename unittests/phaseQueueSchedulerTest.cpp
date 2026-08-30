@@ -758,6 +758,30 @@ TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)
     EXPECT_EQ(scheduler.telemetry().globalWaitRequestIds, (std::vector<uint64_t>{1U, 2U, 3U, 4U}));
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalWaitHoldsOverflowUntilCurrentCohortCompletes)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    ASSERT_EQ(scheduler.queueSnapshot().decodeQueued, 0U);
+
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {1U, 2U, 3U, 4U}, {128, 128, 128, 128}};
+
+    EXPECT_TRUE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitCurrentRows, 0);
+    EXPECT_EQ(scheduler.telemetry().globalWaitFutureRows, 4);
+    EXPECT_EQ(scheduler.telemetry().globalWaitEventId, 7U);
+    EXPECT_EQ(scheduler.telemetry().lastGlobalSelectedAction, PhaseGlobalActionKind::kWait);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalWaitIncludesResidualDecodeAfterDispatchNow)
 {
     PhaseQueueSchedulerConfig config;
@@ -1832,6 +1856,75 @@ TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
     PhaseDispatchPlan third = scheduler.next();
     EXPECT_EQ(ids(third.decodeBatch), (std::set<uint64_t>{2, 3, 4, 5}));
     EXPECT_EQ(scheduler.decodeCohortSize(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortKeepsOverflowQueuedWhileCurrentRowsAreInFlight)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 2U);
+    EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 0U);
+
+    PhaseDispatchPlan const blocked = scheduler.next();
+    EXPECT_EQ(blocked.kind, PhaseDispatchKind::kNone);
+    EXPECT_TRUE(blocked.decodeBatch.empty());
+    EXPECT_EQ(scheduler.decodeQueueSize(), 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortSelectsOnlyReadyMembersDuringPartialRefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+
+    EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 1U);
+    PhaseDispatchPlan const refill = scheduler.next();
+    ASSERT_EQ(refill.decodeBatch.size(), 1U);
+    EXPECT_EQ(refill.decodeBatch.front().requestId, first.decodeBatch.front().requestId);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortSupportsActiveCapacityAboveBatchLimit)
+{
+    for (uint64_t const activeRequests : {65U, 72U, 80U})
+    {
+        PhaseQueueSchedulerConfig config;
+        config.maxDecodeBatchSize = 64;
+        config.enableDecodeCohortBatching = true;
+        PhaseQueueScheduler scheduler(config);
+        for (uint64_t requestId = 1; requestId <= activeRequests; ++requestId)
+        {
+            scheduler.enqueueDecode({requestId, 128});
+        }
+
+        PhaseDispatchPlan const first = scheduler.next();
+        ASSERT_EQ(first.decodeBatch.size(), 64U) << "active requests=" << activeRequests;
+        scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+
+        EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 1U) << "active requests=" << activeRequests;
+        PhaseDispatchPlan const refill = scheduler.next();
+        ASSERT_EQ(refill.decodeBatch.size(), 1U) << "active requests=" << activeRequests;
+        EXPECT_EQ(refill.decodeBatch.front().requestId, first.decodeBatch.front().requestId)
+            << "active requests=" << activeRequests;
+    }
 }
 
 TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchToRecoverAfterDeadline)

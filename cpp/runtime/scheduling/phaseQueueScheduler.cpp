@@ -422,18 +422,12 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
             result.prefillContinuationRows += item.tokenOffset > 0 ? 1 : 0;
         }
     }
-    for (PhaseWorkItem const& item : mDecodeQueue)
+    std::vector<PhaseWorkItem const*> const decodeRows = decodeCandidateRows(mConfig.maxDecodeBatchSize);
+    result.decodeQueued = decodeRows.size();
+    for (PhaseWorkItem const* item : decodeRows)
     {
-        if (isEligible(item, false))
-        {
-            ++result.decodeQueued;
-            if (result.decodeQueued <= static_cast<size_t>(mConfig.maxDecodeBatchSize))
-            {
-                result.decodeCandidateContextTokens += item.tokenCount;
-                result.decodeCandidateMaxContextLength
-                    = std::max(result.decodeCandidateMaxContextLength, item.tokenCount);
-            }
-        }
+        result.decodeCandidateContextTokens += item->tokenCount;
+        result.decodeCandidateMaxContextLength = std::max(result.decodeCandidateMaxContextLength, item->tokenCount);
     }
     result.decodeCandidateTokens = static_cast<int32_t>(std::min<int64_t>(
         result.decodeCandidateContextTokens, static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
@@ -1046,7 +1040,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         }
         return moreUrgentPrefill(*lhs, *rhs);
     };
-    int32_t const count = std::min<int32_t>(maxBatchSize,
+    int32_t count = std::min<int32_t>(maxBatchSize,
         std::count_if(queue.begin(), queue.end(),
             [this, chunkPrefill](PhaseWorkItem const& item) { return isEligible(item, chunkPrefill); }));
     std::vector<PhaseWorkItem> batch;
@@ -1066,6 +1060,10 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
                     mDecodeCohortIds.insert(item.requestId);
                 }
             }
+            count = std::min<int32_t>(
+                maxBatchSize, std::count_if(queue.begin(), queue.end(), [this](PhaseWorkItem const& item) {
+                    return isEligible(item, false) && mDecodeCohortIds.find(item.requestId) != mDecodeCohortIds.end();
+                }));
         }
         for (int32_t i = 0; i < count; ++i)
         {
@@ -2196,10 +2194,24 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
         return false;
     }
     PhaseQueueSnapshot const state = snapshot();
-    if (state.prefillQueued > 0U || state.decodeQueued == 0U
-        || state.decodeQueued >= static_cast<size_t>(mConfig.maxDecodeBatchSize))
+    if (state.prefillQueued > 0U || state.decodeQueued >= static_cast<size_t>(mConfig.maxDecodeBatchSize))
     {
         return false;
+    }
+    if (state.decodeQueued == 0U)
+    {
+        PhaseDecodeCompletionPreview const& next = previews.front();
+        ++mTelemetry.globalWaitDecisionCount;
+        ++mTelemetry.globalWaitSelectedCount;
+        ++mTelemetry.globalWaitCandidateCount;
+        mTelemetry.globalWaitCurrentRows = 0;
+        mTelemetry.globalWaitFutureRows
+            = static_cast<int32_t>(std::min(next.requestIds.size(), static_cast<size_t>(mConfig.maxDecodeBatchSize)));
+        mTelemetry.globalWaitEventId = next.eventId;
+        mTelemetry.globalWaitRequestIds = next.requestIds;
+        mTelemetry.lastGlobalSelectedAction = PhaseGlobalActionKind::kWait;
+        mTelemetry.lastGlobalDecisionReason = PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
+        return mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive;
     }
     std::vector<PhaseGlobalActionCandidate> candidates;
     candidates.reserve(2U * std::min(kMaxWaitCandidates, previews.size()));
