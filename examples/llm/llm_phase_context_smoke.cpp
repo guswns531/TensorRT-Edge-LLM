@@ -42,6 +42,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -333,6 +334,8 @@ struct PhaseTiming
     float prefillMs{};
     float decodeMs{};
     float makespanMs{};
+    float overlapMs{};
+    float overlapPairFraction{};
 };
 
 struct ExecutorTiming
@@ -583,6 +586,109 @@ PhaseTiming measureSequential(rt::EngineExecutor& prefillExecutor, rt::EngineExe
     return total;
 }
 
+PhaseTiming measureControlledOverlap(rt::EngineExecutor& prefillExecutor, rt::EngineExecutor& decodeExecutor,
+    cudaStream_t setupStream, cudaStream_t prefillStream, cudaStream_t decodeStream, int32_t warmup,
+    int32_t iterations, int32_t overlapPercent)
+{
+    ELLM_CHECK(overlapPercent >= 0 && overlapPercent <= 100, "Controlled overlap percentage is outside [0, 100]");
+    cudaEvent_t gate{};
+    cudaEvent_t prefillStart{};
+    cudaEvent_t prefillEnd{};
+    cudaEvent_t decodeStart{};
+    cudaEvent_t decodeEnd{};
+    cudaEvent_t done{};
+    CUDA_CHECK(cudaEventCreate(&gate));
+    CUDA_CHECK(cudaEventCreate(&prefillStart));
+    CUDA_CHECK(cudaEventCreate(&prefillEnd));
+    CUDA_CHECK(cudaEventCreate(&decodeStart));
+    CUDA_CHECK(cudaEventCreate(&decodeEnd));
+    CUDA_CHECK(cudaEventCreate(&done));
+
+    PhaseTiming total;
+    int32_t overlapAccumulator{};
+    int32_t measuredOverlapPairs{};
+    int32_t const totalIterations = warmup + iterations;
+    for (int32_t iteration = 0; iteration < totalIterations; ++iteration)
+    {
+        overlapAccumulator += overlapPercent;
+        bool const concurrent = overlapAccumulator >= 100;
+        overlapAccumulator -= concurrent ? 100 : 0;
+        if (concurrent)
+        {
+            CUDA_CHECK(cudaEventRecord(gate, setupStream));
+            CUDA_CHECK(cudaStreamWaitEvent(prefillStream, gate));
+            CUDA_CHECK(cudaStreamWaitEvent(decodeStream, gate));
+            CUDA_CHECK(cudaEventRecord(prefillStart, prefillStream));
+            ELLM_CHECK(prefillExecutor.execute(prefillStream), "Controlled overlap prefill execution failed");
+            CUDA_CHECK(cudaEventRecord(prefillEnd, prefillStream));
+            CUDA_CHECK(cudaEventRecord(decodeStart, decodeStream));
+            ELLM_CHECK(decodeExecutor.execute(decodeStream), "Controlled overlap decode execution failed");
+            CUDA_CHECK(cudaEventRecord(decodeEnd, decodeStream));
+            CUDA_CHECK(cudaStreamWaitEvent(setupStream, prefillEnd));
+            CUDA_CHECK(cudaStreamWaitEvent(setupStream, decodeEnd));
+            CUDA_CHECK(cudaEventRecord(done, setupStream));
+            CUDA_CHECK(cudaEventSynchronize(done));
+        }
+        else
+        {
+            CUDA_CHECK(cudaEventRecord(prefillStart, prefillStream));
+            ELLM_CHECK(prefillExecutor.execute(prefillStream), "Controlled sequential prefill execution failed");
+            CUDA_CHECK(cudaEventRecord(prefillEnd, prefillStream));
+            CUDA_CHECK(cudaEventSynchronize(prefillEnd));
+            CUDA_CHECK(cudaEventRecord(decodeStart, decodeStream));
+            ELLM_CHECK(decodeExecutor.execute(decodeStream), "Controlled sequential decode execution failed");
+            CUDA_CHECK(cudaEventRecord(decodeEnd, decodeStream));
+            CUDA_CHECK(cudaEventSynchronize(decodeEnd));
+        }
+        if (iteration < warmup)
+        {
+            continue;
+        }
+
+        float prefillMs{};
+        float decodeMs{};
+        CUDA_CHECK(cudaEventElapsedTime(&prefillMs, prefillStart, prefillEnd));
+        CUDA_CHECK(cudaEventElapsedTime(&decodeMs, decodeStart, decodeEnd));
+        total.prefillMs += prefillMs;
+        total.decodeMs += decodeMs;
+        if (concurrent)
+        {
+            float makespanMs{};
+            float prefillStartMs{};
+            float prefillEndMs{};
+            float decodeStartMs{};
+            float decodeEndMs{};
+            CUDA_CHECK(cudaEventElapsedTime(&makespanMs, gate, done));
+            CUDA_CHECK(cudaEventElapsedTime(&prefillStartMs, gate, prefillStart));
+            CUDA_CHECK(cudaEventElapsedTime(&prefillEndMs, gate, prefillEnd));
+            CUDA_CHECK(cudaEventElapsedTime(&decodeStartMs, gate, decodeStart));
+            CUDA_CHECK(cudaEventElapsedTime(&decodeEndMs, gate, decodeEnd));
+            total.makespanMs += makespanMs;
+            total.overlapMs
+                += std::max(0.0F, std::min(prefillEndMs, decodeEndMs) - std::max(prefillStartMs, decodeStartMs));
+            ++measuredOverlapPairs;
+        }
+        else
+        {
+            total.makespanMs += prefillMs + decodeMs;
+        }
+    }
+
+    CUDA_CHECK(cudaEventDestroy(gate));
+    CUDA_CHECK(cudaEventDestroy(prefillStart));
+    CUDA_CHECK(cudaEventDestroy(prefillEnd));
+    CUDA_CHECK(cudaEventDestroy(decodeStart));
+    CUDA_CHECK(cudaEventDestroy(decodeEnd));
+    CUDA_CHECK(cudaEventDestroy(done));
+    float const scale = 1.0F / static_cast<float>(iterations);
+    total.prefillMs *= scale;
+    total.decodeMs *= scale;
+    total.makespanMs *= scale;
+    total.overlapMs *= scale;
+    total.overlapPairFraction = static_cast<float>(measuredOverlapPairs) * scale;
+    return total;
+}
+
 ExecutorTiming measureExecutor(rt::EngineExecutor& executor, cudaStream_t stream, int32_t warmup, int32_t iterations)
 {
     ELLM_CHECK(warmup >= 0 && iterations > 0, "Executor timing requires non-negative warmup and positive iterations");
@@ -738,21 +844,42 @@ int main(int argc, char** argv)
         bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
         if (!semanticOnly)
         {
+            bool const controlledOverlapSweep = std::getenv("TRT_EDGELLM_PHASE_OVERLAP_SWEEP") != nullptr;
+            int32_t controlledDecodeBatchSize = 1;
+            if (controlledOverlapSweep)
+            {
+                if (char const* value = std::getenv("TRT_EDGELLM_PHASE_OVERLAP_SWEEP_DECODE_BATCH"))
+                {
+                    controlledDecodeBatchSize = std::stoi(value);
+                }
+            }
+            ELLM_CHECK(controlledDecodeBatchSize > 0
+                    && controlledDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
+                "Controlled overlap decode batch is outside the engine profile");
             int32_t const prefillSlot0 = ownership.reserve();
             int32_t const prefillSlot1 = config.packedPrefill ? ownership.reserve() : -1;
-            int32_t const decodeSlot = ownership.reserve();
+            std::vector<int32_t> decodeSlots;
+            decodeSlots.reserve(static_cast<size_t>(controlledDecodeBatchSize));
+            for (int32_t row{}; row < controlledDecodeBatchSize; ++row)
+            {
+                decodeSlots.push_back(ownership.reserve());
+            }
+            int32_t const decodeSlot = decodeSlots.front();
             ownership.ensureCapacity(prefillSlot0, 128);
             if (config.packedPrefill)
             {
                 ownership.ensureCapacity(prefillSlot1, 128);
             }
-            ownership.ensureCapacity(decodeSlot, 129);
             ownership.setLength(prefillSlot0, 0);
             if (config.packedPrefill)
             {
                 ownership.setLength(prefillSlot1, 0);
             }
-            ownership.setLength(decodeSlot, 128);
+            for (int32_t const slot : decodeSlots)
+            {
+                ownership.ensureCapacity(slot, 129);
+                ownership.setLength(slot, 128);
+            }
             rt::PhaseKVActiveView prefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "prefill");
             rt::PhaseKVActiveView decodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "decode");
             std::vector<int32_t> const prefillSlots = config.packedPrefill
@@ -761,13 +888,13 @@ int main(int argc, char** argv)
             std::vector<int32_t> const prefillChunkLengths
                 = config.packedPrefill ? std::vector<int32_t>{96, 32} : std::vector<int32_t>{128};
             prefillKV.prepare(prefillSlots, prefillStream);
-            decodeKV.prepare({decodeSlot}, decodeStream);
+            decodeKV.prepare(decodeSlots, decodeStream);
 
             int32_t const prefillTotalTokens = 128;
             ELLM_CHECK(prefillIO->inputsEmbeds.reshape({1, prefillTotalTokens, config.hiddenSize}),
                 "Failed to reshape prefill input embeddings");
-            ELLM_CHECK(
-                decodeIO->inputsEmbeds.reshape({1, 1, config.hiddenSize}), "Failed to reshape decode input embeddings");
+            ELLM_CHECK(decodeIO->inputsEmbeds.reshape({controlledDecodeBatchSize, 1, config.hiddenSize}),
+                "Failed to reshape decode input embeddings");
             CUDA_CHECK(cudaMemsetAsync(
                 prefillIO->inputsEmbeds.rawPointer(), 0, prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
             CUDA_CHECK(cudaMemsetAsync(
@@ -785,7 +912,8 @@ int main(int argc, char** argv)
                 : config.prefillDims(1, prefillTotalTokens, false);
             ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
                 "Failed to bind the stable paged-KV prefill view");
-            ELLM_CHECK(pair->decodeExecutor().prepare(1, config.decodeDims(1), decodeMap, decodeStream),
+            ELLM_CHECK(pair->decodeExecutor().prepare(
+                           1, config.decodeDims(controlledDecodeBatchSize), decodeMap, decodeStream),
                 "Failed to bind the stable paged-KV decode view");
             if (std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr)
             {
@@ -804,7 +932,7 @@ int main(int argc, char** argv)
             float const overlapRatio = (overlap.prefillMs + overlap.decodeMs - overlap.makespanMs)
                 / std::min(overlap.prefillMs, overlap.decodeMs);
             prefillKV.commitLengths(prefillChunkLengths);
-            decodeKV.commitLengths({129});
+            decodeKV.commitLengths(std::vector<int32_t>(static_cast<size_t>(controlledDecodeBatchSize), 129));
             prefillKV.complete();
             decodeKV.complete();
 
@@ -818,6 +946,38 @@ int main(int argc, char** argv)
                 "decode_overlap=%.4f ms",
                 kITERATIONS, sequential.makespanMs, overlap.makespanMs, speedup, overlapRatio, sequential.prefillMs,
                 sequential.decodeMs, overlap.prefillMs, overlap.decodeMs);
+
+            if (controlledOverlapSweep)
+            {
+                std::array<int32_t, 5> constexpr kOVERLAP_PERCENTAGES{0, 25, 50, 75, 100};
+                float controlledSequentialMakespanMs{};
+                for (int32_t const requestedPercent : kOVERLAP_PERCENTAGES)
+                {
+                    PhaseTiming const controlled = measureControlledOverlap(pair->prefillExecutor(),
+                        pair->decodeExecutor(), setupStream, prefillStream, decodeStream, kWARMUP, kITERATIONS,
+                        requestedPercent);
+                    if (requestedPercent == 0)
+                    {
+                        controlledSequentialMakespanMs = controlled.makespanMs;
+                    }
+                    float const controlledSpeedup = controlledSequentialMakespanMs / controlled.makespanMs;
+                    float const activeWallOverlap
+                        = controlled.overlapMs / std::max(controlled.makespanMs, std::numeric_limits<float>::epsilon());
+                    LOG_INFO(
+                        "Controlled phase overlap: decode_batch=%d requested_pairs=%d%% observed_pairs=%.1f%% "
+                        "active_wall_overlap=%.3f%% makespan=%.4f ms speedup=%.3fx prefill=%.4f ms "
+                        "decode=%.4f ms overlap=%.4f ms",
+                        controlledDecodeBatchSize, requestedPercent, controlled.overlapPairFraction * 100.0F,
+                        activeWallOverlap * 100.0F, controlled.makespanMs, controlledSpeedup, controlled.prefillMs,
+                        controlled.decodeMs, controlled.overlapMs);
+                }
+                LOG_INFO("Controlled phase overlap sweep completed; skipping unrelated semantic smoke stages");
+                CUDA_CHECK(cudaStreamDestroy(setupStream));
+                CUDA_CHECK(cudaStreamDestroy(prefillStream));
+                CUDA_CHECK(cudaStreamDestroy(decodeStream));
+                CUDA_CHECK(cudaStreamDestroy(copyStream));
+                return EXIT_SUCCESS;
+            }
 
             // Activate the optional external-prefill context before the server
             // advertises readiness. Text and external prefill share one arena
