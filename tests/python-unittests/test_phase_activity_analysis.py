@@ -172,6 +172,42 @@ def test_missed_planned_overlap_is_reported():
     assert summary["prefill_decode_fidelity"]["missed"] == 1
 
 
+def test_decode_continuity_reports_gaps_and_non_decode_streaks():
+    intervals = [
+        _interval("decode", 1, 0.0, 2.0),
+        _interval("prefill", 2, 3.0, 8.0),
+        _interval("decode", 3, 32.0, 34.0),
+        _interval("decode", 4, 35.0, 37.0),
+    ]
+    metrics = [
+        {
+            "dispatch_index": 1,
+            "global_action": "decode"
+        },
+        {
+            "dispatch_index": 2,
+            "global_action": "prefill"
+        },
+        {
+            "dispatch_index": 3,
+            "global_action": "decode"
+        },
+        {
+            "dispatch_index": 4,
+            "global_action": "decode"
+        },
+    ]
+
+    summary = ANALYZER.summarize_activity(
+        intervals, ANALYZER.activity_segments(intervals), metrics)
+
+    assert summary["decode_continuity"]["gap_samples"] == 2
+    assert summary["decode_continuity"]["gap_max_ms"] == 30.0
+    assert summary["decode_continuity"]["gaps_over_25_ms"] == 1
+    assert summary["decode_continuity"][
+        "max_consecutive_non_decode_actions"] == 1
+
+
 def test_residual_dispatch_is_part_of_action_fidelity():
     prefill = _interval("prefill", 40, 0.0, 2.0)
     prefill["name"] = "prefill_residual_dispatch"

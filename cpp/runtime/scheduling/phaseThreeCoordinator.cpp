@@ -980,6 +980,13 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalEncoderArrivalWaitPeriods = mGlobalEncoderArrivalWaitPeriods;
     result.globalEncoderArrivalWaitExpirations = mGlobalEncoderArrivalWaitExpirations;
     result.lastGlobalEncoderArrivalWaitUs = mLastGlobalEncoderArrivalWaitUs;
+    result.globalFormationLookaheads = mGlobalFormationLookaheads;
+    result.globalFormationPredictedRows = mGlobalFormationPredictedRows;
+    result.globalFormationSelectionChanges = mGlobalFormationSelectionChanges;
+    result.globalFormationPdSelections = mGlobalFormationPdSelections;
+    result.globalFormationOverlapSelections = mGlobalFormationOverlapSelections;
+    result.lastGlobalFormationPredictedRows = mLastGlobalFormationPredictedRows;
+    result.lastGlobalFormationHorizonUs = mLastGlobalFormationHorizonUs;
     result.activeGlobalPlanId = mGlobalExecutionLease.has_value() ? mGlobalExecutionLease->planId : 0U;
     result.globalPlannedOutstanding
         = mGlobalExecutionLease.has_value() ? mGlobalExecutionLease->allowedOutstanding : PhaseExecutionSet::kNone;
@@ -1855,10 +1862,68 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
     }
 
+    PhaseGlobalDecision const myopicDecision = mGlobalScheduler.select(candidates);
+    mLastGlobalFormationPredictedRows = 0U;
+    mLastGlobalFormationHorizonUs = 0.0;
+    if (mConfig.enableGlobalFormationAwareSelection && !residualAugmentation && pd.has_value()
+        && !encoderBatchIndices.empty() && encoderBatchIndices.size() < mConfig.maxEncoderBatchSize
+        && mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0
+        && mLastVisionArrival != std::chrono::steady_clock::time_point{})
+    {
+        double const sinceArrivalUs = std::chrono::duration<double, std::micro>(now - mLastVisionArrival).count();
+        double const nextArrivalUs = std::max(0.0, mVisionInterarrivalEwmaUs - sinceArrivalUs);
+        double const observableHorizonUs = pd->predictedMakespanUs;
+        if (nextArrivalUs <= observableHorizonUs)
+        {
+            size_t const availableRows = mConfig.maxEncoderBatchSize - encoderBatchIndices.size();
+            double const subsequentWindowUs = std::max(0.0, observableHorizonUs - nextArrivalUs);
+            size_t const predictedRows = std::min(
+                availableRows, 1U + static_cast<size_t>(std::floor(subsequentWindowUs / mVisionInterarrivalEwmaUs)));
+            size_t const averageInputTokens
+                = (encoderInputTokens + encoderBatchIndices.size() - 1U) / encoderBatchIndices.size();
+            EncoderCostPrediction const newcomerPrediction
+                = predictEncoderCost(predictedRows, averageInputTokens * predictedRows);
+            EncoderCostPrediction const combinedPrediction = predictEncoderCost(
+                encoderBatchIndices.size() + predictedRows, encoderInputTokens + averageInputTokens * predictedRows);
+            double const equalReferenceWorkUs = pd->referenceWorkUs + combinedPrediction.referenceUs;
+            for (PhaseGlobalActionCandidate& candidate : candidates)
+            {
+                if (candidate.key.kind == PhaseGlobalActionKind::kEncoder)
+                {
+                    candidate.predictedHorizonUs
+                        = encoderMakespanUs + pd->predictedMakespanUs + newcomerPrediction.makespanUs;
+                }
+                else if (candidate.key.kind == pd->key.kind)
+                {
+                    candidate.predictedHorizonUs = pd->predictedMakespanUs + combinedPrediction.makespanUs;
+                }
+                else if (candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                    || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode)
+                {
+                    candidate.predictedHorizonUs = candidate.predictedMakespanUs + newcomerPrediction.makespanUs;
+                }
+                else
+                {
+                    continue;
+                }
+                candidate.horizonReferenceWorkUs = equalReferenceWorkUs;
+            }
+            ++mGlobalFormationLookaheads;
+            mGlobalFormationPredictedRows += predictedRows;
+            mLastGlobalFormationPredictedRows = predictedRows;
+        }
+    }
+
     ++mGlobalDecisionSequence;
     PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
     ++mGlobalDecisions;
     std::optional<size_t> selectedIndex = decision.selectedIndex;
+    if (myopicDecision.selectedIndex.has_value() && decision.selectedIndex.has_value())
+    {
+        PhaseGlobalActionCandidate const& myopic = candidates[*myopicDecision.selectedIndex];
+        PhaseGlobalActionCandidate const& formationAware = candidates[*decision.selectedIndex];
+        mGlobalFormationSelectionChanges += myopic.candidateId != formationAware.candidateId ? 1U : 0U;
+    }
     if (mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
         auto const calibration
@@ -1962,6 +2027,19 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         return false;
     }
     PhaseGlobalActionCandidate selected = candidates[*selectedIndex];
+    if (mLastGlobalFormationPredictedRows > 0U)
+    {
+        mLastGlobalFormationHorizonUs = selected.predictedHorizonUs;
+        if (selected.key.kind == pd->key.kind)
+        {
+            ++mGlobalFormationPdSelections;
+        }
+        else if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+            || selected.key.kind == PhaseGlobalActionKind::kEncoderDecode)
+        {
+            ++mGlobalFormationOverlapSelections;
+        }
+    }
     mLastGlobalAction = selected.key.kind;
     bool const safeProbe = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)

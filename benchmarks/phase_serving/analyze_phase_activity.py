@@ -235,6 +235,16 @@ def _interval_overlap_ms(left: dict[str, Any], right: dict[str, Any]) -> float:
         max(left["start_ms"], right["start_ms"]))
 
 
+def _nearest_percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(
+        0, min(len(ordered) - 1,
+               int(fraction * len(ordered) + 0.999999) - 1))
+    return ordered[index]
+
+
 def summarize_activity(intervals: list[dict[str, Any]],
                        segments: list[dict[str, Any]],
                        metrics: list[dict[str, Any]]) -> dict[str, Any]:
@@ -285,6 +295,25 @@ def summarize_activity(intervals: list[dict[str, Any]],
     observed_masks = Counter(
         int(metric.get("vision_global_observed_outstanding", 0))
         for metric in selected_metrics)
+    decode_dispatches = sorted(
+        (interval for interval in intervals
+         if interval["kind"] == "decode" and _is_dispatch_activity(interval)),
+        key=lambda interval: interval["start_ms"])
+    decode_gaps_ms = [
+        max(0.0, right["start_ms"] - left["end_ms"])
+        for left, right in zip(decode_dispatches, decode_dispatches[1:])
+    ]
+    max_non_decode_streak = 0
+    non_decode_streak = 0
+    for metric in sorted(selected_metrics,
+                         key=lambda item: int(item["dispatch_index"])):
+        action = str(metric.get("global_action", "unknown"))
+        if action in {"decode", "encoder_decode", "prefill_decode"}:
+            non_decode_streak = 0
+        else:
+            non_decode_streak += 1
+            max_non_decode_streak = max(max_non_decode_streak,
+                                        non_decode_streak)
     result = {
         "schema_version":
         1,
@@ -338,6 +367,22 @@ def summarize_activity(intervals: list[dict[str, Any]],
                 str(key): value
                 for key, value in sorted(actual_pd.items())
             },
+        },
+        "decode_continuity": {
+            "dispatches":
+            len(decode_dispatches),
+            "gap_samples":
+            len(decode_gaps_ms),
+            "gap_mean_ms": (sum(decode_gaps_ms) /
+                            len(decode_gaps_ms) if decode_gaps_ms else 0.0),
+            "gap_p95_ms":
+            _nearest_percentile(decode_gaps_ms, 0.95),
+            "gap_max_ms":
+            max(decode_gaps_ms, default=0.0),
+            "gaps_over_25_ms":
+            sum(gap > 25.0 for gap in decode_gaps_ms),
+            "max_consecutive_non_decode_actions":
+            max_non_decode_streak,
         },
     }
     return result

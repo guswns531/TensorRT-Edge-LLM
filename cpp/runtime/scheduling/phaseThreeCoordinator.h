@@ -115,6 +115,10 @@ struct PhaseThreeCoordinatorConfig
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
     bool enableGlobalEncoderPrefillAction{};
+    //! Compare serial and overlap actions over the same bounded current-plus-successor work.
+    //! The successor estimate uses only the observed encoder inter-arrival process and
+    //! the immediately outstanding P/D action; it does not classify the workload.
+    bool enableGlobalFormationAwareSelection{};
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
     //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
@@ -324,6 +328,13 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalEncoderArrivalWaitPeriods{};
     size_t globalEncoderArrivalWaitExpirations{};
     double lastGlobalEncoderArrivalWaitUs{};
+    size_t globalFormationLookaheads{};
+    size_t globalFormationPredictedRows{};
+    size_t globalFormationSelectionChanges{};
+    size_t globalFormationPdSelections{};
+    size_t globalFormationOverlapSelections{};
+    size_t lastGlobalFormationPredictedRows{};
+    double lastGlobalFormationHorizonUs{};
     uint64_t activeGlobalPlanId{};
     PhaseExecutionSet globalPlannedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet globalObservedOutstanding{PhaseExecutionSet::kNone};
@@ -702,6 +713,13 @@ private:
     size_t mGlobalEncoderArrivalWaitPeriods{};
     size_t mGlobalEncoderArrivalWaitExpirations{};
     double mLastGlobalEncoderArrivalWaitUs{};
+    size_t mGlobalFormationLookaheads{};
+    size_t mGlobalFormationPredictedRows{};
+    size_t mGlobalFormationSelectionChanges{};
+    size_t mGlobalFormationPdSelections{};
+    size_t mGlobalFormationOverlapSelections{};
+    size_t mLastGlobalFormationPredictedRows{};
+    double mLastGlobalFormationHorizonUs{};
     bool mGlobalEncoderArrivalWaitDeferred{};
     std::chrono::steady_clock::time_point mLastVisionArrival;
     double mVisionInterarrivalEwmaUs{};

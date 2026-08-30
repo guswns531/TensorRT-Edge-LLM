@@ -2210,6 +2210,9 @@ int main(int argc, char** argv)
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
+                threePhaseConfig.enableGlobalFormationAwareSelection
+                    = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
+                    && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_FORMATION_AWARE") == nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
                 {
                     threePhaseConfig.globalSafeProbeSlackMultiplier = std::stof(value);
@@ -3317,6 +3320,14 @@ int main(int argc, char** argv)
                             visionMetrics.globalEncoderOverlapProbeIntervalBlocked},
                         {"vision_global_overlap_probe_slack_blocked",
                             visionMetrics.globalEncoderOverlapProbeSlackBlocked},
+                        {"vision_global_formation_lookaheads", visionMetrics.globalFormationLookaheads},
+                        {"vision_global_formation_predicted_rows", visionMetrics.globalFormationPredictedRows},
+                        {"vision_global_formation_selection_changes", visionMetrics.globalFormationSelectionChanges},
+                        {"vision_global_formation_pd_selections", visionMetrics.globalFormationPdSelections},
+                        {"vision_global_formation_overlap_selections", visionMetrics.globalFormationOverlapSelections},
+                        {"vision_global_formation_last_predicted_rows", visionMetrics.lastGlobalFormationPredictedRows},
+                        {"vision_global_formation_last_horizon_ms",
+                            visionMetrics.lastGlobalFormationHorizonUs / 1000.0},
                         {"vision_global_action_fidelity_violations", visionMetrics.globalActionFidelityViolations},
                         {"vision_global_planned_outstanding",
                             static_cast<uint8_t>(visionMetrics.globalPlannedOutstanding)},

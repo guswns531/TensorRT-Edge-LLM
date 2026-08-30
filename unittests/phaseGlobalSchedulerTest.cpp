@@ -145,6 +145,31 @@ TEST(PhaseGlobalSchedulerTest, UsesEqualWorkHorizonForWaitComparison)
     EXPECT_EQ(*decision.selectedIndex, 0U);
 }
 
+TEST(PhaseGlobalSchedulerTest, FormationHorizonCanRejectMyopicOverlap)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kPrefill, 16000.0, 10000.0, 100000.0);
+    serial.predictedMakespanUs = 10000.0;
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kEncoderPrefill, 16000.0, 8000.0, 100000.0);
+    overlap.predictedMakespanUs = 8000.0;
+
+    PhaseGlobalDecision const myopic = scheduler.select({serial, overlap});
+    ASSERT_TRUE(myopic.selectedIndex.has_value());
+    EXPECT_EQ(*myopic.selectedIndex, 1U);
+
+    // Both alternatives cover identical current plus successor work. Starting
+    // the partial encoder cohort in the overlap alternative requires one extra
+    // successor launch, while P-first preserves the larger encoder cohort.
+    serial.predictedHorizonUs = 18000.0;
+    serial.horizonReferenceWorkUs = 24000.0;
+    overlap.predictedHorizonUs = 21000.0;
+    overlap.horizonReferenceWorkUs = 24000.0;
+    PhaseGlobalDecision const formationAware = scheduler.select({serial, overlap});
+
+    ASSERT_TRUE(formationAware.selectedIndex.has_value());
+    EXPECT_EQ(*formationAware.selectedIndex, 0U);
+}
+
 TEST(PhaseGlobalSchedulerTest, RequiresConcreteWaitEvent)
 {
     PhaseGlobalScheduler scheduler;
