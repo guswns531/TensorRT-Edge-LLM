@@ -543,6 +543,8 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Global vision-prefill cold-start cost must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.globalSafeProbeSlackMultiplier) && mConfig.globalSafeProbeSlackMultiplier >= 0.0F,
         "Global overlap safe-probe slack multiplier must be finite and non-negative");
+    ELLM_CHECK(mConfig.globalExperimentalOverlapPercent >= -1 && mConfig.globalExperimentalOverlapPercent <= 100,
+        "Global experimental overlap percentage must be -1 or between zero and 100");
     ELLM_CHECK(mConfig.globalCalibrationMaxOverlapKeys > 0U, "Global calibration overlap-key limit must be positive");
     ELLM_CHECK(mConfig.globalDecodeContextBucketTokens > 0, "Global overlap context bucket must be positive");
     for (PhaseEncoderPrefillBatchCost const& cost : mConfig.globalEncoderPrefillCosts)
@@ -944,6 +946,8 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalResidualPrefillDecodeOpportunities = mGlobalResidualPrefillDecodeOpportunities;
     result.globalResidualPrefillDecodeSelections = mGlobalResidualPrefillDecodeSelections;
     result.globalResidualPrefillDecodeUnknownCostRejects = mGlobalResidualPrefillDecodeUnknownCostRejects;
+    result.globalExperimentalResidualPrefillDecodeOpportunities = mGlobalExperimentalResidualPrefillDecodeOpportunities;
+    result.globalExperimentalResidualPrefillDecodeSelections = mGlobalExperimentalResidualPrefillDecodeSelections;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
     result.globalEncoderOverlapOpportunities = mGlobalEncoderOverlapOpportunities;
@@ -1157,6 +1161,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         return false;
     }
     mActiveGlobalPdExecution->lastResidualPdCandidateId = missing->candidateId;
+    bool const experimentalMode = !mGlobalWarmupProbeMode && mConfig.globalExperimentalOverlapPercent >= 0;
     ++mGlobalResidualPrefillDecodeOpportunities;
 
     double const elapsedUs = std::chrono::duration<double, std::micro>(
@@ -1225,7 +1230,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         && probeIntervalReady
         && protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
     overlap.overlapCostKnown = overlapKnown;
-    overlap.safeProbeEligible = safeProbe;
+    overlap.safeProbeEligible = safeProbe || experimentalMode;
     if (estimate.has_value())
     {
         overlap.predictedMakespanUs = static_cast<double>(estimate->makespanMedianMs) * 1000.0;
@@ -1253,7 +1258,25 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     ++mGlobalDecisionSequence;
     ++mGlobalDecisions;
     PhaseGlobalDecision decision = mGlobalScheduler.select({active, overlap});
-    if (safeProbe)
+    if (experimentalMode)
+    {
+        PhaseGlobalDecision const feasible = mGlobalScheduler.select({overlap});
+        if (!feasible.selectedIndex.has_value())
+        {
+            return false;
+        }
+        ++mGlobalExperimentalResidualPrefillDecodeOpportunities;
+        bool const experimentalSelection = phaseGlobalSelectExperimentalOverlap(
+            mConfig.globalExperimentalOverlapPercent, mGlobalExperimentalResidualPrefillDecodeAccumulator);
+        if (!experimentalSelection)
+        {
+            return false;
+        }
+        decision = feasible;
+        decision.selectedIndex = 1U;
+        decision.reason = PhaseGlobalDecisionReason::kExperimentalOverlap;
+    }
+    else if (safeProbe)
     {
         decision.selectedIndex = 1U;
     }
@@ -1267,7 +1290,6 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
         ++mGlobalSafeProbes;
     }
-
     uint64_t const planId = kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence;
     uint64_t const snapshotEpoch = kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch;
     std::optional<PhaseGlobalDispatchPlan> const augmented
@@ -1277,6 +1299,10 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     if (!started)
     {
         return false;
+    }
+    if (experimentalMode)
+    {
+        ++mGlobalExperimentalResidualPrefillDecodeSelections;
     }
     mGlobalExecutionLease = *augmented;
     mActiveGlobalPdExecution.reset();

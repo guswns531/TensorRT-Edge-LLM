@@ -39,7 +39,13 @@ enum class PhaseGlobalDecisionReason
     kDeadlineSafeEfficiency,
     kMinimumViolation,
     kLegacyCompatibility,
+    kExperimentalOverlap,
 };
+
+//! Return a deterministic experimental selection with the requested long-run percentage.
+//! A negative percentage disables the experiment. The caller owns one accumulator per
+//! opportunity stream so that production policy state remains untouched.
+bool phaseGlobalSelectExperimentalOverlap(int32_t percent, size_t& accumulator);
 
 //! Result of one bounded global scheduling decision.
 struct PhaseGlobalDecision
@@ -78,4 +84,3 @@ private:
 };
 
 } // namespace trt_edgellm::rt
-

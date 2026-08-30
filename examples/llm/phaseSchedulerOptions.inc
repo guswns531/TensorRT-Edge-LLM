@@ -102,6 +102,10 @@
         {
             semanticSchedulerConfig.globalSafeProbeInterval = static_cast<size_t>(std::stoull(value));
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT"))
+        {
+            semanticSchedulerConfig.globalExperimentalOverlapPercent = std::stoi(value);
+        }
         semanticSchedulerConfig.elideVacuousGlobalDecisions
             = std::getenv("TRT_EDGELLM_DISABLE_VACUOUS_GLOBAL_ELISION") == nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference

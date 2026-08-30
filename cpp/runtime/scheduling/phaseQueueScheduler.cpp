@@ -129,6 +129,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(
         std::isfinite(mConfig.globalSafeProbeSlackMultiplier) && mConfig.globalSafeProbeSlackMultiplier >= 0.0F,
         "Global safe-probe slack multiplier must be finite and non-negative");
+    check::check(mConfig.globalExperimentalOverlapPercent >= -1 && mConfig.globalExperimentalOverlapPercent <= 100,
+        "Global experimental overlap percentage must be -1 or within [0, 100]");
     check::check(mConfig.globalCalibrationMaxOverlapKeys > 0U, "Global calibration overlap-key limit must be positive");
     check::check(mConfig.maxContinuationPrefillBatchSize >= 0
             && mConfig.maxContinuationPrefillBatchSize <= mConfig.maxPrefillBatchSize,
@@ -904,7 +906,12 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         && state.decodeMaxSloPressure < mConfig.autoDecodePressureLimit;
     bool const prefillRecovery = (mConfig.enablePrefillSloRecovery || automaticLongPrefillRecovery)
         && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
-    if (overlap && mConfig.enableTpotHardGuard && mConsecutiveOverlapBatches >= mConfig.maxConsecutiveOverlapBatches)
+    // The opt-in experiment exposes every executable P+D shape to the global
+    // hard-feasibility filter. Production interference/debt policy remains the
+    // default and is still measured by the ordinary -1 configuration.
+    bool const experimentalEnvelope = overlap && mConfig.globalExperimentalOverlapPercent >= 0;
+    if (!experimentalEnvelope && overlap && mConfig.enableTpotHardGuard
+        && mConsecutiveOverlapBatches >= mConfig.maxConsecutiveOverlapBatches)
     {
         return -1;
     }
@@ -914,9 +921,9 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         double const candidateInterferenceUs = static_cast<double>(candidate.decodeInterferenceMs) * 1000.0;
         bool const debtFeasible = mConfig.maxPredictedDecodeDebtUs == 0.0
             || mPredictedDecodeDebtUs + candidateInterferenceUs <= mConfig.maxPredictedDecodeDebtUs;
-        bool const feasible
-            = (prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
-            && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible);
+        bool const feasible = experimentalEnvelope
+            || ((prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
+                && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible));
         if (!feasible)
         {
             continue;
@@ -1790,6 +1797,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         }
     };
     std::vector<PhaseGlobalActionCandidate> candidates;
+    std::optional<size_t> experimentalOverlapIndex;
+    bool experimentalOverlapMode{};
     if (allowPrefill && prefill.has_value())
     {
         PhaseGlobalActionCandidate candidate;
@@ -1877,6 +1886,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefillRows > 0 && overlapDecodeRows > 0)
     {
         ++mTelemetry.globalOverlapOpportunityCount;
+        experimentalOverlapMode = !mGlobalWarmupProbeMode
+            && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
+            && mConfig.globalExperimentalOverlapPercent >= 0;
         PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows, overlapDecodeRows,
             overlapPrefillChunk, contextBucket(overlapPrefillPastKV), contextBucket(overlapDecodeMaxContext)};
         overlapKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
@@ -1979,7 +1991,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.secondaryStableSlotIds = overlapDecodeStableSlotIds;
         phaseGlobalFinalizeCandidate(candidate);
         candidate.overlapCostKnown = overlapKnown;
-        candidate.safeProbeEligible = safeProbe;
+        candidate.safeProbeEligible = safeProbe || experimentalOverlapMode;
         candidate.calibrationProbe = calibrationProbe;
         candidate.predictedBlockingUs = overlap.makespanUs;
         candidate.predictedMakespanUs = overlap.makespanUs;
@@ -1991,6 +2003,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             protectedPrefillCompletion(overlap, protectedPrefillAdvance(overlapPlan.prefillBatch)));
         candidate.protectedCompletions.push_back({decodeSlack, overlap.makespanUs, overlap.uncertaintyUs});
         candidates.push_back(std::move(candidate));
+        if (experimentalOverlapMode)
+        {
+            experimentalOverlapIndex = candidates.size() - 1U;
+        }
     }
 
     ++mGlobalDecisionSequence;
@@ -2076,6 +2092,46 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             decision.serviceCompression = referenceUs / std::max(makespanUs, std::numeric_limits<double>::epsilon());
         }
     }
+    if (experimentalOverlapMode)
+    {
+        bool overlapSelected{};
+        if (experimentalOverlapIndex.has_value())
+        {
+            PhaseGlobalDecision const feasible = mGlobalScheduler.select({candidates[*experimentalOverlapIndex]});
+            if (feasible.selectedIndex.has_value())
+            {
+                ++mTelemetry.globalExperimentalOverlapOpportunityCount;
+                bool const experimentalSelection = phaseGlobalSelectExperimentalOverlap(
+                    mConfig.globalExperimentalOverlapPercent, mGlobalExperimentalOverlapAccumulator);
+                if (experimentalSelection)
+                {
+                    decision = feasible;
+                    decision.selectedIndex = *experimentalOverlapIndex;
+                    decision.reason = PhaseGlobalDecisionReason::kExperimentalOverlap;
+                    overlapSelected = true;
+                    ++mTelemetry.globalExperimentalOverlapSelectionCount;
+                }
+            }
+        }
+        if (!overlapSelected)
+        {
+            std::vector<PhaseGlobalActionCandidate> serialCandidates;
+            std::vector<size_t> serialIndices;
+            for (size_t index{}; index < candidates.size(); ++index)
+            {
+                if (candidates[index].key.kind != PhaseGlobalActionKind::kPrefillDecode)
+                {
+                    serialCandidates.push_back(candidates[index]);
+                    serialIndices.push_back(index);
+                }
+            }
+            decision = mGlobalScheduler.select(serialCandidates);
+            if (decision.selectedIndex.has_value())
+            {
+                decision.selectedIndex = serialIndices[*decision.selectedIndex];
+            }
+        }
+    }
     ++mTelemetry.globalDecisionCount;
     mTelemetry.lastGlobalDecisionReason = decision.reason;
     mTelemetry.lastGlobalPredictedViolationUs = decision.predictedViolationUs;
@@ -2098,7 +2154,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     case PhaseGlobalActionKind::kPrefillDecode: kind = PhaseDispatchKind::kOverlap; break;
     default: break;
     }
-    bool const safeProbe = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
+    bool const experimentalSelection = decision.reason == PhaseGlobalDecisionReason::kExperimentalOverlap;
+    bool const safeProbe = experimentalSelection || selected.calibrationProbe
+        || (selected.safeProbeEligible && !selected.overlapCostKnown);
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
@@ -3510,6 +3568,7 @@ void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
     mGlobalPlanSequence = 0U;
     mGlobalSnapshotEpoch = 0U;
     mLastGlobalSafeProbeSequence = 0U;
+    mGlobalExperimentalOverlapAccumulator = 0U;
     mNextGlobalAction.reset();
     mNextGlobalDispatchPlan.reset();
 }

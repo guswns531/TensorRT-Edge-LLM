@@ -99,6 +99,103 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_EQ(legacyPolicyCalls, 0U);
 }
 
+TEST(PhaseQueueSchedulerTest, ExperimentalOverlapHundredPercentForcesHardFeasibleCandidate)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalExperimentalOverlapPercent = 100;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.globalDecisionReason, PhaseGlobalDecisionReason::kExperimentalOverlap);
+    EXPECT_TRUE(plan.globalSafeProbe);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, ExperimentalOverlapZeroPercentSelectsSerialCandidate)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalExperimentalOverlapPercent = 0;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, ExperimentalOverlapDoesNotCountOrSelectMemoryInfeasibleCandidate)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalExperimentalOverlapPercent = 100;
+    config.globalMemoryHorizonSupplier = [](PhaseGlobalActionKey const& key, std::vector<uint64_t> const&) {
+        return key.kind == PhaseGlobalActionKind::kPrefillDecode
+            ? PhaseActionMemoryHorizon{1U, 1U, 0U, 0U, 0U, 1U, false}
+            : PhaseActionMemoryHorizon{};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, ExperimentalOverlapFiftyPercentUsesDeterministicOpportunityAccumulator)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalExperimentalOverlapPercent = 50;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_NE(first.kind, PhaseDispatchKind::kOverlap);
+    if (!first.prefillBatch.empty())
+    {
+        scheduler.completePrefill(first.prefillBatch.front(), 32, true);
+    }
+    else
+    {
+        scheduler.completeDecode(first.decodeBatch.front(), 129, true);
+    }
+    PhaseDispatchPlan const remainder = scheduler.next();
+    if (!remainder.prefillBatch.empty())
+    {
+        scheduler.completePrefill(remainder.prefillBatch.front(), 32, true);
+    }
+    else
+    {
+        scheduler.completeDecode(remainder.decodeBatch.front(), 129, true);
+    }
+    scheduler.enqueuePrefill({3, 32});
+    scheduler.enqueueDecode({4, 128});
+
+    PhaseDispatchPlan const second = scheduler.next();
+
+    EXPECT_EQ(second.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 2U);
+    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalActiveElidesVacuousSinglePhaseDecision)
 {
     PhaseQueueSchedulerConfig config;

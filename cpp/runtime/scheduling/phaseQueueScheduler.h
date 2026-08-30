@@ -239,6 +239,8 @@ struct PhaseSchedulerTelemetry
     size_t globalOverlapProbeIntervalBlockedCount{};
     size_t globalOverlapProbeSlackBlockedCount{};
     size_t globalOverlapSelectionCount{};
+    size_t globalExperimentalOverlapOpportunityCount{};
+    size_t globalExperimentalOverlapSelectionCount{};
     size_t globalCandidateParityViolationCount{};
     size_t globalActionFidelityViolationCount{};
     size_t globalPrefillFormationOpportunityCount{};
@@ -371,6 +373,10 @@ struct PhaseQueueSchedulerConfig
     //! on serial execution. Zero disables production probes.
     float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
+    //! Research-only deterministic P+D opportunity sweep. Minus one keeps
+    //! production policy; 0--100 selects that percentage of hard-feasible
+    //! overlap opportunities without applying the deadline/cost objective.
+    int32_t globalExperimentalOverlapPercent{-1};
     //! Maximum distinct P+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     //! Optional ownership-aware memory horizon in one caller-defined unit.
@@ -834,6 +840,7 @@ private:
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
+    size_t mGlobalExperimentalOverlapAccumulator{};
     bool mGlobalWarmupProbeMode{};
     std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;
     std::vector<size_t> mGlobalCalibrationOpportunities;

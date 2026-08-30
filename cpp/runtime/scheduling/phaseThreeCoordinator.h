@@ -101,6 +101,9 @@ struct PhaseThreeCoordinatorConfig
     //! Zero explicitly disables production probes.
     float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
+    //! Research-only exact percentage of hard-feasible residual P+D opportunities.
+    //! Negative preserves production policy; zero through 100 controls the sweep.
+    int32_t globalExperimentalOverlapPercent{-1};
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     int32_t globalDecodeContextBucketTokens{512};
@@ -292,6 +295,8 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalResidualPrefillDecodeOpportunities{};
     size_t globalResidualPrefillDecodeSelections{};
     size_t globalResidualPrefillDecodeUnknownCostRejects{};
+    size_t globalExperimentalResidualPrefillDecodeOpportunities{};
+    size_t globalExperimentalResidualPrefillDecodeSelections{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
     size_t globalEncoderOverlapOpportunities{};
@@ -661,6 +666,9 @@ private:
     size_t mGlobalResidualPrefillDecodeOpportunities{};
     size_t mGlobalResidualPrefillDecodeSelections{};
     size_t mGlobalResidualPrefillDecodeUnknownCostRejects{};
+    size_t mGlobalExperimentalResidualPrefillDecodeOpportunities{};
+    size_t mGlobalExperimentalResidualPrefillDecodeSelections{};
+    size_t mGlobalExperimentalResidualPrefillDecodeAccumulator{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
     size_t mGlobalEncoderOverlapOpportunities{};

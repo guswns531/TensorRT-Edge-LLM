@@ -27,6 +27,24 @@
 
 namespace trt_edgellm::rt
 {
+
+bool phaseGlobalSelectExperimentalOverlap(int32_t percent, size_t& accumulator)
+{
+    if (percent < 0)
+    {
+        return false;
+    }
+    ELLM_CHECK(percent <= 100, "Experimental overlap percentage exceeds 100");
+    constexpr size_t kPERCENT_SCALE = 100U;
+    accumulator += static_cast<size_t>(percent);
+    if (accumulator < kPERCENT_SCALE)
+    {
+        return false;
+    }
+    accumulator -= kPERCENT_SCALE;
+    return true;
+}
+
 namespace
 {
 

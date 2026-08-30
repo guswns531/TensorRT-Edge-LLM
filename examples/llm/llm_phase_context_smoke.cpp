@@ -587,8 +587,8 @@ PhaseTiming measureSequential(rt::EngineExecutor& prefillExecutor, rt::EngineExe
 }
 
 PhaseTiming measureControlledOverlap(rt::EngineExecutor& prefillExecutor, rt::EngineExecutor& decodeExecutor,
-    cudaStream_t setupStream, cudaStream_t prefillStream, cudaStream_t decodeStream, int32_t warmup,
-    int32_t iterations, int32_t overlapPercent)
+    cudaStream_t setupStream, cudaStream_t prefillStream, cudaStream_t decodeStream, int32_t warmup, int32_t iterations,
+    int32_t overlapPercent)
 {
     ELLM_CHECK(overlapPercent >= 0 && overlapPercent <= 100, "Controlled overlap percentage is outside [0, 100]");
     cudaEvent_t gate{};
@@ -853,8 +853,7 @@ int main(int argc, char** argv)
                     controlledDecodeBatchSize = std::stoi(value);
                 }
             }
-            ELLM_CHECK(controlledDecodeBatchSize > 0
-                    && controlledDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
+            ELLM_CHECK(controlledDecodeBatchSize > 0 && controlledDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
                 "Controlled overlap decode batch is outside the engine profile");
             int32_t const prefillSlot0 = ownership.reserve();
             int32_t const prefillSlot1 = config.packedPrefill ? ownership.reserve() : -1;
@@ -953,9 +952,9 @@ int main(int argc, char** argv)
                 float controlledSequentialMakespanMs{};
                 for (int32_t const requestedPercent : kOVERLAP_PERCENTAGES)
                 {
-                    PhaseTiming const controlled = measureControlledOverlap(pair->prefillExecutor(),
-                        pair->decodeExecutor(), setupStream, prefillStream, decodeStream, kWARMUP, kITERATIONS,
-                        requestedPercent);
+                    PhaseTiming const controlled
+                        = measureControlledOverlap(pair->prefillExecutor(), pair->decodeExecutor(), setupStream,
+                            prefillStream, decodeStream, kWARMUP, kITERATIONS, requestedPercent);
                     if (requestedPercent == 0)
                     {
                         controlledSequentialMakespanMs = controlled.makespanMs;
@@ -2198,6 +2197,8 @@ int main(int argc, char** argv)
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
+                threePhaseConfig.globalExperimentalOverlapPercent
+                    = semanticSchedulerConfig.globalExperimentalOverlapPercent;
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
@@ -3127,6 +3128,10 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalOverlapProbeSlackBlockedCount},
                         {"global_overlap_selections",
                             semanticCoordinator.scheduler().telemetry().globalOverlapSelectionCount},
+                        {"global_experimental_overlap_opportunities",
+                            semanticCoordinator.scheduler().telemetry().globalExperimentalOverlapOpportunityCount},
+                        {"global_experimental_overlap_selections",
+                            semanticCoordinator.scheduler().telemetry().globalExperimentalOverlapSelectionCount},
                         {"global_prefill_formation_opportunities",
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationOpportunityCount},
                         {"global_prefill_formation_decode_selections",
@@ -3276,6 +3281,10 @@ int main(int argc, char** argv)
                             visionMetrics.globalResidualPrefillDecodeSelections},
                         {"vision_global_residual_prefill_decode_unknown_cost_rejects",
                             visionMetrics.globalResidualPrefillDecodeUnknownCostRejects},
+                        {"vision_global_experimental_residual_prefill_decode_opportunities",
+                            visionMetrics.globalExperimentalResidualPrefillDecodeOpportunities},
+                        {"vision_global_experimental_residual_prefill_decode_selections",
+                            visionMetrics.globalExperimentalResidualPrefillDecodeSelections},
                         {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
