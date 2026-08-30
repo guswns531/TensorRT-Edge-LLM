@@ -229,8 +229,7 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
     InferenceDims const dims = mConfig.packedPrefill
         ? (externalPrefill && mConfig.hasVisionPrefillProfile()
-                  ? mConfig.visionPackedPrefillDims(
-                      static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens)
+                  ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens)
                   : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens))
         : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);
     ELLM_CHECK(executor.prepare(profileIndex, dims, mPrefillMap, stream), "Independent prefill prepare failed");
@@ -333,6 +332,12 @@ void IndependentPhaseCoordinator::enqueueDecode(PhaseWorkItem item)
 bool IndependentPhaseCoordinator::dispatchNext()
 {
     return mWorker->dispatchNext();
+}
+
+bool IndependentPhaseCoordinator::augmentGlobalAction(PhaseGlobalActionCandidate missingPhase,
+    PhaseGlobalActionCandidate aggregate, uint64_t planId, uint64_t snapshotEpoch)
+{
+    return mWorker->augmentNext(std::move(missingPhase), std::move(aggregate), planId, snapshotEpoch);
 }
 
 bool IndependentPhaseCoordinator::poll()
@@ -461,6 +466,11 @@ void IndependentPhaseCoordinator::setMetricsCollectionEnabled(bool enabled) noex
     {
         mMetrics.clear();
     }
+}
+
+void IndependentPhaseCoordinator::setActivityTimeline(PhaseActivityTimelineRecorder* timeline)
+{
+    mWorker->setActivityTimeline(timeline);
 }
 
 CUcontext IndependentPhaseCoordinator::cudaContext() const noexcept

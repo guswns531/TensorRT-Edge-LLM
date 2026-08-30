@@ -36,6 +36,8 @@
 namespace trt_edgellm::rt
 {
 
+class PhaseActivityTimelineRecorder;
+
 using IndependentPhaseInputCallback = std::function<void(std::vector<PhaseWorkItem> const&, PipelineIO&, cudaStream_t)>;
 using IndependentPhaseBatchCompletionCallback
     = std::function<void(std::vector<PhaseWorkItem> const&, PipelineIO&, cudaStream_t)>;
@@ -77,6 +79,9 @@ public:
     void enqueuePrefill(PhaseWorkItem item);
     void enqueueDecode(PhaseWorkItem item);
     bool dispatchNext();
+    //! Add the idle P or D execution context to a live single-phase action.
+    bool augmentGlobalAction(PhaseGlobalActionCandidate missingPhase, PhaseGlobalActionCandidate aggregate,
+        uint64_t planId, uint64_t snapshotEpoch);
     bool poll();
     void wait();
     void runUntilIdle(size_t maxDispatches);
@@ -109,6 +114,8 @@ public:
     std::vector<PhaseDispatchMetrics> const& metrics() const noexcept;
     //! Enable external metric retention; scheduler telemetry remains active either way.
     void setMetricsCollectionEnabled(bool enabled) noexcept;
+    //! Enable opt-in epoch-relative P/D stream activity recording while idle.
+    void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
     CUcontext cudaContext() const noexcept;
     PhaseKVMemoryStats const& prefillKVMemoryStats() const noexcept;
     PhaseKVMemoryStats const& decodeKVMemoryStats() const noexcept;

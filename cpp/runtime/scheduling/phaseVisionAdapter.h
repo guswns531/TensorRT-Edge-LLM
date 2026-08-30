@@ -36,6 +36,8 @@ namespace trt_edgellm::rt
 struct PhaseVisionBatchStorage;
 struct PhaseVisionMropeStorage;
 struct PhaseVisionPreparedBatch;
+enum class PhaseActivityKind : uint8_t;
+class PhaseActivityTimelineRecorder;
 
 //! High-water policy for encoder-output slabs that are no longer request-owned.
 struct PhaseVisionStoragePolicy
@@ -138,7 +140,8 @@ class PhaseVisionAdapter
 {
 public:
     PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer, LLMEngineConfig const& config,
-        cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy = {});
+        cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy = {}, cudaStream_t copyStream = nullptr);
+    ~PhaseVisionAdapter() noexcept;
 
     PhaseVisionAdapter(PhaseVisionAdapter const&) = delete;
     PhaseVisionAdapter& operator=(PhaseVisionAdapter const&) = delete;
@@ -165,12 +168,16 @@ public:
     void reclaimIdleStorage(bool force = false);
     //! Enable synchronous debug capture only while the adapter is idle.
     void setDebugCallback(std::function<void(PhaseVisionDebugSnapshot const&)> callback);
+    //! Enable opt-in epoch-relative E/C stream activity recording while idle.
+    void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
 
 private:
     static Tensor viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name);
     std::shared_ptr<PhaseVisionBatchStorage> acquireBatchStorage();
-    void copyRunnerOutputs(
-        PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures);
+    void copyRunnerOutputs(PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding,
+        OptionalInputTensors const& deepstackFeatures, cudaStream_t stream);
+    void recordActivity(PhaseActivityKind kind, char const* name, uint64_t correlationId, cudaStream_t stream,
+        std::function<void()> const& enqueue);
     void refreshIdleStorageStats() noexcept;
     void releaseBatchStorageIfIdle();
 
@@ -179,13 +186,16 @@ private:
     LLMEngineConfig mConfig;
     PhaseVisionStoragePolicy mStoragePolicy;
     cudaStream_t mStream{};
+    cudaStream_t mCopyStream{};
     CUcontext mCudaContext{};
+    cudaEvent_t mEncoderDoneEvent{};
     std::unordered_map<uint64_t, std::unique_ptr<PhaseVisionPayload>> mRequests;
     std::optional<LLMGenerationRequest> mBatchedRequest;
     std::vector<std::shared_ptr<PhaseVisionBatchStorage>> mStoragePool;
     size_t mStorageGeneration{};
     PhaseVisionMemoryStats mMemoryStats;
     std::function<void(PhaseVisionDebugSnapshot const&)> mDebugCallback;
+    PhaseActivityTimelineRecorder* mActivityTimeline{};
 };
 
 } // namespace trt_edgellm::rt

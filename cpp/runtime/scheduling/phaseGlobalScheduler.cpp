@@ -360,22 +360,34 @@ PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
 std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
     PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept
 {
-    PhaseGlobalActionKind const expected = active.action == PhaseGlobalActionKind::kPrefill
-        ? PhaseGlobalActionKind::kEncoderPrefill
-        : active.action == PhaseGlobalActionKind::kDecode ? PhaseGlobalActionKind::kEncoderDecode
-                                                          : PhaseGlobalActionKind::kNone;
-    if (augmentation.key.kind != expected || active.launched != phaseExecutionSetForAction(active.action)
-        || active.allowedOutstanding != active.launched || augmentation.secondaryRequestIds != active.primaryRequestIds
-        || augmentation.secondaryStableSlotIds != active.primaryStableSlotIds)
+    if (active.launched != phaseExecutionSetForAction(active.action) || active.allowedOutstanding != active.launched)
+    {
+        return std::nullopt;
+    }
+    bool rowsMatch{};
+    if (active.action == PhaseGlobalActionKind::kPrefill)
+    {
+        rowsMatch = (augmentation.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                        && augmentation.secondaryRequestIds == active.primaryRequestIds
+                        && augmentation.secondaryStableSlotIds == active.primaryStableSlotIds)
+            || (augmentation.key.kind == PhaseGlobalActionKind::kPrefillDecode
+                && augmentation.primaryRequestIds == active.primaryRequestIds
+                && augmentation.primaryStableSlotIds == active.primaryStableSlotIds);
+    }
+    else if (active.action == PhaseGlobalActionKind::kDecode)
+    {
+        rowsMatch = (augmentation.key.kind == PhaseGlobalActionKind::kEncoderDecode
+                        && augmentation.secondaryRequestIds == active.primaryRequestIds
+                        && augmentation.secondaryStableSlotIds == active.primaryStableSlotIds)
+            || (augmentation.key.kind == PhaseGlobalActionKind::kPrefillDecode
+                && augmentation.secondaryRequestIds == active.primaryRequestIds
+                && augmentation.secondaryStableSlotIds == active.primaryStableSlotIds);
+    }
+    if (!rowsMatch)
     {
         return std::nullopt;
     }
     PhaseGlobalDispatchPlan result = phaseGlobalDispatchPlan(planId, snapshotEpoch, augmentation);
-    if (phaseExecutionSetContains(result.allowedOutstanding, PhaseExecutionSet::kPrefill)
-        && phaseExecutionSetContains(result.allowedOutstanding, PhaseExecutionSet::kDecode))
-    {
-        return std::nullopt;
-    }
     return result;
 }
 
@@ -427,6 +439,8 @@ PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key
     key.primaryBatchSize = upperPowerOfTwoBucket(key.primaryBatchSize);
     key.secondaryBatchSize = upperPowerOfTwoBucket(key.secondaryBatchSize);
     key.chunkLength = upperPowerOfTwoBucket(key.chunkLength);
+    key.primaryContextBucket = upperPowerOfTwoBucket(key.primaryContextBucket);
+    key.secondaryContextBucket = upperPowerOfTwoBucket(key.secondaryContextBucket);
     return key;
 }
 

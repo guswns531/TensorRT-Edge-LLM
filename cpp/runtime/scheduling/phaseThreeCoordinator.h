@@ -97,8 +97,9 @@ struct PhaseThreeCoordinatorConfig
     //! Share one process-local E/P/D cost tracker with the downstream server.
     std::shared_ptr<PhaseRuntimeCostTracker> runtimeCostTracker;
     double globalVisionPrefillColdStartUs{50000.0};
-    //! Zero disables production-request exploration; enable only for controlled warm-up probes.
-    float globalSafeProbeSlackMultiplier{};
+    //! Conservative slack multiple for bounded process-local overlap probes.
+    //! Zero explicitly disables production probes.
+    float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
@@ -288,8 +289,20 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalResidualEncoderPrefillSelections{};
     size_t globalResidualEncoderDecodeSelections{};
     size_t globalResidualAugmentationUnknownCostRejects{};
+    size_t globalResidualPrefillDecodeOpportunities{};
+    size_t globalResidualPrefillDecodeSelections{};
+    size_t globalResidualPrefillDecodeUnknownCostRejects{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
+    size_t globalEncoderOverlapOpportunities{};
+    size_t globalEncoderOverlapKnownCosts{};
+    size_t globalEncoderOverlapNoSamples{};
+    size_t globalEncoderOverlapInsufficientSamples{};
+    size_t globalEncoderOverlapUnprofitable{};
+    size_t globalEncoderOverlapSafeProbeEligible{};
+    size_t globalEncoderOverlapProbeDisabled{};
+    size_t globalEncoderOverlapProbeIntervalBlocked{};
+    size_t globalEncoderOverlapProbeSlackBlocked{};
     size_t globalWarmupDecisions{};
     size_t globalWarmupPrefillCandidates{};
     size_t globalWarmupDecodeCandidates{};
@@ -446,6 +459,8 @@ public:
     void setGlobalWarmupProbeMode(bool active);
     //! Enable optional request-level encoder and prefill-handoff telemetry.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
+    //! Enable one shared epoch-relative E/P/D/C activity recorder while idle.
+    void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
 
     //! Observe each completed encoder batch exactly once.
     void setEncoderBatchMetricCallback(
@@ -484,6 +499,7 @@ private:
 
     bool startNextEncoder();
     bool dispatchGlobalAction();
+    bool dispatchGlobalPrefillDecodeResidual(IndependentPhaseServerArbitrationSnapshot const& serverState);
     PhaseExecutionSet observedGlobalExecution() const noexcept;
     void refreshGlobalExecutionLease();
     PhaseGlobalDispatchPlan beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate);
@@ -546,6 +562,9 @@ private:
         //! must not turn one GPU decision boundary into thousands of policy
         //! evaluations.
         std::vector<uint64_t> lastResidualEncoderRequestIds;
+        //! One live P/D lease evaluates a given missing P or D cohort once.
+        //! Repeated host polls are not new GPU scheduling boundaries.
+        uint64_t lastResidualPdCandidateId{};
     };
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::optional<PhaseGlobalDispatchPlan> mGlobalExecutionLease;
@@ -639,8 +658,20 @@ private:
     size_t mGlobalResidualEncoderPrefillSelections{};
     size_t mGlobalResidualEncoderDecodeSelections{};
     size_t mGlobalResidualAugmentationUnknownCostRejects{};
+    size_t mGlobalResidualPrefillDecodeOpportunities{};
+    size_t mGlobalResidualPrefillDecodeSelections{};
+    size_t mGlobalResidualPrefillDecodeUnknownCostRejects{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
+    size_t mGlobalEncoderOverlapOpportunities{};
+    size_t mGlobalEncoderOverlapKnownCosts{};
+    size_t mGlobalEncoderOverlapNoSamples{};
+    size_t mGlobalEncoderOverlapInsufficientSamples{};
+    size_t mGlobalEncoderOverlapUnprofitable{};
+    size_t mGlobalEncoderOverlapSafeProbeEligible{};
+    size_t mGlobalEncoderOverlapProbeDisabled{};
+    size_t mGlobalEncoderOverlapProbeIntervalBlocked{};
+    size_t mGlobalEncoderOverlapProbeSlackBlocked{};
     size_t mGlobalWarmupDecisions{};
     size_t mGlobalWarmupPrefillCandidates{};
     size_t mGlobalWarmupDecodeCandidates{};

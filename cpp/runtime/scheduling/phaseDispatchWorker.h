@@ -33,6 +33,9 @@ namespace trt_edgellm
 namespace rt
 {
 
+enum class PhaseActivityKind : uint8_t;
+class PhaseActivityTimelineRecorder;
+
 //! Reorder one selected phase batch to retain prior request-to-row placement where possible.
 //! The selected request set is unchanged; unassigned rows preserve their current relative order.
 void preservePhaseBatchRowAffinity(
@@ -127,6 +130,11 @@ public:
     //! Returns false when no queued work exists.
     bool dispatchNext();
 
+    //! Add the currently idle P or D context to one live single-phase plan.
+    //! The global scheduler must explicitly authorize the resulting P+D set.
+    bool augmentNext(PhaseGlobalActionCandidate missingPhase, PhaseGlobalActionCandidate aggregate, uint64_t planId,
+        uint64_t snapshotEpoch);
+
     //! Non-blocking event query. Returns true when an in-flight plan completed.
     bool poll();
 
@@ -144,11 +152,18 @@ public:
     std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
     PhaseExecutionSafetyContract const& safetyContract() const noexcept;
 
+    //! Enable opt-in epoch-relative P/D stream activity recording while idle.
+    void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
+
     //! CUDA primary context shared by the two phase streams.
     CUcontext cudaContext() const noexcept;
 
 private:
     void enqueueDeferredDecode();
+    void mergeAugmentedMetrics(PhaseDispatchPlan const& additional, PhaseGlobalActionCandidate const& aggregate,
+        uint64_t planId, uint64_t snapshotEpoch);
+    void enqueueActivity(PhaseActivityKind kind, char const* name, std::vector<PhaseWorkItem> const& batch,
+        PhaseEnqueueCallback const& callback, cudaStream_t stream);
     void completePrefillInFlight();
     void completeDecodeInFlight();
     void completeInFlight();
@@ -165,6 +180,7 @@ private:
     PhaseTensorRTContextMode mExecutionMode{PhaseTensorRTContextMode::kSharedSerialized};
     PhaseExecutionSafetyContract mSafetyContract;
     cudaEvent_t mDispatchStart{};
+    cudaEvent_t mAugmentationStart{};
     cudaEvent_t mPrefillStart{};
     cudaEvent_t mPrefillDone{};
     cudaEvent_t mDecodeStart{};
@@ -176,8 +192,10 @@ private:
     bool mHasPrefill{};
     bool mHasDecode{};
     bool mDecodeDeferred{};
+    bool mResidualAugmentation{};
     size_t mDispatchCount{};
     std::vector<uint64_t> mPreviousDecodeRowRequestIds;
+    PhaseActivityTimelineRecorder* mActivityTimeline{};
 };
 
 } // namespace rt

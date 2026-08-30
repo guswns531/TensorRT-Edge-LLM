@@ -17,6 +17,7 @@
 
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 
+#include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
 #include "common/checkMacros.h"
@@ -722,6 +723,14 @@ void IndependentPhaseAsyncServer::setTimelineCallback(std::function<void(PhaseTi
     mTimelineCallback = std::move(timelineCallback);
 }
 
+void IndependentPhaseAsyncServer::setActivityTimeline(PhaseActivityTimelineRecorder* timeline)
+{
+    ELLM_CHECK(mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty(),
+        "Phase activity timeline can only change while the server is idle");
+    mActivityTimeline = timeline;
+    mCoordinator.setActivityTimeline(timeline);
+}
+
 bool IndependentPhaseAsyncServer::poll()
 {
     bool progressed = pollCompletions();
@@ -874,7 +883,7 @@ std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGl
 
 std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalPrefillAction()
 {
-    if (mCoordinator.busy())
+    if (mCoordinator.busy() && mCoordinator.inFlightKind() != PhaseDispatchKind::kDecode)
     {
         return std::nullopt;
     }
@@ -883,7 +892,7 @@ std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGl
 
 std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalDecodeAction()
 {
-    if (mCoordinator.busy())
+    if (mCoordinator.busy() && mCoordinator.inFlightKind() != PhaseDispatchKind::kPrefill)
     {
         return std::nullopt;
     }
@@ -911,6 +920,16 @@ bool IndependentPhaseAsyncServer::dispatchGlobalAction(
     }
     mCoordinator.scheduler().setNextGlobalAction(std::move(candidate), planId, snapshotEpoch);
     return mCoordinator.dispatchNext();
+}
+
+bool IndependentPhaseAsyncServer::augmentGlobalAction(PhaseGlobalActionCandidate missingPhase,
+    PhaseGlobalActionCandidate aggregate, uint64_t planId, uint64_t snapshotEpoch)
+{
+    if (!mCoordinator.busy())
+    {
+        return false;
+    }
+    return mCoordinator.augmentGlobalAction(std::move(missingPhase), std::move(aggregate), planId, snapshotEpoch);
 }
 
 bool IndependentPhaseAsyncServer::shouldWaitForPrefillFormation()
@@ -1875,7 +1894,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
               if (!finalViews.empty())
               {
                   std::unique_ptr<IndependentPhaseSampleTicket> ticket
-                      = mAdapter.submitSampling(finalViews, io, stream, true);
+                      = submitSamplingWithActivity(finalViews, io, stream, true);
                   ELLM_CHECK(ticket != nullptr, "Prefill sampling adapter returned no completion ticket");
                   enqueueSamplingTicket(std::move(ticket));
                   for (IndependentPhaseRequestView const& view : finalViews)
@@ -1896,7 +1915,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
     callbacks.completeDecodeBatch
         = [this](std::vector<PhaseWorkItem> const& batch, PipelineIO& io, cudaStream_t stream) {
               std::unique_ptr<IndependentPhaseSampleTicket> ticket
-                  = mAdapter.submitSampling(makeViews(batch), io, stream, false);
+                  = submitSamplingWithActivity(makeViews(batch), io, stream, false);
               ELLM_CHECK(ticket != nullptr, "Decode sampling adapter returned no completion ticket");
               enqueueSamplingTicket(std::move(ticket));
           };
@@ -1911,6 +1930,30 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
         }
     };
     return callbacks;
+}
+
+std::unique_ptr<IndependentPhaseSampleTicket> IndependentPhaseAsyncServer::submitSamplingWithActivity(
+    std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream, bool fromPrefill)
+{
+    if (mActivityTimeline == nullptr)
+    {
+        return mAdapter.submitSampling(views, io, stream, fromPrefill);
+    }
+    PhaseActivityKind const kind = fromPrefill ? PhaseActivityKind::kPrefill : PhaseActivityKind::kDecode;
+    char const* name = fromPrefill ? "prefill_sampling" : "decode_sampling";
+    PhaseActivityTimelineRecorder::Token const token
+        = mActivityTimeline->begin(kind, stream, name, mNextSamplingTicketSequence);
+    try
+    {
+        std::unique_ptr<IndependentPhaseSampleTicket> ticket = mAdapter.submitSampling(views, io, stream, fromPrefill);
+        mActivityTimeline->end(token, stream);
+        return ticket;
+    }
+    catch (...)
+    {
+        mActivityTimeline->cancel(token);
+        throw;
+    }
 }
 
 std::vector<IndependentPhaseRequestView> IndependentPhaseAsyncServer::makeViews(

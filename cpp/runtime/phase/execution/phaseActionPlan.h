@@ -114,7 +114,7 @@ PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
 PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
     PhaseGlobalActionCandidate const& launched, double elapsedUs) noexcept;
 
-//! Upgrade a live P or D lease to E+P or E+D without authorizing a third phase.
+//! Upgrade a live P or D lease to E+P, E+D, or P+D without authorizing a third phase.
 std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
     PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept;
 

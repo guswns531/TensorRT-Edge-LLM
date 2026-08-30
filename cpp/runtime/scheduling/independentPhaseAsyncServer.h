@@ -346,6 +346,8 @@ public:
         std::function<void(IndependentPhaseServerCompletion&&)> completionCallback);
     //! Enable optional request-level host transition telemetry while the server is idle.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
+    //! Enable opt-in epoch-relative P/D stream activity recording while idle.
+    void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
     bool poll();
     //! Progress admission, CUDA completions, sampling, and callbacks without
     //! selecting a new P/D action.
@@ -363,6 +365,9 @@ public:
     //! externally coordinated global P/D dispatch.
     bool shouldWaitForGlobalDecodeRefill();
     bool dispatchGlobalAction(PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
+    //! Add an idle P or D context to a live single-phase global action.
+    bool augmentGlobalAction(PhaseGlobalActionCandidate missingPhase, PhaseGlobalActionCandidate aggregate,
+        uint64_t planId, uint64_t snapshotEpoch);
     void runUntilIdle(size_t maxPolls);
 
     std::optional<IndependentPhaseServerToken> tryPopToken();
@@ -485,6 +490,8 @@ private:
     size_t costLimitedAdmissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
+    std::unique_ptr<IndependentPhaseSampleTicket> submitSamplingWithActivity(
+        std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream, bool fromPrefill);
     void enqueueSamplingTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     bool flushEventCallbacks();
     void processTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
@@ -512,6 +519,7 @@ private:
     std::function<void(IndependentPhaseServerToken&&)> mTokenCallback;
     std::function<void(IndependentPhaseServerCompletion&&)> mCompletionCallback;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
+    PhaseActivityTimelineRecorder* mActivityTimeline{};
     size_t mDecodeRefillWaitCount{};
     uint64_t mNextSamplingTicketSequence{1U};
     size_t mPrefillFormationWaitPeriodCount{};

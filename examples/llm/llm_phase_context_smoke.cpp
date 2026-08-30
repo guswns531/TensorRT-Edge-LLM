@@ -28,6 +28,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
+#include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
@@ -643,6 +644,7 @@ int main(int argc, char** argv)
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
+    cudaStream_t copyStream{};
     bool const enablePhaseStreamPriorities = std::getenv("TRT_EDGELLM_PHASE_STREAM_PRIORITIES") != nullptr;
     int leastPriority{};
     int greatestPriority{};
@@ -656,6 +658,7 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaStreamCreateWithPriority(&setupStream, cudaStreamNonBlocking, normalPriority));
         CUDA_CHECK(cudaStreamCreateWithPriority(&prefillStream, cudaStreamNonBlocking, normalPriority));
         CUDA_CHECK(cudaStreamCreateWithPriority(&decodeStream, cudaStreamNonBlocking, greatestPriority));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&copyStream, cudaStreamNonBlocking, normalPriority));
         LOG_INFO("Phase stream priorities: encoder=%d prefill=%d decode=%d", leastPriority, normalPriority,
             greatestPriority);
     }
@@ -664,6 +667,7 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaStreamCreateWithFlags(&setupStream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&copyStream, cudaStreamNonBlocking));
     }
 
     {
@@ -1624,6 +1628,20 @@ int main(int argc, char** argv)
         }
         rt::IndependentPhaseAsyncServer semanticServer(
             serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter), semanticPrefixCache.get());
+        char const* activityPrefixValue = std::getenv("TRT_EDGELLM_PHASE_ACTIVITY_PREFIX");
+        std::unique_ptr<rt::PhaseActivityTimelineRecorder> activityTimeline;
+        std::filesystem::path activityPrefix;
+        if (activityPrefixValue != nullptr)
+        {
+            activityPrefix = activityPrefixValue;
+            if (!activityPrefix.parent_path().empty())
+            {
+                std::filesystem::create_directories(activityPrefix.parent_path());
+            }
+            activityTimeline = std::make_unique<rt::PhaseActivityTimelineRecorder>(setupStream);
+            semanticServer.setActivityTimeline(activityTimeline.get());
+            LOG_INFO("Phase activity timeline enabled: prefix=%s", activityPrefix.string().c_str());
+        }
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
         char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
@@ -1687,8 +1705,13 @@ int main(int argc, char** argv)
                 auto runner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
                     config.maxKVCacheCapacity, encoderStream, checkpointDir);
                 configureVisionContextMemory(*runner);
-                rt::PhaseVisionAdapter visionAdapter(*runner, tokenizer, config, encoderStream, visionStoragePolicy);
+                rt::PhaseVisionAdapter visionAdapter(
+                    *runner, tokenizer, config, encoderStream, visionStoragePolicy, copyStream);
                 rt::PhaseThreeCoordinator threePhase(visionAdapter, semanticServer);
+                if (activityTimeline != nullptr)
+                {
+                    threePhase.setActivityTimeline(activityTimeline.get());
+                }
 
                 rt::LLMGenerationRequest request{};
                 rt::LLMGenerationRequest::Request logicalRequest;
@@ -1945,6 +1968,10 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
                 executionWarmupShapes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
                 warmupTelemetry.globalSafeProbeCount);
+            if (activityTimeline != nullptr)
+            {
+                activityTimeline->reset(setupStream);
+            }
             cudaStream_t ipcEncoderStream{};
             std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
             std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
@@ -1971,7 +1998,7 @@ int main(int argc, char** argv)
                     config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
                 configureVisionContextMemory(*ipcVisionRunner);
                 ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
-                    *ipcVisionRunner, tokenizer, config, ipcEncoderStream, visionStoragePolicy);
+                    *ipcVisionRunner, tokenizer, config, ipcEncoderStream, visionStoragePolicy, copyStream);
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_DEBUG_DIR"))
                 {
                     std::filesystem::path const debugDirectory(value);
@@ -2416,6 +2443,10 @@ int main(int argc, char** argv)
                 }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
+                if (activityTimeline != nullptr)
+                {
+                    ipcThreePhase->setActivityTimeline(activityTimeline.get());
+                }
             }
             else
             {
@@ -2916,6 +2947,26 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
                         {"global_shadow_disagreements",
                             semanticCoordinator.scheduler().telemetry().globalShadowDisagreementCount},
+                        {"global_overlap_opportunities",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapOpportunityCount},
+                        {"global_overlap_known_costs",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapKnownCostCount},
+                        {"global_overlap_no_samples",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapNoSampleCount},
+                        {"global_overlap_insufficient_samples",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapInsufficientSampleCount},
+                        {"global_overlap_unprofitable",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapUnprofitableCount},
+                        {"global_overlap_safe_probe_eligible",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapSafeProbeEligibleCount},
+                        {"global_overlap_probe_disabled",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapProbeDisabledCount},
+                        {"global_overlap_probe_interval_blocked",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapProbeIntervalBlockedCount},
+                        {"global_overlap_probe_slack_blocked",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapProbeSlackBlockedCount},
+                        {"global_overlap_selections",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapSelectionCount},
                         {"global_prefill_formation_opportunities",
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationOpportunityCount},
                         {"global_prefill_formation_decode_selections",
@@ -3059,9 +3110,28 @@ int main(int argc, char** argv)
                             visionMetrics.globalResidualEncoderDecodeSelections},
                         {"vision_global_residual_unknown_cost_rejects",
                             visionMetrics.globalResidualAugmentationUnknownCostRejects},
+                        {"vision_global_residual_prefill_decode_opportunities",
+                            visionMetrics.globalResidualPrefillDecodeOpportunities},
+                        {"vision_global_residual_prefill_decode_selections",
+                            visionMetrics.globalResidualPrefillDecodeSelections},
+                        {"vision_global_residual_prefill_decode_unknown_cost_rejects",
+                            visionMetrics.globalResidualPrefillDecodeUnknownCostRejects},
                         {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
+                        {"vision_global_overlap_opportunities", visionMetrics.globalEncoderOverlapOpportunities},
+                        {"vision_global_overlap_known_costs", visionMetrics.globalEncoderOverlapKnownCosts},
+                        {"vision_global_overlap_no_samples", visionMetrics.globalEncoderOverlapNoSamples},
+                        {"vision_global_overlap_insufficient_samples",
+                            visionMetrics.globalEncoderOverlapInsufficientSamples},
+                        {"vision_global_overlap_unprofitable", visionMetrics.globalEncoderOverlapUnprofitable},
+                        {"vision_global_overlap_safe_probe_eligible",
+                            visionMetrics.globalEncoderOverlapSafeProbeEligible},
+                        {"vision_global_overlap_probe_disabled", visionMetrics.globalEncoderOverlapProbeDisabled},
+                        {"vision_global_overlap_probe_interval_blocked",
+                            visionMetrics.globalEncoderOverlapProbeIntervalBlocked},
+                        {"vision_global_overlap_probe_slack_blocked",
+                            visionMetrics.globalEncoderOverlapProbeSlackBlocked},
                         {"vision_global_action_fidelity_violations", visionMetrics.globalActionFidelityViolations},
                         {"vision_global_planned_outstanding",
                             static_cast<uint8_t>(visionMetrics.globalPlannedOutstanding)},
@@ -3356,10 +3426,26 @@ int main(int argc, char** argv)
                 "Semantic phase requests did not drain and release every slot");
             LOG_INFO("Semantic phase requests passed through IndependentPhaseAsyncServer");
         }
+        if (activityTimeline != nullptr)
+        {
+            activityTimeline->drain();
+            activityTimeline->writeCsv(activityPrefix);
+            rt::PhaseActivitySummary const activity = activityTimeline->summary();
+            double const ratioScale = activity.windowMs > 0.0 ? 100.0 / activity.windowMs : 0.0;
+            LOG_INFO(
+                "Phase activity: window=%.3f ms any_epd=%.2f%% all_idle=%.2f%% epd_idle=%.2f%% "
+                "epd_triple=%.2f%% four_way=%.2f%% E=%.2f%% P=%.2f%% D=%.2f%% C=%.2f%%",
+                activity.windowMs, activity.anyEpdMs * ratioScale, activity.allIdleMs * ratioScale,
+                activity.epdIdleMs * ratioScale, activity.epdTripleMs * ratioScale, activity.fourWayMs * ratioScale,
+                activity.activityMs[0] * ratioScale, activity.activityMs[1] * ratioScale,
+                activity.activityMs[2] * ratioScale, activity.activityMs[3] * ratioScale);
+            semanticServer.setActivityTimeline(nullptr);
+        }
     }
 
     CUDA_CHECK(cudaStreamDestroy(setupStream));
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
+    CUDA_CHECK(cudaStreamDestroy(copyStream));
     return EXIT_SUCCESS;
 }

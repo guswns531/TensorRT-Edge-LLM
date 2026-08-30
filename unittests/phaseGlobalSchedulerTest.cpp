@@ -300,6 +300,31 @@ TEST(PhaseGlobalSchedulerTest, RejectsTriplePhaseLeaseAugmentation)
     EXPECT_FALSE(phaseGlobalAugmentedDispatchPlan(5U, 8U, active, overlap).has_value());
 }
 
+TEST(PhaseGlobalSchedulerTest, UpgradesSinglePdLeaseToMatchingPrefillDecodeOverlap)
+{
+    PhaseGlobalActionCandidate decode = candidate(PhaseGlobalActionKind::kDecode, 8000.0, 6000.0, 10000.0);
+    decode.primaryRequestIds = {9U, 5U};
+    decode.primaryStableSlotIds = {3, 1};
+    phaseGlobalFinalizeCandidate(decode);
+    PhaseGlobalDispatchPlan const active = phaseGlobalDispatchPlan(4U, 7U, decode);
+
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kPrefillDecode, 18000.0, 9000.0, 10000.0);
+    overlap.primaryRequestIds = {20U};
+    overlap.primaryStableSlotIds = {8};
+    overlap.secondaryRequestIds = decode.primaryRequestIds;
+    overlap.secondaryStableSlotIds = decode.primaryStableSlotIds;
+    phaseGlobalFinalizeCandidate(overlap);
+
+    std::optional<PhaseGlobalDispatchPlan> const upgraded = phaseGlobalAugmentedDispatchPlan(5U, 8U, active, overlap);
+    ASSERT_TRUE(upgraded.has_value());
+    EXPECT_EQ(upgraded->action, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_TRUE(upgraded->launchMatches(PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode));
+    overlap.secondaryRequestIds = {7U};
+    overlap.secondaryStableSlotIds = {1};
+    phaseGlobalFinalizeCandidate(overlap);
+    EXPECT_FALSE(phaseGlobalAugmentedDispatchPlan(6U, 9U, active, overlap).has_value());
+}
+
 TEST(PhaseGlobalSchedulerTest, SelectsKnownResidualAugmentationForFirstTokenDeadline)
 {
     PhaseGlobalScheduler scheduler;
@@ -500,6 +525,20 @@ TEST(PhaseGlobalCostModelTest, SharesOverlapSamplesWithinConservativeShapeBucket
     EXPECT_EQ(model.estimate(second)->sampleCount, 2U);
     EXPECT_TRUE(model.overlapEligible(first));
     EXPECT_EQ(phaseGlobalCanonicalOverlapCostKey(first), phaseGlobalCanonicalOverlapCostKey(second));
+}
+
+TEST(PhaseGlobalCostModelTest, SharesOverlapSamplesWithinConservativeContextBuckets)
+{
+    PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});
+    PhaseGlobalActionKey const first{PhaseGlobalActionKind::kEncoderDecode, 2, 7, 0, 3, 5};
+    PhaseGlobalActionKey const second{PhaseGlobalActionKind::kEncoderDecode, 2, 7, 0, 4, 8};
+    model.observe(first, {24.0F, 18.0F});
+    model.observe(second, {24.0F, 17.0F});
+
+    EXPECT_EQ(phaseGlobalCanonicalOverlapCostKey(first), phaseGlobalCanonicalOverlapCostKey(second));
+    ASSERT_TRUE(model.estimate(first).has_value());
+    EXPECT_EQ(model.estimate(second)->sampleCount, 2U);
+    EXPECT_TRUE(model.overlapEligible(second));
 }
 
 } // namespace

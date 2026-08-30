@@ -941,8 +941,20 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalResidualEncoderPrefillSelections = mGlobalResidualEncoderPrefillSelections;
     result.globalResidualEncoderDecodeSelections = mGlobalResidualEncoderDecodeSelections;
     result.globalResidualAugmentationUnknownCostRejects = mGlobalResidualAugmentationUnknownCostRejects;
+    result.globalResidualPrefillDecodeOpportunities = mGlobalResidualPrefillDecodeOpportunities;
+    result.globalResidualPrefillDecodeSelections = mGlobalResidualPrefillDecodeSelections;
+    result.globalResidualPrefillDecodeUnknownCostRejects = mGlobalResidualPrefillDecodeUnknownCostRejects;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
+    result.globalEncoderOverlapOpportunities = mGlobalEncoderOverlapOpportunities;
+    result.globalEncoderOverlapKnownCosts = mGlobalEncoderOverlapKnownCosts;
+    result.globalEncoderOverlapNoSamples = mGlobalEncoderOverlapNoSamples;
+    result.globalEncoderOverlapInsufficientSamples = mGlobalEncoderOverlapInsufficientSamples;
+    result.globalEncoderOverlapUnprofitable = mGlobalEncoderOverlapUnprofitable;
+    result.globalEncoderOverlapSafeProbeEligible = mGlobalEncoderOverlapSafeProbeEligible;
+    result.globalEncoderOverlapProbeDisabled = mGlobalEncoderOverlapProbeDisabled;
+    result.globalEncoderOverlapProbeIntervalBlocked = mGlobalEncoderOverlapProbeIntervalBlocked;
+    result.globalEncoderOverlapProbeSlackBlocked = mGlobalEncoderOverlapProbeSlackBlocked;
     result.globalWarmupDecisions = mGlobalWarmupDecisions;
     result.globalWarmupPrefillCandidates = mGlobalWarmupPrefillCandidates;
     result.globalWarmupDecodeCandidates = mGlobalWarmupDecodeCandidates;
@@ -994,6 +1006,13 @@ void PhaseThreeCoordinator::setTimelineCallback(std::function<void(PhaseTimeline
 {
     ELLM_CHECK(empty(), "Three-phase timeline callback can only change while the coordinator is idle");
     mTimelineCallback = std::move(timelineCallback);
+}
+
+void PhaseThreeCoordinator::setActivityTimeline(PhaseActivityTimelineRecorder* timeline)
+{
+    ELLM_CHECK(empty(), "Three-phase activity timeline can only change while idle");
+    mVision.setActivityTimeline(timeline);
+    mServer.setActivityTimeline(timeline);
 }
 
 void PhaseThreeCoordinator::setEncoderBatchMetricCallback(
@@ -1111,6 +1130,162 @@ void PhaseThreeCoordinator::abandonGlobalExecutionLease() noexcept
     mGlobalExecutionLease.reset();
 }
 
+bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
+    IndependentPhaseServerArbitrationSnapshot const& serverState)
+{
+    if (mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kActive || !mGlobalExecutionLease.has_value()
+        || !mActiveGlobalPdExecution.has_value() || !serverState.busy || !mPending.empty() || !mEncoding.empty()
+        || mVision.busy() || mEncoderPreparation.valid())
+    {
+        return false;
+    }
+    PhaseGlobalActionKind const activeKind = mActiveGlobalPdExecution->candidate.key.kind;
+    bool const addDecode = activeKind == PhaseGlobalActionKind::kPrefill && serverState.decodeQueued > 0U;
+    bool const addPrefill = activeKind == PhaseGlobalActionKind::kDecode && serverState.prefillQueued > 0U;
+    if (!addDecode && !addPrefill)
+    {
+        return false;
+    }
+    std::optional<PhaseGlobalActionCandidate> missing
+        = addDecode ? mServer.previewGlobalDecodeAction() : mServer.previewGlobalPrefillAction();
+    if (!missing.has_value())
+    {
+        return false;
+    }
+    if (missing->candidateId == mActiveGlobalPdExecution->lastResidualPdCandidateId)
+    {
+        return false;
+    }
+    mActiveGlobalPdExecution->lastResidualPdCandidateId = missing->candidateId;
+    ++mGlobalResidualPrefillDecodeOpportunities;
+
+    double const elapsedUs = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
+                                 .count();
+    PhaseGlobalActionCandidate const active
+        = phaseGlobalResidualCandidate(mActiveGlobalPdExecution->candidate, elapsedUs);
+    PhaseGlobalActionCandidate const& prefill = addPrefill ? *missing : active;
+    PhaseGlobalActionCandidate const& decode = addDecode ? *missing : active;
+    PhaseGlobalActionCandidate overlap;
+    overlap.key = {PhaseGlobalActionKind::kPrefillDecode, prefill.key.primaryBatchSize, decode.key.primaryBatchSize,
+        prefill.key.chunkLength, prefill.key.primaryContextBucket, decode.key.primaryContextBucket};
+    overlap.key.executionVariant
+        = phaseExecutionVariant(phaseExecutionVariantUsesPrimaryGraph(prefill.key.executionVariant),
+            phaseExecutionVariantUsesPrimaryGraph(decode.key.executionVariant));
+    overlap.key.primaryWorkClass = prefill.key.primaryWorkClass;
+    overlap.key.residualAugmentation = true;
+    overlap.primaryRequestIds = prefill.primaryRequestIds;
+    overlap.primaryStableSlotIds = prefill.primaryStableSlotIds;
+    overlap.secondaryRequestIds = decode.primaryRequestIds;
+    overlap.secondaryStableSlotIds = decode.primaryStableSlotIds;
+    phaseGlobalFinalizeCandidate(overlap);
+    overlap.referenceWorkUs = active.referenceWorkUs + missing->referenceWorkUs;
+    overlap.requestServiceLagUs = std::max(active.requestServiceLagUs, missing->requestServiceLagUs);
+    overlap.memory = prefill.memory;
+    overlap.memory.allocateBytes = saturatedAdd(overlap.memory.allocateBytes, decode.memory.allocateBytes);
+    overlap.memory.guaranteedGrowthBytes
+        = saturatedAdd(overlap.memory.guaranteedGrowthBytes, decode.memory.guaranteedGrowthBytes);
+    overlap.memory.nearReclaimBytes = saturatedAdd(overlap.memory.nearReclaimBytes, decode.memory.nearReclaimBytes);
+
+    double const activeRobustUs = active.predictedMakespanUs + active.uncertaintyUs;
+    double const missingRobustUs = missing->predictedMakespanUs + missing->uncertaintyUs;
+    double const robustSerialUs = activeRobustUs + missingRobustUs;
+    std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->estimate(overlap.key);
+    PhaseGlobalOverlapCostDiagnostic diagnostic = mRuntimeCostTracker->overlapDiagnostic(overlap.key);
+    if (diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
+        || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples)
+    {
+        // A complete P+D observation is a conservative upper bound for adding
+        // the same idle context after its peer has already made progress.
+        PhaseGlobalActionKey completeOverlapKey = overlap.key;
+        completeOverlapKey.residualAugmentation = false;
+        PhaseGlobalOverlapCostDiagnostic const completeDiagnostic
+            = mRuntimeCostTracker->overlapDiagnostic(completeOverlapKey);
+        if (completeDiagnostic.status == PhaseGlobalOverlapCostStatus::kEligible)
+        {
+            diagnostic = completeDiagnostic;
+            estimate = mRuntimeCostTracker->estimate(completeOverlapKey);
+        }
+    }
+    bool const overlapKnown = diagnostic.status == PhaseGlobalOverlapCostStatus::kEligible;
+    bool const needsCalibration = diagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
+        || diagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
+    bool const probeIntervalReady = mLastGlobalSafeProbeSequence == 0U
+        || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
+    double protectedSlackUs = std::numeric_limits<double>::infinity();
+    for (PhaseProtectedCompletion const& completion : active.protectedCompletions)
+    {
+        protectedSlackUs = std::min(protectedSlackUs, completion.slackUs);
+    }
+    for (PhaseProtectedCompletion const& completion : missing->protectedCompletions)
+    {
+        protectedSlackUs = std::min(protectedSlackUs, completion.slackUs);
+    }
+    bool const safeProbe = !overlapKnown && needsCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
+        && probeIntervalReady
+        && protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
+    overlap.overlapCostKnown = overlapKnown;
+    overlap.safeProbeEligible = safeProbe;
+    if (estimate.has_value())
+    {
+        overlap.predictedMakespanUs = static_cast<double>(estimate->makespanMedianMs) * 1000.0;
+        overlap.uncertaintyUs = static_cast<double>(estimate->uncertaintyMs) * 1000.0;
+    }
+    else
+    {
+        overlap.predictedMakespanUs = std::max(active.predictedMakespanUs, missing->predictedMakespanUs);
+        overlap.uncertaintyUs = std::max(0.0, robustSerialUs - overlap.predictedMakespanUs);
+    }
+    overlap.predictedBlockingUs = overlap.predictedMakespanUs;
+    for (PhaseProtectedCompletion completion : active.protectedCompletions)
+    {
+        completion.predictedCompletionUs = overlap.predictedMakespanUs;
+        completion.uncertaintyUs = overlap.uncertaintyUs;
+        overlap.protectedCompletions.push_back(completion);
+    }
+    for (PhaseProtectedCompletion completion : missing->protectedCompletions)
+    {
+        completion.predictedCompletionUs = overlap.predictedMakespanUs;
+        completion.uncertaintyUs = overlap.uncertaintyUs;
+        overlap.protectedCompletions.push_back(completion);
+    }
+
+    ++mGlobalDecisionSequence;
+    ++mGlobalDecisions;
+    PhaseGlobalDecision decision = mGlobalScheduler.select({active, overlap});
+    if (safeProbe)
+    {
+        decision.selectedIndex = 1U;
+    }
+    if (!decision.selectedIndex.has_value() || *decision.selectedIndex != 1U)
+    {
+        mGlobalResidualPrefillDecodeUnknownCostRejects += !overlapKnown && !safeProbe ? 1U : 0U;
+        return false;
+    }
+    if (safeProbe)
+    {
+        mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
+        ++mGlobalSafeProbes;
+    }
+
+    uint64_t const planId = kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence;
+    uint64_t const snapshotEpoch = kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch;
+    std::optional<PhaseGlobalDispatchPlan> const augmented
+        = phaseGlobalAugmentedDispatchPlan(planId, snapshotEpoch, *mGlobalExecutionLease, overlap);
+    ELLM_CHECK(augmented.has_value(), "Residual P/D augmentation does not match the active phase rows");
+    bool const started = mServer.augmentGlobalAction(std::move(*missing), overlap, planId, snapshotEpoch);
+    if (!started)
+    {
+        return false;
+    }
+    mGlobalExecutionLease = *augmented;
+    mActiveGlobalPdExecution.reset();
+    mLastGlobalAction = PhaseGlobalActionKind::kPrefillDecode;
+    ++mGlobalResidualPrefillDecodeSelections;
+    validateGlobalExecutionLaunch();
+    return true;
+}
+
 bool PhaseThreeCoordinator::dispatchGlobalAction()
 {
     if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled)
@@ -1119,6 +1294,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     refreshGlobalExecutionLease();
     IndependentPhaseServerArbitrationSnapshot const serverState = mServer.arbitrationSnapshot();
+    if (dispatchGlobalPrefillDecodeResidual(serverState))
+    {
+        return true;
+    }
     bool const residualAugmentation = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
         && mGlobalExecutionLease.has_value() && mActiveGlobalPdExecution.has_value() && serverState.busy
         && !mPending.empty() && mEncoding.empty() && !mVision.busy() && !mEncoderPreparation.valid()
@@ -1402,6 +1581,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         || (mConfig.exclusiveEncoderInputTokenThreshold > 0
             && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
     auto addEncoderOverlap = [&](PhaseGlobalActionKind kind, PhaseGlobalActionCandidate const& phase) {
+        ++mGlobalEncoderOverlapOpportunities;
         int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? phase.key.chunkLength : 0;
         PhaseGlobalActionKey overlapKey{kind, static_cast<int32_t>(encoderBatchIndices.size()),
             phase.key.primaryBatchSize, chunkLength, encoderContextBucket, phase.key.primaryContextBucket};
@@ -1481,6 +1661,14 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
         }
         PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mRuntimeCostTracker->overlapDiagnostic(overlapKey);
+        mGlobalEncoderOverlapKnownCosts += overlapKnown ? 1U : 0U;
+        switch (localDiagnostic.status)
+        {
+        case PhaseGlobalOverlapCostStatus::kNoSamples: ++mGlobalEncoderOverlapNoSamples; break;
+        case PhaseGlobalOverlapCostStatus::kInsufficientSamples: ++mGlobalEncoderOverlapInsufficientSamples; break;
+        case PhaseGlobalOverlapCostStatus::kEligible: break;
+        case PhaseGlobalOverlapCostStatus::kUnprofitable: ++mGlobalEncoderOverlapUnprofitable; break;
+        }
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -1550,6 +1738,25 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         && protectedSlackUs
                             >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs)
                     || residualProbeSafe));
+        if (safeProbe)
+        {
+            ++mGlobalEncoderOverlapSafeProbeEligible;
+        }
+        else if (!overlapKnown && needsLocalCalibration && !mGlobalWarmupProbeMode)
+        {
+            if (mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
+            {
+                ++mGlobalEncoderOverlapProbeDisabled;
+            }
+            else if (!probeIntervalReady)
+            {
+                ++mGlobalEncoderOverlapProbeIntervalBlocked;
+            }
+            else
+            {
+                ++mGlobalEncoderOverlapProbeSlackBlocked;
+            }
+        }
         if (safeProbe)
         {
             double const optimisticMakespanUs = std::max(encoderMakespanUs, phase.predictedMakespanUs);

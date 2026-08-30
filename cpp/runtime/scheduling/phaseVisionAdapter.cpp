@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
+#include "runtime/scheduling/phaseActivityTimeline.h"
 
 #include <algorithm>
 #include <limits>
@@ -199,16 +200,29 @@ bool phaseVisionSupportsPrefixBeforeVision(RopeType ropeType) noexcept
 }
 
 PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
-    LLMEngineConfig const& config, cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy)
+    LLMEngineConfig const& config, cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy, cudaStream_t copyStream)
     : mRunner(runner)
     , mTokenizer(tokenizer)
     , mConfig(config)
     , mStoragePolicy(storagePolicy)
     , mStream(stream)
+    , mCopyStream(copyStream == nullptr ? stream : copyStream)
 {
     ELLM_CHECK(mStream != nullptr, "Phase vision adapter requires an explicit CUDA stream");
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mStream, &mCudaContext));
     ELLM_CHECK(mCudaContext != nullptr, "Phase vision stream has no CUDA context");
+    CUcontext copyContext{};
+    CUDA_DRIVER_CHECK(cuStreamGetCtx(mCopyStream, &copyContext));
+    ELLM_CHECK(copyContext == mCudaContext, "Phase vision copy stream must share the encoder CUDA context");
+    CUDA_CHECK(cudaEventCreateWithFlags(&mEncoderDoneEvent, cudaEventDisableTiming));
+}
+
+PhaseVisionAdapter::~PhaseVisionAdapter() noexcept
+{
+    if (mEncoderDoneEvent != nullptr)
+    {
+        static_cast<void>(cudaEventDestroy(mEncoderDoneEvent));
+    }
 }
 
 Tensor PhaseVisionAdapter::viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name)
@@ -257,15 +271,15 @@ std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::acquireBatchStorage
     return storage;
 }
 
-void PhaseVisionAdapter::copyRunnerOutputs(
-    PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding, OptionalInputTensors const& deepstackFeatures)
+void PhaseVisionAdapter::copyRunnerOutputs(PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding,
+    OptionalInputTensors const& deepstackFeatures, cudaStream_t stream)
 {
     auto retain = [&](Tensor const& source, Tensor& destination, std::string const& name) {
         resizeTensor(destination, source, name);
         size_t const copyBytes
             = static_cast<size_t>(source.getShape().volume()) * utils::getTypeSize(source.getDataType());
         CUDA_CHECK(cudaMemcpyAsync(
-            destination.rawPointer(), source.rawPointer(), copyBytes, cudaMemcpyDeviceToDevice, mStream));
+            destination.rawPointer(), source.rawPointer(), copyBytes, cudaMemcpyDeviceToDevice, stream));
         ++mMemoryStats.deviceCopyOperations;
         mMemoryStats.deviceCopyBytes += copyBytes;
     };
@@ -274,6 +288,27 @@ void PhaseVisionAdapter::copyRunnerOutputs(
     for (size_t index{}; index < deepstackFeatures.size(); ++index)
     {
         retain(deepstackFeatures[index], storage.deepstackFeatures[index], "phase_vision_batch_deepstack");
+    }
+}
+
+void PhaseVisionAdapter::recordActivity(PhaseActivityKind kind, char const* name, uint64_t correlationId,
+    cudaStream_t stream, std::function<void()> const& enqueue)
+{
+    if (mActivityTimeline == nullptr)
+    {
+        enqueue();
+        return;
+    }
+    PhaseActivityTimelineRecorder::Token const token = mActivityTimeline->begin(kind, stream, name, correlationId);
+    try
+    {
+        enqueue();
+        mActivityTimeline->end(token, stream);
+    }
+    catch (...)
+    {
+        mActivityTimeline->cancel(token);
+        throw;
     }
 }
 
@@ -425,7 +460,12 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
         }
         bool const directOutput
             = mRunner.bindExternalOutputStorage(prepared->storage->outputEmbedding, externalDeepstack);
-        ELLM_CHECK(mRunner.infer(mStream), "Phase vision inference failed");
+        bool inferenceSucceeded{};
+        uint64_t const correlationId = prepared->submissions.front().requestId;
+        recordActivity(PhaseActivityKind::kEncoder, "encoder_engine", correlationId, mStream,
+            [&] { inferenceSucceeded = mRunner.infer(mStream); });
+        ELLM_CHECK(inferenceSucceeded, "Phase vision inference failed");
+        cudaStream_t completionStream = mStream;
         if (directOutput)
         {
             auto activeBytes = [](Tensor const& tensor) {
@@ -444,7 +484,11 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
         }
         else
         {
-            copyRunnerOutputs(*prepared->storage, outputEmbedding, deepstackFeatures);
+            CUDA_CHECK(cudaEventRecord(mEncoderDoneEvent, mStream));
+            CUDA_CHECK(cudaStreamWaitEvent(mCopyStream, mEncoderDoneEvent));
+            recordActivity(PhaseActivityKind::kCopy, "encoder_output_copy", correlationId, mCopyStream,
+                [&] { copyRunnerOutputs(*prepared->storage, outputEmbedding, deepstackFeatures, mCopyStream); });
+            completionStream = mCopyStream;
         }
 
         int64_t embeddingOffset{};
@@ -480,17 +524,17 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
                 snapshot.encoderBatchSize = prepared->submissions.size();
                 snapshot.encoderBatchIndex = index;
                 snapshot.tokenIds = payload.tokenIds.front();
-                snapshot.outputEmbedding = captureDebugTensor(payload.outputEmbedding, mStream);
-                snapshot.mropeCosSin = captureDebugTensor(payload.mropeCosSin, mStream);
+                snapshot.outputEmbedding = captureDebugTensor(payload.outputEmbedding, completionStream);
+                snapshot.mropeCosSin = captureDebugTensor(payload.mropeCosSin, completionStream);
                 debugSnapshots.push_back(std::move(snapshot));
             }
             embeddingOffset += rowCount;
-            CUDA_CHECK(cudaEventRecord(payload.readyEvent, mStream));
+            CUDA_CHECK(cudaEventRecord(payload.readyEvent, completionStream));
         }
         ELLM_CHECK(embeddingOffset == totalEmbeddingRows, "Phase vision embedding slicing did not consume all rows");
         if (!debugSnapshots.empty())
         {
-            CUDA_CHECK(cudaStreamSynchronize(mStream));
+            CUDA_CHECK(cudaStreamSynchronize(completionStream));
             for (PhaseVisionDebugSnapshot const& snapshot : debugSnapshots)
             {
                 mDebugCallback(snapshot);
@@ -500,6 +544,10 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
     catch (...)
     {
         static_cast<void>(cudaStreamSynchronize(mStream));
+        if (mCopyStream != mStream)
+        {
+            static_cast<void>(cudaStreamSynchronize(mCopyStream));
+        }
         mBatchedRequest.reset();
         throw;
     }
@@ -652,6 +700,12 @@ void PhaseVisionAdapter::setDebugCallback(std::function<void(PhaseVisionDebugSna
 {
     ELLM_CHECK(!busy(), "Phase vision debug callback can only change while the adapter is idle");
     mDebugCallback = std::move(callback);
+}
+
+void PhaseVisionAdapter::setActivityTimeline(PhaseActivityTimelineRecorder* timeline)
+{
+    ELLM_CHECK(!busy(), "Phase activity timeline cannot change while encoder work is in flight");
+    mActivityTimeline = timeline;
 }
 
 void PhaseVisionAdapter::refreshIdleStorageStats() noexcept

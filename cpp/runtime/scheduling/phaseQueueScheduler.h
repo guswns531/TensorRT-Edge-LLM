@@ -229,6 +229,16 @@ struct PhaseSchedulerTelemetry
     size_t globalShadowDisagreementCount{};
     size_t globalNoFeasibleDecisionCount{};
     size_t globalSafeProbeCount{};
+    size_t globalOverlapOpportunityCount{};
+    size_t globalOverlapKnownCostCount{};
+    size_t globalOverlapNoSampleCount{};
+    size_t globalOverlapInsufficientSampleCount{};
+    size_t globalOverlapUnprofitableCount{};
+    size_t globalOverlapSafeProbeEligibleCount{};
+    size_t globalOverlapProbeDisabledCount{};
+    size_t globalOverlapProbeIntervalBlockedCount{};
+    size_t globalOverlapProbeSlackBlockedCount{};
+    size_t globalOverlapSelectionCount{};
     size_t globalCandidateParityViolationCount{};
     size_t globalActionFidelityViolationCount{};
     size_t globalPrefillFormationOpportunityCount{};
@@ -356,9 +366,10 @@ struct PhaseQueueSchedulerConfig
     float globalColdPrefillMsPerToken{0.02F};
     float globalColdDecodeMs{2.0F};
     //! Permit a rate-limited unknown P+D probe only with this multiple of
-    //! robust serial cost remaining as slack. Production exploration is
-    //! opt-in; controlled warm-up probes remain available when this is zero.
-    float globalSafeProbeSlackMultiplier{};
+    //! robust serial cost remaining as slack. A conservative bounded probe is
+    //! enabled by default so an empty process-local model cannot remain stuck
+    //! on serial execution. Zero disables production probes.
+    float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
     //! Maximum distinct P+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};

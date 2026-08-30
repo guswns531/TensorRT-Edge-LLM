@@ -1876,6 +1876,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     }
     if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefillRows > 0 && overlapDecodeRows > 0)
     {
+        ++mTelemetry.globalOverlapOpportunityCount;
         PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows, overlapDecodeRows,
             overlapPrefillChunk, contextBucket(overlapPrefillPastKV), contextBucket(overlapDecodeMaxContext)};
         overlapKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
@@ -1911,6 +1912,15 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlapKnown = selected != nullptr;
         }
         PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mRuntimeCostTracker->overlapDiagnostic(overlapKey);
+        switch (localDiagnostic.status)
+        {
+        case PhaseGlobalOverlapCostStatus::kNoSamples: ++mTelemetry.globalOverlapNoSampleCount; break;
+        case PhaseGlobalOverlapCostStatus::kInsufficientSamples:
+            ++mTelemetry.globalOverlapInsufficientSampleCount;
+            break;
+        case PhaseGlobalOverlapCostStatus::kEligible: ++mTelemetry.globalOverlapKnownCostCount; break;
+        case PhaseGlobalOverlapCostStatus::kUnprofitable: ++mTelemetry.globalOverlapUnprofitableCount; break;
+        }
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -1942,6 +1952,25 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         bool const safeProbe = calibrationProbe
             || (!overlapKnown && needsLocalCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
                 && probeIntervalReady && probeSlackSafe);
+        if (safeProbe)
+        {
+            ++mTelemetry.globalOverlapSafeProbeEligibleCount;
+        }
+        else if (!overlapKnown && needsLocalCalibration && !mGlobalWarmupProbeMode)
+        {
+            if (mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
+            {
+                ++mTelemetry.globalOverlapProbeDisabledCount;
+            }
+            else if (!probeIntervalReady)
+            {
+                ++mTelemetry.globalOverlapProbeIntervalBlockedCount;
+            }
+            else if (!probeSlackSafe)
+            {
+                ++mTelemetry.globalOverlapProbeSlackBlockedCount;
+            }
+        }
         PhaseGlobalActionCandidate candidate;
         candidate.key = overlapKey;
         candidate.primaryRequestIds = overlapPrefillRequestIds;
@@ -2028,6 +2057,25 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         decision = mGlobalScheduler.select(candidates);
     }
+    if (!mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
+    {
+        auto const probe = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
+            return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.safeProbeEligible
+                && !candidate.overlapCostKnown;
+        });
+        if (probe != candidates.end())
+        {
+            size_t const index = static_cast<size_t>(std::distance(candidates.begin(), probe));
+            decision.selectedIndex = index;
+            decision.reason = PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
+            decision.predictedViolationUs = 0.0;
+            double const makespanUs
+                = probe->predictedHorizonUs > 0.0 ? probe->predictedHorizonUs : probe->predictedMakespanUs;
+            double const referenceUs
+                = probe->horizonReferenceWorkUs > 0.0 ? probe->horizonReferenceWorkUs : probe->referenceWorkUs;
+            decision.serviceCompression = referenceUs / std::max(makespanUs, std::numeric_limits<double>::epsilon());
+        }
+    }
     ++mTelemetry.globalDecisionCount;
     mTelemetry.lastGlobalDecisionReason = decision.reason;
     mTelemetry.lastGlobalPredictedViolationUs = decision.predictedViolationUs;
@@ -2055,6 +2103,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
         ++mTelemetry.globalSafeProbeCount;
+    }
+    if (selected.key.kind == PhaseGlobalActionKind::kPrefillDecode)
+    {
+        ++mTelemetry.globalOverlapSelectionCount;
     }
     mTelemetry.lastGlobalSelectedAction = selected.key.kind;
     return GlobalQueueSelection{kind, selected, decision, safeProbe};
@@ -3286,6 +3338,9 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
             metrics.decodeBatchSize, chunkLength, contextBucket(metrics.prefillPastKVMax),
             contextBucket(metrics.plannedDecodeMaxContextLength), metrics.globalExecutionVariant};
         key.primaryWorkClass = static_cast<int32_t>(metrics.prefillClass);
+        key.residualAugmentation = metrics.globalDecisionApplied
+            && metrics.globalSelectedAction.kind == PhaseGlobalActionKind::kPrefillDecode
+            && metrics.globalSelectedAction.residualAugmentation;
         return key;
     }
     if (metrics.kind == PhaseDispatchKind::kPrefill)

@@ -16,6 +16,7 @@
  */
 
 #include "common/checkMacros.h"
+#include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKernelGroupRecorder.h"
 
@@ -24,6 +25,113 @@
 #include <utility>
 
 using namespace trt_edgellm;
+
+TEST(PhaseActivityTimelineTest, SweepsAllFourActivityBitsAndIdleGaps)
+{
+    std::vector<rt::PhaseActivityInterval> const intervals{
+        {1, 0, rt::PhaseActivityKind::kDecode, "decode-0", 0.5F, 2.0F},
+        {2, 0, rt::PhaseActivityKind::kEncoder, "encoder", 1.0F, 6.0F},
+        {3, 0, rt::PhaseActivityKind::kPrefill, "prefill", 2.0F, 7.0F},
+        {4, 0, rt::PhaseActivityKind::kDecode, "decode-1", 3.0F, 5.0F},
+        {5, 0, rt::PhaseActivityKind::kCopy, "copy", 2.5F, 4.5F},
+    };
+    std::vector<rt::PhaseActivitySegment> const segments = rt::phaseActivitySegments(intervals, 8.0F);
+    ASSERT_EQ(segments.size(), 10U);
+    EXPECT_EQ(segments[0].mask, 0U);
+    EXPECT_EQ(segments[1].mask, 0x04U);
+    EXPECT_EQ(segments[2].mask, 0x05U);
+    EXPECT_EQ(segments[3].mask, 0x03U);
+    EXPECT_EQ(segments[4].mask, 0x0BU);
+    EXPECT_EQ(segments[5].mask, 0x0FU);
+    EXPECT_EQ(segments[6].mask, 0x07U);
+    EXPECT_EQ(segments[7].mask, 0x03U);
+    EXPECT_EQ(segments[8].mask, 0x02U);
+    EXPECT_EQ(segments[9].mask, 0U);
+    EXPECT_EQ(rt::phaseActivityMaskString(0x01U), "0001");
+    EXPECT_EQ(rt::phaseActivityMaskString(0x0FU), "1111");
+
+    rt::PhaseActivitySummary const summary = rt::phaseActivitySummary(segments);
+    EXPECT_DOUBLE_EQ(summary.windowMs, 8.0);
+    EXPECT_DOUBLE_EQ(summary.allIdleMs, 1.5);
+    EXPECT_DOUBLE_EQ(summary.epdIdleMs, 1.5);
+    EXPECT_DOUBLE_EQ(summary.anyActivityMs, 6.5);
+    EXPECT_DOUBLE_EQ(summary.anyEpdMs, 6.5);
+    EXPECT_DOUBLE_EQ(summary.epdTripleMs, 2.0);
+    EXPECT_DOUBLE_EQ(summary.fourWayMs, 1.5);
+    EXPECT_DOUBLE_EQ(summary.activityMs[0], 5.0);
+    EXPECT_DOUBLE_EQ(summary.activityMs[1], 5.0);
+    EXPECT_DOUBLE_EQ(summary.activityMs[2], 3.5);
+    EXPECT_DOUBLE_EQ(summary.activityMs[3], 2.0);
+}
+
+TEST(PhaseActivityTimelineTest, RecordsEpochRelativeIntervalsAcrossStreams)
+{
+    cudaStream_t epochStream{};
+    cudaStream_t encoderStream{};
+    cudaStream_t copyStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&epochStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&copyStream, cudaStreamNonBlocking));
+    int32_t* marker{};
+    CUDA_CHECK(cudaMalloc(&marker, 4 * sizeof(int32_t)));
+
+    rt::PhaseActivityTimelineRecorder recorder(epochStream);
+    auto const encoder = recorder.begin(rt::PhaseActivityKind::kEncoder, encoderStream, "vit", 41U);
+    CUDA_CHECK(cudaMemsetAsync(marker, 1, 2 * sizeof(int32_t), encoderStream));
+    recorder.end(encoder, encoderStream);
+    auto const copy = recorder.begin(rt::PhaseActivityKind::kCopy, copyStream, "payload", 41U);
+    CUDA_CHECK(cudaMemsetAsync(marker + 2, 2, 2 * sizeof(int32_t), copyStream));
+    recorder.end(copy, copyStream);
+    EXPECT_EQ(recorder.pendingCount(), 2U);
+    recorder.drain();
+
+    std::vector<rt::PhaseActivityInterval> const intervals = recorder.intervals();
+    ASSERT_EQ(intervals.size(), 2U);
+    EXPECT_EQ(intervals[0].correlationId, 41U);
+    EXPECT_GE(intervals[0].startMs, 0.0F);
+    EXPECT_GE(intervals[0].endMs, intervals[0].startMs);
+    EXPECT_GE(intervals[1].startMs, 0.0F);
+    EXPECT_GE(intervals[1].endMs, intervals[1].startMs);
+
+    CUDA_CHECK(cudaFree(marker));
+    CUDA_CHECK(cudaStreamDestroy(epochStream));
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
+    CUDA_CHECK(cudaStreamDestroy(copyStream));
+}
+
+TEST(PhaseActivityTimelineTest, CountsCopyOnlyTimeAsEpdIdle)
+{
+    std::vector<rt::PhaseActivityInterval> const intervals{
+        {1, 0, rt::PhaseActivityKind::kCopy, "copy", 0.5F, 1.5F},
+    };
+    rt::PhaseActivitySummary const summary = rt::phaseActivitySummary(rt::phaseActivitySegments(intervals, 2.0F));
+
+    EXPECT_DOUBLE_EQ(summary.windowMs, 2.0);
+    EXPECT_DOUBLE_EQ(summary.allIdleMs, 1.0);
+    EXPECT_DOUBLE_EQ(summary.epdIdleMs, 2.0);
+    EXPECT_DOUBLE_EQ(summary.anyActivityMs, 1.0);
+    EXPECT_DOUBLE_EQ(summary.anyEpdMs, 0.0);
+    EXPECT_DOUBLE_EQ(summary.activityMs[3], 1.0);
+}
+
+TEST(PhaseActivityTimelineTest, ActiveSpanExcludesStartupAndTrailingIdleButPreservesInternalIdle)
+{
+    std::vector<rt::PhaseActivityInterval> const intervals{
+        {1, 0, rt::PhaseActivityKind::kEncoder, "encoder", 10.0F, 11.0F},
+        {2, 0, rt::PhaseActivityKind::kDecode, "decode", 12.0F, 13.0F},
+    };
+    std::vector<rt::PhaseActivitySegment> const segments = rt::phaseActivityActiveSpanSegments(intervals);
+
+    ASSERT_EQ(segments.size(), 3U);
+    EXPECT_EQ(segments[0].mask, 0x01U);
+    EXPECT_EQ(segments[1].mask, 0x00U);
+    EXPECT_EQ(segments[2].mask, 0x04U);
+    EXPECT_FLOAT_EQ(segments[0].startMs, 0.0F);
+    EXPECT_FLOAT_EQ(segments[2].endMs, 3.0F);
+    rt::PhaseActivitySummary const summary = rt::phaseActivitySummary(segments);
+    EXPECT_DOUBLE_EQ(summary.windowMs, 3.0);
+    EXPECT_DOUBLE_EQ(summary.allIdleMs, 1.0);
+}
 
 TEST(PhaseDispatchWorkerTest, PreservesSelectedDecodeRowsWithoutChangingRequestSet)
 {
@@ -148,6 +256,101 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeUsesTwoStreamsInOneCudaContext)
     EXPECT_EQ(dispatchMetrics->prefillRequestIds, std::vector<uint64_t>{1U});
     EXPECT_EQ(dispatchMetrics->decodeRequestIds, std::vector<uint64_t>{2U});
     EXPECT_GT(dispatchMetrics->hostCompletionNs, dispatchMetrics->hostDispatchStartNs);
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseDispatchWorkerTest, AugmentsLivePrefillWithResidualDecode)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = rt::PhaseGlobalSchedulerMode::kActive;
+    rt::PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 1, 0, 32});
+
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    rt::PhaseDispatchWorkerCallbacks callbacks;
+    callbacks.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    callbacks.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    int identities[6]{};
+    auto const contract = rt::PhaseExecutionSafetyContract::independent(
+        {&identities[0], &identities[1], &identities[2]}, {&identities[3], &identities[4], &identities[5]});
+    rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream,
+        rt::PhaseTensorRTContextMode::kIndependentConcurrent, contract);
+
+    ASSERT_TRUE(worker.dispatchNext());
+    scheduler.enqueueDecode({2, 64, 2});
+    std::optional<rt::PhaseGlobalActionCandidate> missing = scheduler.previewGlobalDecodeAction();
+    ASSERT_TRUE(missing.has_value());
+    rt::PhaseGlobalActionCandidate aggregate;
+    aggregate.key = {rt::PhaseGlobalActionKind::kPrefillDecode, 1, missing->key.primaryBatchSize, 32, 0,
+        missing->key.primaryContextBucket};
+    aggregate.key.primaryWorkClass = static_cast<int32_t>(rt::PhasePrefillClass::kText);
+    aggregate.key.residualAugmentation = true;
+    aggregate.primaryRequestIds = {1U};
+    aggregate.primaryStableSlotIds = {1};
+    aggregate.secondaryRequestIds = missing->primaryRequestIds;
+    aggregate.secondaryStableSlotIds = missing->primaryStableSlotIds;
+    aggregate.referenceWorkUs = 2.0;
+    aggregate.predictedMakespanUs = 1.0;
+    aggregate.overlapCostKnown = true;
+    rt::phaseGlobalFinalizeCandidate(aggregate);
+
+    EXPECT_TRUE(worker.augmentNext(std::move(*missing), aggregate, 100U, 100U));
+    EXPECT_EQ(worker.inFlightKind(), rt::PhaseDispatchKind::kOverlap);
+    worker.wait();
+
+    ASSERT_TRUE(worker.lastMetrics().has_value());
+    EXPECT_EQ(worker.lastMetrics()->kind, rt::PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(worker.lastMetrics()->prefillRequestIds, std::vector<uint64_t>{1U});
+    EXPECT_EQ(worker.lastMetrics()->decodeRequestIds, std::vector<uint64_t>{2U});
+    EXPECT_TRUE(worker.lastMetrics()->globalSelectedAction.residualAugmentation);
+    EXPECT_TRUE(scheduler.empty());
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseDispatchWorkerTest, RejectsResidualAugmentationWithSharedContext)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = rt::PhaseGlobalSchedulerMode::kActive;
+    rt::PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 1, 0, 32});
+
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    rt::PhaseDispatchWorkerCallbacks callbacks;
+    callbacks.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    callbacks.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+    rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream);
+
+    ASSERT_TRUE(worker.dispatchNext());
+    scheduler.enqueueDecode({2, 64, 2});
+    std::optional<rt::PhaseGlobalActionCandidate> missing = scheduler.previewGlobalDecodeAction();
+    ASSERT_TRUE(missing.has_value());
+    rt::PhaseGlobalActionCandidate aggregate;
+    aggregate.key.kind = rt::PhaseGlobalActionKind::kPrefillDecode;
+    aggregate.primaryRequestIds = {1U};
+    aggregate.secondaryRequestIds = missing->primaryRequestIds;
+
+    EXPECT_FALSE(worker.augmentNext(std::move(*missing), aggregate, 100U, 100U));
+    EXPECT_EQ(worker.inFlightKind(), rt::PhaseDispatchKind::kPrefill);
+    worker.wait();
 
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));

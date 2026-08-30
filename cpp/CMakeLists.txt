@@ -61,6 +61,7 @@ set(PHASE_RUNTIME_CPP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/independentPhaseAsyncServer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/independentPhaseCoordinator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/packedPrefillActiveView.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseActivityTimeline.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseContinuousLoadGenerator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseDispatchWorker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseGlobalScheduler.cpp"
