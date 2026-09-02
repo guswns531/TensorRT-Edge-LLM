@@ -336,6 +336,9 @@ Machine-readable gate 결과:
 
 ## 13. 다음 계획
 
+> 아래 항목을 gate와 분기 조건을 포함한 실행 계획으로 구체화한 문서는
+> `notes/218-completion-residual-decisive-validation-plan-20260902.md`다.
+
 P0–P7 뒤의 우선순위는 다음과 같다.
 
 1. **P0 performance recovery audit**: frozen 41.8 req/s와 instrumented 34.4 req/s의
