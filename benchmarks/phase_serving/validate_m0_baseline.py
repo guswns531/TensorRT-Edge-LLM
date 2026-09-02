@@ -142,10 +142,23 @@ def _validate_repository(manifest: dict[str, Any], repo: Path) -> list[str]:
                             capture_output=True,
                             text=True)
     actual_head = result.stdout.strip()
-    if actual_head != expected_head:
+    head_match = manifest["repository"].get("head_match", "exact")
+    if head_match == "exact" and actual_head != expected_head:
         return [
             f"repository HEAD {actual_head} does not match frozen HEAD {expected_head}"
         ]
+    if head_match == "ancestor":
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", expected_head, actual_head],
+            cwd=repo,
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            return [
+                f"frozen commit {expected_head} is not an ancestor of repository HEAD {actual_head}"
+            ]
+    elif head_match != "exact":
+        return [f"unknown repository head_match mode {head_match!r}"]
     return []
 
 
