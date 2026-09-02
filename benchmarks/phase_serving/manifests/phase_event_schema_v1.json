@@ -118,6 +118,14 @@
         "none"
       ]
     },
+    "dispatch_mode": {
+      "enum": [
+        "none",
+        "single",
+        "co_launch",
+        "residual_augmentation"
+      ]
+    },
     "outstanding_before_mask": {
       "$ref": "#/$defs/activityMask"
     },
@@ -198,6 +206,28 @@
       "type": "integer",
       "minimum": 1
     },
+    "incumbent_dispatch_age_us": {
+      "type": "number",
+      "minimum": 0
+    },
+    "newcomer_phase": {
+      "$ref": "#/$defs/executionPhase"
+    },
+    "newcomer_execution_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "observed_start_skew_percent": {
+      "enum": [
+        -1,
+        0,
+        25,
+        50,
+        75,
+        90,
+        100
+      ]
+    },
     "injection_target_fraction": {
       "type": "number",
       "minimum": 0,
@@ -237,6 +267,14 @@
       "type": "number",
       "minimum": 0
     },
+    "incumbent_gpu_completion_us": {
+      "type": "number",
+      "minimum": 0
+    },
+    "newcomer_gpu_completion_us": {
+      "type": "number",
+      "minimum": 0
+    },
     "completion_visible_host_ns": {
       "type": "integer",
       "minimum": 0
@@ -250,6 +288,14 @@
     },
     "action_fidelity": {
       "type": "boolean"
+    },
+    "action_fidelity_reason": {
+      "enum": [
+        "none",
+        "missing_decision",
+        "action_id_mismatch",
+        "outstanding_mismatch"
+      ]
     }
   },
   "allOf": [
@@ -434,6 +480,16 @@
         "action_direction": {
           "$ref": "#/properties/action_direction"
         },
+        "residual_augmentation": {
+          "type": "boolean"
+        },
+        "residual_anchor": {
+          "enum": [
+            "none",
+            "prefill",
+            "decode"
+          ]
+        },
         "legal": {
           "type": "boolean"
         },
@@ -456,6 +512,17 @@
         },
         "contextual_completion_valid": {
           "type": "boolean"
+        },
+        "contextual_completion_feature_v2_valid": {
+          "type": "boolean"
+        },
+        "contextual_completion_features": {
+          "type": "array",
+          "minItems": 16,
+          "maxItems": 16,
+          "items": {
+            "type": "number"
+          }
         },
         "contextual_direction": {
           "enum": [
@@ -517,6 +584,9 @@
         "contextual_newcomer_reference_us": {
           "type": "number",
           "minimum": 0
+        },
+        "contextual_minimum_slack_us": {
+          "type": "number"
         },
         "max_slo_violation_us": {
           "type": "number",

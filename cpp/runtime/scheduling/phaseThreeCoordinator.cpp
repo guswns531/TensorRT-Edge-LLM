@@ -712,9 +712,10 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     ELLM_CHECK(mConfig.globalExperimentalEncoderDecodeOverlapPercent >= -1
             && mConfig.globalExperimentalEncoderDecodeOverlapPercent <= 100,
         "Global experimental E+D overlap percentage must be -1 or between zero and 100");
-    ELLM_CHECK(mConfig.globalExperimentalEncoderPrefillOverlapPercent < 0
-            || mConfig.globalExperimentalEncoderDecodeOverlapPercent < 0,
-        "Only one experimental encoder overlap kind may be active");
+    // The deterministic P6 static-policy ablation intentionally controls
+    // both E+P and E+D. Each family is filtered in order below and the final
+    // selection still passes the normal feasibility and single-inflight
+    // checks, so enabling both does not weaken execution correctness.
     ELLM_CHECK(std::isfinite(mConfig.directionalInjection.targetFraction)
             && mConfig.directionalInjection.targetFraction >= 0.0 && mConfig.directionalInjection.targetFraction <= 1.0,
         "Directional injection target fraction must be finite and within [0, 1]");
@@ -1508,6 +1509,16 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.requestIds = candidate.requestIds;
     event.inFlight = unifiedInFlightSnapshot();
     event.outstandingBefore = event.inFlight.outstanding;
+    event.dispatchMode = phaseUnifiedDispatchMode(event.outstandingBefore, event.actionKind);
+    event.incumbentPhase = phaseUnifiedDirectionIncumbentPhase(event.requestedDirection);
+    event.newcomerPhase = phaseUnifiedDirectionNewcomerPhase(event.requestedDirection);
+    auto const incumbent = std::find_if(event.inFlight.work.begin(), event.inFlight.work.end(),
+        [&](auto const& work) { return work.phase == event.incumbentPhase; });
+    if (incumbent != event.inFlight.work.end())
+    {
+        event.incumbentExecutionId = incumbent->executionId;
+        event.incumbentDispatchAgeUs = incumbent->dispatchAgeUs;
+    }
     event.plannedOutstanding = plan.allowedOutstanding;
     event.ready.encoderRows = static_cast<int32_t>(mPending.size());
     IndependentPhaseServerArbitrationSnapshot const server = mServer.arbitrationSnapshot(true);
@@ -1546,12 +1557,18 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         snapshot.uncertaintyUs = source.uncertaintyUs;
         snapshot.contextualCompletionValid
             = source.contextualPdFeatureValid || source.contextualEncoderPairFeatureValid;
+        snapshot.contextualCompletionFeatureV2Valid
+            = source.contextualCompletionFeatureValid || source.contextualEncoderCompletionFeatureValid;
+        snapshot.contextualCompletionFeatures = source.contextualEncoderCompletionFeatureValid
+            ? source.contextualEncoderCompletionFeatures
+            : source.contextualCompletionFeatures;
         snapshot.contextualDirection = source.contextualEncoderPairFeatureValid
             ? source.contextualEncoderPairDirection
             : phaseContextualPairDirection(source.key.kind, source.key.residualAnchor);
         snapshot.contextualCompletion = source.contextualCompletion;
         snapshot.contextualIncumbentReferenceUs = source.contextualCompletionIncumbentReferenceUs;
         snapshot.contextualNewcomerReferenceUs = source.contextualCompletionNewcomerReferenceUs;
+        snapshot.contextualMinimumSlackUs = source.contextualCompletionMinimumSlackUs;
         event.candidates.push_back(std::move(snapshot));
     };
     if (candidateFrontier != nullptr)
@@ -1646,14 +1663,35 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
             completion.incrementalActionId = decision->second.incrementalActionId;
             completion.requestedStartSkewPercent = decision->second.requestedStartSkewPercent;
             completion.requestedDirection = decision->second.requestedDirection;
+            completion.direction = decision->second.requestedDirection;
+            completion.dispatchMode = decision->second.dispatchMode;
+            completion.incumbentPhase = decision->second.incumbentPhase;
+            completion.incumbentExecutionId = decision->second.incumbentExecutionId;
+            completion.incumbentDispatchAgeUs = decision->second.incumbentDispatchAgeUs;
+            completion.newcomerPhase = decision->second.newcomerPhase;
             completion.plannedOutstanding = decision->second.plannedOutstanding;
-            completion.actionFidelity
-                = phaseExecutionSetIsSubset(previous.outstanding, decision->second.plannedOutstanding);
+            auto const augmentedOutstanding = mUnifiedAllowedOutstandingByExecution.find(prior.executionId);
+            PhaseExecutionSet const allowedOutstanding
+                = augmentedOutstanding != mUnifiedAllowedOutstandingByExecution.end()
+                ? augmentedOutstanding->second
+                : decision->second.plannedOutstanding;
+            completion.actionFidelity = phaseExecutionSetIsSubset(previous.outstanding, allowedOutstanding);
+            bool const actionIdentityMatches = phaseUnifiedActionIdentityMatches(
+                decision->second.dispatchMode, decision->second.actionId, prior.actionId);
+            if (!actionIdentityMatches)
+            {
+                completion.actionFidelity = false;
+                completion.actionFidelityReason = PhaseUnifiedFidelityReason::kActionIdMismatch;
+            }
+            else if (!completion.actionFidelity)
+            {
+                completion.actionFidelityReason = PhaseUnifiedFidelityReason::kOutstandingMismatch;
+            }
         }
-        auto const allowed = mUnifiedAllowedOutstandingByExecution.find(prior.executionId);
-        if (allowed != mUnifiedAllowedOutstandingByExecution.end())
+        else
         {
-            completion.actionFidelity = phaseExecutionSetIsSubset(previous.outstanding, allowed->second);
+            completion.actionFidelity = false;
+            completion.actionFidelityReason = PhaseUnifiedFidelityReason::kMissingDecision;
         }
         if (prior.phase == PhaseUnifiedPhase::kEncoder)
         {
@@ -1678,6 +1716,63 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
                 completion.gpuStartUs = static_cast<double>(interval->startMs) * 1000.0;
                 completion.gpuEndUs = static_cast<double>(interval->endMs) * 1000.0;
                 completion.gpuDurationUs = *completion.gpuEndUs - *completion.gpuStartUs;
+            }
+            if (decision != mUnifiedDecisionByPlan.end()
+                && completion.dispatchMode != PhaseUnifiedDispatchMode::kSingle)
+            {
+                auto findExecution = [&](PhaseUnifiedPhase phase) -> PhaseInFlightWorkSnapshot const* {
+                    auto const priorWork = std::find_if(previous.work.begin(), previous.work.end(),
+                        [phase](PhaseInFlightWorkSnapshot const& work) { return work.phase == phase; });
+                    if (priorWork != previous.work.end())
+                    {
+                        return &*priorWork;
+                    }
+                    auto const decisionWork
+                        = std::find_if(decision->second.inFlight.work.begin(), decision->second.inFlight.work.end(),
+                            [phase](PhaseInFlightWorkSnapshot const& work) { return work.phase == phase; });
+                    return decisionWork != decision->second.inFlight.work.end() ? &*decisionWork : nullptr;
+                };
+                auto findInterval = [&](PhaseInFlightWorkSnapshot const* work) -> PhaseActivityInterval const* {
+                    if (work == nullptr)
+                    {
+                        return nullptr;
+                    }
+                    auto const match = std::find_if(intervals.rbegin(), intervals.rend(), [&](auto const& candidate) {
+                        return unifiedPhaseActivityMatches(work->phase, candidate)
+                            && candidate.correlationId == work->activityCorrelationId;
+                    });
+                    return match != intervals.rend() ? &*match : nullptr;
+                };
+                PhaseInFlightWorkSnapshot const* incumbentWork = findExecution(completion.incumbentPhase);
+                PhaseInFlightWorkSnapshot const* newcomerWork = findExecution(completion.newcomerPhase);
+                if (incumbentWork != nullptr)
+                {
+                    completion.incumbentExecutionId = incumbentWork->executionId;
+                }
+                if (newcomerWork != nullptr)
+                {
+                    completion.newcomerExecutionId = newcomerWork->executionId;
+                }
+                PhaseActivityInterval const* incumbentInterval = findInterval(incumbentWork);
+                PhaseActivityInterval const* newcomerInterval = findInterval(newcomerWork);
+                if (incumbentInterval != nullptr)
+                {
+                    completion.incumbentGpuCompletionUs = static_cast<double>(incumbentInterval->endMs) * 1000.0;
+                }
+                if (newcomerInterval != nullptr)
+                {
+                    completion.newcomerGpuCompletionUs = static_cast<double>(newcomerInterval->endMs) * 1000.0;
+                }
+                if (incumbentInterval != nullptr && newcomerInterval != nullptr)
+                {
+                    double const incumbentDurationUs = std::max(
+                        1.0, static_cast<double>(incumbentInterval->endMs - incumbentInterval->startMs) * 1000.0);
+                    double const startDeltaUs = std::max(
+                        0.0, static_cast<double>(newcomerInterval->startMs - incumbentInterval->startMs) * 1000.0);
+                    bool const intervalsOverlap = newcomerInterval->startMs < incumbentInterval->endMs;
+                    completion.observedStartSkewPercent = static_cast<int32_t>(
+                        phaseStartSkewBucketFromFraction(startDeltaUs / incumbentDurationUs, intervalsOverlap));
+                }
             }
         }
         emitUnifiedEvent(std::move(completion));
@@ -1760,9 +1855,43 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
             dispatch.incrementalActionId = decision->second.incrementalActionId;
             dispatch.requestedStartSkewPercent = decision->second.requestedStartSkewPercent;
             dispatch.requestedDirection = decision->second.requestedDirection;
+            dispatch.dispatchMode = decision->second.dispatchMode;
+            dispatch.direction = decision->second.requestedDirection;
+            dispatch.incumbentPhase = decision->second.incumbentPhase;
+            dispatch.incumbentExecutionId = decision->second.incumbentExecutionId;
+            dispatch.incumbentDispatchAgeUs = decision->second.incumbentDispatchAgeUs;
+            dispatch.newcomerPhase = decision->second.newcomerPhase;
+            auto const phaseWork = [&](PhaseUnifiedPhase phase) {
+                return std::find_if(current.work.begin(), current.work.end(),
+                    [phase](PhaseInFlightWorkSnapshot const& candidate) { return candidate.phase == phase; });
+            };
+            auto const incumbentWork = phaseWork(dispatch.incumbentPhase);
+            if (incumbentWork != current.work.end())
+            {
+                dispatch.incumbentExecutionId = incumbentWork->executionId;
+                dispatch.incumbentDispatchAgeUs = current.hostSnapshotNs >= incumbentWork->dispatchHostNs
+                    ? static_cast<double>(current.hostSnapshotNs - incumbentWork->dispatchHostNs) / 1000.0
+                    : 0.0;
+            }
+            auto const newcomerWork = phaseWork(dispatch.newcomerPhase);
+            if (newcomerWork != current.work.end())
+            {
+                dispatch.newcomerExecutionId = newcomerWork->executionId;
+            }
             dispatch.plannedOutstanding = decision->second.plannedOutstanding;
             dispatch.actionFidelity = phaseExecutionSetIsSubset(current.outstanding, dispatch.plannedOutstanding);
-            if (dispatch.actionFidelity)
+            bool const actionIdentityMatches = phaseUnifiedActionIdentityMatches(
+                decision->second.dispatchMode, decision->second.actionId, work.actionId);
+            if (!actionIdentityMatches)
+            {
+                dispatch.actionFidelity = false;
+                dispatch.actionFidelityReason = PhaseUnifiedFidelityReason::kActionIdMismatch;
+            }
+            else if (!dispatch.actionFidelity)
+            {
+                dispatch.actionFidelityReason = PhaseUnifiedFidelityReason::kOutstandingMismatch;
+            }
+            else
             {
                 allowOutstanding(work.executionId, dispatch.plannedOutstanding);
             }
@@ -1770,6 +1899,8 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
         else
         {
             dispatch.plannedOutstanding = current.outstanding;
+            dispatch.actionFidelity = false;
+            dispatch.actionFidelityReason = PhaseUnifiedFidelityReason::kMissingDecision;
         }
         emitUnifiedEvent(std::move(dispatch));
         observedBefore = observedBefore | phaseExecutionSetForUnifiedPhase(work.phase);
@@ -1949,6 +2080,8 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     double const elapsedUs = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
                                  .count();
+    double const incumbentReferenceUs = std::max(mActiveGlobalPdExecution->candidate.predictedMakespanUs,
+        mActiveGlobalPdExecution->candidate.predictedBlockingUs);
     PhaseGlobalActionCandidate const active
         = phaseGlobalResidualCandidate(mActiveGlobalPdExecution->candidate, elapsedUs);
     PhaseGlobalActionCandidate const& prefill = addPrefill ? *missing : active;
@@ -2079,11 +2212,16 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         externalPrefillLineage);
     if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
     {
-        overlap.contextualPdFeatures = phaseContextualPdFeatures(
-            {prefill.predictedMakespanUs, decode.predictedMakespanUs, protectedSlackUs, prefill.key.primaryBatchSize,
-                decode.key.primaryBatchSize, prefill.key.chunkLength, prefill.key.primaryContextBucket,
-                decode.key.primaryContextBucket, overlap.key.executionVariant, true, overlap.key.residualAnchor});
+        PhaseContextualPdInput const contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
+            protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
+            prefill.key.primaryContextBucket, decode.key.primaryContextBucket, overlap.key.executionVariant, true,
+            overlap.key.residualAnchor, elapsedUs, incumbentReferenceUs,
+            incumbentReferenceUs > 0.0 ? elapsedUs / incumbentReferenceUs : -1.0,
+            addDecode ? PhaseExecutionSet::kPrefill : PhaseExecutionSet::kDecode};
+        overlap.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
         overlap.contextualPdFeatureValid = true;
+        overlap.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
+        overlap.contextualCompletionFeatureValid = true;
         PhaseContextualPairDirection const contextualDirection
             = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
         bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
@@ -2093,7 +2231,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
             = decodeIncumbent ? prefill.predictedMakespanUs : decode.predictedMakespanUs;
         overlap.contextualCompletionMinimumSlackUs = protectedSlackUs;
         overlap.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(contextualDirection,
-            overlap.contextualPdFeatures, overlap.contextualCompletionIncumbentReferenceUs,
+            overlap.contextualCompletionFeatures, overlap.contextualCompletionIncumbentReferenceUs,
             overlap.contextualCompletionNewcomerReferenceUs);
         PhaseContextualPdEstimate const contextual
             = mRuntimeCostTracker->predictContextualDirection(contextualDirection, overlap.contextualPdFeatures);
@@ -2154,14 +2292,18 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     {
         PhaseContextualPairDirection const direction
             = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+        PhaseContextualCompletionEstimate const authority
+            = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
         bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
         for (PhaseProtectedCompletion& completion : overlap.protectedCompletions)
         {
             bool const incumbent = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
-            completion.predictedCompletionUs = incumbent ? overlap.contextualCompletion.incumbentMeanUs
-                                                         : overlap.contextualCompletion.newcomerMeanUs;
-            completion.uncertaintyUs = incumbent ? overlap.contextualCompletion.incumbentUncertaintyUs
-                                                 : overlap.contextualCompletion.newcomerUncertaintyUs;
+            if (incumbent && !mRuntimeCostTracker->contextualCompletionAuthorityPredictsIncumbent())
+            {
+                continue;
+            }
+            completion.predictedCompletionUs = incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs;
+            completion.uncertaintyUs = incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs;
         }
     }
 
@@ -2291,16 +2433,17 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         return false;
     }
 
+    double residualElapsedUs{};
     std::optional<PhaseGlobalActionCandidate> pd;
     std::vector<PhaseGlobalActionCandidate> pdCandidateFrontier;
     std::optional<PhaseGlobalActionCandidate> prefillForEncoder;
     std::optional<PhaseGlobalActionCandidate> decodeForEncoder;
     if (residualAugmentation)
     {
-        double const elapsedUs = std::chrono::duration<double, std::micro>(
+        residualElapsedUs = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
-                                     .count();
-        pd = phaseGlobalResidualCandidate(mActiveGlobalPdExecution->candidate, elapsedUs);
+                                .count();
+        pd = phaseGlobalResidualCandidate(mActiveGlobalPdExecution->candidate, residualElapsedUs);
         if (pd->key.kind == PhaseGlobalActionKind::kPrefill)
         {
             prefillForEncoder = *pd;
@@ -2825,11 +2968,27 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 mConfig.maxEncoderBatchSize, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
             int32_t const phaseBatchCapacity
                 = kind == PhaseGlobalActionKind::kEncoderPrefill ? kPrefillBatchCapacity : kDecodeBatchCapacity;
-            overlap.contextualEncoderPairFeatures = phaseContextualPairFeatures({encoderMakespanUs,
-                phase.predictedMakespanUs, protectedSlackUs, static_cast<int32_t>(encoderBatchIndices.size()),
-                phase.key.primaryBatchSize, encoderBatchCapacity, phaseBatchCapacity, chunkLength, kChunkQuantum,
-                encoderContextBucket, phase.key.primaryContextBucket, overlapKey.executionVariant, residualAugmentation,
-                overlapKey.residualAnchor});
+            double const incumbentReferenceUs = residualAugmentation && mActiveGlobalPdExecution.has_value()
+                ? std::max(mActiveGlobalPdExecution->candidate.predictedMakespanUs,
+                      mActiveGlobalPdExecution->candidate.predictedBlockingUs)
+                : 0.0;
+            double const requestedSkewFraction = residualAugmentation && incumbentReferenceUs > 0.0
+                ? residualElapsedUs / incumbentReferenceUs
+                : mConfig.directionalInjection.enabled() ? mConfig.directionalInjection.targetFraction
+                                                         : -1.0;
+            PhaseExecutionSet const contextualOutstanding = residualAugmentation
+                ? phase.key.kind == PhaseGlobalActionKind::kPrefill ? PhaseExecutionSet::kPrefill
+                                                                    : PhaseExecutionSet::kDecode
+                : PhaseExecutionSet::kNone;
+            PhaseContextualPairInput const contextualInput{encoderMakespanUs, phase.predictedMakespanUs,
+                protectedSlackUs, static_cast<int32_t>(encoderBatchIndices.size()), phase.key.primaryBatchSize,
+                encoderBatchCapacity, phaseBatchCapacity, chunkLength, kChunkQuantum, encoderContextBucket,
+                phase.key.primaryContextBucket, overlapKey.executionVariant, residualAugmentation,
+                overlapKey.residualAnchor, residualElapsedUs, incumbentReferenceUs, requestedSkewFraction,
+                contextualOutstanding};
+            overlap.contextualEncoderPairFeatures = phaseContextualPairFeatures(contextualInput);
+            overlap.contextualEncoderCompletionFeatures = phaseContextualCompletionFeatures(contextualInput);
+            overlap.contextualEncoderCompletionFeatureValid = true;
             overlap.contextualEncoderPairDirection = phaseContextualPairDirection(kind, overlapKey.residualAnchor);
             if (!residualAugmentation)
             {
@@ -2861,19 +3020,25 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 = encoderIncumbent ? phase.predictedMakespanUs : encoderMakespanUs;
             overlap.contextualCompletionMinimumSlackUs = protectedSlackUs;
             overlap.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
-                overlap.contextualEncoderPairDirection, overlap.contextualEncoderPairFeatures,
+                overlap.contextualEncoderPairDirection, overlap.contextualEncoderCompletionFeatures,
                 overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
             if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && overlap.contextualCompletion.ready
                 && overlap.contextualCompletion.uncertaintyCalibrated)
             {
+                PhaseContextualCompletionEstimate const authority
+                    = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(
+                        overlap.contextualEncoderPairDirection, overlap.contextualCompletion);
                 for (PhaseProtectedCompletion& completion : overlap.protectedCompletions)
                 {
                     bool const incumbent
                         = completion.kind == PhaseProtectedKind::kEncoder ? encoderIncumbent : !encoderIncumbent;
-                    completion.predictedCompletionUs = incumbent ? overlap.contextualCompletion.incumbentMeanUs
-                                                                 : overlap.contextualCompletion.newcomerMeanUs;
-                    completion.uncertaintyUs = incumbent ? overlap.contextualCompletion.incumbentUncertaintyUs
-                                                         : overlap.contextualCompletion.newcomerUncertaintyUs;
+                    if (incumbent && !mRuntimeCostTracker->contextualCompletionAuthorityPredictsIncumbent())
+                    {
+                        continue;
+                    }
+                    completion.predictedCompletionUs = incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs;
+                    completion.uncertaintyUs
+                        = incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs;
                 }
             }
             overlap.contextualEncoderPairExploration = !contextual.ready && safeProbe;
@@ -3260,8 +3425,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PendingGlobalOverlapObservation observation{selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0),
             0.0F, 0.0F, static_cast<float>(phaseElapsedMs), true};
         observation.contextualFeatures = selected.contextualEncoderPairFeatures;
+        observation.contextualCompletionFeatures = selected.contextualEncoderCompletionFeatures;
         observation.contextualDirection = selected.contextualEncoderPairDirection;
         observation.contextualFeatureValid = selected.contextualEncoderPairFeatureValid;
+        observation.contextualCompletionFeatureValid = selected.contextualEncoderCompletionFeatureValid;
         observation.contextualExploration = selected.contextualEncoderPairExploration;
         observation.contextualReferenceWorkMs
             = static_cast<float>(selected.contextualEncoderPairReferenceWorkUs / 1000.0);
@@ -3339,8 +3506,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PendingGlobalOverlapObservation observation{
             selected.key, static_cast<float>(selected.referenceWorkUs / 1000.0), 0.0F, 0.0F, 0.0F, false};
         observation.contextualFeatures = selected.contextualEncoderPairFeatures;
+        observation.contextualCompletionFeatures = selected.contextualEncoderCompletionFeatures;
         observation.contextualDirection = selected.contextualEncoderPairDirection;
         observation.contextualFeatureValid = selected.contextualEncoderPairFeatureValid;
+        observation.contextualCompletionFeatureValid = selected.contextualEncoderCompletionFeatureValid;
         observation.contextualExploration = selected.contextualEncoderPairExploration;
         observation.contextualReferenceWorkMs
             = static_cast<float>(selected.contextualEncoderPairReferenceWorkUs / 1000.0);
@@ -3504,11 +3673,15 @@ void PhaseThreeCoordinator::completeGlobalOverlapObservation()
             = static_cast<double>(encoderIncumbent ? mPendingGlobalOverlapObservation->phaseGpuMs
                                                    : mPendingGlobalOverlapObservation->encoderGpuMs)
             * 1000.0;
-        static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(
-            mPendingGlobalOverlapObservation->contextualDirection, mPendingGlobalOverlapObservation->contextualFeatures,
-            mPendingGlobalOverlapObservation->contextualIncumbentReferenceUs,
-            mPendingGlobalOverlapObservation->contextualNewcomerReferenceUs, incumbentCompletionUs,
-            newcomerCompletionUs, mPendingGlobalOverlapObservation->contextualMinimumSlackUs));
+        if (mPendingGlobalOverlapObservation->contextualCompletionFeatureValid)
+        {
+            static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(
+                mPendingGlobalOverlapObservation->contextualDirection,
+                mPendingGlobalOverlapObservation->contextualCompletionFeatures,
+                mPendingGlobalOverlapObservation->contextualIncumbentReferenceUs,
+                mPendingGlobalOverlapObservation->contextualNewcomerReferenceUs, incumbentCompletionUs,
+                newcomerCompletionUs, mPendingGlobalOverlapObservation->contextualMinimumSlackUs));
+        }
     }
     mPendingGlobalOverlapObservation.reset();
 }

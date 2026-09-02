@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -64,6 +65,24 @@ enum class PhaseInFlightStatus : uint8_t
     kSubmitted,
     kRunning,
     kCompletionReady,
+};
+
+//! Distinguish an idle-boundary pair launch from adding work to a live context.
+enum class PhaseUnifiedDispatchMode : uint8_t
+{
+    kNone,
+    kSingle,
+    kCoLaunch,
+    kResidualAugmentation,
+};
+
+//! Machine-readable reason why a dispatch/completion was rejected for learning.
+enum class PhaseUnifiedFidelityReason : uint8_t
+{
+    kNone,
+    kMissingDecision,
+    kActionIdMismatch,
+    kOutstandingMismatch,
 };
 
 inline char const* phaseUnifiedEventKindName(PhaseUnifiedEventKind kind) noexcept
@@ -206,6 +225,54 @@ inline char const* phaseInFlightStatusName(PhaseInFlightStatus status) noexcept
     return "unknown";
 }
 
+inline char const* phaseUnifiedDispatchModeName(PhaseUnifiedDispatchMode mode) noexcept
+{
+    switch (mode)
+    {
+    case PhaseUnifiedDispatchMode::kNone: return "none";
+    case PhaseUnifiedDispatchMode::kSingle: return "single";
+    case PhaseUnifiedDispatchMode::kCoLaunch: return "co_launch";
+    case PhaseUnifiedDispatchMode::kResidualAugmentation: return "residual_augmentation";
+    }
+    return "unknown";
+}
+
+inline char const* phaseUnifiedFidelityReasonName(PhaseUnifiedFidelityReason reason) noexcept
+{
+    switch (reason)
+    {
+    case PhaseUnifiedFidelityReason::kNone: return "none";
+    case PhaseUnifiedFidelityReason::kMissingDecision: return "missing_decision";
+    case PhaseUnifiedFidelityReason::kActionIdMismatch: return "action_id_mismatch";
+    case PhaseUnifiedFidelityReason::kOutstandingMismatch: return "outstanding_mismatch";
+    }
+    return "unknown";
+}
+
+//! A multi-phase plan owns one stable plan/incremental identity while each
+//! member execution retains its phase-local action ID. Exact member action-ID
+//! equality is therefore meaningful only for a single-phase dispatch.
+inline bool phaseUnifiedActionIdentityMatches(
+    PhaseUnifiedDispatchMode mode, uint64_t selectedActionId, uint64_t memberActionId) noexcept
+{
+    return mode != PhaseUnifiedDispatchMode::kSingle || selectedActionId == memberActionId;
+}
+
+inline PhaseUnifiedDispatchMode phaseUnifiedDispatchMode(
+    PhaseExecutionSet outstandingBefore, PhaseGlobalActionKind action) noexcept
+{
+    bool const pair = action == PhaseGlobalActionKind::kEncoderPrefill
+        || action == PhaseGlobalActionKind::kEncoderDecode || action == PhaseGlobalActionKind::kPrefillDecode;
+    if (!pair)
+    {
+        return action == PhaseGlobalActionKind::kNone || action == PhaseGlobalActionKind::kWait
+            ? PhaseUnifiedDispatchMode::kNone
+            : PhaseUnifiedDispatchMode::kSingle;
+    }
+    return outstandingBefore == PhaseExecutionSet::kNone ? PhaseUnifiedDispatchMode::kCoLaunch
+                                                         : PhaseUnifiedDispatchMode::kResidualAugmentation;
+}
+
 inline PhaseExecutionSet phaseExecutionSetForUnifiedPhase(PhaseUnifiedPhase phase) noexcept
 {
     switch (phase)
@@ -306,10 +373,13 @@ struct PhaseUnifiedCandidateSnapshot
     //! cross-run measured labels without reconstructing process-local model
     //! state or treating the selected action as the whole frontier.
     bool contextualCompletionValid{};
+    bool contextualCompletionFeatureV2Valid{};
+    PhaseContextualPdFeatures contextualCompletionFeatures{};
     PhaseContextualPairDirection contextualDirection{PhaseContextualPairDirection::kPrefillToDecode};
     PhaseContextualCompletionEstimate contextualCompletion;
     double contextualIncumbentReferenceUs{};
     double contextualNewcomerReferenceUs{};
+    double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};
 };
 
 struct PhaseUnifiedEvent
@@ -331,8 +401,13 @@ struct PhaseUnifiedEvent
     PhaseGlobalActionKind actionKind{PhaseGlobalActionKind::kNone};
     PhaseUnifiedActionDirection requestedDirection{PhaseUnifiedActionDirection::kNone};
     PhaseUnifiedActionDirection direction{PhaseUnifiedActionDirection::kNone};
+    PhaseUnifiedDispatchMode dispatchMode{PhaseUnifiedDispatchMode::kNone};
     PhaseUnifiedPhase incumbentPhase{PhaseUnifiedPhase::kNone};
     uint64_t incumbentExecutionId{};
+    double incumbentDispatchAgeUs{};
+    PhaseUnifiedPhase newcomerPhase{PhaseUnifiedPhase::kNone};
+    uint64_t newcomerExecutionId{};
+    int32_t observedStartSkewPercent{-1};
     PhaseExecutionSet outstandingBefore{PhaseExecutionSet::kNone};
     PhaseExecutionSet plannedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet observedOutstanding{PhaseExecutionSet::kNone};
@@ -363,9 +438,12 @@ struct PhaseUnifiedEvent
     uint64_t requestedInjectionDelayUs{};
     std::optional<double> gpuStartUs;
     std::optional<double> gpuEndUs;
+    std::optional<double> incumbentGpuCompletionUs;
+    std::optional<double> newcomerGpuCompletionUs;
     double gpuDurationUs{};
     uint64_t completionVisibleHostNs{};
     bool actionFidelity{true};
+    PhaseUnifiedFidelityReason actionFidelityReason{PhaseUnifiedFidelityReason::kNone};
 };
 
 //! Cross-run stable signature of an immutable observable decision snapshot.

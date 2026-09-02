@@ -1,5 +1,8 @@
 # Research Statement와 Current 간 차이 및 promotion 계획
 
+> P0–P7 실행 결과와 최종 판정은
+> `notes/217-completion-projection-p0-p7-results-20260902.md`에 기록했다.
+
 ## 1. 문서 목적
 
 이 문서는 다음 두 상태를 혼동하지 않기 위한 기준 문서다.

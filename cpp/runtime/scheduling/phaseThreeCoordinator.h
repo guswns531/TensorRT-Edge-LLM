@@ -681,8 +681,10 @@ private:
         float phaseElapsedMs{};
         bool residualAugmentation{};
         PhaseContextualPdFeatures contextualFeatures{};
+        PhaseContextualPdFeatures contextualCompletionFeatures{};
         PhaseContextualPairDirection contextualDirection{PhaseContextualPairDirection::kEncoderToPrefill};
         bool contextualFeatureValid{};
+        bool contextualCompletionFeatureValid{};
         bool contextualExploration{};
         float contextualReferenceWorkMs{};
         double contextualIncumbentReferenceUs{};

@@ -24,6 +24,82 @@ from pathlib import Path
 from typing import Any
 
 POLICY_ENVIRONMENTS = {
+    "current": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
+    "serial": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "shadow",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "shadow",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "shadow",
+        "TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT": "0",
+        "TRT_EDGELLM_EXPERIMENTAL_ENCODER_PREFILL_OVERLAP_PERCENT": "0",
+        "TRT_EDGELLM_EXPERIMENTAL_ENCODER_DECODE_OVERLAP_PERCENT": "0",
+    },
+    "always_overlap": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "shadow",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "shadow",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "shadow",
+        "TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT": "100",
+        "TRT_EDGELLM_EXPERIMENTAL_ENCODER_PREFILL_OVERLAP_PERCENT": "100",
+        "TRT_EDGELLM_EXPERIMENTAL_ENCODER_DECODE_OVERLAP_PERCENT": "100",
+    },
+    "immediate_cost": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "disabled",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "disabled",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "disabled",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
+    "completion_shadow": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
+    "completion_active": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "1",
+    },
+    "completion_no_uncertainty": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "1",
+        "TRT_EDGELLM_COMPLETION_AUTHORITY_USES_UNCERTAINTY": "0",
+    },
+    "completion_no_residual": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "1",
+        "TRT_EDGELLM_COMPLETION_USE_RESIDUAL_FEATURES": "0",
+    },
+    "completion_new_work_only": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "1",
+        "TRT_EDGELLM_COMPLETION_AUTHORITY_PREDICTS_INCUMBENT": "0",
+    },
+    "completion_h2": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "1",
+        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "1",
+    },
     "myopic": {
         "TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER": "0",
     },
@@ -71,6 +147,19 @@ POLICY_ENVIRONMENTS = {
 }
 
 POLICY_ENVIRONMENT_NAMES = {
+    "TRT_EDGELLM_CONTEXTUAL_PD",
+    "TRT_EDGELLM_CONTEXTUAL_EP",
+    "TRT_EDGELLM_CONTEXTUAL_ED",
+    "TRT_EDGELLM_COMPLETION_CONFORMAL",
+    "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE",
+    "TRT_EDGELLM_COMPLETION_AUTHORITY_USES_UNCERTAINTY",
+    "TRT_EDGELLM_COMPLETION_USE_RESIDUAL_FEATURES",
+    "TRT_EDGELLM_COMPLETION_AUTHORITY_PREDICTS_INCUMBENT",
+    "TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT",
+    "TRT_EDGELLM_EXPERIMENTAL_ENCODER_PREFILL_OVERLAP_PERCENT",
+    "TRT_EDGELLM_EXPERIMENTAL_ENCODER_DECODE_OVERLAP_PERCENT",
+    "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE",
+} | {
     name
     for environment in POLICY_ENVIRONMENTS.values()
     for name in environment
@@ -165,6 +254,10 @@ def main() -> int:
     parser.add_argument("--plugin-path", required=True)
     parser.add_argument("--binary-path", required=True)
     parser.add_argument("--case", action="append", dest="cases")
+    parser.add_argument(
+        "--deduplicate-cases",
+        action="store_true",
+        help="retain only the first source entry for each case/variant pair")
     parser.add_argument("--matrix-repeats", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -179,6 +272,17 @@ def main() -> int:
             entry for entry in entries
             if not requested or str(entry.get("case")) in requested
         ]
+        if args.deduplicate_cases:
+            unique = []
+            seen = set()
+            for entry in selected:
+                key = (str(entry.get("case")),
+                       str(entry.get("variant", "default")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(entry)
+            selected = unique
         if requested - {str(entry.get("case")) for entry in selected}:
             raise ValueError("requested case is absent from source manifest")
         commands = []

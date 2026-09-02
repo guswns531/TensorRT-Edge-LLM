@@ -1674,6 +1674,20 @@ int main(int argc, char** argv)
         {
             runtimeCostConfig.completionCalibration.targetCoverage = std::stod(value);
         }
+        auto completionAblation = [](char const* variable, bool& setting) {
+            if (char const* value = std::getenv(variable))
+            {
+                std::string const enabled(value);
+                ELLM_CHECK(enabled == "0" || enabled == "1", std::string(variable) + " must be 0 or 1");
+                setting = enabled == "1";
+            }
+        };
+        completionAblation("TRT_EDGELLM_COMPLETION_AUTHORITY_USES_UNCERTAINTY",
+            runtimeCostConfig.completionCalibration.authorityUsesUncertainty);
+        completionAblation("TRT_EDGELLM_COMPLETION_USE_RESIDUAL_FEATURES",
+            runtimeCostConfig.completionCalibration.useResidualFeatures);
+        completionAblation("TRT_EDGELLM_COMPLETION_AUTHORITY_PREDICTS_INCUMBENT",
+            runtimeCostConfig.completionCalibration.authorityPredictsIncumbent);
         auto runtimeCostTracker = std::make_shared<rt::PhaseRuntimeCostTracker>(runtimeCostConfig);
         semanticSchedulerConfig.runtimeCostTracker = runtimeCostTracker;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
@@ -3835,12 +3849,22 @@ int main(int argc, char** argv)
                         {
                             candidates.push_back({{"action_id", candidate.actionId},
                                 {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
-                                {"action_direction", "none"}, {"legal", candidate.legal},
-                                {"request_ids", candidate.requestIds},
+                                {"action_direction",
+                                    candidate.key.kind == rt::PhaseGlobalActionKind::kEncoderPrefill
+                                            || candidate.key.kind == rt::PhaseGlobalActionKind::kEncoderDecode
+                                            || candidate.key.kind == rt::PhaseGlobalActionKind::kPrefillDecode
+                                        ? rt::phaseContextualPairDirectionName(candidate.contextualDirection)
+                                        : "none"},
+                                {"residual_augmentation", candidate.key.residualAugmentation},
+                                {"residual_anchor", rt::phaseGlobalResidualAnchorName(candidate.key.residualAnchor)},
+                                {"legal", candidate.legal}, {"request_ids", candidate.requestIds},
                                 {"predicted_completion_us", nlohmann::json::array({candidate.predictedCompletionUs})},
                                 {"uncertainty_us", nlohmann::json::array({candidate.uncertaintyUs})},
                                 {"max_slo_violation_us", candidate.predictedSloViolationUs},
                                 {"contextual_completion_valid", candidate.contextualCompletionValid},
+                                {"contextual_completion_feature_v2_valid",
+                                    candidate.contextualCompletionFeatureV2Valid},
+                                {"contextual_completion_features", candidate.contextualCompletionFeatures},
                                 {"contextual_direction",
                                     rt::phaseContextualPairDirectionName(candidate.contextualDirection)},
                                 {"contextual_completion_ready", candidate.contextualCompletion.ready},
@@ -3861,6 +3885,10 @@ int main(int argc, char** argv)
                                     candidate.contextualCompletion.uncertaintyCalibrated},
                                 {"contextual_incumbent_reference_us", candidate.contextualIncumbentReferenceUs},
                                 {"contextual_newcomer_reference_us", candidate.contextualNewcomerReferenceUs}});
+                            if (std::isfinite(candidate.contextualMinimumSlackUs))
+                            {
+                                candidates.back()["contextual_minimum_slack_us"] = candidate.contextualMinimumSlackUs;
+                            }
                         }
                         record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
                             {"snapshot_signature", event.snapshotSignature}, {"plan_id", event.planId},
@@ -3868,6 +3896,7 @@ int main(int argc, char** argv)
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
                             {"requested_action_direction",
                                 rt::phaseUnifiedActionDirectionName(event.requestedDirection)},
+                            {"dispatch_mode", rt::phaseUnifiedDispatchModeName(event.dispatchMode)},
                             {"action_kind", rt::phaseGlobalActionKindName(event.actionKind)},
                             {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
                             {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
@@ -3894,15 +3923,25 @@ int main(int argc, char** argv)
                                 rt::phaseUnifiedActionDirectionName(event.requestedDirection)},
                             {"action_kind", rt::phaseGlobalActionKindName(event.actionKind)},
                             {"action_direction", rt::phaseUnifiedActionDirectionName(event.direction)},
+                            {"dispatch_mode", rt::phaseUnifiedDispatchModeName(event.dispatchMode)},
+                            {"incumbent_dispatch_age_us", event.incumbentDispatchAgeUs},
+                            {"observed_start_skew_percent", event.observedStartSkewPercent},
                             {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
                             {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
                             {"observed_outstanding_mask", static_cast<uint8_t>(event.observedOutstanding)},
                             {"cohort", workJson(event.cohort)}, {"request_ids", event.requestIds},
-                            {"enqueue_host_ns", event.enqueueHostNs}, {"action_fidelity", event.actionFidelity}});
+                            {"enqueue_host_ns", event.enqueueHostNs}, {"action_fidelity", event.actionFidelity},
+                            {"action_fidelity_reason",
+                                rt::phaseUnifiedFidelityReasonName(event.actionFidelityReason)}});
                         if (event.incumbentExecutionId > 0U)
                         {
                             record["incumbent_phase"] = rt::phaseUnifiedPhaseName(event.incumbentPhase);
                             record["incumbent_execution_id"] = event.incumbentExecutionId;
+                        }
+                        if (event.newcomerExecutionId > 0U)
+                        {
+                            record["newcomer_phase"] = rt::phaseUnifiedPhaseName(event.newcomerPhase);
+                            record["newcomer_execution_id"] = event.newcomerExecutionId;
                         }
                         if (event.injectionTargetFraction.has_value())
                         {
@@ -3924,11 +3963,35 @@ int main(int argc, char** argv)
                             {"requested_action_direction",
                                 rt::phaseUnifiedActionDirectionName(event.requestedDirection)},
                             {"action_kind", rt::phaseGlobalActionKindName(event.actionKind)},
+                            {"action_direction", rt::phaseUnifiedActionDirectionName(event.direction)},
+                            {"dispatch_mode", rt::phaseUnifiedDispatchModeName(event.dispatchMode)},
+                            {"incumbent_dispatch_age_us", event.incumbentDispatchAgeUs},
+                            {"observed_start_skew_percent", event.observedStartSkewPercent},
                             {"observed_outstanding_mask", static_cast<uint8_t>(event.observedOutstanding)},
                             {"cohort", workJson(event.cohort)}, {"request_ids", event.requestIds},
                             {"gpu_duration_us", event.gpuDurationUs},
                             {"completion_visible_host_ns", event.completionVisibleHostNs},
-                            {"completion_status", "success"}, {"action_fidelity", event.actionFidelity}});
+                            {"completion_status", "success"}, {"action_fidelity", event.actionFidelity},
+                            {"action_fidelity_reason",
+                                rt::phaseUnifiedFidelityReasonName(event.actionFidelityReason)}});
+                        if (event.incumbentExecutionId > 0U)
+                        {
+                            record["incumbent_phase"] = rt::phaseUnifiedPhaseName(event.incumbentPhase);
+                            record["incumbent_execution_id"] = event.incumbentExecutionId;
+                        }
+                        if (event.newcomerExecutionId > 0U)
+                        {
+                            record["newcomer_phase"] = rt::phaseUnifiedPhaseName(event.newcomerPhase);
+                            record["newcomer_execution_id"] = event.newcomerExecutionId;
+                        }
+                        if (event.incumbentGpuCompletionUs.has_value())
+                        {
+                            record["incumbent_gpu_completion_us"] = *event.incumbentGpuCompletionUs;
+                        }
+                        if (event.newcomerGpuCompletionUs.has_value())
+                        {
+                            record["newcomer_gpu_completion_us"] = *event.newcomerGpuCompletionUs;
+                        }
                         if (event.gpuStartUs.has_value() && event.gpuEndUs.has_value())
                         {
                             record["gpu_start_us"] = *event.gpuStartUs;

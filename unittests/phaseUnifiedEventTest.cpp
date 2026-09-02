@@ -36,6 +36,31 @@ TEST(PhaseUnifiedEventTest, ReportsStableSchemaAndNames)
     EXPECT_STREQ(phaseInFlightStatusName(PhaseInFlightStatus::kCompletionReady), "completion_ready");
     EXPECT_EQ(phaseUnifiedActionDirectionFromName("prefill_to_decode"), PhaseUnifiedActionDirection::kPrefillToDecode);
     EXPECT_FALSE(phaseUnifiedActionDirectionFromName("prefill_decode").has_value());
+    EXPECT_STREQ(phaseUnifiedDispatchModeName(PhaseUnifiedDispatchMode::kCoLaunch), "co_launch");
+    EXPECT_STREQ(
+        phaseUnifiedDispatchModeName(PhaseUnifiedDispatchMode::kResidualAugmentation), "residual_augmentation");
+    EXPECT_STREQ(
+        phaseUnifiedFidelityReasonName(PhaseUnifiedFidelityReason::kOutstandingMismatch), "outstanding_mismatch");
+}
+
+TEST(PhaseUnifiedEventTest, SeparatesCoLaunchFromResidualAugmentation)
+{
+    EXPECT_EQ(phaseUnifiedDispatchMode(PhaseExecutionSet::kNone, PhaseGlobalActionKind::kPrefillDecode),
+        PhaseUnifiedDispatchMode::kCoLaunch);
+    EXPECT_EQ(phaseUnifiedDispatchMode(PhaseExecutionSet::kPrefill, PhaseGlobalActionKind::kPrefillDecode),
+        PhaseUnifiedDispatchMode::kResidualAugmentation);
+    EXPECT_EQ(phaseUnifiedDispatchMode(PhaseExecutionSet::kNone, PhaseGlobalActionKind::kDecode),
+        PhaseUnifiedDispatchMode::kSingle);
+    EXPECT_EQ(phaseUnifiedDispatchMode(PhaseExecutionSet::kNone, PhaseGlobalActionKind::kWait),
+        PhaseUnifiedDispatchMode::kNone);
+}
+
+TEST(PhaseUnifiedEventTest, UsesPlanIdentityForMultiPhaseMemberActions)
+{
+    EXPECT_TRUE(phaseUnifiedActionIdentityMatches(PhaseUnifiedDispatchMode::kSingle, 7U, 7U));
+    EXPECT_FALSE(phaseUnifiedActionIdentityMatches(PhaseUnifiedDispatchMode::kSingle, 7U, 8U));
+    EXPECT_TRUE(phaseUnifiedActionIdentityMatches(PhaseUnifiedDispatchMode::kCoLaunch, 7U, 8U));
+    EXPECT_TRUE(phaseUnifiedActionIdentityMatches(PhaseUnifiedDispatchMode::kResidualAugmentation, 7U, 8U));
 }
 
 TEST(PhaseUnifiedEventTest, DerivesIncrementalActionDirectionFromOutstandingWork)

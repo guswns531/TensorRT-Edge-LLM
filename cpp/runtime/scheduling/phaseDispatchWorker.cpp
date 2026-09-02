@@ -320,6 +320,8 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.globalReferenceWorkMs = mInFlight.globalReferenceWorkMs;
     mCurrentMetrics.contextualPdFeatures = mInFlight.contextualPdFeatures;
     mCurrentMetrics.contextualPdFeatureValid = mInFlight.contextualPdFeatureValid;
+    mCurrentMetrics.contextualCompletionFeatures = mInFlight.contextualCompletionFeatures;
+    mCurrentMetrics.contextualCompletionFeatureValid = mInFlight.contextualCompletionFeatureValid;
     mCurrentMetrics.contextualPdExploration = mInFlight.contextualPdExploration;
     mCurrentMetrics.contextualPdMean = mInFlight.contextualPdMean;
     mCurrentMetrics.contextualPdUncertainty = mInFlight.contextualPdUncertainty;
@@ -534,6 +536,8 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mInFlight.globalReferenceWorkMs = aggregate.referenceWorkUs / 1000.0;
     mInFlight.contextualPdFeatures = aggregate.contextualPdFeatures;
     mInFlight.contextualPdFeatureValid = aggregate.contextualPdFeatureValid;
+    mInFlight.contextualCompletionFeatures = aggregate.contextualCompletionFeatures;
+    mInFlight.contextualCompletionFeatureValid = aggregate.contextualCompletionFeatureValid;
     mInFlight.contextualPdExploration = aggregate.contextualPdExploration;
     mInFlight.contextualPdMean = aggregate.contextualPdMean;
     mInFlight.contextualPdUncertainty = aggregate.contextualPdUncertainty;
@@ -647,6 +651,8 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mCurrentMetrics.globalServiceCompression = mInFlight.globalServiceCompression;
     mCurrentMetrics.contextualPdFeatures = mInFlight.contextualPdFeatures;
     mCurrentMetrics.contextualPdFeatureValid = mInFlight.contextualPdFeatureValid;
+    mCurrentMetrics.contextualCompletionFeatures = mInFlight.contextualCompletionFeatures;
+    mCurrentMetrics.contextualCompletionFeatureValid = mInFlight.contextualCompletionFeatureValid;
     mCurrentMetrics.contextualPdExploration = mInFlight.contextualPdExploration;
     mCurrentMetrics.contextualPdMean = mInFlight.contextualPdMean;
     mCurrentMetrics.contextualPdUncertainty = mInFlight.contextualPdUncertainty;

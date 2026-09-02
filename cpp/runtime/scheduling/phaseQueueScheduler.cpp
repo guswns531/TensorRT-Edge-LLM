@@ -2117,11 +2117,14 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         bool const externalPrefillLineage = overlapPrefillClass == PhasePrefillClass::kExternal;
         if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
         {
-            candidate.contextualPdFeatures = phaseContextualPdFeatures({overlapPrefill->makespanUs,
-                overlapDecode->makespanUs, std::min(prefillSlack, decodeSlack), overlapPrefillRows, overlapDecodeRows,
-                overlapPrefillChunk, overlapKey.primaryContextBucket, overlapKey.secondaryContextBucket,
-                overlapKey.executionVariant, overlapKey.residualAugmentation, overlapKey.residualAnchor});
+            PhaseContextualPdInput const contextualInput{overlapPrefill->makespanUs, overlapDecode->makespanUs,
+                std::min(prefillSlack, decodeSlack), overlapPrefillRows, overlapDecodeRows, overlapPrefillChunk,
+                overlapKey.primaryContextBucket, overlapKey.secondaryContextBucket, overlapKey.executionVariant,
+                overlapKey.residualAugmentation, overlapKey.residualAnchor};
+            candidate.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
             candidate.contextualPdFeatureValid = true;
+            candidate.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
+            candidate.contextualCompletionFeatureValid = true;
             PhaseContextualPairDirection const contextualDirection
                 = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
             bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
@@ -2131,8 +2134,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 = decodeIncumbent ? overlapPrefill->makespanUs : overlapDecode->makespanUs;
             candidate.contextualCompletionMinimumSlackUs = std::min(prefillSlack, decodeSlack);
             candidate.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
-                contextualDirection, candidate.contextualPdFeatures, candidate.contextualCompletionIncumbentReferenceUs,
-                candidate.contextualCompletionNewcomerReferenceUs);
+                contextualDirection, candidate.contextualCompletionFeatures,
+                candidate.contextualCompletionIncumbentReferenceUs, candidate.contextualCompletionNewcomerReferenceUs);
             PhaseContextualPdEstimate const contextual
                 = mRuntimeCostTracker->predictContextualDirection(contextualDirection, candidate.contextualPdFeatures);
             candidate.contextualPdMean = contextual.mean;
@@ -2169,15 +2172,20 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         {
             PhaseContextualPairDirection const direction
                 = phaseContextualPairDirection(candidate.key.kind, candidate.key.residualAnchor);
+            PhaseContextualCompletionEstimate const authority
+                = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, candidate.contextualCompletion);
             bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
             for (PhaseProtectedCompletion& completion : candidate.protectedCompletions)
             {
                 bool const incumbent
                     = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
-                completion.predictedCompletionUs = incumbent ? candidate.contextualCompletion.incumbentMeanUs
-                                                             : candidate.contextualCompletion.newcomerMeanUs;
-                completion.uncertaintyUs = incumbent ? candidate.contextualCompletion.incumbentUncertaintyUs
-                                                     : candidate.contextualCompletion.newcomerUncertaintyUs;
+                if (incumbent && !mRuntimeCostTracker->contextualCompletionAuthorityPredictsIncumbent())
+                {
+                    continue;
+                }
+                completion.predictedCompletionUs = incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs;
+                completion.uncertaintyUs
+                    = incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs;
             }
         }
         candidates.push_back(std::move(candidate));
@@ -2748,11 +2756,16 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     bool const externalPrefill = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
     if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefill)
     {
-        overlap.contextualPdFeatures = phaseContextualPdFeatures(
-            {prefill.predictedMakespanUs, decode.predictedMakespanUs, protectedSlackUs, prefill.key.primaryBatchSize,
-                decode.key.primaryBatchSize, prefill.key.chunkLength, prefill.key.primaryContextBucket,
-                decode.key.primaryContextBucket, overlap.key.executionVariant, true, overlap.key.residualAnchor});
+        PhaseContextualPdInput const contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
+            protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
+            prefill.key.primaryContextBucket, decode.key.primaryContextBucket, overlap.key.executionVariant, true,
+            overlap.key.residualAnchor, elapsedUs, std::max(launched.predictedMakespanUs, launched.predictedBlockingUs),
+            launched.predictedMakespanUs > 0.0 ? elapsedUs / launched.predictedMakespanUs : -1.0,
+            addDecode ? PhaseExecutionSet::kPrefill : PhaseExecutionSet::kDecode};
+        overlap.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
         overlap.contextualPdFeatureValid = true;
+        overlap.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
+        overlap.contextualCompletionFeatureValid = true;
         PhaseContextualPairDirection const direction
             = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
         bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
@@ -2762,7 +2775,7 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
             = decodeIncumbent ? prefill.predictedMakespanUs : decode.predictedMakespanUs;
         overlap.contextualCompletionMinimumSlackUs = protectedSlackUs;
         overlap.contextualCompletion
-            = mRuntimeCostTracker->predictContextualCompletionDirection(direction, overlap.contextualPdFeatures,
+            = mRuntimeCostTracker->predictContextualCompletionDirection(direction, overlap.contextualCompletionFeatures,
                 overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
         PhaseContextualPdEstimate const contextual
             = mRuntimeCostTracker->predictContextualDirection(direction, overlap.contextualPdFeatures);
@@ -2806,14 +2819,18 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     {
         PhaseContextualPairDirection const direction
             = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+        PhaseContextualCompletionEstimate const authority
+            = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
         bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
         for (PhaseProtectedCompletion& completion : overlap.protectedCompletions)
         {
             bool const incumbent = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
-            completion.predictedCompletionUs = incumbent ? overlap.contextualCompletion.incumbentMeanUs
-                                                         : overlap.contextualCompletion.newcomerMeanUs;
-            completion.uncertaintyUs = incumbent ? overlap.contextualCompletion.incumbentUncertaintyUs
-                                                 : overlap.contextualCompletion.newcomerUncertaintyUs;
+            if (incumbent && !mRuntimeCostTracker->contextualCompletionAuthorityPredictsIncumbent())
+            {
+                continue;
+            }
+            completion.predictedCompletionUs = incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs;
+            completion.uncertaintyUs = incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs;
         }
     }
 
@@ -3089,6 +3106,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalReferenceWorkMs = global.referenceWorkUs / 1000.0;
         plan.contextualPdFeatures = global.contextualPdFeatures;
         plan.contextualPdFeatureValid = global.contextualPdFeatureValid;
+        plan.contextualCompletionFeatures = global.contextualCompletionFeatures;
+        plan.contextualCompletionFeatureValid = global.contextualCompletionFeatureValid;
         plan.contextualPdExploration = global.contextualPdExploration;
         plan.contextualPdMean = global.contextualPdMean;
         plan.contextualPdUncertainty = global.contextualPdUncertainty;
@@ -3136,6 +3155,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalReferenceWorkMs = global->candidate.referenceWorkUs / 1000.0;
         plan.contextualPdFeatures = global->candidate.contextualPdFeatures;
         plan.contextualPdFeatureValid = global->candidate.contextualPdFeatureValid;
+        plan.contextualCompletionFeatures = global->candidate.contextualCompletionFeatures;
+        plan.contextualCompletionFeatureValid = global->candidate.contextualCompletionFeatureValid;
         plan.contextualPdExploration = global->candidate.contextualPdExploration;
         plan.contextualPdMean = global->candidate.contextualPdMean;
         plan.contextualPdUncertainty = global->candidate.contextualPdUncertainty;
@@ -4019,10 +4040,13 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
                 double const newcomerCompletionUs
                     = static_cast<double>(decodeIncumbent ? metrics.prefillCompletionMs : metrics.decodeCompletionMs)
                     * 1000.0;
-                static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(direction,
-                    metrics.contextualPdFeatures, metrics.contextualCompletionIncumbentReferenceUs,
-                    metrics.contextualCompletionNewcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs,
-                    metrics.contextualCompletionMinimumSlackUs));
+                if (metrics.contextualCompletionFeatureValid)
+                {
+                    static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(direction,
+                        metrics.contextualCompletionFeatures, metrics.contextualCompletionIncumbentReferenceUs,
+                        metrics.contextualCompletionNewcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs,
+                        metrics.contextualCompletionMinimumSlackUs));
+                }
             }
         }
     }

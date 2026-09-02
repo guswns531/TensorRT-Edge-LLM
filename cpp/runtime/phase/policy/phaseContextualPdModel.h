@@ -83,12 +83,20 @@ struct PhaseContextualPairInput
     PhaseExecutionVariant executionVariant{PhaseExecutionVariant::kEager};
     bool residualAugmentation{};
     PhaseGlobalResidualAnchor residualAnchor{PhaseGlobalResidualAnchor::kNone};
+    double incumbentDispatchAgeUs{};
+    double incumbentReferenceUs{};
+    double requestedStartSkewFraction{-1.0};
+    PhaseExecutionSet outstandingBefore{PhaseExecutionSet::kNone};
 };
 
 //! Project any two-phase action into the common continuous policy space. Each
 //! action family owns an independent posterior, so E+P, E+D, and P+D evidence
 //! cannot contaminate one another.
 PhaseContextualPdFeatures phaseContextualPairFeatures(PhaseContextualPairInput const& input) noexcept;
+
+//! Completion V2 keeps Current's advantage representation unchanged while
+//! projecting continuous incumbent progress into the shadow execution model.
+PhaseContextualPdFeatures phaseContextualCompletionFeatures(PhaseContextualPairInput const& input) noexcept;
 
 struct PhaseContextualPdInput
 {
@@ -103,12 +111,17 @@ struct PhaseContextualPdInput
     PhaseExecutionVariant executionVariant{PhaseExecutionVariant::kEager};
     bool residualAugmentation{};
     PhaseGlobalResidualAnchor residualAnchor{PhaseGlobalResidualAnchor::kNone};
+    double incumbentDispatchAgeUs{};
+    double incumbentReferenceUs{};
+    double requestedStartSkewFraction{-1.0};
+    PhaseExecutionSet outstandingBefore{PhaseExecutionSet::kNone};
 };
 
 //! Project an exact P+D action into a bounded, model- and workload-label-free
 //! decision representation. The execution cost tracker retains exact keys;
 //! only policy evidence is shared through this low-dimensional projection.
 PhaseContextualPdFeatures phaseContextualPdFeatures(PhaseContextualPdInput const& input) noexcept;
+PhaseContextualPdFeatures phaseContextualPdCompletionFeatures(PhaseContextualPdInput const& input) noexcept;
 
 struct PhaseContextualPdModelConfig
 {
@@ -257,6 +270,11 @@ struct PhaseContextualCompletionCalibrationConfig
     size_t windowSize{128U};
     double minimumScale{1.0};
     double maximumScale{8.0};
+    //! P6 policy-only ablations. They never relax feasibility or determine
+    //! whether an observation is admitted into the completion model.
+    bool authorityUsesUncertainty{true};
+    bool useResidualFeatures{true};
+    bool authorityPredictsIncumbent{true};
 };
 
 struct PhaseContextualCompletionCalibrationEstimate

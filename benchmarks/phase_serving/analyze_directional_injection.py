@@ -96,12 +96,17 @@ def nearest_bucket(fraction: float) -> float:
 
 
 def build_samples(
-        events: list[dict[str, Any]],
-        bucket_tolerance: float) -> tuple[list[dict[str, Any]], list[str]]:
+        events: list[dict[str, Any]], bucket_tolerance: float,
+        confidence_beta: float) -> tuple[list[dict[str, Any]], list[str]]:
     """Join newcomer dispatches with incumbent/newcomer completion intervals."""
     errors: list[str] = []
     completions: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    decisions: dict[tuple[str, str, int], dict[str, Any]] = {}
     for event in events:
+        if event.get("event_kind") == "decision":
+            decisions[(str(event.get("_source_log", "")),
+                       str(event.get("run_id")), int(event.get("plan_id",
+                                                               0)))] = event
         if event.get("event_kind") != "completion":
             continue
         key = (str(event.get("_source_log", "")), str(event.get("run_id")),
@@ -182,6 +187,30 @@ def build_samples(
             min(incumbent_end, newcomer_end) -
             max(incumbent_start, newcomer_start))
         makespan = max(incumbent_end, newcomer_end) - incumbent_start
+        incumbent_completion = max(0.0, incumbent_end - newcomer_start)
+        newcomer_completion = max(0.0, newcomer_end - newcomer_start)
+        action_makespan = max(incumbent_completion, newcomer_completion)
+        remaining_incumbent_reference = max(
+            0.0, incumbent_reference - actual_offset)
+        serial_equivalent = remaining_incumbent_reference + newcomer_reference
+        compression = (serial_equivalent - action_makespan) / max(
+            serial_equivalent, 1.0)
+        decision = decisions.get(
+            (source_log, run_id, int(dispatch.get("plan_id", 0))), {})
+        selected = next((candidate
+                         for candidate in decision.get("candidates", [])
+                         if int(candidate.get("action_id", 0)) == int(
+                             dispatch.get("action_id", 0))), {})
+        incumbent_prediction = float(
+            selected.get("contextual_incumbent_mean_us", 0.0))
+        newcomer_prediction = float(
+            selected.get("contextual_newcomer_mean_us", 0.0))
+        incumbent_uncertainty = float(
+            selected.get("contextual_incumbent_uncertainty_us", 0.0))
+        newcomer_uncertainty = float(
+            selected.get("contextual_newcomer_uncertainty_us", 0.0))
+        prediction_ready = bool(
+            selected.get("contextual_completion_ready", False))
         inflight_overlap = overlap > 0.0
         realization = "overlap" if inflight_overlap else "serial_realization"
         samples.append({
@@ -212,6 +241,8 @@ def build_samples(
             inflight_overlap,
             "realization":
             realization,
+            "dispatch_mode":
+            str(dispatch.get("dispatch_mode", "unknown")),
             "accepted_bucket":
             inflight_overlap
             and abs(actual_fraction - bucket) <= bucket_tolerance,
@@ -219,6 +250,8 @@ def build_samples(
             int(dispatch.get("requested_injection_delay_us", 0)),
             "incumbent_phase":
             incumbent_phase,
+            "incumbent_milestone":
+            "tpot" if incumbent_phase == "decode" else "ttft",
             "incumbent_execution_id":
             incumbent_id,
             "incumbent_reference_us":
@@ -229,6 +262,8 @@ def build_samples(
             incumbent_duration - incumbent_reference,
             "newcomer_phase":
             newcomer_phase,
+            "newcomer_milestone":
+            "tpot" if newcomer_phase == "decode" else "ttft",
             "newcomer_execution_id":
             newcomer_id,
             "newcomer_reference_us":
@@ -241,6 +276,35 @@ def build_samples(
             overlap,
             "makespan_us":
             makespan,
+            "incumbent_completion_from_injection_us":
+            incumbent_completion,
+            "newcomer_completion_from_injection_us":
+            newcomer_completion,
+            "action_makespan_from_injection_us":
+            action_makespan,
+            "serial_equivalent_from_injection_us":
+            serial_equivalent,
+            "serial_equivalent_compression":
+            compression,
+            "completion_prediction_ready":
+            prediction_ready,
+            "predicted_incumbent_completion_us":
+            incumbent_prediction,
+            "predicted_newcomer_completion_us":
+            newcomer_prediction,
+            "incumbent_prediction_absolute_error_us":
+            abs(incumbent_prediction -
+                incumbent_completion) if prediction_ready else math.nan,
+            "newcomer_prediction_absolute_error_us":
+            abs(newcomer_prediction -
+                newcomer_completion) if prediction_ready else math.nan,
+            "incumbent_interval_covered":
+            prediction_ready
+            and abs(incumbent_prediction - incumbent_completion)
+            <= confidence_beta * incumbent_uncertainty,
+            "newcomer_interval_covered":
+            prediction_ready and abs(newcomer_prediction - newcomer_completion)
+            <= confidence_beta * newcomer_uncertainty,
             "completion_visible_span_us":
             abs(
                 int(newcomer["completion_visible_host_ns"]) -
@@ -271,9 +335,37 @@ def summarize(samples: list[dict[str, Any]],
         for field in ("actual_fraction", "incumbent_duration_us",
                       "incumbent_slowdown_us", "newcomer_duration_us",
                       "newcomer_slowdown_us", "overlap_us", "makespan_us",
+                      "incumbent_completion_from_injection_us",
+                      "newcomer_completion_from_injection_us",
+                      "action_makespan_from_injection_us",
+                      "serial_equivalent_compression",
                       "completion_visible_span_us"):
             cell[field] = distribution(
                 [float(sample[field]) for sample in group])
+        ready = [
+            sample for sample in group if sample["completion_prediction_ready"]
+        ]
+        cell["prediction"] = {
+            "ready_samples":
+            len(ready),
+            "incumbent_absolute_error_us":
+            distribution([
+                float(sample["incumbent_prediction_absolute_error_us"])
+                for sample in ready
+            ]),
+            "newcomer_absolute_error_us":
+            distribution([
+                float(sample["newcomer_prediction_absolute_error_us"])
+                for sample in ready
+            ]),
+            "incumbent_interval_coverage":
+            sum(
+                bool(sample["incumbent_interval_covered"])
+                for sample in ready) / len(ready) if ready else None,
+            "newcomer_interval_coverage":
+            sum(bool(sample["newcomer_interval_covered"])
+                for sample in ready) / len(ready) if ready else None,
+        }
         cells.append(cell)
 
     direction_gates: list[dict[str, Any]] = []
@@ -360,12 +452,15 @@ def main() -> int:
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--bucket-tolerance", type=float, default=0.13)
     parser.add_argument("--material-effect-ratio", type=float, default=0.03)
+    parser.add_argument("--confidence-beta", type=float, default=1.96)
     args = parser.parse_args()
-    if args.bucket_tolerance < 0.0 or args.material_effect_ratio < 0.0:
+    if (args.bucket_tolerance < 0.0 or args.material_effect_ratio < 0.0
+            or args.confidence_beta < 0.0):
         parser.error("tolerances must be non-negative")
     try:
         events = load_events(args.logs)
-        samples, errors = build_samples(events, args.bucket_tolerance)
+        samples, errors = build_samples(events, args.bucket_tolerance,
+                                        args.confidence_beta)
         if not samples:
             raise ValueError(
                 "no directional-injection completion vectors found")

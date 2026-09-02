@@ -407,6 +407,8 @@ PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(uint64_t planId, uint64_t snapsh
     result.secondaryStableSlotIds = candidate.secondaryStableSlotIds;
     result.contextualPdFeatures = candidate.contextualPdFeatures;
     result.contextualPdFeatureValid = candidate.contextualPdFeatureValid;
+    result.contextualCompletionFeatures = candidate.contextualCompletionFeatures;
+    result.contextualCompletionFeatureValid = candidate.contextualCompletionFeatureValid;
     result.contextualPdExploration = candidate.contextualPdExploration;
     return result;
 }

@@ -214,6 +214,8 @@ struct PhaseDispatchMetrics
     double globalReferenceWorkMs{};
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
+    PhaseContextualPdFeatures contextualCompletionFeatures{};
+    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
     double contextualPdMean{};
     double contextualPdUncertainty{};
@@ -697,6 +699,8 @@ struct PhaseDispatchPlan
     double globalReferenceWorkMs{};
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
+    PhaseContextualPdFeatures contextualCompletionFeatures{};
+    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
     double contextualCompletionIncumbentReferenceUs{};
     double contextualCompletionNewcomerReferenceUs{};

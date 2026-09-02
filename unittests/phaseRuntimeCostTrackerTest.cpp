@@ -213,6 +213,22 @@ TEST(PhaseContextualPairModelTest, ProjectsEncoderPairsIntoContinuousFeatures)
     EXPECT_NE(encoderPrefill, encoderDecode);
 }
 
+TEST(PhaseContextualPairModelTest, CompletionV2AddsResidualStateWithoutChangingAdvantageFeatures)
+{
+    PhaseContextualPairInput early{4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2,
+        PhaseExecutionVariant::kEager, true, PhaseGlobalResidualAnchor::kPrefill, 1000.0, 4000.0, 0.25,
+        PhaseExecutionSet::kPrefill};
+    PhaseContextualPairInput late = early;
+    late.incumbentDispatchAgeUs = 3000.0;
+    late.requestedStartSkewFraction = 0.75;
+
+    EXPECT_EQ(phaseContextualPairFeatures(early), phaseContextualPairFeatures(late));
+    EXPECT_NE(phaseContextualCompletionFeatures(early), phaseContextualCompletionFeatures(late));
+    EXPECT_DOUBLE_EQ(phaseContextualCompletionFeatures(early)[11], 0.25);
+    EXPECT_DOUBLE_EQ(phaseContextualCompletionFeatures(late)[11], 0.75);
+    EXPECT_DOUBLE_EQ(phaseContextualCompletionFeatures(early)[14], 1.0);
+}
+
 TEST(PhaseContextualPairModelTest, KeepsEncoderPrefillAndDecodeEvidenceIndependent)
 {
     PhaseRuntimeCostTrackerConfig config;
@@ -434,6 +450,56 @@ TEST(PhaseContextualCompletionCalibrationTest, SeparatesShadowCalibrationFromSch
     activeConfig.completionCalibration.active = true;
     PhaseRuntimeCostTracker active(activeConfig);
     EXPECT_TRUE(active.contextualCompletionAuthorityEnabled());
+}
+
+TEST(PhaseContextualCompletionCalibrationTest, SupportsPolicyOnlyAuthorityAblations)
+{
+    rt::PhaseRuntimeCostTrackerConfig config;
+    config.completionCalibration.enabled = true;
+    config.completionCalibration.active = true;
+    config.completionCalibration.authorityUsesUncertainty = false;
+    config.completionCalibration.authorityPredictsIncumbent = false;
+    rt::PhaseRuntimeCostTracker tracker(config);
+
+    rt::PhaseContextualCompletionEstimate estimate;
+    estimate.incumbentMeanUs = 100.0;
+    estimate.incumbentUncertaintyUs = 25.0;
+    estimate.newcomerMeanUs = 80.0;
+    estimate.newcomerUncertaintyUs = 20.0;
+    rt::PhaseContextualCompletionEstimate const authority
+        = tracker.contextualCompletionAuthorityEstimate(rt::PhaseContextualPairDirection::kPrefillToDecode, estimate);
+
+    EXPECT_TRUE(tracker.contextualCompletionAuthorityEnabled());
+    EXPECT_FALSE(tracker.contextualCompletionAuthorityPredictsIncumbent());
+    EXPECT_DOUBLE_EQ(authority.incumbentMeanUs, 100.0);
+    EXPECT_DOUBLE_EQ(authority.newcomerMeanUs, 80.0);
+    EXPECT_DOUBLE_EQ(authority.incumbentUncertaintyUs, 0.0);
+    EXPECT_DOUBLE_EQ(authority.newcomerUncertaintyUs, 0.0);
+}
+
+TEST(PhaseContextualCompletionCalibrationTest, ResidualFeatureAblationProjectsToTheSamePosterior)
+{
+    rt::PhaseRuntimeCostTrackerConfig config;
+    config.completionCalibration.useResidualFeatures = false;
+    rt::PhaseRuntimeCostTracker tracker(config);
+    rt::PhaseContextualPdFeatures coLaunch{};
+    rt::PhaseContextualPdFeatures residual{};
+    coLaunch.fill(0.25);
+    residual = coLaunch;
+    for (size_t index{9U}; index < residual.size(); ++index)
+    {
+        residual[index] = 1.0;
+    }
+
+    rt::PhaseContextualCompletionEstimate const coLaunchPrediction = tracker.predictContextualCompletionDirection(
+        rt::PhaseContextualPairDirection::kPrefillToDecode, coLaunch, 100.0, 80.0);
+    rt::PhaseContextualCompletionEstimate const residualPrediction = tracker.predictContextualCompletionDirection(
+        rt::PhaseContextualPairDirection::kPrefillToDecode, residual, 100.0, 80.0);
+
+    EXPECT_DOUBLE_EQ(coLaunchPrediction.incumbentMeanUs, residualPrediction.incumbentMeanUs);
+    EXPECT_DOUBLE_EQ(coLaunchPrediction.newcomerMeanUs, residualPrediction.newcomerMeanUs);
+    EXPECT_DOUBLE_EQ(coLaunchPrediction.incumbentUncertaintyUs, residualPrediction.incumbentUncertaintyUs);
+    EXPECT_DOUBLE_EQ(coLaunchPrediction.newcomerUncertaintyUs, residualPrediction.newcomerUncertaintyUs);
 }
 
 } // namespace

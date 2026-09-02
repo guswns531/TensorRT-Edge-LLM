@@ -119,6 +119,22 @@ def env_option(name: str, value: object) -> list[str]:
     return ["-e", f"{name}={value}"]
 
 
+def cleanup_case_containers(case_name: str, repeats: int) -> None:
+    """Remove only containers owned by one directional-injection cell."""
+    for run_index in range(1, repeats + 1):
+        name = f"phase-p3-{case_name.replace('_', '-')}-run-{run_index:03d}"
+        try:
+            subprocess.run(["docker", "rm", "-f", name],
+                           check=False,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=30.0)
+        except subprocess.TimeoutExpired:
+            print(f"WARNING: timed out cleaning container {name}",
+                  file=sys.stderr,
+                  flush=True)
+
+
 def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
              target: float) -> list[Path]:
     """Execute one requested direction/offset cell and return every repeat log."""
@@ -131,8 +147,22 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
     case_name = f"{direction}-o{round(target * 100):02d}"
     case_dir = args.output_dir / case_name
     logs = sorted(case_dir.glob("run-*/gateway.log"))
-    if args.skip_existing and logs:
-        return logs
+    aggregates = sorted(case_dir.glob("run-*/client/aggregate.json"))
+    complete_runs = {
+        path.parents[1].name
+        for path in aggregates if path.stat().st_size > 0
+    }
+    complete_logs = [
+        path for path in logs
+        if path.parent.name in complete_runs and path.stat().st_size > 0
+    ]
+    if args.skip_existing and len(complete_logs) == args.repeats:
+        return complete_logs
+    if args.skip_existing and (logs or aggregates):
+        print(
+            f"rerunning partial cell {case_name}: "
+            f"{len(complete_logs)}/{args.repeats} complete repeats",
+            flush=True)
 
     workspace = args.workspace.resolve()
     activity_prefix = container_path(case_dir / "activity" / "run-{run}",
@@ -141,6 +171,8 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
         "docker",
         "run",
         "--rm",
+        "--name",
+        f"phase-p3-{case_name.replace('_', '-')}-run-{{run}}",
         "--gpus",
         "all",
         "--ipc",
@@ -284,14 +316,23 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
         "--max-in-flight",
         str(args.stable_slots),
         "--ready-timeout",
-        "180",
+        str(args.ready_timeout),
         "--request-timeout",
-        "900",
+        str(args.request_timeout),
         "--ignore-eos",
         "--",
         *backend,
     ]
-    subprocess.run(command, check=True)
+    if args.dry_run:
+        case_dir.mkdir(parents=True, exist_ok=True)
+        (case_dir / "command.json").write_text(json.dumps(command, indent=2) +
+                                               "\n",
+                                               encoding="utf-8")
+        return []
+    try:
+        subprocess.run(command, check=True)
+    finally:
+        cleanup_case_containers(case_name, args.repeats)
     logs = sorted(case_dir.glob("run-*/gateway.log"))
     if not logs:
         raise RuntimeError(f"no gateway log produced for {case_name}")
@@ -323,6 +364,8 @@ def main() -> int:
                         default="all")
     parser.add_argument("--target", type=float, action="append")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--ready-timeout", type=float, default=180.0)
+    parser.add_argument("--request-timeout", type=float, default=180.0)
     parser.add_argument("--stable-slots", type=int, default=80)
     parser.add_argument("--encoder-batch", type=int, default=4)
     parser.add_argument("--prefill-batch", type=int, default=8)
@@ -340,6 +383,7 @@ def main() -> int:
                         type=float,
                         default=0.95)
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--docker-image",
                         default="nvcr.io/nvidia/tensorrt:26.06-py3")
     parser.add_argument("--harness",
@@ -372,8 +416,9 @@ def main() -> int:
     targets = args.target or list(TARGETS)
     if any(target not in TARGETS for target in targets):
         parser.error(f"targets must be selected from {TARGETS}")
-    if args.repeats <= 0 or min(args.stable_slots, args.encoder_batch,
-                                args.prefill_batch, args.decode_batch) <= 0:
+    if (args.repeats <= 0 or min(args.stable_slots, args.encoder_batch,
+                                 args.prefill_batch, args.decode_batch) <= 0
+            or min(args.ready_timeout, args.request_timeout) <= 0.0):
         parser.error("repeats and capacities must be positive")
     if (args.completion_conformal_min_observations <= 0
             or args.completion_conformal_window
@@ -400,16 +445,17 @@ def main() -> int:
 
     artifact = args.output_dir / "directional-injection-artifact.json"
     samples = args.output_dir / "directional-injection-samples.csv"
-    subprocess.run([
-        sys.executable,
-        str(args.analyzer),
-        *(str(log) for log in logs),
-        "--output-json",
-        str(artifact),
-        "--output-csv",
-        str(samples),
-    ],
-                   check=True)
+    if not args.dry_run:
+        subprocess.run([
+            sys.executable,
+            str(args.analyzer),
+            *(str(log) for log in logs),
+            "--output-json",
+            str(artifact),
+            "--output-csv",
+            str(samples),
+        ],
+                       check=True)
     manifest = {
         "schema_version": 1,
         "directions": list(directions),
@@ -422,6 +468,7 @@ def main() -> int:
         "logs": [str(log) for log in logs],
         "artifact": str(artifact),
         "samples": str(samples),
+        "dry_run": args.dry_run,
         "completion_conformal": {
             "enabled": args.completion_conformal,
             "minimum_observations": args.completion_conformal_min_observations,

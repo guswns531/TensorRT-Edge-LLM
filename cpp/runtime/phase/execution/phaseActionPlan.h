@@ -64,6 +64,8 @@ struct PhaseGlobalActionCandidate
     bool calibrationProbe{};
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
+    PhaseContextualPdFeatures contextualCompletionFeatures{};
+    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
     double contextualPdMean{};
     double contextualPdUncertainty{};
@@ -76,6 +78,8 @@ struct PhaseGlobalActionCandidate
     //! coordinator and recorded with the matching E+P or E+D completion.
     PhaseContextualPdFeatures contextualEncoderPairFeatures{};
     bool contextualEncoderPairFeatureValid{};
+    PhaseContextualPdFeatures contextualEncoderCompletionFeatures{};
+    bool contextualEncoderCompletionFeatureValid{};
     bool contextualEncoderPairReady{};
     bool contextualEncoderPairExploration{};
     double contextualEncoderPairMean{};
@@ -142,6 +146,8 @@ struct PhaseGlobalDispatchPlan
     std::vector<int32_t> secondaryStableSlotIds;
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
+    PhaseContextualPdFeatures contextualCompletionFeatures{};
+    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
 
     bool permits(PhaseExecutionSet phases) const noexcept;

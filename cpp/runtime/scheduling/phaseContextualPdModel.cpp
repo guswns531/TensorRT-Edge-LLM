@@ -108,10 +108,23 @@ PhaseContextualPdFeatures phaseContextualPdFeatures(PhaseContextualPdInput const
     constexpr int32_t kPrefillBatchCapacity = 8;
     constexpr int32_t kDecodeBatchCapacity = 64;
     constexpr int32_t kChunkQuantum = 128;
-    return phaseContextualPairFeatures(
-        {input.prefillUs, input.decodeUs, input.minimumSlackUs, input.prefillBatchSize, input.decodeBatchSize,
-            kPrefillBatchCapacity, kDecodeBatchCapacity, input.chunkLength, kChunkQuantum, input.prefillContextBucket,
-            input.decodeContextBucket, input.executionVariant, input.residualAugmentation, input.residualAnchor});
+    return phaseContextualPairFeatures({input.prefillUs, input.decodeUs, input.minimumSlackUs, input.prefillBatchSize,
+        input.decodeBatchSize, kPrefillBatchCapacity, kDecodeBatchCapacity, input.chunkLength, kChunkQuantum,
+        input.prefillContextBucket, input.decodeContextBucket, input.executionVariant, input.residualAugmentation,
+        input.residualAnchor, input.incumbentDispatchAgeUs, input.incumbentReferenceUs,
+        input.requestedStartSkewFraction, input.outstandingBefore});
+}
+
+PhaseContextualPdFeatures phaseContextualPdCompletionFeatures(PhaseContextualPdInput const& input) noexcept
+{
+    constexpr int32_t kPrefillBatchCapacity = 8;
+    constexpr int32_t kDecodeBatchCapacity = 64;
+    constexpr int32_t kChunkQuantum = 128;
+    return phaseContextualCompletionFeatures({input.prefillUs, input.decodeUs, input.minimumSlackUs,
+        input.prefillBatchSize, input.decodeBatchSize, kPrefillBatchCapacity, kDecodeBatchCapacity, input.chunkLength,
+        kChunkQuantum, input.prefillContextBucket, input.decodeContextBucket, input.executionVariant,
+        input.residualAugmentation, input.residualAnchor, input.incumbentDispatchAgeUs, input.incumbentReferenceUs,
+        input.requestedStartSkewFraction, input.outstandingBefore});
 }
 
 PhaseContextualPdFeatures phaseContextualPairFeatures(PhaseContextualPairInput const& input) noexcept
@@ -137,6 +150,33 @@ PhaseContextualPdFeatures phaseContextualPairFeatures(PhaseContextualPairInput c
         input.residualAugmentation ? 1.0 : 0.0, input.residualAnchor == PhaseGlobalResidualAnchor::kPrefill ? 1.0 : 0.0,
         input.residualAnchor == PhaseGlobalResidualAnchor::kDecode ? 1.0 : 0.0, primaryGraph ? 1.0 : 0.0,
         secondaryGraph ? 1.0 : 0.0};
+}
+
+PhaseContextualPdFeatures phaseContextualCompletionFeatures(PhaseContextualPairInput const& input) noexcept
+{
+    double const primaryUs = std::max(0.0, input.primaryUs);
+    double const secondaryUs = std::max(0.0, input.secondaryUs);
+    double const serialUs = std::max(1.0, primaryUs + secondaryUs);
+    double const incumbentAgeUs = std::max(0.0, input.incumbentDispatchAgeUs);
+    double const incumbentElapsedRatio
+        = input.incumbentReferenceUs > 0.0 ? clampFinite(incumbentAgeUs / input.incumbentReferenceUs, 0.0, 2.0) : 0.0;
+    double const primaryBatchDenominator = std::log1p(std::max(1, input.primaryBatchCapacity));
+    double const secondaryBatchDenominator = std::log1p(std::max(1, input.secondaryBatchCapacity));
+    double const workQuantum = static_cast<double>(std::max(1, input.workQuantum));
+    double const slackRatio = clampFinite(input.minimumSlackUs / serialUs, -4.0, 8.0);
+    return {1.0, clampFinite(std::log1p(primaryUs / 1000.0) / 4.0, 0.0, 2.0),
+        clampFinite(std::log1p(secondaryUs / 1000.0) / 4.0, 0.0, 2.0), primaryUs / serialUs,
+        clampFinite(std::log1p(std::max(0, input.primaryBatchSize)) / primaryBatchDenominator, 0.0, 2.0),
+        clampFinite(std::log1p(std::max(0, input.secondaryBatchSize)) / secondaryBatchDenominator, 0.0, 2.0),
+        clampFinite(static_cast<double>(std::max(0, input.workSize)) / workQuantum, 0.0, 4.0),
+        clampFinite(
+            static_cast<double>(std::max(input.primaryContextBucket, input.secondaryContextBucket)) / 4.0, 0.0, 4.0),
+        slackRatio / 8.0, input.residualAugmentation ? 1.0 : 0.0,
+        clampFinite(std::log1p(incumbentAgeUs / 1000.0) / 4.0, 0.0, 2.0), incumbentElapsedRatio,
+        input.requestedStartSkewFraction >= 0.0 ? clampFinite(input.requestedStartSkewFraction, 0.0, 1.0) : -1.0,
+        phaseExecutionSetContains(input.outstandingBefore, PhaseExecutionSet::kEncoder) ? 1.0 : 0.0,
+        phaseExecutionSetContains(input.outstandingBefore, PhaseExecutionSet::kPrefill) ? 1.0 : 0.0,
+        phaseExecutionSetContains(input.outstandingBefore, PhaseExecutionSet::kDecode) ? 1.0 : 0.0};
 }
 
 double phaseContextualDecisionMakespanUs(double referenceWorkUs, double conservativeAdvantage) noexcept

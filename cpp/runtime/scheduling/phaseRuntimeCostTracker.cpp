@@ -403,6 +403,7 @@ PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::predictContextualComp
     PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features, double incumbentReferenceUs,
     double newcomerReferenceUs)
 {
+    PhaseContextualPdFeatures const policyFeatures = contextualCompletionFeaturesForPolicy(features);
     PhaseContextualCompletionModel* pair{};
     PhaseContextualCompletionModel* ordered{};
     switch (direction)
@@ -436,13 +437,14 @@ PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::predictContextualComp
     bool const primaryIsIncumbent = canonicalPrimaryIsIncumbent(direction);
     double const primaryReferenceUs = primaryIsIncumbent ? incumbentReferenceUs : newcomerReferenceUs;
     double const secondaryReferenceUs = primaryIsIncumbent ? newcomerReferenceUs : incumbentReferenceUs;
-    PhaseContextualCompletionEstimate pairEstimate = pair->predict(features, primaryReferenceUs, secondaryReferenceUs);
+    PhaseContextualCompletionEstimate pairEstimate
+        = pair->predict(policyFeatures, primaryReferenceUs, secondaryReferenceUs);
     if (!primaryIsIncumbent)
     {
         pairEstimate = swapCompletionComponents(pairEstimate);
     }
     PhaseContextualCompletionEstimate const directionEstimate
-        = ordered->predict(features, incumbentReferenceUs, newcomerReferenceUs);
+        = ordered->predict(policyFeatures, incumbentReferenceUs, newcomerReferenceUs);
     ++mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)].predictions;
     PhaseContextualCompletionEstimate const raw = phaseBlendContextualCompletionEstimates(
         pairEstimate, directionEstimate, mConfig.completionDirectionPseudoObservations);
@@ -506,8 +508,9 @@ bool PhaseRuntimeCostTracker::observeContextualCompletionDirection(PhaseContextu
     }
     ELLM_CHECK(
         pair != nullptr && ordered != nullptr && calibrator != nullptr, "Unknown contextual completion direction");
+    PhaseContextualPdFeatures const policyFeatures = contextualCompletionFeaturesForPolicy(features);
     PhaseContextualCompletionEstimate const prediction
-        = predictContextualCompletionDirection(direction, features, incumbentReferenceUs, newcomerReferenceUs);
+        = predictContextualCompletionDirection(direction, policyFeatures, incumbentReferenceUs, newcomerReferenceUs);
     PhaseContextualCompletionTelemetry& telemetry
         = mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)];
     // The prediction above is part of calibration, not candidate generation.
@@ -530,11 +533,41 @@ bool PhaseRuntimeCostTracker::observeContextualCompletionDirection(PhaseContextu
     double const secondaryReferenceUs = primaryIsIncumbent ? newcomerReferenceUs : incumbentReferenceUs;
     double const primaryCompletionUs = primaryIsIncumbent ? incumbentCompletionUs : newcomerCompletionUs;
     double const secondaryCompletionUs = primaryIsIncumbent ? newcomerCompletionUs : incumbentCompletionUs;
-    bool const pairObserved = pair->observe(
-        features, primaryReferenceUs, secondaryReferenceUs, primaryCompletionUs, secondaryCompletionUs, minimumSlackUs);
-    bool const directionObserved = ordered->observe(features, incumbentReferenceUs, newcomerReferenceUs,
+    bool const pairObserved = pair->observe(policyFeatures, primaryReferenceUs, secondaryReferenceUs,
+        primaryCompletionUs, secondaryCompletionUs, minimumSlackUs);
+    bool const directionObserved = ordered->observe(policyFeatures, incumbentReferenceUs, newcomerReferenceUs,
         incumbentCompletionUs, newcomerCompletionUs, minimumSlackUs);
     return pairObserved && directionObserved;
+}
+
+PhaseContextualPdFeatures PhaseRuntimeCostTracker::contextualCompletionFeaturesForPolicy(
+    PhaseContextualPdFeatures features) const noexcept
+{
+    if (!mConfig.completionCalibration.useResidualFeatures)
+    {
+        // Completion V2 indices 9--15 encode residual mode, incumbent age,
+        // elapsed/reference ratio, requested skew, and the outstanding mask.
+        // The first nine shape/cost/slack features remain identical.
+        std::fill(features.begin() + 9, features.end(), 0.0);
+    }
+    return features;
+}
+
+PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::contextualCompletionAuthorityEstimate(
+    PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate estimate) const noexcept
+{
+    if (mConfig.completionCalibration.authorityUsesUncertainty)
+    {
+        double const beta = contextualPairConfig(phaseContextualPairKind(direction)).confidenceBeta;
+        estimate.incumbentUncertaintyUs *= beta;
+        estimate.newcomerUncertaintyUs *= beta;
+    }
+    else
+    {
+        estimate.incumbentUncertaintyUs = 0.0;
+        estimate.newcomerUncertaintyUs = 0.0;
+    }
+    return estimate;
 }
 
 PhaseContextualCompletionTelemetry const& PhaseRuntimeCostTracker::contextualCompletionDirectionTelemetry(

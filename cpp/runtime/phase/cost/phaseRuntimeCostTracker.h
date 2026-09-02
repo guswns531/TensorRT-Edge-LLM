@@ -119,6 +119,12 @@ public:
     {
         return mConfig.completionCalibration.enabled && mConfig.completionCalibration.active;
     }
+    bool contextualCompletionAuthorityPredictsIncumbent() const noexcept
+    {
+        return mConfig.completionCalibration.authorityPredictsIncumbent;
+    }
+    PhaseContextualCompletionEstimate contextualCompletionAuthorityEstimate(
+        PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate estimate) const noexcept;
 
     //! Record the decode component separately from a combined action makespan.
     void observeDecode(
@@ -134,6 +140,8 @@ public:
     void reset();
 
 private:
+    PhaseContextualPdFeatures contextualCompletionFeaturesForPolicy(PhaseContextualPdFeatures features) const noexcept;
+
     struct DecodeKey
     {
         int32_t batchSize{};
