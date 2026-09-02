@@ -103,6 +103,10 @@ double robustCompletionUs(PhaseGlobalActionCandidate const& candidate) noexcept
 
 double actionMakespanUs(PhaseGlobalActionCandidate const& candidate) noexcept
 {
+    if (candidate.decisionCostKnown && candidate.decisionMakespanUs > 0.0)
+    {
+        return candidate.decisionMakespanUs;
+    }
     double const makespan
         = candidate.predictedMakespanUs > 0.0 ? candidate.predictedMakespanUs : candidate.predictedBlockingUs;
     return std::max(0.0, makespan);
@@ -142,10 +146,50 @@ double predictedViolationUs(PhaseGlobalActionCandidate const& candidate, double 
     return std::max(0.0, robustCompletionUs(candidate) + deadlineGuardUs - candidate.minimumProtectedSlackUs);
 }
 
+uint32_t predictedViolationMask(PhaseGlobalActionCandidate const& candidate, double deadlineGuardUs) noexcept
+{
+    uint32_t mask{};
+    for (PhaseProtectedCompletion const& completion : candidate.protectedCompletions)
+    {
+        if (!std::isfinite(completion.slackUs))
+        {
+            continue;
+        }
+        double const robustCompletion
+            = std::max(0.0, completion.predictedCompletionUs) + std::max(0.0, completion.uncertaintyUs);
+        if (robustCompletion + deadlineGuardUs > completion.slackUs)
+        {
+            mask |= uint32_t{1U} << static_cast<uint32_t>(completion.kind);
+        }
+    }
+    return mask;
+}
+
 double serviceCompression(PhaseGlobalActionCandidate const& candidate) noexcept
 {
     double const makespan = std::max(selectionHorizonUs(candidate), std::numeric_limits<double>::epsilon());
     return std::max(0.0, selectionReferenceWorkUs(candidate)) / makespan;
+}
+
+double protectedSlackPressure(PhaseGlobalActionCandidate const& candidate) noexcept
+{
+    double pressure{};
+    for (PhaseProtectedCompletion const& completion : candidate.protectedCompletions)
+    {
+        double const robustCompletion = completion.predictedCompletionUs + completion.uncertaintyUs;
+        if (completion.slackUs <= 0.0)
+        {
+            return robustCompletion > 0.0 ? std::numeric_limits<double>::infinity() : pressure;
+        }
+        pressure = std::max(pressure, robustCompletion / completion.slackUs);
+    }
+    return pressure;
+}
+
+bool isSlackConstrained(double pressure) noexcept
+{
+    constexpr double kPROTECTED_SLACK_PRESSURE_THRESHOLD = 0.5;
+    return pressure >= kPROTECTED_SLACK_PRESSURE_THRESHOLD;
 }
 
 bool hardFeasible(PhaseGlobalActionCandidate const& candidate) noexcept
@@ -154,7 +198,8 @@ bool hardFeasible(PhaseGlobalActionCandidate const& candidate) noexcept
     {
         return false;
     }
-    if (isOverlap(candidate.key.kind) && !candidate.overlapCostKnown && !candidate.safeProbeEligible)
+    if (isOverlap(candidate.key.kind) && !candidate.overlapCostKnown && !candidate.decisionCostKnown
+        && !candidate.safeProbeEligible)
     {
         return false;
     }
@@ -173,12 +218,15 @@ bool dominates(
     double const rightViolation = predictedViolationUs(right, deadlineGuardUs);
     size_t const leftPeak = hardPeakManagedBytes(left.memory);
     size_t const rightPeak = hardPeakManagedBytes(right.memory);
-    bool const noWorse = leftViolation <= rightViolation && selectionHorizonUs(left) <= selectionHorizonUs(right)
+    double const leftPressure = protectedSlackPressure(left);
+    double const rightPressure = protectedSlackPressure(right);
+    bool const noWorse = leftViolation <= rightViolation && leftPressure <= rightPressure
+        && selectionHorizonUs(left) <= selectionHorizonUs(right)
         && selectionReferenceWorkUs(left) >= selectionReferenceWorkUs(right) && leftPeak <= rightPeak
         && left.uncertaintyUs <= right.uncertaintyUs;
     bool const strictlyBetter = leftViolation < rightViolation || selectionHorizonUs(left) < selectionHorizonUs(right)
         || selectionReferenceWorkUs(left) > selectionReferenceWorkUs(right) || leftPeak < rightPeak
-        || left.uncertaintyUs < right.uncertaintyUs;
+        || left.uncertaintyUs < right.uncertaintyUs || leftPressure < rightPressure;
     return noWorse && strictlyBetter;
 }
 
@@ -266,6 +314,18 @@ char const* phaseExecutionVariantName(PhaseExecutionVariant variant) noexcept
     return result;
 }
 
+char const* phaseGlobalResidualAnchorName(PhaseGlobalResidualAnchor anchor) noexcept
+{
+    char const* result = "unknown";
+    switch (anchor)
+    {
+    case PhaseGlobalResidualAnchor::kNone: result = "none"; break;
+    case PhaseGlobalResidualAnchor::kPrefill: result = "prefill"; break;
+    case PhaseGlobalResidualAnchor::kDecode: result = "decode"; break;
+    }
+    return result;
+}
+
 uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noexcept
 {
     uint64_t result = static_cast<uint64_t>(candidate.key.kind);
@@ -277,6 +337,7 @@ uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noe
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.executionVariant));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryWorkClass));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.residualAugmentation));
+    result = hashCombine(result, static_cast<uint64_t>(candidate.key.residualAnchor));
     for (uint64_t const requestId : candidate.primaryRequestIds)
     {
         result = hashCombine(result, requestId);
@@ -317,7 +378,8 @@ void phaseGlobalFinalizeCandidate(PhaseGlobalActionCandidate& candidate)
 
 bool PhaseGlobalDispatchPlan::permits(PhaseExecutionSet phases) const noexcept
 {
-    return phaseExecutionSetIsSubset(phases, allowedOutstanding);
+    return incrementalAction.legal() && phaseExecutionSetIsSubset(phases, allowedOutstanding)
+        && allowedOutstanding == incrementalAction.key.plannedOutstanding;
 }
 
 bool PhaseGlobalDispatchPlan::launchMatches(PhaseExecutionSet phases) const noexcept
@@ -325,8 +387,9 @@ bool PhaseGlobalDispatchPlan::launchMatches(PhaseExecutionSet phases) const noex
     return phases == launched && permits(phases);
 }
 
-PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
-    uint64_t planId, uint64_t snapshotEpoch, PhaseGlobalActionCandidate const& candidate)
+PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
+    PhaseGlobalActionCandidate const& candidate, PhaseExecutionSet outstandingBefore,
+    PhaseUnifiedActionDirection direction, PhaseStartSkewBucket startSkew)
 {
     PhaseGlobalDispatchPlan result;
     result.planId = planId;
@@ -335,11 +398,16 @@ PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
     result.action = candidate.key.kind;
     result.allowedOutstanding = phaseExecutionSetForAction(candidate.key.kind);
     result.launched = result.allowedOutstanding;
+    result.incrementalAction = phaseIncrementalActionForDispatch(
+        outstandingBefore, result.candidateId, candidate.key.kind, direction, startSkew);
     result.waitEventId = candidate.waitEventId;
     result.primaryRequestIds = candidate.primaryRequestIds;
     result.secondaryRequestIds = candidate.secondaryRequestIds;
     result.primaryStableSlotIds = candidate.primaryStableSlotIds;
     result.secondaryStableSlotIds = candidate.secondaryStableSlotIds;
+    result.contextualPdFeatures = candidate.contextualPdFeatures;
+    result.contextualPdFeatureValid = candidate.contextualPdFeatureValid;
+    result.contextualPdExploration = candidate.contextualPdExploration;
     return result;
 }
 
@@ -376,9 +444,11 @@ PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
 }
 
 std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
-    PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept
+    PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation,
+    PhaseStartSkewBucket startSkew) noexcept
 {
-    if (active.launched != phaseExecutionSetForAction(active.action) || active.allowedOutstanding != active.launched)
+    if (!active.incrementalAction.legal() || active.launched != phaseExecutionSetForAction(active.action)
+        || active.allowedOutstanding != active.launched)
     {
         return std::nullopt;
     }
@@ -405,7 +475,20 @@ std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t
     {
         return std::nullopt;
     }
-    PhaseGlobalDispatchPlan result = phaseGlobalDispatchPlan(planId, snapshotEpoch, augmentation);
+    PhaseExecutionSet const augmentationSet = phaseExecutionSetForAction(augmentation.key.kind);
+    PhaseExecutionSet const newcomer = static_cast<PhaseExecutionSet>(
+        static_cast<uint8_t>(augmentationSet) & static_cast<uint8_t>(~static_cast<uint8_t>(active.launched)));
+    PhaseUnifiedPhase const newcomerPhase = newcomer == PhaseExecutionSet::kEncoder ? PhaseUnifiedPhase::kEncoder
+        : newcomer == PhaseExecutionSet::kPrefill                                   ? PhaseUnifiedPhase::kPrefill
+        : newcomer == PhaseExecutionSet::kDecode                                    ? PhaseUnifiedPhase::kDecode
+                                                                                    : PhaseUnifiedPhase::kNone;
+    PhaseUnifiedActionDirection const direction = phaseUnifiedActionDirection(active.launched, newcomerPhase);
+    PhaseGlobalDispatchPlan result
+        = phaseGlobalDispatchPlan(planId, snapshotEpoch, augmentation, active.launched, direction, startSkew);
+    if (!result.incrementalAction.legal())
+    {
+        return std::nullopt;
+    }
     return result;
 }
 
@@ -442,10 +525,10 @@ char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status
 bool PhaseGlobalActionKey::operator==(PhaseGlobalActionKey const& other) const noexcept
 {
     return std::tie(kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket,
-               secondaryContextBucket, executionVariant, primaryWorkClass, residualAugmentation)
+               secondaryContextBucket, executionVariant, primaryWorkClass, residualAugmentation, residualAnchor)
         == std::tie(other.kind, other.primaryBatchSize, other.secondaryBatchSize, other.chunkLength,
             other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant, other.primaryWorkClass,
-            other.residualAugmentation);
+            other.residualAugmentation, other.residualAnchor);
 }
 
 PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept
@@ -477,6 +560,7 @@ size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key
     combine(static_cast<int32_t>(key.executionVariant));
     combine(key.primaryWorkClass);
     combine(static_cast<int32_t>(key.residualAugmentation));
+    combine(static_cast<int32_t>(key.residualAnchor));
     return result;
 }
 
@@ -505,6 +589,9 @@ void PhaseGlobalCostModel::observe(PhaseGlobalActionKey const& key, PhaseGlobalC
         samples.values.pop_front();
     }
     mCoveringContextCache.clear();
+    mCoveringPrimaryCache.clear();
+    mPrimaryLaunchFloorCache.clear();
+    mCoveringOverlapCache.clear();
 }
 
 std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimate(PhaseGlobalActionKey const& key) const
@@ -550,7 +637,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolate
             || observedKey.secondaryContextBucket != target.secondaryContextBucket
             || observedKey.executionVariant != target.executionVariant
             || observedKey.primaryWorkClass != target.primaryWorkClass
-            || observedKey.residualAugmentation != target.residualAugmentation)
+            || observedKey.residualAugmentation != target.residualAugmentation
+            || observedKey.residualAnchor != target.residualAnchor)
         {
             continue;
         }
@@ -617,7 +705,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryBatc
             || observedKey.secondaryContextBucket != target.secondaryContextBucket
             || observedKey.executionVariant != target.executionVariant
             || observedKey.primaryWorkClass != target.primaryWorkClass
-            || observedKey.residualAugmentation != target.residualAugmentation)
+            || observedKey.residualAugmentation != target.residualAugmentation
+            || observedKey.residualAnchor != target.residualAnchor)
         {
             continue;
         }
@@ -676,6 +765,215 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryBatc
     return batchIndex < inserted->second.size() ? inserted->second[batchIndex] : std::nullopt;
 }
 
+std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringOverlap(
+    PhaseGlobalActionKey const& key) const
+{
+    PhaseGlobalActionKey const target = phaseGlobalCanonicalOverlapCostKey(key);
+    if (!isOverlap(target.kind))
+    {
+        return std::nullopt;
+    }
+    auto const cached = mCoveringOverlapCache.find(target);
+    if (cached != mCoveringOverlapCache.end())
+    {
+        return cached->second;
+    }
+
+    struct Cover
+    {
+        PhaseGlobalActionKey key;
+        PhaseGlobalCostEstimate estimate;
+    };
+    std::vector<Cover> covers;
+    for (auto const& [observedKey, samples] : *mSamples)
+    {
+        bool const semanticMatch = !samples.values.empty() && observedKey.kind == target.kind
+            && observedKey.executionVariant == target.executionVariant
+            && observedKey.primaryWorkClass == target.primaryWorkClass
+            && observedKey.residualAugmentation == target.residualAugmentation
+            && observedKey.residualAnchor == target.residualAnchor;
+        bool const geometryCovers = observedKey.primaryBatchSize >= target.primaryBatchSize
+            && observedKey.secondaryBatchSize >= target.secondaryBatchSize
+            && observedKey.chunkLength >= target.chunkLength
+            && observedKey.primaryContextBucket >= target.primaryContextBucket
+            && observedKey.secondaryContextBucket >= target.secondaryContextBucket;
+        if (!semanticMatch || !geometryCovers)
+        {
+            continue;
+        }
+        if (std::optional<PhaseGlobalCostEstimate> const observed = estimate(observedKey))
+        {
+            covers.push_back({observedKey, *observed});
+        }
+    }
+
+    auto geometryNoLarger = [](PhaseGlobalActionKey const& left, PhaseGlobalActionKey const& right) {
+        return left.primaryBatchSize <= right.primaryBatchSize && left.secondaryBatchSize <= right.secondaryBatchSize
+            && left.chunkLength <= right.chunkLength && left.primaryContextBucket <= right.primaryContextBucket
+            && left.secondaryContextBucket <= right.secondaryContextBucket;
+    };
+    auto geometrySmaller = [&](PhaseGlobalActionKey const& left, PhaseGlobalActionKey const& right) {
+        return geometryNoLarger(left, right) && !(geometryNoLarger(right, left));
+    };
+
+    std::optional<PhaseGlobalCostEstimate> result;
+    for (Cover const& cover : covers)
+    {
+        bool dominated{};
+        for (Cover const& other : covers)
+        {
+            if (&cover != &other && geometrySmaller(other.key, cover.key))
+            {
+                dominated = true;
+                break;
+            }
+        }
+        if (dominated)
+        {
+            continue;
+        }
+        if (!result.has_value())
+        {
+            result = cover.estimate;
+            continue;
+        }
+        result->sampleCount = std::min(result->sampleCount, cover.estimate.sampleCount);
+        result->referenceWorkMedianMs = std::min(result->referenceWorkMedianMs, cover.estimate.referenceWorkMedianMs);
+        result->makespanMedianMs = std::max(result->makespanMedianMs, cover.estimate.makespanMedianMs);
+        result->makespanP95Ms = std::max(result->makespanP95Ms, cover.estimate.makespanP95Ms);
+        result->uncertaintyMs = std::max(result->uncertaintyMs, cover.estimate.uncertaintyMs);
+        result->uncertaintyMs = std::max(result->uncertaintyMs, result->makespanP95Ms - result->makespanMedianMs);
+    }
+    mCoveringOverlapCache.emplace(target, result);
+    return result;
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringPrimary(
+    PhaseGlobalActionKey const& key) const
+{
+    PhaseGlobalActionKey const target = phaseGlobalCanonicalOverlapCostKey(key);
+    if (isOverlap(target.kind) || target.kind == PhaseGlobalActionKind::kNone
+        || target.kind == PhaseGlobalActionKind::kWait)
+    {
+        return std::nullopt;
+    }
+    auto const cached = mCoveringPrimaryCache.find(target);
+    if (cached != mCoveringPrimaryCache.end())
+    {
+        return cached->second;
+    }
+
+    struct Cover
+    {
+        PhaseGlobalActionKey key;
+        PhaseGlobalCostEstimate estimate;
+    };
+    std::vector<Cover> covers;
+    for (auto const& [observedKey, samples] : *mSamples)
+    {
+        bool const semanticMatch = !samples.values.empty() && observedKey.kind == target.kind
+            && observedKey.secondaryBatchSize == target.secondaryBatchSize
+            && observedKey.secondaryContextBucket == target.secondaryContextBucket
+            && observedKey.executionVariant == target.executionVariant
+            && observedKey.primaryWorkClass == target.primaryWorkClass
+            && observedKey.residualAugmentation == target.residualAugmentation
+            && observedKey.residualAnchor == target.residualAnchor;
+        bool const geometryCovers = observedKey.primaryBatchSize >= target.primaryBatchSize
+            && observedKey.chunkLength >= target.chunkLength
+            && observedKey.primaryContextBucket >= target.primaryContextBucket;
+        if (!semanticMatch || !geometryCovers)
+        {
+            continue;
+        }
+        if (std::optional<PhaseGlobalCostEstimate> const observed = estimate(observedKey))
+        {
+            covers.push_back({observedKey, *observed});
+        }
+    }
+
+    auto geometryNoLarger = [](PhaseGlobalActionKey const& left, PhaseGlobalActionKey const& right) {
+        return left.primaryBatchSize <= right.primaryBatchSize && left.chunkLength <= right.chunkLength
+            && left.primaryContextBucket <= right.primaryContextBucket;
+    };
+    auto geometrySmaller = [&](PhaseGlobalActionKey const& left, PhaseGlobalActionKey const& right) {
+        return geometryNoLarger(left, right) && !geometryNoLarger(right, left);
+    };
+
+    std::optional<PhaseGlobalCostEstimate> result;
+    for (Cover const& cover : covers)
+    {
+        bool dominated{};
+        for (Cover const& other : covers)
+        {
+            if (&cover != &other && geometrySmaller(other.key, cover.key))
+            {
+                dominated = true;
+                break;
+            }
+        }
+        if (dominated)
+        {
+            continue;
+        }
+        if (!result.has_value())
+        {
+            result = cover.estimate;
+            continue;
+        }
+        result->sampleCount = std::min(result->sampleCount, cover.estimate.sampleCount);
+        result->referenceWorkMedianMs = std::max(result->referenceWorkMedianMs, cover.estimate.referenceWorkMedianMs);
+        result->makespanMedianMs = std::max(result->makespanMedianMs, cover.estimate.makespanMedianMs);
+        result->makespanP95Ms = std::max(result->makespanP95Ms, cover.estimate.makespanP95Ms);
+        result->uncertaintyMs = std::max(result->uncertaintyMs, cover.estimate.uncertaintyMs);
+        result->uncertaintyMs = std::max(result->uncertaintyMs, result->makespanP95Ms - result->makespanMedianMs);
+    }
+    mCoveringPrimaryCache.emplace(target, result);
+    return result;
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryLaunchFloor(
+    PhaseGlobalActionKey const& key) const
+{
+    PhaseGlobalActionKey target = phaseGlobalCanonicalOverlapCostKey(key);
+    if (isOverlap(target.kind) || target.kind == PhaseGlobalActionKind::kNone
+        || target.kind == PhaseGlobalActionKind::kWait)
+    {
+        return std::nullopt;
+    }
+    target.primaryBatchSize = 0;
+    target.secondaryBatchSize = 0;
+    target.chunkLength = 0;
+    target.primaryContextBucket = 0;
+    target.secondaryContextBucket = 0;
+    auto const cached = mPrimaryLaunchFloorCache.find(target);
+    if (cached != mPrimaryLaunchFloorCache.end())
+    {
+        return cached->second;
+    }
+
+    std::optional<PhaseGlobalCostEstimate> result;
+    for (auto const& [observedKey, samples] : *mSamples)
+    {
+        bool const semanticMatch = !samples.values.empty() && observedKey.kind == target.kind
+            && observedKey.executionVariant == target.executionVariant
+            && observedKey.primaryWorkClass == target.primaryWorkClass
+            && observedKey.residualAugmentation == target.residualAugmentation
+            && observedKey.residualAnchor == target.residualAnchor;
+        if (!semanticMatch)
+        {
+            continue;
+        }
+        std::optional<PhaseGlobalCostEstimate> const observed = estimate(observedKey);
+        if (!observed.has_value() || (result.has_value() && observed->makespanMedianMs >= result->makespanMedianMs))
+        {
+            continue;
+        }
+        result = observed;
+    }
+    mPrimaryLaunchFloorCache.emplace(target, result);
+    return result;
+}
+
 bool PhaseGlobalCostModel::overlapEligible(PhaseGlobalActionKey const& key) const
 {
     return !isOverlap(key.kind) || overlapDiagnostic(key).status == PhaseGlobalOverlapCostStatus::kEligible;
@@ -705,6 +1003,9 @@ PhaseGlobalOverlapCostDiagnostic PhaseGlobalCostModel::overlapDiagnostic(PhaseGl
 void PhaseGlobalCostModel::reset()
 {
     mCoveringContextCache.clear();
+    mCoveringPrimaryCache.clear();
+    mPrimaryLaunchFloorCache.clear();
+    mCoveringOverlapCache.clear();
     if (mSamples.unique())
     {
         mSamples->clear();
@@ -756,7 +1057,27 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
         }
     }
     decision.deadlineSafeCandidates = safe.size();
-    std::vector<size_t> frontier = safe.empty() ? feasible : safe;
+    // Exploration is an explicit candidate property, not a second policy
+    // authority after selection. Candidate generation has already enforced
+    // the observation interval and either robust slack or all-late recovery
+    // guard. Prefer one such bounded probe here so exploration cannot become
+    // a post-selection policy override.
+    std::vector<size_t> exploration;
+    for (size_t const index : feasible)
+    {
+        PhaseGlobalActionCandidate const& candidate = candidates[index];
+        bool const unknownProbe
+            = candidate.safeProbeEligible && !candidate.overlapCostKnown && !candidate.decisionCostKnown;
+        // Candidate generation has already applied the process-local probe
+        // interval and either the robust slack guard or the all-late recovery
+        // guard. Keep this exploration inside the selector so there is one
+        // policy authority even when every candidate currently violates SLO.
+        if (unknownProbe)
+        {
+            exploration.push_back(index);
+        }
+    }
+    std::vector<size_t> frontier = !exploration.empty() ? exploration : safe.empty() ? feasible : safe;
     std::vector<size_t> pruned;
     for (size_t const right : frontier)
     {
@@ -783,14 +1104,47 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
     auto betterSafe = [&](size_t left, size_t right) {
         PhaseGlobalActionCandidate const& lhs = candidates[left];
         PhaseGlobalActionCandidate const& rhs = candidates[right];
+        double const lhsPressure = protectedSlackPressure(lhs);
+        double const rhsPressure = protectedSlackPressure(rhs);
+        if (lhsPressure != rhsPressure && (isSlackConstrained(lhsPressure) || isSlackConstrained(rhsPressure)))
+        {
+            return lhsPressure < rhsPressure;
+        }
         double const lhsCompression = serviceCompression(lhs);
         double const rhsCompression = serviceCompression(rhs);
+        if (lhsCompression != rhsCompression)
+        {
+            return lhsCompression > rhsCompression;
+        }
         size_t const lhsReclaim = saturatedAdd(
             lhs.memory.immediateReclaimObserved ? lhs.memory.immediateReclaimBytes : 0U, lhs.memory.nearReclaimBytes);
         size_t const rhsReclaim = saturatedAdd(
             rhs.memory.immediateReclaimObserved ? rhs.memory.immediateReclaimBytes : 0U, rhs.memory.nearReclaimBytes);
-        auto const lhsRank = std::tie(lhsCompression, lhsReclaim, lhs.requestServiceLagUs);
-        auto const rhsRank = std::tie(rhsCompression, rhsReclaim, rhs.requestServiceLagUs);
+        auto const lhsRank = std::tie(lhsReclaim, lhs.requestServiceLagUs);
+        auto const rhsRank = std::tie(rhsReclaim, rhs.requestServiceLagUs);
+        if (lhsRank != rhsRank)
+        {
+            return lhsRank > rhsRank;
+        }
+        uint64_t const lhsId = lhs.candidateId != 0U ? lhs.candidateId : phaseGlobalCandidateId(lhs);
+        uint64_t const rhsId = rhs.candidateId != 0U ? rhs.candidateId : phaseGlobalCandidateId(rhs);
+        return lhsId < rhsId;
+    };
+    auto betterEfficiency = [&](size_t left, size_t right) {
+        PhaseGlobalActionCandidate const& lhs = candidates[left];
+        PhaseGlobalActionCandidate const& rhs = candidates[right];
+        double const lhsCompression = serviceCompression(lhs);
+        double const rhsCompression = serviceCompression(rhs);
+        if (lhsCompression != rhsCompression)
+        {
+            return lhsCompression > rhsCompression;
+        }
+        size_t const lhsReclaim = saturatedAdd(
+            lhs.memory.immediateReclaimObserved ? lhs.memory.immediateReclaimBytes : 0U, lhs.memory.nearReclaimBytes);
+        size_t const rhsReclaim = saturatedAdd(
+            rhs.memory.immediateReclaimObserved ? rhs.memory.immediateReclaimBytes : 0U, rhs.memory.nearReclaimBytes);
+        auto const lhsRank = std::tie(lhsReclaim, lhs.requestServiceLagUs);
+        auto const rhsRank = std::tie(rhsReclaim, rhs.requestServiceLagUs);
         if (lhsRank != rhsRank)
         {
             return lhsRank > rhsRank;
@@ -823,18 +1177,30 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
         return lhsId < rhsId;
     };
 
+    uint32_t const commonViolationMask
+        = safe.empty() ? predictedViolationMask(candidates[pruned.front()], mConfig.deadlineGuardUs) : 0U;
+    uint32_t const unknownViolationMask = uint32_t{1U} << static_cast<uint32_t>(PhaseProtectedKind::kUnknown);
+    bool const allLateSameProtectedSet = safe.empty() && commonViolationMask != 0U
+        && (commonViolationMask & unknownViolationMask) == 0U
+        && std::all_of(pruned.begin(), pruned.end(), [&](size_t index) {
+               return predictedViolationMask(candidates[index], mConfig.deadlineGuardUs) == commonViolationMask;
+           });
     size_t selected = pruned.front();
     for (size_t const index : pruned)
     {
-        if ((safe.empty() && betterViolation(index, selected)) || (!safe.empty() && betterSafe(index, selected)))
+        if ((allLateSameProtectedSet && betterEfficiency(index, selected))
+            || (safe.empty() && !allLateSameProtectedSet && betterViolation(index, selected))
+            || (!safe.empty() && betterSafe(index, selected)))
         {
             selected = index;
         }
     }
     PhaseGlobalActionCandidate const& candidate = candidates[selected];
     decision.selectedIndex = selected;
-    decision.reason = safe.empty() ? PhaseGlobalDecisionReason::kMinimumViolation
-                                   : PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
+    decision.reason = !exploration.empty() ? PhaseGlobalDecisionReason::kBoundedExploration
+        : allLateSameProtectedSet          ? PhaseGlobalDecisionReason::kAllLateEfficiencyRecovery
+        : safe.empty()                     ? PhaseGlobalDecisionReason::kMinimumViolation
+                                           : PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
     decision.predictedViolationUs = predictedViolationUs(candidate, mConfig.deadlineGuardUs);
     decision.serviceCompression = serviceCompression(candidate);
     decision.hardPeakManagedBytes = hardPeakManagedBytes(candidate.memory);

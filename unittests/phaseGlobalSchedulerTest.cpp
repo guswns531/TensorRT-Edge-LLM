@@ -17,6 +17,8 @@
 
 #include "runtime/scheduling/phaseGlobalScheduler.h"
 
+#include "runtime/phase/policy/phaseContextualPdModel.h"
+
 #include <gtest/gtest.h>
 
 namespace trt_edgellm::rt
@@ -42,6 +44,90 @@ TEST(PhaseGlobalSchedulerTest, RejectsBrokenMechanismInvariants)
     PhaseGlobalDecision const decision = scheduler.select({invalid});
     EXPECT_FALSE(decision.selectedIndex.has_value());
     EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kNoHardFeasibleCandidate);
+}
+
+TEST(PhaseGlobalSchedulerTest, ContextualDecisionCostCanGeneralizeAnUnknownOverlap)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kPrefill, 2000.0, 2000.0, 10000.0);
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kPrefillDecode, 4000.0, 4000.0, 10000.0);
+    overlap.overlapCostKnown = false;
+    overlap.decisionCostKnown = true;
+    overlap.decisionMakespanUs = 3000.0;
+
+    PhaseGlobalDecision const decision = scheduler.select({serial, overlap});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+}
+
+TEST(PhaseGlobalSchedulerTest, ContextualDecisionCostCannotBypassExactDeadlineProtection)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate safe = candidate(PhaseGlobalActionKind::kPrefill, 2000.0, 2000.0, 2500.0);
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kPrefillDecode, 4000.0, 4000.0, 2500.0);
+    overlap.overlapCostKnown = false;
+    overlap.decisionCostKnown = true;
+    overlap.decisionMakespanUs = 1000.0;
+
+    PhaseGlobalDecision const decision = scheduler.select({safe, overlap});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+}
+
+TEST(PhaseGlobalSchedulerTest, SelectsBoundedUnknownProbeInsideTheSingleSelector)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kPrefill, 5000.0, 1000.0, 10000.0);
+    PhaseGlobalActionCandidate probe = candidate(PhaseGlobalActionKind::kPrefillDecode, 2000.0, 1500.0, 10000.0);
+    probe.overlapCostKnown = false;
+    probe.safeProbeEligible = true;
+    probe.uncertaintyUs = 100.0;
+
+    PhaseGlobalDecision const decision = scheduler.select({serial, probe});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kBoundedExploration);
+}
+
+TEST(PhaseGlobalSchedulerTest, UsesOnlyExplicitlyEligibleProbeWhenEveryActionIsLate)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kPrefill, 5000.0, 1000.0, 3000.0);
+    PhaseGlobalActionCandidate probe = candidate(PhaseGlobalActionKind::kPrefillDecode, 2000.0, 2500.0, 3000.0);
+    probe.overlapCostKnown = false;
+    probe.safeProbeEligible = false;
+    probe.uncertaintyUs = 1000.0;
+
+    PhaseGlobalDecision const decision = scheduler.select({serial, probe});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+}
+
+TEST(PhaseGlobalSchedulerTest, ExploresLateProbeThatPassedTheCandidateRecoveryGuard)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kDecode, 5000.0, 4000.0, 3000.0);
+    PhaseGlobalActionCandidate probe = candidate(PhaseGlobalActionKind::kPrefillDecode, 6000.0, 4000.0, 3000.0);
+    probe.overlapCostKnown = false;
+    probe.safeProbeEligible = true;
+    probe.uncertaintyUs = 500.0;
+
+    PhaseGlobalDecision const decision = scheduler.select({serial, probe});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kBoundedExploration);
+}
+
+TEST(PhaseContextualPdModelTest, MapsConservativeAdvantageToBoundedDecisionMakespan)
+{
+    EXPECT_DOUBLE_EQ(phaseContextualDecisionMakespanUs(1000.0, 0.25), 750.0);
+    EXPECT_NEAR(phaseContextualDecisionMakespanUs(1000.0, 2.0), 50.0, 1.0e-9);
+    EXPECT_DOUBLE_EQ(phaseContextualDecisionMakespanUs(1000.0, -2.0), 2000.0);
 }
 
 TEST(PhaseGlobalSchedulerTest, DoesNotCountNearReclaimAsHardCapacity)
@@ -84,6 +170,29 @@ TEST(PhaseGlobalSchedulerTest, ProtectsRobustSlackBeforeEfficiency)
     PhaseGlobalDecision const decision = scheduler.select({efficient, safe});
     ASSERT_TRUE(decision.selectedIndex.has_value());
     EXPECT_EQ(*decision.selectedIndex, 1U);
+}
+
+TEST(PhaseGlobalSchedulerTest, PreservesMostConstrainedSlackWithinSafeCandidates)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate now = candidate(PhaseGlobalActionKind::kDecode, 8000.0, 2000.0, 10000.0);
+    now.predictedMakespanUs = 2000.0;
+    now.predictedHorizonUs = 5000.0;
+    now.horizonReferenceWorkUs = 8000.0;
+    now.protectedCompletions = {{10000.0, 2000.0, 0.0, PhaseProtectedKind::kDecode}};
+
+    PhaseGlobalActionCandidate wait = candidate(PhaseGlobalActionKind::kWait, 8000.0, 4000.0, 10000.0);
+    wait.predictedMakespanUs = 4000.0;
+    wait.predictedHorizonUs = 5000.0;
+    wait.horizonReferenceWorkUs = 8000.0;
+    wait.concreteWaitEvent = true;
+    wait.waitEventId = 7U;
+    wait.protectedCompletions = {{10000.0, 4000.0, 0.0, PhaseProtectedKind::kDecode}};
+
+    PhaseGlobalDecision const decision = scheduler.select({now, wait});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
 }
 
 TEST(PhaseGlobalSchedulerTest, UsesMinimumViolationWhenEveryActionIsLate)
@@ -260,6 +369,9 @@ TEST(PhaseGlobalSchedulerTest, MaterializesStableDispatchLease)
     EXPECT_EQ(plan.candidateId, action.candidateId);
     EXPECT_TRUE(plan.launchMatches(PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode));
     EXPECT_FALSE(plan.permits(PhaseExecutionSet::kEncoder));
+    EXPECT_TRUE(plan.incrementalAction.legal());
+    EXPECT_EQ(plan.incrementalAction.key.direction, PhaseUnifiedActionDirection::kPrefillToDecode);
+    EXPECT_EQ(plan.incrementalAction.key.startSkew, PhaseStartSkewBucket::kImmediate);
     EXPECT_EQ(plan.primaryRequestIds, action.primaryRequestIds);
     EXPECT_EQ(plan.secondaryRequestIds, action.secondaryRequestIds);
 }
@@ -304,6 +416,8 @@ TEST(PhaseGlobalSchedulerTest, UpgradesOnlySinglePdLeaseToMatchingEncoderOverlap
     EXPECT_EQ(upgraded->action, PhaseGlobalActionKind::kEncoderDecode);
     EXPECT_TRUE(upgraded->launchMatches(PhaseExecutionSet::kEncoder | PhaseExecutionSet::kDecode));
     EXPECT_FALSE(upgraded->permits(PhaseExecutionSet::kPrefill));
+    EXPECT_TRUE(upgraded->incrementalAction.legal());
+    EXPECT_EQ(upgraded->incrementalAction.key.direction, PhaseUnifiedActionDirection::kDecodeToEncoder);
 
     overlap.key.kind = PhaseGlobalActionKind::kEncoderPrefill;
     phaseGlobalFinalizeCandidate(overlap);
@@ -355,18 +469,58 @@ TEST(PhaseGlobalSchedulerTest, SelectsKnownResidualAugmentationForFirstTokenDead
     PhaseGlobalScheduler scheduler;
     PhaseGlobalActionCandidate continuation = candidate(PhaseGlobalActionKind::kDecode, 4000.0, 4000.0, 10000.0);
     continuation.predictedMakespanUs = 4000.0;
-    continuation.protectedCompletions = {{5000.0, 11000.0, 0.0}};
+    continuation.protectedCompletions = {{5000.0, 11000.0, 0.0, PhaseProtectedKind::kPrefill}};
     PhaseGlobalActionCandidate augmentation
         = candidate(PhaseGlobalActionKind::kEncoderDecode, 14000.0, 7000.0, 10000.0);
     augmentation.key.residualAugmentation = true;
     augmentation.predictedMakespanUs = 7000.0;
-    augmentation.protectedCompletions = {{5000.0, 7000.0, 0.0}};
+    augmentation.protectedCompletions = {{5000.0, 7000.0, 0.0, PhaseProtectedKind::kPrefill}};
 
     PhaseGlobalDecision const decision = scheduler.select({continuation, augmentation});
 
     ASSERT_TRUE(decision.selectedIndex.has_value());
     EXPECT_EQ(*decision.selectedIndex, 1U);
-    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kMinimumViolation);
+    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kAllLateEfficiencyRecovery);
+}
+
+TEST(PhaseGlobalSchedulerTest, RecoversEfficiencyWhenEveryActionMissesTheSameProtectedPhase)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kPrefill, 20000.0, 20000.0, 5000.0);
+    serial.predictedHorizonUs = 20000.0;
+    serial.horizonReferenceWorkUs = 20000.0;
+    serial.protectedCompletions = {{5000.0, 10000.0, 0.0, PhaseProtectedKind::kPrefill}};
+    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kPrefillDecode, 20000.0, 10000.0, 5000.0);
+    overlap.overlapCostKnown = true;
+    overlap.overlapCostProfitable = true;
+    overlap.protectedCompletions = {{5000.0, 12000.0, 0.0, PhaseProtectedKind::kPrefill}};
+
+    PhaseGlobalDecision const decision = scheduler.select({serial, overlap});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kAllLateEfficiencyRecovery);
+}
+
+TEST(PhaseGlobalSchedulerTest, SelectsMeasuredUnprofitableResidualForSmallerDeadlineViolation)
+{
+    PhaseGlobalScheduler scheduler;
+    PhaseGlobalActionCandidate continuation = candidate(PhaseGlobalActionKind::kDecode, 4000.0, 4000.0, 10000.0);
+    continuation.predictedMakespanUs = 4000.0;
+    continuation.protectedCompletions = {{5000.0, 11000.0, 0.0, PhaseProtectedKind::kPrefill}};
+    PhaseGlobalActionCandidate augmentation = candidate(PhaseGlobalActionKind::kPrefillDecode, 6000.0, 7000.0, 10000.0);
+    augmentation.key.residualAugmentation = true;
+    augmentation.key.residualAnchor = PhaseGlobalResidualAnchor::kDecode;
+    augmentation.overlapCostKnown = true;
+    augmentation.overlapCostProfitable = false;
+    augmentation.predictedMakespanUs = 7000.0;
+    augmentation.protectedCompletions = {{5000.0, 7000.0, 0.0, PhaseProtectedKind::kPrefill}};
+
+    PhaseGlobalDecision const decision = scheduler.select({continuation, augmentation});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+    EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kAllLateEfficiencyRecovery);
 }
 
 TEST(PhaseGlobalSchedulerTest, KeepsActivePhaseWhenResidualOverlapCostIsUnknown)
@@ -394,6 +548,21 @@ TEST(PhaseGlobalSchedulerTest, CandidateIdentityPreservesCanonicalRowOrder)
     EXPECT_EQ(phaseGlobalCandidateId(first), phaseGlobalCandidateId(first));
 }
 
+TEST(PhaseGlobalSchedulerTest, CandidateIdentityChangesOnlyForConcreteResidualAnchor)
+{
+    PhaseGlobalActionCandidate ordinary = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, 10000.0);
+    PhaseGlobalActionCandidate implicitNone = ordinary;
+    implicitNone.key.residualAnchor = PhaseGlobalResidualAnchor::kNone;
+    EXPECT_EQ(phaseGlobalCandidateId(ordinary), phaseGlobalCandidateId(implicitNone));
+
+    PhaseGlobalActionCandidate residualPrefill = ordinary;
+    residualPrefill.key.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    PhaseGlobalActionCandidate residualDecode = ordinary;
+    residualDecode.key.residualAnchor = PhaseGlobalResidualAnchor::kDecode;
+    EXPECT_NE(phaseGlobalCandidateId(ordinary), phaseGlobalCandidateId(residualPrefill));
+    EXPECT_NE(phaseGlobalCandidateId(residualPrefill), phaseGlobalCandidateId(residualDecode));
+}
+
 TEST(PhaseGlobalCostModelTest, RecordsRobustDirectOverlapEligibility)
 {
     PhaseGlobalCostModel model({8U, 4U, 2.0F, 0.02F});
@@ -408,6 +577,26 @@ TEST(PhaseGlobalCostModelTest, RecordsRobustDirectOverlapEligibility)
     EXPECT_EQ(estimate->sampleCount, 4U);
     EXPECT_GT(estimate->uncertaintyMs, 0.0F);
     EXPECT_TRUE(model.overlapEligible(key));
+}
+
+TEST(PhaseGlobalCostModelTest, SeparatesResidualAnchorDirections)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.0F});
+    PhaseGlobalActionKey prefillAnchor{PhaseGlobalActionKind::kPrefillDecode, 2, 16, 128, 1, 2};
+    prefillAnchor.residualAugmentation = true;
+    prefillAnchor.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    PhaseGlobalActionKey decodeAnchor = prefillAnchor;
+    decodeAnchor.residualAnchor = PhaseGlobalResidualAnchor::kDecode;
+
+    model.observe(prefillAnchor, {10.0F, 8.0F});
+
+    EXPECT_TRUE(model.estimate(prefillAnchor).has_value());
+    EXPECT_FALSE(model.estimate(decodeAnchor).has_value());
+    PhaseGlobalActionCandidate prefillCandidate;
+    prefillCandidate.key = prefillAnchor;
+    PhaseGlobalActionCandidate decodeCandidate;
+    decodeCandidate.key = decodeAnchor;
+    EXPECT_NE(phaseGlobalCandidateId(prefillCandidate), phaseGlobalCandidateId(decodeCandidate));
 }
 
 TEST(PhaseGlobalCostModelTest, CopyOnWritePreservesPreviewIsolation)
@@ -535,6 +724,104 @@ TEST(PhaseGlobalCostModelTest, UsesSmallestObservedContextThatCoversDecodeReques
     EXPECT_FLOAT_EQ(model.estimatePrimaryBatchCoveringContext(requested)->makespanMedianMs, 5.0F);
     requested.primaryContextBucket = 9;
     EXPECT_FALSE(model.estimatePrimaryBatchCoveringContext(requested).has_value());
+}
+
+TEST(PhaseGlobalCostModelTest, PreservesMeasuredLaunchCostForRaggedPrefill)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});
+    PhaseGlobalActionKey observed{PhaseGlobalActionKind::kPrefill, 1, 0, 64, 1, 0};
+    observed.primaryWorkClass = 1;
+    model.observe(observed, {10.0F, 10.0F});
+
+    PhaseGlobalActionKey requested = observed;
+    requested.chunkLength = 3;
+    requested.primaryContextBucket = 0;
+    std::optional<PhaseGlobalCostEstimate> const estimate = model.estimateCoveringPrimary(requested);
+
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 10.0F);
+    PhaseGlobalActionKey larger = requested;
+    larger.chunkLength = 65;
+    EXPECT_FALSE(model.estimateCoveringPrimary(larger).has_value());
+    PhaseGlobalActionKey wrongClass = requested;
+    wrongClass.primaryWorkClass = 2;
+    EXPECT_FALSE(model.estimateCoveringPrimary(wrongClass).has_value());
+}
+
+TEST(PhaseGlobalCostModelTest, ConservativelyMergesIncomparablePrimaryCovers)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});
+    PhaseGlobalActionKey requested{PhaseGlobalActionKind::kPrefill, 1, 0, 32, 0, 0};
+    PhaseGlobalActionKey moreBatch = requested;
+    moreBatch.primaryBatchSize = 8;
+    PhaseGlobalActionKey moreTokens = requested;
+    moreTokens.chunkLength = 128;
+    model.observe(moreBatch, {12.0F, 12.0F});
+    model.observe(moreTokens, {10.0F, 10.0F});
+
+    std::optional<PhaseGlobalCostEstimate> const estimate = model.estimateCoveringPrimary(requested);
+
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 12.0F);
+}
+
+TEST(PhaseGlobalCostModelTest, LearnsGeometryIndependentPrimaryLaunchFloor)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});
+    PhaseGlobalActionKey initial{PhaseGlobalActionKind::kPrefill, 1, 0, 33, 0, 0};
+    initial.primaryWorkClass = 1;
+    PhaseGlobalActionKey large = initial;
+    large.primaryBatchSize = 8;
+    large.chunkLength = 128;
+    model.observe(initial, {10.0F, 10.0F});
+    model.observe(large, {20.0F, 20.0F});
+
+    PhaseGlobalActionKey continuation = initial;
+    continuation.primaryBatchSize = 2;
+    continuation.chunkLength = 3;
+    continuation.primaryContextBucket = 4;
+    std::optional<PhaseGlobalCostEstimate> const floor = model.estimatePrimaryLaunchFloor(continuation);
+
+    ASSERT_TRUE(floor.has_value());
+    EXPECT_FLOAT_EQ(floor->makespanMedianMs, 10.0F);
+    continuation.executionVariant = PhaseExecutionVariant::kPrimaryGraph;
+    EXPECT_FALSE(model.estimatePrimaryLaunchFloor(continuation).has_value());
+}
+
+TEST(PhaseGlobalCostModelTest, ConservativelyMergesNearestCoveringOverlapShapes)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});
+    PhaseGlobalActionKey requested{PhaseGlobalActionKind::kPrefillDecode, 2, 16, 64, 1, 2};
+    requested.residualAugmentation = true;
+    requested.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    EXPECT_FALSE(model.estimateCoveringOverlap(requested).has_value());
+
+    PhaseGlobalActionKey moreDecode = requested;
+    moreDecode.primaryBatchSize = 4;
+    moreDecode.secondaryBatchSize = 64;
+    moreDecode.chunkLength = 128;
+    moreDecode.primaryContextBucket = 2;
+    moreDecode.secondaryContextBucket = 4;
+    PhaseGlobalActionKey morePrefill = requested;
+    morePrefill.primaryBatchSize = 8;
+    morePrefill.secondaryBatchSize = 32;
+    morePrefill.chunkLength = 128;
+    morePrefill.primaryContextBucket = 4;
+    morePrefill.secondaryContextBucket = 4;
+    model.observe(moreDecode, {30.0F, 12.0F});
+    model.observe(morePrefill, {28.0F, 15.0F});
+
+    std::optional<PhaseGlobalCostEstimate> const estimate = model.estimateCoveringOverlap(requested);
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_FLOAT_EQ(estimate->referenceWorkMedianMs, 28.0F);
+    EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 15.0F);
+
+    PhaseGlobalActionKey wrongAnchor = requested;
+    wrongAnchor.residualAnchor = PhaseGlobalResidualAnchor::kDecode;
+    EXPECT_FALSE(model.estimateCoveringOverlap(wrongAnchor).has_value());
+    PhaseGlobalActionKey largerThanEveryObservation = requested;
+    largerThanEveryObservation.secondaryBatchSize = 128;
+    EXPECT_FALSE(model.estimateCoveringOverlap(largerThanEveryObservation).has_value());
 }
 
 TEST(PhaseGlobalCostModelTest, SharesOverlapSamplesWithinConservativeShapeBuckets)

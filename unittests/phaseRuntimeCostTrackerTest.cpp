@@ -19,6 +19,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace trt_edgellm::rt
 {
 namespace
@@ -79,6 +81,24 @@ TEST(PhaseRuntimeCostTrackerTest, KeepsDecodeContentionBucketsSeparate)
     EXPECT_EQ(tracker.decodeBucketCount(), 2U);
 }
 
+TEST(PhaseRuntimeCostTrackerTest, UsesNearestCoveringContendedDecodeBuckets)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.decodeMinimumSamples = 2U;
+    config.decodeContextBucketTokens = 512;
+    PhaseRuntimeCostTracker tracker(config);
+
+    tracker.observeDecode(32, 1024, false, true, 7.0F);
+    tracker.observeDecode(32, 1024, false, true, 8.0F);
+    tracker.observeDecode(64, 512, false, true, 9.0F);
+    tracker.observeDecode(64, 512, false, true, 10.0F);
+
+    EXPECT_FLOAT_EQ(*tracker.decodeCoveringP95(16, 500, false, true), 10.0F);
+    EXPECT_FLOAT_EQ(*tracker.decodeCoveringP95(32, 700, false, true), 8.0F);
+    EXPECT_FALSE(tracker.decodeCoveringP95(65, 500, false, true).has_value());
+    EXPECT_FALSE(tracker.decodeCoveringP95(16, 500, true, true).has_value());
+}
+
 TEST(PhaseRuntimeCostTrackerTest, ResetDropsAllProcessLocalMeasurements)
 {
     PhaseRuntimeCostTrackerConfig config;
@@ -94,6 +114,326 @@ TEST(PhaseRuntimeCostTrackerTest, ResetDropsAllProcessLocalMeasurements)
     EXPECT_EQ(tracker.confidence(key), PhaseRuntimeCostConfidence::kUnknown);
     EXPECT_FALSE(tracker.decodeP95(1, 128, false, false).has_value());
     EXPECT_EQ(tracker.decodeBucketCount(), 0U);
+}
+
+TEST(PhaseContextualPdModelTest, BecomesReadyAndReducesUncertainty)
+{
+    PhaseContextualPdModelConfig config;
+    config.mode = PhaseContextualPdMode::kActive;
+    config.minimumObservations = 4U;
+    PhaseContextualPdModel model(config);
+    PhaseContextualPdFeatures const features = phaseContextualPdFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 128, 1, 2, PhaseExecutionVariant::kEager, false, {}});
+
+    PhaseContextualPdEstimate const cold = model.predict(features);
+    for (size_t sample{}; sample < 8U; ++sample)
+    {
+        EXPECT_TRUE(model.observe(features, 0.2));
+    }
+    PhaseContextualPdEstimate const warm = model.predict(features);
+
+    EXPECT_FALSE(cold.ready);
+    EXPECT_TRUE(warm.ready);
+    EXPECT_GT(warm.mean, 0.0);
+    EXPECT_LT(warm.uncertainty, cold.uncertainty);
+    EXPECT_EQ(model.telemetry().observations, 8U);
+}
+
+TEST(PhaseContextualPdModelTest, LearnsShapeDependentSignWithoutExactKeys)
+{
+    PhaseContextualPdModelConfig config;
+    config.minimumObservations = 4U;
+    config.confidenceBeta = 0.0;
+    PhaseContextualPdModel model(config);
+    PhaseContextualPdFeatures const small = phaseContextualPdFeatures(
+        {3000.0, 8000.0, 100000.0, 1, 32, 128, 0, 2, PhaseExecutionVariant::kEager, false, {}});
+    PhaseContextualPdFeatures const large = phaseContextualPdFeatures(
+        {30000.0, 8000.0, 100000.0, 8, 32, 128, 0, 2, PhaseExecutionVariant::kEager, false, {}});
+
+    for (size_t sample{}; sample < 32U; ++sample)
+    {
+        EXPECT_TRUE(model.observe(small, 0.2));
+        EXPECT_TRUE(model.observe(large, -0.15));
+    }
+
+    EXPECT_GT(model.predict(small).mean, 0.0);
+    EXPECT_LT(model.predict(large).mean, 0.0);
+}
+
+TEST(PhaseContextualPdModelTest, RejectsInvalidObservationAndResetDropsEvidence)
+{
+    PhaseContextualPdModel model;
+    PhaseContextualPdFeatures const features = phaseContextualPdFeatures({4000.0, 8000.0, 100000.0, 2, 32, 128, 1, 2,
+        PhaseExecutionVariant::kEager, true, PhaseGlobalResidualAnchor::kDecode});
+
+    EXPECT_FALSE(model.observe(features, std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_TRUE(model.observe(features, 0.1));
+    EXPECT_EQ(model.telemetry().observations, 1U);
+    EXPECT_EQ(model.telemetry().rejectedObservations, 1U);
+    model.reset();
+    EXPECT_EQ(model.telemetry().observations, 0U);
+    EXPECT_FALSE(model.predict(features).ready);
+}
+
+TEST(PhaseContextualPdModelTest, UsesPosteriorMeanOnlyForEligibleLateRecovery)
+{
+    PhaseContextualPdEstimate const estimate{0.2, 0.4, -0.1, 8U, true};
+    std::vector<PhaseProtectedCompletion> const decodeLate{
+        {100.0, 120.0, 0.0, PhaseProtectedKind::kDecode}, {200.0, 120.0, 0.0, PhaseProtectedKind::kPrefill}};
+    std::vector<PhaseProtectedCompletion> const prefillLate{
+        {200.0, 120.0, 0.0, PhaseProtectedKind::kDecode}, {100.0, 120.0, 0.0, PhaseProtectedKind::kPrefill}};
+
+    EXPECT_DOUBLE_EQ(phaseContextualPdDecisionValue(estimate, false, false), estimate.lowerConfidenceBound);
+    EXPECT_DOUBLE_EQ(phaseContextualPdDecisionValue(estimate, true, true), estimate.lowerConfidenceBound);
+    EXPECT_DOUBLE_EQ(phaseContextualPdDecisionValue(estimate, true, false), estimate.mean);
+    EXPECT_TRUE(phaseContextualPdDecodeDominatedRecovery(decodeLate, 0.0));
+    EXPECT_FALSE(phaseContextualPdDecodeDominatedRecovery(prefillLate, 0.0));
+    EXPECT_FALSE(phaseContextualPdProducerCriticalPath(false, false));
+    EXPECT_TRUE(phaseContextualPdProducerCriticalPath(true, false));
+    EXPECT_TRUE(phaseContextualPdProducerCriticalPath(false, true));
+    EXPECT_TRUE(phaseContextualPdDrainsReadyPrefill(true, 128, 128));
+    EXPECT_FALSE(phaseContextualPdDrainsReadyPrefill(false, 128, 128));
+    EXPECT_FALSE(phaseContextualPdDrainsReadyPrefill(true, 256, 128));
+    EXPECT_TRUE(phaseContextualPdControlsDecision(false));
+    EXPECT_FALSE(phaseContextualPdControlsDecision(true));
+    EXPECT_FALSE(phaseContextualPdMayPromoteOverlap(false, false));
+    EXPECT_TRUE(phaseContextualPdMayPromoteOverlap(true, false));
+    EXPECT_FALSE(phaseContextualPdMayPromoteOverlap(true, true));
+}
+
+TEST(PhaseContextualPairModelTest, ProjectsEncoderPairsIntoContinuousFeatures)
+{
+    PhaseContextualPdFeatures const encoderPrefill = phaseContextualPairFeatures(
+        {3000.0, 8000.0, 100000.0, 1, 8, 8, 8, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+    PhaseContextualPdFeatures const encoderDecode = phaseContextualPairFeatures(
+        {3000.0, 8000.0, 100000.0, 1, 32, 8, 64, 0, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    EXPECT_EQ(encoderPrefill.size(), kPHASE_CONTEXTUAL_PD_FEATURES);
+    EXPECT_DOUBLE_EQ(encoderPrefill.front(), 1.0);
+    EXPECT_NE(encoderPrefill, encoderDecode);
+}
+
+TEST(PhaseContextualPairModelTest, KeepsEncoderPrefillAndDecodeEvidenceIndependent)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualEp.mode = PhaseContextualPdMode::kActive;
+    config.contextualEp.minimumObservations = 2U;
+    config.contextualEp.confidenceBeta = 0.0;
+    config.contextualEd.mode = PhaseContextualPdMode::kActive;
+    config.contextualEd.minimumObservations = 2U;
+    config.contextualEd.confidenceBeta = 0.0;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 8, 8, 8, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    for (size_t sample{}; sample < 8U; ++sample)
+    {
+        EXPECT_TRUE(tracker.observeContextualPair(PhaseContextualPairKind::kEncoderPrefill, features, 0.2));
+        EXPECT_TRUE(tracker.observeContextualPair(PhaseContextualPairKind::kEncoderDecode, features, -0.2));
+    }
+
+    EXPECT_GT(tracker.predictContextualPair(PhaseContextualPairKind::kEncoderPrefill, features).mean, 0.0);
+    EXPECT_LT(tracker.predictContextualPair(PhaseContextualPairKind::kEncoderDecode, features).mean, 0.0);
+    EXPECT_EQ(tracker.contextualPairTelemetry(PhaseContextualPairKind::kPrefillDecode).observations, 0U);
+
+    tracker.reset();
+    EXPECT_EQ(tracker.contextualPairTelemetry(PhaseContextualPairKind::kEncoderPrefill).observations, 0U);
+    EXPECT_EQ(tracker.contextualPairTelemetry(PhaseContextualPairKind::kEncoderDecode).observations, 0U);
+}
+
+TEST(PhaseContextualPairModelTest, KeepsOppositeDirectionsIndependent)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualPd.mode = PhaseContextualPdMode::kShadow;
+    config.contextualPd.minimumObservations = 2U;
+    config.contextualPd.confidenceBeta = 0.0;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    for (size_t sample{}; sample < 8U; ++sample)
+    {
+        EXPECT_TRUE(tracker.observeContextualDirection(PhaseContextualPairDirection::kPrefillToDecode, features, 0.2));
+        EXPECT_TRUE(tracker.observeContextualDirection(PhaseContextualPairDirection::kDecodeToPrefill, features, -0.2));
+    }
+
+    EXPECT_GT(tracker.predictContextualDirection(PhaseContextualPairDirection::kPrefillToDecode, features).mean, 0.0);
+    EXPECT_LT(tracker.predictContextualDirection(PhaseContextualPairDirection::kDecodeToPrefill, features).mean, 0.0);
+    EXPECT_EQ(tracker.contextualPairTelemetry(PhaseContextualPairKind::kPrefillDecode).observations, 16U);
+    EXPECT_STREQ(phaseContextualPairDirectionName(PhaseContextualPairDirection::kDecodeToPrefill), "decode_to_prefill");
+}
+
+TEST(PhaseContextualPairModelTest, CalibratesBeforeUpdatingAndCountsFalseSafe)
+{
+    PhaseContextualPdModelConfig config;
+    config.minimumObservations = 1U;
+    config.confidenceBeta = 0.0;
+    PhaseContextualPdModel model(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    EXPECT_TRUE(model.observe(features, 0.5));
+    EXPECT_TRUE(model.observe(features, -0.5));
+
+    PhaseContextualPdTelemetry const& telemetry = model.telemetry();
+    EXPECT_EQ(telemetry.calibrationObservations, 2U);
+    EXPECT_EQ(telemetry.readyCalibrationObservations, 1U);
+    EXPECT_EQ(telemetry.predictedSafeObservations, 1U);
+    EXPECT_EQ(telemetry.falseSafeObservations, 1U);
+    EXPECT_GT(telemetry.absoluteErrorSum, 0.0);
+    EXPECT_LT(telemetry.lastPredictionError, 0.0);
+}
+
+TEST(PhaseContextualCompletionModelTest, LearnsIncumbentAndNewcomerResidualsIndependently)
+{
+    PhaseContextualPdModelConfig config;
+    config.minimumObservations = 2U;
+    config.confidenceBeta = 1.96;
+    PhaseContextualCompletionModel model(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    for (size_t sample{}; sample < 16U; ++sample)
+    {
+        EXPECT_TRUE(model.observe(features, 4000.0, 8000.0, 5000.0, 6000.0, 20000.0));
+    }
+    PhaseContextualCompletionEstimate const prediction = model.predict(features, 4000.0, 8000.0);
+
+    EXPECT_TRUE(prediction.ready);
+    EXPECT_NEAR(prediction.incumbentMeanUs, 5000.0, 250.0);
+    EXPECT_NEAR(prediction.newcomerMeanUs, 6000.0, 250.0);
+    EXPECT_EQ(model.telemetry().observations, 16U);
+    EXPECT_EQ(model.telemetry().falseSafeObservations, 0U);
+}
+
+TEST(PhaseContextualCompletionModelTest, PairPosteriorWarmsColdReverseDirection)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualPd.minimumObservations = 2U;
+    config.completionDirectionPseudoObservations = 4.0;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    for (size_t sample{}; sample < 16U; ++sample)
+    {
+        EXPECT_TRUE(tracker.observeContextualCompletionDirection(
+            PhaseContextualPairDirection::kPrefillToDecode, features, 4000.0, 8000.0, 4500.0, 9000.0, 20000.0));
+    }
+
+    PhaseContextualCompletionEstimate const reverse = tracker.predictContextualCompletionDirection(
+        PhaseContextualPairDirection::kDecodeToPrefill, features, 8000.0, 4000.0);
+
+    EXPECT_TRUE(reverse.ready);
+    EXPECT_EQ(reverse.pairObservations, 16U);
+    EXPECT_EQ(reverse.directionObservations, 0U);
+    EXPECT_DOUBLE_EQ(reverse.directionWeight, 0.0);
+    EXPECT_NEAR(reverse.incumbentMeanUs, 9000.0, 300.0);
+    EXPECT_NEAR(reverse.newcomerMeanUs, 4500.0, 300.0);
+    EXPECT_EQ(
+        tracker.contextualCompletionDirectionTelemetry(PhaseContextualPairDirection::kPrefillToDecode).observations,
+        16U);
+    EXPECT_EQ(
+        tracker.contextualCompletionDirectionTelemetry(PhaseContextualPairDirection::kDecodeToPrefill).observations,
+        0U);
+    EXPECT_EQ(tracker.contextualCompletionPairTelemetry(PhaseContextualPairKind::kPrefillDecode).observations, 16U);
+}
+
+TEST(PhaseContextualCompletionModelTest, DirectionPosteriorGraduallyOverridesPairPosterior)
+{
+    PhaseContextualCompletionEstimate pair{5000.0, 1000.0, 7000.0, 800.0, 20U, true};
+    PhaseContextualCompletionEstimate direction{9000.0, 1200.0, 6000.0, 900.0, 4U, true};
+
+    PhaseContextualCompletionEstimate const result = phaseBlendContextualCompletionEstimates(pair, direction, 4.0);
+
+    EXPECT_DOUBLE_EQ(result.directionWeight, 0.5);
+    EXPECT_DOUBLE_EQ(result.incumbentMeanUs, 7000.0);
+    EXPECT_DOUBLE_EQ(result.newcomerMeanUs, 6500.0);
+    EXPECT_GT(result.incumbentUncertaintyUs, 2000.0);
+    EXPECT_EQ(result.pairObservations, 20U);
+    EXPECT_EQ(result.directionObservations, 4U);
+    EXPECT_TRUE(result.ready);
+}
+
+TEST(PhaseContextualCompletionModelTest, HierarchicalTelemetryRejectsInvalidLabelsAtModelBoundary)
+{
+    PhaseRuntimeCostTracker tracker;
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    EXPECT_FALSE(tracker.observeContextualCompletionDirection(
+        PhaseContextualPairDirection::kPrefillToDecode, features, 0.0, 8000.0, 4500.0, 9000.0, 20000.0));
+
+    EXPECT_EQ(
+        tracker.contextualCompletionDirectionTelemetry(PhaseContextualPairDirection::kPrefillToDecode).observations,
+        0U);
+    EXPECT_EQ(tracker.contextualCompletionPairTelemetry(PhaseContextualPairKind::kPrefillDecode).observations, 0U);
+}
+
+TEST(PhaseContextualCompletionCalibrationTest, UsesOnlyPriorPairFamilyResiduals)
+{
+    PhaseContextualCompletionCalibrationConfig config;
+    config.enabled = true;
+    config.targetCoverage = 0.75;
+    config.minimumObservations = 2U;
+    config.windowSize = 4U;
+    PhaseContextualCompletionCalibrator calibrator(config);
+    PhaseContextualCompletionEstimate const raw{100.0, 10.0, 200.0, 20.0, 8U, true};
+
+    EXPECT_FALSE(calibrator.estimate().ready);
+    EXPECT_TRUE(calibrator.observe(raw, 1.0, 120.0, 220.0));
+    EXPECT_TRUE(calibrator.observe(raw, 1.0, 110.0, 260.0));
+
+    PhaseContextualCompletionCalibrationEstimate const estimate = calibrator.estimate();
+    EXPECT_TRUE(estimate.ready);
+    EXPECT_EQ(estimate.observations, 2U);
+    EXPECT_DOUBLE_EQ(estimate.scale, 3.0);
+    PhaseContextualCompletionEstimate const calibrated = calibrator.apply(raw);
+    EXPECT_DOUBLE_EQ(calibrated.incumbentUncertaintyUs, 30.0);
+    EXPECT_DOUBLE_EQ(calibrated.newcomerUncertaintyUs, 60.0);
+    EXPECT_TRUE(calibrated.uncertaintyCalibrated);
+}
+
+TEST(PhaseContextualCompletionCalibrationTest, SharesScaleAcrossOppositeDirectionsButNotPairs)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualPd.minimumObservations = 1U;
+    config.contextualEp.minimumObservations = 1U;
+    config.completionCalibration.enabled = true;
+    config.completionCalibration.minimumObservations = 1U;
+    config.completionCalibration.windowSize = 4U;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    EXPECT_TRUE(tracker.observeContextualCompletionDirection(
+        PhaseContextualPairDirection::kPrefillToDecode, features, 4000.0, 8000.0, 4500.0, 9000.0));
+    EXPECT_TRUE(tracker.observeContextualCompletionDirection(
+        PhaseContextualPairDirection::kPrefillToDecode, features, 4000.0, 8000.0, 7000.0, 12000.0));
+
+    PhaseContextualCompletionCalibrationEstimate const pd
+        = tracker.contextualCompletionCalibration(PhaseContextualPairKind::kPrefillDecode);
+    EXPECT_TRUE(pd.ready);
+    EXPECT_EQ(pd.observations, 1U);
+    EXPECT_EQ(tracker.contextualCompletionCalibration(PhaseContextualPairKind::kEncoderPrefill).observations, 0U);
+    PhaseContextualCompletionEstimate const reverse = tracker.predictContextualCompletionDirection(
+        PhaseContextualPairDirection::kDecodeToPrefill, features, 8000.0, 4000.0);
+    EXPECT_TRUE(reverse.uncertaintyCalibrated);
+    EXPECT_DOUBLE_EQ(reverse.uncertaintyScale, pd.scale);
+}
+
+TEST(PhaseContextualCompletionCalibrationTest, SeparatesShadowCalibrationFromSchedulingAuthority)
+{
+    PhaseRuntimeCostTrackerConfig shadowConfig;
+    shadowConfig.completionCalibration.enabled = true;
+    PhaseRuntimeCostTracker shadow(shadowConfig);
+    EXPECT_FALSE(shadow.contextualCompletionAuthorityEnabled());
+
+    PhaseRuntimeCostTrackerConfig activeConfig;
+    activeConfig.completionCalibration.enabled = true;
+    activeConfig.completionCalibration.active = true;
+    PhaseRuntimeCostTracker active(activeConfig);
+    EXPECT_TRUE(active.contextualCompletionAuthorityEnabled());
 }
 
 } // namespace

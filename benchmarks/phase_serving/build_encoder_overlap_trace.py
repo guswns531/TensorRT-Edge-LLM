@@ -24,22 +24,28 @@ from typing import Any
 def text_request(request_class: str, output_tokens: int,
                  arrival_us: int) -> dict[str, Any]:
     return {
-        "request_class": request_class,
+        "request_class":
+        request_class,
         "messages": [{
-            "role": "user",
+            "role":
+            "user",
             "content":
             "Explain one practical method for reducing online GPU inference latency while preserving correctness."
         }],
-        "max_generate_length": output_tokens,
-        "arrival_offset_us": arrival_us,
+        "max_generate_length":
+        output_tokens,
+        "arrival_offset_us":
+        arrival_us,
     }
 
 
 def vision_request(image: Path, arrival_us: int) -> dict[str, Any]:
     return {
-        "request_class": "vision_overlap",
+        "request_class":
+        "vision_overlap",
         "messages": [{
-            "role": "user",
+            "role":
+            "user",
             "content": [{
                 "type": "image_url",
                 "image_url": {
@@ -50,8 +56,10 @@ def vision_request(image: Path, arrival_us: int) -> dict[str, Any]:
                 "text": "Name the animal in this image in one word."
             }]
         }],
-        "max_generate_length": 1,
-        "arrival_offset_us": arrival_us,
+        "max_generate_length":
+        1,
+        "arrival_offset_us":
+        arrival_us,
     }
 
 
@@ -65,6 +73,10 @@ def main() -> None:
     parser.add_argument("--decode-requests", type=int, default=8)
     parser.add_argument("--decode-output-tokens", type=int, default=192)
     parser.add_argument("--late-arrival-us", type=int, default=300000)
+    parser.add_argument("--phase-order",
+                        choices=("phase_first", "encoder_first",
+                                 "interleaved"),
+                        default="phase_first")
     args = parser.parse_args()
     if (args.encoder_requests <= 0 or args.prefill_requests <= 0
             or args.decode_requests <= 0 or args.decode_output_tokens <= 0
@@ -74,31 +86,30 @@ def main() -> None:
     if not image.is_file():
         parser.error(f"image does not exist: {image}")
 
-    requests: list[dict[str, Any]] = []
+    phase_requests: list[dict[str, Any]] = []
     if args.mode in {"ed", "mixed"}:
-        requests.extend(
+        phase_requests.extend(
             text_request("resident_decode", args.decode_output_tokens, 0)
             for _ in range(args.decode_requests))
     late_arrival_us = 0 if args.mode == "ep" else args.late_arrival_us
-    late_requests: list[dict[str, Any]] = []
-    late_requests.extend(
+    encoder_requests = [
         vision_request(image, late_arrival_us)
-        for _ in range(args.encoder_requests))
+        for _ in range(args.encoder_requests)
+    ]
     if args.mode in {"ep", "mixed"}:
-        late_requests.extend(
+        phase_requests.extend(
             text_request("late_prefill", 1, late_arrival_us)
             for _ in range(args.prefill_requests))
-    # Alternate request classes so the trace itself does not privilege one queue.
-    if args.mode in {"ep", "mixed"}:
-        vision = late_requests[:args.encoder_requests]
-        prefill = late_requests[args.encoder_requests:]
-        late_requests = []
-        while vision or prefill:
-            if vision:
-                late_requests.append(vision.pop(0))
-            if prefill:
-                late_requests.append(prefill.pop(0))
-    requests.extend(late_requests)
+    if args.phase_order == "interleaved":
+        requests = []
+        while phase_requests or encoder_requests:
+            if phase_requests:
+                requests.append(phase_requests.pop(0))
+            if encoder_requests:
+                requests.append(encoder_requests.pop(0))
+    else:
+        requests = (encoder_requests + phase_requests if args.phase_order
+                    == "encoder_first" else phase_requests + encoder_requests)
     payload = {
         "schema_version": 1,
         "workload": f"cosmos-controlled-{args.mode}-overlap",

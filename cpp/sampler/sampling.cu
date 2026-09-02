@@ -429,6 +429,75 @@ __device__ float logitToFloat<__nv_bfloat16>(__nv_bfloat16 value)
     return __bfloat162float(value);
 }
 
+__device__ __forceinline__ uint32_t argmaxCompatibilityRank(int32_t token)
+{
+    constexpr uint32_t kPARTITION_SHIFT = 8U;
+    constexpr uint32_t kPARTITION_MASK = 7U;
+    constexpr uint32_t kLANE_MASK = 255U;
+    constexpr uint32_t kITERATION_SHIFT = 11U;
+    constexpr uint32_t kITERATION_MASK = (1U << 18U) - 1U;
+    uint32_t const unsignedToken = static_cast<uint32_t>(token);
+    uint32_t const partition = (unsignedToken >> kPARTITION_SHIFT) & kPARTITION_MASK;
+    uint32_t const lane = unsignedToken & kLANE_MASK;
+    uint32_t const iteration = unsignedToken >> kITERATION_SHIFT;
+    return (partition << 26U) | (lane << 18U) | (kITERATION_MASK - iteration);
+}
+
+struct ArgmaxCandidate
+{
+    float value;
+    int32_t index;
+
+    __device__ __forceinline__ void insert(float candidateValue, int32_t candidateIndex)
+    {
+        if (candidateValue > value
+            || (candidateValue == value && argmaxCompatibilityRank(candidateIndex) > argmaxCompatibilityRank(index)))
+        {
+            value = candidateValue;
+            index = candidateIndex;
+        }
+    }
+};
+
+struct argmaxCandidateMaxOpFunctor
+{
+    __device__ __forceinline__ ArgmaxCandidate operator()(ArgmaxCandidate const& a, ArgmaxCandidate const& b) const
+    {
+        if (a.value != b.value)
+        {
+            return a.value > b.value ? a : b;
+        }
+        return argmaxCompatibilityRank(a.index) > argmaxCompatibilityRank(b.index) ? a : b;
+    }
+};
+
+template <typename T, int32_t BLOCK_SIZE_>
+__global__ void argmaxKernel(
+    T const* __restrict__ logits, int32_t* __restrict__ topIndices, int32_t rows, int32_t vocabSize)
+{
+    using ArgmaxReduce = cub::BlockReduce<ArgmaxCandidate, BLOCK_SIZE_>;
+    __shared__ typename ArgmaxReduce::TempStorage argmaxStorage;
+
+    auto const row = static_cast<int32_t>(blockIdx.x);
+    auto const tid = static_cast<int32_t>(threadIdx.x);
+    if (row >= rows)
+    {
+        return;
+    }
+
+    int64_t const rowOffset = static_cast<int64_t>(row) * vocabSize;
+    ArgmaxCandidate partial{-FLT_MAX, vocabSize - 1};
+    for (int32_t token = tid; token < vocabSize; token += BLOCK_SIZE_)
+    {
+        partial.insert(logitToFloat(logits[rowOffset + token]), token);
+    }
+    ArgmaxCandidate const best = ArgmaxReduce(argmaxStorage).Reduce(partial, argmaxCandidateMaxOpFunctor());
+    if (tid == 0)
+    {
+        topIndices[row] = best.index;
+    }
+}
+
 template <typename T, int32_t BLOCK_SIZE_>
 __global__ void argmaxEntropyKernel(T const* __restrict__ logits, int32_t* __restrict__ topIndices,
     float* __restrict__ entropy, int32_t rows, int32_t vocabSize, float temperature)
@@ -1248,6 +1317,47 @@ void selectArgmaxAndComputeEntropy(
     {
         argmaxEntropyKernel<float, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<float>(),
             topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows, vocabSize, temperature);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void selectArgmax(rt::Tensor const& input, rt::Tensor& topIndices, cudaStream_t stream)
+{
+    check::check(input.getDeviceType() == rt::DeviceType::kGPU && topIndices.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check((input.getDataType() == nvinfer1::DataType::kFLOAT || input.getDataType() == nvinfer1::DataType::kHALF
+                     || input.getDataType() == nvinfer1::DataType::kBF16)
+            && topIndices.getDataType() == nvinfer1::DataType::kINT32,
+        "Invalid tensor data types");
+
+    auto const inputShape = input.getShape();
+    auto const indexShape = topIndices.getShape();
+    check::check(inputShape.getNumDims() == 2 && indexShape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const rows = inputShape[0];
+    int32_t const vocabSize = inputShape[1];
+    check::check(indexShape[0] == rows && indexShape[1] == 1, "Top index tensor shape mismatch");
+    if (rows <= 0 || vocabSize <= 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBLOCK_SIZE = 1024;
+    dim3 const grid(rows);
+    dim3 const block(kBLOCK_SIZE);
+    if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        argmaxKernel<half, kBLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(input.dataPointer<half>(), topIndices.dataPointer<int32_t>(), rows, vocabSize);
+    }
+    else if (input.getDataType() == nvinfer1::DataType::kBF16)
+    {
+        argmaxKernel<__nv_bfloat16, kBLOCK_SIZE><<<grid, block, 0, stream>>>(
+            input.dataPointer<__nv_bfloat16>(), topIndices.dataPointer<int32_t>(), rows, vocabSize);
+    }
+    else
+    {
+        argmaxKernel<float, kBLOCK_SIZE><<<grid, block, 0, stream>>>(
+            input.dataPointer<float>(), topIndices.dataPointer<int32_t>(), rows, vocabSize);
     }
     CUDA_CHECK(cudaGetLastError());
 }

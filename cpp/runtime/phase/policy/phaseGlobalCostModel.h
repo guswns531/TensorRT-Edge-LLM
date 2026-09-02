@@ -86,10 +86,21 @@ enum class PhaseExecutionVariant : uint8_t
     kBothGraph = 3U,
 };
 
+//! Phase that was already outstanding when a residual overlap was added.
+enum class PhaseGlobalResidualAnchor : uint8_t
+{
+    kNone,
+    kPrefill,
+    kDecode,
+};
+
 PhaseExecutionVariant phaseExecutionVariant(bool primaryGraph, bool secondaryGraph) noexcept;
 bool phaseExecutionVariantUsesPrimaryGraph(PhaseExecutionVariant variant) noexcept;
 bool phaseExecutionVariantUsesSecondaryGraph(PhaseExecutionVariant variant) noexcept;
 char const* phaseExecutionVariantName(PhaseExecutionVariant variant) noexcept;
+
+//! Stable telemetry name for the phase that anchors a residual action.
+char const* phaseGlobalResidualAnchorName(PhaseGlobalResidualAnchor anchor) noexcept;
 
 //! Stable telemetry name for a global action kind.
 char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept;
@@ -108,6 +119,8 @@ struct PhaseGlobalActionKey
     int32_t primaryWorkClass{};
     //! Distinguish overlap that begins after the primary phase has already consumed work.
     bool residualAugmentation{};
+    //! Keep P->P+D and D->P+D observations in independent online-cost buckets.
+    PhaseGlobalResidualAnchor residualAnchor{PhaseGlobalResidualAnchor::kNone};
 
     bool operator==(PhaseGlobalActionKey const& other) const noexcept;
 };
@@ -119,7 +132,9 @@ PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key
 //! One direct CUDA-event observation for a single action key.
 struct PhaseGlobalCostObservation
 {
-    //! Sum of isolated one-request service quanta completed by the action.
+    //! Reference work represented by the action. Overlap uses the exact
+    //! same-shape serial actions; phase-only samples may retain an equivalent
+    //! singleton-service reference for batch-efficiency prediction.
     float referenceWorkMs{};
     //! Observed end-to-end GPU makespan of the complete serial or overlap action.
     float makespanMs{};
@@ -186,6 +201,19 @@ public:
     //! Use the smallest observed primary context bucket that conservatively
     //! covers the requested bucket, with primary-batch interpolation inside it.
     std::optional<PhaseGlobalCostEstimate> estimatePrimaryBatchCoveringContext(PhaseGlobalActionKey const& key) const;
+    //! Reuse only phase-only observations whose batch, chunk, and context
+    //! geometry covers the requested action. This preserves fixed launch cost
+    //! for ragged prefill shapes instead of extrapolating from token count.
+    std::optional<PhaseGlobalCostEstimate> estimateCoveringPrimary(PhaseGlobalActionKey const& key) const;
+    //! Minimum observed phase-only launch cost for the same phase, producer
+    //! class, execution variant, and residual semantics. Geometry is ignored
+    //! deliberately: this is a lower-bound intercept, not a shape estimate.
+    std::optional<PhaseGlobalCostEstimate> estimatePrimaryLaunchFloor(PhaseGlobalActionKey const& key) const;
+    //! Reuse only observations whose complete overlap geometry covers the
+    //! requested geometry. Incomparable nearest covers are merged with the
+    //! slowest robust cost so the estimate cannot cherry-pick a favorable
+    //! batch or context dimension.
+    std::optional<PhaseGlobalCostEstimate> estimateCoveringOverlap(PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
     bool overlapEligible(PhaseGlobalActionKey const& key) const;
     void reset();
@@ -213,6 +241,14 @@ private:
     //! change instead of rescanning every action record once per row.
     mutable std::unordered_map<PhaseGlobalActionKey, std::vector<std::optional<PhaseGlobalCostEstimate>>, KeyHash>
         mCoveringContextCache;
+    //! Includes negative lookups for phase-only covering geometry.
+    mutable std::unordered_map<PhaseGlobalActionKey, std::optional<PhaseGlobalCostEstimate>, KeyHash>
+        mCoveringPrimaryCache;
+    mutable std::unordered_map<PhaseGlobalActionKey, std::optional<PhaseGlobalCostEstimate>, KeyHash>
+        mPrimaryLaunchFloorCache;
+    //! Includes negative lookups. Runtime observations invalidate the cache.
+    mutable std::unordered_map<PhaseGlobalActionKey, std::optional<PhaseGlobalCostEstimate>, KeyHash>
+        mCoveringOverlapCache;
 };
 
 } // namespace trt_edgellm::rt

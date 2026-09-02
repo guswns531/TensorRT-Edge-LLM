@@ -1,0 +1,530 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nvidia.com/tensorrt-edgellm/phase-event-v1.schema.json",
+  "title": "TensorRT Edge-LLM unified phase event",
+  "description": "M1 contract for decision, dispatch, and completion correlation. Host timestamps use CLOCK_MONOTONIC; GPU start and end timestamps share the phase activity recorder's CUDA-event epoch.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_kind",
+    "event_id",
+    "run_id",
+    "host_monotonic_ns"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "event_kind": {
+      "enum": [
+        "decision",
+        "dispatch",
+        "completion"
+      ]
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host_monotonic_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "decision_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "snapshot_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "snapshot_signature": {
+      "description": "Cross-run FNV-1a identity of canonical ready lineage, in-flight phase state, and persistent ownership counts. Transient timestamps and process-local execution IDs are excluded.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "plan_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "execution_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "action_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "incremental_action_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "requested_action_direction": {
+      "enum": [
+        "idle_launch",
+        "encoder_to_prefill",
+        "prefill_to_encoder",
+        "encoder_to_decode",
+        "decode_to_encoder",
+        "prefill_to_decode",
+        "decode_to_prefill",
+        "none"
+      ]
+    },
+    "requested_start_skew_percent": {
+      "enum": [
+        -1,
+        0,
+        25,
+        50,
+        75,
+        90,
+        100
+      ]
+    },
+    "phase": {
+      "enum": [
+        "encoder",
+        "prefill",
+        "decode",
+        "copy"
+      ]
+    },
+    "action_kind": {
+      "enum": [
+        "none",
+        "encoder",
+        "prefill",
+        "decode",
+        "encoder_prefill",
+        "encoder_decode",
+        "prefill_decode",
+        "wait"
+      ]
+    },
+    "action_direction": {
+      "enum": [
+        "idle_launch",
+        "encoder_to_prefill",
+        "prefill_to_encoder",
+        "encoder_to_decode",
+        "decode_to_encoder",
+        "prefill_to_decode",
+        "decode_to_prefill",
+        "none"
+      ]
+    },
+    "outstanding_before_mask": {
+      "$ref": "#/$defs/activityMask"
+    },
+    "planned_outstanding_mask": {
+      "$ref": "#/$defs/activityMask"
+    },
+    "observed_outstanding_mask": {
+      "$ref": "#/$defs/activityMask"
+    },
+    "ready": {
+      "$ref": "#/$defs/work"
+    },
+    "cohort": {
+      "$ref": "#/$defs/work"
+    },
+    "request_ids": {
+      "$ref": "#/$defs/requestIds"
+    },
+    "ready_encoder_request_ids": {
+      "$ref": "#/$defs/requestIds"
+    },
+    "ready_prefill_request_ids": {
+      "$ref": "#/$defs/requestIds"
+    },
+    "ready_prefill_token_counts": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "ready_decode_request_ids": {
+      "$ref": "#/$defs/requestIds"
+    },
+    "ready_decode_context_lengths": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "page_pool_allocated_bundles": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "page_reservation_guaranteed_bundles": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "vision_payload_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "inflight": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inflight"
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/candidate"
+      }
+    },
+    "selected_action_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "enqueue_host_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "incumbent_phase": {
+      "$ref": "#/$defs/executionPhase"
+    },
+    "incumbent_execution_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "injection_target_fraction": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "injection_requested_direction": {
+      "enum": [
+        "encoder_to_prefill",
+        "prefill_to_encoder",
+        "encoder_to_decode",
+        "decode_to_encoder",
+        "prefill_to_decode",
+        "decode_to_prefill"
+      ]
+    },
+    "injection_incumbent_reference_us": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "injection_newcomer_reference_us": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "requested_injection_delay_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "gpu_start_us": {
+      "type": "number",
+      "minimum": 0
+    },
+    "gpu_end_us": {
+      "type": "number",
+      "minimum": 0
+    },
+    "gpu_duration_us": {
+      "type": "number",
+      "minimum": 0
+    },
+    "completion_visible_host_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "completion_status": {
+      "enum": [
+        "success",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "action_fidelity": {
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "decision"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "decision_id",
+          "snapshot_id",
+          "ready",
+          "inflight",
+          "candidates",
+          "request_ids",
+          "selected_action_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "dispatch"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "decision_id",
+          "execution_id",
+          "plan_id",
+          "action_id",
+          "phase",
+          "action_kind",
+          "action_direction",
+          "outstanding_before_mask",
+          "planned_outstanding_mask",
+          "cohort",
+          "request_ids",
+          "enqueue_host_ns"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "completion"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "execution_id",
+          "plan_id",
+          "action_id",
+          "phase",
+          "observed_outstanding_mask",
+          "request_ids",
+          "gpu_duration_us",
+          "completion_visible_host_ns",
+          "completion_status",
+          "action_fidelity"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "executionPhase": {
+      "enum": [
+        "encoder",
+        "prefill",
+        "decode"
+      ]
+    },
+    "activityMask": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 15,
+      "description": "E=1, P=2, D=4, Copy=8"
+    },
+    "work": {
+      "type": "object",
+      "required": [
+        "encoder_rows",
+        "prefill_rows",
+        "prefill_tokens",
+        "decode_rows"
+      ],
+      "properties": {
+        "encoder_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "prefill_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "prefill_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decode_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mean_decode_context": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "requestIds": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "uniqueItems": true
+    },
+    "inflight": {
+      "type": "object",
+      "required": [
+        "phase",
+        "execution_id",
+        "plan_id",
+        "dispatch_age_us",
+        "request_ids",
+        "cohort"
+      ],
+      "properties": {
+        "phase": {
+          "$ref": "#/properties/phase"
+        },
+        "plan_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "execution_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dispatch_age_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cohort": {
+          "$ref": "#/$defs/work"
+        },
+        "request_ids": {
+          "$ref": "#/$defs/requestIds"
+        },
+        "completed_milestone": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "candidate": {
+      "type": "object",
+      "required": [
+        "action_id",
+        "action_kind",
+        "action_direction",
+        "request_ids",
+        "legal"
+      ],
+      "properties": {
+        "action_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "action_kind": {
+          "$ref": "#/properties/action_kind"
+        },
+        "action_direction": {
+          "$ref": "#/properties/action_direction"
+        },
+        "legal": {
+          "type": "boolean"
+        },
+        "request_ids": {
+          "$ref": "#/$defs/requestIds"
+        },
+        "predicted_completion_us": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "uncertainty_us": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "contextual_completion_valid": {
+          "type": "boolean"
+        },
+        "contextual_direction": {
+          "enum": [
+            "encoder_to_prefill",
+            "prefill_to_encoder",
+            "encoder_to_decode",
+            "decode_to_encoder",
+            "prefill_to_decode",
+            "decode_to_prefill"
+          ]
+        },
+        "contextual_completion_ready": {
+          "type": "boolean"
+        },
+        "contextual_incumbent_mean_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_incumbent_uncertainty_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_newcomer_mean_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_newcomer_uncertainty_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_pair_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contextual_direction_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contextual_direction_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "contextual_uncertainty_scale": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_uncertainty_calibration_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contextual_uncertainty_calibrated": {
+          "type": "boolean"
+        },
+        "contextual_incumbent_reference_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_newcomer_reference_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_slo_violation_us": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

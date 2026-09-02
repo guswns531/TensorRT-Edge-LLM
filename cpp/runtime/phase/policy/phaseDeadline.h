@@ -21,6 +21,14 @@
 namespace trt_edgellm::rt
 {
 
+enum class PhaseProtectedKind
+{
+    kUnknown,
+    kEncoder,
+    kPrefill,
+    kDecode,
+};
+
 //! One request deadline protected while evaluating an action. Completion may
 //! include a required follow-up phase when the candidate does not advance the
 //! request owning this deadline.
@@ -29,8 +37,7 @@ struct PhaseProtectedCompletion
     double slackUs{std::numeric_limits<double>::infinity()};
     double predictedCompletionUs{};
     double uncertaintyUs{};
+    PhaseProtectedKind kind{PhaseProtectedKind::kUnknown};
 };
 
-
 } // namespace trt_edgellm::rt
-

@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace trt_edgellm::rt
 {
@@ -26,6 +27,13 @@ namespace trt_edgellm::rt
 struct PhaseQueueSnapshot
 {
     size_t prefillQueued{};
+    //! At least one runnable prefill row consumes an external producer such
+    //! as a vision encoder payload.
+    bool externalPrefillQueued{};
+    //! Canonical eligible queue order used by replay snapshot signatures.
+    std::vector<uint64_t> prefillRequestIds;
+    //! Remaining prompt tokens parallel to prefillRequestIds.
+    std::vector<int32_t> prefillTokenCounts;
     //! Requests already known to the serving facade whose host-side producer
     //! may make another prefill row ready after the current GPU action.
     size_t prefillPendingProducerRows{};
@@ -36,6 +44,10 @@ struct PhaseQueueSnapshot
     uint64_t prefillProducerReadyEventId{};
     bool prefillProducerRowsClassified{};
     size_t decodeQueued{};
+    //! Canonical runnable decode order, bounded by the engine batch profile.
+    std::vector<uint64_t> decodeRequestIds;
+    //! Current KV lengths parallel to decodeRequestIds.
+    std::vector<int32_t> decodeContextLengths;
     int32_t prefillCandidateTokens{};
     int64_t prefillRemainingTokens{};
     int32_t prefillContinuationRows{};
@@ -67,6 +79,4 @@ struct PhaseQueueSnapshot
     int32_t pageReservationAvailableBundles{};
 };
 
-
 } // namespace trt_edgellm::rt
-

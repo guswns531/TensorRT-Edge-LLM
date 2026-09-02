@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseUnifiedEvent.h"
 #include "runtime/scheduling/phaseQueueScheduler.h"
 #include "runtime/scheduling/phaseTimeline.h"
 
@@ -148,9 +149,17 @@ public:
     bool empty() const noexcept;
     PhaseDispatchKind inFlightKind() const noexcept;
     PhasePrefillClass inFlightPrefillClass() const noexcept;
+    PhaseGlobalActionCandidate const* inFlightGlobalCandidate() const noexcept;
     size_t dispatchCount() const noexcept;
     std::optional<PhaseDispatchMetrics> const& lastMetrics() const noexcept;
     PhaseExecutionSafetyContract const& safetyContract() const noexcept;
+
+    //! Read-only host-observed P/D execution state. This never synchronizes a stream
+    //! and is not consumed by the current scheduling policy.
+    PhaseInFlightSnapshot inFlightSnapshot(uint64_t hostSnapshotNs = 0U) const noexcept;
+
+    //! Configure an opt-in M2 launch-order/delay experiment while idle.
+    void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
 
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
@@ -171,6 +180,7 @@ private:
     void recordTimeline(
         std::vector<PhaseWorkItem> const& batch, PhaseTimelineStage stage, uint64_t timestampNs = 0U) const;
     bool eventReady(cudaEvent_t event) const;
+    void waitForDirectionalInjection(PhaseUnifiedActionDirection direction, uint64_t incumbentEnqueueHostNs) const;
 
     PhaseQueueScheduler& mScheduler;
     PhaseDispatchWorkerCallbacks mCallbacks;
@@ -193,9 +203,16 @@ private:
     bool mHasDecode{};
     bool mDecodeDeferred{};
     bool mResidualAugmentation{};
+    uint64_t mPrefillEnqueueHostNs{};
+    uint64_t mDecodeEnqueueHostNs{};
+    uint64_t mPrefillPlanId{};
+    uint64_t mDecodePlanId{};
+    uint64_t mPrefillActionId{};
+    uint64_t mDecodeActionId{};
     size_t mDispatchCount{};
     std::vector<uint64_t> mPreviousDecodeRowRequestIds;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
+    PhaseDirectionalInjectionControl mDirectionalInjection;
 };
 
 } // namespace rt

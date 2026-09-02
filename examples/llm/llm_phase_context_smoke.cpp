@@ -1264,11 +1264,6 @@ int main(int argc, char** argv)
             nvinfer1::DataType::kINT32, "semantic_phase_host_decode_ids");
         rt::Tensor deviceSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_decode_ids");
-        size_t const samplingWorkspaceBytes = getSelectAllTopKWorkspaceSize(maxPhaseBatch, config.outputVocabSize, 1);
-        rt::Tensor prefillSamplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT8, "semantic_phase_prefill_sampling_workspace");
-        rt::Tensor decodeSamplingWorkspace({static_cast<int64_t>(samplingWorkspaceBytes)}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT8, "semantic_phase_decode_sampling_workspace");
         rt::Tensor prefillSelectedIds({config.maxSupportedPrefillBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
         rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
@@ -1548,7 +1543,6 @@ int main(int argc, char** argv)
                                   cudaStream_t stream, bool prefill) {
             int32_t const batchSize = static_cast<int32_t>(views.size());
             rt::Tensor& selectedIds = prefill ? prefillSelectedIds : decodeSelectedIds;
-            rt::Tensor& workspace = prefill ? prefillSamplingWorkspace : decodeSamplingWorkspace;
             SamplingSlotPool::Slot& slot = samplingSlotPool.acquire();
             ELLM_CHECK(io.outputLogits.reshape({batchSize, config.outputVocabSize})
                     && selectedIds.reshape({batchSize, 1}) && slot.hostIds.reshape({batchSize}),
@@ -1570,7 +1564,7 @@ int main(int argc, char** argv)
                 }
                 samplingLogits = &prefillCompactedLogits;
             }
-            selectAllTopK(*samplingLogits, std::nullopt, selectedIds, 1, workspace, stream);
+            selectArgmax(*samplingLogits, selectedIds, stream);
             CUDA_CHECK(cudaMemcpyAsync(slot.hostIds.rawPointer(), selectedIds.rawPointer(),
                 static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaEventRecord(slot.ready, stream));
@@ -1612,6 +1606,74 @@ int main(int argc, char** argv)
         runtimeCostConfig.decodeMinimumSamples = semanticSchedulerConfig.decodeComponentMinSamples;
         runtimeCostConfig.decodeWindowSize = semanticSchedulerConfig.decodeComponentWindow;
         runtimeCostConfig.decodeContextBucketTokens = semanticSchedulerConfig.runtimeDecodeContextBucketTokens;
+        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_PD"))
+        {
+            std::string const mode(value);
+            ELLM_CHECK(mode == "disabled" || mode == "shadow" || mode == "active",
+                "TRT_EDGELLM_CONTEXTUAL_PD must be disabled, shadow, or active");
+            runtimeCostConfig.contextualPd.mode = mode == "active" ? rt::PhaseContextualPdMode::kActive
+                : mode == "shadow"                                 ? rt::PhaseContextualPdMode::kShadow
+                                                                   : rt::PhaseContextualPdMode::kDisabled;
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_PD_MIN_OBSERVATIONS"))
+        {
+            runtimeCostConfig.contextualPd.minimumObservations = static_cast<size_t>(std::stoull(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_PD_CONFIDENCE_BETA"))
+        {
+            runtimeCostConfig.contextualPd.confidenceBeta = std::stod(value);
+        }
+        auto configureContextualEncoderPair = [](char const* modeVariable, char const* observationsVariable,
+                                                  char const* betaVariable, rt::PhaseContextualPdModelConfig& config) {
+            if (char const* value = std::getenv(modeVariable))
+            {
+                std::string const mode(value);
+                ELLM_CHECK(mode == "disabled" || mode == "shadow" || mode == "active",
+                    std::string(modeVariable) + " must be disabled, shadow, or active");
+                config.mode = mode == "active" ? rt::PhaseContextualPdMode::kActive
+                    : mode == "shadow"         ? rt::PhaseContextualPdMode::kShadow
+                                               : rt::PhaseContextualPdMode::kDisabled;
+            }
+            if (char const* value = std::getenv(observationsVariable))
+            {
+                config.minimumObservations = static_cast<size_t>(std::stoull(value));
+            }
+            if (char const* value = std::getenv(betaVariable))
+            {
+                config.confidenceBeta = std::stod(value);
+            }
+        };
+        configureContextualEncoderPair("TRT_EDGELLM_CONTEXTUAL_EP", "TRT_EDGELLM_CONTEXTUAL_EP_MIN_OBSERVATIONS",
+            "TRT_EDGELLM_CONTEXTUAL_EP_CONFIDENCE_BETA", runtimeCostConfig.contextualEp);
+        configureContextualEncoderPair("TRT_EDGELLM_CONTEXTUAL_ED", "TRT_EDGELLM_CONTEXTUAL_ED_MIN_OBSERVATIONS",
+            "TRT_EDGELLM_CONTEXTUAL_ED_CONFIDENCE_BETA", runtimeCostConfig.contextualEd);
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL"))
+        {
+            std::string const enabled(value);
+            ELLM_CHECK(enabled == "0" || enabled == "1", "TRT_EDGELLM_COMPLETION_CONFORMAL must be 0 or 1");
+            runtimeCostConfig.completionCalibration.enabled = enabled == "1";
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE"))
+        {
+            std::string const active(value);
+            ELLM_CHECK(active == "0" || active == "1", "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE must be 0 or 1");
+            runtimeCostConfig.completionCalibration.active = active == "1";
+            ELLM_CHECK(
+                !runtimeCostConfig.completionCalibration.active || runtimeCostConfig.completionCalibration.enabled,
+                "Active completion conformal authority requires TRT_EDGELLM_COMPLETION_CONFORMAL=1");
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_MIN_OBSERVATIONS"))
+        {
+            runtimeCostConfig.completionCalibration.minimumObservations = static_cast<size_t>(std::stoull(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_WINDOW"))
+        {
+            runtimeCostConfig.completionCalibration.windowSize = static_cast<size_t>(std::stoull(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_TARGET"))
+        {
+            runtimeCostConfig.completionCalibration.targetCoverage = std::stod(value);
+        }
         auto runtimeCostTracker = std::make_shared<rt::PhaseRuntimeCostTracker>(runtimeCostConfig);
         semanticSchedulerConfig.runtimeCostTracker = runtimeCostTracker;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
@@ -1647,7 +1709,12 @@ int main(int argc, char** argv)
         }
         ELLM_CHECK(maxInFlightRequests > 0 && maxInFlightRequests <= static_cast<size_t>(maxStableSlots),
             "Phase server in-flight capacity must be in the stable slot range");
-        if (std::getenv("TRT_EDGELLM_DISABLE_DECODE_ALIGNED_ADMISSION") == nullptr)
+        // Stable indexed ownership makes an in-flight limit independent of the
+        // largest decode cohort. Keep the old decode-aligned cap only as an
+        // explicit compatibility experiment; applying it by default can leave
+        // valid stable slots idle and inflate admission/TTFT latency.
+        if (std::getenv("TRT_EDGELLM_ENABLE_DECODE_ALIGNED_ADMISSION") != nullptr
+            && std::getenv("TRT_EDGELLM_DISABLE_DECODE_ALIGNED_ADMISSION") == nullptr)
         {
             size_t const requestedCapacity = maxInFlightRequests;
             maxInFlightRequests = rt::phaseDecodeAlignedAdmissionCapacity(
@@ -1666,6 +1733,15 @@ int main(int argc, char** argv)
         }
         serverConfig.enablePrefixReuse = enablePrefixReuse;
         serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
+        serverConfig.synchronizeDecodeSampling = std::getenv("TRT_EDGELLM_SYNCHRONIZE_DECODE_SAMPLING") != nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_REFILL_BATCH"))
+        {
+            serverConfig.admissionRefillBatchSize = static_cast<size_t>(std::stoul(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_REFILL_WINDOW_US"))
+        {
+            serverConfig.admissionRefillWindowUs = std::stod(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_PREFILL_GRAPHS"))
         {
             serverConfig.maxPrefillGraphs = static_cast<size_t>(std::stoul(value));
@@ -1679,6 +1755,12 @@ int main(int argc, char** argv)
         serverConfig.maxPendingRequests = 1024;
         serverConfig.enableGlobalWaitActions
             = semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled;
+        serverConfig.enableCompletionAwareAdmissionProjection
+            = std::getenv("TRT_EDGELLM_COMPLETION_AWARE_ADMISSION_PROJECTION") != nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_WAIT_AUTHORITY"))
+        {
+            serverConfig.enableGlobalWaitAuthority = std::stoi(value) != 0;
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAMPLING_COLD_START_US"))
         {
             serverConfig.globalSamplingColdStartUs = std::stod(value);
@@ -1955,6 +2037,9 @@ int main(int argc, char** argv)
             }
             ELLM_CHECK(ipcIngressQuantum > 0, "Phase IPC ingress quantum must be positive");
             bool const emitPhaseMetrics = std::getenv("TRT_EDGELLM_EMIT_PHASE_METRICS") != nullptr;
+            std::string const schedulerRunId = std::getenv("TRT_EDGELLM_PHASE_RUN_ID") != nullptr
+                ? std::getenv("TRT_EDGELLM_PHASE_RUN_ID")
+                : "phase-ipc";
             semanticCoordinator.setMetricsCollectionEnabled(emitPhaseMetrics);
             size_t const warmupAdmissionLimit = serverConfig.enableAdaptiveAdmission
                 ? serverConfig.latencyInFlightRequests
@@ -1965,6 +2050,10 @@ int main(int argc, char** argv)
             {
                 int32_t batchSize{};
                 int32_t promptTokens{};
+                //! Zero preserves the dense paired warmup. Positive values
+                //! add low-dimensional contextual coverage without becoming
+                //! a workload-specific action table.
+                int32_t overlapPrefillRows{};
             };
             std::vector<int32_t> requestedWarmupBatchSizes;
             if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"))
@@ -2003,7 +2092,7 @@ int main(int argc, char** argv)
                     = rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes));
                 for (int32_t const batchSize : warmupBatchSizes)
                 {
-                    warmupShapes.push_back({batchSize, 0});
+                    warmupShapes.push_back({batchSize, 0, 0});
                 }
             }
             bool const globalOverlapWarmup
@@ -2026,6 +2115,21 @@ int main(int argc, char** argv)
             for (DecodeWarmupShape const& shape : warmupShapes)
             {
                 executionWarmupShapes.insert(executionWarmupShapes.end(), shapeWarmupSamples, shape);
+            }
+            if (globalOverlapWarmup && !warmupShapes.empty())
+            {
+                DecodeWarmupShape const& largestDecode = *std::max_element(warmupShapes.begin(), warmupShapes.end(),
+                    [](DecodeWarmupShape const& lhs, DecodeWarmupShape const& rhs) {
+                        return lhs.batchSize < rhs.batchSize;
+                    });
+                int32_t const prefillLimit = semanticSchedulerConfig.maxPrefillBatchSize;
+                for (int32_t prefillRows = 1; prefillRows < prefillLimit; prefillRows *= 2)
+                {
+                    DecodeWarmupShape contextualShape = largestDecode;
+                    contextualShape.overlapPrefillRows = prefillRows;
+                    executionWarmupShapes.insert(
+                        executionWarmupShapes.end(), globalOverlapWarmupSamples, contextualShape);
+                }
             }
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(globalOverlapWarmup);
             uint64_t warmupRequestId = 1000000;
@@ -2075,7 +2179,10 @@ int main(int argc, char** argv)
                     size_t const availableRows = warmupAdmissionLimit > static_cast<size_t>(batchSize)
                         ? warmupAdmissionLimit - static_cast<size_t>(batchSize)
                         : 0U;
-                    overlapWarmupRows = std::min({availableRows, static_cast<size_t>(batchSize),
+                    size_t const requestedPrefillRows = shape.overlapPrefillRows > 0
+                        ? static_cast<size_t>(shape.overlapPrefillRows)
+                        : static_cast<size_t>(batchSize);
+                    overlapWarmupRows = std::min({availableRows, requestedPrefillRows,
                         static_cast<size_t>(semanticSchedulerConfig.maxPrefillBatchSize)});
                     for (size_t row{}; row < overlapWarmupRows; ++row)
                     {
@@ -2207,12 +2314,42 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.globalExperimentalEncoderDecodeOverlapPercent = std::stoi(value);
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION"))
+                {
+                    std::optional<rt::PhaseUnifiedActionDirection> const direction
+                        = rt::phaseUnifiedActionDirectionFromName(value);
+                    ELLM_CHECK(direction.has_value(), "Unknown directional-injection phase order");
+                    threePhaseConfig.directionalInjection.direction = *direction;
+                    char const* target = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_TARGET");
+                    char const* incumbent = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_INCUMBENT_US");
+                    char const* newcomer = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_NEWCOMER_US");
+                    ELLM_CHECK(target != nullptr && incumbent != nullptr && newcomer != nullptr,
+                        "Directional injection requires target, incumbent, and newcomer references");
+                    threePhaseConfig.directionalInjection.targetFraction = std::stod(target);
+                    threePhaseConfig.directionalInjection.incumbentReferenceUs = std::stod(incumbent);
+                    threePhaseConfig.directionalInjection.newcomerReferenceUs = std::stod(newcomer);
+                    if (char const* delay = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_DELAY_US"))
+                    {
+                        threePhaseConfig.directionalInjection.requestedDelayUs = std::stoull(delay);
+                    }
+                    else
+                    {
+                        threePhaseConfig.directionalInjection.requestedDelayUs
+                            = static_cast<uint64_t>(std::llround(threePhaseConfig.directionalInjection.targetFraction
+                                * threePhaseConfig.directionalInjection.incumbentReferenceUs));
+                    }
+                }
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
                 threePhaseConfig.enableGlobalFormationAwareSelection
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
+                    && std::getenv("TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE") != nullptr
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_FORMATION_AWARE") == nullptr;
+                if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_FORMATION_REALIZED_DISPATCHES"))
+                {
+                    threePhaseConfig.globalFormationRealizedDispatches = static_cast<size_t>(std::stoull(value));
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
                 {
                     threePhaseConfig.globalSafeProbeSlackMultiplier = std::stof(value);
@@ -2627,6 +2764,8 @@ int main(int argc, char** argv)
             }
             std::deque<rt::PhaseTimelineEvent> phaseTimelineEvents;
             std::deque<rt::PhaseVisionEncoderBatchMetric> encoderBatchMetrics;
+            std::deque<rt::PhaseFormationRealizedEpisode> formationEpisodes;
+            std::deque<rt::PhaseUnifiedEvent> unifiedSchedulerEvents;
             if (emitPhaseMetrics)
             {
                 auto const timelineCallback
@@ -2638,6 +2777,11 @@ int main(int argc, char** argv)
                     ipcThreePhase->setEncoderBatchMetricCallback([&](rt::PhaseVisionEncoderBatchMetric const& metric) {
                         encoderBatchMetrics.push_back(metric);
                     });
+                    ipcThreePhase->setFormationEpisodeCallback([&](rt::PhaseFormationRealizedEpisode const& episode) {
+                        formationEpisodes.push_back(episode);
+                    });
+                    ipcThreePhase->setUnifiedEventCallback(
+                        [&](rt::PhaseUnifiedEvent const& event) { unifiedSchedulerEvents.push_back(event); });
                 }
             }
             bool const asyncRequestAdapter = std::getenv("TRT_EDGELLM_IPC_ASYNC_REQUEST_ADAPTER") != nullptr;
@@ -2936,6 +3080,7 @@ int main(int argc, char** argv)
                                 {"primary_context_bucket", cost.key.primaryContextBucket},
                                 {"secondary_context_bucket", cost.key.secondaryContextBucket},
                                 {"execution_variant", rt::phaseExecutionVariantName(cost.key.executionVariant)},
+                                {"residual_anchor", rt::phaseGlobalResidualAnchorName(cost.key.residualAnchor)},
                                 {"status", rt::phaseGlobalOverlapCostStatusName(cost.diagnostic.status)},
                                 {"sample_count", cost.diagnostic.sampleCount},
                                 {"opportunity_count", cost.opportunityCount}, {"required", cost.required},
@@ -2953,9 +3098,14 @@ int main(int argc, char** argv)
                         if (input.kind == PhaseIpcKind::kCalibrationEnd)
                         {
                             ++measurementEpoch;
+                            if (ipcThreePhase != nullptr)
+                            {
+                                ipcThreePhase->resetGlobalDecisionCostTelemetry();
+                            }
                             emittedMetrics = semanticCoordinator.metrics().size();
                             phaseTimelineEvents.clear();
                             encoderBatchMetrics.clear();
+                            formationEpisodes.clear();
                             emitRecord("PHASE_EPOCH\t", {{"epoch", measurementEpoch}, {"kind", "measurement"}});
                         }
                         char const* calibrationAction = input.kind == PhaseIpcKind::kCalibrationBegin ? "begin"
@@ -3081,6 +3231,73 @@ int main(int argc, char** argv)
                     auto const decodeGraphs = semanticCoordinator.decodeGraphCacheStats();
                     rt::PhaseThreeCoordinatorMetrics const visionMetrics
                         = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
+                    rt::PhaseContextualPdTelemetry const contextualPdCalibration
+                        = runtimeCostTracker->contextualPairTelemetry(rt::PhaseContextualPairKind::kPrefillDecode);
+                    rt::PhaseContextualPdTelemetry const contextualEpCalibration
+                        = runtimeCostTracker->contextualPairTelemetry(rt::PhaseContextualPairKind::kEncoderPrefill);
+                    rt::PhaseContextualPdTelemetry const contextualEdCalibration
+                        = runtimeCostTracker->contextualPairTelemetry(rt::PhaseContextualPairKind::kEncoderDecode);
+                    auto const directionObservations = [&](rt::PhaseContextualPairDirection direction) {
+                        return runtimeCostTracker->contextualDirectionTelemetry(direction).observations;
+                    };
+                    auto const completionTelemetryJson = [](rt::PhaseContextualCompletionTelemetry const& telemetry) {
+                        return nlohmann::json{{"predictions", telemetry.predictions},
+                            {"observations", telemetry.observations},
+                            {"ready_calibration_observations", telemetry.readyCalibrationObservations},
+                            {"incumbent_interval_covered", telemetry.incumbentIntervalCovered},
+                            {"newcomer_interval_covered", telemetry.newcomerIntervalCovered},
+                            {"ready_incumbent_interval_covered", telemetry.readyIncumbentIntervalCovered},
+                            {"ready_newcomer_interval_covered", telemetry.readyNewcomerIntervalCovered},
+                            {"conformal_calibration_observations", telemetry.conformalCalibrationObservations},
+                            {"conformal_incumbent_interval_covered", telemetry.conformalIncumbentIntervalCovered},
+                            {"conformal_newcomer_interval_covered", telemetry.conformalNewcomerIntervalCovered},
+                            {"conformal_predicted_safe", telemetry.conformalPredictedSafeObservations},
+                            {"conformal_false_safe", telemetry.conformalFalseSafeObservations},
+                            {"predicted_safe", telemetry.predictedSafeObservations},
+                            {"false_safe", telemetry.falseSafeObservations},
+                            {"incumbent_absolute_error_us", telemetry.incumbentAbsoluteErrorUs},
+                            {"incumbent_squared_error_us", telemetry.incumbentSquaredErrorUs},
+                            {"newcomer_absolute_error_us", telemetry.newcomerAbsoluteErrorUs},
+                            {"newcomer_squared_error_us", telemetry.newcomerSquaredErrorUs},
+                            {"ready_incumbent_absolute_error_us", telemetry.readyIncumbentAbsoluteErrorUs},
+                            {"ready_incumbent_squared_error_us", telemetry.readyIncumbentSquaredErrorUs},
+                            {"ready_newcomer_absolute_error_us", telemetry.readyNewcomerAbsoluteErrorUs},
+                            {"ready_newcomer_squared_error_us", telemetry.readyNewcomerSquaredErrorUs}};
+                    };
+                    nlohmann::json completionCalibration = nlohmann::json::object();
+                    for (rt::PhaseContextualPairDirection const direction :
+                        {rt::PhaseContextualPairDirection::kPrefillToDecode,
+                            rt::PhaseContextualPairDirection::kDecodeToPrefill,
+                            rt::PhaseContextualPairDirection::kEncoderToPrefill,
+                            rt::PhaseContextualPairDirection::kPrefillToEncoder,
+                            rt::PhaseContextualPairDirection::kEncoderToDecode,
+                            rt::PhaseContextualPairDirection::kDecodeToEncoder})
+                    {
+                        rt::PhaseContextualCompletionTelemetry const& telemetry
+                            = runtimeCostTracker->contextualCompletionDirectionTelemetry(direction);
+                        completionCalibration[rt::phaseContextualPairDirectionName(direction)]
+                            = completionTelemetryJson(telemetry);
+                    }
+                    nlohmann::json completionPairCalibration
+                        = {{"prefill_decode",
+                               completionTelemetryJson(runtimeCostTracker->contextualCompletionPairTelemetry(
+                                   rt::PhaseContextualPairKind::kPrefillDecode))},
+                            {"encoder_prefill",
+                                completionTelemetryJson(runtimeCostTracker->contextualCompletionPairTelemetry(
+                                    rt::PhaseContextualPairKind::kEncoderPrefill))},
+                            {"encoder_decode",
+                                completionTelemetryJson(runtimeCostTracker->contextualCompletionPairTelemetry(
+                                    rt::PhaseContextualPairKind::kEncoderDecode))}};
+                    auto const conformalCalibrationJson = [&](rt::PhaseContextualPairKind kind) {
+                        rt::PhaseContextualCompletionCalibrationEstimate const estimate
+                            = runtimeCostTracker->contextualCompletionCalibration(kind);
+                        return nlohmann::json{{"scale", estimate.scale}, {"observations", estimate.observations},
+                            {"ready", estimate.ready}};
+                    };
+                    nlohmann::json completionConformalCalibration
+                        = {{"prefill_decode", conformalCalibrationJson(rt::PhaseContextualPairKind::kPrefillDecode)},
+                            {"encoder_prefill", conformalCalibrationJson(rt::PhaseContextualPairKind::kEncoderPrefill)},
+                            {"encoder_decode", conformalCalibrationJson(rt::PhaseContextualPairKind::kEncoderDecode)}};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
                         {"host_scheduler_decision_us", metrics.hostSchedulerDecisionUs},
@@ -3096,6 +3313,7 @@ int main(int argc, char** argv)
                         {"prefill_continuation_rows", metrics.prefillContinuationRows},
                         {"prefill_past_kv_max", metrics.prefillPastKVMax}, {"decode_tokens", metrics.decodeTokens},
                         {"prefill_gpu_ms", metrics.prefillGpuMs},
+                        {"prefill_completion_ms", metrics.prefillCompletionMs},
                         {"decode_context_tokens", metrics.decodeContextTokens},
                         {"decode_context_max", metrics.plannedDecodeMaxContextLength},
                         {"decode_replacement_rows", metrics.predictedDecodeReplacementRows},
@@ -3104,6 +3322,7 @@ int main(int argc, char** argv)
                         {"predicted_decode_drain_gpu_ms", metrics.predictedDecodeDrainGpuMs},
                         {"predicted_decode_drain_turns", metrics.predictedDecodeDrainTurns},
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
+                        {"decode_completion_ms", metrics.decodeCompletionMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
                         {"memory_drain_preference", rt::phaseDrainPreferenceName(metrics.drainPreference)},
                         {"memory_drain_preference_applied", metrics.drainPreferenceApplied},
@@ -3112,10 +3331,28 @@ int main(int argc, char** argv)
                         {"global_safe_probe", metrics.globalSafeProbe},
                         {"global_action", rt::phaseGlobalActionKindName(metrics.globalSelectedAction.kind)},
                         {"global_execution_variant", rt::phaseExecutionVariantName(metrics.globalExecutionVariant)},
+                        {"global_selected_residual_anchor",
+                            rt::phaseGlobalResidualAnchorName(metrics.globalSelectedAction.residualAnchor)},
+                        {"global_observed_residual_anchor",
+                            rt::phaseGlobalResidualAnchorName(metrics.globalObservedResidualAnchor)},
                         {"global_decision_reason", static_cast<int32_t>(metrics.globalDecisionReason)},
+                        {"global_action_fidelity_violations",
+                            semanticCoordinator.scheduler().telemetry().globalActionFidelityViolationCount},
                         {"global_predicted_violation_us", metrics.globalPredictedViolationUs},
                         {"global_service_compression", metrics.globalServiceCompression},
                         {"global_reference_work_ms", metrics.globalReferenceWorkMs},
+                        {"contextual_pd_feature_valid", metrics.contextualPdFeatureValid},
+                        {"contextual_pd_exploration", metrics.contextualPdExploration},
+                        {"contextual_pd_mean", metrics.contextualPdMean},
+                        {"contextual_pd_uncertainty", metrics.contextualPdUncertainty},
+                        {"contextual_pd_lcb", metrics.contextualPdLowerConfidenceBound},
+                        {"contextual_completion_incumbent_reference_us",
+                            metrics.contextualCompletionIncumbentReferenceUs},
+                        {"contextual_completion_newcomer_reference_us",
+                            metrics.contextualCompletionNewcomerReferenceUs},
+                        {"contextual_completion", std::move(completionCalibration)},
+                        {"contextual_completion_pair", std::move(completionPairCalibration)},
+                        {"contextual_completion_conformal", std::move(completionConformalCalibration)},
                         {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
                         {"global_active_decisions",
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
@@ -3125,6 +3362,8 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalOverlapOpportunityCount},
                         {"global_overlap_known_costs",
                             semanticCoordinator.scheduler().telemetry().globalOverlapKnownCostCount},
+                        {"global_overlap_covering_costs",
+                            semanticCoordinator.scheduler().telemetry().globalOverlapCoveringCostCount},
                         {"global_overlap_no_samples",
                             semanticCoordinator.scheduler().telemetry().globalOverlapNoSampleCount},
                         {"global_overlap_insufficient_samples",
@@ -3141,6 +3380,114 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalOverlapProbeSlackBlockedCount},
                         {"global_overlap_selections",
                             semanticCoordinator.scheduler().telemetry().globalOverlapSelectionCount},
+                        {"contextual_pd_predictions",
+                            semanticCoordinator.scheduler().telemetry().contextualPdPredictionCount},
+                        {"contextual_pd_ready", semanticCoordinator.scheduler().telemetry().contextualPdReadyCount},
+                        {"contextual_pd_shadow_disagreements",
+                            semanticCoordinator.scheduler().telemetry().contextualPdShadowDisagreementCount},
+                        {"contextual_pd_observations",
+                            semanticCoordinator.scheduler().telemetry().contextualPdObservationCount},
+                        {"contextual_pd_rejected_observations",
+                            semanticCoordinator.scheduler().telemetry().contextualPdRejectedObservationCount},
+                        {"contextual_pd_positive_selections",
+                            semanticCoordinator.scheduler().telemetry().contextualPdPositiveSelectionCount},
+                        {"contextual_pd_negative_selections",
+                            semanticCoordinator.scheduler().telemetry().contextualPdNegativeSelectionCount},
+                        {"contextual_pd_explorations",
+                            semanticCoordinator.scheduler().telemetry().contextualPdExplorationCount},
+                        {"contextual_pd_last_reward",
+                            semanticCoordinator.scheduler().telemetry().contextualPdLastReward},
+                        {"contextual_pd_last_mean", semanticCoordinator.scheduler().telemetry().contextualPdLastMean},
+                        {"contextual_pd_last_uncertainty",
+                            semanticCoordinator.scheduler().telemetry().contextualPdLastUncertainty},
+                        {"contextual_pd_last_lcb",
+                            semanticCoordinator.scheduler().telemetry().contextualPdLastLowerConfidenceBound},
+                        {"contextual_pd_calibration_observations", contextualPdCalibration.calibrationObservations},
+                        {"contextual_pd_ready_calibration_observations",
+                            contextualPdCalibration.readyCalibrationObservations},
+                        {"contextual_pd_interval_covered", contextualPdCalibration.confidenceIntervalCovered},
+                        {"contextual_pd_ready_interval_covered",
+                            contextualPdCalibration.readyConfidenceIntervalCovered},
+                        {"contextual_pd_predicted_safe", contextualPdCalibration.predictedSafeObservations},
+                        {"contextual_pd_false_safe", contextualPdCalibration.falseSafeObservations},
+                        {"contextual_pd_absolute_error_sum", contextualPdCalibration.absoluteErrorSum},
+                        {"contextual_pd_squared_error_sum", contextualPdCalibration.squaredErrorSum},
+                        {"contextual_pd_ready_absolute_error_sum", contextualPdCalibration.readyAbsoluteErrorSum},
+                        {"contextual_pd_ready_squared_error_sum", contextualPdCalibration.readySquaredErrorSum},
+                        {"contextual_prefill_to_decode_observations",
+                            directionObservations(rt::PhaseContextualPairDirection::kPrefillToDecode)},
+                        {"contextual_decode_to_prefill_observations",
+                            directionObservations(rt::PhaseContextualPairDirection::kDecodeToPrefill)},
+                        {"contextual_ep_predictions", visionMetrics.contextualEpPredictions},
+                        {"contextual_ep_ready", visionMetrics.contextualEpReady},
+                        {"contextual_ep_shadow_disagreements", visionMetrics.contextualEpShadowDisagreements},
+                        {"contextual_ep_observations", visionMetrics.contextualEpObservations},
+                        {"contextual_ep_rejected_observations", visionMetrics.contextualEpRejectedObservations},
+                        {"contextual_ep_positive_selections", visionMetrics.contextualEpPositiveSelections},
+                        {"contextual_ep_negative_selections", visionMetrics.contextualEpNegativeSelections},
+                        {"contextual_ep_explorations", visionMetrics.contextualEpExplorations},
+                        {"contextual_ep_last_reward", visionMetrics.contextualEpLastReward},
+                        {"contextual_ep_last_mean", visionMetrics.contextualEpLastMean},
+                        {"contextual_ep_last_uncertainty", visionMetrics.contextualEpLastUncertainty},
+                        {"contextual_ep_last_lcb", visionMetrics.contextualEpLastLowerConfidenceBound},
+                        {"contextual_ep_calibration_observations", contextualEpCalibration.calibrationObservations},
+                        {"contextual_ep_ready_calibration_observations",
+                            contextualEpCalibration.readyCalibrationObservations},
+                        {"contextual_ep_interval_covered", contextualEpCalibration.confidenceIntervalCovered},
+                        {"contextual_ep_ready_interval_covered",
+                            contextualEpCalibration.readyConfidenceIntervalCovered},
+                        {"contextual_ep_predicted_safe", contextualEpCalibration.predictedSafeObservations},
+                        {"contextual_ep_false_safe", contextualEpCalibration.falseSafeObservations},
+                        {"contextual_ep_absolute_error_sum", contextualEpCalibration.absoluteErrorSum},
+                        {"contextual_ep_squared_error_sum", contextualEpCalibration.squaredErrorSum},
+                        {"contextual_ep_ready_absolute_error_sum", contextualEpCalibration.readyAbsoluteErrorSum},
+                        {"contextual_ep_ready_squared_error_sum", contextualEpCalibration.readySquaredErrorSum},
+                        {"contextual_encoder_to_prefill_observations",
+                            directionObservations(rt::PhaseContextualPairDirection::kEncoderToPrefill)},
+                        {"contextual_prefill_to_encoder_observations",
+                            directionObservations(rt::PhaseContextualPairDirection::kPrefillToEncoder)},
+                        {"contextual_ed_predictions", visionMetrics.contextualEdPredictions},
+                        {"contextual_ed_ready", visionMetrics.contextualEdReady},
+                        {"contextual_ed_shadow_disagreements", visionMetrics.contextualEdShadowDisagreements},
+                        {"contextual_ed_observations", visionMetrics.contextualEdObservations},
+                        {"contextual_ed_rejected_observations", visionMetrics.contextualEdRejectedObservations},
+                        {"contextual_ed_positive_selections", visionMetrics.contextualEdPositiveSelections},
+                        {"contextual_ed_negative_selections", visionMetrics.contextualEdNegativeSelections},
+                        {"contextual_ed_explorations", visionMetrics.contextualEdExplorations},
+                        {"contextual_ed_last_reward", visionMetrics.contextualEdLastReward},
+                        {"contextual_ed_last_mean", visionMetrics.contextualEdLastMean},
+                        {"contextual_ed_last_uncertainty", visionMetrics.contextualEdLastUncertainty},
+                        {"contextual_ed_last_lcb", visionMetrics.contextualEdLastLowerConfidenceBound},
+                        {"contextual_ed_calibration_observations", contextualEdCalibration.calibrationObservations},
+                        {"contextual_ed_ready_calibration_observations",
+                            contextualEdCalibration.readyCalibrationObservations},
+                        {"contextual_ed_interval_covered", contextualEdCalibration.confidenceIntervalCovered},
+                        {"contextual_ed_ready_interval_covered",
+                            contextualEdCalibration.readyConfidenceIntervalCovered},
+                        {"contextual_ed_predicted_safe", contextualEdCalibration.predictedSafeObservations},
+                        {"contextual_ed_false_safe", contextualEdCalibration.falseSafeObservations},
+                        {"contextual_ed_absolute_error_sum", contextualEdCalibration.absoluteErrorSum},
+                        {"contextual_ed_squared_error_sum", contextualEdCalibration.squaredErrorSum},
+                        {"contextual_ed_ready_absolute_error_sum", contextualEdCalibration.readyAbsoluteErrorSum},
+                        {"contextual_ed_ready_squared_error_sum", contextualEdCalibration.readySquaredErrorSum},
+                        {"contextual_encoder_to_decode_observations",
+                            directionObservations(rt::PhaseContextualPairDirection::kEncoderToDecode)},
+                        {"contextual_decode_to_encoder_observations",
+                            directionObservations(rt::PhaseContextualPairDirection::kDecodeToEncoder)},
+                        {"global_known_overlap_priorities",
+                            semanticCoordinator.scheduler().telemetry().globalKnownOverlapPriorityCount},
+                        {"global_measured_unprofitable_overlap_selections",
+                            semanticCoordinator.scheduler()
+                                .telemetry()
+                                .globalMeasuredUnprofitableOverlapSelectionCount},
+                        {"global_cost_key_observations",
+                            semanticCoordinator.scheduler().telemetry().globalCostKeyObservationCount},
+                        {"global_cost_key_parity_violations",
+                            semanticCoordinator.scheduler().telemetry().globalCostKeyParityViolationCount},
+                        {"global_residual_prefill_anchor_observations",
+                            semanticCoordinator.scheduler().telemetry().globalResidualPrefillAnchorObservationCount},
+                        {"global_residual_decode_anchor_observations",
+                            semanticCoordinator.scheduler().telemetry().globalResidualDecodeAnchorObservationCount},
                         {"global_experimental_overlap_opportunities",
                             semanticCoordinator.scheduler().telemetry().globalExperimentalOverlapOpportunityCount},
                         {"global_experimental_overlap_selections",
@@ -3294,6 +3641,19 @@ int main(int argc, char** argv)
                             visionMetrics.globalResidualPrefillDecodeSelections},
                         {"vision_global_residual_prefill_decode_unknown_cost_rejects",
                             visionMetrics.globalResidualPrefillDecodeUnknownCostRejects},
+                        {"vision_global_residual_prefill_anchor_opportunities",
+                            visionMetrics.globalResidualPrefillAnchorOpportunities},
+                        {"vision_global_residual_prefill_anchor_selections",
+                            visionMetrics.globalResidualPrefillAnchorSelections},
+                        {"vision_global_residual_decode_anchor_opportunities",
+                            visionMetrics.globalResidualDecodeAnchorOpportunities},
+                        {"vision_global_residual_decode_anchor_selections",
+                            visionMetrics.globalResidualDecodeAnchorSelections},
+                        {"vision_global_residual_measured_unprofitable_opportunities",
+                            visionMetrics.globalResidualMeasuredUnprofitableOpportunities},
+                        {"vision_global_residual_measured_unprofitable_selections",
+                            visionMetrics.globalResidualMeasuredUnprofitableSelections},
+                        {"vision_global_residual_covering_cost_hits", visionMetrics.globalResidualCoveringCostHits},
                         {"vision_global_experimental_residual_prefill_decode_opportunities",
                             visionMetrics.globalExperimentalResidualPrefillDecodeOpportunities},
                         {"vision_global_experimental_residual_prefill_decode_selections",
@@ -3327,9 +3687,88 @@ int main(int argc, char** argv)
                         {"vision_global_formation_selection_changes", visionMetrics.globalFormationSelectionChanges},
                         {"vision_global_formation_pd_selections", visionMetrics.globalFormationPdSelections},
                         {"vision_global_formation_overlap_selections", visionMetrics.globalFormationOverlapSelections},
+                        {"vision_global_formation_h2_agreements", visionMetrics.globalFormationH2Agreements},
+                        {"vision_global_formation_post_policy_overrides",
+                            visionMetrics.globalFormationPostPolicyOverrides},
+                        {"vision_global_formation_regret_samples", visionMetrics.globalFormationRegretSamples},
+                        {"vision_global_formation_positive_regrets", visionMetrics.globalFormationPositiveRegrets},
+                        {"vision_global_formation_predicted_regret_ms",
+                            visionMetrics.globalFormationPredictedRegretUs / 1000.0},
+                        {"vision_global_formation_max_predicted_regret_ms",
+                            visionMetrics.maxGlobalFormationPredictedRegretUs / 1000.0},
                         {"vision_global_formation_last_predicted_rows", visionMetrics.lastGlobalFormationPredictedRows},
                         {"vision_global_formation_last_horizon_ms",
                             visionMetrics.lastGlobalFormationHorizonUs / 1000.0},
+                        {"vision_global_formation_last_cost_gap_ms",
+                            visionMetrics.lastGlobalFormationCostGapUs / 1000.0},
+                        {"vision_global_formation_last_planner_us", visionMetrics.lastGlobalFormationPlannerUs},
+                        {"vision_global_formation_last_snapshot_id", visionMetrics.lastGlobalFormationSnapshotId},
+                        {"vision_global_formation_last_h2_action",
+                            rt::phaseGlobalActionKindName(visionMetrics.lastGlobalFormationH2Action)},
+                        {"vision_global_formation_last_oracle_action",
+                            rt::phaseGlobalActionKindName(visionMetrics.lastGlobalFormationOracleAction)},
+                        {"vision_global_formation_last_decode_violation_ms",
+                            visionMetrics.lastGlobalFormationDecodeViolationUs / 1000.0},
+                        {"vision_global_formation_realized_episodes_started",
+                            visionMetrics.globalFormationRealizedEpisodesStarted},
+                        {"vision_global_formation_realized_episodes_completed",
+                            visionMetrics.globalFormationRealizedEpisodesCompleted},
+                        {"vision_global_formation_realized_episodes_truncated",
+                            visionMetrics.globalFormationRealizedEpisodesTruncated},
+                        {"vision_global_formation_realized_decode_services",
+                            visionMetrics.globalFormationRealizedDecodeServices},
+                        {"vision_global_formation_realized_decode_budgets",
+                            visionMetrics.globalFormationRealizedDecodeBudgets},
+                        {"vision_global_formation_realized_decode_service_violations",
+                            visionMetrics.globalFormationRealizedDecodeServiceViolations},
+                        {"vision_global_formation_realized_decode_service_gap_ms",
+                            visionMetrics.globalFormationRealizedDecodeServiceGapUs / 1000.0},
+                        {"vision_global_formation_realized_decode_service_gap_max_ms",
+                            visionMetrics.maxGlobalFormationRealizedDecodeServiceGapUs / 1000.0},
+                        {"vision_global_formation_realized_decode_service_violation_ms",
+                            visionMetrics.globalFormationRealizedDecodeServiceViolationUs / 1000.0},
+                        {"vision_global_formation_realized_decode_service_violation_max_ms",
+                            visionMetrics.maxGlobalFormationRealizedDecodeServiceViolationUs / 1000.0},
+                        {"vision_global_formation_realized_last_episode_id",
+                            visionMetrics.lastGlobalFormationRealizedEpisodeId},
+                        {"vision_global_formation_realized_last_snapshot_id",
+                            visionMetrics.lastGlobalFormationRealizedSnapshotId},
+                        {"vision_global_formation_realized_last_selected_action",
+                            rt::phaseGlobalActionKindName(visionMetrics.lastGlobalFormationRealizedSelectedAction)},
+                        {"vision_global_formation_realized_last_myopic_action",
+                            rt::phaseGlobalActionKindName(visionMetrics.lastGlobalFormationRealizedMyopicAction)},
+                        {"vision_global_formation_realized_last_oracle_action",
+                            rt::phaseGlobalActionKindName(visionMetrics.lastGlobalFormationRealizedOracleAction)},
+                        {"vision_global_formation_realized_last_dispatches",
+                            visionMetrics.lastGlobalFormationRealizedDispatches},
+                        {"vision_global_formation_realized_last_encoder_rows",
+                            visionMetrics.lastGlobalFormationRealizedEncoderRows},
+                        {"vision_global_formation_realized_last_prefill_rows",
+                            visionMetrics.lastGlobalFormationRealizedPrefillRows},
+                        {"vision_global_formation_realized_last_decode_rows",
+                            visionMetrics.lastGlobalFormationRealizedDecodeRows},
+                        {"vision_global_formation_realized_last_first_decode_rows",
+                            visionMetrics.lastGlobalFormationRealizedFirstDecodeRows},
+                        {"vision_global_formation_realized_last_max_decode_rows",
+                            visionMetrics.lastGlobalFormationRealizedMaxDecodeRows},
+                        {"vision_global_formation_realized_last_decode_serviced",
+                            visionMetrics.lastGlobalFormationRealizedDecodeServiced},
+                        {"vision_global_formation_realized_last_decode_budget_known",
+                            visionMetrics.lastGlobalFormationRealizedDecodeBudgetKnown},
+                        {"vision_global_formation_realized_last_truncated",
+                            visionMetrics.lastGlobalFormationRealizedTruncated},
+                        {"vision_global_formation_realized_last_predicted_regret_ms",
+                            visionMetrics.lastGlobalFormationRealizedPredictedRegretUs / 1000.0},
+                        {"vision_global_formation_realized_last_decode_budget_ms",
+                            visionMetrics.lastGlobalFormationRealizedDecodeBudgetUs / 1000.0},
+                        {"vision_global_formation_realized_last_decode_service_gap_ms",
+                            visionMetrics.lastGlobalFormationRealizedDecodeServiceGapUs / 1000.0},
+                        {"vision_global_formation_realized_last_decode_completion_visible_ms",
+                            visionMetrics.lastGlobalFormationRealizedDecodeCompletionVisibleUs / 1000.0},
+                        {"vision_global_formation_realized_last_horizon_completion_visible_ms",
+                            visionMetrics.lastGlobalFormationRealizedHorizonCompletionVisibleUs / 1000.0},
+                        {"vision_global_formation_realized_last_decode_service_violation_ms",
+                            visionMetrics.lastGlobalFormationRealizedDecodeServiceViolationUs / 1000.0},
                         {"vision_global_action_fidelity_violations", visionMetrics.globalActionFidelityViolations},
                         {"vision_global_planned_outstanding",
                             static_cast<uint8_t>(visionMetrics.globalPlannedOutstanding)},
@@ -3366,6 +3805,138 @@ int main(int argc, char** argv)
                         {"vision_prefill_ready_wait_max_ms", visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0}};
                     serializedRecords.push_back("PHASE_METRIC\t" + metricEvent.dump());
                 }
+                while (emitPhaseMetrics && !unifiedSchedulerEvents.empty())
+                {
+                    madeProgress = true;
+                    rt::PhaseUnifiedEvent const event = std::move(unifiedSchedulerEvents.front());
+                    unifiedSchedulerEvents.pop_front();
+                    auto const workJson = [](rt::PhaseUnifiedWork const& work) {
+                        return nlohmann::json{{"encoder_rows", work.encoderRows}, {"prefill_rows", work.prefillRows},
+                            {"prefill_tokens", work.prefillTokens}, {"decode_rows", work.decodeRows},
+                            {"decode_context_tokens", work.decodeContextTokens}};
+                    };
+                    nlohmann::json record{{"schema_version", event.schemaVersion},
+                        {"event_kind", rt::phaseUnifiedEventKindName(event.kind)}, {"event_id", event.eventId},
+                        {"run_id", schedulerRunId}, {"host_monotonic_ns", event.hostMonotonicNs}};
+                    if (event.kind == rt::PhaseUnifiedEventKind::kDecision)
+                    {
+                        nlohmann::json inflight = nlohmann::json::array();
+                        for (rt::PhaseInFlightWorkSnapshot const& work : event.inFlight.work)
+                        {
+                            inflight.push_back({{"phase", rt::phaseUnifiedPhaseName(work.phase)},
+                                {"execution_id", work.executionId}, {"plan_id", work.planId},
+                                {"action_id", work.actionId}, {"activity_correlation_id", work.activityCorrelationId},
+                                {"status", rt::phaseInFlightStatusName(work.status)},
+                                {"dispatch_host_ns", work.dispatchHostNs}, {"dispatch_age_us", work.dispatchAgeUs},
+                                {"request_ids", work.requestIds}, {"cohort", workJson(work.work)}});
+                        }
+                        nlohmann::json candidates = nlohmann::json::array();
+                        for (rt::PhaseUnifiedCandidateSnapshot const& candidate : event.candidates)
+                        {
+                            candidates.push_back({{"action_id", candidate.actionId},
+                                {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
+                                {"action_direction", "none"}, {"legal", candidate.legal},
+                                {"request_ids", candidate.requestIds},
+                                {"predicted_completion_us", nlohmann::json::array({candidate.predictedCompletionUs})},
+                                {"uncertainty_us", nlohmann::json::array({candidate.uncertaintyUs})},
+                                {"max_slo_violation_us", candidate.predictedSloViolationUs},
+                                {"contextual_completion_valid", candidate.contextualCompletionValid},
+                                {"contextual_direction",
+                                    rt::phaseContextualPairDirectionName(candidate.contextualDirection)},
+                                {"contextual_completion_ready", candidate.contextualCompletion.ready},
+                                {"contextual_incumbent_mean_us", candidate.contextualCompletion.incumbentMeanUs},
+                                {"contextual_incumbent_uncertainty_us",
+                                    candidate.contextualCompletion.incumbentUncertaintyUs},
+                                {"contextual_newcomer_mean_us", candidate.contextualCompletion.newcomerMeanUs},
+                                {"contextual_newcomer_uncertainty_us",
+                                    candidate.contextualCompletion.newcomerUncertaintyUs},
+                                {"contextual_pair_observations", candidate.contextualCompletion.pairObservations},
+                                {"contextual_direction_observations",
+                                    candidate.contextualCompletion.directionObservations},
+                                {"contextual_direction_weight", candidate.contextualCompletion.directionWeight},
+                                {"contextual_uncertainty_scale", candidate.contextualCompletion.uncertaintyScale},
+                                {"contextual_uncertainty_calibration_observations",
+                                    candidate.contextualCompletion.uncertaintyCalibrationObservations},
+                                {"contextual_uncertainty_calibrated",
+                                    candidate.contextualCompletion.uncertaintyCalibrated},
+                                {"contextual_incumbent_reference_us", candidate.contextualIncumbentReferenceUs},
+                                {"contextual_newcomer_reference_us", candidate.contextualNewcomerReferenceUs}});
+                        }
+                        record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
+                            {"snapshot_signature", event.snapshotSignature}, {"plan_id", event.planId},
+                            {"action_id", event.actionId}, {"incremental_action_id", event.incrementalActionId},
+                            {"requested_start_skew_percent", event.requestedStartSkewPercent},
+                            {"requested_action_direction",
+                                rt::phaseUnifiedActionDirectionName(event.requestedDirection)},
+                            {"action_kind", rt::phaseGlobalActionKindName(event.actionKind)},
+                            {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
+                            {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
+                            {"ready", workJson(event.ready)}, {"selected_cohort", workJson(event.cohort)},
+                            {"ready_encoder_request_ids", event.readyEncoderRequestIds},
+                            {"ready_prefill_request_ids", event.readyPrefillRequestIds},
+                            {"ready_prefill_token_counts", event.readyPrefillTokenCounts},
+                            {"ready_decode_request_ids", event.readyDecodeRequestIds},
+                            {"ready_decode_context_lengths", event.readyDecodeContextLengths},
+                            {"page_pool_allocated_bundles", event.pagePoolAllocatedBundles},
+                            {"page_reservation_guaranteed_bundles", event.pageReservationGuaranteedBundles},
+                            {"vision_payload_bytes", event.visionPayloadBytes}, {"request_ids", event.requestIds},
+                            {"inflight", std::move(inflight)}, {"candidates", std::move(candidates)},
+                            {"selected_action_id", event.selectedActionId}});
+                    }
+                    else if (event.kind == rt::PhaseUnifiedEventKind::kDispatch)
+                    {
+                        record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
+                            {"execution_id", event.executionId}, {"plan_id", event.planId},
+                            {"action_id", event.actionId}, {"phase", rt::phaseUnifiedPhaseName(event.phase)},
+                            {"incremental_action_id", event.incrementalActionId},
+                            {"requested_start_skew_percent", event.requestedStartSkewPercent},
+                            {"requested_action_direction",
+                                rt::phaseUnifiedActionDirectionName(event.requestedDirection)},
+                            {"action_kind", rt::phaseGlobalActionKindName(event.actionKind)},
+                            {"action_direction", rt::phaseUnifiedActionDirectionName(event.direction)},
+                            {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
+                            {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
+                            {"observed_outstanding_mask", static_cast<uint8_t>(event.observedOutstanding)},
+                            {"cohort", workJson(event.cohort)}, {"request_ids", event.requestIds},
+                            {"enqueue_host_ns", event.enqueueHostNs}, {"action_fidelity", event.actionFidelity}});
+                        if (event.incumbentExecutionId > 0U)
+                        {
+                            record["incumbent_phase"] = rt::phaseUnifiedPhaseName(event.incumbentPhase);
+                            record["incumbent_execution_id"] = event.incumbentExecutionId;
+                        }
+                        if (event.injectionTargetFraction.has_value())
+                        {
+                            record["injection_target_fraction"] = *event.injectionTargetFraction;
+                            record["injection_requested_direction"]
+                                = rt::phaseUnifiedActionDirectionName(event.injectionRequestedDirection);
+                            record["injection_incumbent_reference_us"] = event.injectionIncumbentReferenceUs;
+                            record["injection_newcomer_reference_us"] = event.injectionNewcomerReferenceUs;
+                            record["requested_injection_delay_us"] = event.requestedInjectionDelayUs;
+                        }
+                    }
+                    else
+                    {
+                        record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
+                            {"execution_id", event.executionId}, {"plan_id", event.planId},
+                            {"action_id", event.actionId}, {"phase", rt::phaseUnifiedPhaseName(event.phase)},
+                            {"incremental_action_id", event.incrementalActionId},
+                            {"requested_start_skew_percent", event.requestedStartSkewPercent},
+                            {"requested_action_direction",
+                                rt::phaseUnifiedActionDirectionName(event.requestedDirection)},
+                            {"action_kind", rt::phaseGlobalActionKindName(event.actionKind)},
+                            {"observed_outstanding_mask", static_cast<uint8_t>(event.observedOutstanding)},
+                            {"cohort", workJson(event.cohort)}, {"request_ids", event.requestIds},
+                            {"gpu_duration_us", event.gpuDurationUs},
+                            {"completion_visible_host_ns", event.completionVisibleHostNs},
+                            {"completion_status", "success"}, {"action_fidelity", event.actionFidelity}});
+                        if (event.gpuStartUs.has_value() && event.gpuEndUs.has_value())
+                        {
+                            record["gpu_start_us"] = *event.gpuStartUs;
+                            record["gpu_end_us"] = *event.gpuEndUs;
+                        }
+                    }
+                    serializedRecords.push_back("PHASE_SCHEDULER_EVENT\t" + record.dump());
+                }
                 while (emitPhaseMetrics && !phaseTimelineEvents.empty())
                 {
                     madeProgress = true;
@@ -3387,6 +3958,41 @@ int main(int argc, char** argv)
                         {"batch_size", metric.batchSize}, {"input_bytes", metric.inputBytes},
                         {"input_tokens", metric.inputTokens}, {"gpu_ms", metric.gpuMs}};
                     serializedRecords.push_back("PHASE_ENCODER_METRIC\t" + metricEvent.dump());
+                }
+                while (emitPhaseMetrics && !formationEpisodes.empty())
+                {
+                    madeProgress = true;
+                    rt::PhaseFormationRealizedEpisode const episode = std::move(formationEpisodes.front());
+                    formationEpisodes.pop_front();
+                    nlohmann::json dispatches = nlohmann::json::array();
+                    for (rt::PhaseFormationRealizedDispatch const& dispatch : episode.dispatches)
+                    {
+                        dispatches.push_back(
+                            {{"plan_id", dispatch.planId}, {"action", rt::phaseGlobalActionKindName(dispatch.action)},
+                                {"encoder_rows", dispatch.work.encoderRows},
+                                {"prefill_rows", dispatch.work.prefillRows}, {"decode_rows", dispatch.work.decodeRows},
+                                {"dispatch_after_ms", dispatch.dispatchedAfterUs / 1000.0},
+                                {"completion_visible_after_ms", dispatch.completionVisibleAfterUs / 1000.0}});
+                    }
+                    nlohmann::json const episodeEvent{{"episode_id", episode.episodeId},
+                        {"snapshot_id", episode.snapshotId},
+                        {"selected_action", rt::phaseGlobalActionKindName(episode.selectedAction)},
+                        {"myopic_action", rt::phaseGlobalActionKindName(episode.myopicAction)},
+                        {"oracle_action", rt::phaseGlobalActionKindName(episode.oracleAction)},
+                        {"predicted_regret_ms", episode.predictedRegretUs / 1000.0},
+                        {"decode_budget_ms",
+                            std::isfinite(episode.decodeServiceBudgetUs) ? episode.decodeServiceBudgetUs / 1000.0
+                                                                         : 0.0},
+                        {"decode_budget_known", std::isfinite(episode.decodeServiceBudgetUs)},
+                        {"encoder_rows", episode.encoderRows}, {"prefill_rows", episode.prefillRows},
+                        {"decode_rows", episode.decodeRows}, {"first_decode_rows", episode.firstDecodeRows},
+                        {"max_decode_rows", episode.maxDecodeRows}, {"decode_serviced", episode.decodeServiced},
+                        {"decode_service_gap_ms", episode.decodeServiceGapUs / 1000.0},
+                        {"decode_completion_visible_ms", episode.decodeCompletionVisibleUs / 1000.0},
+                        {"horizon_completion_visible_ms", episode.horizonCompletionVisibleUs / 1000.0},
+                        {"decode_service_violation_ms", episode.decodeServiceViolationUs / 1000.0},
+                        {"truncated", episode.truncated}, {"dispatches", std::move(dispatches)}};
+                    serializedRecords.push_back("PHASE_FORMATION_EPISODE\t" + episodeEvent.dump());
                 }
                 std::vector<PhaseOutputRecord> phaseOutputRecords;
                 while (auto token = popTokenEvent())
@@ -3446,13 +4052,15 @@ int main(int argc, char** argv)
             LOG_INFO(
                 "Phase formation: decode_refill_waits=%zu prefill_wait_periods=%zu prefill_deferrals=%zu "
                 "prefill_profile_selections=%zu prefill_profile_misses=%zu "
+                "admission_refill_wait_periods=%zu admission_refill_deferrals=%zu "
                 "adaptive_transitions=%zu throughput_mode=%s "
                 "admission_limit=%zu admission_increases=%zu admission_decreases=%zu cost_limit=%zu "
                 "cost_blocks=%zu tpot_budget_us=%.3f tpot_satisfiable=%s external_profile=%s "
                 "external_profile_selections=%zu unsatisfiable_decisions=%zu",
                 semanticServer.decodeRefillWaitCount(), semanticServer.prefillFormationWaitPeriodCount(),
                 semanticServer.prefillFormationDeferralCount(), semanticServer.prefillFormationProfileSelectionCount(),
-                semanticServer.prefillFormationProfileMissCount(), semanticServer.throughputModeTransitionCount(),
+                semanticServer.prefillFormationProfileMissCount(), semanticServer.admissionRefillWaitPeriodCount(),
+                semanticServer.admissionRefillDeferralCount(), semanticServer.throughputModeTransitionCount(),
                 semanticServer.throughputMode() ? "yes" : "no", semanticServer.adaptiveAdmissionLimit(),
                 semanticServer.adaptiveAdmissionIncreaseCount(), semanticServer.adaptiveAdmissionDecreaseCount(),
                 semanticServer.adaptiveAdmissionCostLimit(), semanticServer.adaptiveAdmissionCostBlockCount(),
@@ -3507,6 +4115,22 @@ int main(int argc, char** argv)
             if (ipcThreePhase != nullptr)
             {
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
+                rt::PhaseSchedulerTelemetry const& schedulerMetrics = semanticCoordinator.scheduler().telemetry();
+                LOG_INFO("Phase global scheduler decision cost: samples=%zu mean=%.3f us p95=%.3f us max=%.3f us",
+                    visionMetrics.globalHostDecisionSamples, visionMetrics.globalHostDecisionMeanUs,
+                    visionMetrics.globalHostDecisionP95Us, visionMetrics.globalHostDecisionMaxUs);
+                LOG_INFO(
+                    "Phase global scheduler summary: decisions=%zu active=%zu overlaps=%zu known_profitable=%zu "
+                    "known_unprofitable_selected=%zu safe_probes=%zu wait_decisions=%zu wait_selected=%zu "
+                    "contextual_predictions=%zu contextual_ready=%zu contextual_disagreements=%zu "
+                    "action_fidelity_violations=%zu",
+                    schedulerMetrics.globalDecisionCount, schedulerMetrics.globalActiveDecisionCount,
+                    schedulerMetrics.globalOverlapSelectionCount, schedulerMetrics.globalKnownOverlapPriorityCount,
+                    schedulerMetrics.globalMeasuredUnprofitableOverlapSelectionCount,
+                    schedulerMetrics.globalSafeProbeCount, schedulerMetrics.globalWaitDecisionCount,
+                    schedulerMetrics.globalWaitSelectedCount, schedulerMetrics.contextualPdPredictionCount,
+                    schedulerMetrics.contextualPdReadyCount, schedulerMetrics.contextualPdShadowDisagreementCount,
+                    schedulerMetrics.globalActionFidelityViolationCount);
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "
                     "encoder_input_bytes_last=%zu encoder_input_bytes_max=%zu "

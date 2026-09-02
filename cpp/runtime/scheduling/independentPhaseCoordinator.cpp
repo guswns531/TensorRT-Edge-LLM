@@ -434,6 +434,22 @@ PhasePrefillClass IndependentPhaseCoordinator::inFlightPrefillClass() const noex
     return mWorker->inFlightPrefillClass();
 }
 
+PhaseGlobalActionCandidate const* IndependentPhaseCoordinator::inFlightGlobalCandidate() const noexcept
+{
+    return mWorker->inFlightGlobalCandidate();
+}
+
+PhaseInFlightSnapshot IndependentPhaseCoordinator::inFlightSnapshot(uint64_t hostSnapshotNs) const noexcept
+{
+    return mWorker->inFlightSnapshot(hostSnapshotNs);
+}
+
+void IndependentPhaseCoordinator::setDirectionalInjectionControl(PhaseDirectionalInjectionControl control)
+{
+    ELLM_CHECK(!busy(), "Phase directional injection control cannot change while work is in flight");
+    mWorker->setDirectionalInjectionControl(control);
+}
+
 TensorMap& IndependentPhaseCoordinator::prefillTensorMap() noexcept
 {
     return mPrefillMap;

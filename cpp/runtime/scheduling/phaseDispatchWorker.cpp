@@ -22,7 +22,9 @@
 #include "runtime/scheduling/phaseActivityTimeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -185,6 +187,33 @@ PhaseDispatchWorker::~PhaseDispatchWorker() noexcept
     static_cast<void>(cudaEventDestroy(mDecodeDone));
 }
 
+void PhaseDispatchWorker::setDirectionalInjectionControl(PhaseDirectionalInjectionControl control)
+{
+    check::check(!mBusy, "Phase directional injection control cannot change while work is in flight.");
+    check::check(!control.enabled() || mExecutionMode == PhaseTensorRTContextMode::kIndependentConcurrent,
+        "Directional injection requires independent TensorRT execution contexts.");
+    check::check(control.targetFraction >= 0.0 && control.targetFraction <= 1.0,
+        "Directional injection target fraction must be within [0, 1].");
+    mDirectionalInjection = control;
+}
+
+void PhaseDispatchWorker::waitForDirectionalInjection(
+    PhaseUnifiedActionDirection direction, uint64_t incumbentEnqueueHostNs) const
+{
+    if (!mDirectionalInjection.enabled() || mDirectionalInjection.direction != direction
+        || mDirectionalInjection.requestedDelayUs == 0U)
+    {
+        return;
+    }
+    uint64_t const timestampNs = phaseTimelineNowNs();
+    uint64_t const elapsedUs
+        = timestampNs > incumbentEnqueueHostNs ? (timestampNs - incumbentEnqueueHostNs) / 1000U : 0U;
+    if (elapsedUs < mDirectionalInjection.requestedDelayUs)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(mDirectionalInjection.requestedDelayUs - elapsedUs));
+    }
+}
+
 bool PhaseDispatchWorker::dispatchNext()
 {
     check::check(!mBusy, "Cannot dispatch while another phase plan is in flight.");
@@ -207,6 +236,12 @@ bool PhaseDispatchWorker::dispatchNext()
         }
     }
     mCurrentMetrics = PhaseDispatchMetrics{};
+    mPrefillEnqueueHostNs = 0U;
+    mDecodeEnqueueHostNs = 0U;
+    mPrefillPlanId = 0U;
+    mDecodePlanId = 0U;
+    mPrefillActionId = 0U;
+    mDecodeActionId = 0U;
     PhaseExecutionSet launched{PhaseExecutionSet::kNone};
     if (mHasPrefill)
     {
@@ -283,6 +318,15 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.globalPredictedViolationUs = mInFlight.globalPredictedViolationUs;
     mCurrentMetrics.globalServiceCompression = mInFlight.globalServiceCompression;
     mCurrentMetrics.globalReferenceWorkMs = mInFlight.globalReferenceWorkMs;
+    mCurrentMetrics.contextualPdFeatures = mInFlight.contextualPdFeatures;
+    mCurrentMetrics.contextualPdFeatureValid = mInFlight.contextualPdFeatureValid;
+    mCurrentMetrics.contextualPdExploration = mInFlight.contextualPdExploration;
+    mCurrentMetrics.contextualPdMean = mInFlight.contextualPdMean;
+    mCurrentMetrics.contextualPdUncertainty = mInFlight.contextualPdUncertainty;
+    mCurrentMetrics.contextualPdLowerConfidenceBound = mInFlight.contextualPdLowerConfidenceBound;
+    mCurrentMetrics.contextualCompletionIncumbentReferenceUs = mInFlight.contextualCompletionIncumbentReferenceUs;
+    mCurrentMetrics.contextualCompletionNewcomerReferenceUs = mInFlight.contextualCompletionNewcomerReferenceUs;
+    mCurrentMetrics.contextualCompletionMinimumSlackUs = mInFlight.contextualCompletionMinimumSlackUs;
     mCurrentMetrics.decodeCohortSize = static_cast<int32_t>(mScheduler.decodeCohortSize());
     int64_t prefillPastKVSum{};
     mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();
@@ -339,16 +383,19 @@ bool PhaseDispatchWorker::dispatchNext()
         mCallbacks.onDispatch(mCurrentMetrics);
     }
     CUDA_CHECK(cudaEventRecord(mDispatchStart, mPrefillStream));
-    if (mHasPrefill)
-    {
+    auto enqueuePrefill = [&] {
+        mPrefillPlanId = mInFlight.globalPlanId > 0U ? mInFlight.globalPlanId : mCurrentMetrics.dispatchIndex;
+        mPrefillActionId = mInFlight.globalCandidateId > 0U ? mInFlight.globalCandidateId : mPrefillPlanId;
+        mPrefillEnqueueHostNs = phaseTimelineNowNs();
         recordTimeline(mInFlight.prefillBatch, PhaseTimelineStage::kPrefillStart);
         CUDA_CHECK(cudaEventRecord(mPrefillStart, mPrefillStream));
         enqueueActivity(PhaseActivityKind::kPrefill, "prefill_dispatch", mInFlight.prefillBatch,
             mCallbacks.enqueuePrefill, mPrefillStream);
         CUDA_CHECK(cudaEventRecord(mPrefillDone, mPrefillStream));
-    }
-    if (mHasDecode)
-    {
+    };
+    auto enqueueDecode = [&] {
+        mDecodePlanId = mInFlight.globalPlanId > 0U ? mInFlight.globalPlanId : mCurrentMetrics.dispatchIndex;
+        mDecodeActionId = mInFlight.globalCandidateId > 0U ? mInFlight.globalCandidateId : mDecodePlanId;
         bool const serializeSharedContext
             = mHasPrefill && mExecutionMode == PhaseTensorRTContextMode::kSharedSerialized;
         if (serializeSharedContext)
@@ -360,11 +407,36 @@ bool PhaseDispatchWorker::dispatchNext()
         else
         {
             CUDA_CHECK(cudaStreamWaitEvent(mDecodeStream, mDispatchStart));
+            mDecodeEnqueueHostNs = phaseTimelineNowNs();
             recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
             CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
             enqueueActivity(PhaseActivityKind::kDecode, "decode_dispatch", mInFlight.decodeBatch,
                 mCallbacks.enqueueDecode, mDecodeStream);
             CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
+        }
+    };
+    bool const decodeFirst = mHasPrefill && mHasDecode
+        && mExecutionMode == PhaseTensorRTContextMode::kIndependentConcurrent
+        && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill;
+    if (decodeFirst)
+    {
+        enqueueDecode();
+        waitForDirectionalInjection(PhaseUnifiedActionDirection::kDecodeToPrefill, mDecodeEnqueueHostNs);
+        enqueuePrefill();
+    }
+    else
+    {
+        if (mHasPrefill)
+        {
+            enqueuePrefill();
+        }
+        if (mHasPrefill && mHasDecode)
+        {
+            waitForDirectionalInjection(PhaseUnifiedActionDirection::kPrefillToDecode, mPrefillEnqueueHostNs);
+        }
+        if (mHasDecode)
+        {
+            enqueueDecode();
         }
     }
     mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
@@ -386,9 +458,15 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
     PhaseGlobalActionKind const expectedMissing
         = mHasPrefill ? PhaseGlobalActionKind::kDecode : PhaseGlobalActionKind::kPrefill;
     check::check(missingPhase.key.kind == expectedMissing, "Residual P/D augmentation selected the active phase.");
+    PhaseGlobalResidualAnchor const observedAnchor
+        = mHasPrefill ? PhaseGlobalResidualAnchor::kPrefill : PhaseGlobalResidualAnchor::kDecode;
+    check::check(aggregate.key.residualAugmentation && aggregate.key.residualAnchor == observedAnchor,
+        "Residual P/D cost key does not match the phase that is already executing.");
 
     mScheduler.setNextGlobalAction(std::move(missingPhase), planId, snapshotEpoch);
     PhaseDispatchPlan additional = mScheduler.next();
+    uint64_t const effectivePlanId = additional.globalPlanId;
+    uint64_t const effectiveSnapshotEpoch = additional.globalSnapshotEpoch;
     bool const addsPrefill = !additional.prefillBatch.empty() && additional.decodeBatch.empty();
     bool const addsDecode = additional.prefillBatch.empty() && !additional.decodeBatch.empty();
     check::check((mHasPrefill && addsDecode) || (mHasDecode && addsPrefill),
@@ -396,8 +474,12 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
 
     if (addsPrefill)
     {
+        waitForDirectionalInjection(PhaseUnifiedActionDirection::kDecodeToPrefill, mDecodeEnqueueHostNs);
         mInFlight.prefillBatch = std::move(additional.prefillBatch);
         mHasPrefill = true;
+        mPrefillPlanId = effectivePlanId;
+        mPrefillActionId = aggregate.candidateId;
+        mPrefillEnqueueHostNs = phaseTimelineNowNs();
         CUDA_CHECK(cudaEventRecord(mAugmentationStart, mPrefillStream));
         recordTimeline(mInFlight.prefillBatch, PhaseTimelineStage::kPrefillStart);
         CUDA_CHECK(cudaEventRecord(mPrefillStart, mPrefillStream));
@@ -407,6 +489,7 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
     }
     else
     {
+        waitForDirectionalInjection(PhaseUnifiedActionDirection::kPrefillToDecode, mPrefillEnqueueHostNs);
         mInFlight.decodeBatch = std::move(additional.decodeBatch);
         preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
         mPreviousDecodeRowRequestIds.clear();
@@ -416,6 +499,9 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
             mPreviousDecodeRowRequestIds.push_back(item.requestId);
         }
         mHasDecode = true;
+        mDecodePlanId = effectivePlanId;
+        mDecodeActionId = aggregate.candidateId;
+        mDecodeEnqueueHostNs = phaseTimelineNowNs();
         CUDA_CHECK(cudaEventRecord(mAugmentationStart, mDecodeStream));
         recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
         CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
@@ -424,8 +510,9 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
         CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
     }
     mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
+    mCurrentMetrics.globalObservedResidualAnchor = observedAnchor;
     mResidualAugmentation = true;
-    mergeAugmentedMetrics(additional, aggregate, planId, snapshotEpoch);
+    mergeAugmentedMetrics(additional, aggregate, effectivePlanId, effectiveSnapshotEpoch);
     return true;
 }
 
@@ -443,7 +530,17 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mInFlight.globalAllowedOutstanding = PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode;
     mInFlight.globalActionFidelity = true;
     mInFlight.globalSelectedAction = aggregate.key;
+    mInFlight.globalCandidate = aggregate;
     mInFlight.globalReferenceWorkMs = aggregate.referenceWorkUs / 1000.0;
+    mInFlight.contextualPdFeatures = aggregate.contextualPdFeatures;
+    mInFlight.contextualPdFeatureValid = aggregate.contextualPdFeatureValid;
+    mInFlight.contextualPdExploration = aggregate.contextualPdExploration;
+    mInFlight.contextualPdMean = aggregate.contextualPdMean;
+    mInFlight.contextualPdUncertainty = aggregate.contextualPdUncertainty;
+    mInFlight.contextualPdLowerConfidenceBound = aggregate.contextualPdLowerConfidenceBound;
+    mInFlight.contextualCompletionIncumbentReferenceUs = aggregate.contextualCompletionIncumbentReferenceUs;
+    mInFlight.contextualCompletionNewcomerReferenceUs = aggregate.contextualCompletionNewcomerReferenceUs;
+    mInFlight.contextualCompletionMinimumSlackUs = aggregate.contextualCompletionMinimumSlackUs;
     mInFlight.globalServiceCompression
         = aggregate.referenceWorkUs / std::max(aggregate.predictedMakespanUs, std::numeric_limits<double>::epsilon());
     mInFlight.concurrentPrefillActive = true;
@@ -526,12 +623,14 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
         mCurrentMetrics.prefillMinTtftSlackUs = 0.0;
     }
     mCurrentMetrics.decodeContextTokens = 0;
+    mCurrentMetrics.plannedDecodeMaxContextLength = 0;
     for (PhaseWorkItem const& item : mInFlight.decodeBatch)
     {
         mCurrentMetrics.decodeContextTokens += item.tokenCount;
+        mCurrentMetrics.plannedDecodeMaxContextLength
+            = std::max(mCurrentMetrics.plannedDecodeMaxContextLength, item.tokenCount);
     }
     mCurrentMetrics.decodeTokens = mCurrentMetrics.decodeBatchSize;
-    mCurrentMetrics.plannedDecodeMaxContextLength = mInFlight.plannedDecodeMaxContextLength;
     mCurrentMetrics.concurrentPrefillActive = true;
     mCurrentMetrics.globalDecisionEvaluated = true;
     mCurrentMetrics.globalDecisionApplied = true;
@@ -546,6 +645,15 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mCurrentMetrics.globalSelectedAction = aggregate.key;
     mCurrentMetrics.globalReferenceWorkMs = mInFlight.globalReferenceWorkMs;
     mCurrentMetrics.globalServiceCompression = mInFlight.globalServiceCompression;
+    mCurrentMetrics.contextualPdFeatures = mInFlight.contextualPdFeatures;
+    mCurrentMetrics.contextualPdFeatureValid = mInFlight.contextualPdFeatureValid;
+    mCurrentMetrics.contextualPdExploration = mInFlight.contextualPdExploration;
+    mCurrentMetrics.contextualPdMean = mInFlight.contextualPdMean;
+    mCurrentMetrics.contextualPdUncertainty = mInFlight.contextualPdUncertainty;
+    mCurrentMetrics.contextualPdLowerConfidenceBound = mInFlight.contextualPdLowerConfidenceBound;
+    mCurrentMetrics.contextualCompletionIncumbentReferenceUs = mInFlight.contextualCompletionIncumbentReferenceUs;
+    mCurrentMetrics.contextualCompletionNewcomerReferenceUs = mInFlight.contextualCompletionNewcomerReferenceUs;
+    mCurrentMetrics.contextualCompletionMinimumSlackUs = mInFlight.contextualCompletionMinimumSlackUs;
 }
 
 bool PhaseDispatchWorker::eventReady(cudaEvent_t event) const
@@ -609,6 +717,7 @@ void PhaseDispatchWorker::wait()
 void PhaseDispatchWorker::enqueueDeferredDecode()
 {
     check::check(mDecodeDeferred && mHasDecode, "No deferred decode batch is available.");
+    mDecodeEnqueueHostNs = phaseTimelineNowNs();
     recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
     CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
     enqueueActivity(
@@ -727,6 +836,7 @@ void PhaseDispatchWorker::collectMetrics()
         CUDA_CHECK(cudaEventElapsedTime(&mCurrentMetrics.prefillGpuMs, mPrefillStart, mPrefillDone));
         CUDA_CHECK(cudaEventElapsedTime(&phaseEndMs, makespanStart, mPrefillDone));
         phaseEndMs = std::max(0.0F, phaseEndMs);
+        mCurrentMetrics.prefillCompletionMs = phaseEndMs;
         mCurrentMetrics.makespanGpuMs = std::max(mCurrentMetrics.makespanGpuMs, phaseEndMs);
     }
     if (mCurrentMetrics.decodeBatchSize > 0)
@@ -734,6 +844,7 @@ void PhaseDispatchWorker::collectMetrics()
         CUDA_CHECK(cudaEventElapsedTime(&mCurrentMetrics.decodeGpuMs, mDecodeStart, mDecodeDone));
         CUDA_CHECK(cudaEventElapsedTime(&phaseEndMs, makespanStart, mDecodeDone));
         phaseEndMs = std::max(0.0F, phaseEndMs);
+        mCurrentMetrics.decodeCompletionMs = phaseEndMs;
         mCurrentMetrics.makespanGpuMs = std::max(mCurrentMetrics.makespanGpuMs, phaseEndMs);
     }
     float const phaseSum = mCurrentMetrics.prefillGpuMs + mCurrentMetrics.decodeGpuMs;
@@ -789,6 +900,15 @@ PhasePrefillClass PhaseDispatchWorker::inFlightPrefillClass() const noexcept
     return mInFlight.prefillBatch.front().prefillClass;
 }
 
+PhaseGlobalActionCandidate const* PhaseDispatchWorker::inFlightGlobalCandidate() const noexcept
+{
+    if (!mBusy || !mInFlight.globalCandidate.has_value())
+    {
+        return nullptr;
+    }
+    return &*mInFlight.globalCandidate;
+}
+
 size_t PhaseDispatchWorker::dispatchCount() const noexcept
 {
     return mDispatchCount;
@@ -802,6 +922,72 @@ std::optional<PhaseDispatchMetrics> const& PhaseDispatchWorker::lastMetrics() co
 PhaseExecutionSafetyContract const& PhaseDispatchWorker::safetyContract() const noexcept
 {
     return mSafetyContract;
+}
+
+PhaseInFlightSnapshot PhaseDispatchWorker::inFlightSnapshot(uint64_t hostSnapshotNs) const noexcept
+{
+    constexpr uint64_t kEXECUTION_ID_SHIFT = 2U;
+    constexpr uint64_t kPREFILL_EXECUTION_TAG = 1U;
+    constexpr uint64_t kDECODE_EXECUTION_TAG = 2U;
+    PhaseInFlightSnapshot result;
+    result.hostSnapshotNs = hostSnapshotNs > 0U ? hostSnapshotNs : phaseTimelineNowNs();
+    if (!mBusy)
+    {
+        return result;
+    }
+
+    uint64_t const fallbackPlanId
+        = mCurrentMetrics.globalPlanId > 0U ? mCurrentMetrics.globalPlanId : mCurrentMetrics.dispatchIndex;
+    uint64_t const fallbackActionId
+        = mCurrentMetrics.globalCandidateId > 0U ? mCurrentMetrics.globalCandidateId : fallbackPlanId;
+    auto const status = [this](PhaseUnifiedPhase phase) {
+        if (phase == PhaseUnifiedPhase::kDecode && mDecodeDeferred)
+        {
+            return PhaseInFlightStatus::kSubmitted;
+        }
+        cudaEvent_t const done = phase == PhaseUnifiedPhase::kPrefill ? mPrefillDone : mDecodeDone;
+        return cudaEventQuery(done) == cudaSuccess ? PhaseInFlightStatus::kCompletionReady
+                                                   : PhaseInFlightStatus::kRunning;
+    };
+    if (mHasPrefill)
+    {
+        PhaseInFlightWorkSnapshot work;
+        work.phase = PhaseUnifiedPhase::kPrefill;
+        work.status = status(work.phase);
+        work.executionId = (mCurrentMetrics.dispatchIndex << kEXECUTION_ID_SHIFT) | kPREFILL_EXECUTION_TAG;
+        work.activityCorrelationId = mCurrentMetrics.dispatchIndex;
+        work.planId = mPrefillPlanId > 0U ? mPrefillPlanId : fallbackPlanId;
+        work.actionId = mPrefillActionId > 0U ? mPrefillActionId : fallbackActionId;
+        work.dispatchHostNs = mPrefillEnqueueHostNs > 0U ? mPrefillEnqueueHostNs : mCurrentMetrics.hostDispatchStartNs;
+        work.dispatchAgeUs = result.hostSnapshotNs >= work.dispatchHostNs
+            ? static_cast<double>(result.hostSnapshotNs - work.dispatchHostNs) / 1000.0
+            : 0.0;
+        work.requestIds = mCurrentMetrics.prefillRequestIds;
+        work.work.prefillRows = mCurrentMetrics.prefillBatchSize;
+        work.work.prefillTokens = mCurrentMetrics.prefillTokens;
+        result.work.push_back(work);
+        result.outstanding = result.outstanding | PhaseExecutionSet::kPrefill;
+    }
+    if (mHasDecode)
+    {
+        PhaseInFlightWorkSnapshot work;
+        work.phase = PhaseUnifiedPhase::kDecode;
+        work.status = status(work.phase);
+        work.executionId = (mCurrentMetrics.dispatchIndex << kEXECUTION_ID_SHIFT) | kDECODE_EXECUTION_TAG;
+        work.activityCorrelationId = mCurrentMetrics.dispatchIndex;
+        work.planId = mDecodePlanId > 0U ? mDecodePlanId : fallbackPlanId;
+        work.actionId = mDecodeActionId > 0U ? mDecodeActionId : fallbackActionId;
+        work.dispatchHostNs = mDecodeEnqueueHostNs > 0U ? mDecodeEnqueueHostNs : mCurrentMetrics.hostDispatchStartNs;
+        work.dispatchAgeUs = result.hostSnapshotNs >= work.dispatchHostNs
+            ? static_cast<double>(result.hostSnapshotNs - work.dispatchHostNs) / 1000.0
+            : 0.0;
+        work.requestIds = mCurrentMetrics.decodeRequestIds;
+        work.work.decodeRows = mCurrentMetrics.decodeBatchSize;
+        work.work.decodeContextTokens = mCurrentMetrics.decodeContextTokens;
+        result.work.push_back(work);
+        result.outstanding = result.outstanding | PhaseExecutionSet::kDecode;
+    }
+    return result;
 }
 
 void PhaseDispatchWorker::setActivityTimeline(PhaseActivityTimelineRecorder* timeline)

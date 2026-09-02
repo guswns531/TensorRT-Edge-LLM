@@ -295,6 +295,7 @@ TEST(PhaseDispatchWorkerTest, AugmentsLivePrefillWithResidualDecode)
         missing->key.primaryContextBucket};
     aggregate.key.primaryWorkClass = static_cast<int32_t>(rt::PhasePrefillClass::kText);
     aggregate.key.residualAugmentation = true;
+    aggregate.key.residualAnchor = rt::PhaseGlobalResidualAnchor::kPrefill;
     aggregate.primaryRequestIds = {1U};
     aggregate.primaryStableSlotIds = {1};
     aggregate.secondaryRequestIds = missing->primaryRequestIds;
@@ -313,6 +314,8 @@ TEST(PhaseDispatchWorkerTest, AugmentsLivePrefillWithResidualDecode)
     EXPECT_EQ(worker.lastMetrics()->prefillRequestIds, std::vector<uint64_t>{1U});
     EXPECT_EQ(worker.lastMetrics()->decodeRequestIds, std::vector<uint64_t>{2U});
     EXPECT_TRUE(worker.lastMetrics()->globalSelectedAction.residualAugmentation);
+    EXPECT_EQ(worker.lastMetrics()->globalObservedResidualAnchor, rt::PhaseGlobalResidualAnchor::kPrefill);
+    EXPECT_EQ(worker.lastMetrics()->plannedDecodeMaxContextLength, 64);
     EXPECT_TRUE(scheduler.empty());
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));

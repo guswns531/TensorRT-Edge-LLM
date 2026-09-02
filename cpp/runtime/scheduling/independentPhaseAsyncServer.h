@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -41,6 +42,10 @@ struct PhaseVisionPayload;
 
 //! Align admission to complete decode cohorts without exceeding the requested request capacity.
 size_t phaseDecodeAlignedAdmissionCapacity(size_t requestedCapacity, size_t decodeBatchCapacity) noexcept;
+//! A decode completion may block the owner thread only when it cannot delay
+//! already-observable producer work. This is state-based, not workload-based.
+bool phaseShouldSynchronizeDecodeSampling(
+    bool enabled, bool fromPrefill, bool externalPrefillQueued, size_t externalProducerRows) noexcept;
 //! Expose at most one complete prefill cohort to each serving-loop arbitration point.
 size_t phaseServingIngressQuantum(size_t maxPendingRequests, size_t prefillBatchCapacity) noexcept;
 //! Pure decision helper for sampling-aware decode-tail refill.
@@ -49,6 +54,9 @@ bool shouldDeferDecodeForSamplingRefill(
 //! Bound a partial prefill cohort while known upstream producers can add rows.
 bool shouldDeferPrefillForMicrobatchFormation(size_t targetRows, size_t prefillRows, size_t pendingProducerRows,
     double minTtftSlackUs, double ttftGuardUs, double elapsedUs, double formationWindowUs) noexcept;
+//! Hold newly available admission slots briefly so queued requests enter prefill as one refill cohort.
+bool shouldDeferAdmissionForPrefillRefill(size_t targetRows, size_t pendingRows, size_t availableSlots,
+    size_t activeRows, double elapsedUs, double formationWindowUs) noexcept;
 //! Restrict formation to short-output cohorts when a positive limit is configured.
 bool phasePrefillFormationSupportsOutputLength(int32_t maxOutputTokens, int32_t cohortMaxOutputTokens) noexcept;
 
@@ -195,6 +203,14 @@ struct IndependentPhaseServerConfig
     std::vector<int32_t> eosTokenIds;
     bool enablePrefixReuse{};
     bool enableCudaGraphs{};
+    //! Allow a concrete decode-sampling event to close the next decode
+    //! formation boundary synchronously. Ready/pending producer work retains
+    //! priority, so this never blocks the E/P first-token critical path.
+    bool synchronizeDecodeSampling{};
+    //! Target queued-request cohort admitted together after active requests complete.
+    size_t admissionRefillBatchSize{};
+    //! Maximum residence of partially available admission capacity. Zero disables refill formation.
+    double admissionRefillWindowUs{};
     size_t maxPendingRequests{};
     size_t maxPrefillGraphs{4U};
     size_t maxDecodeGraphs{8U};
@@ -207,6 +223,13 @@ struct IndependentPhaseServerConfig
     //! Replace the fixed refill decision with a global WAIT action over one
     //! concrete sampling event and its predicted future decode batch.
     bool enableGlobalWaitActions{};
+    //! Project already-submitted decode completions into the next admission/P
+    //! frontier. Disabled unless a transition-aware policy consumes it.
+    bool enableCompletionAwareAdmissionProjection{};
+    //! Evaluate and record global WAIT actions without granting them dispatch
+    //! authority when false. This keeps the selector, completion previews, and
+    //! telemetry identical for causal WAIT ablations.
+    bool enableGlobalWaitAuthority{true};
     double globalSamplingColdStartUs{200.0};
     size_t globalSamplingLatencyWindow{32U};
     //! Defer a partial prefill cohort while known upstream producers can fill this many rows.
@@ -270,8 +293,19 @@ struct IndependentPhaseServerArbitrationSnapshot
     bool busy{};
     PhaseDispatchKind inFlightKind{PhaseDispatchKind::kNone};
     PhasePrefillClass inFlightPrefillClass{PhasePrefillClass::kAny};
+    //! Host-observed P/D context state. Current policies do not consume it.
+    PhaseInFlightSnapshot inFlight;
     size_t prefillQueued{};
+    std::vector<uint64_t> prefillRequestIds;
+    std::vector<int32_t> prefillTokenCounts;
+    int32_t prefillCandidateTokens{};
     size_t decodeQueued{};
+    std::vector<uint64_t> decodeRequestIds;
+    std::vector<int32_t> decodeContextLengths;
+    int32_t decodeCandidateTokens{};
+    int32_t pagePoolAllocatedBundles{};
+    int32_t pageReservationGuaranteedBundles{};
+    size_t visionPayloadBytes{};
     double prefillOldestRequestAgeUs{};
     double prefillMinTtftSlackUs{};
     double decodeOldestWaitUs{};
@@ -348,6 +382,8 @@ public:
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
+    //! Configure an opt-in M2 directional launch experiment while idle.
+    void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
     bool poll();
     //! Progress admission, CUDA completions, sampling, and callbacks without
     //! selecting a new P/D action.
@@ -355,12 +391,15 @@ public:
     //! Select and enqueue at most one ready P/D action.
     bool dispatchReady();
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    std::vector<PhaseGlobalActionCandidate> const& lastGlobalPreviewCandidates() const noexcept;
     std::optional<PhaseGlobalActionCandidate> previewGlobalPrefillAction();
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
     PhaseGlobalCostEstimate estimateGlobalPrefillCost(
         int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const;
     PhaseGlobalCostEstimate estimateGlobalPrefillDrainCost(
         int32_t batchSize, int32_t promptTokens, PhasePrefillClass prefillClass) const;
+    std::optional<float> estimateGlobalDecodeComponentP95(
+        int32_t batchSize, int32_t maxContextLength, bool prefillActive) const;
     //! Apply the bounded completion-aware WAIT/refill decision before an
     //! externally coordinated global P/D dispatch.
     bool shouldWaitForGlobalDecodeRefill();
@@ -376,6 +415,9 @@ public:
     size_t pendingCount() const noexcept;
     //! Return true while a concrete CUDA sampling completion can refill decode.
     bool hasPendingSampling() const noexcept;
+    //! Snapshot the earliest concrete decode-producing sampling completions.
+    //! These are already-submitted CUDA events, never predicted arrivals.
+    std::vector<PhaseDecodeCompletionPreview> previewPendingDecodeCompletions(size_t maxPreviews = 2U) const;
     //! Include encoder and encoded-ready work that has not entered this server yet.
     void setExternalPendingRequests(size_t pendingRequests, double minTpotTargetUs = 0.0, size_t externalRequests = 0U,
         size_t externalPrefillTokens = 0U) noexcept;
@@ -403,6 +445,8 @@ public:
     size_t prefillFormationDeferralCount() const noexcept;
     size_t prefillFormationProfileSelectionCount() const noexcept;
     size_t prefillFormationProfileMissCount() const noexcept;
+    size_t admissionRefillWaitPeriodCount() const noexcept;
+    size_t admissionRefillDeferralCount() const noexcept;
     size_t pageGrowthWaitCount() const noexcept;
     size_t pendingPageGrowthCount() const noexcept;
     size_t pageGrowthOwnerCount() const noexcept;
@@ -430,10 +474,14 @@ public:
     size_t adaptiveAdmissionExternalProfileSelectionCount() const noexcept;
     size_t adaptiveAdmissionUnsatisfiableDecisionCount() const noexcept;
     float decodeAdmissionTpotPressure() const noexcept;
-    IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot() const noexcept;
+    //! Return scalar arbitration state by default. Exact ready/in-flight
+    //! vectors are materialized only for decision/event capture.
+    IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot(bool includeReadyDetails = false) const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
+    uint64_t globalPlanSequence() const noexcept;
+    uint64_t globalSnapshotEpoch() const noexcept;
     PhaseSchedulerTelemetry const& schedulerTelemetry() const noexcept;
 
 private:
@@ -476,6 +524,7 @@ private:
     std::vector<IndependentPhaseRequestView> makeViews(std::vector<PhaseWorkItem> const& batch) const;
     bool isEos(int32_t tokenId) const noexcept;
     bool admitPendingRequests();
+    bool shouldWaitForAdmissionRefill();
     bool resumePendingDecodeRequests();
     bool enqueueDecodeOrWait(uint64_t requestId, RequestState& state);
     void activateVisionSuffix(uint64_t requestId, RequestState& state);
@@ -486,12 +535,17 @@ private:
     int32_t pageReservationBudget() const;
     void refreshPageGrowthOwners();
     bool shouldWaitForPrefillFormation();
+    //! Evaluate one incremental P->D or D->P boundary for the direct server
+    //! loop. Three-phase coordination calls pollCompletions() and therefore
+    //! retains sole ownership of its own incremental action policy.
+    bool tryAugmentReadyAction();
     size_t admissionLimit() const noexcept;
     double effectiveAdmissionTpotBudgetUs() const noexcept;
     std::vector<IndependentPhaseAdmissionCost> const& activeAdmissionCosts() const noexcept;
     size_t costLimitedAdmissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
+    void completeSamplingTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     std::unique_ptr<IndependentPhaseSampleTicket> submitSamplingWithActivity(
         std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream, bool fromPrefill);
     void enqueueSamplingTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
@@ -530,6 +584,8 @@ private:
     size_t mPrefillFormationDeferralCount{};
     size_t mPrefillFormationProfileSelectionCount{};
     size_t mPrefillFormationProfileMissCount{};
+    size_t mAdmissionRefillWaitPeriodCount{};
+    size_t mAdmissionRefillDeferralCount{};
     size_t mPageGrowthWaitCount{};
     size_t mVisionPrefillReleaseCount{};
     size_t mVisionPrefillReleasedBytes{};
@@ -550,6 +606,11 @@ private:
     bool mLastAdmissionExternalProfileActive{};
     std::optional<bool> mAdmissionExternalProfileEpochSelection;
     std::optional<std::chrono::steady_clock::time_point> mPrefillFormationStartedAt;
+    std::optional<std::chrono::steady_clock::time_point> mAdmissionRefillStartedAt;
+    uint64_t mResidualIncumbentCandidateId{};
+    uint64_t mResidualMissingCandidateId{};
+    size_t mResidualPrefillQueued{std::numeric_limits<size_t>::max()};
+    size_t mResidualDecodeQueued{std::numeric_limits<size_t>::max()};
 };
 
 } // namespace trt_edgellm::rt

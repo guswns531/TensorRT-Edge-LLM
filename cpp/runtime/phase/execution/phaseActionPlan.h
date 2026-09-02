@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseIncrementalAction.h"
 #include "runtime/phase/ownership/phaseOwnershipHorizon.h"
+#include "runtime/phase/policy/phaseContextualPdModel.h"
 #include "runtime/phase/policy/phaseDeadline.h"
 #include "runtime/phase/policy/phaseGlobalCostModel.h"
 
@@ -53,10 +55,36 @@ struct PhaseGlobalActionCandidate
     bool shapeSafe{true};
     //! Overlap candidates require direct observations or one explicitly safe probe.
     bool overlapCostKnown{true};
+    //! A measured overlap may be feasible for deadline recovery even when it
+    //! does not compress serial work. Profitability remains a ranking signal.
+    bool overlapCostProfitable{true};
     bool safeProbeEligible{};
     //! Controlled calibration may remeasure a portable prior until enough
     //! exact node-local samples exist. This is never set by production policy.
     bool calibrationProbe{};
+    PhaseContextualPdFeatures contextualPdFeatures{};
+    bool contextualPdFeatureValid{};
+    bool contextualPdExploration{};
+    double contextualPdMean{};
+    double contextualPdUncertainty{};
+    double contextualPdLowerConfidenceBound{};
+    double contextualCompletionIncumbentReferenceUs{};
+    double contextualCompletionNewcomerReferenceUs{};
+    double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
+    PhaseContextualCompletionEstimate contextualCompletion{};
+    //! Encoder pair policy evidence is consumed by the three-phase global
+    //! coordinator and recorded with the matching E+P or E+D completion.
+    PhaseContextualPdFeatures contextualEncoderPairFeatures{};
+    bool contextualEncoderPairFeatureValid{};
+    bool contextualEncoderPairReady{};
+    bool contextualEncoderPairExploration{};
+    double contextualEncoderPairMean{};
+    double contextualEncoderPairUncertainty{};
+    double contextualEncoderPairLowerConfidenceBound{};
+    PhaseContextualPairDirection contextualEncoderPairDirection{PhaseContextualPairDirection::kEncoderToPrefill};
+    //! Sum of the two isolated batch makespans. This is intentionally
+    //! separate from throughput-oriented service reference work.
+    double contextualEncoderPairReferenceWorkUs{};
     //! WAIT is valid only for an already outstanding completion source.
     bool concreteWaitEvent{};
     uint64_t waitEventId{};
@@ -68,6 +96,13 @@ struct PhaseGlobalActionCandidate
     double uncertaintyUs{};
     //! GPU makespan of this action only. Zero falls back to predictedBlockingUs.
     double predictedMakespanUs{};
+    //! Low-dimensional policy estimate used only to rank already-safe actions.
+    //! Exact CUDA costs and protected completion bounds remain authoritative
+    //! for feasibility and deadline checks. This separation lets contextual
+    //! evidence interpolate across shapes without pretending to be an exact
+    //! execution-cost observation.
+    bool decisionCostKnown{};
+    double decisionMakespanUs{};
     //! Bounded decision-horizon cost. WAIT comparisons use the same future work
     //! on both NOW and WAIT alternatives so dispatching work now is not treated
     //! as if it left no residual work. Zero falls back to the action makespan.
@@ -98,19 +133,26 @@ struct PhaseGlobalDispatchPlan
     PhaseGlobalActionKind action{PhaseGlobalActionKind::kNone};
     PhaseExecutionSet allowedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet launched{PhaseExecutionSet::kNone};
+    //! M3 action identity is the correctness authority for 0/1/2-context transitions.
+    PhaseIncrementalAction incrementalAction;
     uint64_t waitEventId{};
     std::vector<uint64_t> primaryRequestIds;
     std::vector<uint64_t> secondaryRequestIds;
     std::vector<int32_t> primaryStableSlotIds;
     std::vector<int32_t> secondaryStableSlotIds;
+    PhaseContextualPdFeatures contextualPdFeatures{};
+    bool contextualPdFeatureValid{};
+    bool contextualPdExploration{};
 
     bool permits(PhaseExecutionSet phases) const noexcept;
     bool launchMatches(PhaseExecutionSet phases) const noexcept;
 };
 
 //! Materialize one selected candidate into an explicit execution lease.
-PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(
-    uint64_t planId, uint64_t snapshotEpoch, PhaseGlobalActionCandidate const& candidate);
+PhaseGlobalDispatchPlan phaseGlobalDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
+    PhaseGlobalActionCandidate const& candidate, PhaseExecutionSet outstandingBefore = PhaseExecutionSet::kNone,
+    PhaseUnifiedActionDirection direction = PhaseUnifiedActionDirection::kNone,
+    PhaseStartSkewBucket startSkew = PhaseStartSkewBucket::kImmediate);
 
 //! Return the unfinished portion of an already launched single-phase action.
 PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
@@ -118,6 +160,7 @@ PhaseGlobalActionCandidate phaseGlobalResidualCandidate(
 
 //! Upgrade a live P or D lease to E+P, E+D, or P+D without authorizing a third phase.
 std::optional<PhaseGlobalDispatchPlan> phaseGlobalAugmentedDispatchPlan(uint64_t planId, uint64_t snapshotEpoch,
-    PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation) noexcept;
+    PhaseGlobalDispatchPlan const& active, PhaseGlobalActionCandidate const& augmentation,
+    PhaseStartSkewBucket startSkew = PhaseStartSkewBucket::kUnknown) noexcept;
 
 } // namespace trt_edgellm::rt

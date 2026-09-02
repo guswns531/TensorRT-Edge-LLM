@@ -30,6 +30,24 @@ namespace trt_edgellm::rt
 PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig config)
     : mConfig(config)
     , mActions(config.action)
+    , mContextualPd(config.contextualPd)
+    , mContextualDp(config.contextualPd)
+    , mContextualEp(config.contextualEp)
+    , mContextualPe(config.contextualEp)
+    , mContextualEd(config.contextualEd)
+    , mContextualDe(config.contextualEd)
+    , mCompletionPd(config.contextualPd)
+    , mCompletionDp(config.contextualPd)
+    , mCompletionEp(config.contextualEp)
+    , mCompletionPe(config.contextualEp)
+    , mCompletionEd(config.contextualEd)
+    , mCompletionDe(config.contextualEd)
+    , mCompletionPdPair(config.contextualPd)
+    , mCompletionEpPair(config.contextualEp)
+    , mCompletionEdPair(config.contextualEd)
+    , mCompletionPdCalibration(config.completionCalibration)
+    , mCompletionEpCalibration(config.completionCalibration)
+    , mCompletionEdCalibration(config.completionCalibration)
 {
     ELLM_CHECK(mConfig.actionMinimumSamples > 0U, "Runtime action minimum sample count must be positive");
     ELLM_CHECK(mConfig.actionMinimumSamples <= mConfig.action.windowSize,
@@ -38,6 +56,9 @@ PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig c
     ELLM_CHECK(mConfig.decodeWindowSize >= mConfig.decodeMinimumSamples,
         "Runtime decode sample window must cover the minimum sample count");
     ELLM_CHECK(mConfig.decodeContextBucketTokens > 0, "Runtime decode context bucket must be positive");
+    ELLM_CHECK(std::isfinite(mConfig.completionDirectionPseudoObservations)
+            && mConfig.completionDirectionPseudoObservations > 0.0,
+        "Completion direction pseudo-observation count must be finite and positive");
 }
 
 void PhaseRuntimeCostTracker::observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation)
@@ -69,10 +90,30 @@ std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::estimatePrimaryB
     return mActions.estimatePrimaryBatchCoveringContext(key);
 }
 
+std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::estimateCoveringPrimary(
+    PhaseGlobalActionKey const& key) const
+{
+    return mActions.estimateCoveringPrimary(key);
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::estimatePrimaryLaunchFloor(
+    PhaseGlobalActionKey const& key) const
+{
+    return mActions.estimatePrimaryLaunchFloor(key);
+}
+
 std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::trustedEstimatePrimaryBatchCoveringContext(
     PhaseGlobalActionKey const& key) const
 {
     std::optional<PhaseGlobalCostEstimate> const estimateValue = mActions.estimatePrimaryBatchCoveringContext(key);
+    return estimateValue.has_value() && estimateValue->sampleCount >= mConfig.actionMinimumSamples ? estimateValue
+                                                                                                   : std::nullopt;
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::trustedEstimateCoveringOverlap(
+    PhaseGlobalActionKey const& key) const
+{
+    std::optional<PhaseGlobalCostEstimate> const estimateValue = mActions.estimateCoveringOverlap(key);
     return estimateValue.has_value() && estimateValue->sampleCount >= mConfig.actionMinimumSamples ? estimateValue
                                                                                                    : std::nullopt;
 }
@@ -104,6 +145,428 @@ bool PhaseRuntimeCostTracker::overlapEligible(PhaseGlobalActionKey const& key) c
     return mActions.overlapEligible(key);
 }
 
+PhaseContextualPdEstimate PhaseRuntimeCostTracker::predictContextualPd(PhaseContextualPdFeatures const& features)
+{
+    return mContextualPd.predict(features);
+}
+
+bool PhaseRuntimeCostTracker::observeContextualPd(
+    PhaseContextualPdFeatures const& features, double normalizedAdvantage, double weight)
+{
+    return mContextualPd.observe(features, normalizedAdvantage, weight);
+}
+
+void PhaseRuntimeCostTracker::recordContextualPdSelection(bool overlap, bool exploration) noexcept
+{
+    mContextualPd.recordSelection(overlap, exploration);
+}
+
+PhaseContextualPdModelConfig const& PhaseRuntimeCostTracker::contextualPdConfig() const noexcept
+{
+    return mContextualPd.config();
+}
+
+PhaseContextualPdTelemetry PhaseRuntimeCostTracker::contextualPdTelemetry() const noexcept
+{
+    return contextualPairTelemetry(PhaseContextualPairKind::kPrefillDecode);
+}
+
+PhaseContextualPdEstimate PhaseRuntimeCostTracker::predictContextualPair(
+    PhaseContextualPairKind kind, PhaseContextualPdFeatures const& features)
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode: return mContextualPd.predict(features);
+    case PhaseContextualPairKind::kEncoderPrefill: return mContextualEp.predict(features);
+    case PhaseContextualPairKind::kEncoderDecode: return mContextualEd.predict(features);
+    }
+    ELLM_CHECK(false, "Unknown contextual pair kind");
+}
+
+bool PhaseRuntimeCostTracker::observeContextualPair(
+    PhaseContextualPairKind kind, PhaseContextualPdFeatures const& features, double normalizedAdvantage, double weight)
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode: return mContextualPd.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairKind::kEncoderPrefill: return mContextualEp.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairKind::kEncoderDecode: return mContextualEd.observe(features, normalizedAdvantage, weight);
+    }
+    ELLM_CHECK(false, "Unknown contextual pair kind");
+}
+
+void PhaseRuntimeCostTracker::recordContextualPairSelection(
+    PhaseContextualPairKind kind, bool overlap, bool exploration) noexcept
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode: mContextualPd.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairKind::kEncoderPrefill: mContextualEp.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairKind::kEncoderDecode: mContextualEd.recordSelection(overlap, exploration); break;
+    }
+}
+
+PhaseContextualPdModelConfig const& PhaseRuntimeCostTracker::contextualPairConfig(
+    PhaseContextualPairKind kind) const noexcept
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode: return mContextualPd.config();
+    case PhaseContextualPairKind::kEncoderPrefill: return mContextualEp.config();
+    case PhaseContextualPairKind::kEncoderDecode: return mContextualEd.config();
+    }
+    return mContextualPd.config();
+}
+
+namespace
+{
+
+size_t completionDirectionIndex(PhaseContextualPairDirection direction) noexcept
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode: return 0U;
+    case PhaseContextualPairDirection::kDecodeToPrefill: return 1U;
+    case PhaseContextualPairDirection::kEncoderToPrefill: return 2U;
+    case PhaseContextualPairDirection::kPrefillToEncoder: return 3U;
+    case PhaseContextualPairDirection::kEncoderToDecode: return 4U;
+    case PhaseContextualPairDirection::kDecodeToEncoder: return 5U;
+    }
+    return 0U;
+}
+
+bool canonicalPrimaryIsIncumbent(PhaseContextualPairDirection direction) noexcept
+{
+    return direction == PhaseContextualPairDirection::kPrefillToDecode
+        || direction == PhaseContextualPairDirection::kEncoderToPrefill
+        || direction == PhaseContextualPairDirection::kEncoderToDecode;
+}
+
+PhaseContextualCompletionEstimate swapCompletionComponents(PhaseContextualCompletionEstimate value) noexcept
+{
+    std::swap(value.incumbentMeanUs, value.newcomerMeanUs);
+    std::swap(value.incumbentUncertaintyUs, value.newcomerUncertaintyUs);
+    return value;
+}
+
+void observeHierarchicalCompletionTelemetry(PhaseContextualCompletionTelemetry& telemetry,
+    PhaseContextualCompletionEstimate const& prediction, double confidenceBeta, double incumbentCompletionUs,
+    double newcomerCompletionUs, double minimumSlackUs) noexcept
+{
+    double const incumbentErrorUs = incumbentCompletionUs - prediction.incumbentMeanUs;
+    double const newcomerErrorUs = newcomerCompletionUs - prediction.newcomerMeanUs;
+    bool const incumbentCovered = std::abs(incumbentErrorUs) <= confidenceBeta * prediction.incumbentUncertaintyUs;
+    bool const newcomerCovered = std::abs(newcomerErrorUs) <= confidenceBeta * prediction.newcomerUncertaintyUs;
+    double const predictedRobustUs
+        = std::max(prediction.incumbentMeanUs + confidenceBeta * prediction.incumbentUncertaintyUs,
+            prediction.newcomerMeanUs + confidenceBeta * prediction.newcomerUncertaintyUs);
+    bool const predictedSafe = std::isfinite(minimumSlackUs) && predictedRobustUs <= minimumSlackUs;
+    ++telemetry.observations;
+    telemetry.readyCalibrationObservations += prediction.ready ? 1U : 0U;
+    telemetry.incumbentIntervalCovered += incumbentCovered ? 1U : 0U;
+    telemetry.newcomerIntervalCovered += newcomerCovered ? 1U : 0U;
+    telemetry.readyIncumbentIntervalCovered += prediction.ready && incumbentCovered ? 1U : 0U;
+    telemetry.readyNewcomerIntervalCovered += prediction.ready && newcomerCovered ? 1U : 0U;
+    telemetry.conformalCalibrationObservations += prediction.uncertaintyCalibrated ? 1U : 0U;
+    telemetry.conformalIncumbentIntervalCovered += prediction.uncertaintyCalibrated && incumbentCovered ? 1U : 0U;
+    telemetry.conformalNewcomerIntervalCovered += prediction.uncertaintyCalibrated && newcomerCovered ? 1U : 0U;
+    telemetry.predictedSafeObservations += predictedSafe ? 1U : 0U;
+    telemetry.falseSafeObservations
+        += predictedSafe && std::max(incumbentCompletionUs, newcomerCompletionUs) > minimumSlackUs ? 1U : 0U;
+    telemetry.conformalPredictedSafeObservations += prediction.uncertaintyCalibrated && predictedSafe ? 1U : 0U;
+    telemetry.conformalFalseSafeObservations += prediction.uncertaintyCalibrated && predictedSafe
+            && std::max(incumbentCompletionUs, newcomerCompletionUs) > minimumSlackUs
+        ? 1U
+        : 0U;
+    telemetry.incumbentAbsoluteErrorUs += std::abs(incumbentErrorUs);
+    telemetry.incumbentSquaredErrorUs += incumbentErrorUs * incumbentErrorUs;
+    telemetry.newcomerAbsoluteErrorUs += std::abs(newcomerErrorUs);
+    telemetry.newcomerSquaredErrorUs += newcomerErrorUs * newcomerErrorUs;
+    telemetry.readyIncumbentAbsoluteErrorUs += prediction.ready ? std::abs(incumbentErrorUs) : 0.0;
+    telemetry.readyIncumbentSquaredErrorUs += prediction.ready ? incumbentErrorUs * incumbentErrorUs : 0.0;
+    telemetry.readyNewcomerAbsoluteErrorUs += prediction.ready ? std::abs(newcomerErrorUs) : 0.0;
+    telemetry.readyNewcomerSquaredErrorUs += prediction.ready ? newcomerErrorUs * newcomerErrorUs : 0.0;
+}
+
+PhaseContextualPdTelemetry mergeContextualTelemetry(
+    PhaseContextualPdTelemetry left, PhaseContextualPdTelemetry const& right) noexcept
+{
+    left.predictions += right.predictions;
+    left.observations += right.observations;
+    left.rejectedObservations += right.rejectedObservations;
+    left.positiveSelections += right.positiveSelections;
+    left.negativeSelections += right.negativeSelections;
+    left.explorations += right.explorations;
+    left.calibrationObservations += right.calibrationObservations;
+    left.readyCalibrationObservations += right.readyCalibrationObservations;
+    left.confidenceIntervalCovered += right.confidenceIntervalCovered;
+    left.readyConfidenceIntervalCovered += right.readyConfidenceIntervalCovered;
+    left.predictedSafeObservations += right.predictedSafeObservations;
+    left.falseSafeObservations += right.falseSafeObservations;
+    left.absoluteErrorSum += right.absoluteErrorSum;
+    left.squaredErrorSum += right.squaredErrorSum;
+    left.readyAbsoluteErrorSum += right.readyAbsoluteErrorSum;
+    left.readySquaredErrorSum += right.readySquaredErrorSum;
+    if (right.observations > 0U)
+    {
+        left.lastReward = right.lastReward;
+        left.lastMean = right.lastMean;
+        left.lastUncertainty = right.lastUncertainty;
+        left.lastLowerConfidenceBound = right.lastLowerConfidenceBound;
+        left.lastPredictionError = right.lastPredictionError;
+    }
+    return left;
+}
+
+} // namespace
+
+PhaseContextualPdTelemetry PhaseRuntimeCostTracker::contextualPairTelemetry(PhaseContextualPairKind kind) const noexcept
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode:
+        return mergeContextualTelemetry(mContextualPd.telemetry(), mContextualDp.telemetry());
+    case PhaseContextualPairKind::kEncoderPrefill:
+        return mergeContextualTelemetry(mContextualEp.telemetry(), mContextualPe.telemetry());
+    case PhaseContextualPairKind::kEncoderDecode:
+        return mergeContextualTelemetry(mContextualEd.telemetry(), mContextualDe.telemetry());
+    }
+    return mContextualPd.telemetry();
+}
+
+PhaseContextualPdEstimate PhaseRuntimeCostTracker::predictContextualDirection(
+    PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features)
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode: return mContextualPd.predict(features);
+    case PhaseContextualPairDirection::kDecodeToPrefill: return mContextualDp.predict(features);
+    case PhaseContextualPairDirection::kEncoderToPrefill: return mContextualEp.predict(features);
+    case PhaseContextualPairDirection::kPrefillToEncoder: return mContextualPe.predict(features);
+    case PhaseContextualPairDirection::kEncoderToDecode: return mContextualEd.predict(features);
+    case PhaseContextualPairDirection::kDecodeToEncoder: return mContextualDe.predict(features);
+    }
+    ELLM_CHECK(false, "Unknown contextual pair direction");
+}
+
+bool PhaseRuntimeCostTracker::observeContextualDirection(PhaseContextualPairDirection direction,
+    PhaseContextualPdFeatures const& features, double normalizedAdvantage, double weight)
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode:
+        return mContextualPd.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairDirection::kDecodeToPrefill:
+        return mContextualDp.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairDirection::kEncoderToPrefill:
+        return mContextualEp.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairDirection::kPrefillToEncoder:
+        return mContextualPe.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairDirection::kEncoderToDecode:
+        return mContextualEd.observe(features, normalizedAdvantage, weight);
+    case PhaseContextualPairDirection::kDecodeToEncoder:
+        return mContextualDe.observe(features, normalizedAdvantage, weight);
+    }
+    ELLM_CHECK(false, "Unknown contextual pair direction");
+}
+
+void PhaseRuntimeCostTracker::recordContextualDirectionSelection(
+    PhaseContextualPairDirection direction, bool overlap, bool exploration) noexcept
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode: mContextualPd.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairDirection::kDecodeToPrefill: mContextualDp.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairDirection::kEncoderToPrefill: mContextualEp.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairDirection::kPrefillToEncoder: mContextualPe.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairDirection::kEncoderToDecode: mContextualEd.recordSelection(overlap, exploration); break;
+    case PhaseContextualPairDirection::kDecodeToEncoder: mContextualDe.recordSelection(overlap, exploration); break;
+    }
+}
+
+PhaseContextualPdTelemetry const& PhaseRuntimeCostTracker::contextualDirectionTelemetry(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode: return mContextualPd.telemetry();
+    case PhaseContextualPairDirection::kDecodeToPrefill: return mContextualDp.telemetry();
+    case PhaseContextualPairDirection::kEncoderToPrefill: return mContextualEp.telemetry();
+    case PhaseContextualPairDirection::kPrefillToEncoder: return mContextualPe.telemetry();
+    case PhaseContextualPairDirection::kEncoderToDecode: return mContextualEd.telemetry();
+    case PhaseContextualPairDirection::kDecodeToEncoder: return mContextualDe.telemetry();
+    }
+    return mContextualPd.telemetry();
+}
+
+PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::predictContextualCompletionDirection(
+    PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features, double incumbentReferenceUs,
+    double newcomerReferenceUs)
+{
+    PhaseContextualCompletionModel* pair{};
+    PhaseContextualCompletionModel* ordered{};
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode:
+        pair = &mCompletionPdPair;
+        ordered = &mCompletionPd;
+        break;
+    case PhaseContextualPairDirection::kDecodeToPrefill:
+        pair = &mCompletionPdPair;
+        ordered = &mCompletionDp;
+        break;
+    case PhaseContextualPairDirection::kEncoderToPrefill:
+        pair = &mCompletionEpPair;
+        ordered = &mCompletionEp;
+        break;
+    case PhaseContextualPairDirection::kPrefillToEncoder:
+        pair = &mCompletionEpPair;
+        ordered = &mCompletionPe;
+        break;
+    case PhaseContextualPairDirection::kEncoderToDecode:
+        pair = &mCompletionEdPair;
+        ordered = &mCompletionEd;
+        break;
+    case PhaseContextualPairDirection::kDecodeToEncoder:
+        pair = &mCompletionEdPair;
+        ordered = &mCompletionDe;
+        break;
+    }
+    ELLM_CHECK(pair != nullptr && ordered != nullptr, "Unknown contextual completion direction");
+    bool const primaryIsIncumbent = canonicalPrimaryIsIncumbent(direction);
+    double const primaryReferenceUs = primaryIsIncumbent ? incumbentReferenceUs : newcomerReferenceUs;
+    double const secondaryReferenceUs = primaryIsIncumbent ? newcomerReferenceUs : incumbentReferenceUs;
+    PhaseContextualCompletionEstimate pairEstimate = pair->predict(features, primaryReferenceUs, secondaryReferenceUs);
+    if (!primaryIsIncumbent)
+    {
+        pairEstimate = swapCompletionComponents(pairEstimate);
+    }
+    PhaseContextualCompletionEstimate const directionEstimate
+        = ordered->predict(features, incumbentReferenceUs, newcomerReferenceUs);
+    ++mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)].predictions;
+    PhaseContextualCompletionEstimate const raw = phaseBlendContextualCompletionEstimates(
+        pairEstimate, directionEstimate, mConfig.completionDirectionPseudoObservations);
+    switch (phaseContextualPairKind(direction))
+    {
+    case PhaseContextualPairKind::kPrefillDecode: return mCompletionPdCalibration.apply(raw);
+    case PhaseContextualPairKind::kEncoderPrefill: return mCompletionEpCalibration.apply(raw);
+    case PhaseContextualPairKind::kEncoderDecode: return mCompletionEdCalibration.apply(raw);
+    }
+    return raw;
+}
+
+bool PhaseRuntimeCostTracker::observeContextualCompletionDirection(PhaseContextualPairDirection direction,
+    PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
+    double incumbentCompletionUs, double newcomerCompletionUs, double minimumSlackUs)
+{
+    // Keep hierarchical calibration on the exact admissibility boundary used
+    // by both underlying completion models. Counting a rejected label in the
+    // wrapper would make pair and direction coverage incomparable.
+    if (!std::isfinite(incumbentReferenceUs) || incumbentReferenceUs <= 0.0 || !std::isfinite(newcomerReferenceUs)
+        || newcomerReferenceUs <= 0.0 || !std::isfinite(incumbentCompletionUs) || incumbentCompletionUs < 0.0
+        || !std::isfinite(newcomerCompletionUs) || newcomerCompletionUs < 0.0)
+    {
+        return false;
+    }
+    PhaseContextualCompletionModel* pair{};
+    PhaseContextualCompletionModel* ordered{};
+    PhaseContextualCompletionCalibrator* calibrator{};
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode:
+        pair = &mCompletionPdPair;
+        ordered = &mCompletionPd;
+        calibrator = &mCompletionPdCalibration;
+        break;
+    case PhaseContextualPairDirection::kDecodeToPrefill:
+        pair = &mCompletionPdPair;
+        ordered = &mCompletionDp;
+        calibrator = &mCompletionPdCalibration;
+        break;
+    case PhaseContextualPairDirection::kEncoderToPrefill:
+        pair = &mCompletionEpPair;
+        ordered = &mCompletionEp;
+        calibrator = &mCompletionEpCalibration;
+        break;
+    case PhaseContextualPairDirection::kPrefillToEncoder:
+        pair = &mCompletionEpPair;
+        ordered = &mCompletionPe;
+        calibrator = &mCompletionEpCalibration;
+        break;
+    case PhaseContextualPairDirection::kEncoderToDecode:
+        pair = &mCompletionEdPair;
+        ordered = &mCompletionEd;
+        calibrator = &mCompletionEdCalibration;
+        break;
+    case PhaseContextualPairDirection::kDecodeToEncoder:
+        pair = &mCompletionEdPair;
+        ordered = &mCompletionDe;
+        calibrator = &mCompletionEdCalibration;
+        break;
+    }
+    ELLM_CHECK(
+        pair != nullptr && ordered != nullptr && calibrator != nullptr, "Unknown contextual completion direction");
+    PhaseContextualCompletionEstimate const prediction
+        = predictContextualCompletionDirection(direction, features, incumbentReferenceUs, newcomerReferenceUs);
+    PhaseContextualCompletionTelemetry& telemetry
+        = mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)];
+    // The prediction above is part of calibration, not candidate generation.
+    --telemetry.predictions;
+    observeHierarchicalCompletionTelemetry(telemetry, prediction,
+        contextualPairConfig(phaseContextualPairKind(direction)).confidenceBeta, incumbentCompletionUs,
+        newcomerCompletionUs, minimumSlackUs);
+    PhaseContextualCompletionEstimate rawPrediction = prediction;
+    rawPrediction.incumbentUncertaintyUs /= prediction.uncertaintyScale;
+    rawPrediction.newcomerUncertaintyUs /= prediction.uncertaintyScale;
+    rawPrediction.uncertaintyScale = 1.0;
+    rawPrediction.uncertaintyCalibrationObservations = 0U;
+    rawPrediction.uncertaintyCalibrated = false;
+    static_cast<void>(
+        calibrator->observe(rawPrediction, contextualPairConfig(phaseContextualPairKind(direction)).confidenceBeta,
+            incumbentCompletionUs, newcomerCompletionUs));
+
+    bool const primaryIsIncumbent = canonicalPrimaryIsIncumbent(direction);
+    double const primaryReferenceUs = primaryIsIncumbent ? incumbentReferenceUs : newcomerReferenceUs;
+    double const secondaryReferenceUs = primaryIsIncumbent ? newcomerReferenceUs : incumbentReferenceUs;
+    double const primaryCompletionUs = primaryIsIncumbent ? incumbentCompletionUs : newcomerCompletionUs;
+    double const secondaryCompletionUs = primaryIsIncumbent ? newcomerCompletionUs : incumbentCompletionUs;
+    bool const pairObserved = pair->observe(
+        features, primaryReferenceUs, secondaryReferenceUs, primaryCompletionUs, secondaryCompletionUs, minimumSlackUs);
+    bool const directionObserved = ordered->observe(features, incumbentReferenceUs, newcomerReferenceUs,
+        incumbentCompletionUs, newcomerCompletionUs, minimumSlackUs);
+    return pairObserved && directionObserved;
+}
+
+PhaseContextualCompletionTelemetry const& PhaseRuntimeCostTracker::contextualCompletionDirectionTelemetry(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    return mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)];
+}
+
+PhaseContextualCompletionTelemetry const& PhaseRuntimeCostTracker::contextualCompletionPairTelemetry(
+    PhaseContextualPairKind kind) const noexcept
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode: return mCompletionPdPair.telemetry();
+    case PhaseContextualPairKind::kEncoderPrefill: return mCompletionEpPair.telemetry();
+    case PhaseContextualPairKind::kEncoderDecode: return mCompletionEdPair.telemetry();
+    }
+    return mCompletionPdPair.telemetry();
+}
+
+PhaseContextualCompletionCalibrationEstimate PhaseRuntimeCostTracker::contextualCompletionCalibration(
+    PhaseContextualPairKind kind) const
+{
+    switch (kind)
+    {
+    case PhaseContextualPairKind::kPrefillDecode: return mCompletionPdCalibration.estimate();
+    case PhaseContextualPairKind::kEncoderPrefill: return mCompletionEpCalibration.estimate();
+    case PhaseContextualPairKind::kEncoderDecode: return mCompletionEdCalibration.estimate();
+    }
+    return mCompletionPdCalibration.estimate();
+}
+
 void PhaseRuntimeCostTracker::observeDecode(
     int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive, float gpuMs)
 {
@@ -133,6 +596,54 @@ std::optional<float> PhaseRuntimeCostTracker::decodeP95(
     return ordered[p95Index];
 }
 
+std::optional<float> PhaseRuntimeCostTracker::decodeCoveringP95(
+    int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const
+{
+    DecodeKey const target = decodeKey(batchSize, maxContextLength, encoderActive, prefillActive);
+    struct Cover
+    {
+        DecodeKey key;
+        float p95{};
+    };
+    std::vector<Cover> covers;
+    for (auto const& [key, samples] : mDecodeComponents)
+    {
+        if (key.encoderActive != target.encoderActive || key.prefillActive != target.prefillActive
+            || key.batchSize < target.batchSize || key.contextBucket < target.contextBucket
+            || samples.size() < mConfig.decodeMinimumSamples)
+        {
+            continue;
+        }
+        std::vector<float> ordered(samples.begin(), samples.end());
+        std::sort(ordered.begin(), ordered.end());
+        size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1U;
+        covers.push_back({key, ordered[p95Index]});
+    }
+
+    std::optional<float> result;
+    for (Cover const& cover : covers)
+    {
+        bool dominated{};
+        for (Cover const& other : covers)
+        {
+            bool const noLarger
+                = other.key.batchSize <= cover.key.batchSize && other.key.contextBucket <= cover.key.contextBucket;
+            bool const strictlySmaller
+                = other.key.batchSize < cover.key.batchSize || other.key.contextBucket < cover.key.contextBucket;
+            if (&cover != &other && noLarger && strictlySmaller)
+            {
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated)
+        {
+            result = std::max(result.value_or(0.0F), cover.p95);
+        }
+    }
+    return result;
+}
+
 size_t PhaseRuntimeCostTracker::decodeBucketCount() const noexcept
 {
     return mDecodeComponents.size();
@@ -141,6 +652,25 @@ size_t PhaseRuntimeCostTracker::decodeBucketCount() const noexcept
 void PhaseRuntimeCostTracker::reset()
 {
     mActions.reset();
+    mContextualPd.reset();
+    mContextualDp.reset();
+    mContextualEp.reset();
+    mContextualPe.reset();
+    mContextualEd.reset();
+    mContextualDe.reset();
+    mCompletionPd.reset();
+    mCompletionDp.reset();
+    mCompletionEp.reset();
+    mCompletionPe.reset();
+    mCompletionEd.reset();
+    mCompletionDe.reset();
+    mCompletionPdPair.reset();
+    mCompletionEpPair.reset();
+    mCompletionEdPair.reset();
+    mCompletionPdCalibration.reset();
+    mCompletionEpCalibration.reset();
+    mCompletionEdCalibration.reset();
+    mCompletionHierarchicalTelemetry = {};
     mDecodeComponents.clear();
 }
 

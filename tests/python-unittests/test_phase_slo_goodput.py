@@ -95,3 +95,37 @@ def test_slo_goodput_counts_only_joint_slo_passes(tmp_path):
     assert result["pass_rate"] == 0.5
     assert result["request_goodput_per_s"] == 0.5
     assert result["token_goodput_per_s"] == 16.0
+    assert result["failure_reasons"] == {"pass": 1, "ttft": 1}
+    assert result["by_request_class"]["text"]["failure_reasons"] == {
+        "pass": 1,
+        "ttft": 1,
+    }
+
+
+def test_slo_goodput_attributes_joint_failures(tmp_path):
+    path = tmp_path / "requests.csv"
+    fieldnames = [
+        "request_class", "scheduled_arrival_us", "first_token_us",
+        "completed_us", "output_tokens", "http_status", "error", "ttft_ms",
+        "tpot_ms", "e2e_ms"
+    ]
+    with path.open("w", newline="", encoding="utf-8") as destination:
+        writer = csv.DictWriter(destination, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({
+            "request_class": "vision",
+            "scheduled_arrival_us": 0,
+            "first_token_us": 600_000,
+            "completed_us": 3_000_000,
+            "output_tokens": 32,
+            "http_status": 200,
+            "error": "",
+            "ttft_ms": 600,
+            "tpot_ms": 60,
+            "e2e_ms": 3000,
+        })
+
+    result = GOODPUT.summarize(path, ttft_ms=500, tpot_ms=50, e2e_ms=2500)
+
+    assert result["passed_requests"] == 0
+    assert result["failure_reasons"] == {"ttft+tpot+e2e": 1}

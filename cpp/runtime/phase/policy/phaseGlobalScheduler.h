@@ -37,9 +37,13 @@ enum class PhaseGlobalDecisionReason
     kNoCandidate,
     kNoHardFeasibleCandidate,
     kDeadlineSafeEfficiency,
+    kBoundedExploration,
     kMinimumViolation,
     kLegacyCompatibility,
     kExperimentalOverlap,
+    //! Every feasible action misses the same protected phase set; select the
+    //! action that clears the common work horizon most efficiently.
+    kAllLateEfficiencyRecovery,
 };
 
 //! Return a deterministic experimental selection with the requested long-run percentage.

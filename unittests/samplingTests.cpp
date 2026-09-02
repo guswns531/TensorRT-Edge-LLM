@@ -442,6 +442,77 @@ TEST_F(SamplingTest, SelectArgmaxAndComputeEntropy)
     EXPECT_NEAR(hostEntropy[1], entropyRef({-1.0F, 2.0F, 5.0F, 4.0F}), 1e-4F);
 }
 
+TEST_F(SamplingTest, SelectArgmaxMatchesGenericTopOne)
+{
+    constexpr int32_t kROWS = 3;
+    constexpr int32_t kVOCAB_SIZE = 7;
+    std::vector<float> const hostLogits{
+        -2.0F,
+        1.0F,
+        4.0F,
+        3.0F,
+        0.0F,
+        -1.0F,
+        2.0F,
+        9.0F,
+        2.0F,
+        1.0F,
+        8.0F,
+        3.0F,
+        4.0F,
+        5.0F,
+        -7.0F,
+        -6.0F,
+        -5.0F,
+        -4.0F,
+        -3.0F,
+        -2.0F,
+        -1.0F,
+    };
+
+    rt::Tensor logits({kROWS, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor directIndices({kROWS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor genericIndices({kROWS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    size_t const workspaceSize = getSelectAllTopKWorkspaceSize(kROWS, kVOCAB_SIZE, 1);
+    rt::Tensor workspace({static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    copyHostToDevice<float>(logits, hostLogits);
+
+    selectArgmax(logits, directIndices, /*stream=*/0);
+    selectAllTopK(logits, std::nullopt, genericIndices, /*topK=*/1, workspace, /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(directIndices), copyDeviceToHost<int32_t>(genericIndices));
+}
+
+TEST_F(SamplingTest, SelectArgmaxMatchesGenericTopOneAcrossPartitionTies)
+{
+    constexpr int32_t kROWS = 3;
+    constexpr int32_t kVOCAB_SIZE = 8192;
+    std::vector<float> hostLogits(static_cast<size_t>(kROWS) * kVOCAB_SIZE, -10.0F);
+    auto setLogit = [&](int32_t row, int32_t token, float value) {
+        hostLogits[static_cast<size_t>(row) * kVOCAB_SIZE + token] = value;
+    };
+    setLogit(0, 220, 5.0F);
+    setLogit(0, 1378, 5.0F);
+    setLogit(1, 3847, 7.0F);
+    setLogit(1, 7388, 7.0F);
+    setLogit(2, 3847, 9.0F);
+    setLogit(2, 4095, 9.0F);
+
+    rt::Tensor logits({kROWS, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor directIndices({kROWS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor genericIndices({kROWS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    size_t const workspaceSize = getSelectAllTopKWorkspaceSize(kROWS, kVOCAB_SIZE, 1);
+    rt::Tensor workspace({static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    copyHostToDevice<float>(logits, hostLogits);
+
+    selectArgmax(logits, directIndices, /*stream=*/0);
+    selectAllTopK(logits, std::nullopt, genericIndices, /*topK=*/1, workspace, /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(directIndices), copyDeviceToHost<int32_t>(genericIndices));
+}
+
 TEST_F(SamplingTest, DiffusionFusedSamplerMatchesSeparateKernels)
 {
     constexpr int32_t rows = 3;

@@ -38,6 +38,15 @@ TEST(IndependentPhaseAsyncServerTest, PreservesSubCohortAndInvalidCapacities)
     EXPECT_EQ(phaseDecodeAlignedAdmissionCapacity(80, 0), 80U);
 }
 
+TEST(IndependentPhaseAsyncServerTest, SynchronizesDecodeCompletionOnlyWithoutProducerCriticalPath)
+{
+    EXPECT_TRUE(phaseShouldSynchronizeDecodeSampling(true, false, false, 0));
+    EXPECT_FALSE(phaseShouldSynchronizeDecodeSampling(false, false, false, 0));
+    EXPECT_FALSE(phaseShouldSynchronizeDecodeSampling(true, true, false, 0));
+    EXPECT_FALSE(phaseShouldSynchronizeDecodeSampling(true, false, true, 0));
+    EXPECT_FALSE(phaseShouldSynchronizeDecodeSampling(true, false, false, 1));
+}
+
 TEST(IndependentPhaseAsyncServerTest, ExposesOneCompletePrefillCohortPerIngressTurn)
 {
     EXPECT_EQ(phaseServingIngressQuantum(1024, 8), 8U);
@@ -73,6 +82,24 @@ TEST(IndependentPhaseAsyncServerTest, PrefillFormationHonorsWindowAndTtftGuard)
     EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 4000.0, 1000.0, 250.0, 250.0));
     EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 1000.0, 1000.0, 100.0, 250.0));
     EXPECT_FALSE(shouldDeferPrefillForMicrobatchFormation(8, 2, 6, 4000.0, 1000.0, 0.0, 0.0));
+}
+
+TEST(IndependentPhaseAsyncServerTest, AdmissionRefillWaitsForOneCompletePrefillCohort)
+{
+    EXPECT_TRUE(shouldDeferAdmissionForPrefillRefill(8, 32, 1, 63, 1000.0, 10000.0));
+    EXPECT_TRUE(shouldDeferAdmissionForPrefillRefill(8, 8, 7, 57, 9999.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(8, 32, 8, 56, 1000.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(8, 7, 1, 63, 1000.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(8, 32, 1, 63, 10000.0, 10000.0));
+}
+
+TEST(IndependentPhaseAsyncServerTest, AdmissionRefillNeverBlocksDrainOrDisabledMode)
+{
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(0, 32, 1, 63, 1000.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(1, 32, 1, 63, 1000.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(8, 32, 0, 64, 1000.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(8, 32, 1, 0, 1000.0, 10000.0));
+    EXPECT_FALSE(shouldDeferAdmissionForPrefillRefill(8, 32, 1, 63, 0.0, 0.0));
 }
 
 TEST(IndependentPhaseAsyncServerTest, PrefillFormationCanSelectShortOutputCohorts)

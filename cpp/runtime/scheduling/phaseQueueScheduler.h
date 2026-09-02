@@ -171,6 +171,10 @@ struct PhaseDispatchMetrics
     double decodeQueueWaitUs{};
     float prefillGpuMs{};
     float decodeGpuMs{};
+    //! Component completion relative to the current H1 dispatch/augmentation
+    //! boundary, rather than the component's own CUDA start event.
+    float prefillCompletionMs{};
+    float decodeCompletionMs{};
     float makespanGpuMs{};
     float overlapRatio{};
     //! External vision encoder state captured when this dispatch was selected.
@@ -202,10 +206,21 @@ struct PhaseDispatchMetrics
     bool globalActionFidelity{};
     PhaseExecutionVariant globalExecutionVariant{PhaseExecutionVariant::kEager};
     PhaseGlobalActionKey globalSelectedAction{};
+    //! Actual phase already executing when this dispatch was augmented.
+    PhaseGlobalResidualAnchor globalObservedResidualAnchor{PhaseGlobalResidualAnchor::kNone};
     PhaseGlobalDecisionReason globalDecisionReason{PhaseGlobalDecisionReason::kNoCandidate};
     double globalPredictedViolationUs{};
     double globalServiceCompression{};
     double globalReferenceWorkMs{};
+    PhaseContextualPdFeatures contextualPdFeatures{};
+    bool contextualPdFeatureValid{};
+    bool contextualPdExploration{};
+    double contextualPdMean{};
+    double contextualPdUncertainty{};
+    double contextualPdLowerConfidenceBound{};
+    double contextualCompletionIncumbentReferenceUs{};
+    double contextualCompletionNewcomerReferenceUs{};
+    double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
 };
 
 struct PhaseSchedulerTelemetry
@@ -234,6 +249,7 @@ struct PhaseSchedulerTelemetry
     size_t globalSafeProbeCount{};
     size_t globalOverlapOpportunityCount{};
     size_t globalOverlapKnownCostCount{};
+    size_t globalOverlapCoveringCostCount{};
     size_t globalOverlapNoSampleCount{};
     size_t globalOverlapInsufficientSampleCount{};
     size_t globalOverlapUnprofitableCount{};
@@ -242,6 +258,24 @@ struct PhaseSchedulerTelemetry
     size_t globalOverlapProbeIntervalBlockedCount{};
     size_t globalOverlapProbeSlackBlockedCount{};
     size_t globalOverlapSelectionCount{};
+    size_t contextualPdPredictionCount{};
+    size_t contextualPdReadyCount{};
+    size_t contextualPdShadowDisagreementCount{};
+    size_t contextualPdObservationCount{};
+    size_t contextualPdRejectedObservationCount{};
+    size_t contextualPdPositiveSelectionCount{};
+    size_t contextualPdNegativeSelectionCount{};
+    size_t contextualPdExplorationCount{};
+    double contextualPdLastReward{};
+    double contextualPdLastMean{};
+    double contextualPdLastUncertainty{};
+    double contextualPdLastLowerConfidenceBound{};
+    size_t globalKnownOverlapPriorityCount{};
+    size_t globalMeasuredUnprofitableOverlapSelectionCount{};
+    size_t globalCostKeyObservationCount{};
+    size_t globalCostKeyParityViolationCount{};
+    size_t globalResidualPrefillAnchorObservationCount{};
+    size_t globalResidualDecodeAnchorObservationCount{};
     size_t globalExperimentalOverlapOpportunityCount{};
     size_t globalExperimentalOverlapSelectionCount{};
     size_t globalCandidateParityViolationCount{};
@@ -605,6 +639,8 @@ struct PhaseDecodeCompletionPreview
     //! Empty vectors preserve the synthetic/unit-test preview contract.
     std::vector<int32_t> stableSlotIds;
     std::vector<PhaseSchedulingHints> schedulingHints;
+    //! Next-decode service budget measured from event readiness.
+    double serviceBudgetUs{};
 };
 
 struct PhaseDispatchPlan
@@ -659,6 +695,26 @@ struct PhaseDispatchPlan
     double globalPredictedViolationUs{};
     double globalServiceCompression{};
     double globalReferenceWorkMs{};
+    PhaseContextualPdFeatures contextualPdFeatures{};
+    bool contextualPdFeatureValid{};
+    bool contextualPdExploration{};
+    double contextualCompletionIncumbentReferenceUs{};
+    double contextualCompletionNewcomerReferenceUs{};
+    double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
+    double contextualPdMean{};
+    double contextualPdUncertainty{};
+    double contextualPdLowerConfidenceBound{};
+    //! Complete policy candidate retained while this plan is in flight. The
+    //! execution worker exposes it read-only so the same global policy can
+    //! evaluate adding an idle peer context at a later host decision boundary.
+    std::optional<PhaseGlobalActionCandidate> globalCandidate;
+};
+
+struct PhaseGlobalResidualSelection
+{
+    PhaseGlobalActionCandidate missingPhase;
+    PhaseGlobalActionCandidate aggregate;
+    bool selected{};
 };
 
 //! Host-side two-queue batch scheduler for phase-separated, dual-stream inference.
@@ -701,18 +757,35 @@ public:
     //! Cost-key coverage accumulated during the current or most recent calibration epoch.
     std::vector<PhaseGlobalOverlapCostRecord> globalCalibrationDiagnostics() const;
     //! Return a read-only scheduling snapshot for an upstream phase arbiter.
-    PhaseQueueSnapshot queueSnapshot() const;
+    //! Return aggregate queue state for the scheduling hot path. Ready-row
+    //! vectors are materialized only for opt-in decision/event capture.
+    PhaseQueueSnapshot queueSnapshot(bool includeReadyDetails = false) const;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
     PhaseGlobalSelectionMode globalSelectionMode() const noexcept;
+    //! Return the last IDs consumed by direct or externally coordinated dispatch.
+    uint64_t globalPlanSequence() const noexcept;
+    uint64_t globalSnapshotEpoch() const noexcept;
     //! Compare D-now with at most two concrete WAIT(event)+D-future actions.
     //! Shadow mode records the decision without delaying dispatch.
     bool shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompletionPreview> const& previews);
+    double defaultDecodeTpotTargetUs() const noexcept
+    {
+        return mConfig.globalDecodeTpotTargetUs;
+    }
     //! Preview the best current P/D action without removing queue entries.
     std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    //! Return the complete immutable P/D frontier captured by the preceding
+    //! previewGlobalAction() call. This is telemetry/evaluation evidence only;
+    //! the selected action remains owned by the existing queue policy.
+    std::vector<PhaseGlobalActionCandidate> const& lastGlobalPreviewCandidates() const noexcept;
     //! Preview only the current prefill action for an external E+P candidate.
     std::optional<PhaseGlobalActionCandidate> previewGlobalPrefillAction();
     //! Preview decode only while an external encoder is already in flight.
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    //! Compare a live single-phase action with adding the currently ready peer
+    //! context. This is the incremental counterpart of previewGlobalAction().
+    std::optional<PhaseGlobalResidualSelection> previewGlobalResidualAction(
+        PhaseGlobalActionCandidate const& launched, double elapsedUs);
     //! Robust cost for a future prefill that has not entered the queue yet.
     //! This lets an upstream encoder protect the complete E->P first-token path
     //! without a workload label or a separate offline-only policy.
@@ -721,6 +794,9 @@ public:
     //! Sum the robust per-turn costs required to reach the first decode token.
     PhaseGlobalCostEstimate estimateGlobalPrefillDrainCost(
         int32_t batchSize, int32_t promptTokens, PhasePrefillClass prefillClass) const;
+    //! Observed p95 completion of D while it shares the GPU with P.
+    std::optional<float> estimateGlobalDecodeComponentP95(
+        int32_t batchSize, int32_t maxContextLength, bool prefillActive) const;
     //! Consume one externally selected P/D action at the next dispatch boundary.
     void setNextGlobalAction(PhaseGlobalActionCandidate candidate, uint64_t planId = 0U, uint64_t snapshotEpoch = 0U);
     void setGlobalMemoryHorizonSupplier(
@@ -769,6 +845,7 @@ private:
         PhaseGlobalActionCandidate candidate;
         PhaseGlobalDecision decision;
         bool safeProbe{};
+        std::vector<PhaseGlobalActionCandidate> candidateFrontier;
     };
 
     std::optional<GlobalQueueSelection> selectGlobalQueueAction(PhaseQueueSnapshot const& snapshot,
@@ -799,7 +876,7 @@ private:
         bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize, int32_t plannedDecodeMaxContextLength,
         PhaseQueueSnapshot const& snapshot, bool preferMaximumProgress, float& predictedGpuMs,
         float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept;
-    PhaseQueueSnapshot snapshot() const;
+    PhaseQueueSnapshot snapshot(bool includeReadyDetails = false) const;
     int32_t prefillBatchLimit(PhasePrefillClass prefillClass) const noexcept;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
     int32_t costAwarePrefillTokens(PhaseWorkItem const& item, int32_t chunkLimit) const noexcept;
@@ -856,6 +933,7 @@ private:
     std::vector<size_t> mGlobalCalibrationOpportunities;
     std::optional<PhaseGlobalActionCandidate> mNextGlobalAction;
     std::optional<PhaseGlobalDispatchPlan> mNextGlobalDispatchPlan;
+    std::vector<PhaseGlobalActionCandidate> mLastGlobalPreviewCandidates;
     std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)>
         mGlobalExecutionVariantSupplier;
 };

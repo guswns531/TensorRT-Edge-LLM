@@ -373,7 +373,7 @@ void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
     mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
 }
 
-PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
+PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
 {
     PhaseQueueSnapshot result{};
     result.prefillPendingProducerRows = mPendingPrefillProducerRows;
@@ -414,10 +414,19 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     }
     result.prefillQueued = static_cast<size_t>(std::count_if(mPrefillQueue.begin(), mPrefillQueue.end(),
         [this](PhaseWorkItem const& item) { return isEligible(item, true); }));
+    result.externalPrefillQueued
+        = std::any_of(mPrefillQueue.begin(), mPrefillQueue.end(), [this](PhaseWorkItem const& item) {
+              return isEligible(item, true) && item.prefillClass == PhasePrefillClass::kExternal;
+          });
     for (PhaseWorkItem const& item : mPrefillQueue)
     {
         if (isEligible(item, true))
         {
+            if (includeReadyDetails)
+            {
+                result.prefillRequestIds.push_back(item.requestId);
+                result.prefillTokenCounts.push_back(item.tokenCount);
+            }
             result.prefillRemainingTokens += item.tokenCount;
             result.prefillContinuationRows += item.tokenOffset > 0 ? 1 : 0;
         }
@@ -426,6 +435,11 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot() const
     result.decodeQueued = decodeRows.size();
     for (PhaseWorkItem const* item : decodeRows)
     {
+        if (includeReadyDetails)
+        {
+            result.decodeRequestIds.push_back(item->requestId);
+            result.decodeContextLengths.push_back(item->tokenCount);
+        }
         result.decodeCandidateContextTokens += item->tokenCount;
         result.decodeCandidateMaxContextLength = std::max(result.decodeCandidateMaxContextLength, item->tokenCount);
     }
@@ -511,9 +525,9 @@ int32_t PhaseQueueScheduler::prefillBatchLimit(PhasePrefillClass prefillClass) c
     return mConfig.maxPrefillBatchSize;
 }
 
-PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot() const
+PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot(bool includeReadyDetails) const
 {
-    return snapshot();
+    return snapshot(includeReadyDetails);
 }
 
 PhaseGlobalSchedulerMode PhaseQueueScheduler::globalSchedulerMode() const noexcept
@@ -524,6 +538,16 @@ PhaseGlobalSchedulerMode PhaseQueueScheduler::globalSchedulerMode() const noexce
 PhaseGlobalSelectionMode PhaseQueueScheduler::globalSelectionMode() const noexcept
 {
     return mConfig.globalSelectionMode;
+}
+
+uint64_t PhaseQueueScheduler::globalPlanSequence() const noexcept
+{
+    return mGlobalPlanSequence;
+}
+
+uint64_t PhaseQueueScheduler::globalSnapshotEpoch() const noexcept
+{
+    return mGlobalSnapshotEpoch;
 }
 
 bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
@@ -1591,6 +1615,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     int32_t overlapDecodeMaxContext{};
     int32_t overlapPrefillUsefulTokens{};
     bool overlapPrefillInitial{};
+    bool overlapPrefillAllFinal{!overlapPlan.prefillBatch.empty()};
     PhasePrefillClass overlapPrefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> overlapPrefillRequestIds;
     std::vector<uint64_t> overlapDecodeRequestIds;
@@ -1601,6 +1626,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         overlapPrefillChunk = std::max(overlapPrefillChunk, item.tokenCount);
         overlapPrefillPastKV = std::max(overlapPrefillPastKV, item.tokenOffset);
         overlapPrefillUsefulTokens += item.tokenCount;
+        overlapPrefillAllFinal = overlapPrefillAllFinal && item.tokenOffset + item.tokenCount == item.promptTokenCount;
         overlapPrefillRequestIds.push_back(item.requestId);
         overlapPrefillStableSlotIds.push_back(item.kvSlotId);
     }
@@ -1642,6 +1668,12 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     static_cast<double>(interpolated->referenceWorkMedianMs) * 1000.0, true};
             }
         }
+        if (std::optional<PhaseGlobalCostEstimate> const covering = mRuntimeCostTracker->estimateCoveringPrimary(key))
+        {
+            return {static_cast<double>(covering->makespanMedianMs) * 1000.0,
+                static_cast<double>(covering->uncertaintyMs) * 1000.0,
+                static_cast<double>(covering->referenceWorkMedianMs) * 1000.0, true};
+        }
         PhasePrefillBatchCost const* selected{};
         PhasePrefillBatchCost const* singleton{};
         for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
@@ -1669,13 +1701,18 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         double const fallbackMs = std::max(0.001,
             static_cast<double>(mConfig.globalColdPrefillMsPerToken)
                 * static_cast<double>(std::max(1, candidateTokens)));
-        double const makespanMs = selected != nullptr ? selected->p95GpuMs : fallbackMs;
+        std::optional<PhaseGlobalCostEstimate> const launchFloor = mRuntimeCostTracker->estimatePrimaryLaunchFloor(key);
+        double const launchFloorMs = launchFloor.has_value() ? launchFloor->makespanMedianMs : 0.0;
+        double const makespanMs = std::max(selected != nullptr ? selected->p95GpuMs : fallbackMs, launchFloorMs);
         double const referenceMs = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * rows : makespanMs;
-        double const uncertaintyMs = selected != nullptr ? 0.0 : mConfig.globalCostModelConfig.coldStartUncertaintyMs;
+        double const uncertaintyMs = launchFloor.has_value() ? launchFloor->uncertaintyMs
+            : selected != nullptr                            ? 0.0
+                                                             : mConfig.globalCostModelConfig.coldStartUncertaintyMs;
         return {makespanMs * 1000.0, uncertaintyMs * 1000.0, referenceMs * 1000.0, selected != nullptr};
     };
-    auto decodePrediction = [&]() -> Prediction {
-        if (std::optional<Prediction> const online = fromOnline(decodeKey))
+    auto predictDecode
+        = [&](PhaseGlobalActionKey const& key, int32_t rows, int32_t maxContext, int64_t contextTokens) -> Prediction {
+        if (std::optional<Prediction> const online = fromOnline(key))
         {
             return *online;
         }
@@ -1683,7 +1720,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseDecodeBatchCost const* singleton{};
         for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {
-            if (cost.batchSize == 1 && cost.maxContextLength >= decodeMaxContext
+            if (cost.batchSize == 1 && cost.maxContextLength >= maxContext
                 && (singleton == nullptr || cost.maxContextLength < singleton->maxContextLength
                     || (cost.maxContextLength == singleton->maxContextLength && cost.p95GpuMs < singleton->p95GpuMs)))
             {
@@ -1692,11 +1729,11 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             int64_t const totalLimit = cost.maxTotalContextTokens > 0
                 ? cost.maxTotalContextTokens
                 : static_cast<int64_t>(cost.batchSize) * cost.maxContextLength;
-            if (cost.maxContextLength < decodeMaxContext || totalLimit < decodeContextTokens)
+            if (cost.maxContextLength < maxContext || totalLimit < contextTokens)
             {
                 continue;
             }
-            if (cost.batchSize >= decodeRows
+            if (cost.batchSize >= rows
                 && (selected == nullptr || cost.batchSize < selected->batchSize
                     || (cost.batchSize == selected->batchSize && cost.p95GpuMs < selected->p95GpuMs)))
             {
@@ -1704,8 +1741,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             }
         }
         double const makespanMs = selected != nullptr ? selected->p95GpuMs : mConfig.globalColdDecodeMs;
-        double const referenceMs
-            = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * decodeRows : makespanMs;
+        double const referenceMs = singleton != nullptr ? static_cast<double>(singleton->p95GpuMs) * rows : makespanMs;
         double const uncertaintyMs = selected != nullptr ? 0.0 : mConfig.globalCostModelConfig.coldStartUncertaintyMs;
         return {makespanMs * 1000.0, uncertaintyMs * 1000.0, referenceMs * 1000.0, selected != nullptr};
     };
@@ -1714,8 +1750,30 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         ? std::optional<Prediction>(predictPrefill(
               prefillKey, prefillRows, prefillChunk, prefillPastKV, prefillInitial, prefillClass, prefillUsefulTokens))
         : std::nullopt;
-    std::optional<Prediction> const decode
-        = decodeRows > 0 ? std::optional<Prediction>(decodePrediction()) : std::nullopt;
+    std::optional<Prediction> const decode = decodeRows > 0
+        ? std::optional<Prediction>(predictDecode(decodeKey, decodeRows, decodeMaxContext, decodeContextTokens))
+        : std::nullopt;
+    std::optional<Prediction> overlapPrefill;
+    std::optional<Prediction> overlapDecode;
+    if (overlapPrefillRows > 0 && overlapDecodeRows > 0)
+    {
+        PhaseGlobalActionKey overlapPrefillKey{PhaseGlobalActionKind::kPrefill, overlapPrefillRows, 0,
+            overlapPrefillChunk, contextBucket(overlapPrefillPastKV), 0};
+        overlapPrefillKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
+        overlapPrefillKey.executionVariant = executionVariant(overlapPrefillKey, overlapPrefillUsefulTokens);
+        overlapPrefill = predictPrefill(overlapPrefillKey, overlapPrefillRows, overlapPrefillChunk,
+            overlapPrefillPastKV, overlapPrefillInitial, overlapPrefillClass, overlapPrefillUsefulTokens);
+        PhaseGlobalActionKey overlapDecodeKey{
+            PhaseGlobalActionKind::kDecode, overlapDecodeRows, 0, 1, contextBucket(overlapDecodeMaxContext), 0};
+        overlapDecodeKey.executionVariant = executionVariant(overlapDecodeKey, 0);
+        int64_t overlapDecodeContextTokens{};
+        for (PhaseWorkItem const& item : overlapPlan.decodeBatch)
+        {
+            overlapDecodeContextTokens += item.tokenCount;
+        }
+        overlapDecode
+            = predictDecode(overlapDecodeKey, overlapDecodeRows, overlapDecodeMaxContext, overlapDecodeContextTokens);
+    }
     struct PrefillFormationPrediction
     {
         Prediction combined;
@@ -1796,7 +1854,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         int32_t const residualTurns = (remainingTokens + futureChunkTokens - 1) / futureChunkTokens;
         return PhaseProtectedCompletion{prefillSlack,
             action.makespanUs + static_cast<double>(residualTurns) * prefill->makespanUs,
-            action.uncertaintyUs + static_cast<double>(residualTurns) * prefill->uncertaintyUs};
+            action.uncertaintyUs + static_cast<double>(residualTurns) * prefill->uncertaintyUs,
+            PhaseProtectedKind::kPrefill};
     };
     auto protect = [&](PhaseGlobalActionCandidate& candidate, int32_t advancedPrefillTokens, Prediction const& action) {
         if (prefill.has_value())
@@ -1809,7 +1868,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 || candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode;
             double const completion = action.makespanUs + (advancesDecode ? 0.0 : decode->makespanUs);
             double const uncertainty = action.uncertaintyUs + (advancesDecode ? 0.0 : decode->uncertaintyUs);
-            candidate.protectedCompletions.push_back({decodeSlack, completion, uncertainty});
+            candidate.protectedCompletions.push_back(
+                {decodeSlack, completion, uncertainty, PhaseProtectedKind::kDecode});
         }
     };
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -1857,7 +1917,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         // rows, deadline protection, and the dispatched action remain exact.
         double prefillFirstHorizonUs = prefill->makespanUs + decode->makespanUs;
         double decodeFirstHorizonUs = prefillFirstHorizonUs;
-        double serialReferenceWorkUs = prefill->referenceWorkUs + decode->referenceWorkUs;
+        double serialReferenceWorkUs = prefill->makespanUs + decode->makespanUs;
         if (prefillFormation.has_value())
         {
             // A known host-side producer can make more compatible rows ready
@@ -1868,9 +1928,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 + prefillFormation->residual.makespanUs;
             decodeFirstHorizonUs = std::max(decode->makespanUs, prefillFormation->producerWaitUs)
                 + prefillFormation->combined.makespanUs;
-            serialReferenceWorkUs = decode->referenceWorkUs
-                + std::max(prefill->referenceWorkUs + prefillFormation->residual.referenceWorkUs,
-                    prefillFormation->combined.referenceWorkUs);
+            serialReferenceWorkUs = decode->makespanUs
+                + std::max(
+                    prefill->makespanUs + prefillFormation->residual.makespanUs, prefillFormation->combined.makespanUs);
         }
         for (PhaseGlobalActionCandidate& candidate : candidates)
         {
@@ -1899,7 +1959,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             }
         }
     }
-    if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefillRows > 0 && overlapDecodeRows > 0)
+    if (allowOverlap && prefill.has_value() && decode.has_value() && overlapPrefill.has_value()
+        && overlapDecode.has_value())
     {
         ++mTelemetry.globalOverlapOpportunityCount;
         experimentalOverlapMode = !mGlobalWarmupProbeMode
@@ -1910,11 +1971,14 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         overlapKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
         overlapKey.executionVariant = executionVariant(overlapKey, overlapPrefillUsefulTokens);
         Prediction overlap{};
-        bool overlapKnown{};
+        bool overlapMeasured{};
+        bool overlapProfitable{};
+        bool overlapCovered{};
         if (std::optional<Prediction> const online = fromOnline(overlapKey))
         {
             overlap = *online;
-            overlapKnown = mRuntimeCostTracker->overlapEligible(overlapKey);
+            overlapMeasured = mRuntimeCostTracker->confidence(overlapKey) == PhaseRuntimeCostConfidence::kReady;
+            overlapProfitable = mRuntimeCostTracker->overlapEligible(overlapKey);
         }
         else
         {
@@ -1933,13 +1997,34 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 }
             }
             overlap.makespanUs = selected != nullptr ? static_cast<double>(selected->makespanP95GpuMs) * 1000.0
-                                                     : prefill->makespanUs + decode->makespanUs;
-            overlap.uncertaintyUs = selected != nullptr ? 0.0 : prefill->uncertaintyUs + decode->uncertaintyUs;
-            overlap.referenceWorkUs = prefill->referenceWorkUs + decode->referenceWorkUs;
+                                                     : overlapPrefill->makespanUs + overlapDecode->makespanUs;
+            overlap.uncertaintyUs
+                = selected != nullptr ? 0.0 : overlapPrefill->uncertaintyUs + overlapDecode->uncertaintyUs;
+            overlap.referenceWorkUs = overlapPrefill->makespanUs + overlapDecode->makespanUs;
             overlap.directlyKnown = selected != nullptr;
-            overlapKnown = selected != nullptr;
+            overlapMeasured = selected != nullptr;
+            overlapProfitable = selected != nullptr;
+        }
+        if (!overlapMeasured && mRuntimeCostTracker->contextualPdConfig().mode == PhaseContextualPdMode::kDisabled)
+        {
+            std::optional<PhaseGlobalCostEstimate> const covering
+                = mRuntimeCostTracker->trustedEstimateCoveringOverlap(overlapKey);
+            if (covering.has_value())
+            {
+                overlap.makespanUs = static_cast<double>(covering->makespanMedianMs) * 1000.0;
+                overlap.uncertaintyUs = static_cast<double>(covering->uncertaintyMs) * 1000.0;
+                overlap.referenceWorkUs = overlapPrefill->makespanUs + overlapDecode->makespanUs;
+                overlap.directlyKnown = false;
+                overlapMeasured = true;
+                double const robustMakespanUs = overlap.makespanUs + overlap.uncertaintyUs;
+                overlapProfitable = overlap.referenceWorkUs >= robustMakespanUs
+                        * (1.0 + static_cast<double>(mConfig.globalCostModelConfig.minimumOverlapGainRatio));
+                overlapCovered = true;
+            }
         }
         PhaseGlobalOverlapCostDiagnostic const localDiagnostic = mRuntimeCostTracker->overlapDiagnostic(overlapKey);
+        overlapMeasured = overlapMeasured || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kEligible
+            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kUnprofitable;
         switch (localDiagnostic.status)
         {
         case PhaseGlobalOverlapCostStatus::kNoSamples: ++mTelemetry.globalOverlapNoSampleCount; break;
@@ -1949,6 +2034,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         case PhaseGlobalOverlapCostStatus::kEligible: ++mTelemetry.globalOverlapKnownCostCount; break;
         case PhaseGlobalOverlapCostStatus::kUnprofitable: ++mTelemetry.globalOverlapUnprofitableCount; break;
         }
+        mTelemetry.globalOverlapCoveringCostCount += overlapCovered ? 1U : 0U;
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -1970,21 +2056,27 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 calibrationTarget = true;
             }
         }
-        double const robustSerialUs
-            = prefill->makespanUs + prefill->uncertaintyUs + decode->makespanUs + decode->uncertaintyUs;
+        double const robustSerialUs = overlapPrefill->makespanUs + overlapPrefill->uncertaintyUs
+            + overlapDecode->makespanUs + overlapDecode->uncertaintyUs;
         bool const probeIntervalReady = mLastGlobalSafeProbeSequence == 0U
             || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
         bool const probeSlackSafe = std::min(prefillSlack, decodeSlack)
             >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
+        // Once serial service is itself predicted to miss the protected
+        // request, refusing every unknown overlap makes that violation
+        // self-sustaining. The cold-start overlap bound below is exactly the
+        // robust serial cost, so one rate-limited probe cannot be ranked as
+        // safer than serial but may discover a recovery action.
+        bool const deadlineRecoveryProbe = std::min(prefillSlack, decodeSlack) < robustSerialUs;
         bool const calibrationProbe = mGlobalWarmupProbeMode && calibrationTarget && needsLocalCalibration;
         bool const safeProbe = calibrationProbe
-            || (!overlapKnown && needsLocalCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
-                && probeIntervalReady && probeSlackSafe);
+            || (!overlapMeasured && needsLocalCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
+                && probeIntervalReady && (probeSlackSafe || deadlineRecoveryProbe));
         if (safeProbe)
         {
             ++mTelemetry.globalOverlapSafeProbeEligibleCount;
         }
-        else if (!overlapKnown && needsLocalCalibration && !mGlobalWarmupProbeMode)
+        else if (!overlapMeasured && needsLocalCalibration && !mGlobalWarmupProbeMode)
         {
             if (mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
             {
@@ -2006,18 +2098,88 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.primaryStableSlotIds = overlapPrefillStableSlotIds;
         candidate.secondaryStableSlotIds = overlapDecodeStableSlotIds;
         phaseGlobalFinalizeCandidate(candidate);
-        candidate.overlapCostKnown = overlapKnown;
+        candidate.overlapCostKnown = overlapMeasured;
+        candidate.overlapCostProfitable = overlapProfitable;
         candidate.safeProbeEligible = safeProbe || experimentalOverlapMode;
         candidate.calibrationProbe = calibrationProbe;
         candidate.predictedBlockingUs = overlap.makespanUs;
         candidate.predictedMakespanUs = overlap.makespanUs;
         candidate.uncertaintyUs = overlap.uncertaintyUs;
-        candidate.referenceWorkUs = overlap.referenceWorkUs;
+        // Overlap profitability compares the exact batched P and D actions
+        // against executing those same actions serially. Singleton-scaled
+        // work is useful for batch efficiency, but it would classify large
+        // contended overlaps as profitable merely because batching itself is
+        // efficient.
+        candidate.referenceWorkUs = overlapPrefill->makespanUs + overlapDecode->makespanUs;
         candidate.requestServiceLagUs = std::max(state.prefillOldestRequestAgeUs, state.decodeOldestWaitUs);
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
+        PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
+        bool const externalPrefillLineage = overlapPrefillClass == PhasePrefillClass::kExternal;
+        if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
+        {
+            candidate.contextualPdFeatures = phaseContextualPdFeatures({overlapPrefill->makespanUs,
+                overlapDecode->makespanUs, std::min(prefillSlack, decodeSlack), overlapPrefillRows, overlapDecodeRows,
+                overlapPrefillChunk, overlapKey.primaryContextBucket, overlapKey.secondaryContextBucket,
+                overlapKey.executionVariant, overlapKey.residualAugmentation, overlapKey.residualAnchor});
+            candidate.contextualPdFeatureValid = true;
+            PhaseContextualPairDirection const contextualDirection
+                = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
+            bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
+            candidate.contextualCompletionIncumbentReferenceUs
+                = decodeIncumbent ? overlapDecode->makespanUs : overlapPrefill->makespanUs;
+            candidate.contextualCompletionNewcomerReferenceUs
+                = decodeIncumbent ? overlapPrefill->makespanUs : overlapDecode->makespanUs;
+            candidate.contextualCompletionMinimumSlackUs = std::min(prefillSlack, decodeSlack);
+            candidate.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
+                contextualDirection, candidate.contextualPdFeatures, candidate.contextualCompletionIncumbentReferenceUs,
+                candidate.contextualCompletionNewcomerReferenceUs);
+            PhaseContextualPdEstimate const contextual
+                = mRuntimeCostTracker->predictContextualDirection(contextualDirection, candidate.contextualPdFeatures);
+            candidate.contextualPdMean = contextual.mean;
+            candidate.contextualPdUncertainty = contextual.uncertainty;
+            candidate.contextualPdLowerConfidenceBound = contextual.lowerConfidenceBound;
+            candidate.contextualPdExploration
+                = !contextual.ready && probeIntervalReady && (probeSlackSafe || deadlineRecoveryProbe);
+            bool const producerCriticalPath = phaseContextualPdProducerCriticalPath(
+                mExternalEncoderActive || state.prefillPendingProducerRows > 0U, false);
+            if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready
+                && phaseContextualPdControlsDecision(producerCriticalPath))
+            {
+                candidate.decisionCostKnown = true;
+                candidate.decisionMakespanUs
+                    = phaseContextualDecisionMakespanUs(candidate.referenceWorkUs, contextual.lowerConfidenceBound);
+            }
+            ++mTelemetry.contextualPdPredictionCount;
+            mTelemetry.contextualPdReadyCount += contextual.ready ? 1U : 0U;
+        }
         candidate.protectedCompletions.push_back(
             protectedPrefillCompletion(overlap, protectedPrefillAdvance(overlapPlan.prefillBatch)));
-        candidate.protectedCompletions.push_back({decodeSlack, overlap.makespanUs, overlap.uncertaintyUs});
+        double overlapDecodeCompletionUs = overlap.makespanUs;
+        double overlapDecodeUncertaintyUs = overlap.uncertaintyUs;
+        if (std::optional<float> const decodeP95
+            = estimateGlobalDecodeComponentP95(overlapDecodeRows, overlapDecodeMaxContext, true))
+        {
+            overlapDecodeCompletionUs = static_cast<double>(*decodeP95) * 1000.0;
+            overlapDecodeUncertaintyUs = 0.0;
+        }
+        candidate.protectedCompletions.push_back(
+            {decodeSlack, overlapDecodeCompletionUs, overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode});
+        if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && candidate.contextualCompletion.ready
+            && candidate.contextualCompletion.uncertaintyCalibrated)
+        {
+            PhaseContextualPairDirection const direction
+                = phaseContextualPairDirection(candidate.key.kind, candidate.key.residualAnchor);
+            bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
+            for (PhaseProtectedCompletion& completion : candidate.protectedCompletions)
+            {
+                bool const incumbent
+                    = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
+                completion.predictedCompletionUs = incumbent ? candidate.contextualCompletion.incumbentMeanUs
+                                                             : candidate.contextualCompletion.newcomerMeanUs;
+                completion.uncertaintyUs = incumbent ? candidate.contextualCompletion.incumbentUncertaintyUs
+                                                     : candidate.contextualCompletion.newcomerUncertaintyUs;
+            }
+        }
         candidates.push_back(std::move(candidate));
         if (experimentalOverlapMode)
         {
@@ -2089,23 +2251,29 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         decision = mGlobalScheduler.select(candidates);
     }
-    if (!mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
+    if (!mGlobalWarmupProbeMode && !experimentalOverlapMode
+        && mRuntimeCostTracker->contextualPdConfig().mode != PhaseContextualPdMode::kDisabled)
     {
-        auto const probe = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
-            return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.safeProbeEligible
-                && !candidate.overlapCostKnown;
+        auto const overlap = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
+            return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.contextualPdFeatureValid;
         });
-        if (probe != candidates.end())
+        if (overlap != candidates.end())
         {
-            size_t const index = static_cast<size_t>(std::distance(candidates.begin(), probe));
-            decision.selectedIndex = index;
-            decision.reason = PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
-            decision.predictedViolationUs = 0.0;
-            double const makespanUs
-                = probe->predictedHorizonUs > 0.0 ? probe->predictedHorizonUs : probe->predictedMakespanUs;
-            double const referenceUs
-                = probe->horizonReferenceWorkUs > 0.0 ? probe->horizonReferenceWorkUs : probe->referenceWorkUs;
-            decision.serviceCompression = referenceUs / std::max(makespanUs, std::numeric_limits<double>::epsilon());
+            bool const producerCriticalPath = phaseContextualPdProducerCriticalPath(
+                mExternalEncoderActive || state.prefillPendingProducerRows > 0U, false);
+            bool const selectedOverlap = decision.selectedIndex.has_value()
+                && candidates[*decision.selectedIndex].key.kind == PhaseGlobalActionKind::kPrefillDecode;
+            bool const contextualControlsDecision = phaseContextualPdControlsDecision(producerCriticalPath);
+            bool const contextualOverlap = overlap->contextualPdLowerConfidenceBound > 0.0;
+            mTelemetry.contextualPdShadowDisagreementCount
+                += contextualControlsDecision && contextualOverlap != selectedOverlap ? 1U : 0U;
+            if (contextualControlsDecision)
+            {
+                PhaseContextualPairDirection const direction
+                    = phaseContextualPairDirection(overlap->key.kind, overlap->key.residualAnchor);
+                mRuntimeCostTracker->recordContextualDirectionSelection(
+                    direction, selectedOverlap, overlap->contextualPdExploration);
+            }
         }
     }
     if (experimentalOverlapMode)
@@ -2157,7 +2325,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         ++mTelemetry.globalNoFeasibleDecisionCount;
         return std::nullopt;
     }
-    PhaseGlobalActionCandidate const& selected = candidates[*decision.selectedIndex];
+    PhaseGlobalActionCandidate const selected = candidates[*decision.selectedIndex];
     if (prefillFormation.has_value() && selected.key.kind == PhaseGlobalActionKind::kDecode)
     {
         ++mTelemetry.globalPrefillFormationDecodeSelectionCount;
@@ -2181,9 +2349,12 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     if (selected.key.kind == PhaseGlobalActionKind::kPrefillDecode)
     {
         ++mTelemetry.globalOverlapSelectionCount;
+        mTelemetry.globalKnownOverlapPriorityCount += selected.overlapCostProfitable ? 1U : 0U;
+        mTelemetry.globalMeasuredUnprofitableOverlapSelectionCount
+            += selected.overlapCostKnown && !selected.overlapCostProfitable ? 1U : 0U;
     }
     mTelemetry.lastGlobalSelectedAction = selected.key.kind;
-    return GlobalQueueSelection{kind, selected, decision, safeProbe};
+    return GlobalQueueSelection{kind, selected, decision, safeProbe, std::move(candidates)};
 }
 
 bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompletionPreview> const& previews)
@@ -2314,8 +2485,8 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
     currentCandidate.referenceWorkUs = currentPrediction.referenceUs;
     currentCandidate.requestServiceLagUs = state.decodeOldestWaitUs;
     phaseGlobalFinalizeCandidate(currentCandidate);
-    currentCandidate.protectedCompletions.push_back(
-        {state.decodeMinTpotSlackUs, currentPrediction.makespanUs, currentPrediction.uncertaintyUs});
+    currentCandidate.protectedCompletions.push_back({state.decodeMinTpotSlackUs, currentPrediction.makespanUs,
+        currentPrediction.uncertaintyUs, PhaseProtectedKind::kDecode});
     if (mConfig.globalMemoryHorizonSupplier)
     {
         currentCandidate.memory
@@ -2379,8 +2550,8 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
             nowCandidate.horizonReferenceWorkUs = horizonReferenceUs;
             nowCandidate.uncertaintyUs += preview.waitUncertaintyUs + residual.uncertaintyUs;
             nowCandidate.protectedCompletions.clear();
-            nowCandidate.protectedCompletions.push_back(
-                {state.decodeMinTpotSlackUs, currentCandidate.predictedBlockingUs, currentCandidate.uncertaintyUs});
+            nowCandidate.protectedCompletions.push_back({state.decodeMinTpotSlackUs,
+                currentCandidate.predictedBlockingUs, currentCandidate.uncertaintyUs, PhaseProtectedKind::kDecode});
             candidates.push_back(std::move(nowCandidate));
 
             PhaseGlobalActionCandidate wait;
@@ -2397,8 +2568,8 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
             wait.primaryRequestIds = std::move(futureRequestIds);
             wait.primaryStableSlotIds = std::move(futureStableSlotIds);
             phaseGlobalFinalizeCandidate(wait);
-            wait.protectedCompletions.push_back(
-                {state.decodeMinTpotSlackUs, wait.predictedBlockingUs, wait.uncertaintyUs});
+            wait.protectedCompletions.push_back({state.decodeMinTpotSlackUs, wait.predictedBlockingUs,
+                wait.uncertaintyUs, PhaseProtectedKind::kDecode});
             if (mConfig.globalMemoryHorizonSupplier)
             {
                 wait.memory = mConfig.globalMemoryHorizonSupplier(wait.key, wait.requestIds);
@@ -2448,7 +2619,14 @@ std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalActi
         mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
             ? std::optional<PhaseDispatchKind>(legacyQueueDecision(state))
             : std::nullopt);
+    mLastGlobalPreviewCandidates
+        = selection.has_value() ? selection->candidateFrontier : std::vector<PhaseGlobalActionCandidate>{};
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
+}
+
+std::vector<PhaseGlobalActionCandidate> const& PhaseQueueScheduler::lastGlobalPreviewCandidates() const noexcept
+{
+    return mLastGlobalPreviewCandidates;
 }
 
 std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalPrefillAction()
@@ -2465,6 +2643,222 @@ std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalDeco
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
 }
 
+std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalResidualAction(
+    PhaseGlobalActionCandidate const& launched, double elapsedUs)
+{
+    if (mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kActive
+        || mConfig.globalSelectionMode != PhaseGlobalSelectionMode::kProfileFree
+        || (launched.key.kind != PhaseGlobalActionKind::kPrefill
+            && launched.key.kind != PhaseGlobalActionKind::kDecode))
+    {
+        return std::nullopt;
+    }
+
+    bool const addDecode = launched.key.kind == PhaseGlobalActionKind::kPrefill;
+    std::optional<PhaseGlobalActionCandidate> missing
+        = addDecode ? previewGlobalDecodeAction() : previewGlobalPrefillAction();
+    if (!missing.has_value())
+    {
+        return std::nullopt;
+    }
+
+    PhaseGlobalActionCandidate const active = phaseGlobalResidualCandidate(launched, elapsedUs);
+    PhaseGlobalActionCandidate const& prefill = addDecode ? active : *missing;
+    PhaseGlobalActionCandidate const& decode = addDecode ? *missing : active;
+    PhaseGlobalActionCandidate overlap;
+    overlap.key = {PhaseGlobalActionKind::kPrefillDecode, prefill.key.primaryBatchSize, decode.key.primaryBatchSize,
+        prefill.key.chunkLength, prefill.key.primaryContextBucket, decode.key.primaryContextBucket};
+    overlap.key.executionVariant
+        = phaseExecutionVariant(phaseExecutionVariantUsesPrimaryGraph(prefill.key.executionVariant),
+            phaseExecutionVariantUsesPrimaryGraph(decode.key.executionVariant));
+    overlap.key.primaryWorkClass = prefill.key.primaryWorkClass;
+    overlap.key.residualAugmentation = true;
+    overlap.key.residualAnchor = addDecode ? PhaseGlobalResidualAnchor::kPrefill : PhaseGlobalResidualAnchor::kDecode;
+    overlap.primaryRequestIds = prefill.primaryRequestIds;
+    overlap.primaryStableSlotIds = prefill.primaryStableSlotIds;
+    overlap.secondaryRequestIds = decode.primaryRequestIds;
+    overlap.secondaryStableSlotIds = decode.primaryStableSlotIds;
+    phaseGlobalFinalizeCandidate(overlap);
+    overlap.referenceWorkUs = active.predictedMakespanUs + missing->predictedMakespanUs;
+    overlap.requestServiceLagUs = std::max(active.requestServiceLagUs, missing->requestServiceLagUs);
+    if (mConfig.globalMemoryHorizonSupplier)
+    {
+        overlap.memory = mConfig.globalMemoryHorizonSupplier(overlap.key, overlap.requestIds);
+    }
+
+    double const robustSerialUs
+        = active.predictedMakespanUs + active.uncertaintyUs + missing->predictedMakespanUs + missing->uncertaintyUs;
+    PhaseGlobalOverlapCostDiagnostic diagnostic = mRuntimeCostTracker->overlapDiagnostic(overlap.key);
+    bool overlapKnown = diagnostic.status == PhaseGlobalOverlapCostStatus::kEligible
+        || diagnostic.status == PhaseGlobalOverlapCostStatus::kUnprofitable;
+    bool overlapProfitable = diagnostic.status == PhaseGlobalOverlapCostStatus::kEligible;
+    std::optional<PhaseGlobalCostEstimate> estimate
+        = overlapKnown ? mRuntimeCostTracker->estimate(overlap.key) : std::nullopt;
+    if (!estimate.has_value())
+    {
+        PhaseGlobalActionKey completeKey = overlap.key;
+        completeKey.residualAugmentation = false;
+        completeKey.residualAnchor = PhaseGlobalResidualAnchor::kNone;
+        PhaseGlobalOverlapCostDiagnostic const completeDiagnostic = mRuntimeCostTracker->overlapDiagnostic(completeKey);
+        bool const completeKnown = completeDiagnostic.status == PhaseGlobalOverlapCostStatus::kEligible
+            || completeDiagnostic.status == PhaseGlobalOverlapCostStatus::kUnprofitable;
+        estimate = completeKnown ? mRuntimeCostTracker->estimate(completeKey)
+                                 : mRuntimeCostTracker->trustedEstimateCoveringOverlap(completeKey);
+        if (estimate.has_value())
+        {
+            overlapKnown = true;
+            double const robustMakespanUs
+                = static_cast<double>(estimate->makespanMedianMs + estimate->uncertaintyMs) * 1000.0;
+            overlapProfitable = overlap.referenceWorkUs >= robustMakespanUs
+                    * (1.0 + static_cast<double>(mConfig.globalCostModelConfig.minimumOverlapGainRatio));
+        }
+    }
+    overlap.overlapCostKnown = overlapKnown;
+    overlap.overlapCostProfitable = overlapProfitable;
+    if (estimate.has_value())
+    {
+        overlap.predictedMakespanUs = static_cast<double>(estimate->makespanMedianMs) * 1000.0;
+        overlap.uncertaintyUs = static_cast<double>(estimate->uncertaintyMs) * 1000.0;
+    }
+    else
+    {
+        overlap.predictedMakespanUs = std::max(active.predictedMakespanUs, missing->predictedMakespanUs);
+        overlap.uncertaintyUs = std::max(0.0, robustSerialUs - overlap.predictedMakespanUs);
+    }
+    overlap.predictedBlockingUs = overlap.predictedMakespanUs;
+
+    double protectedSlackUs = std::numeric_limits<double>::infinity();
+    for (PhaseProtectedCompletion const& completion : active.protectedCompletions)
+    {
+        protectedSlackUs = std::min(protectedSlackUs, completion.slackUs);
+    }
+    for (PhaseProtectedCompletion const& completion : missing->protectedCompletions)
+    {
+        protectedSlackUs = std::min(protectedSlackUs, completion.slackUs);
+    }
+    bool const probeIntervalReady = mLastGlobalSafeProbeSequence == 0U
+        || mGlobalDecisionSequence - mLastGlobalSafeProbeSequence >= mConfig.globalSafeProbeInterval;
+    bool const deadlineRecovery = protectedSlackUs < robustSerialUs;
+    bool const slackSafe
+        = protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
+    overlap.safeProbeEligible = !overlapKnown && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
+        && (deadlineRecovery || slackSafe);
+
+    PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
+    bool const externalPrefill = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
+    if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefill)
+    {
+        overlap.contextualPdFeatures = phaseContextualPdFeatures(
+            {prefill.predictedMakespanUs, decode.predictedMakespanUs, protectedSlackUs, prefill.key.primaryBatchSize,
+                decode.key.primaryBatchSize, prefill.key.chunkLength, prefill.key.primaryContextBucket,
+                decode.key.primaryContextBucket, overlap.key.executionVariant, true, overlap.key.residualAnchor});
+        overlap.contextualPdFeatureValid = true;
+        PhaseContextualPairDirection const direction
+            = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+        bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
+        overlap.contextualCompletionIncumbentReferenceUs
+            = decodeIncumbent ? decode.predictedMakespanUs : prefill.predictedMakespanUs;
+        overlap.contextualCompletionNewcomerReferenceUs
+            = decodeIncumbent ? prefill.predictedMakespanUs : decode.predictedMakespanUs;
+        overlap.contextualCompletionMinimumSlackUs = protectedSlackUs;
+        overlap.contextualCompletion
+            = mRuntimeCostTracker->predictContextualCompletionDirection(direction, overlap.contextualPdFeatures,
+                overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
+        PhaseContextualPdEstimate const contextual
+            = mRuntimeCostTracker->predictContextualDirection(direction, overlap.contextualPdFeatures);
+        overlap.contextualPdMean = contextual.mean;
+        overlap.contextualPdUncertainty = contextual.uncertainty;
+        overlap.contextualPdLowerConfidenceBound = contextual.lowerConfidenceBound;
+        overlap.contextualPdExploration = !contextual.ready && probeIntervalReady && (deadlineRecovery || slackSafe);
+        if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
+        {
+            overlap.decisionCostKnown = true;
+            overlap.decisionMakespanUs
+                = phaseContextualDecisionMakespanUs(overlap.referenceWorkUs, contextual.lowerConfidenceBound);
+        }
+    }
+
+    double overlapDecodeCompletionUs = overlap.predictedMakespanUs;
+    double overlapDecodeUncertaintyUs = overlap.uncertaintyUs;
+    int32_t const decodeContextLength
+        = decode.key.primaryContextBucket * std::max(1, mConfig.runtimeDecodeContextBucketTokens);
+    if (std::optional<float> const decodeP95
+        = estimateGlobalDecodeComponentP95(decode.key.primaryBatchSize, decodeContextLength, true))
+    {
+        overlapDecodeCompletionUs = static_cast<double>(*decodeP95) * 1000.0;
+        overlapDecodeUncertaintyUs = 0.0;
+    }
+    auto appendProtected = [&](PhaseGlobalActionCandidate const& source) {
+        for (PhaseProtectedCompletion completion : source.protectedCompletions)
+        {
+            completion.predictedCompletionUs = completion.kind == PhaseProtectedKind::kDecode
+                ? overlapDecodeCompletionUs
+                : overlap.predictedMakespanUs;
+            completion.uncertaintyUs
+                = completion.kind == PhaseProtectedKind::kDecode ? overlapDecodeUncertaintyUs : overlap.uncertaintyUs;
+            overlap.protectedCompletions.push_back(completion);
+        }
+    };
+    appendProtected(active);
+    appendProtected(*missing);
+    if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && overlap.contextualCompletion.ready
+        && overlap.contextualCompletion.uncertaintyCalibrated)
+    {
+        PhaseContextualPairDirection const direction
+            = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+        bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
+        for (PhaseProtectedCompletion& completion : overlap.protectedCompletions)
+        {
+            bool const incumbent = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
+            completion.predictedCompletionUs = incumbent ? overlap.contextualCompletion.incumbentMeanUs
+                                                         : overlap.contextualCompletion.newcomerMeanUs;
+            completion.uncertaintyUs = incumbent ? overlap.contextualCompletion.incumbentUncertaintyUs
+                                                 : overlap.contextualCompletion.newcomerUncertaintyUs;
+        }
+    }
+
+    // Compare equal work horizons. Leaving the incumbent single phase active
+    // does not discard the ready peer phase; it executes that phase at the
+    // immediately following boundary. A one-action incumbent would therefore
+    // make serial look artificially cheap and suppress every profitable
+    // residual overlap.
+    PhaseGlobalActionCandidate serial = active;
+    serial.predictedHorizonUs = active.predictedMakespanUs + missing->predictedMakespanUs;
+    serial.horizonReferenceWorkUs = overlap.referenceWorkUs;
+    auto hasProtectedKind = [&](PhaseProtectedKind kind) {
+        return std::any_of(serial.protectedCompletions.begin(), serial.protectedCompletions.end(),
+            [&](PhaseProtectedCompletion const& completion) { return completion.kind == kind; });
+    };
+    for (PhaseProtectedCompletion completion : missing->protectedCompletions)
+    {
+        if (hasProtectedKind(completion.kind))
+        {
+            continue;
+        }
+        completion.predictedCompletionUs += active.predictedMakespanUs;
+        completion.uncertaintyUs += active.uncertaintyUs;
+        serial.protectedCompletions.push_back(completion);
+    }
+
+    ++mGlobalDecisionSequence;
+    PhaseGlobalDecision const decision = mGlobalScheduler.select({serial, overlap});
+    bool const selectedOverlap = decision.selectedIndex.has_value() && *decision.selectedIndex == 1U;
+    if (overlap.contextualPdFeatureValid)
+    {
+        PhaseContextualPairDirection const direction
+            = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+        mRuntimeCostTracker->recordContextualDirectionSelection(
+            direction, selectedOverlap, overlap.contextualPdExploration);
+    }
+    if (selectedOverlap && overlap.safeProbeEligible && !overlap.overlapCostKnown)
+    {
+        mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
+        ++mTelemetry.globalSafeProbeCount;
+    }
+    mTelemetry.globalOverlapSelectionCount += selectedOverlap ? 1U : 0U;
+    return PhaseGlobalResidualSelection{std::move(*missing), std::move(overlap), selectedOverlap};
+}
+
 PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const
 {
@@ -2479,6 +2873,11 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     {
         return *online;
     }
+    if (std::optional<PhaseGlobalCostEstimate> const covering = mRuntimeCostTracker->estimateCoveringPrimary(key))
+    {
+        return *covering;
+    }
+    std::optional<PhaseGlobalCostEstimate> const launchFloor = mRuntimeCostTracker->estimatePrimaryLaunchFloor(key);
 
     PhasePrefillBatchCost const* selected{};
     PhasePrefillBatchCost const* singleton{};
@@ -2508,12 +2907,22 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     {
         float const referenceMs
             = singleton != nullptr ? singleton->p95GpuMs * static_cast<float>(batchSize) : selected->p95GpuMs;
-        return {0U, referenceMs, selected->p95GpuMs, selected->p95GpuMs, 0.0F};
+        float const makespanMs = launchFloor.has_value() ? std::max(selected->p95GpuMs, launchFloor->makespanMedianMs)
+                                                         : selected->p95GpuMs;
+        float const uncertaintyMs = launchFloor.has_value() ? launchFloor->uncertaintyMs : 0.0F;
+        return {launchFloor.has_value() ? launchFloor->sampleCount : 0U, std::max(referenceMs, makespanMs), makespanMs,
+            std::max(makespanMs, launchFloor.has_value() ? launchFloor->makespanP95Ms : makespanMs), uncertaintyMs};
     }
 
     double const totalTokens = static_cast<double>(batchSize) * static_cast<double>(chunkLength);
     float const coldMs
         = static_cast<float>(std::max(0.001, static_cast<double>(mConfig.globalColdPrefillMsPerToken) * totalTokens));
+    if (launchFloor.has_value())
+    {
+        float const makespanMs = std::max(coldMs, launchFloor->makespanMedianMs);
+        return {launchFloor->sampleCount, makespanMs, makespanMs, std::max(makespanMs, launchFloor->makespanP95Ms),
+            launchFloor->uncertaintyMs};
+    }
     return {0U, coldMs, coldMs, coldMs, mConfig.globalCostModelConfig.coldStartUncertaintyMs};
 }
 
@@ -2673,10 +3082,20 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         mNextGlobalAction.reset();
         mNextGlobalDispatchPlan.reset();
         appliedGlobalAction = global;
+        plan.globalCandidate = global;
         plan.globalDecisionEvaluated = true;
         plan.globalDecisionApplied = true;
         plan.globalSelectedAction = global.key;
         plan.globalReferenceWorkMs = global.referenceWorkUs / 1000.0;
+        plan.contextualPdFeatures = global.contextualPdFeatures;
+        plan.contextualPdFeatureValid = global.contextualPdFeatureValid;
+        plan.contextualPdExploration = global.contextualPdExploration;
+        plan.contextualPdMean = global.contextualPdMean;
+        plan.contextualPdUncertainty = global.contextualPdUncertainty;
+        plan.contextualPdLowerConfidenceBound = global.contextualPdLowerConfidenceBound;
+        plan.contextualCompletionIncumbentReferenceUs = global.contextualCompletionIncumbentReferenceUs;
+        plan.contextualCompletionNewcomerReferenceUs = global.contextualCompletionNewcomerReferenceUs;
+        plan.contextualCompletionMinimumSlackUs = global.contextualCompletionMinimumSlackUs;
         double const predictedMakespanUs
             = global.predictedMakespanUs > 0.0 ? global.predictedMakespanUs : global.predictedBlockingUs;
         plan.globalServiceCompression
@@ -2715,6 +3134,15 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalPredictedViolationUs = global->decision.predictedViolationUs;
         plan.globalServiceCompression = global->decision.serviceCompression;
         plan.globalReferenceWorkMs = global->candidate.referenceWorkUs / 1000.0;
+        plan.contextualPdFeatures = global->candidate.contextualPdFeatures;
+        plan.contextualPdFeatureValid = global->candidate.contextualPdFeatureValid;
+        plan.contextualPdExploration = global->candidate.contextualPdExploration;
+        plan.contextualPdMean = global->candidate.contextualPdMean;
+        plan.contextualPdUncertainty = global->candidate.contextualPdUncertainty;
+        plan.contextualPdLowerConfidenceBound = global->candidate.contextualPdLowerConfidenceBound;
+        plan.contextualCompletionIncumbentReferenceUs = global->candidate.contextualCompletionIncumbentReferenceUs;
+        plan.contextualCompletionNewcomerReferenceUs = global->candidate.contextualCompletionNewcomerReferenceUs;
+        plan.contextualCompletionMinimumSlackUs = global->candidate.contextualCompletionMinimumSlackUs;
         plan.globalSafeProbe = global->safeProbe;
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kShadow)
         {
@@ -2724,6 +3152,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         {
             kind = global->kind;
             appliedGlobalAction = global->candidate;
+            plan.globalCandidate = global->candidate;
             plan.globalDecisionApplied = true;
             plan.globalCandidateId = global->candidate.candidateId;
             PhaseGlobalDispatchPlan const globalPlan
@@ -3346,6 +3775,17 @@ std::optional<float> PhaseQueueScheduler::decodeComponentP95(
     return mRuntimeCostTracker->decodeP95(batchSize, maxContextLength, encoderActive, prefillActive);
 }
 
+std::optional<float> PhaseQueueScheduler::estimateGlobalDecodeComponentP95(
+    int32_t batchSize, int32_t maxContextLength, bool prefillActive) const
+{
+    std::optional<float> result = decodeComponentP95(batchSize, maxContextLength, false, prefillActive);
+    if (!result.has_value())
+    {
+        result = mRuntimeCostTracker->decodeCoveringP95(batchSize, maxContextLength, false, prefillActive);
+    }
+    return result;
+}
+
 void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
 {
     check::check(
@@ -3433,6 +3873,8 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
         key.residualAugmentation = metrics.globalDecisionApplied
             && metrics.globalSelectedAction.kind == PhaseGlobalActionKind::kPrefillDecode
             && metrics.globalSelectedAction.residualAugmentation;
+        key.residualAnchor
+            = key.residualAugmentation ? metrics.globalObservedResidualAnchor : PhaseGlobalResidualAnchor::kNone;
         return key;
     }
     if (metrics.kind == PhaseDispatchKind::kPrefill)
@@ -3530,6 +3972,20 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     if (mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kDisabled && metrics.makespanGpuMs > 0.0F)
     {
         PhaseGlobalActionKey const observedKey = globalActionKey(metrics);
+        if (metrics.globalDecisionApplied && observedKey.kind != PhaseGlobalActionKind::kNone)
+        {
+            ++mTelemetry.globalCostKeyObservationCount;
+            bool const exactKeyParity = metrics.globalSelectedAction == observedKey;
+            mTelemetry.globalCostKeyParityViolationCount += exactKeyParity ? 0U : 1U;
+            if (observedKey.residualAnchor == PhaseGlobalResidualAnchor::kPrefill)
+            {
+                ++mTelemetry.globalResidualPrefillAnchorObservationCount;
+            }
+            else if (observedKey.residualAnchor == PhaseGlobalResidualAnchor::kDecode)
+            {
+                ++mTelemetry.globalResidualDecodeAnchorObservationCount;
+            }
+        }
         bool const planBoundSample = !metrics.globalDecisionApplied
             || (metrics.globalCandidateParity && metrics.globalActionFidelity
                 && metrics.globalSelectedAction == observedKey);
@@ -3541,8 +3997,43 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
                 referenceWorkMs = static_cast<float>(metrics.globalReferenceWorkMs);
             }
             mRuntimeCostTracker->observe(observedKey, {referenceWorkMs, metrics.makespanGpuMs});
+            if (observedKey.kind == PhaseGlobalActionKind::kPrefillDecode && metrics.contextualPdFeatureValid
+                && referenceWorkMs > 0.0F)
+            {
+                double const reward = (static_cast<double>(referenceWorkMs) - metrics.makespanGpuMs)
+                    / static_cast<double>(referenceWorkMs);
+                PhaseContextualPairDirection const direction
+                    = phaseContextualPairDirection(observedKey.kind, observedKey.residualAnchor);
+                if (mRuntimeCostTracker->observeContextualDirection(direction, metrics.contextualPdFeatures, reward))
+                {
+                    ++mTelemetry.contextualPdObservationCount;
+                }
+                else
+                {
+                    ++mTelemetry.contextualPdRejectedObservationCount;
+                }
+                bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
+                double const incumbentCompletionUs
+                    = static_cast<double>(decodeIncumbent ? metrics.decodeCompletionMs : metrics.prefillCompletionMs)
+                    * 1000.0;
+                double const newcomerCompletionUs
+                    = static_cast<double>(decodeIncumbent ? metrics.prefillCompletionMs : metrics.decodeCompletionMs)
+                    * 1000.0;
+                static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(direction,
+                    metrics.contextualPdFeatures, metrics.contextualCompletionIncumbentReferenceUs,
+                    metrics.contextualCompletionNewcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs,
+                    metrics.contextualCompletionMinimumSlackUs));
+            }
         }
     }
+    PhaseContextualPdTelemetry const& contextualTelemetry = mRuntimeCostTracker->contextualPdTelemetry();
+    mTelemetry.contextualPdPositiveSelectionCount = contextualTelemetry.positiveSelections;
+    mTelemetry.contextualPdNegativeSelectionCount = contextualTelemetry.negativeSelections;
+    mTelemetry.contextualPdExplorationCount = contextualTelemetry.explorations;
+    mTelemetry.contextualPdLastReward = contextualTelemetry.lastReward;
+    mTelemetry.contextualPdLastMean = contextualTelemetry.lastMean;
+    mTelemetry.contextualPdLastUncertainty = contextualTelemetry.lastUncertainty;
+    mTelemetry.contextualPdLastLowerConfidenceBound = contextualTelemetry.lastLowerConfidenceBound;
     ++mTelemetry.sampleCount;
     mTelemetry.lastDispatch = metrics;
 }

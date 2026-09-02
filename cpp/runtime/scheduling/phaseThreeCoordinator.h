@@ -17,10 +17,12 @@
 
 #pragma once
 
+#include "runtime/phase/policy/phaseFormationPlanner.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -108,6 +110,8 @@ struct PhaseThreeCoordinatorConfig
     int32_t globalExperimentalEncoderPrefillOverlapPercent{-1};
     //! Research-only exact percentage of hard-feasible E+D opportunities.
     int32_t globalExperimentalEncoderDecodeOverlapPercent{-1};
+    //! Research-only M2 launch order and host-delay control. Disabled by default.
+    PhaseDirectionalInjectionControl directionalInjection;
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     int32_t globalDecodeContextBucketTokens{512};
@@ -116,9 +120,12 @@ struct PhaseThreeCoordinatorConfig
     //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
     bool enableGlobalEncoderPrefillAction{};
     //! Compare serial and overlap actions over the same bounded current-plus-successor work.
-    //! The successor estimate uses only the observed encoder inter-arrival process and
-    //! the immediately outstanding P/D action; it does not classify the workload.
+    //! The immutable transition uses only current ready rows and concrete,
+    //! already-outstanding completion events. It never predicts future arrivals.
     bool enableGlobalFormationAwareSelection{};
+    //! Number of actual dispatches attributed after an H=2/myopic selection
+    //! change. The selected action is the first dispatch in the horizon.
+    size_t globalFormationRealizedDispatches{4U};
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
     //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
@@ -303,6 +310,13 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalResidualPrefillDecodeOpportunities{};
     size_t globalResidualPrefillDecodeSelections{};
     size_t globalResidualPrefillDecodeUnknownCostRejects{};
+    size_t globalResidualPrefillAnchorOpportunities{};
+    size_t globalResidualPrefillAnchorSelections{};
+    size_t globalResidualDecodeAnchorOpportunities{};
+    size_t globalResidualDecodeAnchorSelections{};
+    size_t globalResidualMeasuredUnprofitableOpportunities{};
+    size_t globalResidualMeasuredUnprofitableSelections{};
+    size_t globalResidualCoveringCostHits{};
     size_t globalExperimentalResidualPrefillDecodeOpportunities{};
     size_t globalExperimentalResidualPrefillDecodeSelections{};
     size_t globalExperimentalEncoderPrefillOpportunities{};
@@ -324,6 +338,10 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalWarmupPrefillCandidates{};
     size_t globalWarmupDecodeCandidates{};
     size_t globalActionFidelityViolations{};
+    size_t globalHostDecisionSamples{};
+    double globalHostDecisionMeanUs{};
+    double globalHostDecisionP95Us{};
+    double globalHostDecisionMaxUs{};
     double lastGlobalFirstTokenCriticalPathUs{};
     size_t globalEncoderArrivalWaitPeriods{};
     size_t globalEncoderArrivalWaitExpirations{};
@@ -333,8 +351,74 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalFormationSelectionChanges{};
     size_t globalFormationPdSelections{};
     size_t globalFormationOverlapSelections{};
+    size_t globalFormationH2Agreements{};
+    size_t globalFormationPostPolicyOverrides{};
+    size_t globalFormationRegretSamples{};
+    size_t globalFormationPositiveRegrets{};
+    double globalFormationPredictedRegretUs{};
+    double maxGlobalFormationPredictedRegretUs{};
     size_t lastGlobalFormationPredictedRows{};
     double lastGlobalFormationHorizonUs{};
+    double lastGlobalFormationCostGapUs{};
+    double lastGlobalFormationPlannerUs{};
+    uint64_t lastGlobalFormationSnapshotId{};
+    PhaseGlobalActionKind lastGlobalFormationH2Action{PhaseGlobalActionKind::kNone};
+    PhaseGlobalActionKind lastGlobalFormationOracleAction{PhaseGlobalActionKind::kNone};
+    double lastGlobalFormationDecodeViolationUs{};
+    size_t globalFormationRealizedEpisodesStarted{};
+    size_t globalFormationRealizedEpisodesCompleted{};
+    size_t globalFormationRealizedEpisodesTruncated{};
+    size_t globalFormationRealizedDecodeServices{};
+    size_t globalFormationRealizedDecodeBudgets{};
+    size_t globalFormationRealizedDecodeServiceViolations{};
+    double globalFormationRealizedDecodeServiceGapUs{};
+    double maxGlobalFormationRealizedDecodeServiceGapUs{};
+    double globalFormationRealizedDecodeServiceViolationUs{};
+    double maxGlobalFormationRealizedDecodeServiceViolationUs{};
+    uint64_t lastGlobalFormationRealizedEpisodeId{};
+    uint64_t lastGlobalFormationRealizedSnapshotId{};
+    PhaseGlobalActionKind lastGlobalFormationRealizedSelectedAction{PhaseGlobalActionKind::kNone};
+    PhaseGlobalActionKind lastGlobalFormationRealizedMyopicAction{PhaseGlobalActionKind::kNone};
+    PhaseGlobalActionKind lastGlobalFormationRealizedOracleAction{PhaseGlobalActionKind::kNone};
+    size_t lastGlobalFormationRealizedDispatches{};
+    size_t lastGlobalFormationRealizedEncoderRows{};
+    size_t lastGlobalFormationRealizedPrefillRows{};
+    size_t lastGlobalFormationRealizedDecodeRows{};
+    size_t lastGlobalFormationRealizedFirstDecodeRows{};
+    size_t lastGlobalFormationRealizedMaxDecodeRows{};
+    bool lastGlobalFormationRealizedDecodeServiced{};
+    bool lastGlobalFormationRealizedDecodeBudgetKnown{};
+    bool lastGlobalFormationRealizedTruncated{};
+    double lastGlobalFormationRealizedPredictedRegretUs{};
+    double lastGlobalFormationRealizedDecodeBudgetUs{};
+    double lastGlobalFormationRealizedDecodeServiceGapUs{};
+    double lastGlobalFormationRealizedDecodeCompletionVisibleUs{};
+    double lastGlobalFormationRealizedHorizonCompletionVisibleUs{};
+    double lastGlobalFormationRealizedDecodeServiceViolationUs{};
+    size_t contextualEpReady{};
+    size_t contextualEpShadowDisagreements{};
+    size_t contextualEpPredictions{};
+    size_t contextualEpObservations{};
+    size_t contextualEpRejectedObservations{};
+    size_t contextualEpPositiveSelections{};
+    size_t contextualEpNegativeSelections{};
+    size_t contextualEpExplorations{};
+    double contextualEpLastReward{};
+    double contextualEpLastMean{};
+    double contextualEpLastUncertainty{};
+    double contextualEpLastLowerConfidenceBound{};
+    size_t contextualEdReady{};
+    size_t contextualEdShadowDisagreements{};
+    size_t contextualEdPredictions{};
+    size_t contextualEdObservations{};
+    size_t contextualEdRejectedObservations{};
+    size_t contextualEdPositiveSelections{};
+    size_t contextualEdNegativeSelections{};
+    size_t contextualEdExplorations{};
+    double contextualEdLastReward{};
+    double contextualEdLastMean{};
+    double contextualEdLastUncertainty{};
+    double contextualEdLastLowerConfidenceBound{};
     uint64_t activeGlobalPlanId{};
     PhaseExecutionSet globalPlannedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet globalObservedOutstanding{PhaseExecutionSet::kNone};
@@ -481,14 +565,21 @@ public:
     std::vector<PhaseGlobalOverlapCostRecord> globalCalibrationDiagnostics() const;
     //! Enable controlled unknown E+P/E+D probes while the coordinator is idle.
     void setGlobalWarmupProbeMode(bool active);
+    //! Start a fresh low-overhead decision-latency epoch.
+    void resetGlobalDecisionCostTelemetry() noexcept;
     //! Enable optional request-level encoder and prefill-handoff telemetry.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     //! Enable one shared epoch-relative E/P/D/C activity recorder while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
+    //! Emit schema-versioned decision/dispatch/completion records without changing policy.
+    void setUnifiedEventCallback(std::function<void(PhaseUnifiedEvent const&)> unifiedEventCallback);
 
     //! Observe each completed encoder batch exactly once.
     void setEncoderBatchMetricCallback(
         std::function<void(PhaseVisionEncoderBatchMetric const&)> encoderBatchMetricCallback);
+    //! Observe each completed bounded formation-attribution episode exactly once.
+    void setFormationEpisodeCallback(
+        std::function<void(PhaseFormationRealizedEpisode const&)> formationEpisodeCallback);
     //! Deliver server tokens and completions without an intermediate polling queue.
     void setEventCallbacks(std::function<void(IndependentPhaseServerToken&&)> tokenCallback,
         std::function<void(IndependentPhaseServerCompletion&&)> completionCallback);
@@ -526,12 +617,17 @@ private:
     bool dispatchGlobalPrefillDecodeResidual(IndependentPhaseServerArbitrationSnapshot const& serverState);
     PhaseExecutionSet observedGlobalExecution() const noexcept;
     void refreshGlobalExecutionLease();
-    PhaseGlobalDispatchPlan beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate);
+    PhaseGlobalDispatchPlan beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate,
+        std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr);
     void validateGlobalExecutionLaunch();
     void abandonGlobalExecutionLease() noexcept;
+    void emitCompletedFormationEpisodes();
     void completeGlobalOverlapObservation();
+    void recordGlobalDecisionCost(std::chrono::steady_clock::time_point startedAt) noexcept;
     bool completeEncoder();
     bool completeEncoderPreparation();
+    bool submitPreparedEncoder();
+    void markUnifiedEncoderSubmitted();
     bool dispatchReadyPrefill();
     std::vector<size_t> nextEncoderBatchIndices();
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
@@ -544,6 +640,11 @@ private:
     void refreshEncoderSerializationGate() noexcept;
     void eraseTpotTarget(uint64_t requestId);
     void observeServerCompletion(uint64_t requestId);
+    PhaseInFlightSnapshot unifiedInFlightSnapshot(uint64_t hostSnapshotNs = 0U) const;
+    void recordUnifiedDecision(PhaseGlobalActionCandidate const& candidate, PhaseGlobalDispatchPlan const& plan,
+        std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr);
+    void observeUnifiedInFlightTransitions();
+    void emitUnifiedEvent(PhaseUnifiedEvent event);
     void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,
         uint64_t timestampNs = 0U) const;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;
@@ -552,6 +653,7 @@ private:
 
     PhaseVisionAdapter& mVision;
     IndependentPhaseAsyncServer& mServer;
+    PhaseActivityTimelineRecorder* mActivityTimeline{};
     PhaseThreeCoordinatorConfig mConfig;
     PhaseGlobalScheduler mGlobalScheduler;
     std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
@@ -559,6 +661,8 @@ private:
     std::deque<PendingVisionRequest> mPending;
     std::vector<PendingVisionRequest> mEncoding;
     std::future<std::shared_ptr<PhaseVisionPreparedBatch>> mEncoderPreparation;
+    //! A CPU/preprocess-complete batch awaiting an E/P/D scheduling decision.
+    std::shared_ptr<PhaseVisionPreparedBatch> mPreparedEncoder;
     std::deque<ReadyPrefillRequest> mReadyPrefill;
     std::unordered_set<uint64_t> mRequestIds;
     std::unordered_map<uint64_t, double> mRequestTpotTargets;
@@ -576,6 +680,14 @@ private:
         float phaseGpuMs{};
         float phaseElapsedMs{};
         bool residualAugmentation{};
+        PhaseContextualPdFeatures contextualFeatures{};
+        PhaseContextualPairDirection contextualDirection{PhaseContextualPairDirection::kEncoderToPrefill};
+        bool contextualFeatureValid{};
+        bool contextualExploration{};
+        float contextualReferenceWorkMs{};
+        double contextualIncumbentReferenceUs{};
+        double contextualNewcomerReferenceUs{};
+        double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};
     };
     struct ActiveGlobalPdExecution
     {
@@ -593,10 +705,14 @@ private:
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::optional<PhaseGlobalDispatchPlan> mGlobalExecutionLease;
     std::optional<ActiveGlobalPdExecution> mActiveGlobalPdExecution;
+    PhaseFormationRealizedTracker mGlobalFormationRealizedTracker;
+    std::optional<PhaseFormationRealizedEpisodeStart> mPendingGlobalFormationRealizedEpisode;
     std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;
     std::vector<size_t> mGlobalCalibrationOpportunities;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
+    std::function<void(PhaseUnifiedEvent const&)> mUnifiedEventCallback;
     std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
+    std::function<void(PhaseFormationRealizedEpisode const&)> mFormationEpisodeCallback;
     size_t mEstimatedEncodedBytes{};
     size_t mEncoderStarts{};
     size_t mEncoderCompletions{};
@@ -611,6 +727,15 @@ private:
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};
     float mMaxEncoderGpuMs{};
+    bool mEncoderGpuSubmitted{};
+    uint64_t mEncoderDispatchHostNs{};
+    uint64_t mEncoderExecutionId{};
+    uint64_t mEncoderActivityCorrelationId{};
+    uint64_t mEncoderPlanId{};
+    uint64_t mEncoderActionId{};
+    PhaseGlobalActionKind mEncoderActionKind{PhaseGlobalActionKind::kNone};
+    bool mDirectionalInjectionFrontierReleased{};
+    std::optional<uint64_t> mDirectionalInjectionPlanId;
     size_t mReadyPrefillTokens{};
     size_t mAdmissionProfilePrefillTokens{};
     size_t mEstimatedPromptTokens{};
@@ -685,6 +810,13 @@ private:
     size_t mGlobalResidualPrefillDecodeOpportunities{};
     size_t mGlobalResidualPrefillDecodeSelections{};
     size_t mGlobalResidualPrefillDecodeUnknownCostRejects{};
+    size_t mGlobalResidualPrefillAnchorOpportunities{};
+    size_t mGlobalResidualPrefillAnchorSelections{};
+    size_t mGlobalResidualDecodeAnchorOpportunities{};
+    size_t mGlobalResidualDecodeAnchorSelections{};
+    size_t mGlobalResidualMeasuredUnprofitableOpportunities{};
+    size_t mGlobalResidualMeasuredUnprofitableSelections{};
+    size_t mGlobalResidualCoveringCostHits{};
     size_t mGlobalExperimentalResidualPrefillDecodeOpportunities{};
     size_t mGlobalExperimentalResidualPrefillDecodeSelections{};
     size_t mGlobalExperimentalResidualPrefillDecodeAccumulator{};
@@ -709,6 +841,12 @@ private:
     size_t mGlobalWarmupPrefillCandidates{};
     size_t mGlobalWarmupDecodeCandidates{};
     size_t mGlobalActionFidelityViolations{};
+    static constexpr size_t kGLOBAL_DECISION_COST_WINDOW = 4096U;
+    std::array<double, kGLOBAL_DECISION_COST_WINDOW> mGlobalDecisionCostsUs{};
+    size_t mGlobalDecisionCostSamples{};
+    size_t mGlobalDecisionCostCursor{};
+    double mGlobalDecisionCostSumUs{};
+    double mGlobalDecisionCostMaxUs{};
     double mLastGlobalFirstTokenCriticalPathUs{};
     size_t mGlobalEncoderArrivalWaitPeriods{};
     size_t mGlobalEncoderArrivalWaitExpirations{};
@@ -718,8 +856,24 @@ private:
     size_t mGlobalFormationSelectionChanges{};
     size_t mGlobalFormationPdSelections{};
     size_t mGlobalFormationOverlapSelections{};
+    size_t mGlobalFormationH2Agreements{};
+    size_t mGlobalFormationPostPolicyOverrides{};
+    size_t mGlobalFormationRegretSamples{};
+    size_t mGlobalFormationPositiveRegrets{};
+    double mGlobalFormationPredictedRegretUs{};
+    double mMaxGlobalFormationPredictedRegretUs{};
+    size_t mContextualEpReady{};
+    size_t mContextualEpShadowDisagreements{};
+    size_t mContextualEdReady{};
+    size_t mContextualEdShadowDisagreements{};
     size_t mLastGlobalFormationPredictedRows{};
     double mLastGlobalFormationHorizonUs{};
+    double mLastGlobalFormationCostGapUs{};
+    double mLastGlobalFormationPlannerUs{};
+    uint64_t mLastGlobalFormationSnapshotId{};
+    PhaseGlobalActionKind mLastGlobalFormationH2Action{PhaseGlobalActionKind::kNone};
+    PhaseGlobalActionKind mLastGlobalFormationOracleAction{PhaseGlobalActionKind::kNone};
+    double mLastGlobalFormationDecodeViolationUs{};
     bool mGlobalEncoderArrivalWaitDeferred{};
     std::chrono::steady_clock::time_point mLastVisionArrival;
     double mVisionInterarrivalEwmaUs{};
@@ -728,6 +882,12 @@ private:
     size_t mGlobalDecisionSequence{};
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};
+    uint64_t mUnifiedEventSequence{};
+    uint64_t mUnifiedEncoderExecutionSequence{};
+    uint64_t mUnifiedFallbackPlanSequence{};
+    std::optional<PhaseInFlightSnapshot> mPreviousUnifiedInFlight;
+    std::unordered_map<uint64_t, PhaseUnifiedEvent> mUnifiedDecisionByPlan;
+    std::unordered_map<uint64_t, PhaseExecutionSet> mUnifiedAllowedOutstandingByExecution;
     size_t mLastGlobalSafeProbeSequence{};
     bool mGlobalWarmupProbeMode{};
 };

@@ -163,6 +163,18 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
     rt::Tensor& workspace, cudaStream_t stream);
 
 /*!
+ * \brief Select the top-1 index from every input row without a temporary workspace.
+ *
+ * This is the greedy-only counterpart of selectAllTopK(..., topK=1). It uses one
+ * reduction kernel instead of the generic two-stage top-K implementation.
+ *
+ * \param[in] input Input tensor [GPU, Float/Half/BF16] with shape [rows, vocab-size]
+ * \param[out] topIndices Top-1 indices [GPU, Int32] with shape [rows, 1]
+ * \param[in] stream CUDA stream to execute the kernel
+ */
+void selectArgmax(rt::Tensor const& input, rt::Tensor& topIndices, cudaStream_t stream);
+
+/*!
  * \brief Scatter selected top-k logits into a dense probability tensor.
  *
  * topKValues/topKIndices are [batch-size, top-k] outputs from selectAllTopK().
