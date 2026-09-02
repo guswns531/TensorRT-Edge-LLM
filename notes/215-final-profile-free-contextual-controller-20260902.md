@@ -17,10 +17,13 @@ production 설정을 구현하고, 실제 OpenAI-compatible HTTP request trace�
 3. 39와 48.8 req/s에서는 joint SLO를 모든 요청이 통과했다. 97.5 req/s에서는
    pass rate median이 `40.97%`로 내려간다. 실패는 TPOT가 아니라 arrival
    backlog가 포함된 TTFT와 E2E에서 발생한다.
-4. 최종 mixed trace의 CUDA-event active span에서 E/P/D overlap은 존재하지만
-   작다. E+P는 `3.47%`, P+D는 `0.001%`이고 E/P/D idle은 `33.74%`다.
-   independent context가 있다고 concurrency가 자동으로 이익이 되는 것은
-   아니다.
+4. 최신 12-workload와 39/48.8/97.5 req/s activity diagnostic에서 일반 burst
+   workload의 E/P/D idle은 `1.31--3.92%`였고, wave/drain의 `70.46%`만 의도된
+   arrival gap이었다. 실제 pair overlap은 workload에 따라 `0.64--39.50%`였으며,
+   offered load가 증가할 때 P+D overlap은 `23.02 -> 28.98 -> 32.27%`로
+   증가했다. Independent context와 contextual controller가 실제로 동시 실행을
+   만들고 있으며, overlap의 주된 역할은 빈 idle을 채우는 것보다 이미 busy한
+   GPU의 makespan을 압축하는 것이다.
 5. Legacy 대비로는 mixed, poisson, text-heavy, vision-heavy throughput이 아직
    낮다. 따라서 현재 결과는 vLLM comparison gate는 통과하지만 모든 historical
    baseline을 지배하는 최종점은 아니다.
@@ -311,31 +314,139 @@ server capacity를 넘으면서 admission 이전 arrival backlog가 쌓이는 �
 
 ## 8. E/P/D/Copy activity
 
-최종 mixed HTTP trace 한 번을 phase metrics와 CUDA event를 켜고 실행했다.
+### 8.1 이전 mixed `33.74%` 결과의 교정
 
-| Mask | Meaning | Time | Active-span ratio |
-|---|---|---:|---:|
-| 0000 | E/P/D/Copy idle | 831.396 ms | 33.74% |
-| 0001 | E only | 744.768 ms | 30.23% |
-| 0010 | P only | 317.107 ms | 12.87% |
-| 0100 | D only | 485.122 ms | 19.69% |
-| 0011 | E+P | 85.491 ms | 3.47% |
-| 0110 | P+D | 0.031 ms | 0.001% |
+이 문서의 이전 revision은 mixed trace의 idle을 `33.74%`로 보고했다. 이는
+runtime 동작이 아니라 artifact 결합 오류였다. `sync`와 `worker-4` variant가 같은
+`activity-{run}` prefix를 공유했고, 저장 단계에서 sync runtime log와 worker-4
+activity CSV가 결합됐다. 그 결과 runtime phase summary의 dispatch `123`개 중
+activity interval은 `68`개만 들어갔다.
 
-Phase inclusive utilization은 E `33.70%`, P `16.34%`, D `19.69%`다. Copy는
-`0%`다. 이 trace는 encoder output을 별도 D2D copy하지 않고 device-resident
-vision lease로 P에 전달했다.
-
-Planned P+D action은 두 번 있었지만 same-dispatch physical kernel overlap은
-0회였다. 두 context enqueue가 legal해도 GPU resource availability와 launch order에
-따라 커널 구간이 겹치지 않을 수 있다.
+최신 진단은 workload와 load point마다 고유 prefix를 사용한다. 또한 다음 coverage
+invariant를 분석 전에 검사했다.
 
 ```text
-logical overlap action != measured kernel overlap
+runtime phase-summary dispatches == activity planned dispatches
+planned pair actions == measured pair-action records
 ```
 
-따라서 online reward는 action label이 아니라 CUDA-event start/end의 measured
-compression으로 갱신해야 한다.
+12개 workload와 3개 load point, 총 15개 실행 모두 첫 invariant가 exact match였다.
+P+D도 모든 실행에서 planned/actual action count가 같았고 missed/unplanned action은
+없었다. 따라서 이전 `33.74%` 수치는 폐기하고 아래 결과로 대체한다.
+
+| Trace | Runtime/activity dispatches | Planned/actual P+D |
+|---|---:|---:|
+| short | 39 / 39 | 5 / 5 |
+| balanced | 517 / 517 | 92 / 92 |
+| decode-heavy | 1437 / 1437 | 133 / 133 |
+| long-prefill | 1348 / 1348 | 664 / 664 |
+| bimodal | 1822 / 1822 | 511 / 511 |
+| text-heavy | 96 / 96 | 11 / 11 |
+| mixed | 119 / 119 | 5 / 5 |
+| vision-heavy | 146 / 146 | 3 / 3 |
+| poisson | 183 / 183 | 13 / 13 |
+| wave/drain | 146 / 146 | 6 / 6 |
+| multi-image | 36 / 36 | 2 / 2 |
+| late-vision | 203 / 203 | 1 / 1 |
+| load 39.0 | 841 / 841 | 227 / 227 |
+| load 48.8 | 635 / 635 | 214 / 214 |
+| load 97.5 | 514 / 514 | 211 / 211 |
+
+### 8.2 최신 Current 12-workload activity
+
+각 workload를 최신 Current binary의 fresh process에서 한 번씩 실행했다. 이 표는
+성능 promotion용 3-run median이 아니라 GPU activity 구조를 확인하기 위한 1회
+diagnostic이다. Warmup과 calibration은 lifecycle dispatch correlation으로
+제외했다.
+
+Phase column은 각 phase의 inclusive activity이므로 overlap 구간이 중복 집계되어
+합이 100%를 넘을 수 있다. `Any overlap`은 둘 이상의 E/P/D phase가 동시에 active인
+mutually exclusive mask의 합이다.
+
+| Workload | Active span ms | E | P | D | Copy | Idle | Any overlap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| short | 428.3 | 0.00% | 48.09% | 70.97% | 0.00% | 1.47% | 20.53% |
+| balanced | 5466.9 | 0.00% | 38.03% | 76.80% | 0.00% | 2.51% | 17.34% |
+| decode-heavy | 14328.2 | 0.00% | 17.46% | 90.11% | 0.00% | 2.48% | 10.05% |
+| long-prefill | 21306.1 | 0.00% | 88.16% | 50.03% | 0.00% | 1.31% | 39.50% |
+| bimodal | 23428.1 | 0.00% | 53.63% | 71.18% | 0.00% | 1.33% | 26.13% |
+| text-heavy | 1724.3 | 24.35% | 42.02% | 40.10% | 0.00% | 2.83% | 9.30% |
+| mixed | 2580.9 | 32.16% | 41.00% | 29.04% | 0.00% | 3.71% | 5.90% |
+| vision-heavy | 3499.8 | 35.70% | 60.32% | 24.28% | 0.00% | 3.92% | 24.22% |
+| poisson | 2370.4 | 17.76% | 39.17% | 50.50% | 0.00% | 2.66% | 10.09% |
+| wave/drain | 6509.9 | 8.03% | 8.18% | 13.97% | 0.00% | 70.46% | 0.64% |
+| multi-image | 489.6 | 26.89% | 26.53% | 51.01% | 0.00% | 2.85% | 7.27% |
+| late-vision | 1820.2 | 9.67% | 19.28% | 75.14% | 0.00% | 3.20% | 7.29% |
+
+일반 burst workload의 idle은 `1.31--3.92%`다. wave/drain의 `70.46%`는 네 개의
+arrival wave 사이를 의도적으로 비운 trace 계약이며 scheduler가 실행 가능한 일을
+놓친 idle로 해석하면 안 된다. 실제 계산 overlap은 long-prefill `39.50%`, bimodal
+`26.13%`, vision-heavy `24.22%`까지 형성된다.
+
+### 8.3 Mutually exclusive phase mask
+
+Bit 정의는 `E=0001`, `P=0010`, `D=0100`, `Copy=1000`이다. 아래 각 행의
+unrounded 값은 정확히 100%로 합산되며 표시 값은 소수 셋째 자리에서 반올림했다.
+
+| Workload | 0000 idle | 0001 E | 0010 P | 0011 E+P | 0100 D | 0101 E+D | 0110 P+D | 0111 E+P+D |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| short | 1.466% | 0.000% | 27.560% | 0.000% | 50.443% | 0.000% | 20.531% | 0.000% |
+| balanced | 2.513% | 0.000% | 20.690% | 0.000% | 59.458% | 0.000% | 17.339% | 0.000% |
+| decode-heavy | 2.479% | 0.000% | 7.406% | 0.000% | 80.064% | 0.000% | 10.050% | 0.000% |
+| long-prefill | 1.312% | 0.000% | 48.660% | 0.000% | 10.531% | 0.000% | 39.497% | 0.000% |
+| bimodal | 1.326% | 0.000% | 27.492% | 0.000% | 45.047% | 0.000% | 26.134% | 0.000% |
+| text-heavy | 2.834% | 24.347% | 32.715% | 0.000% | 30.801% | 0.000% | 9.303% | 0.000% |
+| mixed | 3.707% | 28.802% | 35.093% | 3.355% | 26.495% | 0.000% | 2.548% | 0.000% |
+| vision-heavy | 3.924% | 12.085% | 36.102% | 23.612% | 23.672% | 0.000% | 0.605% | 0.000% |
+| poisson | 2.661% | 12.568% | 29.081% | 5.191% | 45.604% | 0.000% | 4.895% | 0.000% |
+| wave/drain | 70.457% | 8.026% | 7.545% | 0.000% | 13.333% | 0.000% | 0.638% | 0.000% |
+| multi-image | 2.846% | 26.887% | 19.260% | 0.000% | 43.733% | 0.000% | 7.274% | 0.000% |
+| late-vision | 3.195% | 2.860% | 14.190% | 4.611% | 72.466% | 2.203% | 0.474% | 0.000% |
+
+Copy bit가 포함된 `1000--1111` mask는 모든 workload에서 각각 `0.000%`다. Vision
+encoder output은 별도 D2D output copy 없이 retained device-resident slab lease로
+P에 전달된다. `E+P+D`가 0인 것은 production action space를 bounded pair action으로
+제한한 설계와도 일치한다.
+
+### 8.4 Offered load에 따른 activity 변화
+
+동일 text trace에서 offered load만 높인 one-repeat diagnostic 결과다.
+
+| Offered req/s | Active span ms | P | D | Idle | P+D |
+|---:|---:|---:|---:|---:|---:|
+| 39.0 | 8338.2 | 44.98% | 76.08% | 1.97% | 23.02% |
+| 48.8 | 6943.3 | 52.75% | 74.00% | 2.23% | 28.98% |
+| 97.5 | 6111.9 | 54.90% | 74.92% | 2.45% | 32.27% |
+
+세 load point는 text-only이므로 표에 없는 E, E+P, E+D, E+P+D와 모든 Copy mask는
+`0.00%`다. P와 D column은 inclusive 값이며 `P+D`가 양쪽에 포함된다.
+
+Idle ratio는 `1.97 -> 2.23 -> 2.45%`로 아주 조금 증가하지만 absolute idle은 약
+`164 -> 155 -> 150 ms`로 감소한다. 총 active span이 더 빠르게 짧아져 생긴
+denominator effect다. 반면 P+D는 `23.02 -> 28.98 -> 32.27%`로 증가한다. 즉
+controller는 pressure가 커질수록 실제 overlap을 더 많이 사용한다.
+
+### 8.5 해석과 계측 한계
+
+이번 결과는 “idle이 적으므로 overlap이 필요 없다”는 결론을 지지하지 않는다.
+대부분의 trace에서 GPU는 이미 serial work만으로도 busy하다. 이때 overlap의 역할은
+idle hole을 메우는 것이 아니라 같은 E/P/D work의 wall-clock makespan을 줄이는
+것이다. 따라서 판단 기준은 overlap 비율 자체가 아니라 다음 값이어야 한다.
+
+```text
+isolated equivalent work / overlapped makespan
+    subject to TTFT/TPOT slack and formation preservation
+```
+
+또한 activity mask는 CUDA event로 감싼 phase의 “작업 중인 시간 구간”이다. 이는
+SM active, tensor-core utilization, DRAM bandwidth 또는 L2 pressure와 동일하지
+않다. E/P/D interval이 겹쳐도 커널이 자원을 완전히 직렬화할 수 있고, 반대로 작은
+시간 overlap이 높은 makespan gain을 만들 수도 있다. 이 구분은 selected point의
+Nsight Systems/Compute 분석으로 검증해야 한다.
+
+Planned action label만으로 physical overlap을 추정하지 않는다. Online reward는
+CUDA-event start/end에서 관측한 equal-work compression으로 갱신하고, activity
+artifact는 runtime dispatch coverage가 exact match일 때만 유효한 것으로 취급한다.
 
 ## 9. Validation
 
@@ -376,8 +487,13 @@ initializer 경로다. 이 commit에서 tolerance를 넓혀 숨기지 않는다.
 .local/final-contextual-provenance-canonical-20260902/
 .local/final-contextual-provenance-comparison-20260902/
 .local/final-contextual-provenance-load-3x5-20260902/
-.local/final-contextual-activity-20260902/
+.local/final-current-activity-12x1-20260902/
+.local/final-current-activity-load-3x1-20260902/
 ```
+
+이전 `.local/final-contextual-activity-20260902/`는 variant 간 prefix 충돌이 있어
+activity headline 근거로 사용하지 않는다. 위 두 `final-current-activity-*` root가
+교정된 결과의 source of truth다.
 
 주요 파일:
 
@@ -408,6 +524,8 @@ formation-summary.json
    payoff surface에 적응하는지 확인한다.
 7. 논문용 selected points는 Nsight Systems/Compute로 SM active, DRAM, L2,
    concurrent kernel, host launch gap을 반복 측정한다.
+8. Activity harness는 workload/variant별 고유 prefix와 exact dispatch coverage
+   검사를 필수 invariant로 유지한다.
 
 최종 방향은 유지한다.
 
