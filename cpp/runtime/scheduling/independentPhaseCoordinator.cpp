@@ -126,10 +126,12 @@ void IndependentPhaseCoordinator::setCallbacks(IndependentPhaseCoordinatorCallba
 PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
 {
     PhaseDispatchWorkerCallbacks callbacks;
-    callbacks.enqueuePrefill
-        = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueuePrefillBatch(batch, stream); };
-    callbacks.enqueueDecode
-        = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) { enqueueDecodeBatch(batch, stream); };
+    callbacks.enqueuePrefill = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) {
+        return enqueuePrefillBatch(batch, stream);
+    };
+    callbacks.enqueueDecode = [this](std::vector<PhaseWorkItem> const& batch, cudaStream_t stream) {
+        return enqueueDecodeBatch(batch, stream);
+    };
     callbacks.completePrefillBatch = [this](std::vector<PhaseWorkItem> const& batch) { completePrefillBatch(batch); };
     callbacks.completeDecodeBatch = [this](std::vector<PhaseWorkItem> const& batch) { completeDecodeBatch(batch); };
     callbacks.completePrefill = [this](PhaseWorkItem const& item) {
@@ -175,8 +177,11 @@ PhaseDispatchWorkerCallbacks IndependentPhaseCoordinator::makeWorkerCallbacks()
     return callbacks;
 }
 
-void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
+PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
+    std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
 {
+    PhaseHostExecutionTiming timing;
+    timing.prepareStartHostNs = phaseTimelineNowNs();
     ELLM_CHECK(!batch.empty(), "Independent prefill enqueue requires a non-empty batch");
     PhasePrefillClass const prefillClass = batch.front().prefillClass;
     ELLM_CHECK(
@@ -244,14 +249,22 @@ void IndependentPhaseCoordinator::enqueuePrefillBatch(std::vector<PhaseWorkItem>
         mCapturedPrefillShapes.insert(graphShape);
         mPrefillGraphShapeObservations.erase(graphShape);
     }
+    timing.prepareEndHostNs = phaseTimelineNowNs();
     EngineExecutor::GraphCacheStats const beforeExecute = executor.graphCacheStats();
+    timing.executeStartHostNs = phaseTimelineNowNs();
     ELLM_CHECK(executor.execute(stream), "Independent packed prefill execute failed");
+    timing.executeEndHostNs = phaseTimelineNowNs();
     EngineExecutor::GraphCacheStats const afterExecute = executor.graphCacheStats();
     mLastPrefillGraphReplay = afterExecute.hits > beforeExecute.hits;
+    timing.graphReplay = mLastPrefillGraphReplay;
+    return timing;
 }
 
-void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
+PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueueDecodeBatch(
+    std::vector<PhaseWorkItem> const& batch, cudaStream_t stream)
 {
+    PhaseHostExecutionTiming timing;
+    timing.prepareStartHostNs = phaseTimelineNowNs();
     std::vector<int32_t> slots;
     for (PhaseWorkItem const& item : batch)
     {
@@ -283,10 +296,15 @@ void IndependentPhaseCoordinator::enqueueDecodeBatch(std::vector<PhaseWorkItem> 
         mCapturedDecodeShapes.insert(graphShape);
         mDecodeGraphShapeObservations.erase(graphShape);
     }
+    timing.prepareEndHostNs = phaseTimelineNowNs();
     EngineExecutor::GraphCacheStats const beforeExecute = mExecutors.decodeExecutor().graphCacheStats();
+    timing.executeStartHostNs = phaseTimelineNowNs();
     ELLM_CHECK(mExecutors.decodeExecutor().execute(stream), "Independent decode execute failed");
+    timing.executeEndHostNs = phaseTimelineNowNs();
     EngineExecutor::GraphCacheStats const afterExecute = mExecutors.decodeExecutor().graphCacheStats();
     mLastDecodeGraphReplay = afterExecute.hits > beforeExecute.hits;
+    timing.graphReplay = mLastDecodeGraphReplay;
+    return timing;
 }
 
 void IndependentPhaseCoordinator::completePrefillBatch(std::vector<PhaseWorkItem> const& batch)
@@ -502,6 +520,12 @@ cudaStream_t IndependentPhaseCoordinator::phaseStream(PhaseUnifiedPhase phase) c
 cudaEvent_t IndependentPhaseCoordinator::phaseStartEvent(PhaseUnifiedPhase phase) const noexcept
 {
     return mWorker->phaseStartEvent(phase);
+}
+
+void IndependentPhaseCoordinator::setNextDispatchPreamble(
+    PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble)
+{
+    mWorker->setNextDispatchPreamble(phase, std::move(preamble));
 }
 
 PhaseKVMemoryStats const& IndependentPhaseCoordinator::prefillKVMemoryStats() const noexcept

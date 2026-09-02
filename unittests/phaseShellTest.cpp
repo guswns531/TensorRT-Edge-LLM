@@ -175,8 +175,14 @@ TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
     int32_t decodeEnqueues{};
     std::unordered_map<uint64_t, int32_t> decodeSteps;
     rt::PhaseDispatchWorkerCallbacks callbacks;
-    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
-    callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++decodeEnqueues; };
+    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {
+        ++prefillEnqueues;
+        return rt::PhaseHostExecutionTiming{};
+    };
+    callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {
+        ++decodeEnqueues;
+        return rt::PhaseHostExecutionTiming{};
+    };
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
         return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, false};
     };
@@ -231,8 +237,14 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeUsesTwoStreamsInOneCudaContext)
     std::vector<rt::PhaseTimelineEvent> timeline;
     std::optional<rt::PhaseDispatchMetrics> dispatchMetrics;
     rt::PhaseDispatchWorkerCallbacks callbacks;
-    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++prefillEnqueues; };
-    callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { ++decodeEnqueues; };
+    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {
+        ++prefillEnqueues;
+        return rt::PhaseHostExecutionTiming{};
+    };
+    callbacks.enqueueDecode = [&](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {
+        ++decodeEnqueues;
+        return rt::PhaseHostExecutionTiming{};
+    };
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
         return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
     };
@@ -273,6 +285,56 @@ TEST(PhaseDispatchWorkerTest, ConcurrentModeUsesTwoStreamsInOneCudaContext)
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
+TEST(PhaseDispatchWorkerTest, RunsOneShotPreambleAfterBatchMaterialization)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    rt::PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueuePrefill({2, 32});
+
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+
+    int32_t preambles{};
+    int32_t enqueues{};
+    rt::PhaseDispatchWorkerCallbacks callbacks;
+    callbacks.enqueuePrefill = [&](std::vector<rt::PhaseWorkItem> const& batch, cudaStream_t stream) {
+        EXPECT_EQ(stream, prefillStream);
+        EXPECT_EQ(batch.size(), 1U);
+        EXPECT_EQ(preambles, 1);
+        ++enqueues;
+        return rt::PhaseHostExecutionTiming{};
+    };
+    callbacks.enqueueDecode
+        = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { return rt::PhaseHostExecutionTiming{}; };
+    callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
+        return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
+    };
+    callbacks.completeDecode
+        = [](rt::PhaseWorkItem const& item) { return rt::PhaseDecodeCompletion{item.tokenCount + 1, true}; };
+
+    rt::PhaseDispatchWorker worker(scheduler, std::move(callbacks), prefillStream, decodeStream);
+    worker.setNextDispatchPreamble(rt::PhaseUnifiedPhase::kPrefill, [&](cudaStream_t stream) {
+        EXPECT_EQ(stream, prefillStream);
+        ++preambles;
+    });
+    EXPECT_TRUE(worker.dispatchNext());
+    worker.wait();
+    EXPECT_EQ(preambles, 1);
+    EXPECT_EQ(enqueues, 1);
+
+    EXPECT_TRUE(worker.dispatchNext());
+    worker.wait();
+    EXPECT_EQ(preambles, 1);
+    EXPECT_EQ(enqueues, 2);
+
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
 TEST(PhaseDispatchWorkerTest, AugmentsLivePrefillWithResidualDecode)
 {
     rt::PhaseQueueSchedulerConfig config;
@@ -285,8 +347,10 @@ TEST(PhaseDispatchWorkerTest, AugmentsLivePrefillWithResidualDecode)
     CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
     rt::PhaseDispatchWorkerCallbacks callbacks;
-    callbacks.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
-    callbacks.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.enqueuePrefill
+        = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { return rt::PhaseHostExecutionTiming{}; };
+    callbacks.enqueueDecode
+        = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { return rt::PhaseHostExecutionTiming{}; };
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
         return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
     };
@@ -345,8 +409,10 @@ TEST(PhaseDispatchWorkerTest, RejectsResidualAugmentationWithSharedContext)
     CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
     rt::PhaseDispatchWorkerCallbacks callbacks;
-    callbacks.enqueuePrefill = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
-    callbacks.enqueueDecode = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) {};
+    callbacks.enqueuePrefill
+        = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { return rt::PhaseHostExecutionTiming{}; };
+    callbacks.enqueueDecode
+        = [](std::vector<rt::PhaseWorkItem> const&, cudaStream_t) { return rt::PhaseHostExecutionTiming{}; };
     callbacks.completePrefill = [](rt::PhaseWorkItem const& item) {
         return rt::PhasePrefillCompletion{item.tokenOffset + item.tokenCount, true};
     };

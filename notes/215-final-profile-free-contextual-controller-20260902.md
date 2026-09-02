@@ -1,5 +1,11 @@
 # Final Profile-Free Contextual Phase Controller
 
+> **2026-09-02 R7 addendum:** prepared directional execution으로 R0--R6의 realization
+> blocker를 해결했고, Release 12-workload 및 E/P/D/Copy activity를 다시 검증했다.
+> 최종 구현, 30-cell 방향성 표, latency/throughput/memory 표와 다음 계획은
+> `notes/220-prepared-directional-execution-r7-results-20260902.md`에 있다. 이 문서의
+> canonical controller 결과는 frozen comparison 기준으로 계속 유지한다.
+
 ## 1. 결론
 
 이번 단계는 workload 이름이나 고정 `E/P/D` shape rule을 사용하지 않는 최종

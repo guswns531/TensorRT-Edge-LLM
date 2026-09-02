@@ -3976,7 +3976,12 @@ int main(int argc, char** argv)
                             {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
                             {"observed_outstanding_mask", static_cast<uint8_t>(event.observedOutstanding)},
                             {"cohort", workJson(event.cohort)}, {"request_ids", event.requestIds},
-                            {"enqueue_host_ns", event.enqueueHostNs}, {"action_fidelity", event.actionFidelity},
+                            {"enqueue_host_ns", event.enqueueHostNs},
+                            {"prepare_start_host_ns", event.prepareStartHostNs},
+                            {"prepare_end_host_ns", event.prepareEndHostNs},
+                            {"execute_start_host_ns", event.executeStartHostNs},
+                            {"execute_end_host_ns", event.executeEndHostNs}, {"graph_replay", event.graphReplay},
+                            {"action_fidelity", event.actionFidelity},
                             {"action_fidelity_reason",
                                 rt::phaseUnifiedFidelityReasonName(event.actionFidelityReason)}});
                         if (event.incumbentExecutionId > 0U)

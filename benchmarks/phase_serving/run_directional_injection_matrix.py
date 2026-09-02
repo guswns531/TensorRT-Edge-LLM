@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -164,6 +165,10 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
             f"rerunning partial cell {case_name}: "
             f"{len(complete_logs)}/{args.repeats} complete repeats",
             flush=True)
+        # Telemetry streams are append-only. Retaining a failed partial run
+        # would merge stale and fresh events into one causal sample.
+        cleanup_case_containers(case_name, args.repeats)
+        shutil.rmtree(case_dir)
 
     workspace = args.workspace.resolve()
     activity_prefix = container_path(case_dir / "activity" / "run-{run}",
@@ -273,6 +278,12 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
         "TRT_EDGELLM_DIRECTIONAL_INJECTION_NEWCOMER_US":
         references[newcomer],
     }
+    if args.cuda_graphs:
+        environment["TRT_EDGELLM_CAPTURE_PHASE_GRAPHS"] = 1
+        environment[
+            "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = args.graph_warmup_decode_batches
+    if args.async_encoder_preparation:
+        environment["TRT_EDGELLM_VISION_ASYNC_PREPARATION"] = 1
     if args.completion_conformal:
         environment["TRT_EDGELLM_COMPLETION_CONFORMAL"] = 1
         environment[
@@ -317,7 +328,7 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
         "--phase-calibration-min-requests",
         "0",
         "--max-workers",
-        "8",
+        str(args.client_workers),
         "--max-in-flight",
         str(args.stable_slots),
         "--ready-timeout",
@@ -373,6 +384,7 @@ def main() -> int:
     parser.add_argument("--ready-timeout", type=float, default=180.0)
     parser.add_argument("--request-timeout", type=float, default=180.0)
     parser.add_argument("--stable-slots", type=int, default=80)
+    parser.add_argument("--client-workers", type=int, default=80)
     parser.add_argument("--encoder-batch", type=int, default=4)
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument("--decode-batch", type=int, default=32)
@@ -381,6 +393,10 @@ def main() -> int:
                         choices=range(0, 101),
                         default=100)
     parser.add_argument("--completion-conformal", action="store_true")
+    parser.add_argument("--cuda-graphs", action="store_true")
+    parser.add_argument("--async-encoder-preparation", action="store_true")
+    parser.add_argument("--graph-warmup-decode-batches",
+                        default="1,2,4,8,16,32")
     parser.add_argument("--completion-conformal-min-observations",
                         type=int,
                         default=16)
@@ -422,8 +438,9 @@ def main() -> int:
     targets = args.target or list(TARGETS)
     if any(target not in TARGETS for target in targets):
         parser.error(f"targets must be selected from {TARGETS}")
-    if (args.repeats <= 0 or min(args.stable_slots, args.encoder_batch,
-                                 args.prefill_batch, args.decode_batch) <= 0
+    if (args.repeats <= 0
+            or min(args.stable_slots, args.client_workers, args.encoder_batch,
+                   args.prefill_batch, args.decode_batch) <= 0
             or min(args.ready_timeout, args.request_timeout) <= 0.0):
         parser.error("repeats and capacities must be positive")
     if (args.completion_conformal_min_observations <= 0
@@ -481,6 +498,8 @@ def main() -> int:
             "window": args.completion_conformal_window,
             "target": args.completion_conformal_target,
         },
+        "cuda_graphs": args.cuda_graphs,
+        "async_encoder_preparation": args.async_encoder_preparation,
     }
     (args.output_dir / "matrix-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",

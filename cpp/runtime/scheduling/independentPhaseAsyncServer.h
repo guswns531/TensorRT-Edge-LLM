@@ -386,6 +386,7 @@ public:
     void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
     cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
     cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
+    void setNextDispatchPreamble(PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble);
     bool poll();
     //! Progress admission, CUDA completions, sampling, and callbacks without
     //! selecting a new P/D action.

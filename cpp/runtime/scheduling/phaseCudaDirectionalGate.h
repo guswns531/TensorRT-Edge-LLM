@@ -39,14 +39,23 @@ public:
     //! Enqueue a device-side wait on newcomerStream. The gate is released only
     //! after incumbentStart is visible on the GPU plus delayUs.
     void enqueue(cudaStream_t newcomerStream, cudaEvent_t incumbentStart, uint64_t delayUs);
+    //! Queue newcomer work behind a device semaphore before the incumbent is
+    //! submitted. signal() later defines the incumbent GPU start boundary.
+    void arm(cudaStream_t newcomerStream, uint64_t delayUs);
+    void signal(cudaStream_t incumbentStream);
     void wait() noexcept;
 
 private:
     void ensureStorage();
+    static void CUDART_CB releaseHostGate(void* userData);
 
     cudaStream_t mGateStream{};
     cudaEvent_t mGateDone{};
-    int mClockRateKHz{};
+    uint32_t* mHostGateFlag{};
+    uint32_t* mDeviceGateFlag{};
+    uint32_t* mHostIncumbentFlag{};
+    uint32_t* mDeviceIncumbentFlag{};
+    uint64_t mPendingDelayUs{};
 };
 
 } // namespace trt_edgellm::rt

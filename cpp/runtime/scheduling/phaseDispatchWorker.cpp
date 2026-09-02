@@ -219,6 +219,7 @@ void PhaseDispatchWorker::setDirectionalInjectionControl(PhaseDirectionalInjecti
     check::check(control.targetFraction >= 0.0 && control.targetFraction <= 1.0,
         "Directional injection target fraction must be within [0, 1].");
     mDirectionalInjection = control;
+    mDirectionalInjectionConsumed = false;
 }
 
 cudaStream_t PhaseDispatchWorker::phaseStream(PhaseUnifiedPhase phase) const noexcept
@@ -233,6 +234,17 @@ cudaEvent_t PhaseDispatchWorker::phaseStartEvent(PhaseUnifiedPhase phase) const 
     return phase == PhaseUnifiedPhase::kPrefill ? mPrefillStart
         : phase == PhaseUnifiedPhase::kDecode   ? mDecodeStart
                                                 : nullptr;
+}
+
+void PhaseDispatchWorker::setNextDispatchPreamble(PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble)
+{
+    check::check(!mBusy, "A phase dispatch preamble can only be installed while the worker is idle");
+    check::check(phase == PhaseUnifiedPhase::kPrefill || phase == PhaseUnifiedPhase::kDecode,
+        "A phase dispatch preamble only supports prefill or decode");
+    std::function<void(cudaStream_t)>& target
+        = phase == PhaseUnifiedPhase::kPrefill ? mNextPrefillDispatchPreamble : mNextDecodeDispatchPreamble;
+    check::check(!target, "A phase dispatch preamble is already installed");
+    target = std::move(preamble);
 }
 
 bool PhaseDispatchWorker::dispatchNext()
@@ -411,16 +423,26 @@ bool PhaseDispatchWorker::dispatchNext()
     }
     CUDA_CHECK(cudaEventRecord(mDispatchStart, mPrefillStream));
     auto enqueuePrefill = [&] {
+        if (mNextPrefillDispatchPreamble)
+        {
+            std::function<void(cudaStream_t)> preamble = std::move(mNextPrefillDispatchPreamble);
+            preamble(mPrefillStream);
+        }
         mPrefillPlanId = mInFlight.globalPlanId > 0U ? mInFlight.globalPlanId : mCurrentMetrics.dispatchIndex;
         mPrefillActionId = mInFlight.globalCandidateId > 0U ? mInFlight.globalCandidateId : mPrefillPlanId;
         mPrefillEnqueueHostNs = phaseTimelineNowNs();
         recordTimeline(mInFlight.prefillBatch, PhaseTimelineStage::kPrefillStart);
         CUDA_CHECK(cudaEventRecord(mPrefillStart, mPrefillStream));
-        enqueueActivity(PhaseActivityKind::kPrefill, "prefill_dispatch", mInFlight.prefillBatch,
-            mCallbacks.enqueuePrefill, mPrefillStream);
+        mCurrentMetrics.prefillHostExecution = enqueueActivity(PhaseActivityKind::kPrefill, "prefill_dispatch",
+            mInFlight.prefillBatch, mCallbacks.enqueuePrefill, mPrefillStream);
         CUDA_CHECK(cudaEventRecord(mPrefillDone, mPrefillStream));
     };
     auto enqueueDecode = [&] {
+        if (mNextDecodeDispatchPreamble)
+        {
+            std::function<void(cudaStream_t)> preamble = std::move(mNextDecodeDispatchPreamble);
+            preamble(mDecodeStream);
+        }
         mDecodePlanId = mInFlight.globalPlanId > 0U ? mInFlight.globalPlanId : mCurrentMetrics.dispatchIndex;
         mDecodeActionId = mInFlight.globalCandidateId > 0U ? mInFlight.globalCandidateId : mDecodePlanId;
         bool const serializeSharedContext
@@ -437,8 +459,8 @@ bool PhaseDispatchWorker::dispatchNext()
             mDecodeEnqueueHostNs = phaseTimelineNowNs();
             recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
             CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
-            enqueueActivity(PhaseActivityKind::kDecode, "decode_dispatch", mInFlight.decodeBatch,
-                mCallbacks.enqueueDecode, mDecodeStream);
+            mCurrentMetrics.decodeHostExecution = enqueueActivity(PhaseActivityKind::kDecode, "decode_dispatch",
+                mInFlight.decodeBatch, mCallbacks.enqueueDecode, mDecodeStream);
             CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
         }
     };
@@ -449,10 +471,12 @@ bool PhaseDispatchWorker::dispatchNext()
     {
         enqueueDecode();
         if (mDirectionalInjection.enabled()
-            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill)
+            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill
+            && !mDirectionalInjectionConsumed)
         {
             mDirectionalCudaGate.enqueue(mPrefillStream, mDecodeStart,
                 remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mDecodeEnqueueHostNs));
+            mDirectionalInjectionConsumed = true;
         }
         enqueuePrefill();
     }
@@ -465,10 +489,12 @@ bool PhaseDispatchWorker::dispatchNext()
         if (mHasPrefill && mHasDecode)
         {
             if (mDirectionalInjection.enabled()
-                && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode)
+                && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode
+                && !mDirectionalInjectionConsumed)
             {
                 mDirectionalCudaGate.enqueue(mDecodeStream, mPrefillStart,
                     remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mPrefillEnqueueHostNs));
+                mDirectionalInjectionConsumed = true;
             }
         }
         if (mHasDecode)
@@ -512,10 +538,12 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
     if (addsPrefill)
     {
         if (mDirectionalInjection.enabled()
-            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill)
+            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill
+            && !mDirectionalInjectionConsumed)
         {
             mDirectionalCudaGate.enqueue(mPrefillStream, mDecodeStart,
                 remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mDecodeEnqueueHostNs));
+            mDirectionalInjectionConsumed = true;
         }
         mInFlight.prefillBatch = std::move(additional.prefillBatch);
         mHasPrefill = true;
@@ -525,17 +553,19 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
         CUDA_CHECK(cudaEventRecord(mAugmentationStart, mPrefillStream));
         recordTimeline(mInFlight.prefillBatch, PhaseTimelineStage::kPrefillStart);
         CUDA_CHECK(cudaEventRecord(mPrefillStart, mPrefillStream));
-        enqueueActivity(PhaseActivityKind::kPrefill, "prefill_residual_dispatch", mInFlight.prefillBatch,
-            mCallbacks.enqueuePrefill, mPrefillStream);
+        mCurrentMetrics.prefillHostExecution = enqueueActivity(PhaseActivityKind::kPrefill, "prefill_residual_dispatch",
+            mInFlight.prefillBatch, mCallbacks.enqueuePrefill, mPrefillStream);
         CUDA_CHECK(cudaEventRecord(mPrefillDone, mPrefillStream));
     }
     else
     {
         if (mDirectionalInjection.enabled()
-            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode)
+            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode
+            && !mDirectionalInjectionConsumed)
         {
             mDirectionalCudaGate.enqueue(mDecodeStream, mPrefillStart,
                 remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mPrefillEnqueueHostNs));
+            mDirectionalInjectionConsumed = true;
         }
         mInFlight.decodeBatch = std::move(additional.decodeBatch);
         preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
@@ -552,8 +582,8 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
         CUDA_CHECK(cudaEventRecord(mAugmentationStart, mDecodeStream));
         recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
         CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
-        enqueueActivity(PhaseActivityKind::kDecode, "decode_residual_dispatch", mInFlight.decodeBatch,
-            mCallbacks.enqueueDecode, mDecodeStream);
+        mCurrentMetrics.decodeHostExecution = enqueueActivity(PhaseActivityKind::kDecode, "decode_residual_dispatch",
+            mInFlight.decodeBatch, mCallbacks.enqueueDecode, mDecodeStream);
         CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
     }
     mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
@@ -771,27 +801,27 @@ void PhaseDispatchWorker::enqueueDeferredDecode()
     mDecodeEnqueueHostNs = phaseTimelineNowNs();
     recordTimeline(mInFlight.decodeBatch, PhaseTimelineStage::kDecodeStart);
     CUDA_CHECK(cudaEventRecord(mDecodeStart, mDecodeStream));
-    enqueueActivity(
+    mCurrentMetrics.decodeHostExecution = enqueueActivity(
         PhaseActivityKind::kDecode, "decode_dispatch", mInFlight.decodeBatch, mCallbacks.enqueueDecode, mDecodeStream);
     CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
     mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
     mDecodeDeferred = false;
 }
 
-void PhaseDispatchWorker::enqueueActivity(PhaseActivityKind kind, char const* name,
+PhaseHostExecutionTiming PhaseDispatchWorker::enqueueActivity(PhaseActivityKind kind, char const* name,
     std::vector<PhaseWorkItem> const& batch, PhaseEnqueueCallback const& callback, cudaStream_t stream)
 {
     if (mActivityTimeline == nullptr)
     {
-        callback(batch, stream);
-        return;
+        return callback(batch, stream);
     }
     PhaseActivityTimelineRecorder::Token const token
         = mActivityTimeline->begin(kind, stream, name, mCurrentMetrics.dispatchIndex);
     try
     {
-        callback(batch, stream);
+        PhaseHostExecutionTiming const timing = callback(batch, stream);
         mActivityTimeline->end(token, stream);
+        return timing;
     }
     catch (...)
     {
@@ -1010,6 +1040,11 @@ PhaseInFlightSnapshot PhaseDispatchWorker::inFlightSnapshot(uint64_t hostSnapsho
         work.planId = mPrefillPlanId > 0U ? mPrefillPlanId : fallbackPlanId;
         work.actionId = mPrefillActionId > 0U ? mPrefillActionId : fallbackActionId;
         work.dispatchHostNs = mPrefillEnqueueHostNs > 0U ? mPrefillEnqueueHostNs : mCurrentMetrics.hostDispatchStartNs;
+        work.prepareStartHostNs = mCurrentMetrics.prefillHostExecution.prepareStartHostNs;
+        work.prepareEndHostNs = mCurrentMetrics.prefillHostExecution.prepareEndHostNs;
+        work.executeStartHostNs = mCurrentMetrics.prefillHostExecution.executeStartHostNs;
+        work.executeEndHostNs = mCurrentMetrics.prefillHostExecution.executeEndHostNs;
+        work.graphReplay = mCurrentMetrics.prefillHostExecution.graphReplay;
         work.dispatchAgeUs = result.hostSnapshotNs >= work.dispatchHostNs
             ? static_cast<double>(result.hostSnapshotNs - work.dispatchHostNs) / 1000.0
             : 0.0;
@@ -1029,6 +1064,11 @@ PhaseInFlightSnapshot PhaseDispatchWorker::inFlightSnapshot(uint64_t hostSnapsho
         work.planId = mDecodePlanId > 0U ? mDecodePlanId : fallbackPlanId;
         work.actionId = mDecodeActionId > 0U ? mDecodeActionId : fallbackActionId;
         work.dispatchHostNs = mDecodeEnqueueHostNs > 0U ? mDecodeEnqueueHostNs : mCurrentMetrics.hostDispatchStartNs;
+        work.prepareStartHostNs = mCurrentMetrics.decodeHostExecution.prepareStartHostNs;
+        work.prepareEndHostNs = mCurrentMetrics.decodeHostExecution.prepareEndHostNs;
+        work.executeStartHostNs = mCurrentMetrics.decodeHostExecution.executeStartHostNs;
+        work.executeEndHostNs = mCurrentMetrics.decodeHostExecution.executeEndHostNs;
+        work.graphReplay = mCurrentMetrics.decodeHostExecution.graphReplay;
         work.dispatchAgeUs = result.hostSnapshotNs >= work.dispatchHostNs
             ? static_cast<double>(result.hostSnapshotNs - work.dispatchHostNs) / 1000.0
             : 0.0;

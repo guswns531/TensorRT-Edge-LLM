@@ -75,6 +75,11 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     }
 }
 
+bool MultimodalRunner::prepareInference(cudaStream_t /*stream*/)
+{
+    return true;
+}
+
 void MultimodalRunner::loadExternalWeights(
     std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream)
 {

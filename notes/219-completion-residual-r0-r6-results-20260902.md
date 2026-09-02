@@ -1,5 +1,11 @@
 # Completion/Residual R0--R6 구현 및 결정 결과
 
+> **R7 update:** 이 문서의 R2 prepared-execution blocker는 이후 해결됐다.
+> mapped semaphore, staged vision preparation, exact P/D dispatch preamble로 6-direction
+> 30-cell fidelity를 검증한 최신 결과는
+> `notes/220-prepared-directional-execution-r7-results-20260902.md`를 기준으로 한다.
+> 아래 R0--R6 내용은 실패 원인과 branch decision을 보존하는 historical record다.
+
 날짜: 2026-09-02  
 브랜치: `codex/v010-phase-forward-port`  
 대상: `nvidia/Cosmos-Reason2-2B`, RTX 3080 10 GiB, TensorRT 11.0/CUDA 13.3

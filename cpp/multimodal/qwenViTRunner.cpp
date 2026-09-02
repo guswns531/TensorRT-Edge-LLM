@@ -844,6 +844,11 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
     return true;
 }
 
+bool QwenViTRunner::prepareInference(cudaStream_t stream)
+{
+    return mVitInput.getShape()[0] == 0 || selectVisualProfileForInputTokens(mVitInput.getShape()[0], stream);
+}
+
 bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 {
     // Skip VIT inference if there are no images to process

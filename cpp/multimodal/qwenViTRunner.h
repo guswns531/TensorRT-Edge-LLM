@@ -137,6 +137,7 @@ public:
     //! \param[in] stream CUDA stream for execution
     //! \return True if inference succeeded, false otherwise
     bool infer(cudaStream_t stream) noexcept override;
+    bool prepareInference(cudaStream_t stream) override;
 
     //! \brief Validate and load configuration from JSON file
     //! \param[in] engineDir Path to engine directory

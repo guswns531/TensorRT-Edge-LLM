@@ -405,6 +405,7 @@ std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vecto
             = mropeCosSin->isEmpty() ? std::nullopt : OptionalOutputTensor{std::ref(*mropeCosSin)};
         ELLM_CHECK(mRunner.preprocess(prepared->batchedRequest, prepared->tokenIds, &mTokenizer, mrope, mStream),
             "Phase vision preprocessing failed");
+        ELLM_CHECK(mRunner.prepareInference(mStream), "Phase vision execution preparation failed");
         ELLM_CHECK(prepared->tokenIds.size() == prepared->submissions.size(),
             "Phase vision preprocessing returned the wrong logical batch size");
         prepared->embeddingRows = phaseVisionEmbeddingRows(prepared->tokenIds, mConfig.imageTokenId);

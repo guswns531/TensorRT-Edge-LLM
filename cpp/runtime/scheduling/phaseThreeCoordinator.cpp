@@ -40,13 +40,6 @@ namespace
 constexpr uint64_t kTHREE_PHASE_PLAN_NAMESPACE = uint64_t{1U} << 63U;
 constexpr uint64_t kTHREE_PHASE_EXECUTION_NAMESPACE = uint64_t{1U} << 62U;
 
-uint64_t phaseDispatchHostNs(PhaseInFlightSnapshot const& snapshot, PhaseUnifiedPhase phase) noexcept
-{
-    auto const work = std::find_if(snapshot.work.begin(), snapshot.work.end(),
-        [phase](PhaseInFlightWorkSnapshot const& candidate) { return candidate.phase == phase; });
-    return work != snapshot.work.end() ? work->dispatchHostNs : 0U;
-}
-
 uint64_t remainingDirectionalDelayUs(uint64_t requestedDelayUs, uint64_t incumbentDispatchHostNs) noexcept
 {
     uint64_t const currentTimestampNs = phaseTimelineNowNs();
@@ -1466,6 +1459,10 @@ PhaseInFlightSnapshot PhaseThreeCoordinator::unifiedInFlightSnapshot(
         encoder.planId = mEncoderPlanId;
         encoder.actionId = mEncoderActionId;
         encoder.dispatchHostNs = mEncoderDispatchHostNs;
+        encoder.prepareStartHostNs = mEncoderPrepareStartHostNs;
+        encoder.prepareEndHostNs = mEncoderPrepareEndHostNs;
+        encoder.executeStartHostNs = mEncoderExecuteStartHostNs;
+        encoder.executeEndHostNs = mEncoderExecuteEndHostNs;
         encoder.dispatchAgeUs = timestampNs >= mEncoderDispatchHostNs
             ? static_cast<double>(timestampNs - mEncoderDispatchHostNs) / 1000.0
             : 0.0;
@@ -1835,7 +1832,9 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
         }
         bool const selectedInjectionPlan
             = mDirectionalInjectionPlanId.has_value() && dispatch.planId == *mDirectionalInjectionPlanId;
-        if (selectedInjectionPlan && injectionPair)
+        bool const plannedInjectionNewcomer
+            = work.phase == phaseUnifiedDirectionNewcomerPhase(mConfig.directionalInjection.direction);
+        if (selectedInjectionPlan && plannedInjectionNewcomer)
         {
             dispatch.injectionTargetFraction = mConfig.directionalInjection.targetFraction;
             dispatch.injectionRequestedDirection = mConfig.directionalInjection.direction;
@@ -1846,6 +1845,11 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
         dispatch.cohort = work.work;
         dispatch.requestIds = work.requestIds;
         dispatch.enqueueHostNs = work.dispatchHostNs;
+        dispatch.prepareStartHostNs = work.prepareStartHostNs;
+        dispatch.prepareEndHostNs = work.prepareEndHostNs;
+        dispatch.executeStartHostNs = work.executeStartHostNs;
+        dispatch.executeEndHostNs = work.executeEndHostNs;
+        dispatch.graphReplay = work.graphReplay;
         dispatch.observedOutstanding = current.outstanding;
         auto const decision = mUnifiedDecisionByPlan.find(work.planId);
         if (decision != mUnifiedDecisionByPlan.end())
@@ -3401,6 +3405,18 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             "Residual lease augmentation selected an unsupported action");
         ELLM_CHECK(mGlobalExecutionLease.has_value() && mActiveGlobalPdExecution.has_value(),
             "Residual lease augmentation lost its active phase");
+        bool const controlledPhaseFirstInjection
+            = (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                  && mConfig.directionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToEncoder)
+            || (selected.key.kind == PhaseGlobalActionKind::kEncoderDecode
+                && mConfig.directionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToEncoder);
+        if (controlledPhaseFirstInjection && !mDirectionalInjectionPlanId.has_value())
+        {
+            // E submission can exceed one short P/D residual. Preserve the
+            // prepared E cohort and realize the controlled action at the next
+            // P/D boundary, where E can be prequeued behind a device gate.
+            return false;
+        }
         double const phaseElapsedMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
                                           .count();
@@ -3534,38 +3550,87 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             ? PhaseUnifiedActionDirection::kPrefillToEncoder
             : PhaseUnifiedActionDirection::kDecodeToEncoder;
         bool const launchPhaseFirst = mConfig.directionalInjection.direction == phaseFirstDirection;
+        bool const selectInjectionPlan = mConfig.directionalInjection.enabled()
+            && phaseUnifiedDirectionsSharePair(encoderFirstDirection, mConfig.directionalInjection.direction)
+            && !mDirectionalInjectionPlanId.has_value();
+        if (selectInjectionPlan)
+        {
+            mDirectionalInjectionPlanId = executionPlan.planId;
+        }
         bool encoderStarted{};
         bool phaseStarted{};
         if (launchPhaseFirst)
         {
-            phaseStarted
-                = mServer.dispatchGlobalAction(std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
-            if (phaseStarted)
+            bool const controlledInjection = mConfig.directionalInjection.enabled()
+                && mConfig.directionalInjection.direction == phaseFirstDirection
+                && mDirectionalInjectionPlanId == executionPlan.planId;
+            if (controlledInjection)
             {
-                if (mConfig.directionalInjection.enabled()
-                    && mConfig.directionalInjection.direction == phaseFirstDirection)
+                // Host submission order need not equal GPU execution order.
+                // Prequeue slow E submission behind a device semaphore, then
+                // signal it immediately before the P/D dispatch.
+                ELLM_CHECK(preparedEncoderReady && mPreparedEncoder != nullptr && !mEncoding.empty() && !mVision.busy(),
+                    "Controlled phase-first encoder launch requires a prepared encoder batch");
+                mDirectionalCudaGate.arm(mVision.stream(), mConfig.directionalInjection.requestedDelayUs);
+                std::shared_ptr<PhaseVisionPreparedBatch> prepared = std::move(mPreparedEncoder);
+                mEncoderDispatchHostNs = phaseTimelineNowNs();
+                mEncoderExecuteStartHostNs = mEncoderDispatchHostNs;
+                CUcontext const cudaContext = mVision.cudaContext();
+                std::future<bool> encoderSubmission
+                    = std::async(std::launch::async, [this, cudaContext, prepared = std::move(prepared)]() mutable {
+                          ScopedCudaContext context(cudaContext);
+                          return mVision.submitPrepared(std::move(prepared));
+                      });
+                mServer.setNextDispatchPreamble(
+                    phaseKind, [this](cudaStream_t stream) { mDirectionalCudaGate.signal(stream); });
+                phaseStarted = mServer.dispatchGlobalAction(
+                    std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
+                encoderStarted = encoderSubmission.get();
+                mEncoderExecuteEndHostNs = phaseTimelineNowNs();
+                if (encoderStarted)
                 {
-                    mDirectionalCudaGate.enqueue(mVision.stream(), mServer.phaseStartEvent(phaseKind),
-                        remainingDirectionalDelayUs(mConfig.directionalInjection.requestedDelayUs,
-                            phaseDispatchHostNs(mServer.arbitrationSnapshot(true).inFlight, phaseKind)));
+                    mServer.setExternalEncoderActive(true);
+                    markUnifiedEncoderSubmitted();
                 }
-                encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
+            }
+            else
+            {
+                phaseStarted = mServer.dispatchGlobalAction(
+                    std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
+                if (phaseStarted)
+                {
+                    encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
+                }
             }
         }
         else
         {
-            encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
-            if (encoderStarted)
+            bool const controlledEncoderFirst = mConfig.directionalInjection.enabled()
+                && mConfig.directionalInjection.direction == encoderFirstDirection
+                && mDirectionalInjectionPlanId == executionPlan.planId;
+            if (controlledEncoderFirst)
             {
-                if (mConfig.directionalInjection.enabled()
-                    && mConfig.directionalInjection.direction == encoderFirstDirection)
+                encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
+                if (encoderStarted)
                 {
                     mDirectionalCudaGate.enqueue(mServer.phaseStream(phaseKind), mVision.startEvent(),
                         remainingDirectionalDelayUs(
                             mConfig.directionalInjection.requestedDelayUs, mEncoderDispatchHostNs));
+                    phaseStarted = mServer.dispatchGlobalAction(
+                        std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
                 }
-                phaseStarted = mServer.dispatchGlobalAction(
-                    std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
+            }
+            else
+            {
+                // Preserve the production encoder-first action semantics.
+                // Controlled directional injection uses the prepared device
+                // gate above when exact cross-phase start placement is needed.
+                encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
+                if (encoderStarted)
+                {
+                    phaseStarted = mServer.dispatchGlobalAction(
+                        std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
+                }
             }
         }
         if (!encoderStarted || !phaseStarted)
@@ -3816,6 +3881,11 @@ bool PhaseThreeCoordinator::startNextEncoder()
     }
     try
     {
+        mEncoderPrepareStartHostNs = phaseTimelineNowNs();
+        mEncoderPrepareEndHostNs = 0U;
+        mEncoderExecuteStartHostNs = 0U;
+        mEncoderExecuteEndHostNs = 0U;
+        mEncoderDispatchHostNs = 0U;
         if (mConfig.enableAsyncEncoderPreparation)
         {
             ELLM_CHECK(!mEncoderPreparation.valid(), "An async encoder preparation is already active");
@@ -3830,7 +3900,11 @@ bool PhaseThreeCoordinator::startNextEncoder()
         }
         else
         {
+            mEncoderDispatchHostNs = phaseTimelineNowNs();
+            mEncoderExecuteStartHostNs = mEncoderDispatchHostNs;
             ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
+            mEncoderPrepareEndHostNs = phaseTimelineNowNs();
+            mEncoderExecuteEndHostNs = mEncoderPrepareEndHostNs;
             mServer.setExternalEncoderActive(true);
             markUnifiedEncoderSubmitted();
         }
@@ -3863,7 +3937,7 @@ bool PhaseThreeCoordinator::startNextEncoder()
 void PhaseThreeCoordinator::markUnifiedEncoderSubmitted()
 {
     mEncoderGpuSubmitted = true;
-    mEncoderDispatchHostNs = phaseTimelineNowNs();
+    mEncoderDispatchHostNs = mEncoderDispatchHostNs > 0U ? mEncoderDispatchHostNs : phaseTimelineNowNs();
     mEncoderExecutionId = kTHREE_PHASE_EXECUTION_NAMESPACE | ++mUnifiedEncoderExecutionSequence;
     mEncoderActivityCorrelationId = mEncoding.front().requestId;
     if (mGlobalExecutionLease.has_value()
@@ -3892,6 +3966,7 @@ bool PhaseThreeCoordinator::completeEncoderPreparation()
     try
     {
         std::shared_ptr<PhaseVisionPreparedBatch> prepared = mEncoderPreparation.get();
+        mEncoderPrepareEndHostNs = phaseTimelineNowNs();
         mLastEncoderPreparationUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mEncoderPreparationStartedAt)
                   .count();
@@ -3929,7 +4004,10 @@ bool PhaseThreeCoordinator::submitPreparedEncoder()
         return false;
     }
     std::shared_ptr<PhaseVisionPreparedBatch> prepared = std::move(mPreparedEncoder);
+    mEncoderDispatchHostNs = phaseTimelineNowNs();
+    mEncoderExecuteStartHostNs = mEncoderDispatchHostNs;
     ELLM_CHECK(mVision.submitPrepared(std::move(prepared)), "Failed to submit staged encoder batch");
+    mEncoderExecuteEndHostNs = phaseTimelineNowNs();
     mServer.setExternalEncoderActive(true);
     markUnifiedEncoderSubmitted();
     return true;

@@ -19,20 +19,11 @@
 
 #include "common/checkMacros.h"
 
+#include <chrono>
+#include <thread>
+
 namespace trt_edgellm::rt
 {
-namespace
-{
-
-__global__ void delayDirectionalGate(uint64_t cycles)
-{
-    uint64_t const started = clock64();
-    while (clock64() - started < cycles)
-    {
-    }
-}
-
-} // namespace
 
 PhaseCudaDirectionalGate::~PhaseCudaDirectionalGate() noexcept
 {
@@ -44,6 +35,14 @@ PhaseCudaDirectionalGate::~PhaseCudaDirectionalGate() noexcept
     if (mGateStream != nullptr)
     {
         static_cast<void>(cudaStreamDestroy(mGateStream));
+    }
+    if (mHostGateFlag != nullptr)
+    {
+        static_cast<void>(cudaFreeHost(mHostGateFlag));
+    }
+    if (mHostIncumbentFlag != nullptr)
+    {
+        static_cast<void>(cudaFreeHost(mHostIncumbentFlag));
     }
 }
 
@@ -58,19 +57,61 @@ void PhaseCudaDirectionalGate::ensureStorage()
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
     CUDA_CHECK(cudaStreamCreateWithPriority(&mGateStream, cudaStreamNonBlocking, greatestPriority));
     CUDA_CHECK(cudaEventCreateWithFlags(&mGateDone, cudaEventDisableTiming));
-    CUDA_CHECK(cudaDeviceGetAttribute(&mClockRateKHz, cudaDevAttrClockRate, 0));
+    CUDA_CHECK(cudaHostAlloc(&mHostGateFlag, sizeof(uint32_t), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(&mDeviceGateFlag, mHostGateFlag, 0U));
+    CUDA_CHECK(cudaHostAlloc(&mHostIncumbentFlag, sizeof(uint32_t), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(&mDeviceIncumbentFlag, mHostIncumbentFlag, 0U));
+    __atomic_store_n(mHostGateFlag, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(mHostIncumbentFlag, 0U, __ATOMIC_RELEASE);
+}
+
+void CUDART_CB PhaseCudaDirectionalGate::releaseHostGate(void* userData)
+{
+    auto& gate = *static_cast<PhaseCudaDirectionalGate*>(userData);
+    if (gate.mPendingDelayUs > 0U)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(gate.mPendingDelayUs));
+    }
+    __atomic_store_n(gate.mHostGateFlag, 1U, __ATOMIC_RELEASE);
 }
 
 void PhaseCudaDirectionalGate::enqueue(cudaStream_t newcomerStream, cudaEvent_t incumbentStart, uint64_t delayUs)
 {
     wait();
     ensureStorage();
+    __atomic_store_n(mHostGateFlag, 0U, __ATOMIC_RELEASE);
+    mPendingDelayUs = delayUs;
     CUDA_CHECK(cudaStreamWaitEvent(mGateStream, incumbentStart));
-    uint64_t const cycles = delayUs * static_cast<uint64_t>(mClockRateKHz) / 1000U;
-    delayDirectionalGate<<<1, 1, 0, mGateStream>>>(cycles);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaLaunchHostFunc(mGateStream, releaseHostGate, this));
     CUDA_CHECK(cudaEventRecord(mGateDone, mGateStream));
-    CUDA_CHECK(cudaStreamWaitEvent(newcomerStream, mGateDone));
+    CUstream const driverStream = reinterpret_cast<CUstream>(newcomerStream);
+    CUdeviceptr const gateAddress = reinterpret_cast<CUdeviceptr>(mDeviceGateFlag);
+    CUDA_DRIVER_CHECK(cuStreamWaitValue32(driverStream, gateAddress, 1U, CU_STREAM_WAIT_VALUE_EQ));
+}
+
+void PhaseCudaDirectionalGate::arm(cudaStream_t newcomerStream, uint64_t delayUs)
+{
+    wait();
+    ensureStorage();
+    __atomic_store_n(mHostGateFlag, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(mHostIncumbentFlag, 0U, __ATOMIC_RELEASE);
+    mPendingDelayUs = delayUs;
+    CUstream const gateStream = reinterpret_cast<CUstream>(mGateStream);
+    CUdeviceptr const incumbentAddress = reinterpret_cast<CUdeviceptr>(mDeviceIncumbentFlag);
+    CUDA_DRIVER_CHECK(cuStreamWaitValue32(gateStream, incumbentAddress, 1U, CU_STREAM_WAIT_VALUE_EQ));
+    CUDA_CHECK(cudaLaunchHostFunc(mGateStream, releaseHostGate, this));
+    CUDA_CHECK(cudaEventRecord(mGateDone, mGateStream));
+    CUstream const driverStream = reinterpret_cast<CUstream>(newcomerStream);
+    CUdeviceptr const gateAddress = reinterpret_cast<CUdeviceptr>(mDeviceGateFlag);
+    CUDA_DRIVER_CHECK(cuStreamWaitValue32(driverStream, gateAddress, 1U, CU_STREAM_WAIT_VALUE_EQ));
+}
+
+void PhaseCudaDirectionalGate::signal(cudaStream_t incumbentStream)
+{
+    ELLM_CHECK(mDeviceIncumbentFlag != nullptr, "Directional gate must be armed before it is signalled");
+    CUstream const driverStream = reinterpret_cast<CUstream>(incumbentStream);
+    CUdeviceptr const incumbentAddress = reinterpret_cast<CUdeviceptr>(mDeviceIncumbentFlag);
+    CUDA_DRIVER_CHECK(cuStreamWriteValue32(driverStream, incumbentAddress, 1U, CU_STREAM_WRITE_VALUE_DEFAULT));
 }
 
 void PhaseCudaDirectionalGate::wait() noexcept

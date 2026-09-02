@@ -162,6 +162,10 @@ public:
      */
     virtual bool infer(cudaStream_t stream) = 0;
 
+    //! Prepare profile-dependent execution state after preprocessing, before
+    //! the scheduler places the encoder stream behind a launch gate.
+    virtual bool prepareInference(cudaStream_t stream);
+
     //! @brief Get output embeddings from vision encoder
     //! @return Reference to output embedding tensor
     virtual rt::Tensor& getOutputEmbedding();

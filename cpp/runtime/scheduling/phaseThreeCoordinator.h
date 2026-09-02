@@ -735,6 +735,10 @@ private:
     float mMaxEncoderGpuMs{};
     bool mEncoderGpuSubmitted{};
     uint64_t mEncoderDispatchHostNs{};
+    uint64_t mEncoderPrepareStartHostNs{};
+    uint64_t mEncoderPrepareEndHostNs{};
+    uint64_t mEncoderExecuteStartHostNs{};
+    uint64_t mEncoderExecuteEndHostNs{};
     uint64_t mEncoderExecutionId{};
     uint64_t mEncoderActivityCorrelationId{};
     uint64_t mEncoderPlanId{};

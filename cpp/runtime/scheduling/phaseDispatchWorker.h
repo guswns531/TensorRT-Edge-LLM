@@ -55,7 +55,7 @@ struct PhaseDecodeCompletion
     bool finished{};
 };
 
-using PhaseEnqueueCallback = std::function<void(std::vector<PhaseWorkItem> const&, cudaStream_t)>;
+using PhaseEnqueueCallback = std::function<PhaseHostExecutionTiming(std::vector<PhaseWorkItem> const&, cudaStream_t)>;
 using PhaseBatchCompletionCallback = std::function<void(std::vector<PhaseWorkItem> const&)>;
 using PrefillCompletionCallback = std::function<PhasePrefillCompletion(PhaseWorkItem const&)>;
 using DecodeCompletionCallback = std::function<PhaseDecodeCompletion(PhaseWorkItem const&)>;
@@ -169,13 +169,16 @@ public:
     CUcontext cudaContext() const noexcept;
     cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
     cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
+    //! Run a one-shot callback after batch materialization and immediately
+    //! before the selected phase records its CUDA start event.
+    void setNextDispatchPreamble(PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble);
 
 private:
     void enqueueDeferredDecode();
     void mergeAugmentedMetrics(PhaseDispatchPlan const& additional, PhaseGlobalActionCandidate const& aggregate,
         uint64_t planId, uint64_t snapshotEpoch);
-    void enqueueActivity(PhaseActivityKind kind, char const* name, std::vector<PhaseWorkItem> const& batch,
-        PhaseEnqueueCallback const& callback, cudaStream_t stream);
+    PhaseHostExecutionTiming enqueueActivity(PhaseActivityKind kind, char const* name,
+        std::vector<PhaseWorkItem> const& batch, PhaseEnqueueCallback const& callback, cudaStream_t stream);
     void completePrefillInFlight();
     void completeDecodeInFlight();
     void completeInFlight();
@@ -214,7 +217,10 @@ private:
     std::vector<uint64_t> mPreviousDecodeRowRequestIds;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
     PhaseDirectionalInjectionControl mDirectionalInjection;
+    bool mDirectionalInjectionConsumed{};
     PhaseCudaDirectionalGate mDirectionalCudaGate;
+    std::function<void(cudaStream_t)> mNextPrefillDispatchPreamble;
+    std::function<void(cudaStream_t)> mNextDecodeDispatchPreamble;
 };
 
 } // namespace rt

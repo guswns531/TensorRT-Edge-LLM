@@ -765,6 +765,12 @@ cudaEvent_t IndependentPhaseAsyncServer::phaseStartEvent(PhaseUnifiedPhase phase
     return mCoordinator.phaseStartEvent(phase);
 }
 
+void IndependentPhaseAsyncServer::setNextDispatchPreamble(
+    PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble)
+{
+    mCoordinator.setNextDispatchPreamble(phase, std::move(preamble));
+}
+
 bool IndependentPhaseAsyncServer::poll()
 {
     bool progressed = pollCompletions();

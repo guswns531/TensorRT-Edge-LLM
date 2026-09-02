@@ -111,6 +111,16 @@ enum class PhaseDrainPreference
 
 char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept;
 
+//! Host realization stages for one prepared TensorRT phase execution.
+struct PhaseHostExecutionTiming
+{
+    uint64_t prepareStartHostNs{};
+    uint64_t prepareEndHostNs{};
+    uint64_t executeStartHostNs{};
+    uint64_t executeEndHostNs{};
+    bool graphReplay{};
+};
+
 struct PhaseDispatchMetrics
 {
     size_t dispatchIndex{};
@@ -122,6 +132,8 @@ struct PhaseDispatchMetrics
     uint64_t hostDispatchStartNs{};
     uint64_t hostSubmissionEndNs{};
     uint64_t hostCompletionNs{};
+    PhaseHostExecutionTiming prefillHostExecution;
+    PhaseHostExecutionTiming decodeHostExecution;
     //! Stable request membership used to join dispatch metrics with request timelines.
     std::vector<uint64_t> prefillRequestIds;
     std::vector<uint64_t> decodeRequestIds;

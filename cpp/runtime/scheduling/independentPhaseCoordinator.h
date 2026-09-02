@@ -124,6 +124,7 @@ public:
     CUcontext cudaContext() const noexcept;
     cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
     cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
+    void setNextDispatchPreamble(PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble);
     PhaseKVMemoryStats const& prefillKVMemoryStats() const noexcept;
     PhaseKVMemoryStats const& decodeKVMemoryStats() const noexcept;
     KVPageTableUploadStats const& prefillPageTableUploadStats() const noexcept;
@@ -131,8 +132,8 @@ public:
 
 private:
     PhaseDispatchWorkerCallbacks makeWorkerCallbacks();
-    void enqueuePrefillBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
-    void enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
+    PhaseHostExecutionTiming enqueuePrefillBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
+    PhaseHostExecutionTiming enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
     void completePrefillBatch(std::vector<PhaseWorkItem> const& batch);
     void completeDecodeBatch(std::vector<PhaseWorkItem> const& batch);
 

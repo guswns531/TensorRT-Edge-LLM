@@ -347,6 +347,11 @@ struct PhaseInFlightWorkSnapshot
     uint64_t planId{};
     uint64_t actionId{};
     uint64_t dispatchHostNs{};
+    uint64_t prepareStartHostNs{};
+    uint64_t prepareEndHostNs{};
+    uint64_t executeStartHostNs{};
+    uint64_t executeEndHostNs{};
+    bool graphReplay{};
     double dispatchAgeUs{};
     std::vector<uint64_t> requestIds;
     PhaseUnifiedWork work;
@@ -431,6 +436,11 @@ struct PhaseUnifiedEvent
     std::vector<PhaseUnifiedCandidateSnapshot> candidates;
     uint64_t selectedActionId{};
     uint64_t enqueueHostNs{};
+    uint64_t prepareStartHostNs{};
+    uint64_t prepareEndHostNs{};
+    uint64_t executeStartHostNs{};
+    uint64_t executeEndHostNs{};
+    bool graphReplay{};
     std::optional<double> injectionTargetFraction;
     PhaseUnifiedActionDirection injectionRequestedDirection{PhaseUnifiedActionDirection::kNone};
     double injectionIncumbentReferenceUs{};

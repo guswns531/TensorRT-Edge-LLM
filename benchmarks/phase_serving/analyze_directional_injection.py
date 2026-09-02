@@ -95,9 +95,16 @@ def nearest_bucket(fraction: float) -> float:
     return min(TARGET_BUCKETS, key=lambda bucket: abs(bucket - fraction))
 
 
+def cohort_rows(event: dict[str, Any], phase: str) -> int:
+    """Return the logical row count for one phase completion."""
+    return int(event.get("cohort", {}).get(f"{phase}_rows", 0))
+
+
 def build_samples(
-        events: list[dict[str, Any]], bucket_tolerance: float,
-        confidence_beta: float) -> tuple[list[dict[str, Any]], list[str]]:
+        events: list[dict[str, Any]],
+        bucket_tolerance: float,
+        confidence_beta: float = 1.96
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Join newcomer dispatches with incumbent/newcomer completion intervals."""
     errors: list[str] = []
     completions: dict[tuple[str, str, str, int], dict[str, Any]] = {}
@@ -213,6 +220,21 @@ def build_samples(
             selected.get("contextual_completion_ready", False))
         inflight_overlap = overlap > 0.0
         realization = "overlap" if inflight_overlap else "serial_realization"
+        decision_incumbent_age_us = next(
+            (float(work.get("dispatch_age_us", 0.0))
+             for work in decision.get("inflight", [])
+             if int(work.get("execution_id", 0)) == incumbent_id),
+            float(dispatch.get("incumbent_dispatch_age_us", 0.0)))
+        requested_delay_us = int(
+            dispatch.get("requested_injection_delay_us", 0))
+        target_late_by_us = max(0.0,
+                                decision_incumbent_age_us - requested_delay_us)
+        prepare_start_ns = int(dispatch.get("prepare_start_host_ns", 0))
+        prepare_end_ns = int(dispatch.get("prepare_end_host_ns", 0))
+        execute_start_ns = int(dispatch.get("execute_start_host_ns", 0))
+        execute_end_ns = int(dispatch.get("execute_end_host_ns", 0))
+        decision_host_ns = int(decision.get("host_monotonic_ns", 0))
+        enqueue_host_ns = int(dispatch.get("enqueue_host_ns", 0))
         samples.append({
             "run_id":
             run_id,
@@ -247,13 +269,29 @@ def build_samples(
             inflight_overlap
             and abs(actual_fraction - bucket) <= bucket_tolerance,
             "requested_delay_us":
-            int(dispatch.get("requested_injection_delay_us", 0)),
+            requested_delay_us,
+            "decision_incumbent_age_us":
+            decision_incumbent_age_us,
+            "target_causally_reachable":
+            target_late_by_us <= bucket_tolerance * incumbent_reference,
+            "target_late_by_us":
+            target_late_by_us,
+            "decision_to_enqueue_us":
+            max(0, enqueue_host_ns - decision_host_ns) / 1000.0,
+            "prepare_host_us":
+            max(0, prepare_end_ns - prepare_start_ns) / 1000.0,
+            "execute_submit_host_us":
+            max(0, execute_end_ns - execute_start_ns) / 1000.0,
+            "graph_replay":
+            bool(dispatch.get("graph_replay", False)),
             "incumbent_phase":
             incumbent_phase,
             "incumbent_milestone":
             "tpot" if incumbent_phase == "decode" else "ttft",
             "incumbent_execution_id":
             incumbent_id,
+            "incumbent_rows":
+            cohort_rows(incumbent, incumbent_phase),
             "incumbent_reference_us":
             incumbent_reference,
             "incumbent_duration_us":
@@ -266,6 +304,8 @@ def build_samples(
             "tpot" if newcomer_phase == "decode" else "ttft",
             "newcomer_execution_id":
             newcomer_id,
+            "newcomer_rows":
+            cohort_rows(newcomer, newcomer_phase),
             "newcomer_reference_us":
             newcomer_reference,
             "newcomer_duration_us":
@@ -339,9 +379,16 @@ def summarize(samples: list[dict[str, Any]],
                       "newcomer_completion_from_injection_us",
                       "action_makespan_from_injection_us",
                       "serial_equivalent_compression",
-                      "completion_visible_span_us"):
+                      "completion_visible_span_us",
+                      "decision_incumbent_age_us", "target_late_by_us",
+                      "decision_to_enqueue_us", "prepare_host_us",
+                      "execute_submit_host_us"):
             cell[field] = distribution(
                 [float(sample[field]) for sample in group])
+        cell["target_causally_reachable_samples"] = sum(
+            bool(sample["target_causally_reachable"]) for sample in group)
+        cell["graph_replay_samples"] = sum(
+            bool(sample["graph_replay"]) for sample in group)
         ready = [
             sample for sample in group if sample["completion_prediction_ready"]
         ]
@@ -410,6 +457,36 @@ def summarize(samples: list[dict[str, Any]],
             and maximum_ratio >= material_effect_ratio,
         })
 
+    requested_groups: dict[tuple[str, float],
+                           list[dict[str,
+                                     Any]]] = collections.defaultdict(list)
+    for sample in samples:
+        requested_groups[(sample["requested_direction"],
+                          float(sample["target_fraction"]))].append(sample)
+    target_realizability = []
+    for (direction, target), group in sorted(requested_groups.items()):
+        target_realizability.append({
+            "requested_direction":
+            direction,
+            "target_fraction":
+            target,
+            "samples":
+            len(group),
+            "causally_reachable_samples":
+            sum(bool(sample["target_causally_reachable"]) for sample in group),
+            "overlap_samples":
+            sum(bool(sample["inflight_overlap"]) for sample in group),
+            "actual_fraction":
+            distribution(
+                [float(sample["actual_fraction"]) for sample in group]),
+            "requested_target_error":
+            distribution(
+                [float(sample["requested_target_error"]) for sample in group]),
+            "target_late_by_us":
+            distribution(
+                [float(sample["target_late_by_us"]) for sample in group]),
+        })
+
     return {
         "schema_version":
         1,
@@ -421,6 +498,8 @@ def summarize(samples: list[dict[str, Any]],
         sum(bool(sample["accepted_bucket"]) for sample in samples),
         "cells":
         cells,
+        "target_realizability":
+        target_realizability,
         "gate_a": {
             "material_effect_ratio":
             material_effect_ratio,

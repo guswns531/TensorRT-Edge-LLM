@@ -118,6 +118,46 @@ def test_rejects_a_bucket_without_measured_gpu_overlap() -> None:
     assert samples[0]["actual_start_skew_bucket"] == "serial_realization"
 
 
+def test_reports_causal_offset_floor_and_graph_submission_timing() -> None:
+    newcomer = dispatch("late", 0.25, 1, 2)
+    newcomer.update({
+        "plan_id": 7,
+        "enqueue_host_ns": 1_500_000,
+        "prepare_start_host_ns": 1_510_000,
+        "prepare_end_host_ns": 1_610_000,
+        "execute_start_host_ns": 1_620_000,
+        "execute_end_host_ns": 1_650_000,
+        "graph_replay": True,
+    })
+    decision = {
+        "event_kind": "decision",
+        "run_id": "late",
+        "plan_id": 7,
+        "host_monotonic_ns": 1_400_000,
+        "inflight": [{
+            "execution_id": 1,
+            "dispatch_age_us": 55.0
+        }],
+    }
+    events = [
+        decision,
+        newcomer,
+        completion("late", "prefill", 1, 10.0, 110.0),
+        completion("late", "decode", 2, 65.0, 105.0),
+    ]
+
+    samples, errors = build_samples(events, bucket_tolerance=0.12)
+
+    assert not errors
+    assert len(samples) == 1
+    assert not samples[0]["target_causally_reachable"]
+    assert samples[0]["target_late_by_us"] == 30.0
+    assert samples[0]["decision_to_enqueue_us"] == 100.0
+    assert samples[0]["prepare_host_us"] == 100.0
+    assert samples[0]["execute_submit_host_us"] == 30.0
+    assert samples[0]["graph_replay"]
+
+
 def incremental_events() -> list[dict]:
     """Return one complete M3 decision/dispatch/completion chain."""
     common = {
