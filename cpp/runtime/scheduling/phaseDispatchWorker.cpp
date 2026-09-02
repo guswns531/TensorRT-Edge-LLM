@@ -24,7 +24,6 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -35,6 +34,14 @@ namespace rt
 
 namespace
 {
+
+uint64_t remainingDirectionalDelayUs(uint64_t requestedDelayUs, uint64_t incumbentEnqueueHostNs) noexcept
+{
+    uint64_t const currentTimestampNs = phaseTimelineNowNs();
+    uint64_t const elapsedUs
+        = currentTimestampNs > incumbentEnqueueHostNs ? (currentTimestampNs - incumbentEnqueueHostNs) / 1000U : 0U;
+    return requestedDelayUs > elapsedUs ? requestedDelayUs - elapsedUs : 0U;
+}
 
 CUcontext getStreamCudaContext(cudaStream_t stream)
 {
@@ -65,8 +72,19 @@ void validatePrimaryCudaContext(CUcontext context)
 void preservePhaseBatchRowAffinity(
     std::vector<PhaseWorkItem>& batch, std::vector<uint64_t> const& previousRowRequestIds)
 {
-    if (batch.empty() || previousRowRequestIds.empty())
+    if (batch.empty())
     {
+        return;
+    }
+    auto const canonicalLess = [](PhaseWorkItem const& left, PhaseWorkItem const& right) {
+        int32_t constexpr kCONTEXT_BUCKET = 128;
+        int32_t const leftBucket = left.tokenCount / kCONTEXT_BUCKET;
+        int32_t const rightBucket = right.tokenCount / kCONTEXT_BUCKET;
+        return leftBucket != rightBucket ? leftBucket < rightBucket : left.requestId < right.requestId;
+    };
+    if (previousRowRequestIds.empty())
+    {
+        std::stable_sort(batch.begin(), batch.end(), canonicalLess);
         return;
     }
     std::unordered_map<uint64_t, size_t> selectedRows;
@@ -90,6 +108,17 @@ void preservePhaseBatchRowAffinity(
         assigned[row] = 1U;
         consumed[selected->second] = 1U;
     }
+    std::vector<size_t> canonicalSources;
+    canonicalSources.reserve(batch.size());
+    for (size_t index{}; index < batch.size(); ++index)
+    {
+        if (consumed[index] == 0U)
+        {
+            canonicalSources.push_back(index);
+        }
+    }
+    std::stable_sort(canonicalSources.begin(), canonicalSources.end(),
+        [&](size_t left, size_t right) { return canonicalLess(batch[left], batch[right]); });
     size_t source{};
     for (size_t row{}; row < ordered.size(); ++row)
     {
@@ -97,12 +126,7 @@ void preservePhaseBatchRowAffinity(
         {
             continue;
         }
-        while (consumed[source] != 0U)
-        {
-            ++source;
-        }
-        ordered[row] = batch[source];
-        consumed[source] = 1U;
+        ordered[row] = batch[canonicalSources[source++]];
     }
     batch = std::move(ordered);
 }
@@ -197,21 +221,18 @@ void PhaseDispatchWorker::setDirectionalInjectionControl(PhaseDirectionalInjecti
     mDirectionalInjection = control;
 }
 
-void PhaseDispatchWorker::waitForDirectionalInjection(
-    PhaseUnifiedActionDirection direction, uint64_t incumbentEnqueueHostNs) const
+cudaStream_t PhaseDispatchWorker::phaseStream(PhaseUnifiedPhase phase) const noexcept
 {
-    if (!mDirectionalInjection.enabled() || mDirectionalInjection.direction != direction
-        || mDirectionalInjection.requestedDelayUs == 0U)
-    {
-        return;
-    }
-    uint64_t const timestampNs = phaseTimelineNowNs();
-    uint64_t const elapsedUs
-        = timestampNs > incumbentEnqueueHostNs ? (timestampNs - incumbentEnqueueHostNs) / 1000U : 0U;
-    if (elapsedUs < mDirectionalInjection.requestedDelayUs)
-    {
-        std::this_thread::sleep_for(std::chrono::microseconds(mDirectionalInjection.requestedDelayUs - elapsedUs));
-    }
+    return phase == PhaseUnifiedPhase::kPrefill ? mPrefillStream
+        : phase == PhaseUnifiedPhase::kDecode   ? mDecodeStream
+                                                : nullptr;
+}
+
+cudaEvent_t PhaseDispatchWorker::phaseStartEvent(PhaseUnifiedPhase phase) const noexcept
+{
+    return phase == PhaseUnifiedPhase::kPrefill ? mPrefillStart
+        : phase == PhaseUnifiedPhase::kDecode   ? mDecodeStart
+                                                : nullptr;
 }
 
 bool PhaseDispatchWorker::dispatchNext()
@@ -225,6 +246,10 @@ bool PhaseDispatchWorker::dispatchNext()
 
     mHasPrefill = !mInFlight.prefillBatch.empty();
     mHasDecode = !mInFlight.decodeBatch.empty();
+    if (mHasPrefill)
+    {
+        preservePhaseBatchRowAffinity(mInFlight.prefillBatch, {});
+    }
     if (mHasDecode)
     {
         preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
@@ -423,7 +448,12 @@ bool PhaseDispatchWorker::dispatchNext()
     if (decodeFirst)
     {
         enqueueDecode();
-        waitForDirectionalInjection(PhaseUnifiedActionDirection::kDecodeToPrefill, mDecodeEnqueueHostNs);
+        if (mDirectionalInjection.enabled()
+            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill)
+        {
+            mDirectionalCudaGate.enqueue(mPrefillStream, mDecodeStart,
+                remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mDecodeEnqueueHostNs));
+        }
         enqueuePrefill();
     }
     else
@@ -434,7 +464,12 @@ bool PhaseDispatchWorker::dispatchNext()
         }
         if (mHasPrefill && mHasDecode)
         {
-            waitForDirectionalInjection(PhaseUnifiedActionDirection::kPrefillToDecode, mPrefillEnqueueHostNs);
+            if (mDirectionalInjection.enabled()
+                && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode)
+            {
+                mDirectionalCudaGate.enqueue(mDecodeStream, mPrefillStart,
+                    remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mPrefillEnqueueHostNs));
+            }
         }
         if (mHasDecode)
         {
@@ -476,7 +511,12 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
 
     if (addsPrefill)
     {
-        waitForDirectionalInjection(PhaseUnifiedActionDirection::kDecodeToPrefill, mDecodeEnqueueHostNs);
+        if (mDirectionalInjection.enabled()
+            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill)
+        {
+            mDirectionalCudaGate.enqueue(mPrefillStream, mDecodeStart,
+                remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mDecodeEnqueueHostNs));
+        }
         mInFlight.prefillBatch = std::move(additional.prefillBatch);
         mHasPrefill = true;
         mPrefillPlanId = effectivePlanId;
@@ -491,7 +531,12 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
     }
     else
     {
-        waitForDirectionalInjection(PhaseUnifiedActionDirection::kPrefillToDecode, mPrefillEnqueueHostNs);
+        if (mDirectionalInjection.enabled()
+            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode)
+        {
+            mDirectionalCudaGate.enqueue(mDecodeStream, mPrefillStart,
+                remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mPrefillEnqueueHostNs));
+        }
         mInFlight.decodeBatch = std::move(additional.decodeBatch);
         preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
         mPreviousDecodeRowRequestIds.clear();

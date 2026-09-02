@@ -384,6 +384,8 @@ public:
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
     //! Configure an opt-in M2 directional launch experiment while idle.
     void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
+    cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
+    cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
     bool poll();
     //! Progress admission, CUDA completions, sampling, and callbacks without
     //! selecting a new P/D action.

@@ -19,6 +19,7 @@
 
 #include "runtime/phase/policy/phaseFormationPlanner.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
+#include "runtime/scheduling/phaseCudaDirectionalGate.h"
 #include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
@@ -572,7 +573,8 @@ public:
     //! Enable one shared epoch-relative E/P/D/C activity recorder while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
     //! Emit schema-versioned decision/dispatch/completion records without changing policy.
-    void setUnifiedEventCallback(std::function<void(PhaseUnifiedEvent const&)> unifiedEventCallback);
+    void setUnifiedEventCallback(
+        std::function<void(PhaseUnifiedEvent const&)> unifiedEventCallback, bool detailedDecisionSnapshots = true);
 
     //! Observe each completed encoder batch exactly once.
     void setEncoderBatchMetricCallback(
@@ -640,7 +642,7 @@ private:
     void refreshEncoderSerializationGate() noexcept;
     void eraseTpotTarget(uint64_t requestId);
     void observeServerCompletion(uint64_t requestId);
-    PhaseInFlightSnapshot unifiedInFlightSnapshot(uint64_t hostSnapshotNs = 0U) const;
+    PhaseInFlightSnapshot unifiedInFlightSnapshot(uint64_t hostSnapshotNs = 0U, bool includeRequestIds = true) const;
     void recordUnifiedDecision(PhaseGlobalActionCandidate const& candidate, PhaseGlobalDispatchPlan const& plan,
         std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr);
     void observeUnifiedInFlightTransitions();
@@ -655,6 +657,7 @@ private:
     IndependentPhaseAsyncServer& mServer;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
     PhaseThreeCoordinatorConfig mConfig;
+    PhaseCudaDirectionalGate mDirectionalCudaGate;
     PhaseGlobalScheduler mGlobalScheduler;
     std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
     PhaseMemoryBroker mMemoryBroker;
@@ -713,6 +716,7 @@ private:
     std::vector<size_t> mGlobalCalibrationOpportunities;
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     std::function<void(PhaseUnifiedEvent const&)> mUnifiedEventCallback;
+    bool mUnifiedDetailedDecisionSnapshots{true};
     std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
     std::function<void(PhaseFormationRealizedEpisode const&)> mFormationEpisodeCallback;
     size_t mEstimatedEncodedBytes{};

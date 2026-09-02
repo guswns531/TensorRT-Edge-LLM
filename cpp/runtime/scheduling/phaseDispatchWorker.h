@@ -18,6 +18,7 @@
 #pragma once
 
 #include "runtime/phase/mechanism/phaseUnifiedEvent.h"
+#include "runtime/scheduling/phaseCudaDirectionalGate.h"
 #include "runtime/scheduling/phaseQueueScheduler.h"
 #include "runtime/scheduling/phaseTimeline.h"
 
@@ -166,6 +167,8 @@ public:
 
     //! CUDA primary context shared by the two phase streams.
     CUcontext cudaContext() const noexcept;
+    cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
+    cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
 
 private:
     void enqueueDeferredDecode();
@@ -180,8 +183,6 @@ private:
     void recordTimeline(
         std::vector<PhaseWorkItem> const& batch, PhaseTimelineStage stage, uint64_t timestampNs = 0U) const;
     bool eventReady(cudaEvent_t event) const;
-    void waitForDirectionalInjection(PhaseUnifiedActionDirection direction, uint64_t incumbentEnqueueHostNs) const;
-
     PhaseQueueScheduler& mScheduler;
     PhaseDispatchWorkerCallbacks mCallbacks;
     cudaStream_t mPrefillStream{};
@@ -213,6 +214,7 @@ private:
     std::vector<uint64_t> mPreviousDecodeRowRequestIds;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
     PhaseDirectionalInjectionControl mDirectionalInjection;
+    PhaseCudaDirectionalGate mDirectionalCudaGate;
 };
 
 } // namespace rt

@@ -494,6 +494,16 @@ CUcontext IndependentPhaseCoordinator::cudaContext() const noexcept
     return mWorker->cudaContext();
 }
 
+cudaStream_t IndependentPhaseCoordinator::phaseStream(PhaseUnifiedPhase phase) const noexcept
+{
+    return mWorker->phaseStream(phase);
+}
+
+cudaEvent_t IndependentPhaseCoordinator::phaseStartEvent(PhaseUnifiedPhase phase) const noexcept
+{
+    return mWorker->phaseStartEvent(phase);
+}
+
 PhaseKVMemoryStats const& IndependentPhaseCoordinator::prefillKVMemoryStats() const noexcept
 {
     return mPrefillKV.memoryStats();

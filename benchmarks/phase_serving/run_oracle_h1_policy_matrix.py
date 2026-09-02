@@ -213,11 +213,15 @@ def materialize_command(entry: dict[str, Any],
 
     _remove_docker_environment(command, POLICY_ENVIRONMENT_NAMES)
     _set_docker_environment(command, "TRT_EDGELLM_EMIT_PHASE_METRICS", "1")
+    _set_docker_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL",
+                            "research")
     relative_output = output_dir.resolve().relative_to(
         host_workspace.resolve())
     activity_prefix = container_workspace / relative_output / "activity" / "run-001"
     _set_docker_environment(command, "TRT_EDGELLM_PHASE_ACTIVITY_PREFIX",
                             str(activity_prefix))
+    _set_docker_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_PATH",
+                            str(activity_prefix) + "-events.jsonl")
     _set_docker_environment(command, "TRT_EDGELLM_PHASE_RUN_ID",
                             f"oracle-h1-{policy}-{case}-r{matrix_repeat:03d}")
     _set_docker_environment(command, "EDGELLM_PLUGIN_PATH", plugin_path)

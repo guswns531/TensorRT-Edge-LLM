@@ -2051,10 +2051,19 @@ int main(int argc, char** argv)
             }
             ELLM_CHECK(ipcIngressQuantum > 0, "Phase IPC ingress quantum must be positive");
             bool const emitPhaseMetrics = std::getenv("TRT_EDGELLM_EMIT_PHASE_METRICS") != nullptr;
+            std::string const phaseTelemetryLevel = std::getenv("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL") != nullptr
+                ? std::getenv("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL")
+                : "full";
+            ELLM_CHECK(phaseTelemetryLevel == "full" || phaseTelemetryLevel == "research"
+                    || phaseTelemetryLevel == "counterfactual",
+                "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL must be full, research, or counterfactual");
+            bool const emitPhaseRequestTimeline = emitPhaseMetrics && phaseTelemetryLevel == "full";
+            bool const emitFullUnifiedSnapshots = phaseTelemetryLevel != "research";
+            bool const collectPhaseDispatchMetrics = emitPhaseMetrics && phaseTelemetryLevel == "full";
             std::string const schedulerRunId = std::getenv("TRT_EDGELLM_PHASE_RUN_ID") != nullptr
                 ? std::getenv("TRT_EDGELLM_PHASE_RUN_ID")
                 : "phase-ipc";
-            semanticCoordinator.setMetricsCollectionEnabled(emitPhaseMetrics);
+            semanticCoordinator.setMetricsCollectionEnabled(collectPhaseDispatchMetrics);
             size_t const warmupAdmissionLimit = serverConfig.enableAdaptiveAdmission
                 ? serverConfig.latencyInFlightRequests
                 : serverConfig.maxInFlightRequests;
@@ -2782,12 +2791,18 @@ int main(int argc, char** argv)
             std::deque<rt::PhaseUnifiedEvent> unifiedSchedulerEvents;
             if (emitPhaseMetrics)
             {
-                auto const timelineCallback
-                    = [&](rt::PhaseTimelineEvent const& event) { phaseTimelineEvents.push_back(event); };
-                semanticServer.setTimelineCallback(timelineCallback);
+                if (emitPhaseRequestTimeline)
+                {
+                    auto const timelineCallback
+                        = [&](rt::PhaseTimelineEvent const& event) { phaseTimelineEvents.push_back(event); };
+                    semanticServer.setTimelineCallback(timelineCallback);
+                    if (ipcThreePhase != nullptr)
+                    {
+                        ipcThreePhase->setTimelineCallback(timelineCallback);
+                    }
+                }
                 if (ipcThreePhase != nullptr)
                 {
-                    ipcThreePhase->setTimelineCallback(timelineCallback);
                     ipcThreePhase->setEncoderBatchMetricCallback([&](rt::PhaseVisionEncoderBatchMetric const& metric) {
                         encoderBatchMetrics.push_back(metric);
                     });
@@ -2795,7 +2810,8 @@ int main(int argc, char** argv)
                         formationEpisodes.push_back(episode);
                     });
                     ipcThreePhase->setUnifiedEventCallback(
-                        [&](rt::PhaseUnifiedEvent const& event) { unifiedSchedulerEvents.push_back(event); });
+                        [&](rt::PhaseUnifiedEvent const& event) { unifiedSchedulerEvents.push_back(event); },
+                        emitFullUnifiedSnapshots);
                 }
             }
             bool const asyncRequestAdapter = std::getenv("TRT_EDGELLM_IPC_ASYNC_REQUEST_ADAPTER") != nullptr;
@@ -2820,7 +2836,19 @@ int main(int argc, char** argv)
             size_t outputWriteBatches{};
             size_t outputWriteRecords{};
             size_t outputWriteBytes{};
+            size_t telemetryWriteBytes{};
             double outputSerializationUs{};
+            std::ofstream phaseTelemetryOutput;
+            if (char const* value = std::getenv("TRT_EDGELLM_PHASE_TELEMETRY_PATH"))
+            {
+                std::filesystem::path const path(value);
+                if (path.has_parent_path())
+                {
+                    std::filesystem::create_directories(path.parent_path());
+                }
+                phaseTelemetryOutput.open(path, std::ios::out | std::ios::trunc);
+                ELLM_CHECK(phaseTelemetryOutput.good(), "Failed to open phase telemetry output path");
+            }
             std::unordered_map<int32_t, std::string> decodedTokenTextCache;
             decodedTokenTextCache.reserve(4096U);
             size_t decodedTokenTextCacheHits{};
@@ -2877,23 +2905,41 @@ int main(int argc, char** argv)
                         outputSerializationUs += std::chrono::duration<double, std::micro>(
                             std::chrono::steady_clock::now() - serializationStart)
                                                      .count();
-                        size_t bytes{};
+                        size_t responseBytes{};
+                        size_t telemetryBytes{};
                         for (std::string const& line : readyLines)
                         {
-                            bytes += line.size() + 1U;
+                            bool const telemetry = phaseTelemetryOutput.is_open() && line.rfind("PHASE_", 0U) == 0U
+                                && line.rfind("PHASE_EVENT\t", 0U) != 0U;
+                            (telemetry ? telemetryBytes : responseBytes) += line.size() + 1U;
                         }
-                        std::string payload;
-                        payload.reserve(bytes);
+                        std::string responsePayload;
+                        std::string telemetryPayload;
+                        responsePayload.reserve(responseBytes);
+                        telemetryPayload.reserve(telemetryBytes);
                         for (std::string& line : readyLines)
                         {
+                            bool const telemetry = phaseTelemetryOutput.is_open() && line.rfind("PHASE_", 0U) == 0U
+                                && line.rfind("PHASE_EVENT\t", 0U) != 0U;
+                            std::string& payload = telemetry ? telemetryPayload : responsePayload;
                             payload.append(line);
                             payload.push_back('\n');
                         }
-                        std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-                        std::cout.flush();
+                        if (!telemetryPayload.empty())
+                        {
+                            phaseTelemetryOutput.write(
+                                telemetryPayload.data(), static_cast<std::streamsize>(telemetryPayload.size()));
+                            telemetryWriteBytes += telemetryPayload.size();
+                        }
+                        if (!responsePayload.empty())
+                        {
+                            std::cout.write(
+                                responsePayload.data(), static_cast<std::streamsize>(responsePayload.size()));
+                            std::cout.flush();
+                        }
                         ++outputWriteBatches;
                         outputWriteRecords += readyRecords.size();
-                        outputWriteBytes += payload.size();
+                        outputWriteBytes += responsePayload.size();
                     }
                     if (closed)
                     {
@@ -3233,11 +3279,11 @@ int main(int argc, char** argv)
                 ++ipcPollCalls;
                 auto const serializationStart = std::chrono::steady_clock::now();
                 std::vector<std::string> serializedRecords;
-                if (!emitPhaseMetrics)
+                if (!collectPhaseDispatchMetrics)
                 {
                     emittedMetrics = semanticCoordinator.metrics().size();
                 }
-                while (emitPhaseMetrics && emittedMetrics < semanticCoordinator.metrics().size())
+                while (collectPhaseDispatchMetrics && emittedMetrics < semanticCoordinator.metrics().size())
                 {
                     madeProgress = true;
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
@@ -4000,7 +4046,7 @@ int main(int argc, char** argv)
                     }
                     serializedRecords.push_back("PHASE_SCHEDULER_EVENT\t" + record.dump());
                 }
-                while (emitPhaseMetrics && !phaseTimelineEvents.empty())
+                while (emitPhaseRequestTimeline && !phaseTimelineEvents.empty())
                 {
                     madeProgress = true;
                     rt::PhaseTimelineEvent const event = phaseTimelineEvents.front();
@@ -4164,8 +4210,10 @@ int main(int argc, char** argv)
                 semanticCoordinator.prefillPageTableUploadStats());
             logKVMemoryOps(
                 "decode", semanticCoordinator.decodeKVMemoryStats(), semanticCoordinator.decodePageTableUploadStats());
-            LOG_INFO("Phase IPC policy: ingress_quantum=%zu emit_metrics=%s", ipcIngressQuantum,
-                emitPhaseMetrics ? "yes" : "no");
+            LOG_INFO(
+                "Phase IPC policy: ingress_quantum=%zu emit_metrics=%s collect_dispatch_metrics=%s telemetry_level=%s",
+                ipcIngressQuantum, emitPhaseMetrics ? "yes" : "no", collectPhaseDispatchMetrics ? "yes" : "no",
+                phaseTelemetryLevel.c_str());
             LOG_INFO("Phase IPC response path: native_callback");
             LOG_INFO(
                 "Phase page reservation: mode=%s base=%d guaranteed=%d growth_owners=%zu growth_pending=%zu "
@@ -4252,16 +4300,22 @@ int main(int argc, char** argv)
             }
             outputReady.notify_one();
             outputWriter.join();
+            if (phaseTelemetryOutput.is_open())
+            {
+                phaseTelemetryOutput.flush();
+                phaseTelemetryOutput.close();
+            }
             LOG_INFO("Phase IPC token text cache: entries=%zu hits=%zu misses=%zu", decodedTokenTextCache.size(),
                 decodedTokenTextCacheHits, decodedTokenTextCacheMisses);
             LOG_INFO(
                 "Phase IPC host cost: polls=%zu ingress=%.3f ms adapter_workers=%zu adapter_inputs=%zu "
                 "adapter=%.3f ms "
                 "poll=%.3f ms serialize=%.3f ms output_serialize=%.3f ms output_batches=%zu output_records=%zu "
-                "output_bytes=%zu",
+                "output_bytes=%zu telemetry_bytes=%zu",
                 ipcPollCalls, ipcIngressUs / 1000.0, asyncRequestAdapter ? requestAdapterWorkers : 0U,
                 ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, ipcPollUs / 1000.0, ipcSerializationUs / 1000.0,
-                outputSerializationUs / 1000.0, outputWriteBatches, outputWriteRecords, outputWriteBytes);
+                outputSerializationUs / 1000.0, outputWriteBatches, outputWriteRecords, outputWriteBytes,
+                telemetryWriteBytes);
             auto const prefillGraphStats = semanticCoordinator.prefillGraphCacheStats();
             auto const decodeGraphStats = semanticCoordinator.decodeGraphCacheStats();
             LOG_INFO(

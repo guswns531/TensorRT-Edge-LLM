@@ -144,6 +144,18 @@ TEST(PhaseDispatchWorkerTest, PreservesSelectedDecodeRowsWithoutChangingRequestS
     EXPECT_EQ(batch[2].requestId, 14U);
 }
 
+TEST(PhaseDispatchWorkerTest, CanonicalizesUnassignedRowsByContextBucketAndRequestId)
+{
+    std::vector<rt::PhaseWorkItem> batch{{13, 257}, {11, 129}, {14, 130}, {12, 257}};
+    rt::preservePhaseBatchRowAffinity(batch, {});
+
+    ASSERT_EQ(batch.size(), 4U);
+    EXPECT_EQ(batch[0].requestId, 11U);
+    EXPECT_EQ(batch[1].requestId, 14U);
+    EXPECT_EQ(batch[2].requestId, 12U);
+    EXPECT_EQ(batch[3].requestId, 13U);
+}
+
 TEST(PhaseDispatchWorkerTest, RunsChunkCompletionAndDecodeRequeue)
 {
     rt::PhaseQueueSchedulerConfig config;

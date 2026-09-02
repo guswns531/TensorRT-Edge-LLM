@@ -28,7 +28,6 @@
 #include <limits>
 #include <memory>
 #include <numeric>
-#include <thread>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -41,27 +40,19 @@ namespace
 constexpr uint64_t kTHREE_PHASE_PLAN_NAMESPACE = uint64_t{1U} << 63U;
 constexpr uint64_t kTHREE_PHASE_EXECUTION_NAMESPACE = uint64_t{1U} << 62U;
 
-void waitForDirectionalInjection(PhaseDirectionalInjectionControl const& control, PhaseUnifiedActionDirection direction,
-    uint64_t incumbentDispatchHostNs)
-{
-    if (!control.enabled() || control.direction != direction || control.requestedDelayUs == 0U)
-    {
-        return;
-    }
-    uint64_t const timestampNs = phaseTimelineNowNs();
-    uint64_t const elapsedUs
-        = timestampNs > incumbentDispatchHostNs ? (timestampNs - incumbentDispatchHostNs) / 1000U : 0U;
-    if (elapsedUs < control.requestedDelayUs)
-    {
-        std::this_thread::sleep_for(std::chrono::microseconds(control.requestedDelayUs - elapsedUs));
-    }
-}
-
 uint64_t phaseDispatchHostNs(PhaseInFlightSnapshot const& snapshot, PhaseUnifiedPhase phase) noexcept
 {
     auto const work = std::find_if(snapshot.work.begin(), snapshot.work.end(),
         [phase](PhaseInFlightWorkSnapshot const& candidate) { return candidate.phase == phase; });
     return work != snapshot.work.end() ? work->dispatchHostNs : 0U;
+}
+
+uint64_t remainingDirectionalDelayUs(uint64_t requestedDelayUs, uint64_t incumbentDispatchHostNs) noexcept
+{
+    uint64_t const currentTimestampNs = phaseTimelineNowNs();
+    uint64_t const elapsedUs
+        = currentTimestampNs > incumbentDispatchHostNs ? (currentTimestampNs - incumbentDispatchHostNs) / 1000U : 0U;
+    return requestedDelayUs > elapsedUs ? requestedDelayUs - elapsedUs : 0U;
 }
 
 PhaseUnifiedActionDirection phaseInitialDirection(
@@ -1379,10 +1370,12 @@ void PhaseThreeCoordinator::setActivityTimeline(PhaseActivityTimelineRecorder* t
     mServer.setActivityTimeline(timeline);
 }
 
-void PhaseThreeCoordinator::setUnifiedEventCallback(std::function<void(PhaseUnifiedEvent const&)> unifiedEventCallback)
+void PhaseThreeCoordinator::setUnifiedEventCallback(
+    std::function<void(PhaseUnifiedEvent const&)> unifiedEventCallback, bool detailedDecisionSnapshots)
 {
     ELLM_CHECK(empty(), "Three-phase unified event callback can only change while idle");
     mUnifiedEventCallback = std::move(unifiedEventCallback);
+    mUnifiedDetailedDecisionSnapshots = detailedDecisionSnapshots;
     mPreviousUnifiedInFlight.reset();
     mUnifiedDecisionByPlan.clear();
     mUnifiedAllowedOutstandingByExecution.clear();
@@ -1450,10 +1443,11 @@ void PhaseThreeCoordinator::emitUnifiedEvent(PhaseUnifiedEvent event)
     mUnifiedEventCallback(event);
 }
 
-PhaseInFlightSnapshot PhaseThreeCoordinator::unifiedInFlightSnapshot(uint64_t hostSnapshotNs) const
+PhaseInFlightSnapshot PhaseThreeCoordinator::unifiedInFlightSnapshot(
+    uint64_t hostSnapshotNs, bool includeRequestIds) const
 {
     uint64_t const timestampNs = hostSnapshotNs > 0U ? hostSnapshotNs : phaseTimelineNowNs();
-    PhaseInFlightSnapshot result = mServer.arbitrationSnapshot(true).inFlight;
+    PhaseInFlightSnapshot result = mServer.arbitrationSnapshot(includeRequestIds).inFlight;
     result.hostSnapshotNs = timestampNs;
     for (PhaseInFlightWorkSnapshot& work : result.work)
     {
@@ -1475,10 +1469,13 @@ PhaseInFlightSnapshot PhaseThreeCoordinator::unifiedInFlightSnapshot(uint64_t ho
         encoder.dispatchAgeUs = timestampNs >= mEncoderDispatchHostNs
             ? static_cast<double>(timestampNs - mEncoderDispatchHostNs) / 1000.0
             : 0.0;
-        encoder.requestIds.reserve(mEncoding.size());
-        for (PendingVisionRequest const& request : mEncoding)
+        if (includeRequestIds)
         {
-            encoder.requestIds.push_back(request.requestId);
+            encoder.requestIds.reserve(mEncoding.size());
+            for (PendingVisionRequest const& request : mEncoding)
+            {
+                encoder.requestIds.push_back(request.requestId);
+            }
         }
         encoder.work.encoderRows = static_cast<int32_t>(mEncoding.size());
         result.work.push_back(encoder);
@@ -1507,7 +1504,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.selectedActionId = candidate.candidateId;
     event.cohort = unifiedCandidateWork(candidate);
     event.requestIds = candidate.requestIds;
-    event.inFlight = unifiedInFlightSnapshot();
+    event.inFlight = unifiedInFlightSnapshot(0U, mUnifiedDetailedDecisionSnapshots);
     event.outstandingBefore = event.inFlight.outstanding;
     event.dispatchMode = phaseUnifiedDispatchMode(event.outstandingBefore, event.actionKind);
     event.incumbentPhase = phaseUnifiedDirectionIncumbentPhase(event.requestedDirection);
@@ -1521,27 +1518,31 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     }
     event.plannedOutstanding = plan.allowedOutstanding;
     event.ready.encoderRows = static_cast<int32_t>(mPending.size());
-    IndependentPhaseServerArbitrationSnapshot const server = mServer.arbitrationSnapshot(true);
+    IndependentPhaseServerArbitrationSnapshot const server
+        = mServer.arbitrationSnapshot(mUnifiedDetailedDecisionSnapshots);
     event.ready.prefillRows = static_cast<int32_t>(server.prefillQueued);
     event.ready.prefillTokens = server.prefillCandidateTokens;
     event.ready.decodeRows = static_cast<int32_t>(server.decodeQueued);
     event.ready.decodeContextTokens = server.decodeCandidateTokens;
-    event.readyEncoderRequestIds.reserve(mPending.size());
-    for (PendingVisionRequest const& request : mPending)
+    if (mUnifiedDetailedDecisionSnapshots)
     {
-        event.readyEncoderRequestIds.push_back(request.requestId);
+        event.readyEncoderRequestIds.reserve(mPending.size());
+        for (PendingVisionRequest const& request : mPending)
+        {
+            event.readyEncoderRequestIds.push_back(request.requestId);
+        }
+        event.readyPrefillRequestIds = server.prefillRequestIds;
+        event.readyPrefillTokenCounts = server.prefillTokenCounts;
+        event.readyPrefillRequestIds.reserve(event.readyPrefillRequestIds.size() + mReadyPrefill.size());
+        event.readyPrefillTokenCounts.reserve(event.readyPrefillTokenCounts.size() + mReadyPrefill.size());
+        for (ReadyPrefillRequest const& request : mReadyPrefill)
+        {
+            event.readyPrefillRequestIds.push_back(request.requestId);
+            event.readyPrefillTokenCounts.push_back(static_cast<int32_t>(request.promptTokens.size()));
+        }
+        event.readyDecodeRequestIds = server.decodeRequestIds;
+        event.readyDecodeContextLengths = server.decodeContextLengths;
     }
-    event.readyPrefillRequestIds = server.prefillRequestIds;
-    event.readyPrefillTokenCounts = server.prefillTokenCounts;
-    event.readyPrefillRequestIds.reserve(event.readyPrefillRequestIds.size() + mReadyPrefill.size());
-    event.readyPrefillTokenCounts.reserve(event.readyPrefillTokenCounts.size() + mReadyPrefill.size());
-    for (ReadyPrefillRequest const& request : mReadyPrefill)
-    {
-        event.readyPrefillRequestIds.push_back(request.requestId);
-        event.readyPrefillTokenCounts.push_back(static_cast<int32_t>(request.promptTokens.size()));
-    }
-    event.readyDecodeRequestIds = server.decodeRequestIds;
-    event.readyDecodeContextLengths = server.decodeContextLengths;
     event.pagePoolAllocatedBundles = server.pagePoolAllocatedBundles;
     event.pageReservationGuaranteedBundles = server.pageReservationGuaranteedBundles;
     event.visionPayloadBytes = server.visionPayloadBytes + mReadyPrefillBytes + mEstimatedEncodedBytes;
@@ -1571,14 +1572,14 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         snapshot.contextualMinimumSlackUs = source.contextualCompletionMinimumSlackUs;
         event.candidates.push_back(std::move(snapshot));
     };
-    if (candidateFrontier != nullptr)
+    if (mUnifiedDetailedDecisionSnapshots && candidateFrontier != nullptr)
     {
         for (PhaseGlobalActionCandidate const& frontierCandidate : *candidateFrontier)
         {
             appendCandidate(frontierCandidate);
         }
     }
-    else
+    else if (mUnifiedDetailedDecisionSnapshots)
     {
         appendCandidate(candidate);
     }
@@ -3439,9 +3440,13 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PhaseUnifiedPhase const incumbentPhase = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
             ? PhaseUnifiedPhase::kPrefill
             : PhaseUnifiedPhase::kDecode;
-        uint64_t const incumbentDispatchHostNs
-            = phaseDispatchHostNs(mServer.arbitrationSnapshot(true).inFlight, incumbentPhase);
-        waitForDirectionalInjection(mConfig.directionalInjection, injectionDirection, incumbentDispatchHostNs);
+        if (mConfig.directionalInjection.enabled() && mConfig.directionalInjection.direction == injectionDirection)
+        {
+            mDirectionalCudaGate.enqueue(mVision.stream(), mServer.phaseStartEvent(incumbentPhase),
+                mConfig.directionalInjection.requestedDelayUs > static_cast<uint64_t>(phaseElapsedMs * 1000.0)
+                    ? mConfig.directionalInjection.requestedDelayUs - static_cast<uint64_t>(phaseElapsedMs * 1000.0)
+                    : 0U);
+        }
         bool const started = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
         if (!started)
         {
@@ -3537,9 +3542,13 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 = mServer.dispatchGlobalAction(std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
             if (phaseStarted)
             {
-                uint64_t const incumbentDispatchHostNs
-                    = phaseDispatchHostNs(mServer.arbitrationSnapshot(true).inFlight, phaseKind);
-                waitForDirectionalInjection(mConfig.directionalInjection, phaseFirstDirection, incumbentDispatchHostNs);
+                if (mConfig.directionalInjection.enabled()
+                    && mConfig.directionalInjection.direction == phaseFirstDirection)
+                {
+                    mDirectionalCudaGate.enqueue(mVision.stream(), mServer.phaseStartEvent(phaseKind),
+                        remainingDirectionalDelayUs(mConfig.directionalInjection.requestedDelayUs,
+                            phaseDispatchHostNs(mServer.arbitrationSnapshot(true).inFlight, phaseKind)));
+                }
                 encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
             }
         }
@@ -3548,8 +3557,13 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
             if (encoderStarted)
             {
-                waitForDirectionalInjection(
-                    mConfig.directionalInjection, encoderFirstDirection, mEncoderDispatchHostNs);
+                if (mConfig.directionalInjection.enabled()
+                    && mConfig.directionalInjection.direction == encoderFirstDirection)
+                {
+                    mDirectionalCudaGate.enqueue(mServer.phaseStream(phaseKind), mVision.startEvent(),
+                        remainingDirectionalDelayUs(
+                            mConfig.directionalInjection.requestedDelayUs, mEncoderDispatchHostNs));
+                }
                 phaseStarted = mServer.dispatchGlobalAction(
                     std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
             }

@@ -1,5 +1,9 @@
 # Completion/residual scheduling 결정 검증 계획
 
+> 실행 상태: R0--R6 완료. 사전 정의 gate에 따라 Branch C(Current production 유지,
+> completion/residual measurement-only)를 선택했다. 상세 결과는
+> `notes/219-completion-residual-r0-r6-results-20260902.md`에 기록했다.
+
 날짜: 2026-09-02  
 브랜치: `codex/v010-phase-forward-port`  
 대상: `nvidia/Cosmos-Reason2-2B`, RTX 3080 10 GiB, TensorRT 11.0/CUDA 13.3

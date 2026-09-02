@@ -163,6 +163,8 @@ public:
     std::optional<PhaseVisionPrefixPlan> makePrefixPlan(LLMGenerationRequest const& request);
     size_t maxInputTokens() const noexcept;
     CUcontext cudaContext() const noexcept;
+    cudaStream_t stream() const noexcept;
+    cudaEvent_t startEvent() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;
     //! Reclaim idle slabs above the configured high-water mark, or every idle slab under broker pressure.
     void reclaimIdleStorage(bool force = false);
@@ -189,6 +191,7 @@ private:
     cudaStream_t mCopyStream{};
     CUcontext mCudaContext{};
     cudaEvent_t mEncoderDoneEvent{};
+    cudaEvent_t mEncoderStartEvent{};
     std::unordered_map<uint64_t, std::unique_ptr<PhaseVisionPayload>> mRequests;
     std::optional<LLMGenerationRequest> mBatchedRequest;
     std::vector<std::shared_ptr<PhaseVisionBatchStorage>> mStoragePool;

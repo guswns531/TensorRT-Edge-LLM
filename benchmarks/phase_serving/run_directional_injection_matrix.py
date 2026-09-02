@@ -137,7 +137,7 @@ def cleanup_case_containers(case_name: str, repeats: int) -> None:
 
 def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
              target: float) -> list[Path]:
-    """Execute one requested direction/offset cell and return every repeat log."""
+    """Execute one requested cell and return its side-channel event streams."""
     incumbent, newcomer, pair = PHASE_BY_DIRECTION[direction]
     references = {
         "encoder": args.encoder_us,
@@ -146,15 +146,16 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
     }
     case_name = f"{direction}-o{round(target * 100):02d}"
     case_dir = args.output_dir / case_name
-    logs = sorted(case_dir.glob("run-*/gateway.log"))
+    logs = sorted(case_dir.glob("activity/run-*-events.jsonl"))
     aggregates = sorted(case_dir.glob("run-*/client/aggregate.json"))
     complete_runs = {
-        path.parents[1].name
+        f"run-{int(path.parents[1].name.split('-')[-1]):03d}"
         for path in aggregates if path.stat().st_size > 0
     }
     complete_logs = [
         path for path in logs
-        if path.parent.name in complete_runs and path.stat().st_size > 0
+        if path.stem.removesuffix("-events") in complete_runs
+        and path.stat().st_size > 0
     ]
     if args.skip_existing and len(complete_logs) == args.repeats:
         return complete_logs
@@ -253,8 +254,12 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
         1.96,
         "TRT_EDGELLM_EMIT_PHASE_METRICS":
         1,
+        "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL":
+        "counterfactual",
         "TRT_EDGELLM_PHASE_ACTIVITY_PREFIX":
         activity_prefix,
+        "TRT_EDGELLM_PHASE_TELEMETRY_PATH":
+        activity_prefix + "-events.jsonl",
         "TRT_EDGELLM_IPC_ASYNC_REQUEST_ADAPTER":
         1,
         "TRT_EDGELLM_IPC_REQUEST_ADAPTER_WORKERS":
@@ -333,12 +338,13 @@ def run_case(args: argparse.Namespace, traces: dict[str, Path], direction: str,
         subprocess.run(command, check=True)
     finally:
         cleanup_case_containers(case_name, args.repeats)
-    logs = sorted(case_dir.glob("run-*/gateway.log"))
+    logs = sorted(case_dir.glob("activity/run-*-events.jsonl"))
     if not logs:
-        raise RuntimeError(f"no gateway log produced for {case_name}")
+        raise RuntimeError(
+            f"no telemetry event stream produced for {case_name}")
     if len(logs) != args.repeats:
         raise RuntimeError(
-            f"expected {args.repeats} gateway logs for {case_name}, found {len(logs)}"
+            f"expected {args.repeats} event streams for {case_name}, found {len(logs)}"
         )
     return logs
 

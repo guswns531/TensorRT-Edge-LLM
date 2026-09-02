@@ -208,6 +208,7 @@ PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Toke
     , mStream(stream)
     , mCopyStream(copyStream == nullptr ? stream : copyStream)
 {
+    CUDA_CHECK(cudaEventCreate(&mEncoderStartEvent));
     ELLM_CHECK(mStream != nullptr, "Phase vision adapter requires an explicit CUDA stream");
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mStream, &mCudaContext));
     ELLM_CHECK(mCudaContext != nullptr, "Phase vision stream has no CUDA context");
@@ -219,6 +220,7 @@ PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Toke
 
 PhaseVisionAdapter::~PhaseVisionAdapter() noexcept
 {
+    static_cast<void>(cudaEventDestroy(mEncoderStartEvent));
     if (mEncoderDoneEvent != nullptr)
     {
         static_cast<void>(cudaEventDestroy(mEncoderDoneEvent));
@@ -462,6 +464,7 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
             = mRunner.bindExternalOutputStorage(prepared->storage->outputEmbedding, externalDeepstack);
         bool inferenceSucceeded{};
         uint64_t const correlationId = prepared->submissions.front().requestId;
+        CUDA_CHECK(cudaEventRecord(mEncoderStartEvent, mStream));
         recordActivity(PhaseActivityKind::kEncoder, "encoder_engine", correlationId, mStream,
             [&] { inferenceSucceeded = mRunner.infer(mStream); });
         ELLM_CHECK(inferenceSucceeded, "Phase vision inference failed");
@@ -689,6 +692,16 @@ size_t PhaseVisionAdapter::maxInputTokens() const noexcept
 CUcontext PhaseVisionAdapter::cudaContext() const noexcept
 {
     return mCudaContext;
+}
+
+cudaStream_t PhaseVisionAdapter::stream() const noexcept
+{
+    return mStream;
+}
+
+cudaEvent_t PhaseVisionAdapter::startEvent() const noexcept
+{
+    return mEncoderStartEvent;
 }
 
 PhaseVisionMemoryStats const& PhaseVisionAdapter::memoryStats() const noexcept

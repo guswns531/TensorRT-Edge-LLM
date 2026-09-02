@@ -122,6 +122,8 @@ public:
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
     CUcontext cudaContext() const noexcept;
+    cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
+    cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
     PhaseKVMemoryStats const& prefillKVMemoryStats() const noexcept;
     PhaseKVMemoryStats const& decodeKVMemoryStats() const noexcept;
     KVPageTableUploadStats const& prefillPageTableUploadStats() const noexcept;

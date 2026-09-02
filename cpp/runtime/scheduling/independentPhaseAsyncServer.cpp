@@ -755,6 +755,16 @@ void IndependentPhaseAsyncServer::setDirectionalInjectionControl(PhaseDirectiona
     mCoordinator.setDirectionalInjectionControl(control);
 }
 
+cudaStream_t IndependentPhaseAsyncServer::phaseStream(PhaseUnifiedPhase phase) const noexcept
+{
+    return mCoordinator.phaseStream(phase);
+}
+
+cudaEvent_t IndependentPhaseAsyncServer::phaseStartEvent(PhaseUnifiedPhase phase) const noexcept
+{
+    return mCoordinator.phaseStartEvent(phase);
+}
+
 bool IndependentPhaseAsyncServer::poll()
 {
     bool progressed = pollCompletions();
