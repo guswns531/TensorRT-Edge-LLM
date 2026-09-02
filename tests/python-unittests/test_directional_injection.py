@@ -246,6 +246,32 @@ def test_validates_incremental_identity_across_event_chain() -> None:
     assert summary["executions"] == 1
 
 
+def test_accepts_matching_compact_decision_when_enabled() -> None:
+    events = incremental_events()
+    events[0]["candidates"] = []
+
+    errors, summary = _validate(events,
+                                require_fidelity=True,
+                                require_gpu_intervals=True,
+                                allow_compact_decisions=True)
+
+    assert not errors
+    assert summary["decisions"] == 1
+
+
+def test_rejects_mismatched_compact_decision_identity() -> None:
+    events = incremental_events()
+    events[0]["candidates"] = []
+    events[0]["selected_action_id"] = 11
+
+    errors, _ = _validate(events,
+                          require_fidelity=True,
+                          require_gpu_intervals=True,
+                          allow_compact_decisions=True)
+
+    assert any("compact decision selected action" in error for error in errors)
+
+
 def test_rejects_incremental_identity_change_and_triple_mask() -> None:
     events = incremental_events()
     events[-1]["incremental_action_id"] = 100

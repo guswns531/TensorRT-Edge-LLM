@@ -8,6 +8,8 @@
 
 선행 문서: `notes/219-completion-residual-r0-r6-results-20260902.md`
 
+후속 검증: `notes/221-process-local-calibration-and-saturation-r8-results-20260902.md`
+
 ## 1. Executive summary
 
 R0--R6의 핵심 blocker는 scheduler가 선택한 residual offset과 GPU에서 실제로

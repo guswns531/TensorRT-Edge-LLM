@@ -162,6 +162,7 @@ def _validate(
     require_fidelity: bool,
     require_gpu_intervals: bool,
     require_residual_contract: bool = False,
+    allow_compact_decisions: bool = False,
     activity_intervals: list[Path] | None = None
 ) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
@@ -297,9 +298,14 @@ def _validate(
             }
             selected = candidates_by_id.get(event.get("selected_action_id"))
             if selected is None:
-                errors.append(
-                    f"{event['_source']}: selected action is absent from candidate frontier"
-                )
+                if not allow_compact_decisions or event.get("candidates"):
+                    errors.append(
+                        f"{event['_source']}: selected action is absent from candidate frontier"
+                    )
+                elif event.get("selected_action_id") != event.get("action_id"):
+                    errors.append(
+                        f"{event['_source']}: compact decision selected action does not match its action identity"
+                    )
             elif selected.get("request_ids") != event.get("request_ids"):
                 errors.append(
                     f"{event['_source']}: selected candidate request lineage does not match decision"
@@ -496,7 +502,8 @@ def _validate(
     if activity_intervals:
         activity_dispatches = 0
         dispatch_names = {
-            "encoder_engine", "prefill_dispatch", "decode_dispatch"
+            "encoder_engine", "prefill_dispatch", "decode_dispatch",
+            "prefill_residual_dispatch", "decode_residual_dispatch"
         }
         for path in activity_intervals:
             with path.open(newline="", encoding="utf-8") as source:
@@ -532,6 +539,11 @@ def main() -> int:
     parser.add_argument("--require-action-fidelity", action="store_true")
     parser.add_argument("--require-gpu-intervals", action="store_true")
     parser.add_argument("--require-residual-contract", action="store_true")
+    parser.add_argument(
+        "--allow-compact-decisions",
+        action="store_true",
+        help=
+        "accept research telemetry that omits the detailed candidate frontier")
     parser.add_argument("--activity-intervals", type=Path, nargs="*")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -543,6 +555,7 @@ def main() -> int:
         errors, summary = _validate(events, args.require_action_fidelity,
                                     args.require_gpu_intervals,
                                     args.require_residual_contract,
+                                    args.allow_compact_decisions,
                                     args.activity_intervals)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

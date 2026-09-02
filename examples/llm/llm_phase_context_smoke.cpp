@@ -3146,6 +3146,62 @@ int main(int argc, char** argv)
                                 {"opportunity_count", cost.opportunityCount}, {"required", cost.required},
                                 {"robust_compression", cost.diagnostic.robustCompression}});
                         }
+                        size_t contextualRequiredDirections{};
+                        size_t contextualReadyDirections{};
+                        auto const contextualDirectionCalibration
+                            = [&](rt::PhaseContextualPairDirection direction, size_t minimumObservations) {
+                                  rt::PhaseContextualPdTelemetry const& telemetry
+                                      = runtimeCostTracker->contextualDirectionTelemetry(direction);
+                                  bool const required = telemetry.predictions > 0U || telemetry.observations > 0U;
+                                  bool const ready = required && telemetry.observations >= minimumObservations;
+                                  contextualRequiredDirections += required ? 1U : 0U;
+                                  contextualReadyDirections += ready ? 1U : 0U;
+                                  return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
+                                      {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
+                                      {"minimum_observations", minimumObservations}, {"required", required},
+                                      {"ready", ready}};
+                              };
+                        auto const contextualFamilyCalibration = [&](rt::PhaseContextualPairKind kind,
+                                                                     rt::PhaseContextualPairDirection first,
+                                                                     rt::PhaseContextualPairDirection second) {
+                            rt::PhaseContextualPdModelConfig const& config
+                                = runtimeCostTracker->contextualPairConfig(kind);
+                            nlohmann::json directions = nlohmann::json::array();
+                            size_t const requiredBefore = contextualRequiredDirections;
+                            size_t const readyBefore = contextualReadyDirections;
+                            if (config.mode != rt::PhaseContextualPdMode::kDisabled)
+                            {
+                                directions.push_back(contextualDirectionCalibration(first, config.minimumObservations));
+                                directions.push_back(
+                                    contextualDirectionCalibration(second, config.minimumObservations));
+                            }
+                            size_t const requiredDirections = contextualRequiredDirections - requiredBefore;
+                            size_t const readyDirections = contextualReadyDirections - readyBefore;
+                            return nlohmann::json{{"enabled", config.mode != rt::PhaseContextualPdMode::kDisabled},
+                                {"minimum_observations", config.minimumObservations},
+                                {"required_directions", requiredDirections}, {"ready_directions", readyDirections},
+                                {"converged", requiredDirections > 0U && readyDirections == requiredDirections},
+                                {"directions", std::move(directions)}};
+                        };
+                        nlohmann::json contextualCalibration
+                            = {{"prefill_decode",
+                                   contextualFamilyCalibration(rt::PhaseContextualPairKind::kPrefillDecode,
+                                       rt::PhaseContextualPairDirection::kPrefillToDecode,
+                                       rt::PhaseContextualPairDirection::kDecodeToPrefill)},
+                                {"encoder_prefill",
+                                    contextualFamilyCalibration(rt::PhaseContextualPairKind::kEncoderPrefill,
+                                        rt::PhaseContextualPairDirection::kEncoderToPrefill,
+                                        rt::PhaseContextualPairDirection::kPrefillToEncoder)},
+                                {"encoder_decode",
+                                    contextualFamilyCalibration(rt::PhaseContextualPairKind::kEncoderDecode,
+                                        rt::PhaseContextualPairDirection::kEncoderToDecode,
+                                        rt::PhaseContextualPairDirection::kDecodeToEncoder)}};
+                        bool const exactCostCalibrationConverged
+                            = requiredCostKeys > 0U && calibratedCostKeys == requiredCostKeys;
+                        bool const contextualPolicyCalibrationConverged = contextualRequiredDirections > 0U
+                            && contextualReadyDirections == contextualRequiredDirections;
+                        bool const calibrationConverged
+                            = exactCostCalibrationConverged || contextualPolicyCalibrationConverged;
                         bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
                         if (changesCalibration)
                         {
@@ -3191,8 +3247,12 @@ int main(int argc, char** argv)
                             {"calibration_cost_keys", std::move(calibrationCostKeys)},
                             {"calibrated_cost_keys", calibratedCostKeys}, {"required_cost_keys", requiredCostKeys},
                             {"calibration_target_keys", calibrationCosts.size()},
-                            {"calibration_converged",
-                                requiredCostKeys > 0U && calibratedCostKeys == requiredCostKeys}});
+                            {"exact_cost_calibration_converged", exactCostCalibrationConverged},
+                            {"contextual_policy_calibration", std::move(contextualCalibration)},
+                            {"contextual_required_directions", contextualRequiredDirections},
+                            {"contextual_ready_directions", contextualReadyDirections},
+                            {"contextual_policy_calibration_converged", contextualPolicyCalibrationConverged},
+                            {"calibration_converged", calibrationConverged}});
                         ++ingestedLines;
                         continue;
                     }
@@ -3297,6 +3357,11 @@ int main(int argc, char** argv)
                         = runtimeCostTracker->contextualPairTelemetry(rt::PhaseContextualPairKind::kEncoderPrefill);
                     rt::PhaseContextualPdTelemetry const contextualEdCalibration
                         = runtimeCostTracker->contextualPairTelemetry(rt::PhaseContextualPairKind::kEncoderDecode);
+                    rt::PhaseVisionMemoryStats const visionMemory
+                        = ipcVisionAdapter != nullptr ? ipcVisionAdapter->memoryStats() : rt::PhaseVisionMemoryStats{};
+                    char const* visionCopyPath = visionMemory.deviceCopyOperations > 0U ? "explicit_d2d"
+                        : visionMemory.directOutputBatches > 0U                         ? "direct_output"
+                                                                                        : "not_issued";
                     auto const directionObservations = [&](rt::PhaseContextualPairDirection direction) {
                         return runtimeCostTracker->contextualDirectionTelemetry(direction).observations;
                     };
@@ -3384,6 +3449,11 @@ int main(int argc, char** argv)
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
                         {"decode_completion_ms", metrics.decodeCompletionMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},
+                        {"vision_copy_path", visionCopyPath},
+                        {"vision_direct_output_batches", visionMemory.directOutputBatches},
+                        {"vision_direct_output_bytes", visionMemory.directOutputBytes},
+                        {"vision_d2d_operations", visionMemory.deviceCopyOperations},
+                        {"vision_d2d_bytes", visionMemory.deviceCopyBytes},
                         {"memory_drain_preference", rt::phaseDrainPreferenceName(metrics.drainPreference)},
                         {"memory_drain_preference_applied", metrics.drainPreferenceApplied},
                         {"global_decision_evaluated", metrics.globalDecisionEvaluated},

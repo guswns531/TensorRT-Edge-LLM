@@ -1502,7 +1502,11 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.cohort = unifiedCandidateWork(candidate);
     event.requestIds = candidate.requestIds;
     event.inFlight = unifiedInFlightSnapshot(0U, mUnifiedDetailedDecisionSnapshots);
-    event.outstandingBefore = event.inFlight.outstanding;
+    // The dispatch plan is the mechanism authority for this transition. A
+    // residual P/D augmentation may be recorded after enqueue has returned
+    // but before the server's next arbitration snapshot exposes the incumbent
+    // context, so a fresh observational snapshot can transiently be empty.
+    event.outstandingBefore = plan.incrementalAction.key.outstandingBefore;
     event.dispatchMode = phaseUnifiedDispatchMode(event.outstandingBefore, event.actionKind);
     event.incumbentPhase = phaseUnifiedDirectionIncumbentPhase(event.requestedDirection);
     event.newcomerPhase = phaseUnifiedDirectionNewcomerPhase(event.requestedDirection);
@@ -1621,6 +1625,19 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
         {
             PhaseExecutionSet const incumbentPhase = phaseExecutionSetForUnifiedPhase(incumbent.phase);
             if (phaseExecutionSetContains(decision.plannedOutstanding, incumbentPhase))
+            {
+                allowOutstanding(incumbent.executionId, decision.plannedOutstanding);
+            }
+        }
+        // Compact telemetry deliberately omits detailed in-flight snapshots.
+        // Once the newcomer is observable, extend every retained incumbent
+        // that belongs to the transition's authoritative before-set. This is
+        // the same residual lease, not an unplanned overlap.
+        for (PhaseInFlightWorkSnapshot const& incumbent : previous.work)
+        {
+            PhaseExecutionSet const incumbentPhase = phaseExecutionSetForUnifiedPhase(incumbent.phase);
+            if (phaseExecutionSetContains(decision.outstandingBefore, incumbentPhase)
+                && phaseExecutionSetContains(decision.plannedOutstanding, incumbentPhase))
             {
                 allowOutstanding(incumbent.executionId, decision.plannedOutstanding);
             }
