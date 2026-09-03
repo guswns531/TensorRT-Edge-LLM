@@ -63,10 +63,23 @@ PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig c
             && mConfig.completionCalibration.authorityCoverageTolerance >= 0.0
             && mConfig.completionCalibration.authorityCoverageTolerance < 1.0,
         "Completion authority coverage tolerance must be finite and in [0, 1)");
+    ELLM_CHECK(mConfig.completionCalibration.authorityMinimumObservations > 0U,
+        "Completion authority minimum observations must be positive");
+    ELLM_CHECK(mConfig.completionCalibration.authorityMinimumObservations <= mConfig.completionCalibration.windowSize,
+        "Completion authority evidence window must cover the minimum observations");
+    ELLM_CHECK(std::isfinite(mConfig.completionCalibration.authorityDemotionCoverageTolerance)
+            && mConfig.completionCalibration.authorityDemotionCoverageTolerance
+                >= mConfig.completionCalibration.authorityCoverageTolerance
+            && mConfig.completionCalibration.authorityDemotionCoverageTolerance < 1.0,
+        "Completion authority demotion tolerance must cover promotion tolerance and be in [0, 1)");
     ELLM_CHECK(std::isfinite(mConfig.completionCalibration.authorityMaximumFalseSafeRate)
             && mConfig.completionCalibration.authorityMaximumFalseSafeRate >= 0.0
             && mConfig.completionCalibration.authorityMaximumFalseSafeRate <= 1.0,
         "Completion authority false-safe rate must be finite and in [0, 1]");
+    ELLM_CHECK(std::isfinite(mConfig.completionCalibration.authorityBlendWeight)
+            && mConfig.completionCalibration.authorityBlendWeight >= 0.0
+            && mConfig.completionCalibration.authorityBlendWeight <= 1.0,
+        "Completion authority blend weight must be finite and in [0, 1]");
 }
 
 void PhaseRuntimeCostTracker::observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation)
@@ -467,7 +480,7 @@ PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::predictContextualComp
 
 bool PhaseRuntimeCostTracker::observeContextualCompletionDirection(PhaseContextualPairDirection direction,
     PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
-    double incumbentCompletionUs, double newcomerCompletionUs, double minimumSlackUs)
+    double incumbentCompletionUs, double newcomerCompletionUs, double minimumSlackUs, double scalarDecisionMakespanUs)
 {
     // Keep hierarchical calibration on the exact admissibility boundary used
     // by both underlying completion models. Counting a rejected label in the
@@ -526,6 +539,8 @@ bool PhaseRuntimeCostTracker::observeContextualCompletionDirection(PhaseContextu
     observeHierarchicalCompletionTelemetry(telemetry, prediction,
         contextualPairConfig(phaseContextualPairKind(direction)).confidenceBeta, incumbentCompletionUs,
         newcomerCompletionUs, minimumSlackUs);
+    observeContextualCompletionAuthorityEvidence(direction, prediction, policyFeatures, incumbentReferenceUs,
+        newcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs, minimumSlackUs, scalarDecisionMakespanUs);
     PhaseContextualCompletionEstimate rawPrediction = prediction;
     rawPrediction.incumbentUncertaintyUs /= prediction.uncertaintyScale;
     rawPrediction.newcomerUncertaintyUs /= prediction.uncertaintyScale;
@@ -585,28 +600,153 @@ bool PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidenceReady(
     {
         return false;
     }
-    PhaseContextualCompletionTelemetry const& telemetry
-        = mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)];
-    size_t const minimum = mConfig.completionCalibration.minimumObservations;
-    if (telemetry.readyCalibrationObservations < minimum || telemetry.conformalCalibrationObservations < minimum)
+    return contextualCompletionAuthorityEvidence(direction).validated;
+}
+
+bool PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidenceSatisfies(
+    PhaseContextualCompletionAuthorityEvidence const& evidence, double coverageTolerance) const noexcept
+{
+    size_t const minimum = mConfig.completionCalibration.authorityMinimumObservations;
+    if (evidence.observations < minimum)
     {
         return false;
     }
-    double const incumbentCoverage = static_cast<double>(telemetry.conformalIncumbentIntervalCovered)
-        / static_cast<double>(telemetry.conformalCalibrationObservations);
-    double const newcomerCoverage = static_cast<double>(telemetry.conformalNewcomerIntervalCovered)
-        / static_cast<double>(telemetry.conformalCalibrationObservations);
-    double const minimumCoverage = std::max(
-        0.0, mConfig.completionCalibration.targetCoverage - mConfig.completionCalibration.authorityCoverageTolerance);
+    double const incumbentCoverage
+        = static_cast<double>(evidence.incumbentIntervalCovered) / static_cast<double>(evidence.observations);
+    double const newcomerCoverage
+        = static_cast<double>(evidence.newcomerIntervalCovered) / static_cast<double>(evidence.observations);
+    double const minimumCoverage = std::max(0.0, mConfig.completionCalibration.targetCoverage - coverageTolerance);
     if (incumbentCoverage < minimumCoverage || newcomerCoverage < minimumCoverage)
     {
         return false;
     }
-    double const falseSafeRate = telemetry.conformalPredictedSafeObservations > 0U
-        ? static_cast<double>(telemetry.conformalFalseSafeObservations)
-            / static_cast<double>(telemetry.conformalPredictedSafeObservations)
+    double const falseSafeRate = evidence.predictedSafeObservations > 0U
+        ? static_cast<double>(evidence.falseSafeObservations) / static_cast<double>(evidence.predictedSafeObservations)
         : 0.0;
     return falseSafeRate <= mConfig.completionCalibration.authorityMaximumFalseSafeRate;
+}
+
+PhaseContextualCompletionAuthorityEvidence PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidence(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    return mCompletionAuthorityEvidence[completionDirectionIndex(direction)].aggregate;
+}
+
+void PhaseRuntimeCostTracker::observeContextualCompletionAuthorityEvidence(PhaseContextualPairDirection direction,
+    PhaseContextualCompletionEstimate const& prediction, PhaseContextualPdFeatures const& features,
+    double incumbentReferenceUs, double newcomerReferenceUs, double incumbentCompletionUs, double newcomerCompletionUs,
+    double minimumSlackUs, double scalarDecisionMakespanUs) noexcept
+{
+    if (!prediction.uncertaintyCalibrated)
+    {
+        return;
+    }
+    double const beta = contextualPairConfig(phaseContextualPairKind(direction)).confidenceBeta;
+    double const incumbentRobustUs = prediction.incumbentMeanUs + beta * prediction.incumbentUncertaintyUs;
+    double const newcomerRobustUs = prediction.newcomerMeanUs + beta * prediction.newcomerUncertaintyUs;
+    double const actualMakespanUs = std::max(incumbentCompletionUs, newcomerCompletionUs);
+    double const completionMakespanUs = phaseContextualCompletionDecisionMakespanUs(prediction, features);
+    double const scalarMakespanUs = std::isfinite(scalarDecisionMakespanUs)
+        ? std::max(0.0, scalarDecisionMakespanUs)
+        : std::max(incumbentReferenceUs, newcomerReferenceUs);
+    CompletionAuthorityEvidenceSample const sample{
+        std::abs(incumbentCompletionUs - prediction.incumbentMeanUs) <= beta * prediction.incumbentUncertaintyUs,
+        std::abs(newcomerCompletionUs - prediction.newcomerMeanUs) <= beta * prediction.newcomerUncertaintyUs,
+        std::isfinite(minimumSlackUs) && std::max(incumbentRobustUs, newcomerRobustUs) <= minimumSlackUs,
+        std::isfinite(minimumSlackUs) && std::max(incumbentRobustUs, newcomerRobustUs) <= minimumSlackUs
+            && std::max(incumbentCompletionUs, newcomerCompletionUs) > minimumSlackUs,
+        std::abs(actualMakespanUs - completionMakespanUs), std::abs(actualMakespanUs - scalarMakespanUs),
+        std::abs(incumbentCompletionUs - prediction.incumbentMeanUs),
+        std::abs(incumbentCompletionUs - incumbentReferenceUs),
+        std::abs(newcomerCompletionUs - prediction.newcomerMeanUs),
+        std::abs(newcomerCompletionUs - newcomerReferenceUs)};
+    CompletionAuthorityEvidenceWindow& window = mCompletionAuthorityEvidence[completionDirectionIndex(direction)];
+    auto add
+        = [](PhaseContextualCompletionAuthorityEvidence& aggregate, CompletionAuthorityEvidenceSample const& value) {
+              ++aggregate.observations;
+              aggregate.incumbentIntervalCovered += value.incumbentCovered ? 1U : 0U;
+              aggregate.newcomerIntervalCovered += value.newcomerCovered ? 1U : 0U;
+              aggregate.predictedSafeObservations += value.predictedSafe ? 1U : 0U;
+              aggregate.falseSafeObservations += value.falseSafe ? 1U : 0U;
+              aggregate.completionAbsoluteErrorUs += value.completionAbsoluteErrorUs;
+              aggregate.referenceAbsoluteErrorUs += value.referenceAbsoluteErrorUs;
+              aggregate.incumbentCompletionAbsoluteErrorUs += value.incumbentCompletionAbsoluteErrorUs;
+              aggregate.incumbentReferenceAbsoluteErrorUs += value.incumbentReferenceAbsoluteErrorUs;
+              aggregate.newcomerCompletionAbsoluteErrorUs += value.newcomerCompletionAbsoluteErrorUs;
+              aggregate.newcomerReferenceAbsoluteErrorUs += value.newcomerReferenceAbsoluteErrorUs;
+          };
+    auto remove
+        = [](PhaseContextualCompletionAuthorityEvidence& aggregate, CompletionAuthorityEvidenceSample const& value) {
+              --aggregate.observations;
+              aggregate.incumbentIntervalCovered -= value.incumbentCovered ? 1U : 0U;
+              aggregate.newcomerIntervalCovered -= value.newcomerCovered ? 1U : 0U;
+              aggregate.predictedSafeObservations -= value.predictedSafe ? 1U : 0U;
+              aggregate.falseSafeObservations -= value.falseSafe ? 1U : 0U;
+              aggregate.completionAbsoluteErrorUs -= value.completionAbsoluteErrorUs;
+              aggregate.referenceAbsoluteErrorUs -= value.referenceAbsoluteErrorUs;
+              aggregate.incumbentCompletionAbsoluteErrorUs -= value.incumbentCompletionAbsoluteErrorUs;
+              aggregate.incumbentReferenceAbsoluteErrorUs -= value.incumbentReferenceAbsoluteErrorUs;
+              aggregate.newcomerCompletionAbsoluteErrorUs -= value.newcomerCompletionAbsoluteErrorUs;
+              aggregate.newcomerReferenceAbsoluteErrorUs -= value.newcomerReferenceAbsoluteErrorUs;
+          };
+    if (window.samples.size() == mConfig.completionCalibration.windowSize)
+    {
+        remove(window.aggregate, window.samples.front());
+        window.samples.pop_front();
+    }
+    window.samples.push_back(sample);
+    add(window.aggregate, sample);
+    bool const promotionReady = contextualCompletionAuthorityEvidenceSatisfies(
+        window.aggregate, mConfig.completionCalibration.authorityCoverageTolerance);
+    bool const retainAuthority = contextualCompletionAuthorityEvidenceSatisfies(
+        window.aggregate, mConfig.completionCalibration.authorityDemotionCoverageTolerance);
+    if (!window.aggregate.validated && promotionReady)
+    {
+        window.aggregate.validated = true;
+        ++window.aggregate.promotions;
+    }
+    else if (window.aggregate.validated && !retainAuthority)
+    {
+        window.aggregate.validated = false;
+        ++window.aggregate.demotions;
+    }
+}
+
+double PhaseRuntimeCostTracker::contextualCompletionAuthorityBlendWeight(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    PhaseContextualCompletionAuthorityEvidence const evidence = contextualCompletionAuthorityEvidence(direction);
+    if (!evidence.validated || evidence.referenceAbsoluteErrorUs <= std::numeric_limits<double>::epsilon())
+    {
+        return 0.0;
+    }
+    double const relativeImprovement
+        = (evidence.referenceAbsoluteErrorUs - evidence.completionAbsoluteErrorUs) / evidence.referenceAbsoluteErrorUs;
+    size_t const minimum = mConfig.completionCalibration.authorityMinimumObservations;
+    double const maturity = evidence.observations > minimum
+        ? static_cast<double>(evidence.observations - minimum) / static_cast<double>(evidence.observations)
+        : 0.0;
+    return mConfig.completionCalibration.authorityBlendWeight * maturity * std::clamp(relativeImprovement, 0.0, 1.0);
+}
+
+double PhaseRuntimeCostTracker::contextualCompletionAuthorityComponentBlendWeight(
+    PhaseContextualPairDirection direction, bool incumbent) const noexcept
+{
+    PhaseContextualCompletionAuthorityEvidence const evidence = contextualCompletionAuthorityEvidence(direction);
+    double const completionError
+        = incumbent ? evidence.incumbentCompletionAbsoluteErrorUs : evidence.newcomerCompletionAbsoluteErrorUs;
+    double const referenceError
+        = incumbent ? evidence.incumbentReferenceAbsoluteErrorUs : evidence.newcomerReferenceAbsoluteErrorUs;
+    if (!evidence.validated || referenceError <= std::numeric_limits<double>::epsilon())
+    {
+        return 0.0;
+    }
+    double const relativeImprovement = (referenceError - completionError) / referenceError;
+    size_t const minimum = mConfig.completionCalibration.authorityMinimumObservations;
+    double const maturity = evidence.observations > minimum
+        ? static_cast<double>(evidence.observations - minimum) / static_cast<double>(evidence.observations)
+        : 0.0;
+    return mConfig.completionCalibration.authorityBlendWeight * maturity * std::clamp(relativeImprovement, 0.0, 1.0);
 }
 
 bool PhaseRuntimeCostTracker::contextualCompletionAuthorityReady(
@@ -754,6 +894,12 @@ void PhaseRuntimeCostTracker::resetPolicyPosterior()
     mCompletionEpCalibration.reset();
     mCompletionEdCalibration.reset();
     mCompletionHierarchicalTelemetry = {};
+    mCompletionAuthorityEvidence = {};
+}
+
+void PhaseRuntimeCostTracker::resetCompletionAuthorityEvidence() noexcept
+{
+    mCompletionAuthorityEvidence = {};
 }
 
 void PhaseRuntimeCostTracker::reset()

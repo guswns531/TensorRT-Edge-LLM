@@ -2091,8 +2091,14 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         case PhaseGlobalOverlapCostStatus::kUnprofitable: ++mTelemetry.globalOverlapUnprofitableCount; break;
         }
         mTelemetry.globalOverlapCoveringCostCount += overlapCovered ? 1U : 0U;
+        PhaseContextualPairDirection const completionDirection
+            = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
+        bool const needsCompletionCalibration = mGlobalWarmupProbeMode
+            && mRuntimeCostTracker->contextualCompletionAuthorityEnabled()
+            && !mRuntimeCostTracker->contextualCompletionAuthorityEvidenceReady(completionDirection);
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
-            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
+            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples
+            || needsCompletionCalibration;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
         if (mGlobalWarmupProbeMode)
         {
@@ -2229,6 +2235,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             PhaseContextualCompletionEstimate const authority
                 = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(
                     contextualDirection, candidate.contextualCompletion);
+            double const completionWeight
+                = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(contextualDirection);
+            double const scalarMakespanUs
+                = candidate.decisionCostKnown ? candidate.decisionMakespanUs : candidate.predictedMakespanUs;
+            candidate.decisionCostKnown = true;
+            candidate.decisionMakespanUs = phaseBlendContextualCompletionDecisionMakespanUs(
+                scalarMakespanUs, authority, candidate.contextualCompletionFeatures, completionWeight);
             bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
             for (PhaseProtectedCompletion& completion : candidate.protectedCompletions)
             {
@@ -2238,9 +2251,11 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 {
                     continue;
                 }
-                completion.predictedCompletionUs = incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs;
-                completion.uncertaintyUs
-                    = incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs;
+                double const componentWeight = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
+                    contextualDirection, incumbent);
+                phaseBlendContextualCompletionComponent(completion.predictedCompletionUs, completion.uncertaintyUs,
+                    incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs,
+                    incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
             }
         }
         candidates.push_back(std::move(candidate));
@@ -2875,6 +2890,12 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     {
         PhaseContextualCompletionEstimate const authority
             = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
+        double const completionWeight = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(direction);
+        double const scalarMakespanUs
+            = overlap.decisionCostKnown ? overlap.decisionMakespanUs : overlap.predictedMakespanUs;
+        overlap.decisionCostKnown = true;
+        overlap.decisionMakespanUs = phaseBlendContextualCompletionDecisionMakespanUs(
+            scalarMakespanUs, authority, overlap.contextualCompletionFeatures, completionWeight);
         bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
         for (PhaseProtectedCompletion& completion : overlap.protectedCompletions)
         {
@@ -2883,8 +2904,11 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
             {
                 continue;
             }
-            completion.predictedCompletionUs = incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs;
-            completion.uncertaintyUs = incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs;
+            double const componentWeight
+                = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, incumbent);
+            phaseBlendContextualCompletionComponent(completion.predictedCompletionUs, completion.uncertaintyUs,
+                incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs,
+                incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
         }
     }
 
@@ -4107,10 +4131,12 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
                     * 1000.0;
                 if (metrics.contextualCompletionFeatureValid)
                 {
+                    double const scalarDecisionMakespanUs = phaseContextualDecisionMakespanUs(
+                        static_cast<double>(referenceWorkMs) * 1000.0, metrics.contextualPdLowerConfidenceBound);
                     static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(direction,
                         metrics.contextualCompletionFeatures, metrics.contextualCompletionIncumbentReferenceUs,
                         metrics.contextualCompletionNewcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs,
-                        metrics.contextualCompletionMinimumSlackUs));
+                        metrics.contextualCompletionMinimumSlackUs, scalarDecisionMakespanUs));
                 }
             }
         }
@@ -4188,6 +4214,13 @@ void PhaseQueueScheduler::resetPolicyPosterior()
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Policy posterior can only be reset while the scheduler is idle");
     mRuntimeCostTracker->resetPolicyPosterior();
+}
+
+void PhaseQueueScheduler::resetCompletionAuthorityEvidence()
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Completion authority evidence can only be reset while the scheduler is idle");
+    mRuntimeCostTracker->resetCompletionAuthorityEvidence();
 }
 
 void PhaseQueueScheduler::resetExecutionCostHistory()

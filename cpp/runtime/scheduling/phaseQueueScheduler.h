@@ -854,6 +854,9 @@ public:
     //! Reset only the contextual online policy posterior. The scheduler must
     //! be idle; exact CUDA execution observations remain available.
     void resetPolicyPosterior();
+    //! Retain the generic posterior but require measurement-local held-out
+    //! evidence before completion predictions influence scheduling.
+    void resetCompletionAuthorityEvidence();
     //! Reset only exact CUDA execution observations. The scheduler must be
     //! idle; contextual policy state remains available.
     void resetExecutionCostHistory();

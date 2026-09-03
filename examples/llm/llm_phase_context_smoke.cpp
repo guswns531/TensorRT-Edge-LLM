@@ -1727,9 +1727,22 @@ int main(int argc, char** argv)
         {
             runtimeCostConfig.completionCalibration.authorityCoverageTolerance = std::stod(value);
         }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_MIN_OBSERVATIONS"))
+        {
+            runtimeCostConfig.completionCalibration.authorityMinimumObservations
+                = static_cast<size_t>(std::stoull(value));
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_DEMOTION_TOLERANCE"))
+        {
+            runtimeCostConfig.completionCalibration.authorityDemotionCoverageTolerance = std::stod(value);
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_MAX_FALSE_SAFE_RATE"))
         {
             runtimeCostConfig.completionCalibration.authorityMaximumFalseSafeRate = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_BLEND_WEIGHT"))
+        {
+            runtimeCostConfig.completionCalibration.authorityBlendWeight = std::stod(value);
         }
         auto completionAblation = [](char const* variable, bool& setting) {
             if (char const* value = std::getenv(variable))
@@ -2295,6 +2308,7 @@ int main(int argc, char** argv)
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
             semanticCoordinator.scheduler().resetSchedulingHistory();
+            semanticCoordinator.scheduler().resetCompletionAuthorityEvidence();
             if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
                 || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
             {
@@ -2830,6 +2844,7 @@ int main(int argc, char** argv)
                     }
                     semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
                     semanticCoordinator.scheduler().resetSchedulingHistory();
+                    semanticCoordinator.scheduler().resetCompletionAuthorityEvidence();
                     if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
                         || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
                     {
@@ -3222,6 +3237,8 @@ int main(int argc, char** argv)
                                 = runtimeCostTracker->contextualDirectionTelemetry(direction);
                             rt::PhaseContextualCompletionTelemetry const& completion
                                 = runtimeCostTracker->contextualCompletionDirectionTelemetry(direction);
+                            rt::PhaseContextualCompletionAuthorityEvidence const authority
+                                = runtimeCostTracker->contextualCompletionAuthorityEvidence(direction);
                             bool const required = telemetry.predictions > 0U || telemetry.observations > 0U;
                             bool const ready = required && telemetry.observations >= minimumObservations;
                             contextualRequiredDirections += required ? 1U : 0U;
@@ -3232,6 +3249,38 @@ int main(int argc, char** argv)
                                 {"completion_ready_observations", completion.readyCalibrationObservations},
                                 {"completion_conformal_observations", completion.conformalCalibrationObservations},
                                 {"completion_conformal_false_safe", completion.conformalFalseSafeObservations},
+                                {"completion_authority_window_observations", authority.observations},
+                                {"completion_authority_minimum_observations",
+                                    runtimeCostConfig.completionCalibration.authorityMinimumObservations},
+                                {"completion_authority_blend_weight",
+                                    runtimeCostConfig.completionCalibration.authorityBlendWeight},
+                                {"completion_authority_incumbent_covered", authority.incumbentIntervalCovered},
+                                {"completion_authority_newcomer_covered", authority.newcomerIntervalCovered},
+                                {"completion_authority_predicted_safe", authority.predictedSafeObservations},
+                                {"completion_authority_false_safe", authority.falseSafeObservations},
+                                {"completion_authority_completion_absolute_error_us",
+                                    authority.completionAbsoluteErrorUs},
+                                {"completion_authority_reference_absolute_error_us",
+                                    authority.referenceAbsoluteErrorUs},
+                                {"completion_authority_empirical_blend_weight",
+                                    runtimeCostTracker->contextualCompletionAuthorityBlendWeight(direction)},
+                                {"completion_authority_incumbent_completion_absolute_error_us",
+                                    authority.incumbentCompletionAbsoluteErrorUs},
+                                {"completion_authority_incumbent_reference_absolute_error_us",
+                                    authority.incumbentReferenceAbsoluteErrorUs},
+                                {"completion_authority_newcomer_completion_absolute_error_us",
+                                    authority.newcomerCompletionAbsoluteErrorUs},
+                                {"completion_authority_newcomer_reference_absolute_error_us",
+                                    authority.newcomerReferenceAbsoluteErrorUs},
+                                {"completion_authority_incumbent_blend_weight",
+                                    runtimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
+                                        direction, true)},
+                                {"completion_authority_newcomer_blend_weight",
+                                    runtimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
+                                        direction, false)},
+                                {"completion_authority_promotions", authority.promotions},
+                                {"completion_authority_demotions", authority.demotions},
+                                {"completion_authority_validated", authority.validated},
                                 {"completion_authority_evidence_ready",
                                     runtimeCostTracker->contextualCompletionAuthorityEvidenceReady(direction)}};
                         };
@@ -3288,6 +3337,7 @@ int main(int argc, char** argv)
                         if (input.kind == PhaseIpcKind::kCalibrationEnd)
                         {
                             semanticCoordinator.scheduler().resetSchedulingHistory();
+                            semanticCoordinator.scheduler().resetCompletionAuthorityEvidence();
                             if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
                                 || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
                             {

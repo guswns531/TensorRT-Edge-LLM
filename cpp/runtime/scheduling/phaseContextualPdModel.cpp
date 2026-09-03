@@ -189,6 +189,38 @@ double phaseContextualDecisionMakespanUs(double referenceWorkUs, double conserva
     return reference * (1.0 - advantage);
 }
 
+double phaseContextualCompletionDecisionMakespanUs(
+    PhaseContextualCompletionEstimate const& estimate, PhaseContextualPdFeatures const& features) noexcept
+{
+    constexpr size_t kPRODUCER_BATCH_FILL_FEATURE = 4U;
+    double const formationRisk = clampFinite(features[kPRODUCER_BATCH_FILL_FEATURE], 0.0, 1.0);
+    double const incumbent
+        = std::max(0.0, estimate.incumbentMeanUs) + formationRisk * std::max(0.0, estimate.incumbentUncertaintyUs);
+    double const newcomer
+        = std::max(0.0, estimate.newcomerMeanUs) + formationRisk * std::max(0.0, estimate.newcomerUncertaintyUs);
+    return std::max(incumbent, newcomer);
+}
+
+double phaseBlendContextualCompletionDecisionMakespanUs(double scalarMakespanUs,
+    PhaseContextualCompletionEstimate const& estimate, PhaseContextualPdFeatures const& features,
+    double completionWeight) noexcept
+{
+    double const weight = clampFinite(completionWeight, 0.0, 1.0);
+    double const scalar = std::max(0.0, scalarMakespanUs);
+    double const completion = phaseContextualCompletionDecisionMakespanUs(estimate, features);
+    return scalar + weight * (completion - scalar);
+}
+
+void phaseBlendContextualCompletionComponent(double& predictedCompletionUs, double& uncertaintyUs,
+    double completionMeanUs, double completionUncertaintyUs, double completionWeight) noexcept
+{
+    double const weight = clampFinite(completionWeight, 0.0, 1.0);
+    double const baselineMean = std::max(0.0, predictedCompletionUs);
+    double const baselineUncertainty = std::max(0.0, uncertaintyUs);
+    predictedCompletionUs = baselineMean + weight * (std::max(0.0, completionMeanUs) - baselineMean);
+    uncertaintyUs = baselineUncertainty + weight * (std::max(0.0, completionUncertaintyUs) - baselineUncertainty);
+}
+
 double phaseContextualPdDecisionValue(
     PhaseContextualPdEstimate const& estimate, bool decodeOnlyRecovery, bool producerCriticalPath) noexcept
 {

@@ -255,6 +255,25 @@ struct PhaseContextualCompletionEstimate
     bool uncertaintyCalibrated{};
 };
 
+//! Convert a calibrated two-component completion vector into an efficiency
+//! horizon. Expected completion drives low-density producer actions, while
+//! the uncertainty penalty grows continuously with producer-batch fill to
+//! protect valuable E/P formation without any workload label or shape rule.
+double phaseContextualCompletionDecisionMakespanUs(
+    PhaseContextualCompletionEstimate const& estimate, PhaseContextualPdFeatures const& features) noexcept;
+
+//! Blend a validated completion-vector estimate with the incumbent scalar
+//! policy horizon. The scalar head remains a stabilizing prior while the
+//! component model adapts online; one global weight applies to every pair,
+//! direction, shape, and workload.
+double phaseBlendContextualCompletionDecisionMakespanUs(double scalarMakespanUs,
+    PhaseContextualCompletionEstimate const& estimate, PhaseContextualPdFeatures const& features,
+    double completionWeight) noexcept;
+
+//! Apply the same policy blend to one protected completion component.
+void phaseBlendContextualCompletionComponent(double& predictedCompletionUs, double& uncertaintyUs,
+    double completionMeanUs, double completionUncertaintyUs, double completionWeight) noexcept;
+
 //! Configuration for bounded online conformal calibration. The same
 //! configuration is used by every pair family; no direction, shape, trace, or
 //! workload label enters the calibration policy.
@@ -273,9 +292,22 @@ struct PhaseContextualCompletionCalibrationConfig
     //! Authority requires measured conformal coverage to remain within this
     //! tolerance of targetCoverage for both completion components.
     double authorityCoverageTolerance{0.05};
+    //! Held-out directional samples required after pair-family conformal
+    //! calibration. This is intentionally separate from minimumObservations:
+    //! the latter fits the shared uncertainty scale, while this smaller
+    //! window validates that the ordered direction transfers safely.
+    size_t authorityMinimumObservations{8U};
+    //! Once promoted, retain authority until recent coverage crosses this
+    //! wider bound. The shared hysteresis prevents policy oscillation when a
+    //! bounded evidence window moves around the promotion threshold.
+    double authorityDemotionCoverageTolerance{0.10};
     //! Maximum accepted false-safe fraction among conformal predictions that
     //! were classified as SLO safe. Zero is the production default.
     double authorityMaximumFalseSafeRate{0.0};
+    //! Continuous authority granted to a validated completion vector. A
+    //! partial weight avoids a discontinuous policy switch at promotion while
+    //! preserving the scalar action-value head as a process-local prior.
+    double authorityBlendWeight{1.0};
     //! P6 policy-only ablations. They never relax feasibility or determine
     //! whether an observation is admitted into the completion model.
     bool authorityUsesUncertainty{true};
@@ -340,6 +372,27 @@ struct PhaseContextualCompletionTelemetry
     double readyIncumbentSquaredErrorUs{};
     double readyNewcomerAbsoluteErrorUs{};
     double readyNewcomerSquaredErrorUs{};
+};
+
+//! Bounded held-out evidence used to promote one ordered completion direction
+//! to scheduling authority. Unlike the lifetime telemetry above, this view
+//! covers the same recent-observation horizon as the conformal calibrator.
+struct PhaseContextualCompletionAuthorityEvidence
+{
+    size_t observations{};
+    size_t incumbentIntervalCovered{};
+    size_t newcomerIntervalCovered{};
+    size_t predictedSafeObservations{};
+    size_t falseSafeObservations{};
+    double completionAbsoluteErrorUs{};
+    double referenceAbsoluteErrorUs{};
+    double incumbentCompletionAbsoluteErrorUs{};
+    double incumbentReferenceAbsoluteErrorUs{};
+    double newcomerCompletionAbsoluteErrorUs{};
+    double newcomerReferenceAbsoluteErrorUs{};
+    size_t promotions{};
+    size_t demotions{};
+    bool validated{};
 };
 
 //! Two-output residual RLS completion predictor. The deterministic isolated

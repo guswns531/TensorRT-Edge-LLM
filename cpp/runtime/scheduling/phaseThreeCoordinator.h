@@ -690,9 +690,15 @@ private:
         bool contextualCompletionFeatureValid{};
         bool contextualExploration{};
         float contextualReferenceWorkMs{};
+        double contextualLowerConfidenceBound{};
         double contextualIncumbentReferenceUs{};
         double contextualNewcomerReferenceUs{};
         double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};
+        //! Mechanism-owned plan joining the independently completed E and P/D
+        //! measurements. Runtime state such as externalEncoderActive may be
+        //! cleared before the slower member completes and is not a stable join
+        //! key.
+        uint64_t planId{};
     };
     struct ActiveGlobalPdExecution
     {

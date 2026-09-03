@@ -109,11 +109,14 @@ public:
     bool observeContextualCompletionDirection(PhaseContextualPairDirection direction,
         PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
         double incumbentCompletionUs, double newcomerCompletionUs,
-        double minimumSlackUs = std::numeric_limits<double>::infinity());
+        double minimumSlackUs = std::numeric_limits<double>::infinity(),
+        double scalarDecisionMakespanUs = std::numeric_limits<double>::quiet_NaN());
     PhaseContextualCompletionTelemetry const& contextualCompletionDirectionTelemetry(
         PhaseContextualPairDirection direction) const noexcept;
     PhaseContextualCompletionTelemetry const& contextualCompletionPairTelemetry(
         PhaseContextualPairKind kind) const noexcept;
+    PhaseContextualCompletionAuthorityEvidence contextualCompletionAuthorityEvidence(
+        PhaseContextualPairDirection direction) const noexcept;
     PhaseContextualCompletionCalibrationEstimate contextualCompletionCalibration(PhaseContextualPairKind kind) const;
     bool contextualCompletionAuthorityEnabled() const noexcept
     {
@@ -128,6 +131,14 @@ public:
     {
         return mConfig.completionCalibration.authorityPredictsIncumbent;
     }
+    //! Return an empirical-risk blend. Held-out completion error must improve
+    //! on the isolated scalar prior; the relative improvement continuously
+    //! determines how much of the configured maximum authority is granted.
+    double contextualCompletionAuthorityBlendWeight(PhaseContextualPairDirection direction) const noexcept;
+    //! Grant each completion boundary authority from its own held-out risk.
+    //! One accurate component cannot hide or force authority on a harmful peer.
+    double contextualCompletionAuthorityComponentBlendWeight(
+        PhaseContextualPairDirection direction, bool incumbent) const noexcept;
     PhaseContextualCompletionEstimate contextualCompletionAuthorityEstimate(
         PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate estimate) const noexcept;
 
@@ -149,11 +160,43 @@ public:
     //! Drop contextual action-value, completion, and uncertainty-calibration
     //! state while preserving exact execution observations.
     void resetPolicyPosterior();
+    //! Start a new serving-distribution validation epoch while retaining the
+    //! generic posterior and conformal calibration learned during warmup.
+    //! Completion estimates regain authority only from held-out observations
+    //! collected in the new epoch.
+    void resetCompletionAuthorityEvidence() noexcept;
     //! Drop every process-local execution and policy observation.
     void reset();
 
 private:
     PhaseContextualPdFeatures contextualCompletionFeaturesForPolicy(PhaseContextualPdFeatures features) const noexcept;
+
+    struct CompletionAuthorityEvidenceSample
+    {
+        bool incumbentCovered{};
+        bool newcomerCovered{};
+        bool predictedSafe{};
+        bool falseSafe{};
+        double completionAbsoluteErrorUs{};
+        double referenceAbsoluteErrorUs{};
+        double incumbentCompletionAbsoluteErrorUs{};
+        double incumbentReferenceAbsoluteErrorUs{};
+        double newcomerCompletionAbsoluteErrorUs{};
+        double newcomerReferenceAbsoluteErrorUs{};
+    };
+
+    struct CompletionAuthorityEvidenceWindow
+    {
+        std::deque<CompletionAuthorityEvidenceSample> samples;
+        PhaseContextualCompletionAuthorityEvidence aggregate;
+    };
+
+    void observeContextualCompletionAuthorityEvidence(PhaseContextualPairDirection direction,
+        PhaseContextualCompletionEstimate const& prediction, PhaseContextualPdFeatures const& features,
+        double incumbentReferenceUs, double newcomerReferenceUs, double incumbentCompletionUs,
+        double newcomerCompletionUs, double minimumSlackUs, double scalarDecisionMakespanUs) noexcept;
+    bool contextualCompletionAuthorityEvidenceSatisfies(
+        PhaseContextualCompletionAuthorityEvidence const& evidence, double coverageTolerance) const noexcept;
 
     struct DecodeKey
     {
@@ -194,6 +237,7 @@ private:
     PhaseContextualCompletionCalibrator mCompletionEpCalibration;
     PhaseContextualCompletionCalibrator mCompletionEdCalibration;
     std::array<PhaseContextualCompletionTelemetry, 6U> mCompletionHierarchicalTelemetry{};
+    std::array<CompletionAuthorityEvidenceWindow, 6U> mCompletionAuthorityEvidence{};
     std::unordered_map<DecodeKey, std::deque<float>, DecodeKeyHash> mDecodeComponents;
 };
 

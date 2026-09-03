@@ -394,6 +394,34 @@ TEST(PhaseContextualCompletionModelTest, DirectionPosteriorGraduallyOverridesPai
     EXPECT_TRUE(result.ready);
 }
 
+TEST(PhaseContextualCompletionModelTest, CompletionDecisionRiskScalesWithProducerFormation)
+{
+    PhaseContextualCompletionEstimate const estimate{100.0, 40.0, 80.0, 20.0, 16U, true};
+    PhaseContextualPdFeatures sparse{};
+    PhaseContextualPdFeatures dense{};
+    dense[4] = 1.0;
+
+    EXPECT_DOUBLE_EQ(phaseContextualCompletionDecisionMakespanUs(estimate, sparse), 100.0);
+    EXPECT_DOUBLE_EQ(phaseContextualCompletionDecisionMakespanUs(estimate, dense), 140.0);
+}
+
+TEST(PhaseContextualCompletionModelTest, AuthorityBlendPreservesEndpointsAndComponents)
+{
+    PhaseContextualCompletionEstimate const estimate{80.0, 20.0, 120.0, 40.0, 8U, true};
+    PhaseContextualPdFeatures features{};
+    features[4] = 0.5;
+
+    EXPECT_DOUBLE_EQ(phaseBlendContextualCompletionDecisionMakespanUs(200.0, estimate, features, 0.0), 200.0);
+    EXPECT_DOUBLE_EQ(phaseBlendContextualCompletionDecisionMakespanUs(200.0, estimate, features, 1.0), 140.0);
+    EXPECT_DOUBLE_EQ(phaseBlendContextualCompletionDecisionMakespanUs(200.0, estimate, features, 0.5), 170.0);
+
+    double completionUs{200.0};
+    double uncertaintyUs{10.0};
+    phaseBlendContextualCompletionComponent(completionUs, uncertaintyUs, 100.0, 30.0, 0.25);
+    EXPECT_DOUBLE_EQ(completionUs, 175.0);
+    EXPECT_DOUBLE_EQ(uncertaintyUs, 15.0);
+}
+
 TEST(PhaseContextualCompletionModelTest, HierarchicalTelemetryRejectsInvalidLabelsAtModelBoundary)
 {
     PhaseRuntimeCostTracker tracker;
@@ -440,6 +468,7 @@ TEST(PhaseContextualCompletionCalibrationTest, SharesScaleAcrossOppositeDirectio
     config.contextualEp.minimumObservations = 1U;
     config.completionCalibration.enabled = true;
     config.completionCalibration.minimumObservations = 1U;
+    config.completionCalibration.authorityMinimumObservations = 1U;
     config.completionCalibration.windowSize = 4U;
     PhaseRuntimeCostTracker tracker(config);
     PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
@@ -482,6 +511,7 @@ TEST(PhaseContextualCompletionCalibrationTest, AuthorityRequiresHeldOutDirection
     config.completionCalibration.enabled = true;
     config.completionCalibration.active = true;
     config.completionCalibration.minimumObservations = 1U;
+    config.completionCalibration.authorityMinimumObservations = 1U;
     config.completionCalibration.windowSize = 4U;
     PhaseRuntimeCostTracker tracker(config);
     PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
@@ -499,6 +529,25 @@ TEST(PhaseContextualCompletionCalibrationTest, AuthorityRequiresHeldOutDirection
     EXPECT_TRUE(estimate.ready);
     EXPECT_TRUE(estimate.uncertaintyCalibrated);
     EXPECT_TRUE(tracker.contextualCompletionAuthorityReady(direction, estimate));
+    EXPECT_EQ(tracker.contextualCompletionAuthorityEvidence(direction).observations, 1U);
+    EXPECT_EQ(tracker.contextualCompletionAuthorityEvidence(direction).promotions, 1U);
+    EXPECT_TRUE(tracker.contextualCompletionAuthorityEvidence(direction).validated);
+    for (size_t sample{}; sample < 8U; ++sample)
+    {
+        ASSERT_TRUE(tracker.observeContextualCompletionDirection(direction, features, 4000.0, 8000.0, 4000.0, 8000.0));
+    }
+    PhaseContextualCompletionAuthorityEvidence const evidence
+        = tracker.contextualCompletionAuthorityEvidence(direction);
+    EXPECT_EQ(evidence.observations, config.completionCalibration.windowSize);
+    EXPECT_EQ(evidence.incumbentIntervalCovered, evidence.observations);
+    EXPECT_EQ(evidence.newcomerIntervalCovered, evidence.observations);
+    tracker.resetCompletionAuthorityEvidence();
+    PhaseContextualCompletionEstimate const retained
+        = tracker.predictContextualCompletionDirection(direction, features, 4000.0, 8000.0);
+    EXPECT_TRUE(retained.ready);
+    EXPECT_TRUE(retained.uncertaintyCalibrated);
+    EXPECT_EQ(tracker.contextualCompletionAuthorityEvidence(direction).observations, 0U);
+    EXPECT_FALSE(tracker.contextualCompletionAuthorityReady(direction, retained));
     PhaseContextualCompletionEstimate const reverse = tracker.predictContextualCompletionDirection(
         PhaseContextualPairDirection::kDecodeToPrefill, features, 8000.0, 4000.0);
     EXPECT_FALSE(tracker.contextualCompletionAuthorityReady(PhaseContextualPairDirection::kDecodeToPrefill, reverse));
