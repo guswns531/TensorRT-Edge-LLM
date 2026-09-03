@@ -71,6 +71,8 @@ def test_prepare_generic_command_selects_vlm_calibration(
     assert result[result.index("--generic-warmup-trace") +
                   1] == str(generic_vlm)
     assert result[result.index("--warmup-requests") + 1] == "1"
+    assert result[result.index("--phase-calibration-round-requests") +
+                  1] == "1"
     assert "TRT_EDGELLM_POLICY_WARMUP_MODE={policy_warmup_mode}" in result
 
 
@@ -108,6 +110,33 @@ def test_prepare_replaces_stale_backend_build(tmp_path: Path) -> None:
     assert ("EDGELLM_PLUGIN_PATH=/workspace/new-build/"
             "libNvInfer_edgellm_plugin.so.1.0") in result
     assert "LD_LIBRARY_PATH=/opt/tensorrt/lib:/workspace/new-build/examples/llm" in result
+
+
+def test_prepare_replaces_backend_engine(tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3",
+        "/workspace/build/examples/llm/llm_phase_context_smoke",
+        "/workspace/old-engine", "/workspace/model"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "zero_start",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    backend_engine_dir="/workspace/new-engine")
+
+    binary = result.index(
+        "/workspace/build/examples/llm/llm_phase_context_smoke")
+    assert result[binary + 1] == "/workspace/new-engine"
+    assert result[binary + 2] == "/workspace/model"
 
 
 def test_prepare_pd_only_changes_authority_without_changing_mode(
@@ -155,3 +184,51 @@ def test_prepare_pd_only_changes_authority_without_changing_mode(
     assert environments["TRT_EDGELLM_CONTEXTUAL_EP"] == "shadow"
     assert environments["TRT_EDGELLM_CONTEXTUAL_ED"] == "shadow"
     assert "TRT_EDGELLM_POLICY_WARMUP_MODE={policy_warmup_mode}" in result
+
+
+def test_prepare_overrides_backend_environment(tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "-e", "TRT_EDGELLM_GLOBAL_SCHEDULER=active",
+        "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command(
+        {"command": command},
+        "zero_start",
+        tmp_path / "out",
+        1,
+        generic,
+        generic,
+        backend_environment=("TRT_EDGELLM_GLOBAL_SCHEDULER=disabled", ))
+
+    assert "TRT_EDGELLM_GLOBAL_SCHEDULER=disabled" in result
+    assert "TRT_EDGELLM_GLOBAL_SCHEDULER=active" not in result
+
+
+def test_prepare_overrides_client_max_in_flight(tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1",
+        "--max-in-flight", "48", "--", "docker", "run", "--rm",
+        "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "zero_start",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    client_max_in_flight=80)
+
+    assert result[result.index("--max-in-flight") + 1] == "80"

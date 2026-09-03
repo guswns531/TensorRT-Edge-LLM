@@ -40,53 +40,78 @@ def _text_request(prompt_tokens: int, output_tokens: int, arrival_us: int,
 
 def _vision_request(image_url: str, output_tokens: int, arrival_us: int,
                     request_class: str) -> dict[str, Any]:
+    content = [{
+        "type": "image_url",
+        "image_url": {
+            "url": image_url
+        },
+    }]
+    content.append({
+        "type": "text",
+        "text": "Describe the image briefly.",
+    })
     return {
         "messages": [{
-            "role":
-            "user",
-            "content": [{
-                "type": "image_url",
-                "image_url": {
-                    "url": image_url
-                },
-            }, {
-                "type": "text",
-                "text": "Describe the image briefly.",
-            }],
+            "role": "user",
+            "content": content,
         }],
-        "max_generate_length":
-        output_tokens,
-        "arrival_offset_us":
-        arrival_us,
-        "request_class":
-        request_class,
+        "max_generate_length": output_tokens,
+        "arrival_offset_us": arrival_us,
+        "request_class": request_class,
     }
 
 
 def build_trace(image_url: str | None, cycles: int,
                 cycle_interval_us: int) -> dict[str, Any]:
-    """Return a fixed state-coverage trace independent of measured traffic."""
+    """Return a fixed action-coverage trace independent of measured traffic."""
     requests: list[dict[str, Any]] = []
+    # Cover both latency-oriented refill cohorts and throughput-oriented
+    # cohorts without deriving the sequence from a measured workload. Keep D8
+    # first so a one-cycle smoke trace retains its established request count.
+    decode_rows = (8, 1, 2, 4, 16, 32, 64)
+    phase_offsets = (
+        {
+            "decode": 0,
+            "prefill": 40_000,
+            "encoder": 80_000,
+        },
+        {
+            "prefill": 0,
+            "decode": 40_000,
+            "encoder": 80_000,
+        },
+        {
+            "encoder": 0,
+            "prefill": 40_000,
+            "decode": 80_000,
+        },
+        {
+            "encoder": 0,
+            "decode": 40_000,
+            "prefill": 80_000,
+        },
+    )
     for cycle in range(cycles):
         base = cycle * cycle_interval_us
-        # Establish long-lived D cohorts at three useful cohort scales.
-        for rows, offset in ((8, 0), (32, 1200), (64, 2400)):
+        offsets = phase_offsets[cycle % len(phase_offsets)]
+        # Use one bounded D cohort per cycle. This preserves admission slots
+        # for E/P and covers the configured decode range across cycles.
+        requests.extend(
+            _text_request(32, 64, base +
+                          offsets["decode"], "generic_resident_decode")
+            for _ in range(decode_rows[cycle % len(decode_rows)]))
+        # Rotate phase order across cycles so both incumbent directions are
+        # observable without replaying the workload under measurement.
+        for wave, rows in enumerate((1, 4, 8)):
             requests.extend(
-                _text_request(32, 64, base + offset, "generic_resident_decode")
-                for _ in range(rows))
-        # Cross the resident cohorts with fixed-128 P candidates. Alternating
-        # offsets exposes both incumbent directions without observing the
-        # production trace being measured.
-        for wave, rows in enumerate((1, 4, 8, 8, 4, 1)):
-            requests.extend(
-                _text_request(128, 8, base + 4000 +
-                              wave * 1500, "generic_prefill")
+                _text_request(1024, 8, base + offsets["prefill"] +
+                              wave * 5_000, "generic_prefill")
                 for _ in range(rows))
         if image_url is not None:
-            for wave, rows in enumerate((1, 2, 4, 4, 2, 1)):
+            for wave, rows in enumerate((1, 2, 4)):
                 requests.extend(
-                    _vision_request(image_url, 16, base + 4500 +
-                                    wave * 1700, "generic_vision")
+                    _vision_request(image_url, 16, base + offsets["encoder"] +
+                                    wave * 8_000, "generic_vision")
                     for _ in range(rows))
     requests.sort(key=lambda request: int(request["arrival_offset_us"]))
     return {
@@ -103,7 +128,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--image-url")
     parser.add_argument("--cycles", type=int, default=2)
-    parser.add_argument("--cycle-interval-us", type=int, default=120_000)
+    parser.add_argument("--cycle-interval-us", type=int, default=1_000_000)
     args = parser.parse_args()
     if args.cycles <= 0 or args.cycle_interval_us <= 0:
         parser.error("cycles and cycle interval must be positive")

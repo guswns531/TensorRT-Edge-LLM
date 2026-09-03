@@ -1830,6 +1830,66 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         overlapDecode
             = predictDecode(overlapDecodeKey, overlapDecodeRows, overlapDecodeMaxContext, overlapDecodeContextTokens);
     }
+    struct DecodeFormationPrediction
+    {
+        Prediction combined;
+        Prediction newlyProduced;
+    };
+    std::optional<DecodeFormationPrediction> decodeFormation;
+    bool const commonPairFrontier = prefillRequestIds == overlapPrefillRequestIds
+        && decodeRequestIds == overlapDecodeRequestIds && prefillRows == overlapPrefillRows
+        && decodeRows == overlapDecodeRows;
+    if (mConfig.enableDecodeFormationHorizon && prefill.has_value() && decode.has_value() && commonPairFrontier
+        && overlapPrefillAllFinal && decodeRows < mConfig.maxDecodeBatchSize)
+    {
+        ++mTelemetry.globalDecodeFormationSnapshotCount;
+        int32_t combinedRows = decodeRows;
+        int64_t combinedContextTokens = decodeContextTokens;
+        int32_t combinedMaxContext = decodeMaxContext;
+        int32_t producedRows{};
+        int64_t producedContextTokens{};
+        int32_t producedMaxContext{};
+        for (PhaseWorkItem const& item : overlapPlan.prefillBatch)
+        {
+            if (combinedRows >= mConfig.maxDecodeBatchSize)
+            {
+                break;
+            }
+            int32_t const resultingContext
+                = item.promptTokenCount > 0 ? item.promptTokenCount : item.tokenOffset + item.tokenCount;
+            ++combinedRows;
+            combinedContextTokens += resultingContext;
+            combinedMaxContext = std::max(combinedMaxContext, resultingContext);
+            ++producedRows;
+            producedContextTokens += resultingContext;
+            producedMaxContext = std::max(producedMaxContext, resultingContext);
+        }
+        if (producedRows > 0)
+        {
+            PhaseGlobalActionKey combinedKey{
+                PhaseGlobalActionKind::kDecode, combinedRows, 0, 1, contextBucket(combinedMaxContext), 0};
+            combinedKey.executionVariant = executionVariant(combinedKey, 0);
+            PhaseGlobalActionKey producedKey{
+                PhaseGlobalActionKind::kDecode, producedRows, 0, 1, contextBucket(producedMaxContext), 0};
+            producedKey.executionVariant = executionVariant(producedKey, 0);
+            Prediction const combined
+                = predictDecode(combinedKey, combinedRows, combinedMaxContext, combinedContextTokens);
+            Prediction const produced
+                = predictDecode(producedKey, producedRows, producedMaxContext, producedContextTokens);
+            mTelemetry.globalDecodeFormationCombinedCostHitCount += combined.directlyKnown ? 1U : 0U;
+            mTelemetry.globalDecodeFormationProducedCostHitCount += produced.directlyKnown ? 1U : 0U;
+            // The bounded transition is used only when both successor shapes
+            // have measured coverage. A cold process must not manufacture a
+            // formation benefit from fallback costs.
+            if (combined.directlyKnown && produced.directlyKnown)
+            {
+                decodeFormation = DecodeFormationPrediction{combined, produced};
+                ++mTelemetry.globalDecodeFormationOpportunityCount;
+                mTelemetry.globalDecodeFormationMaxProducedRows
+                    = std::max(mTelemetry.globalDecodeFormationMaxProducedRows, static_cast<size_t>(producedRows));
+            }
+        }
+    }
     struct PrefillFormationPrediction
     {
         Prediction combined;
@@ -1987,6 +2047,18 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             serialReferenceWorkUs = decode->makespanUs
                 + std::max(
                     prefill->makespanUs + prefillFormation->residual.makespanUs, prefillFormation->combined.makespanUs);
+        }
+        if (decodeFormation.has_value())
+        {
+            // Compare one observable P -> D transition over equal useful
+            // work. Completing final P rows makes them decode-ready without
+            // predicting a future arrival. P-first can consume the incumbent
+            // and newly produced rows in one combined D launch; D-first must
+            // still service the produced rows after P completes.
+            prefillFirstHorizonUs = prefill->makespanUs + decodeFormation->combined.makespanUs;
+            decodeFirstHorizonUs = decode->makespanUs + prefill->makespanUs + decodeFormation->newlyProduced.makespanUs;
+            serialReferenceWorkUs
+                = prefill->makespanUs + decode->makespanUs + decodeFormation->newlyProduced.makespanUs;
         }
         for (PhaseGlobalActionCandidate& candidate : candidates)
         {
@@ -2176,11 +2248,18 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.requestServiceLagUs = std::max(state.prefillOldestRequestAgeUs, state.decodeOldestWaitUs);
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
         PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
-        bool const externalPrefillLineage = overlapPrefillClass == PhasePrefillClass::kExternal;
         PhaseContextualPairDirection const contextualDirection
             = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
-        if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
+        bool const contextualLineageEnabled
+            = overlapPrefillClass != PhasePrefillClass::kExternal || mConfig.enableExternalContextualPd;
+        if (contextualMode != PhaseContextualPdMode::kDisabled && contextualLineageEnabled)
         {
+            // Once E has completed, an external/VLM prefill is ordinary P
+            // work for this pair action. Its TTFT remains protected below,
+            // while an outstanding or pending producer still prevents the
+            // local P+D head from taking policy authority. Keeping external
+            // P out of the feature space made generic text observations
+            // unusable precisely when a VLM request reached P+D.
             PhaseContextualPdInput const contextualInput{overlapPrefill->makespanUs, overlapDecode->makespanUs,
                 std::min(prefillSlack, decodeSlack), overlapPrefillRows, overlapDecodeRows, overlapPrefillChunk,
                 overlapKey.primaryContextBucket, overlapKey.secondaryContextBucket, overlapKey.executionVariant,
@@ -2257,6 +2336,14 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs,
                     incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
             }
+        }
+        if (decodeFormation.has_value())
+        {
+            double const currentActionUs
+                = candidate.decisionCostKnown ? candidate.decisionMakespanUs : candidate.predictedMakespanUs;
+            candidate.predictedHorizonUs = currentActionUs + decodeFormation->newlyProduced.makespanUs;
+            candidate.horizonReferenceWorkUs
+                = prefill->makespanUs + decode->makespanUs + decodeFormation->newlyProduced.makespanUs;
         }
         candidates.push_back(std::move(candidate));
         if (experimentalOverlapMode)
@@ -2407,6 +2494,21 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     if (prefillFormation.has_value() && selected.key.kind == PhaseGlobalActionKind::kDecode)
     {
         ++mTelemetry.globalPrefillFormationDecodeSelectionCount;
+    }
+    if (decodeFormation.has_value())
+    {
+        if (selected.key.kind == PhaseGlobalActionKind::kPrefill)
+        {
+            ++mTelemetry.globalDecodeFormationPrefillSelectionCount;
+        }
+        else if (selected.key.kind == PhaseGlobalActionKind::kDecode)
+        {
+            ++mTelemetry.globalDecodeFormationDecodeSelectionCount;
+        }
+        else if (selected.key.kind == PhaseGlobalActionKind::kPrefillDecode)
+        {
+            ++mTelemetry.globalDecodeFormationOverlapSelectionCount;
+        }
     }
     PhaseDispatchKind kind{PhaseDispatchKind::kNone};
     switch (selected.key.kind)
@@ -2823,9 +2925,15 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         && (deadlineRecovery || slackSafe);
 
     PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
-    bool const externalPrefill = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
-    if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefill)
+    bool const contextualLineageEnabled
+        = prefill.key.primaryWorkClass != static_cast<int32_t>(PhasePrefillClass::kExternal)
+        || mConfig.enableExternalContextualPd;
+    if (contextualMode != PhaseContextualPdMode::kDisabled && contextualLineageEnabled)
     {
+        // Residual P+D augmentation is producer-agnostic once the P row is
+        // runnable. External/VLM rows have already satisfied their E -> P
+        // dependency here, and the same completion-vector model can price
+        // the remaining P and D work without a workload label.
         PhaseContextualPdInput const contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
             protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
             prefill.key.primaryContextBucket, decode.key.primaryContextBucket, overlap.key.executionVariant, true,

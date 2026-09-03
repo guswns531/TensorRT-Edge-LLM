@@ -107,6 +107,22 @@ def _replace_backend_build(command: list[str],
             command[index] = "LD_LIBRARY_PATH=" + ":".join(paths)
 
 
+def _replace_backend_engine(command: list[str],
+                            backend_engine_dir: str) -> None:
+    if not backend_engine_dir:
+        return
+    binary_suffix = "/examples/llm/llm_phase_context_smoke"
+    try:
+        binary_index = next(index for index, value in enumerate(command)
+                            if value.endswith(binary_suffix))
+    except StopIteration as error:
+        raise ValueError(
+            "backend command has no phase context binary") from error
+    if binary_index + 1 >= len(command):
+        raise ValueError("phase context binary has no engine argument")
+    command[binary_index + 1] = backend_engine_dir
+
+
 def _is_vision_trace(path: Path) -> bool:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return any(
@@ -124,16 +140,25 @@ def prepare_command(entry: dict[str, Any],
                     generic_text: Path,
                     generic_vlm: Path,
                     backend_build_root: str = "",
-                    policy_variant: str = "full_active") -> list[str]:
+                    backend_engine_dir: str = "",
+                    policy_variant: str = "full_active",
+                    backend_environment: tuple[str, ...] = (),
+                    client_max_in_flight: int = 0) -> list[str]:
     if policy_variant not in POLICY_VARIANTS:
         raise ValueError(f"unknown policy variant: {policy_variant}")
     command = list(entry["command"])
     _set_option(command, "--output-dir", str(output_dir))
     _set_option(command, "--repeats", str(repeats))
     _set_option(command, "--policy-warmup-mode", mode)
+    if client_max_in_flight > 0:
+        _set_option(command, "--max-in-flight", str(client_max_in_flight))
     _inject_backend_mode(command)
     _replace_backend_build(command, backend_build_root)
+    _replace_backend_engine(command, backend_engine_dir)
     for name, value in POLICY_VARIANTS[policy_variant].items():
+        _set_backend_environment(command, name, value)
+    for assignment in backend_environment:
+        name, value = assignment.split("=", 1)
         _set_backend_environment(command, name, value)
     _drop_option(command, "--generic-warmup-trace", True)
     if mode == "generic":
@@ -143,6 +168,12 @@ def prepare_command(entry: dict[str, Any],
             json.loads(calibration.read_text(encoding="utf-8"))["requests"])
         _set_option(command, "--generic-warmup-trace", str(calibration))
         _set_option(command, "--warmup-requests", str(request_count))
+        # The generic trace encodes action coverage in both request ordering
+        # and arrival offsets. Execute the complete trace as one calibration
+        # round so the client cannot truncate a later phase-order cycle or
+        # restart its arrival epoch in the middle of the trace.
+        _set_option(command, "--phase-calibration-round-requests",
+                    str(request_count))
         _set_option(command, "--phase-calibration-min-requests",
                     str(request_count))
     elif mode in ("graph_only", "zero_start"):
@@ -158,6 +189,8 @@ def main() -> int:
     parser.add_argument("--generic-text", type=Path, required=True)
     parser.add_argument("--generic-vlm", type=Path, required=True)
     parser.add_argument("--backend-build-root", default="")
+    parser.add_argument("--backend-engine-dir", default="")
+    parser.add_argument("--client-max-in-flight", type=int, default=0)
     parser.add_argument("--policy-variant",
                         choices=sorted(POLICY_VARIANTS),
                         default="full_active")
@@ -165,12 +198,22 @@ def main() -> int:
     parser.add_argument("--cases", default="")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--backend-env",
+        action="append",
+        default=[],
+        help="override one backend NAME=VALUE assignment; may be repeated")
     args = parser.parse_args()
     modes = tuple(value for value in args.modes.split(",") if value)
     if not modes or any(mode not in MODES for mode in modes):
         parser.error(f"modes must be drawn from {','.join(MODES)}")
-    if args.repeats <= 0:
-        parser.error("repeats must be positive")
+    if args.repeats <= 0 or args.client_max_in_flight < 0:
+        parser.error(
+            "repeats must be positive and client-max-in-flight cannot be negative"
+        )
+    if any("=" not in assignment or not assignment.split("=", 1)[0]
+           for assignment in args.backend_env):
+        parser.error("backend-env values must use NAME=VALUE")
     selected_cases = {value for value in args.cases.split(",") if value}
     entries = json.loads(args.base_commands.read_text(encoding="utf-8"))
     if selected_cases:
@@ -187,7 +230,10 @@ def main() -> int:
             command = prepare_command(entry, mode, output, args.repeats,
                                       args.generic_text, args.generic_vlm,
                                       args.backend_build_root,
-                                      args.policy_variant)
+                                      args.backend_engine_dir,
+                                      args.policy_variant,
+                                      tuple(args.backend_env),
+                                      args.client_max_in_flight)
             commands.append({
                 "mode": mode,
                 "policy_variant": args.policy_variant,

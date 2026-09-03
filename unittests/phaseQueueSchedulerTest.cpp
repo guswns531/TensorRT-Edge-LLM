@@ -551,6 +551,42 @@ TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
     EXPECT_NEAR(candidate->horizonReferenceWorkUs, 3280.0, 1.0e-3);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalPricesFinalPrefillAsObservableDecodeFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableDecodeFormationHorizon = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 3, 0, 128, true, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueueDecode({2, 512, 4});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 12500.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 14000.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationCombinedCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationProducedCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationPrefillSelectionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationDecodeSelectionCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationOverlapSelectionCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationMaxProducedRows, 1U);
+    std::vector<PhaseGlobalActionCandidate> const& frontier = scheduler.lastGlobalPreviewCandidates();
+    auto const decode = std::find_if(frontier.begin(), frontier.end(),
+        [](PhaseGlobalActionCandidate const& action) { return action.key.kind == PhaseGlobalActionKind::kDecode; });
+    ASSERT_NE(decode, frontier.end());
+    EXPECT_NEAR(decode->predictedHorizonUs, 14000.0, 1.0e-3);
+    EXPECT_NEAR(decode->horizonReferenceWorkUs, 14000.0, 1.0e-3);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalPreviewRetainsTheCompletePolicyNeutralCandidateFrontier)
 {
     PhaseQueueSchedulerConfig config;
@@ -677,6 +713,39 @@ TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
     EXPECT_NE(first.candidateId, second.candidateId);
     PhaseGlobalDispatchPlan const plan = phaseGlobalDispatchPlan(1U, 1U, first);
     EXPECT_EQ(plan.primaryStableSlotIds, (std::vector<int32_t>{3, 0}));
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalPrefillResidualUsesSharedContextualModel)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kShadow;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableExternalContextualPd = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({2, 128, 4});
+
+    PhaseGlobalActionCandidate launched;
+    launched.key = {PhaseGlobalActionKind::kPrefill, 1, 0, 128, 0, 0};
+    launched.key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kExternal);
+    launched.primaryRequestIds = {1U};
+    launched.primaryStableSlotIds = {3};
+    launched.predictedBlockingUs = 4000.0;
+    launched.predictedMakespanUs = 4000.0;
+    launched.referenceWorkUs = 4000.0;
+    phaseGlobalFinalizeCandidate(launched);
+
+    std::optional<PhaseGlobalResidualSelection> const residual
+        = scheduler.previewGlobalResidualAction(launched, 1000.0);
+
+    ASSERT_TRUE(residual.has_value());
+    EXPECT_EQ(residual->aggregate.key.kind, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_EQ(residual->aggregate.key.primaryWorkClass, static_cast<int32_t>(PhasePrefillClass::kExternal));
+    EXPECT_TRUE(residual->aggregate.contextualPdFeatureValid);
+    EXPECT_TRUE(residual->aggregate.contextualCompletionFeatureValid);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDeadlineProtectsCompleteRemainingPrefillPath)

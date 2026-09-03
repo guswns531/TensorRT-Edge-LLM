@@ -3092,6 +3092,10 @@ int main(int argc, char** argv)
             };
             double ipcRequestAdapterUs{};
             size_t ipcRequestAdapterInputs{};
+            size_t ipcRequestAdapterOutOfOrderCompletions{};
+            size_t ipcRequestAdapterMaxReadyBypass{};
+            bool const allowOutOfOrderAdapterCompletion
+                = std::getenv("TRT_EDGELLM_DISABLE_IPC_ADAPTER_OUT_OF_ORDER") == nullptr;
             std::thread inputReader([&]() {
                 std::string line;
                 while (std::getline(std::cin, line))
@@ -3143,16 +3147,35 @@ int main(int argc, char** argv)
                 while (true)
                 {
                     std::future<PhaseIpcInput> task;
+                    size_t readyTaskIndex{};
                     {
                         std::lock_guard<std::mutex> lock(pendingMutex);
-                        if (pendingInputTasks.empty()
-                            || pendingInputTasks.front().wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                        if (pendingInputTasks.empty())
                         {
                             break;
                         }
-                        task = std::move(pendingInputTasks.front());
-                        pendingInputTasks.pop_front();
+                        auto readyTask = pendingInputTasks.begin();
+                        if (allowOutOfOrderAdapterCompletion)
+                        {
+                            readyTask = std::find_if(pendingInputTasks.begin(), pendingInputTasks.end(),
+                                [](std::future<PhaseIpcInput>& candidate) {
+                                    return candidate.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                                });
+                        }
+                        else if (readyTask->wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                        {
+                            readyTask = pendingInputTasks.end();
+                        }
+                        if (readyTask == pendingInputTasks.end())
+                        {
+                            break;
+                        }
+                        readyTaskIndex = static_cast<size_t>(std::distance(pendingInputTasks.begin(), readyTask));
+                        task = std::move(*readyTask);
+                        pendingInputTasks.erase(readyTask);
                     }
+                    ipcRequestAdapterOutOfOrderCompletions += readyTaskIndex > 0U ? 1U : 0U;
+                    ipcRequestAdapterMaxReadyBypass = std::max(ipcRequestAdapterMaxReadyBypass, readyTaskIndex);
                     inputAdapterReady.notify_one();
                     PhaseIpcInput input = task.get();
                     ipcRequestAdapterUs += input.adapterUs;
@@ -3775,6 +3798,22 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationResidualCostHitCount},
                         {"global_prefill_formation_max_pending_rows",
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationMaxPendingRows},
+                        {"global_decode_formation_snapshots",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationSnapshotCount},
+                        {"global_decode_formation_opportunities",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationOpportunityCount},
+                        {"global_decode_formation_combined_cost_hits",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationCombinedCostHitCount},
+                        {"global_decode_formation_produced_cost_hits",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationProducedCostHitCount},
+                        {"global_decode_formation_prefill_selections",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationPrefillSelectionCount},
+                        {"global_decode_formation_decode_selections",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationDecodeSelectionCount},
+                        {"global_decode_formation_overlap_selections",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationOverlapSelectionCount},
+                        {"global_decode_formation_max_produced_rows",
+                            semanticCoordinator.scheduler().telemetry().globalDecodeFormationMaxProducedRows},
                         {"global_wait_decisions", semanticCoordinator.scheduler().telemetry().globalWaitDecisionCount},
                         {"global_wait_selected", semanticCoordinator.scheduler().telemetry().globalWaitSelectedCount},
                         {"global_wait_candidates",
@@ -4431,6 +4470,10 @@ int main(int argc, char** argv)
                 ipcIngressQuantum, emitPhaseMetrics ? "yes" : "no", collectPhaseDispatchMetrics ? "yes" : "no",
                 phaseTelemetryLevel.c_str());
             LOG_INFO("Phase IPC response path: native_callback");
+            LOG_INFO(
+                "Phase IPC request adapter: inputs=%zu total=%.3f ms out_of_order_completions=%zu max_ready_bypass=%zu",
+                ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, ipcRequestAdapterOutOfOrderCompletions,
+                ipcRequestAdapterMaxReadyBypass);
             LOG_INFO(
                 "Phase page reservation: mode=%s base=%d guaranteed=%d growth_owners=%zu growth_pending=%zu "
                 "growth_waits=%zu",

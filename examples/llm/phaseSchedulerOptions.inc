@@ -109,6 +109,10 @@
         }
         semanticSchedulerConfig.elideVacuousGlobalDecisions
             = std::getenv("TRT_EDGELLM_DISABLE_VACUOUS_GLOBAL_ELISION") == nullptr;
+        semanticSchedulerConfig.enableDecodeFormationHorizon
+            = std::getenv("TRT_EDGELLM_DISABLE_DECODE_FORMATION_HORIZON") == nullptr;
+        semanticSchedulerConfig.enableExternalContextualPd
+            = std::getenv("TRT_EDGELLM_DISABLE_EXTERNAL_CONTEXTUAL_PD") == nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference
             = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;

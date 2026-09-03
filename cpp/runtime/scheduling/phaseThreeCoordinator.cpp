@@ -4405,9 +4405,9 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     {
         return {};
     }
-    if (globalActive && !batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
-        && batchSize == inputs.size() && mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0
-        && mLastVisionArrival != std::chrono::steady_clock::time_point{})
+    if (globalActive && mConfig.encoderBatchWaitUs > 0.0 && !batchFull && !mediaFull && !inputFull && !tokenFull
+        && !resourceLimited && !capacityFull && batchSize == inputs.size() && mVisionInterarrivalSamples > 0U
+        && mVisionInterarrivalEwmaUs > 0.0 && mLastVisionArrival != std::chrono::steady_clock::time_point{})
     {
         double const sinceArrivalUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mLastVisionArrival).count();

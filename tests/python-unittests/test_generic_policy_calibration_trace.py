@@ -30,12 +30,20 @@ def test_generic_trace_is_fixed_and_optionally_covers_vision() -> None:
                                        cycles=1,
                                        cycle_interval_us=120_000)
 
-    assert len(text["requests"]) == 130
-    assert len(vision["requests"]) == 144
+    assert len(text["requests"]) == 21
+    assert len(vision["requests"]) == 28
     assert all(request["request_class"].startswith("generic_")
                for request in vision["requests"])
     assert [request["arrival_offset_us"] for request in vision["requests"]
             ] == sorted(request["arrival_offset_us"]
                         for request in vision["requests"])
-    assert sum(request["request_class"] == "generic_vision"
-               for request in vision["requests"]) == 14
+    vision_requests = [
+        request for request in vision["requests"]
+        if request["request_class"] == "generic_vision"
+    ]
+    assert len(vision_requests) == 7
+    assert sorted(
+        sum(
+            part.get("type") == "image_url"
+            for part in request["messages"][0]["content"])
+        for request in vision_requests) == [1, 1, 1, 1, 1, 1, 1]

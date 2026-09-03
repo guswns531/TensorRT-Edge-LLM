@@ -300,6 +300,14 @@ struct PhaseSchedulerTelemetry
     size_t globalPrefillFormationCombinedCostHitCount{};
     size_t globalPrefillFormationResidualCostHitCount{};
     size_t globalPrefillFormationMaxPendingRows{};
+    size_t globalDecodeFormationSnapshotCount{};
+    size_t globalDecodeFormationOpportunityCount{};
+    size_t globalDecodeFormationCombinedCostHitCount{};
+    size_t globalDecodeFormationProducedCostHitCount{};
+    size_t globalDecodeFormationPrefillSelectionCount{};
+    size_t globalDecodeFormationDecodeSelectionCount{};
+    size_t globalDecodeFormationOverlapSelectionCount{};
+    size_t globalDecodeFormationMaxProducedRows{};
     size_t globalWaitDecisionCount{};
     size_t globalWaitSelectedCount{};
     size_t globalWaitCandidateCount{};
@@ -599,6 +607,10 @@ struct PhaseQueueSchedulerConfig
     //! pre-reserved ownership contract. The mechanism batch and online
     //! observation paths remain unchanged.
     bool elideVacuousGlobalDecisions{};
+    //! Include final-P rows in a bounded prediction of the immediately following D cohort.
+    bool enableDecodeFormationHorizon{};
+    //! Apply the contextual P+D controller after an external producer has completed E -> P.
+    bool enableExternalContextualPd{};
     double prefillQueueWaitTargetUs{5000.0};
     double decodeQueueWaitTargetUs{2000.0};
     //! Default next-token deadline for bounded WAIT/refill decisions when a
