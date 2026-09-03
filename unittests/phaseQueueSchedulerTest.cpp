@@ -477,6 +477,30 @@ TEST(PhaseQueueSchedulerTest, AcceptsCoordinatorPlanNamespaceAfterLocalWarmup)
     EXPECT_EQ(plan.globalSnapshotEpoch, kCoordinatorNamespace | 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, ExternalGlobalLeaseIsNotReformedByNewReadyWork)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enablePriorityBatching = true;
+    config.maxPrefillBatchSize = 1;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 3});
+    std::optional<PhaseGlobalActionCandidate> candidate = scheduler.previewGlobalPrefillAction();
+    ASSERT_TRUE(candidate.has_value());
+    ASSERT_EQ(candidate->primaryRequestIds, (std::vector<uint64_t>{1U}));
+    PhaseSchedulingHints urgent;
+    urgent.priority = 3;
+    scheduler.enqueuePrefill({2, 32, 4, 0, 0, true, urgent});
+    scheduler.setNextGlobalAction(*candidate, 1U, 1U);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+    EXPECT_TRUE(plan.globalCandidateParity);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
 {
     PhaseQueueSchedulerConfig config;
@@ -765,6 +789,28 @@ TEST(PhaseQueueSchedulerTest, ServingEpochResetCanPreserveGlobalWarmupCosts)
     EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
     scheduler.resetHistory();
     EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, ServingEpochCanResetMechanismAndCostPlanesSeparately)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kPrefill;
+    sample.prefillClass = PhasePrefillClass::kText;
+    sample.prefillBatchSize = 1;
+    sample.prefillTokens = 128;
+    sample.prefillPaddedTokens = 128;
+    sample.prefillGpuMs = 3.0F;
+    sample.makespanGpuMs = 3.0F;
+    scheduler.observeMetrics(sample);
+
+    scheduler.resetSchedulingHistory();
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
+    scheduler.resetExecutionCostHistory();
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 0U);
+    EXPECT_NO_THROW(scheduler.resetPolicyPosterior());
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)

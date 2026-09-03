@@ -270,6 +270,12 @@ struct PhaseContextualCompletionCalibrationConfig
     size_t windowSize{128U};
     double minimumScale{1.0};
     double maximumScale{8.0};
+    //! Authority requires measured conformal coverage to remain within this
+    //! tolerance of targetCoverage for both completion components.
+    double authorityCoverageTolerance{0.05};
+    //! Maximum accepted false-safe fraction among conformal predictions that
+    //! were classified as SLO safe. Zero is the production default.
+    double authorityMaximumFalseSafeRate{0.0};
     //! P6 policy-only ablations. They never relax feasibility or determine
     //! whether an observation is admitted into the completion model.
     bool authorityUsesUncertainty{true};

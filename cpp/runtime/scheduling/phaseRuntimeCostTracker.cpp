@@ -59,6 +59,14 @@ PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig c
     ELLM_CHECK(std::isfinite(mConfig.completionDirectionPseudoObservations)
             && mConfig.completionDirectionPseudoObservations > 0.0,
         "Completion direction pseudo-observation count must be finite and positive");
+    ELLM_CHECK(std::isfinite(mConfig.completionCalibration.authorityCoverageTolerance)
+            && mConfig.completionCalibration.authorityCoverageTolerance >= 0.0
+            && mConfig.completionCalibration.authorityCoverageTolerance < 1.0,
+        "Completion authority coverage tolerance must be finite and in [0, 1)");
+    ELLM_CHECK(std::isfinite(mConfig.completionCalibration.authorityMaximumFalseSafeRate)
+            && mConfig.completionCalibration.authorityMaximumFalseSafeRate >= 0.0
+            && mConfig.completionCalibration.authorityMaximumFalseSafeRate <= 1.0,
+        "Completion authority false-safe rate must be finite and in [0, 1]");
 }
 
 void PhaseRuntimeCostTracker::observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation)
@@ -570,6 +578,43 @@ PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::contextualCompletionA
     return estimate;
 }
 
+bool PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidenceReady(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    if (!contextualCompletionAuthorityEnabled())
+    {
+        return false;
+    }
+    PhaseContextualCompletionTelemetry const& telemetry
+        = mCompletionHierarchicalTelemetry[completionDirectionIndex(direction)];
+    size_t const minimum = mConfig.completionCalibration.minimumObservations;
+    if (telemetry.readyCalibrationObservations < minimum || telemetry.conformalCalibrationObservations < minimum)
+    {
+        return false;
+    }
+    double const incumbentCoverage = static_cast<double>(telemetry.conformalIncumbentIntervalCovered)
+        / static_cast<double>(telemetry.conformalCalibrationObservations);
+    double const newcomerCoverage = static_cast<double>(telemetry.conformalNewcomerIntervalCovered)
+        / static_cast<double>(telemetry.conformalCalibrationObservations);
+    double const minimumCoverage = std::max(
+        0.0, mConfig.completionCalibration.targetCoverage - mConfig.completionCalibration.authorityCoverageTolerance);
+    if (incumbentCoverage < minimumCoverage || newcomerCoverage < minimumCoverage)
+    {
+        return false;
+    }
+    double const falseSafeRate = telemetry.conformalPredictedSafeObservations > 0U
+        ? static_cast<double>(telemetry.conformalFalseSafeObservations)
+            / static_cast<double>(telemetry.conformalPredictedSafeObservations)
+        : 0.0;
+    return falseSafeRate <= mConfig.completionCalibration.authorityMaximumFalseSafeRate;
+}
+
+bool PhaseRuntimeCostTracker::contextualCompletionAuthorityReady(
+    PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate const& estimate) const noexcept
+{
+    return estimate.ready && estimate.uncertaintyCalibrated && contextualCompletionAuthorityEvidenceReady(direction);
+}
+
 PhaseContextualCompletionTelemetry const& PhaseRuntimeCostTracker::contextualCompletionDirectionTelemetry(
     PhaseContextualPairDirection direction) const noexcept
 {
@@ -682,9 +727,14 @@ size_t PhaseRuntimeCostTracker::decodeBucketCount() const noexcept
     return mDecodeComponents.size();
 }
 
-void PhaseRuntimeCostTracker::reset()
+void PhaseRuntimeCostTracker::resetExecutionCostHistory()
 {
     mActions.reset();
+    mDecodeComponents.clear();
+}
+
+void PhaseRuntimeCostTracker::resetPolicyPosterior()
+{
     mContextualPd.reset();
     mContextualDp.reset();
     mContextualEp.reset();
@@ -704,7 +754,12 @@ void PhaseRuntimeCostTracker::reset()
     mCompletionEpCalibration.reset();
     mCompletionEdCalibration.reset();
     mCompletionHierarchicalTelemetry = {};
-    mDecodeComponents.clear();
+}
+
+void PhaseRuntimeCostTracker::reset()
+{
+    resetExecutionCostHistory();
+    resetPolicyPosterior();
 }
 
 bool PhaseRuntimeCostTracker::DecodeKey::operator==(DecodeKey const& other) const noexcept

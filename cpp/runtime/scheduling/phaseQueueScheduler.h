@@ -848,6 +848,17 @@ public:
     //! Reset queue-policy history between serving epochs. Shape warmup may
     //! preserve direct Global CUDA observations while still clearing request
     //! age, fairness, and admission state.
+    //! Reset queue/service history while leaving both execution-cost and
+    //! contextual-policy state unchanged. The scheduler must be idle.
+    void resetSchedulingHistory();
+    //! Reset only the contextual online policy posterior. The scheduler must
+    //! be idle; exact CUDA execution observations remain available.
+    void resetPolicyPosterior();
+    //! Reset only exact CUDA execution observations. The scheduler must be
+    //! idle; contextual policy state remains available.
+    void resetExecutionCostHistory();
+    //! Backward-compatible serving-epoch reset. When preserveRuntimeCosts is
+    //! true, both execution and policy observations survive.
     void resetHistory(bool preserveRuntimeCosts = false);
 
     //! Permit deterministic synthetic startup traffic to collect unknown P+D
@@ -901,6 +912,8 @@ private:
     bool isEligible(PhaseWorkItem const& item, bool prefill) const;
     std::vector<PhaseWorkItem> popBatch(std::deque<PhaseWorkItem>& queue, int32_t maxBatchSize, bool chunkPrefill,
         PhaseQueueSnapshot const& snapshot, PhaseDispatchPlan& plan);
+    std::vector<PhaseWorkItem> popGlobalCandidateBatch(std::deque<PhaseWorkItem>& queue,
+        PhaseGlobalActionCandidate const& candidate, bool primary, bool chunkPrefill, PhaseDispatchPlan& plan);
     void enqueueKnownPrefill(PhaseWorkItem item);
     void enqueueKnownDecode(PhaseWorkItem item);
 

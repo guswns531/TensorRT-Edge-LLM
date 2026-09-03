@@ -1515,6 +1515,62 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     return batch;
 }
 
+std::vector<PhaseWorkItem> PhaseQueueScheduler::popGlobalCandidateBatch(std::deque<PhaseWorkItem>& queue,
+    PhaseGlobalActionCandidate const& candidate, bool primary, bool chunkPrefill, PhaseDispatchPlan& plan)
+{
+    std::vector<uint64_t> const& requestIds = primary ? candidate.primaryRequestIds : candidate.secondaryRequestIds;
+    std::vector<int32_t> const& stableSlotIds
+        = primary ? candidate.primaryStableSlotIds : candidate.secondaryStableSlotIds;
+    check::check(requestIds.size() == stableSlotIds.size(), "Global candidate row and stable-slot counts differ");
+    auto const now = std::chrono::steady_clock::now();
+    std::vector<PhaseWorkItem> batch;
+    batch.reserve(requestIds.size());
+    for (size_t index{}; index < requestIds.size(); ++index)
+    {
+        auto selected = std::find_if(queue.begin(), queue.end(), [&](PhaseWorkItem const& item) {
+            return item.requestId == requestIds[index] && item.kvSlotId == stableSlotIds[index];
+        });
+        check::check(selected != queue.end(), "Globally leased request disappeared before dispatch");
+        check::check(isEligible(*selected, chunkPrefill), "Globally leased request became ineligible before dispatch");
+        PhaseWorkItem item = *selected;
+        if (chunkPrefill)
+        {
+            item.tokenCount = std::min(item.tokenCount, candidate.key.chunkLength);
+        }
+        queue.erase(selected);
+        check::check(mInFlightRequestIds.insert(item.requestId).second, "Request is already in flight");
+        auto const queued = mQueuedSince.find(item.requestId);
+        check::check(queued != mQueuedSince.end(), "Globally leased request has no queue timestamp");
+        double& queueWaitUs = chunkPrefill ? plan.prefillQueueWaitUs : plan.decodeQueueWaitUs;
+        queueWaitUs = std::max(queueWaitUs, std::chrono::duration<double, std::micro>(now - queued->second).count());
+        mQueuedSince.erase(queued);
+        batch.push_back(std::move(item));
+    }
+    if (chunkPrefill)
+    {
+        if (mConfig.enableWavefrontPrefillBatching)
+        {
+            if (mPrefillCohortIds.empty())
+            {
+                mPrefillCohortIds.insert(requestIds.begin(), requestIds.end());
+            }
+            ++mPrefillCohortTurns;
+            plan.prefillCohortSize = static_cast<int32_t>(mPrefillCohortIds.size());
+        }
+        plan.prefillCostLookupRows = candidate.key.primaryBatchSize;
+        plan.prefillCostLookupChunkLength = candidate.key.chunkLength;
+    }
+    else
+    {
+        if (mConfig.enableDecodeCohortBatching)
+        {
+            mDecodeCohortIds.insert(requestIds.begin(), requestIds.end());
+        }
+        mPreviousDecodeSelectionIds = requestIds;
+    }
+    return batch;
+}
+
 PhaseDispatchPlan PhaseQueueScheduler::previewMechanismPlan(PhaseDispatchKind kind) const
 {
     PhaseQueueScheduler preview = *this;
@@ -2115,6 +2171,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidate.memory = memoryFor(candidate.key, candidate.requestIds);
         PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
         bool const externalPrefillLineage = overlapPrefillClass == PhasePrefillClass::kExternal;
+        PhaseContextualPairDirection const contextualDirection
+            = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
         if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
         {
             PhaseContextualPdInput const contextualInput{overlapPrefill->makespanUs, overlapDecode->makespanUs,
@@ -2125,8 +2183,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             candidate.contextualPdFeatureValid = true;
             candidate.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
             candidate.contextualCompletionFeatureValid = true;
-            PhaseContextualPairDirection const contextualDirection
-                = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
             bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
             candidate.contextualCompletionIncumbentReferenceUs
                 = decodeIncumbent ? overlapDecode->makespanUs : overlapPrefill->makespanUs;
@@ -2167,14 +2223,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         }
         candidate.protectedCompletions.push_back(
             {decodeSlack, overlapDecodeCompletionUs, overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode});
-        if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && candidate.contextualCompletion.ready
-            && candidate.contextualCompletion.uncertaintyCalibrated)
+        if (mRuntimeCostTracker->contextualCompletionAuthorityReady(
+                contextualDirection, candidate.contextualCompletion))
         {
-            PhaseContextualPairDirection const direction
-                = phaseContextualPairDirection(candidate.key.kind, candidate.key.residualAnchor);
             PhaseContextualCompletionEstimate const authority
-                = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, candidate.contextualCompletion);
-            bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
+                = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(
+                    contextualDirection, candidate.contextualCompletion);
+            bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
             for (PhaseProtectedCompletion& completion : candidate.protectedCompletions)
             {
                 bool const incumbent
@@ -2814,11 +2869,10 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     };
     appendProtected(active);
     appendProtected(*missing);
-    if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && overlap.contextualCompletion.ready
-        && overlap.contextualCompletion.uncertaintyCalibrated)
+    PhaseContextualPairDirection const direction
+        = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+    if (mRuntimeCostTracker->contextualCompletionAuthorityReady(direction, overlap.contextualCompletion))
     {
-        PhaseContextualPairDirection const direction
-            = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
         PhaseContextualCompletionEstimate const authority
             = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
         bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
@@ -3224,11 +3278,19 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     if (kind == PhaseDispatchKind::kPrefill || kind == PhaseDispatchKind::kOverlap)
     {
-        int32_t const overlapPrefillBatchSize
-            = mConfig.maxOverlapPrefillBatchSize > 0 ? mConfig.maxOverlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
-        int32_t const prefillBatchSize
-            = kind == PhaseDispatchKind::kOverlap ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
-        plan.prefillBatch = popBatch(mPrefillQueue, prefillBatchSize, true, state, plan);
+        if (appliedGlobalAction.has_value())
+        {
+            plan.prefillBatch = popGlobalCandidateBatch(mPrefillQueue, *appliedGlobalAction, true, true, plan);
+        }
+        else
+        {
+            int32_t const overlapPrefillBatchSize = mConfig.maxOverlapPrefillBatchSize > 0
+                ? mConfig.maxOverlapPrefillBatchSize
+                : mConfig.maxPrefillBatchSize;
+            int32_t const prefillBatchSize
+                = kind == PhaseDispatchKind::kOverlap ? overlapPrefillBatchSize : mConfig.maxPrefillBatchSize;
+            plan.prefillBatch = popBatch(mPrefillQueue, prefillBatchSize, true, state, plan);
+        }
     }
     if (kind == PhaseDispatchKind::kOverlap && plan.prefillDeferredForTpot)
     {
@@ -3237,7 +3299,10 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     }
     if (kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap)
     {
-        plan.decodeBatch = popBatch(mDecodeQueue, plan.plannedDecodeBatchSize, false, state, plan);
+        plan.decodeBatch = appliedGlobalAction.has_value()
+            ? popGlobalCandidateBatch(mDecodeQueue, *appliedGlobalAction,
+                  appliedGlobalAction->key.kind == PhaseGlobalActionKind::kDecode, false, plan)
+            : popBatch(mDecodeQueue, plan.plannedDecodeBatchSize, false, state, plan);
     }
     if (appliedGlobalAction.has_value())
     {
@@ -4091,16 +4156,12 @@ void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference prefer
     mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
 }
 
-void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
+void PhaseQueueScheduler::resetSchedulingHistory()
 {
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Scheduling history can only be reset while the scheduler is idle");
     mTelemetry = {};
     mRecentDecodeTpotUs = std::make_shared<RecentDecodeTpot>();
-    if (!preserveRuntimeCosts)
-    {
-        mRuntimeCostTracker->reset();
-    }
     mLatencySafeFallback = false;
     mConsecutiveDecodeBatches = 0;
     mConsecutiveOverlapBatches = 0;
@@ -4120,6 +4181,29 @@ void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
     mGlobalExperimentalOverlapAccumulator = 0U;
     mNextGlobalAction.reset();
     mNextGlobalDispatchPlan.reset();
+}
+
+void PhaseQueueScheduler::resetPolicyPosterior()
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Policy posterior can only be reset while the scheduler is idle");
+    mRuntimeCostTracker->resetPolicyPosterior();
+}
+
+void PhaseQueueScheduler::resetExecutionCostHistory()
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Execution cost history can only be reset while the scheduler is idle");
+    mRuntimeCostTracker->resetExecutionCostHistory();
+}
+
+void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
+{
+    resetSchedulingHistory();
+    if (!preserveRuntimeCosts)
+    {
+        mRuntimeCostTracker->reset();
+    }
 }
 
 void PhaseQueueScheduler::setGlobalWarmupProbeMode(bool active)

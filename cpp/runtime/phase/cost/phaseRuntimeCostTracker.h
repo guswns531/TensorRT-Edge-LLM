@@ -119,6 +119,11 @@ public:
     {
         return mConfig.completionCalibration.enabled && mConfig.completionCalibration.active;
     }
+    //! Return true only after the ordered direction and its conformal
+    //! uncertainty have enough held-out evidence for policy authority.
+    bool contextualCompletionAuthorityEvidenceReady(PhaseContextualPairDirection direction) const noexcept;
+    bool contextualCompletionAuthorityReady(
+        PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate const& estimate) const noexcept;
     bool contextualCompletionAuthorityPredictsIncumbent() const noexcept
     {
         return mConfig.completionCalibration.authorityPredictsIncumbent;
@@ -137,6 +142,14 @@ public:
         int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const;
     size_t decodeBucketCount() const noexcept;
 
+    //! Drop exact action/decode service observations while preserving the
+    //! contextual policy posterior. CUDA graph/profile state is owned by the
+    //! execution coordinator and is therefore unaffected.
+    void resetExecutionCostHistory();
+    //! Drop contextual action-value, completion, and uncertainty-calibration
+    //! state while preserving exact execution observations.
+    void resetPolicyPosterior();
+    //! Drop every process-local execution and policy observation.
     void reset();
 
 private:

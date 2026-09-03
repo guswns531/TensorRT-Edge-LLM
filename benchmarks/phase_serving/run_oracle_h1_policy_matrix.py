@@ -31,6 +31,15 @@ POLICY_ENVIRONMENTS = {
         "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
         "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
     },
+    # Grant online authority only to P+D without changing the shared
+    # candidate, execution, or calibration mechanisms.
+    "pd_only": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "shadow",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "shadow",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
     "serial": {
         "TRT_EDGELLM_CONTEXTUAL_PD": "shadow",
         "TRT_EDGELLM_CONTEXTUAL_EP": "shadow",
@@ -196,7 +205,8 @@ def materialize_command(entry: dict[str, Any],
                         container_workspace: Path,
                         plugin_path: str,
                         binary_path: str,
-                        matrix_repeat: int = 1) -> dict[str, Any]:
+                        matrix_repeat: int = 1,
+                        telemetry_level: str = "research") -> dict[str, Any]:
     """Return one event-enabled, one-repeat command without changing its trace contract."""
     if policy not in POLICY_ENVIRONMENTS:
         raise ValueError(f"unknown policy: {policy}")
@@ -214,7 +224,7 @@ def materialize_command(entry: dict[str, Any],
     _remove_docker_environment(command, POLICY_ENVIRONMENT_NAMES)
     _set_docker_environment(command, "TRT_EDGELLM_EMIT_PHASE_METRICS", "1")
     _set_docker_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL",
-                            "research")
+                            telemetry_level)
     relative_output = output_dir.resolve().relative_to(
         host_workspace.resolve())
     activity_prefix = container_workspace / relative_output / "activity" / "run-001"
@@ -263,6 +273,9 @@ def main() -> int:
         action="store_true",
         help="retain only the first source entry for each case/variant pair")
     parser.add_argument("--matrix-repeats", type=int, default=1)
+    parser.add_argument("--telemetry-level",
+                        choices=("research", "full", "counterfactual"),
+                        default="research")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
@@ -298,7 +311,8 @@ def main() -> int:
                 materialize_command(
                     entry, args.policy, repeat_root, args.host_workspace,
                     args.container_workspace, args.plugin_path,
-                    args.binary_path, matrix_repeat) for entry in selected)
+                    args.binary_path, matrix_repeat, args.telemetry_level)
+                for entry in selected)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         command_manifest = args.output_dir / "commands.json"
         command_manifest.write_text(json.dumps(commands, indent=2) + "\n",

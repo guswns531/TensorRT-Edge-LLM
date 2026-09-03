@@ -2309,11 +2309,10 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
             = completion.kind == PhaseProtectedKind::kDecode ? overlapDecodeUncertaintyUs : overlap.uncertaintyUs;
         overlap.protectedCompletions.push_back(completion);
     }
-    if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && overlap.contextualCompletion.ready
-        && overlap.contextualCompletion.uncertaintyCalibrated)
+    PhaseContextualPairDirection const direction
+        = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+    if (mRuntimeCostTracker->contextualCompletionAuthorityReady(direction, overlap.contextualCompletion))
     {
-        PhaseContextualPairDirection const direction
-            = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
         PhaseContextualCompletionEstimate const authority
             = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
         bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
@@ -3044,8 +3043,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             overlap.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
                 overlap.contextualEncoderPairDirection, overlap.contextualEncoderCompletionFeatures,
                 overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
-            if (mRuntimeCostTracker->contextualCompletionAuthorityEnabled() && overlap.contextualCompletion.ready
-                && overlap.contextualCompletion.uncertaintyCalibrated)
+            if (mRuntimeCostTracker->contextualCompletionAuthorityReady(
+                    overlap.contextualEncoderPairDirection, overlap.contextualCompletion))
             {
                 PhaseContextualCompletionEstimate const authority
                     = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(

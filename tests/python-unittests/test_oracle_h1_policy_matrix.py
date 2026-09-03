@@ -100,3 +100,24 @@ def test_materializes_m6_shadow_without_policy_authority() -> None:
     assert values["TRT_EDGELLM_CONTEXTUAL_ED"] == "shadow"
     assert values["TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"] == "0"
     assert values["TRT_EDGELLM_CONTEXTUAL_PD_CONFIDENCE_BETA"] == "1.96"
+
+
+def test_materializes_pd_only_authority() -> None:
+    result = materialize_command(entry(), "pd_only", Path("/host/out"),
+                                 Path("/host"), Path("/workspace"),
+                                 "/workspace/plugin.so",
+                                 "/workspace/build/llm_phase_context_smoke")
+    values = environment(result["command"])
+    assert values["TRT_EDGELLM_CONTEXTUAL_PD"] == "active"
+    assert values["TRT_EDGELLM_CONTEXTUAL_EP"] == "shadow"
+    assert values["TRT_EDGELLM_CONTEXTUAL_ED"] == "shadow"
+
+
+def test_materializes_full_request_timeline() -> None:
+    result = materialize_command(entry(), "current", Path("/host/out"),
+                                 Path("/host"), Path("/workspace"),
+                                 "/workspace/plugin.so",
+                                 "/workspace/build/llm_phase_context_smoke", 1,
+                                 "full")
+    values = environment(result["command"])
+    assert values["TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"] == "full"

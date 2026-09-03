@@ -116,6 +116,29 @@ TEST(PhaseRuntimeCostTrackerTest, ResetDropsAllProcessLocalMeasurements)
     EXPECT_EQ(tracker.decodeBucketCount(), 0U);
 }
 
+TEST(PhaseRuntimeCostTrackerTest, ExecutionAndPolicyStateResetIndependently)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.actionMinimumSamples = 1U;
+    config.contextualPd.mode = PhaseContextualPdMode::kActive;
+    config.contextualPd.minimumObservations = 1U;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kPrefillDecode, 1, 1, 128, 1, 1};
+    PhaseContextualPdFeatures const features = phaseContextualPdFeatures(
+        {3000.0, 7000.0, 100000.0, 1, 1, 128, 1, 1, PhaseExecutionVariant::kEager, false, {}});
+    tracker.observe(key, {10.0F, 8.0F});
+    ASSERT_TRUE(tracker.observeContextualDirection(PhaseContextualPairDirection::kPrefillToDecode, features, 0.2));
+
+    tracker.resetExecutionCostHistory();
+    EXPECT_EQ(tracker.confidence(key), PhaseRuntimeCostConfidence::kUnknown);
+    EXPECT_EQ(tracker.contextualDirectionTelemetry(PhaseContextualPairDirection::kPrefillToDecode).observations, 1U);
+
+    tracker.observe(key, {10.0F, 8.0F});
+    tracker.resetPolicyPosterior();
+    EXPECT_EQ(tracker.confidence(key), PhaseRuntimeCostConfidence::kReady);
+    EXPECT_EQ(tracker.contextualDirectionTelemetry(PhaseContextualPairDirection::kPrefillToDecode).observations, 0U);
+}
+
 TEST(PhaseContextualPdModelTest, BecomesReadyAndReducesUncertainty)
 {
     PhaseContextualPdModelConfig config;
@@ -450,6 +473,35 @@ TEST(PhaseContextualCompletionCalibrationTest, SeparatesShadowCalibrationFromSch
     activeConfig.completionCalibration.active = true;
     PhaseRuntimeCostTracker active(activeConfig);
     EXPECT_TRUE(active.contextualCompletionAuthorityEnabled());
+}
+
+TEST(PhaseContextualCompletionCalibrationTest, AuthorityRequiresHeldOutDirectionalCoverage)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualPd.minimumObservations = 1U;
+    config.completionCalibration.enabled = true;
+    config.completionCalibration.active = true;
+    config.completionCalibration.minimumObservations = 1U;
+    config.completionCalibration.windowSize = 4U;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+    PhaseContextualPairDirection const direction = PhaseContextualPairDirection::kPrefillToDecode;
+
+    PhaseContextualCompletionEstimate estimate
+        = tracker.predictContextualCompletionDirection(direction, features, 4000.0, 8000.0);
+    EXPECT_FALSE(tracker.contextualCompletionAuthorityReady(direction, estimate));
+    for (size_t sample{}; sample < 3U; ++sample)
+    {
+        ASSERT_TRUE(tracker.observeContextualCompletionDirection(direction, features, 4000.0, 8000.0, 4000.0, 8000.0));
+    }
+    estimate = tracker.predictContextualCompletionDirection(direction, features, 4000.0, 8000.0);
+    EXPECT_TRUE(estimate.ready);
+    EXPECT_TRUE(estimate.uncertaintyCalibrated);
+    EXPECT_TRUE(tracker.contextualCompletionAuthorityReady(direction, estimate));
+    PhaseContextualCompletionEstimate const reverse = tracker.predictContextualCompletionDirection(
+        PhaseContextualPairDirection::kDecodeToPrefill, features, 8000.0, 4000.0);
+    EXPECT_FALSE(tracker.contextualCompletionAuthorityReady(PhaseContextualPairDirection::kDecodeToPrefill, reverse));
 }
 
 TEST(PhaseContextualCompletionCalibrationTest, SupportsPolicyOnlyAuthorityAblations)

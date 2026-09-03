@@ -79,6 +79,48 @@ enum class PhaseIpcKind
     kCalibrationEnd,
 };
 
+enum class PhasePolicyWarmupMode
+{
+    kGraphOnly,
+    kGeneric,
+    kTraceDerived,
+    kZeroStart,
+};
+
+PhasePolicyWarmupMode phasePolicyWarmupMode()
+{
+    std::string const value = std::getenv("TRT_EDGELLM_POLICY_WARMUP_MODE") != nullptr
+        ? std::getenv("TRT_EDGELLM_POLICY_WARMUP_MODE")
+        : "trace_derived";
+    ELLM_CHECK(value == "graph_only" || value == "generic" || value == "trace_derived" || value == "zero_start",
+        "TRT_EDGELLM_POLICY_WARMUP_MODE must be graph_only, generic, trace_derived, or zero_start");
+    if (value == "graph_only")
+    {
+        return PhasePolicyWarmupMode::kGraphOnly;
+    }
+    if (value == "generic")
+    {
+        return PhasePolicyWarmupMode::kGeneric;
+    }
+    if (value == "zero_start")
+    {
+        return PhasePolicyWarmupMode::kZeroStart;
+    }
+    return PhasePolicyWarmupMode::kTraceDerived;
+}
+
+char const* phasePolicyWarmupModeName(PhasePolicyWarmupMode mode) noexcept
+{
+    switch (mode)
+    {
+    case PhasePolicyWarmupMode::kGraphOnly: return "graph_only";
+    case PhasePolicyWarmupMode::kGeneric: return "generic";
+    case PhasePolicyWarmupMode::kTraceDerived: return "trace_derived";
+    case PhasePolicyWarmupMode::kZeroStart: return "zero_start";
+    }
+    return "unknown";
+}
+
 struct PhaseIpcInput
 {
     uint64_t requestId{};
@@ -1601,6 +1643,7 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
+        PhasePolicyWarmupMode const policyWarmupMode = phasePolicyWarmupMode();
         rt::PhaseRuntimeCostTrackerConfig runtimeCostConfig;
         runtimeCostConfig.action = semanticSchedulerConfig.globalCostModelConfig;
         runtimeCostConfig.decodeMinimumSamples = semanticSchedulerConfig.decodeComponentMinSamples;
@@ -1647,6 +1690,12 @@ int main(int argc, char** argv)
             "TRT_EDGELLM_CONTEXTUAL_EP_CONFIDENCE_BETA", runtimeCostConfig.contextualEp);
         configureContextualEncoderPair("TRT_EDGELLM_CONTEXTUAL_ED", "TRT_EDGELLM_CONTEXTUAL_ED_MIN_OBSERVATIONS",
             "TRT_EDGELLM_CONTEXTUAL_ED_CONFIDENCE_BETA", runtimeCostConfig.contextualEd);
+        if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly)
+        {
+            runtimeCostConfig.contextualPd.mode = rt::PhaseContextualPdMode::kDisabled;
+            runtimeCostConfig.contextualEp.mode = rt::PhaseContextualPdMode::kDisabled;
+            runtimeCostConfig.contextualEd.mode = rt::PhaseContextualPdMode::kDisabled;
+        }
         if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL"))
         {
             std::string const enabled(value);
@@ -1673,6 +1722,14 @@ int main(int argc, char** argv)
         if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_TARGET"))
         {
             runtimeCostConfig.completionCalibration.targetCoverage = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_COVERAGE_TOLERANCE"))
+        {
+            runtimeCostConfig.completionCalibration.authorityCoverageTolerance = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_MAX_FALSE_SAFE_RATE"))
+        {
+            runtimeCostConfig.completionCalibration.authorityMaximumFalseSafeRate = std::stod(value);
         }
         auto completionAblation = [](char const* variable, bool& setting) {
             if (char const* value = std::getenv(variable))
@@ -2237,8 +2294,13 @@ int main(int argc, char** argv)
             rt::PhaseSchedulerTelemetry const warmupTelemetry = semanticCoordinator.scheduler().telemetry();
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
-            semanticCoordinator.scheduler().resetHistory(
-                semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive);
+            semanticCoordinator.scheduler().resetSchedulingHistory();
+            if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
+                || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
+            {
+                semanticCoordinator.scheduler().resetExecutionCostHistory();
+                semanticCoordinator.scheduler().resetPolicyPosterior();
+            }
             if (serverConfig.enableCudaGraphs && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") == nullptr)
             {
                 // Retain the primed graph cache, but do not synchronously capture
@@ -2254,9 +2316,9 @@ int main(int argc, char** argv)
                 }
                 semanticCoordinator.setGraphCaptureMinObservations(graphCaptureMinObservations);
             }
-            LOG_INFO("Phase IPC shape warmup: batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
-                executionWarmupShapes.size(), warmedRequests, warmupTelemetry.overlapSampleCount,
-                warmupTelemetry.globalSafeProbeCount);
+            LOG_INFO("Phase IPC shape warmup: mode=%s batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
+                phasePolicyWarmupModeName(policyWarmupMode), executionWarmupShapes.size(), warmedRequests,
+                warmupTelemetry.overlapSampleCount, warmupTelemetry.globalSafeProbeCount);
             if (activityTimeline != nullptr)
             {
                 activityTimeline->reset(setupStream);
@@ -2767,7 +2829,13 @@ int main(int argc, char** argv)
                         calibration.setGlobalWarmupProbeMode(false);
                     }
                     semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
-                    semanticCoordinator.scheduler().resetHistory(true);
+                    semanticCoordinator.scheduler().resetSchedulingHistory();
+                    if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
+                        || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
+                    {
+                        semanticCoordinator.scheduler().resetExecutionCostHistory();
+                        semanticCoordinator.scheduler().resetPolicyPosterior();
+                    }
                     LOG_INFO(
                         "Phase encoder calibration: shapes=%zu isolated=%zu encoder_decode=%zu vision_requests=%zu",
                         encoderCalibrationBatches.size(), encoderCalibrationExecutions,
@@ -3148,19 +3216,25 @@ int main(int argc, char** argv)
                         }
                         size_t contextualRequiredDirections{};
                         size_t contextualReadyDirections{};
-                        auto const contextualDirectionCalibration
-                            = [&](rt::PhaseContextualPairDirection direction, size_t minimumObservations) {
-                                  rt::PhaseContextualPdTelemetry const& telemetry
-                                      = runtimeCostTracker->contextualDirectionTelemetry(direction);
-                                  bool const required = telemetry.predictions > 0U || telemetry.observations > 0U;
-                                  bool const ready = required && telemetry.observations >= minimumObservations;
-                                  contextualRequiredDirections += required ? 1U : 0U;
-                                  contextualReadyDirections += ready ? 1U : 0U;
-                                  return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
-                                      {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
-                                      {"minimum_observations", minimumObservations}, {"required", required},
-                                      {"ready", ready}};
-                              };
+                        auto const contextualDirectionCalibration = [&](rt::PhaseContextualPairDirection direction,
+                                                                        size_t minimumObservations) {
+                            rt::PhaseContextualPdTelemetry const& telemetry
+                                = runtimeCostTracker->contextualDirectionTelemetry(direction);
+                            rt::PhaseContextualCompletionTelemetry const& completion
+                                = runtimeCostTracker->contextualCompletionDirectionTelemetry(direction);
+                            bool const required = telemetry.predictions > 0U || telemetry.observations > 0U;
+                            bool const ready = required && telemetry.observations >= minimumObservations;
+                            contextualRequiredDirections += required ? 1U : 0U;
+                            contextualReadyDirections += ready ? 1U : 0U;
+                            return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
+                                {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
+                                {"minimum_observations", minimumObservations}, {"required", required}, {"ready", ready},
+                                {"completion_ready_observations", completion.readyCalibrationObservations},
+                                {"completion_conformal_observations", completion.conformalCalibrationObservations},
+                                {"completion_conformal_false_safe", completion.conformalFalseSafeObservations},
+                                {"completion_authority_evidence_ready",
+                                    runtimeCostTracker->contextualCompletionAuthorityEvidenceReady(direction)}};
+                        };
                         auto const contextualFamilyCalibration = [&](rt::PhaseContextualPairKind kind,
                                                                      rt::PhaseContextualPairDirection first,
                                                                      rt::PhaseContextualPairDirection second) {
@@ -3213,6 +3287,13 @@ int main(int argc, char** argv)
                         }
                         if (input.kind == PhaseIpcKind::kCalibrationEnd)
                         {
+                            semanticCoordinator.scheduler().resetSchedulingHistory();
+                            if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
+                                || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
+                            {
+                                semanticCoordinator.scheduler().resetExecutionCostHistory();
+                                semanticCoordinator.scheduler().resetPolicyPosterior();
+                            }
                             ++measurementEpoch;
                             if (ipcThreePhase != nullptr)
                             {
@@ -3222,6 +3303,13 @@ int main(int argc, char** argv)
                             phaseTimelineEvents.clear();
                             encoderBatchMetrics.clear();
                             formationEpisodes.clear();
+                            if (activityTimeline != nullptr)
+                            {
+                                // Generic/trace-derived HTTP calibration uses
+                                // the real phase streams. Start the measured
+                                // activity window only after that work drains.
+                                activityTimeline->reset(setupStream);
+                            }
                             emitRecord("PHASE_EPOCH\t", {{"epoch", measurementEpoch}, {"kind", "measurement"}});
                         }
                         char const* calibrationAction = input.kind == PhaseIpcKind::kCalibrationBegin ? "begin"
@@ -3229,6 +3317,7 @@ int main(int argc, char** argv)
                                                                                                       : "status";
                         emitEvent({{"type", "control"}, {"request_index", requestId},
                             {"calibration", calibrationAction}, {"epoch", measurementEpoch},
+                            {"policy_warmup_mode", phasePolicyWarmupModeName(policyWarmupMode)},
                             {"encoder_prefill_probes", calibrationMetrics.globalEncoderPrefillSelections},
                             {"residual_augmentation_opportunities",
                                 calibrationMetrics.globalResidualAugmentationOpportunities},
@@ -3424,6 +3513,8 @@ int main(int argc, char** argv)
                             {"encoder_prefill", conformalCalibrationJson(rt::PhaseContextualPairKind::kEncoderPrefill)},
                             {"encoder_decode", conformalCalibrationJson(rt::PhaseContextualPairKind::kEncoderDecode)}};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
+                        {"measurement_epoch", measurementEpoch},
+                        {"policy_warmup_mode", phasePolicyWarmupModeName(policyWarmupMode)},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
                         {"host_scheduler_decision_us", metrics.hostSchedulerDecisionUs},
                         {"host_dispatch_start_us", static_cast<double>(metrics.hostDispatchStartNs) / 1000.0},
