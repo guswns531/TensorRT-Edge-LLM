@@ -123,6 +123,7 @@ char const* phasePolicyWarmupModeName(PhasePolicyWarmupMode mode) noexcept
 
 struct PhaseIpcInput
 {
+    uint64_t ingressSequence{};
     uint64_t requestId{};
     PhaseIpcKind kind{PhaseIpcKind::kSubmit};
     bool valid{true};
@@ -132,6 +133,35 @@ struct PhaseIpcInput
     rt::PhaseSchedulingHints scheduling;
     double adapterUs{};
 };
+
+enum class PhaseIpcOrderingClass : uint8_t
+{
+    kText,
+    kVision,
+    kBarrier,
+};
+
+struct PendingPhaseIpcInput
+{
+    PhaseIpcOrderingClass orderingClass{PhaseIpcOrderingClass::kText};
+    std::future<PhaseIpcInput> task;
+};
+
+PhaseIpcOrderingClass phaseIpcOrderingClass(std::string const& line) noexcept
+{
+    if (line.find("\"type\":\"calibration_") != std::string::npos
+        || line.find("\"type\": \"calibration_") != std::string::npos
+        || line.find("\"type\":\"cancel\"") != std::string::npos
+        || line.find("\"type\": \"cancel\"") != std::string::npos)
+    {
+        return PhaseIpcOrderingClass::kBarrier;
+    }
+    if (line.find("\"image_url\"") != std::string::npos)
+    {
+        return PhaseIpcOrderingClass::kVision;
+    }
+    return PhaseIpcOrderingClass::kText;
+}
 
 PhaseIpcInput parsePhaseIpcInput(std::string const& line, int32_t defaultMaxOutputTokens)
 {
@@ -2303,12 +2333,18 @@ int main(int argc, char** argv)
             }
             ELLM_CHECK(semanticServer.empty() && ownership.availableSlots() == maxStableSlots,
                 "Phase IPC shape warmup did not release every stable slot");
+            CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+            CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+            CUDA_CHECK(cudaStreamSynchronize(copyStream));
+            CUDA_CHECK(cudaStreamSynchronize(setupStream));
             semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
             rt::PhaseSchedulerTelemetry const warmupTelemetry = semanticCoordinator.scheduler().telemetry();
             // Shape priming is not production traffic. Keep graph entries, but
             // do not let synthetic queue waits drive adaptive admission.
             semanticCoordinator.scheduler().resetSchedulingHistory();
-            semanticCoordinator.scheduler().resetCompletionAuthorityEvidence();
+            // Completion-authority evidence is deliberately retained. It is
+            // collected from held-out warmup observations and belongs to the
+            // calibrated physical model, not to serving-policy telemetry.
             if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
                 || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
             {
@@ -2843,8 +2879,14 @@ int main(int argc, char** argv)
                         calibration.setGlobalWarmupProbeMode(false);
                     }
                     semanticCoordinator.scheduler().setGlobalWarmupProbeMode(false);
+                    CUDA_CHECK(cudaStreamSynchronize(ipcEncoderStream));
+                    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+                    CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+                    CUDA_CHECK(cudaStreamSynchronize(copyStream));
+                    CUDA_CHECK(cudaStreamSynchronize(setupStream));
                     semanticCoordinator.scheduler().resetSchedulingHistory();
-                    semanticCoordinator.scheduler().resetCompletionAuthorityEvidence();
+                    // Preserve held-out completion evidence across the epoch
+                    // transition; only serving-policy history is reset.
                     if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
                         || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
                     {
@@ -2906,7 +2948,7 @@ int main(int argc, char** argv)
             ELLM_CHECK(requestAdapterWorkers > 0, "IPC request adapter worker count must be positive");
             std::deque<std::string> pendingLines;
             std::deque<PhaseIpcInput> pendingInputs;
-            std::deque<std::future<PhaseIpcInput>> pendingInputTasks;
+            std::deque<PendingPhaseIpcInput> pendingInputTasks;
             std::mutex pendingMutex;
             std::condition_variable inputAdapterReady;
             bool inputClosed{};
@@ -3094,9 +3136,28 @@ int main(int argc, char** argv)
             size_t ipcRequestAdapterInputs{};
             size_t ipcRequestAdapterOutOfOrderCompletions{};
             size_t ipcRequestAdapterMaxReadyBypass{};
-            bool const allowOutOfOrderAdapterCompletion
-                = std::getenv("TRT_EDGELLM_DISABLE_IPC_ADAPTER_OUT_OF_ORDER") == nullptr;
+            bool allowOutOfOrderAdapterCompletion{true};
+            char const* const canonicalVisionOrder = std::getenv("TRT_EDGELLM_CANONICAL_VISION_ADAPTER_ORDER");
+            char const* const disableOutOfOrder = std::getenv("TRT_EDGELLM_DISABLE_IPC_ADAPTER_OUT_OF_ORDER");
+            ELLM_CHECK(canonicalVisionOrder == nullptr || disableOutOfOrder == nullptr,
+                "TRT_EDGELLM_CANONICAL_VISION_ADAPTER_ORDER and "
+                "TRT_EDGELLM_DISABLE_IPC_ADAPTER_OUT_OF_ORDER cannot both be set");
+            if (canonicalVisionOrder != nullptr)
+            {
+                std::string const enabled(canonicalVisionOrder);
+                ELLM_CHECK(
+                    enabled == "0" || enabled == "1", "TRT_EDGELLM_CANONICAL_VISION_ADAPTER_ORDER must be 0 or 1");
+                allowOutOfOrderAdapterCompletion = enabled == "0";
+            }
+            else if (disableOutOfOrder != nullptr)
+            {
+                std::string const disabled(disableOutOfOrder);
+                ELLM_CHECK(
+                    disabled == "0" || disabled == "1", "TRT_EDGELLM_DISABLE_IPC_ADAPTER_OUT_OF_ORDER must be 0 or 1");
+                allowOutOfOrderAdapterCompletion = disabled == "0";
+            }
             std::thread inputReader([&]() {
+                uint64_t ingressSequence{};
                 std::string line;
                 while (std::getline(std::cin, line))
                 {
@@ -3107,16 +3168,20 @@ int main(int argc, char** argv)
                             std::unique_lock<std::mutex> lock(pendingMutex);
                             inputAdapterReady.wait(
                                 lock, [&]() { return pendingInputTasks.size() < requestAdapterWorkers; });
-                            pendingInputTasks.push_back(std::async(std::launch::async,
-                                [line = std::move(line),
-                                    defaultMaxOutputTokens = serverConfig.defaultMaxOutputTokens]() {
-                                    auto const adapterStart = std::chrono::steady_clock::now();
-                                    PhaseIpcInput input = parsePhaseIpcInput(line, defaultMaxOutputTokens);
-                                    input.adapterUs = std::chrono::duration<double, std::micro>(
-                                        std::chrono::steady_clock::now() - adapterStart)
-                                                          .count();
-                                    return input;
-                                }));
+                            uint64_t const sequence = ingressSequence++;
+                            PhaseIpcOrderingClass const orderingClass = phaseIpcOrderingClass(line);
+                            pendingInputTasks.push_back({orderingClass,
+                                std::async(std::launch::async,
+                                    [line = std::move(line), sequence,
+                                        defaultMaxOutputTokens = serverConfig.defaultMaxOutputTokens]() {
+                                        auto const adapterStart = std::chrono::steady_clock::now();
+                                        PhaseIpcInput input = parsePhaseIpcInput(line, defaultMaxOutputTokens);
+                                        input.ingressSequence = sequence;
+                                        input.adapterUs = std::chrono::duration<double, std::micro>(
+                                            std::chrono::steady_clock::now() - adapterStart)
+                                                              .count();
+                                        return input;
+                                    })});
                         }
                         else
                         {
@@ -3158,20 +3223,40 @@ int main(int argc, char** argv)
                         if (allowOutOfOrderAdapterCompletion)
                         {
                             readyTask = std::find_if(pendingInputTasks.begin(), pendingInputTasks.end(),
-                                [](std::future<PhaseIpcInput>& candidate) {
-                                    return candidate.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                                [](PendingPhaseIpcInput& candidate) {
+                                    return candidate.task.wait_for(std::chrono::seconds(0))
+                                        == std::future_status::ready;
                                 });
                         }
-                        else if (readyTask->wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                        else
                         {
-                            readyTask = pendingInputTasks.end();
+                            auto const firstVision = std::find_if(pendingInputTasks.begin(), pendingInputTasks.end(),
+                                [](PendingPhaseIpcInput const& candidate) {
+                                    return candidate.orderingClass == PhaseIpcOrderingClass::kVision;
+                                });
+                            auto const barrier = std::find_if(pendingInputTasks.begin(), pendingInputTasks.end(),
+                                [](PendingPhaseIpcInput const& candidate) {
+                                    return candidate.orderingClass == PhaseIpcOrderingClass::kBarrier;
+                                });
+                            readyTask = std::find_if(pendingInputTasks.begin(),
+                                barrier == pendingInputTasks.end() ? pendingInputTasks.end() : std::next(barrier),
+                                [&](PendingPhaseIpcInput& candidate) {
+                                    bool const orderedVision = candidate.orderingClass != PhaseIpcOrderingClass::kVision
+                                        || &candidate == &*firstVision;
+                                    bool const orderedBarrier
+                                        = candidate.orderingClass != PhaseIpcOrderingClass::kBarrier
+                                        || &candidate == &pendingInputTasks.front();
+                                    return orderedVision && orderedBarrier
+                                        && candidate.task.wait_for(std::chrono::seconds(0))
+                                        == std::future_status::ready;
+                                });
                         }
                         if (readyTask == pendingInputTasks.end())
                         {
                             break;
                         }
                         readyTaskIndex = static_cast<size_t>(std::distance(pendingInputTasks.begin(), readyTask));
-                        task = std::move(*readyTask);
+                        task = std::move(readyTask->task);
                         pendingInputTasks.erase(readyTask);
                     }
                     ipcRequestAdapterOutOfOrderCompletions += readyTaskIndex > 0U ? 1U : 0U;
@@ -3181,6 +3266,13 @@ int main(int argc, char** argv)
                     ipcRequestAdapterUs += input.adapterUs;
                     ++ipcRequestAdapterInputs;
                     inputs.push_back(std::move(input));
+                }
+                if (inputs.size() > 1U)
+                {
+                    std::stable_sort(
+                        inputs.begin(), inputs.end(), [](PhaseIpcInput const& left, PhaseIpcInput const& right) {
+                            return left.ingressSequence < right.ingressSequence;
+                        });
                 }
                 bool madeProgress = !lines.empty() || !inputs.empty();
                 auto const ingressStart = std::chrono::steady_clock::now();
@@ -3359,8 +3451,24 @@ int main(int argc, char** argv)
                         }
                         if (input.kind == PhaseIpcKind::kCalibrationEnd)
                         {
+                            CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+                            CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+                            if (ipcEncoderStream != nullptr)
+                            {
+                                CUDA_CHECK(cudaStreamSynchronize(ipcEncoderStream));
+                            }
+                            CUDA_CHECK(cudaStreamSynchronize(copyStream));
+                            CUDA_CHECK(cudaStreamSynchronize(setupStream));
+                            if (activityTimeline != nullptr)
+                            {
+                                activityTimeline->drain();
+                                ELLM_CHECK(activityTimeline->pendingCount() == 0U,
+                                    "Calibration ended with an outstanding E/P/D/Copy activity interval");
+                            }
                             semanticCoordinator.scheduler().resetSchedulingHistory();
-                            semanticCoordinator.scheduler().resetCompletionAuthorityEvidence();
+                            // All physical observations are now complete and
+                            // immutable. Retain validation evidence while
+                            // starting serving-policy telemetry at zero.
                             if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly
                                 || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
                             {
@@ -4471,8 +4579,11 @@ int main(int argc, char** argv)
                 phaseTelemetryLevel.c_str());
             LOG_INFO("Phase IPC response path: native_callback");
             LOG_INFO(
-                "Phase IPC request adapter: inputs=%zu total=%.3f ms out_of_order_completions=%zu max_ready_bypass=%zu",
-                ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, ipcRequestAdapterOutOfOrderCompletions,
+                "Phase IPC request adapter: inputs=%zu total=%.3f ms vision_canonical=%s "
+                "unrestricted_out_of_order=%s "
+                "out_of_order_completions=%zu max_ready_bypass=%zu",
+                ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, allowOutOfOrderAdapterCompletion ? "no" : "yes",
+                allowOutOfOrderAdapterCompletion ? "yes" : "no", ipcRequestAdapterOutOfOrderCompletions,
                 ipcRequestAdapterMaxReadyBypass);
             LOG_INFO(
                 "Phase page reservation: mode=%s base=%d guaranteed=%d growth_owners=%zu growth_pending=%zu "
