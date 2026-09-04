@@ -607,6 +607,33 @@
         "contextual_completion_ready": {
           "type": "boolean"
         },
+        "contextual_effect_valid": {
+          "type": "boolean"
+        },
+        "contextual_effect_ready": {
+          "type": "boolean"
+        },
+        "contextual_effect_compression_mean": {
+          "type": "number"
+        },
+        "contextual_effect_compression_uncertainty": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_effect_incumbent_stretch_mean": {
+          "type": "number"
+        },
+        "contextual_effect_incumbent_stretch_uncertainty": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextual_effect_order_margin_mean": {
+          "type": "number"
+        },
+        "contextual_effect_order_margin_uncertainty": {
+          "type": "number",
+          "minimum": 0
+        },
         "contextual_incumbent_mean_us": {
           "type": "number",
           "minimum": 0

@@ -384,6 +384,8 @@ struct PhaseUnifiedCandidateSnapshot
     PhaseContextualPdFeatures contextualCompletionFeatures{};
     PhaseContextualPairDirection contextualDirection{PhaseContextualPairDirection::kPrefillToDecode};
     PhaseContextualCompletionEstimate contextualCompletion;
+    bool contextualEffectValid{};
+    PhaseContextualEffectEstimate contextualEffect;
     double contextualIncumbentReferenceUs{};
     double contextualNewcomerReferenceUs{};
     double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};

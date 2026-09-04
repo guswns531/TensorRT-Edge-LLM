@@ -427,6 +427,56 @@ PhaseContextualPdTelemetry const& PhaseContextualPdModel::telemetry() const noex
     return mTelemetry;
 }
 
+PhaseContextualEffectModel::PhaseContextualEffectModel(PhaseContextualPdModelConfig config)
+    : mCompression(config)
+    , mIncumbentStretch(config)
+    , mCompletionOrder(config)
+{
+}
+
+PhaseContextualEffectEstimate PhaseContextualEffectModel::predict(PhaseContextualPdFeatures const& features)
+{
+    return {mCompression.predict(features), mIncumbentStretch.predict(features), mCompletionOrder.predict(features)};
+}
+
+bool PhaseContextualEffectModel::observe(PhaseContextualPdFeatures const& features, double normalizedCompression,
+    double normalizedIncumbentStretch, double normalizedCompletionOrderMargin, double weight)
+{
+    // Validate every output before updating any posterior. A partially
+    // consumed label would make the three heads refer to different epochs.
+    if (!std::isfinite(normalizedCompression) || !std::isfinite(normalizedIncumbentStretch)
+        || !std::isfinite(normalizedCompletionOrderMargin) || !std::isfinite(weight) || weight <= 0.0)
+    {
+        return false;
+    }
+    bool const compression = mCompression.observe(features, normalizedCompression, weight);
+    bool const incumbent = mIncumbentStretch.observe(features, normalizedIncumbentStretch, weight);
+    bool const order = mCompletionOrder.observe(features, normalizedCompletionOrderMargin, weight);
+    return compression && incumbent && order;
+}
+
+void PhaseContextualEffectModel::reset() noexcept
+{
+    mCompression.reset();
+    mIncumbentStretch.reset();
+    mCompletionOrder.reset();
+}
+
+PhaseContextualPdTelemetry const& PhaseContextualEffectModel::compressionTelemetry() const noexcept
+{
+    return mCompression.telemetry();
+}
+
+PhaseContextualPdTelemetry const& PhaseContextualEffectModel::incumbentStretchTelemetry() const noexcept
+{
+    return mIncumbentStretch.telemetry();
+}
+
+PhaseContextualPdTelemetry const& PhaseContextualEffectModel::completionOrderTelemetry() const noexcept
+{
+    return mCompletionOrder.telemetry();
+}
+
 PhaseContextualCompletionModel::PhaseContextualCompletionModel(PhaseContextualPdModelConfig config)
     : mConfig(completionModelConfig(config))
     , mIncumbent(mConfig)

@@ -2282,6 +2282,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             candidate.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
                 contextualDirection, candidate.contextualCompletionFeatures,
                 candidate.contextualCompletionIncumbentReferenceUs, candidate.contextualCompletionNewcomerReferenceUs);
+            candidate.contextualEffect = mRuntimeCostTracker->predictContextualEffectDirection(
+                contextualDirection, candidate.contextualCompletionFeatures);
+            candidate.contextualEffectValid = true;
             PhaseContextualPdEstimate const contextual
                 = mRuntimeCostTracker->predictContextualDirection(contextualDirection, candidate.contextualPdFeatures);
             candidate.contextualPdMean = contextual.mean;
@@ -2974,6 +2977,9 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         overlap.contextualCompletion
             = mRuntimeCostTracker->predictContextualCompletionDirection(direction, overlap.contextualCompletionFeatures,
                 overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
+        overlap.contextualEffect
+            = mRuntimeCostTracker->predictContextualEffectDirection(direction, overlap.contextualCompletionFeatures);
+        overlap.contextualEffectValid = true;
         PhaseContextualPdEstimate const contextual
             = mRuntimeCostTracker->predictContextualDirection(direction, overlap.contextualPdFeatures);
         overlap.contextualPdMean = contextual.mean;

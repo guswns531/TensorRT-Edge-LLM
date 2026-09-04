@@ -145,4 +145,122 @@ private:
     std::unordered_map<uint64_t, PhaseCompletionVector> mVectors;
 };
 
+//! Fidelity of the physical outcome injected into an immutable replay. The
+//! transition mechanism never changes with this value; it is telemetry for
+//! predictor ablation and authority gates.
+enum class PhaseOutcomeFidelity : uint8_t
+{
+    kScalarEnvelope,
+    kEffectVector,
+    kCompletionVector,
+    kMeasuredReplay,
+};
+
+//! One isolated component reference at the frozen dispatch boundary.
+struct PhaseOutcomeComponentReference
+{
+    PhaseUnifiedPhase phase{PhaseUnifiedPhase::kNone};
+    uint64_t executionId{};
+    double isolatedReferenceUs{};
+    bool incumbent{};
+};
+
+//! A predictor may return more than one physically plausible completion
+//! order. Scalar prediction intentionally returns both orders; richer models
+//! may collapse the envelope only when their confidence excludes reversal.
+struct PhaseOutcomeEnvelope
+{
+    uint64_t actionId{};
+    PhaseOutcomeFidelity fidelity{PhaseOutcomeFidelity::kScalarEnvelope};
+    std::vector<PhaseCompletionVector> alternatives;
+    bool ready{};
+};
+
+//! Immutable, in-process decision state. The live coordinator and allocators
+//! are never referenced after construction, which makes branch comparison
+//! exact and repeatable within one process.
+struct PhaseFrozenDecisionSnapshot
+{
+    uint64_t snapshotId{};
+    uint64_t scalarPolicyStateSignature{};
+    PhaseIncrementalProjectionSnapshot projection;
+    std::vector<PhaseIncrementalAction> frontier;
+};
+
+enum class PhaseFrozenReplayReason : uint8_t
+{
+    kReplayed,
+    kInvalidSnapshot,
+    kMissingAction,
+    kActionNotLegal,
+    kEnvelopeNotReady,
+    kEnvelopeActionMismatch,
+    kInvalidOutcome,
+};
+
+struct PhaseFrozenReplayTrajectory
+{
+    bool valid{};
+    std::vector<PhaseIncrementalProjection> boundaries;
+    double robustHorizonUs{};
+    size_t encoderReadyRows{};
+    size_t prefillReadyRows{};
+    size_t decodeReadyRows{};
+    PhaseProjectedOwnership ownership;
+};
+
+struct PhaseFrozenReplayResult
+{
+    bool valid{};
+    PhaseFrozenReplayReason reason{PhaseFrozenReplayReason::kInvalidSnapshot};
+    uint64_t snapshotId{};
+    uint64_t actionId{};
+    PhaseOutcomeFidelity fidelity{PhaseOutcomeFidelity::kScalarEnvelope};
+    std::vector<PhaseFrozenReplayTrajectory> trajectories;
+    double worstCaseRobustHorizonUs{};
+};
+
+//! Decision-relevant effect estimate used to materialize an outcome envelope.
+//! Margins are normalized by the sum of isolated component references.
+struct PhaseEffectOutcomeEstimate
+{
+    double compressionMean{};
+    double compressionUncertainty{};
+    double incumbentStretchMean{};
+    double incumbentStretchUncertainty{};
+    double orderMarginMean{};
+    double orderMarginUncertainty{};
+    bool ready{};
+};
+
+char const* phaseFrozenReplayReasonName(PhaseFrozenReplayReason reason) noexcept;
+
+//! Validate and freeze a policy snapshot. The returned ID covers request/DAG
+//! state, canonical row order, ownership, in-flight work, candidate frontier,
+//! and the scalar model state supplied by the caller.
+std::optional<PhaseFrozenDecisionSnapshot> phaseFreezeDecisionSnapshot(PhaseIncrementalProjectionSnapshot projection,
+    std::vector<PhaseIncrementalAction> frontier, uint64_t scalarPolicyStateSignature) noexcept;
+
+//! Build a conservative two-order envelope from a scalar makespan. This never
+//! invents an external arrival or claims to know which component finishes first.
+PhaseOutcomeEnvelope phaseScalarOutcomeEnvelope(uint64_t actionId,
+    std::vector<PhaseOutcomeComponentReference> const& components, double actionMakespanUs,
+    double uncertaintyUs) noexcept;
+
+//! Build the smallest completion envelope consistent with three normalized
+//! effects. If the completion-order confidence interval crosses zero, both
+//! physical orders are retained.
+PhaseOutcomeEnvelope phaseEffectOutcomeEnvelope(uint64_t actionId,
+    std::vector<PhaseOutcomeComponentReference> const& components, PhaseEffectOutcomeEstimate const& estimate) noexcept;
+
+//! Wrap a directly predicted or measured physical completion vector.
+PhaseOutcomeEnvelope phaseCompletionOutcomeEnvelope(
+    PhaseCompletionVector completion, PhaseOutcomeFidelity fidelity, bool ready = true) noexcept;
+
+//! Replay every envelope alternative for at most two request-ready boundaries.
+//! The worst-case robust horizon is suitable for the SLO guard; individual
+//! trajectories remain available for dominance and diagnostic analysis.
+PhaseFrozenReplayResult phaseReplayFrozenOutcome(PhaseFrozenDecisionSnapshot const& snapshot, uint64_t actionId,
+    PhaseOutcomeEnvelope const& envelope, double uncertaintyScale = 1.0) noexcept;
+
 } // namespace trt_edgellm::rt

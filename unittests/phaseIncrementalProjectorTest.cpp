@@ -49,6 +49,22 @@ bool hasNewcomer(std::vector<PhaseIncrementalAction> const& actions, PhaseUnifie
     });
 }
 
+PhaseIncrementalProjectionSnapshot encoderPrefillProjection()
+{
+    PhaseIncrementalProjectionSnapshot snapshot;
+    snapshot.epoch = 9U;
+    snapshot.inFlight.hostSnapshotNs = 1000U;
+    snapshot.inFlight.outstanding = PhaseExecutionSet::kEncoder | PhaseExecutionSet::kPrefill;
+    snapshot.inFlight.work
+        = {inFlight(PhaseUnifiedPhase::kEncoder, 71U, {701U}), inFlight(PhaseUnifiedPhase::kPrefill, 72U, {702U})};
+    snapshot.requests = {
+        {701U, PhaseProjectedRequestStage::kEncoder, 1, 2, 0, 100U, 1000U},
+        {702U, PhaseProjectedRequestStage::kPrefill, 2, 2, 0, 200U, 2000U, true},
+    };
+    snapshot.ownership = phaseProjectedOwnership(snapshot.requests);
+    return snapshot;
+}
+
 TEST(PhaseIncrementalProjectorTest, ReplayPredictorReturnsOnlyExactLegalActionIdentity)
 {
     PhaseIncrementalAction const action
@@ -235,6 +251,80 @@ TEST(PhaseIncrementalProjectorTest, RejectsACompletionVectorWithReversedIncumben
 
     EXPECT_FALSE(result.valid);
     EXPECT_EQ(result.reason, PhaseProjectionReason::kInvalidCompletionVector);
+}
+
+TEST(PhaseFrozenReplayTest, FreezesCompletePolicyStateAndRejectsOwnershipMismatch)
+{
+    PhaseIncrementalAction const action
+        = pairAction(PhaseGlobalActionKind::kEncoderPrefill, PhaseUnifiedActionDirection::kEncoderToPrefill);
+    PhaseIncrementalProjectionSnapshot projection = encoderPrefillProjection();
+    std::optional<PhaseFrozenDecisionSnapshot> const frozen = phaseFreezeDecisionSnapshot(projection, {action}, 1234U);
+
+    ASSERT_TRUE(frozen.has_value());
+    EXPECT_NE(frozen->snapshotId, 0U);
+    EXPECT_EQ(frozen->scalarPolicyStateSignature, 1234U);
+    projection.ownership.visionBytes += 1U;
+    EXPECT_FALSE(phaseFreezeDecisionSnapshot(projection, {action}, 1234U).has_value());
+}
+
+TEST(PhaseFrozenReplayTest, ScalarEnvelopePreservesBothCompletionOrders)
+{
+    PhaseIncrementalAction const action
+        = pairAction(PhaseGlobalActionKind::kEncoderPrefill, PhaseUnifiedActionDirection::kEncoderToPrefill);
+    std::optional<PhaseFrozenDecisionSnapshot> const frozen
+        = phaseFreezeDecisionSnapshot(encoderPrefillProjection(), {action}, 11U);
+    ASSERT_TRUE(frozen.has_value());
+    PhaseOutcomeEnvelope const envelope = phaseScalarOutcomeEnvelope(action.actionId,
+        {{PhaseUnifiedPhase::kEncoder, 71U, 6.0, true}, {PhaseUnifiedPhase::kPrefill, 72U, 4.0, false}}, 10.0, 0.5);
+
+    ASSERT_TRUE(envelope.ready);
+    ASSERT_EQ(envelope.alternatives.size(), 2U);
+    PhaseFrozenReplayResult const replay = phaseReplayFrozenOutcome(*frozen, action.actionId, envelope);
+
+    ASSERT_TRUE(replay.valid) << phaseFrozenReplayReasonName(replay.reason);
+    ASSERT_EQ(replay.trajectories.size(), 2U);
+    ASSERT_EQ(replay.trajectories[0].boundaries.size(), 2U);
+    ASSERT_EQ(replay.trajectories[1].boundaries.size(), 2U);
+    EXPECT_EQ(replay.trajectories[0].boundaries.front().completed.phase, PhaseUnifiedPhase::kEncoder);
+    EXPECT_EQ(replay.trajectories[1].boundaries.front().completed.phase, PhaseUnifiedPhase::kPrefill);
+    for (PhaseFrozenReplayTrajectory const& trajectory : replay.trajectories)
+    {
+        EXPECT_EQ(trajectory.prefillReadyRows, 1U);
+        EXPECT_EQ(trajectory.decodeReadyRows, 1U);
+        EXPECT_EQ(trajectory.ownership.visionBytes, 100U);
+        EXPECT_EQ(trajectory.ownership.kvBytes, 2000U);
+        EXPECT_EQ(trajectory.ownership.reclaimedVisionBytes, 200U);
+    }
+}
+
+TEST(PhaseFrozenReplayTest, EffectEnvelopeRetainsOrderUncertainty)
+{
+    PhaseIncrementalAction const action
+        = pairAction(PhaseGlobalActionKind::kEncoderPrefill, PhaseUnifiedActionDirection::kEncoderToPrefill);
+    PhaseEffectOutcomeEstimate const uncertain{0.2, 0.02, 0.1, 0.03, 0.01, 0.05, true};
+    PhaseOutcomeEnvelope const envelope = phaseEffectOutcomeEnvelope(action.actionId,
+        {{PhaseUnifiedPhase::kEncoder, 71U, 6.0, true}, {PhaseUnifiedPhase::kPrefill, 72U, 4.0, false}}, uncertain);
+
+    ASSERT_TRUE(envelope.ready);
+    ASSERT_EQ(envelope.alternatives.size(), 2U);
+    EXPECT_LT(envelope.alternatives[0].components[1].completionUs, envelope.alternatives[0].components[0].completionUs);
+    EXPECT_GT(envelope.alternatives[1].components[1].completionUs, envelope.alternatives[1].components[0].completionUs);
+}
+
+TEST(PhaseFrozenReplayTest, RejectsOutcomeForADifferentAction)
+{
+    PhaseIncrementalAction const action
+        = pairAction(PhaseGlobalActionKind::kEncoderPrefill, PhaseUnifiedActionDirection::kEncoderToPrefill);
+    std::optional<PhaseFrozenDecisionSnapshot> const frozen
+        = phaseFreezeDecisionSnapshot(encoderPrefillProjection(), {action}, 11U);
+    ASSERT_TRUE(frozen.has_value());
+    PhaseOutcomeEnvelope envelope = phaseScalarOutcomeEnvelope(action.actionId,
+        {{PhaseUnifiedPhase::kEncoder, 71U, 6.0, true}, {PhaseUnifiedPhase::kPrefill, 72U, 4.0, false}}, 10.0, 0.5);
+    ++envelope.actionId;
+
+    PhaseFrozenReplayResult const replay = phaseReplayFrozenOutcome(*frozen, action.actionId, envelope);
+    EXPECT_FALSE(replay.valid);
+    EXPECT_EQ(replay.reason, PhaseFrozenReplayReason::kEnvelopeActionMismatch);
 }
 
 } // namespace

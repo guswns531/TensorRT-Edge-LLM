@@ -1576,6 +1576,8 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
             ? source.contextualEncoderPairDirection
             : phaseContextualPairDirection(source.key.kind, source.key.residualAnchor);
         snapshot.contextualCompletion = source.contextualCompletion;
+        snapshot.contextualEffectValid = source.contextualEffectValid;
+        snapshot.contextualEffect = source.contextualEffect;
         snapshot.contextualIncumbentReferenceUs = source.contextualCompletionIncumbentReferenceUs;
         snapshot.contextualNewcomerReferenceUs = source.contextualCompletionNewcomerReferenceUs;
         snapshot.contextualMinimumSlackUs = source.contextualCompletionMinimumSlackUs;
@@ -3116,6 +3118,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             overlap.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
                 overlap.contextualEncoderPairDirection, overlap.contextualEncoderCompletionFeatures,
                 overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
+            overlap.contextualEffect = mRuntimeCostTracker->predictContextualEffectDirection(
+                overlap.contextualEncoderPairDirection, overlap.contextualEncoderCompletionFeatures);
+            overlap.contextualEffectValid = true;
             if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
             {
                 overlap.decisionCostKnown = true;

@@ -217,19 +217,21 @@ def _set_docker_environment(command: list[str], name: str, value: str) -> None:
     command[image_index:image_index] = ["-e", f"{name}={value}"]
 
 
-def materialize_command(entry: dict[str, Any],
-                        policy: str,
-                        output_root: Path,
-                        host_workspace: Path,
-                        container_workspace: Path,
-                        plugin_path: str,
-                        binary_path: str,
-                        matrix_repeat: int = 1,
-                        telemetry_level: str = "research",
-                        warmup_requests: int | None = None,
-                        backend_environment: dict[str, str] | None = None,
-                        trace_path: Path | None = None
-                        ) -> dict[str, Any]:
+def materialize_command(
+    entry: dict[str, Any],
+    policy: str,
+    output_root: Path,
+    host_workspace: Path,
+    container_workspace: Path,
+    plugin_path: str,
+    binary_path: str,
+    matrix_repeat: int = 1,
+    telemetry_level: str = "research",
+    warmup_requests: int | None = None,
+    backend_environment: dict[str, str] | None = None,
+    trace_path: Path | None = None,
+    policy_warmup_mode: str | None = None,
+) -> dict[str, Any]:
     """Return one event-enabled, one-repeat command without changing its trace contract."""
     if policy not in POLICY_ENVIRONMENTS:
         raise ValueError(f"unknown policy: {policy}")
@@ -243,6 +245,10 @@ def materialize_command(entry: dict[str, Any],
         _replace_option(command, "--warmup-requests", str(warmup_requests))
         _replace_option(command, "--phase-calibration-min-requests",
                         str(warmup_requests))
+        if warmup_requests == 0 and policy_warmup_mode is None:
+            policy_warmup_mode = "zero_start"
+    if policy_warmup_mode is not None:
+        _replace_option(command, "--policy-warmup-mode", policy_warmup_mode)
     trace_index = command.index("--trace") + 1
     selected_trace = trace_path or Path(command[trace_index])
     if not selected_trace.is_absolute():
@@ -308,12 +314,16 @@ def main() -> int:
         type=int,
         help="override the source manifest's generic warm-up budget")
     parser.add_argument(
-        "--backend-env",
-        action="append",
-        default=[],
-        metavar="NAME=VALUE",
-        help="inject a research backend environment variable")
-    parser.add_argument("--trace", type=Path,
+        "--policy-warmup-mode",
+        choices=("graph_only", "zero_start", "generic", "trace_derived"),
+        help="override warm-up provenance together with its request budget")
+    parser.add_argument("--backend-env",
+                        action="append",
+                        default=[],
+                        metavar="NAME=VALUE",
+                        help="inject a research backend environment variable")
+    parser.add_argument("--trace",
+                        type=Path,
                         help="override the source manifest request trace")
     parser.add_argument("--telemetry-level",
                         choices=("research", "full", "counterfactual"),
@@ -361,10 +371,10 @@ def main() -> int:
                 repeat_root /= f"repeat-{matrix_repeat:03d}"
             commands.extend(
                 materialize_command(
-                    entry, args.policy, repeat_root, args.host_workspace,
-                    args.container_workspace, args.plugin_path,
-                    args.binary_path, matrix_repeat, args.telemetry_level,
-                    args.warmup_requests, backend_environment, args.trace)
+                    entry, args.policy, repeat_root, args.host_workspace, args.
+                    container_workspace, args.plugin_path, args.binary_path,
+                    matrix_repeat, args.telemetry_level, args.warmup_requests,
+                    backend_environment, args.trace, args.policy_warmup_mode)
                 for entry in selected)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         command_manifest = args.output_dir / "commands.json"

@@ -74,6 +74,11 @@ struct PhaseGlobalActionCandidate
     double contextualCompletionNewcomerReferenceUs{};
     double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
     PhaseContextualCompletionEstimate contextualCompletion{};
+    //! Shadow-only decision-relevant physical effects. These are collected
+    //! from the same common-epoch labels as Completion-Vector but do not gain
+    //! scheduling authority until frozen replay gates pass.
+    bool contextualEffectValid{};
+    PhaseContextualEffectEstimate contextualEffect{};
     //! Same-snapshot scalar counterfactual captured immediately before
     //! completion-vector authority changes decision or protected completion
     //! estimates. This is diagnostic state, not a second policy authority.

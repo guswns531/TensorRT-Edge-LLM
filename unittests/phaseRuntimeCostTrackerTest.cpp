@@ -345,6 +345,56 @@ TEST(PhaseContextualCompletionModelTest, LearnsIncumbentAndNewcomerResidualsInde
     EXPECT_EQ(model.telemetry().falseSafeObservations, 0U);
 }
 
+TEST(PhaseContextualEffectModelTest, LearnsThreeDecisionRelevantEffectsIndependently)
+{
+    PhaseContextualPdModelConfig config;
+    config.minimumObservations = 2U;
+    config.confidenceBeta = 0.0;
+    PhaseContextualEffectModel model(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+
+    for (size_t sample{}; sample < 16U; ++sample)
+    {
+        ASSERT_TRUE(model.observe(features, 0.25, 0.10, -0.20));
+    }
+    PhaseContextualEffectEstimate const estimate = model.predict(features);
+
+    EXPECT_TRUE(estimate.ready());
+    EXPECT_NEAR(estimate.compression.mean, 0.25, 0.02);
+    EXPECT_NEAR(estimate.incumbentStretch.mean, 0.10, 0.02);
+    EXPECT_NEAR(estimate.completionOrderMargin.mean, -0.20, 0.02);
+    EXPECT_EQ(model.compressionTelemetry().observations, 16U);
+    EXPECT_EQ(model.incumbentStretchTelemetry().observations, 16U);
+    EXPECT_EQ(model.completionOrderTelemetry().observations, 16U);
+
+    model.reset();
+    EXPECT_EQ(model.compressionTelemetry().observations, 0U);
+}
+
+TEST(PhaseContextualEffectModelTest, RuntimeTrackerDerivesTargetsFromPhysicalCompletion)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualPd.minimumObservations = 2U;
+    config.contextualPd.confidenceBeta = 0.0;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+    PhaseContextualPairDirection const direction = PhaseContextualPairDirection::kPrefillToDecode;
+
+    for (size_t sample{}; sample < 16U; ++sample)
+    {
+        ASSERT_TRUE(tracker.observeContextualCompletionDirection(direction, features, 4000.0, 8000.0, 5000.0, 6000.0));
+    }
+    PhaseContextualEffectEstimate const estimate = tracker.predictContextualEffectDirection(direction, features);
+
+    EXPECT_TRUE(estimate.ready());
+    EXPECT_NEAR(estimate.compression.mean, 0.5, 0.03);
+    EXPECT_NEAR(estimate.incumbentStretch.mean, 0.25, 0.03);
+    EXPECT_NEAR(estimate.completionOrderMargin.mean, 1.0 / 12.0, 0.02);
+    EXPECT_EQ(tracker.contextualEffectDirectionModel(direction).compressionTelemetry().observations, 16U);
+}
+
 TEST(PhaseContextualCompletionModelTest, PairPosteriorWarmsColdReverseDirection)
 {
     PhaseRuntimeCostTrackerConfig config;

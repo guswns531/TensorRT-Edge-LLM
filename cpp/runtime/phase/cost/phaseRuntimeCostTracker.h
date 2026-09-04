@@ -131,6 +131,16 @@ public:
     PhaseContextualPdTelemetry const& contextualDirectionTelemetry(
         PhaseContextualPairDirection direction) const noexcept;
 
+    PhaseContextualEffectEstimate predictContextualEffectDirection(
+        PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features);
+    //! Convert one common-epoch physical pair observation into the three
+    //! normalized Effect-Vector targets and update them atomically.
+    bool observeContextualEffectDirection(PhaseContextualPairDirection direction,
+        PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
+        double incumbentCompletionUs, double newcomerCompletionUs, double weight = 1.0);
+    PhaseContextualEffectModel const& contextualEffectDirectionModel(
+        PhaseContextualPairDirection direction) const noexcept;
+
     PhaseContextualCompletionEstimate predictContextualCompletionDirection(PhaseContextualPairDirection direction,
         PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs);
     bool observeContextualCompletionDirection(PhaseContextualPairDirection direction,
@@ -257,6 +267,12 @@ private:
     PhaseContextualPdModel mContextualPe;
     PhaseContextualPdModel mContextualEd;
     PhaseContextualPdModel mContextualDe;
+    PhaseContextualEffectModel mEffectPd;
+    PhaseContextualEffectModel mEffectDp;
+    PhaseContextualEffectModel mEffectEp;
+    PhaseContextualEffectModel mEffectPe;
+    PhaseContextualEffectModel mEffectEd;
+    PhaseContextualEffectModel mEffectDe;
     PhaseContextualCompletionModel mCompletionPd;
     PhaseContextualCompletionModel mCompletionDp;
     PhaseContextualCompletionModel mCompletionEp;

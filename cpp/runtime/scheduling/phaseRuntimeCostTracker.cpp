@@ -48,6 +48,12 @@ PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig c
     , mContextualPe(config.contextualEp)
     , mContextualEd(config.contextualEd)
     , mContextualDe(config.contextualEd)
+    , mEffectPd(config.contextualPd)
+    , mEffectDp(config.contextualPd)
+    , mEffectEp(config.contextualEp)
+    , mEffectPe(config.contextualEp)
+    , mEffectEd(config.contextualEd)
+    , mEffectDe(config.contextualEd)
     , mCompletionPd(config.contextualPd)
     , mCompletionDp(config.contextualPd)
     , mCompletionEp(config.contextualEp)
@@ -432,6 +438,76 @@ PhaseContextualPdTelemetry const& PhaseRuntimeCostTracker::contextualDirectionTe
     return mContextualPd.telemetry();
 }
 
+PhaseContextualEffectEstimate PhaseRuntimeCostTracker::predictContextualEffectDirection(
+    PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features)
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode: return mEffectPd.predict(features);
+    case PhaseContextualPairDirection::kDecodeToPrefill: return mEffectDp.predict(features);
+    case PhaseContextualPairDirection::kEncoderToPrefill: return mEffectEp.predict(features);
+    case PhaseContextualPairDirection::kPrefillToEncoder: return mEffectPe.predict(features);
+    case PhaseContextualPairDirection::kEncoderToDecode: return mEffectEd.predict(features);
+    case PhaseContextualPairDirection::kDecodeToEncoder: return mEffectDe.predict(features);
+    }
+    ELLM_CHECK(false, "Unknown contextual effect direction");
+}
+
+bool PhaseRuntimeCostTracker::observeContextualEffectDirection(PhaseContextualPairDirection direction,
+    PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
+    double incumbentCompletionUs, double newcomerCompletionUs, double weight)
+{
+    if (!std::isfinite(incumbentReferenceUs) || incumbentReferenceUs <= 0.0 || !std::isfinite(newcomerReferenceUs)
+        || newcomerReferenceUs <= 0.0 || !std::isfinite(incumbentCompletionUs) || incumbentCompletionUs < 0.0
+        || !std::isfinite(newcomerCompletionUs) || newcomerCompletionUs < 0.0 || !std::isfinite(weight)
+        || weight <= 0.0)
+    {
+        return false;
+    }
+    double const serialReferenceUs = incumbentReferenceUs + newcomerReferenceUs;
+    double const normalizedCompression
+        = (serialReferenceUs - std::max(incumbentCompletionUs, newcomerCompletionUs)) / serialReferenceUs;
+    double const normalizedIncumbentStretch = (incumbentCompletionUs - incumbentReferenceUs) / incumbentReferenceUs;
+    double const normalizedCompletionOrderMargin = (newcomerCompletionUs - incumbentCompletionUs) / serialReferenceUs;
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode:
+        return mEffectPd.observe(
+            features, normalizedCompression, normalizedIncumbentStretch, normalizedCompletionOrderMargin, weight);
+    case PhaseContextualPairDirection::kDecodeToPrefill:
+        return mEffectDp.observe(
+            features, normalizedCompression, normalizedIncumbentStretch, normalizedCompletionOrderMargin, weight);
+    case PhaseContextualPairDirection::kEncoderToPrefill:
+        return mEffectEp.observe(
+            features, normalizedCompression, normalizedIncumbentStretch, normalizedCompletionOrderMargin, weight);
+    case PhaseContextualPairDirection::kPrefillToEncoder:
+        return mEffectPe.observe(
+            features, normalizedCompression, normalizedIncumbentStretch, normalizedCompletionOrderMargin, weight);
+    case PhaseContextualPairDirection::kEncoderToDecode:
+        return mEffectEd.observe(
+            features, normalizedCompression, normalizedIncumbentStretch, normalizedCompletionOrderMargin, weight);
+    case PhaseContextualPairDirection::kDecodeToEncoder:
+        return mEffectDe.observe(
+            features, normalizedCompression, normalizedIncumbentStretch, normalizedCompletionOrderMargin, weight);
+    }
+    ELLM_CHECK(false, "Unknown contextual effect direction");
+}
+
+PhaseContextualEffectModel const& PhaseRuntimeCostTracker::contextualEffectDirectionModel(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    switch (direction)
+    {
+    case PhaseContextualPairDirection::kPrefillToDecode: return mEffectPd;
+    case PhaseContextualPairDirection::kDecodeToPrefill: return mEffectDp;
+    case PhaseContextualPairDirection::kEncoderToPrefill: return mEffectEp;
+    case PhaseContextualPairDirection::kPrefillToEncoder: return mEffectPe;
+    case PhaseContextualPairDirection::kEncoderToDecode: return mEffectEd;
+    case PhaseContextualPairDirection::kDecodeToEncoder: return mEffectDe;
+    }
+    return mEffectPd;
+}
+
 PhaseContextualCompletionEstimate PhaseRuntimeCostTracker::predictContextualCompletionDirection(
     PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features, double incumbentReferenceUs,
     double newcomerReferenceUs)
@@ -572,7 +648,9 @@ bool PhaseRuntimeCostTracker::observeContextualCompletionDirection(PhaseContextu
         primaryCompletionUs, secondaryCompletionUs, minimumSlackUs);
     bool const directionObserved = ordered->observe(policyFeatures, incumbentReferenceUs, newcomerReferenceUs,
         incumbentCompletionUs, newcomerCompletionUs, minimumSlackUs);
-    return pairObserved && directionObserved;
+    bool const effectObserved = observeContextualEffectDirection(direction, policyFeatures, incumbentReferenceUs,
+        newcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs);
+    return pairObserved && directionObserved && effectObserved;
 }
 
 PhaseContextualPdFeatures PhaseRuntimeCostTracker::contextualCompletionFeaturesForPolicy(
@@ -931,6 +1009,12 @@ void PhaseRuntimeCostTracker::resetPolicyPosterior()
     mContextualPe.reset();
     mContextualEd.reset();
     mContextualDe.reset();
+    mEffectPd.reset();
+    mEffectDp.reset();
+    mEffectEp.reset();
+    mEffectPe.reset();
+    mEffectEd.reset();
+    mEffectDe.reset();
     mCompletionPd.reset();
     mCompletionDp.reset();
     mCompletionEp.reset();

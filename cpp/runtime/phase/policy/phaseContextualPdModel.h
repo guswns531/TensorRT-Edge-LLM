@@ -231,6 +231,45 @@ private:
     PhaseContextualPdTelemetry mTelemetry;
 };
 
+//! Three decision-relevant physical effects. Unlike the completion-vector
+//! model, this representation does not predict absolute component timestamps.
+//! It retains only equal-work compression, incumbent interference, and the
+//! signed completion-order margin needed by deterministic transition replay.
+struct PhaseContextualEffectEstimate
+{
+    PhaseContextualPdEstimate compression;
+    PhaseContextualPdEstimate incumbentStretch;
+    PhaseContextualPdEstimate completionOrderMargin;
+
+    bool ready() const noexcept
+    {
+        return compression.ready && incumbentStretch.ready && completionOrderMargin.ready;
+    }
+};
+
+//! Multi-output RLS sharing the existing continuous feature contract. Each
+//! head owns an independent posterior so one noisy target cannot corrupt the
+//! others; the feature extraction and observation chronology remain common.
+class PhaseContextualEffectModel
+{
+public:
+    explicit PhaseContextualEffectModel(PhaseContextualPdModelConfig config = {});
+
+    PhaseContextualEffectEstimate predict(PhaseContextualPdFeatures const& features);
+    bool observe(PhaseContextualPdFeatures const& features, double normalizedCompression,
+        double normalizedIncumbentStretch, double normalizedCompletionOrderMargin, double weight = 1.0);
+    void reset() noexcept;
+
+    PhaseContextualPdTelemetry const& compressionTelemetry() const noexcept;
+    PhaseContextualPdTelemetry const& incumbentStretchTelemetry() const noexcept;
+    PhaseContextualPdTelemetry const& completionOrderTelemetry() const noexcept;
+
+private:
+    PhaseContextualPdModel mCompression;
+    PhaseContextualPdModel mIncumbentStretch;
+    PhaseContextualPdModel mCompletionOrder;
+};
+
 //! Prediction of the two completion boundaries created by adding a newcomer
 //! context to an incumbent context. Times are relative to the newcomer launch
 //! boundary used by the M4 projector.
