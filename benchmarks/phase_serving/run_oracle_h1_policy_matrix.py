@@ -225,7 +225,10 @@ def materialize_command(entry: dict[str, Any],
                         plugin_path: str,
                         binary_path: str,
                         matrix_repeat: int = 1,
-                        telemetry_level: str = "research") -> dict[str, Any]:
+                        telemetry_level: str = "research",
+                        warmup_requests: int | None = None,
+                        backend_environment: dict[str, str] | None = None
+                        ) -> dict[str, Any]:
     """Return one event-enabled, one-repeat command without changing its trace contract."""
     if policy not in POLICY_ENVIRONMENTS:
         raise ValueError(f"unknown policy: {policy}")
@@ -235,6 +238,10 @@ def materialize_command(entry: dict[str, Any],
     output_dir = output_root / case / variant
     _replace_option(command, "--output-dir", str(output_dir))
     _replace_option(command, "--repeats", "1")
+    if warmup_requests is not None:
+        _replace_option(command, "--warmup-requests", str(warmup_requests))
+        _replace_option(command, "--phase-calibration-min-requests",
+                        str(warmup_requests))
     trace_index = command.index("--trace") + 1
     trace_path = Path(command[trace_index])
     if not trace_path.is_absolute():
@@ -259,6 +266,8 @@ def materialize_command(entry: dict[str, Any],
         "/opt/tensorrt/lib:/usr/local/cuda/lib64:" +
         str(Path(binary_path).parent))
     for name, value in POLICY_ENVIRONMENTS[policy].items():
+        _set_docker_environment(command, name, value)
+    for name, value in (backend_environment or {}).items():
         _set_docker_environment(command, name, value)
     binary_index = next(index for index, token in enumerate(command)
                         if token.endswith("/llm_phase_context_smoke"))
@@ -292,6 +301,16 @@ def main() -> int:
         action="store_true",
         help="retain only the first source entry for each case/variant pair")
     parser.add_argument("--matrix-repeats", type=int, default=1)
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        help="override the source manifest's generic warm-up budget")
+    parser.add_argument(
+        "--backend-env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="inject a research backend environment variable")
     parser.add_argument("--telemetry-level",
                         choices=("research", "full", "counterfactual"),
                         default="research")
@@ -303,6 +322,16 @@ def main() -> int:
             raise ValueError("source command manifest must be a list")
         if args.matrix_repeats < 1:
             raise ValueError("matrix repeats must be positive")
+        if args.warmup_requests is not None and args.warmup_requests < 0:
+            raise ValueError("warmup requests must be non-negative")
+        backend_environment = {}
+        for assignment in args.backend_env:
+            if "=" not in assignment:
+                raise ValueError("backend environment must use NAME=VALUE")
+            name, value = assignment.split("=", 1)
+            if not name:
+                raise ValueError("backend environment name must not be empty")
+            backend_environment[name] = value
         requested = set(args.cases or [])
         selected = [
             entry for entry in entries
@@ -330,7 +359,8 @@ def main() -> int:
                 materialize_command(
                     entry, args.policy, repeat_root, args.host_workspace,
                     args.container_workspace, args.plugin_path,
-                    args.binary_path, matrix_repeat, args.telemetry_level)
+                    args.binary_path, matrix_repeat, args.telemetry_level,
+                    args.warmup_requests, backend_environment)
                 for entry in selected)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         command_manifest = args.output_dir / "commands.json"

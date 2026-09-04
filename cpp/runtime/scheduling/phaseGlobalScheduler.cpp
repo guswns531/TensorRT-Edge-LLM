@@ -511,6 +511,21 @@ char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept
     return result;
 }
 
+std::optional<PhaseGlobalActionKind> phaseGlobalActionKindFromName(std::string_view name) noexcept
+{
+    for (PhaseGlobalActionKind const kind :
+        {PhaseGlobalActionKind::kNone, PhaseGlobalActionKind::kEncoder, PhaseGlobalActionKind::kPrefill,
+            PhaseGlobalActionKind::kDecode, PhaseGlobalActionKind::kEncoderPrefill,
+            PhaseGlobalActionKind::kEncoderDecode, PhaseGlobalActionKind::kPrefillDecode, PhaseGlobalActionKind::kWait})
+    {
+        if (name == phaseGlobalActionKindName(kind))
+        {
+            return kind;
+        }
+    }
+    return std::nullopt;
+}
+
 char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status) noexcept
 {
     char const* result = "unknown";

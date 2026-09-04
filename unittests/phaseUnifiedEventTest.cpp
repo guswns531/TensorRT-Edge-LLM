@@ -44,6 +44,8 @@ TEST(PhaseUnifiedEventTest, ReportsStableSchemaAndNames)
         phaseUnifiedDispatchModeName(PhaseUnifiedDispatchMode::kResidualAugmentation), "residual_augmentation");
     EXPECT_STREQ(
         phaseUnifiedFidelityReasonName(PhaseUnifiedFidelityReason::kOutstandingMismatch), "outstanding_mismatch");
+    EXPECT_EQ(phaseGlobalActionKindFromName("encoder_decode"), PhaseGlobalActionKind::kEncoderDecode);
+    EXPECT_FALSE(phaseGlobalActionKindFromName("encoder+decode").has_value());
 }
 
 TEST(PhaseUnifiedEventTest, SeparatesCoLaunchFromResidualAugmentation)

@@ -22,6 +22,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -104,6 +105,8 @@ char const* phaseGlobalResidualAnchorName(PhaseGlobalResidualAnchor anchor) noex
 
 //! Stable telemetry name for a global action kind.
 char const* phaseGlobalActionKindName(PhaseGlobalActionKind kind) noexcept;
+//! Parse the stable telemetry name used by research replay controls.
+std::optional<PhaseGlobalActionKind> phaseGlobalActionKindFromName(std::string_view name) noexcept;
 
 //! Shape key for online action-cost observations. Bucketing belongs to the caller.
 struct PhaseGlobalActionKey

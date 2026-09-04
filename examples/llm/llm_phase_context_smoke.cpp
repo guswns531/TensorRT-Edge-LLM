@@ -2449,6 +2449,16 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.globalExperimentalEncoderDecodeOverlapPercent = std::stoi(value);
                 }
+                if (char const* value = std::getenv("TRT_EDGELLM_REPLAY_DECISION_SEQUENCE"))
+                {
+                    threePhaseConfig.globalReplayDecisionSequence = std::stoull(value);
+                    char const* action = std::getenv("TRT_EDGELLM_REPLAY_ACTION_KIND");
+                    ELLM_CHECK(action != nullptr, "Causal replay decision requires an action kind");
+                    std::optional<rt::PhaseGlobalActionKind> const kind = rt::phaseGlobalActionKindFromName(action);
+                    ELLM_CHECK(kind.has_value() && *kind != rt::PhaseGlobalActionKind::kNone,
+                        "Unknown or empty causal replay action kind");
+                    threePhaseConfig.globalReplayActionKind = *kind;
+                }
                 if (char const* value = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION"))
                 {
                     std::optional<rt::PhaseUnifiedActionDirection> const direction
@@ -4356,11 +4366,13 @@ int main(int argc, char** argv)
                                 candidates.back()["contextual_minimum_slack_us"] = candidate.contextualMinimumSlackUs;
                             }
                         }
-                        record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
-                            {"snapshot_signature", event.snapshotSignature}, {"plan_id", event.planId},
-                            {"strict_snapshot_signature", event.strictSnapshotSignature},
+                        record.update({{"decision_id", event.decisionId},
+                            {"policy_decision_sequence", event.policyDecisionSequence},
+                            {"snapshot_id", event.snapshotId}, {"snapshot_signature", event.snapshotSignature},
+                            {"plan_id", event.planId}, {"strict_snapshot_signature", event.strictSnapshotSignature},
                             {"kv_ownership_signature", event.kvOwnershipSignature},
-                            {"vision_lease_signature", event.visionLeaseSignature}, {"action_id", event.actionId},
+                            {"vision_lease_signature", event.visionLeaseSignature},
+                            {"causal_replay_forced", event.causalReplayForced}, {"action_id", event.actionId},
                             {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
                             {"requested_action_direction",

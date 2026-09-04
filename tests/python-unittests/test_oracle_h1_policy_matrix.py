@@ -89,6 +89,30 @@ def test_materializes_independent_matrix_repeat_lineage() -> None:
         "oracle-h1-myopic-balanced-r002")
 
 
+def test_materializes_warmup_and_replay_overrides() -> None:
+    source = entry()
+    repeats_index = source["command"].index("--repeats")
+    source["command"][repeats_index:repeats_index] = [
+        "--warmup-requests", "128", "--phase-calibration-min-requests", "128"
+    ]
+    result = materialize_command(
+        source, "completion_active", Path("/host/out"), Path("/host"),
+        Path("/workspace"), "/workspace/plugin.so",
+        "/workspace/build/llm_phase_context_smoke", telemetry_level="counterfactual",
+        warmup_requests=1696,
+        backend_environment={
+            "TRT_EDGELLM_REPLAY_DECISION_SEQUENCE": "406",
+            "TRT_EDGELLM_REPLAY_ACTION_KIND": "prefill",
+        })
+    command = result["command"]
+    values = environment(command)
+    assert command[command.index("--warmup-requests") + 1] == "1696"
+    assert command[command.index("--phase-calibration-min-requests") + 1] == "1696"
+    assert values["TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"] == "counterfactual"
+    assert values["TRT_EDGELLM_REPLAY_DECISION_SEQUENCE"] == "406"
+    assert values["TRT_EDGELLM_REPLAY_ACTION_KIND"] == "prefill"
+
+
 def test_materializes_m6_shadow_without_policy_authority() -> None:
     result = materialize_command(entry(), "m6_shadow", Path("/host/out"),
                                  Path("/host"), Path("/workspace"),

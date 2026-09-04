@@ -111,6 +111,9 @@ struct PhaseThreeCoordinatorConfig
     int32_t globalExperimentalEncoderPrefillOverlapPercent{-1};
     //! Research-only exact percentage of hard-feasible E+D opportunities.
     int32_t globalExperimentalEncoderDecodeOverlapPercent{-1};
+    //! Research-only one-shot causal branch override. Zero disables replay.
+    size_t globalReplayDecisionSequence{};
+    PhaseGlobalActionKind globalReplayActionKind{PhaseGlobalActionKind::kNone};
     //! Research-only M2 launch order and host-delay control. Disabled by default.
     PhaseDirectionalInjectionControl directionalInjection;
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
@@ -906,6 +909,7 @@ private:
     std::unordered_map<uint64_t, PhaseExecutionSet> mUnifiedAllowedOutstandingByExecution;
     size_t mLastGlobalSafeProbeSequence{};
     bool mGlobalWarmupProbeMode{};
+    bool mGlobalReplayApplied{};
 };
 
 } // namespace trt_edgellm::rt

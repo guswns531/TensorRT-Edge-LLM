@@ -38,6 +38,11 @@
       "type": "integer",
       "minimum": 1
     },
+    "policy_decision_sequence": {
+      "description": "Monotonic policy invocation sequence used only to address one-shot causal replay branches.",
+      "type": "integer",
+      "minimum": 1
+    },
     "snapshot_id": {
       "type": "integer",
       "minimum": 1
@@ -61,6 +66,9 @@
       "description": "Cross-run identity of active and pending vision payload lifetimes.",
       "type": "integer",
       "minimum": 1
+    },
+    "causal_replay_forced": {
+      "type": "boolean"
     },
     "plan_id": {
       "type": "integer",

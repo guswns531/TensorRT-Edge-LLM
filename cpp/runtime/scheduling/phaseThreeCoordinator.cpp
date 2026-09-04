@@ -1493,6 +1493,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     PhaseUnifiedEvent event;
     event.kind = PhaseUnifiedEventKind::kDecision;
     event.decisionId = plan.snapshotEpoch;
+    event.policyDecisionSequence = mGlobalDecisionSequence;
     event.snapshotId = plan.snapshotEpoch;
     event.planId = plan.planId;
     event.actionId = candidate.candidateId;
@@ -1500,6 +1501,9 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.requestedStartSkewPercent = static_cast<int32_t>(plan.incrementalAction.key.startSkew);
     event.requestedDirection = plan.incrementalAction.key.direction;
     event.actionKind = candidate.key.kind;
+    event.causalReplayForced = mConfig.globalReplayDecisionSequence > 0U
+        && mGlobalDecisionSequence == mConfig.globalReplayDecisionSequence
+        && candidate.key.kind == mConfig.globalReplayActionKind;
     event.selectedActionId = candidate.candidateId;
     event.cohort = unifiedCandidateWork(candidate);
     event.requestIds = candidate.requestIds;
@@ -3457,6 +3461,17 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     applyExperimentalEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode,
         mConfig.globalExperimentalEncoderDecodeOverlapPercent, mGlobalExperimentalEncoderDecodeOpportunities,
         mGlobalExperimentalEncoderDecodeSelections, mGlobalExperimentalEncoderDecodeAccumulator);
+    if (!mGlobalReplayApplied && mConfig.globalReplayDecisionSequence > 0U
+        && mGlobalDecisionSequence == mConfig.globalReplayDecisionSequence)
+    {
+        auto const replay = std::find_if(candidates.begin(), candidates.end(),
+            [&](auto const& candidate) { return candidate.key.kind == mConfig.globalReplayActionKind; });
+        ELLM_CHECK(replay != candidates.end(), "Causal replay action is absent from the exact decision frontier");
+        PhaseGlobalDecision const feasible = mGlobalScheduler.select({*replay});
+        ELLM_CHECK(feasible.selectedIndex.has_value(), "Causal replay action is not feasible at the target decision");
+        selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), replay));
+        mGlobalReplayApplied = true;
+    }
     std::optional<PhaseFormationRegret> formationRegret;
     if (formationEvaluated && selectedIndex.has_value())
     {

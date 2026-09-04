@@ -407,6 +407,8 @@ struct PhaseUnifiedEvent
     uint64_t eventId{};
     uint64_t hostMonotonicNs{};
     uint64_t decisionId{};
+    //! Monotonic policy invocation sequence, including residual decisions.
+    uint64_t policyDecisionSequence{};
     uint64_t snapshotId{};
     uint64_t executionId{};
     uint64_t planId{};
@@ -448,6 +450,7 @@ struct PhaseUnifiedEvent
     //! Snapshot plus exact candidate frontier and persistent ownership.
     //! This is the pre-branch identity required by forced causal replay.
     uint64_t strictSnapshotSignature{};
+    bool causalReplayForced{};
     PhaseUnifiedWork cohort;
     std::vector<uint64_t> requestIds;
     PhaseInFlightSnapshot inFlight;
