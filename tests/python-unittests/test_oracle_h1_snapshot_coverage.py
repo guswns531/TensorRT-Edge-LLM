@@ -128,3 +128,16 @@ def test_rejects_a_corrupted_exact_signature() -> None:
     assert result["summary"]["snapshot_signatures"] == 0
     assert any("invalid snapshot signature" in error
                for error in result["errors"])
+
+
+def test_does_not_join_hidden_encoder_frontiers_with_same_ready_state(
+) -> None:
+    scalar = policy_events("scalar", "encoder", 10, 100, 1)
+    active = policy_events("active", "encoder", 20, 200, 1)
+    scalar[0]["candidates"][0]["request_ids"] = [1]
+    active[0]["candidates"][0]["request_ids"] = [1, 2, 3, 4]
+    result = build_coverage({"scalar": scalar, "active": active})
+    assert result["summary"]["snapshot_signatures"] == 2
+    assert result["summary"]["exact_repeated_snapshots"] == 0
+    assert result["summary"]["exact_multi_action_snapshots"] == 0
+    assert not result["summary"]["gate_b_candidate_coverage"]

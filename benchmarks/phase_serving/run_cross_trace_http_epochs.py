@@ -47,6 +47,26 @@ def replace_placeholders(command: list[str],
     ]
 
 
+def load_backend_from_manifest(path: Path, case: str) -> list[str]:
+    """Load the backend suffix from one frozen HTTP command manifest."""
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(entries, list):
+        raise ValueError("source command manifest must be a list")
+    matches = [entry for entry in entries if str(entry.get("case")) == case]
+    if len(matches) != 1:
+        raise ValueError(
+            f"source case {case!r} must match exactly one manifest entry")
+    command = [str(value) for value in matches[0].get("command", [])]
+    try:
+        separator = command.index("--")
+    except ValueError as error:
+        raise ValueError("source command has no backend separator") from error
+    backend = command[separator + 1:]
+    if not backend:
+        raise ValueError("source command has an empty backend suffix")
+    return backend
+
+
 def read_endpoint(endpoint: str, path: str, timeout: float) -> str:
     """Read one gateway endpoint."""
     with urllib.request.urlopen(endpoint.rstrip("/") + path,
@@ -124,6 +144,8 @@ def main() -> int:
                         type=int,
                         default=424)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--source-command-manifest", type=Path)
+    parser.add_argument("--source-case")
     parser.add_argument("backend_command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -134,6 +156,19 @@ def main() -> int:
     backend_command = args.backend_command
     if backend_command and backend_command[0] == "--":
         backend_command = backend_command[1:]
+    if args.source_command_manifest is not None:
+        if backend_command:
+            parser.error("use either a source manifest or a backend command")
+        if not args.source_case:
+            parser.error("--source-case is required with a source manifest")
+        try:
+            backend_command = load_backend_from_manifest(
+                args.source_command_manifest, args.source_case)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            parser.error(str(error))
+    elif args.source_case:
+        parser.error(
+            "--source-command-manifest is required with --source-case")
     if not backend_command:
         parser.error("backend command is required after --")
     if (args.port <= 0 or args.max_workers <= 0 or args.max_in_flight <= 0

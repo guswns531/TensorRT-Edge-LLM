@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from benchmarks.phase_serving.run_cross_trace_http_epochs import (
-    parse_epoch, replace_placeholders)
+    load_backend_from_manifest, parse_epoch, replace_placeholders)
 
 
 def test_parses_named_epoch() -> None:
@@ -27,3 +27,11 @@ def test_resolves_persistent_backend_placeholders() -> None:
     assert replace_placeholders(
         ["--run={run}", "--warmup={policy_warmup_mode}"],
         "generic") == ["--run=001", "--warmup=generic"]
+
+
+def test_loads_backend_from_frozen_manifest(tmp_path) -> None:
+    manifest = tmp_path / "commands.json"
+    manifest.write_text(
+        '[{"case":"mixed","command":["wrapper","--","docker","run"]}]',
+        encoding="utf-8")
+    assert load_backend_from_manifest(manifest, "mixed") == ["docker", "run"]
