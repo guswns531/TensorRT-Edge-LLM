@@ -27,6 +27,18 @@
 namespace trt_edgellm::rt
 {
 
+char const* phaseContextualCompletionCalibrationStageName(PhaseContextualCompletionCalibrationStage stage) noexcept
+{
+    switch (stage)
+    {
+    case PhaseContextualCompletionCalibrationStage::kPosteriorFit: return "posterior_fit";
+    case PhaseContextualCompletionCalibrationStage::kUncertaintyCalibration: return "uncertainty_calibration";
+    case PhaseContextualCompletionCalibrationStage::kAuthorityValidation: return "authority_validation";
+    case PhaseContextualCompletionCalibrationStage::kComplete: return "complete";
+    }
+    return "unknown";
+}
+
 PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig config)
     : mConfig(config)
     , mActions(config.action)
@@ -603,6 +615,17 @@ bool PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidenceReady(
     return contextualCompletionAuthorityEvidence(direction).validated;
 }
 
+bool PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidenceComplete(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    if (!contextualCompletionAuthorityEnabled())
+    {
+        return false;
+    }
+    return contextualCompletionAuthorityEvidence(direction).observations
+        >= mConfig.completionCalibration.authorityMinimumObservations;
+}
+
 bool PhaseRuntimeCostTracker::contextualCompletionAuthorityEvidenceSatisfies(
     PhaseContextualCompletionAuthorityEvidence const& evidence, double coverageTolerance) const noexcept
 {
@@ -783,6 +806,33 @@ PhaseContextualCompletionCalibrationEstimate PhaseRuntimeCostTracker::contextual
     case PhaseContextualPairKind::kEncoderDecode: return mCompletionEdCalibration.estimate();
     }
     return mCompletionPdCalibration.estimate();
+}
+
+PhaseContextualCompletionCalibrationProgress PhaseRuntimeCostTracker::contextualCompletionCalibrationProgress(
+    PhaseContextualPairDirection direction) const noexcept
+{
+    PhaseContextualPairKind const kind = phaseContextualPairKind(direction);
+    size_t const posteriorObservations = contextualCompletionDirectionTelemetry(direction).observations;
+    size_t const posteriorMinimumObservations = contextualPairConfig(kind).minimumObservations;
+    PhaseContextualCompletionCalibrationEstimate const uncertainty = contextualCompletionCalibration(kind);
+    size_t const authorityObservations = contextualCompletionAuthorityEvidence(direction).observations;
+    PhaseContextualCompletionCalibrationProgress progress{PhaseContextualCompletionCalibrationStage::kComplete,
+        posteriorObservations, posteriorMinimumObservations, uncertainty.observations,
+        mConfig.completionCalibration.minimumObservations, authorityObservations,
+        mConfig.completionCalibration.authorityMinimumObservations};
+    if (posteriorObservations < posteriorMinimumObservations)
+    {
+        progress.stage = PhaseContextualCompletionCalibrationStage::kPosteriorFit;
+    }
+    else if (!uncertainty.ready)
+    {
+        progress.stage = PhaseContextualCompletionCalibrationStage::kUncertaintyCalibration;
+    }
+    else if (authorityObservations < mConfig.completionCalibration.authorityMinimumObservations)
+    {
+        progress.stage = PhaseContextualCompletionCalibrationStage::kAuthorityValidation;
+    }
+    return progress;
 }
 
 void PhaseRuntimeCostTracker::observeDecode(

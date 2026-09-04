@@ -3346,6 +3346,8 @@ int main(int argc, char** argv)
                         }
                         size_t contextualRequiredDirections{};
                         size_t contextualReadyDirections{};
+                        size_t completionRequiredDirections{};
+                        size_t completionCompleteDirections{};
                         auto const contextualDirectionCalibration = [&](rt::PhaseContextualPairDirection direction,
                                                                         size_t minimumObservations) {
                             rt::PhaseContextualPdTelemetry const& telemetry
@@ -3354,10 +3356,23 @@ int main(int argc, char** argv)
                                 = runtimeCostTracker->contextualCompletionDirectionTelemetry(direction);
                             rt::PhaseContextualCompletionAuthorityEvidence const authority
                                 = runtimeCostTracker->contextualCompletionAuthorityEvidence(direction);
-                            bool const required = telemetry.predictions > 0U || telemetry.observations > 0U;
+                            // Candidate generation may predict a residual or
+                            // reverse direction that never becomes a legal
+                            // dispatched action.  Such a direction remains on
+                            // scalar fallback and must not prevent a bounded
+                            // calibration epoch from terminating.
+                            bool const required = telemetry.observations > 0U;
                             bool const ready = required && telemetry.observations >= minimumObservations;
+                            rt::PhaseContextualCompletionCalibrationProgress const progress
+                                = runtimeCostTracker->contextualCompletionCalibrationProgress(direction);
+                            bool const completionRequired
+                                = runtimeCostTracker->contextualCompletionAuthorityEnabled() && required;
+                            bool const completionComplete = completionRequired
+                                && runtimeCostTracker->contextualCompletionAuthorityEvidenceComplete(direction);
                             contextualRequiredDirections += required ? 1U : 0U;
                             contextualReadyDirections += ready ? 1U : 0U;
+                            completionRequiredDirections += completionRequired ? 1U : 0U;
+                            completionCompleteDirections += completionComplete ? 1U : 0U;
                             return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
                                 {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
                                 {"minimum_observations", minimumObservations}, {"required", required}, {"ready", ready},
@@ -3397,7 +3412,16 @@ int main(int argc, char** argv)
                                 {"completion_authority_demotions", authority.demotions},
                                 {"completion_authority_validated", authority.validated},
                                 {"completion_authority_evidence_ready",
-                                    runtimeCostTracker->contextualCompletionAuthorityEvidenceReady(direction)}};
+                                    runtimeCostTracker->contextualCompletionAuthorityEvidenceReady(direction)},
+                                {"completion_calibration_stage",
+                                    rt::phaseContextualCompletionCalibrationStageName(progress.stage)},
+                                {"completion_candidate_seen", telemetry.predictions > 0U},
+                                {"completion_posterior_observations", progress.posteriorObservations},
+                                {"completion_posterior_minimum_observations", progress.posteriorMinimumObservations},
+                                {"completion_uncertainty_observations", progress.uncertaintyObservations},
+                                {"completion_uncertainty_minimum_observations",
+                                    progress.uncertaintyMinimumObservations},
+                                {"completion_authority_evidence_complete", completionComplete}};
                         };
                         auto const contextualFamilyCalibration = [&](rt::PhaseContextualPairKind kind,
                                                                      rt::PhaseContextualPairDirection first,
@@ -3438,8 +3462,11 @@ int main(int argc, char** argv)
                             = requiredCostKeys > 0U && calibratedCostKeys == requiredCostKeys;
                         bool const contextualPolicyCalibrationConverged = contextualRequiredDirections > 0U
                             && contextualReadyDirections == contextualRequiredDirections;
-                        bool const calibrationConverged
-                            = exactCostCalibrationConverged || contextualPolicyCalibrationConverged;
+                        bool const completionPolicyCalibrationConverged = completionRequiredDirections > 0U
+                            && completionCompleteDirections == completionRequiredDirections;
+                        bool const calibrationConverged = runtimeCostTracker->contextualCompletionAuthorityEnabled()
+                            ? contextualPolicyCalibrationConverged && completionPolicyCalibrationConverged
+                            : exactCostCalibrationConverged || contextualPolicyCalibrationConverged;
                         bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
                         if (changesCalibration)
                         {
@@ -3522,6 +3549,9 @@ int main(int argc, char** argv)
                             {"contextual_required_directions", contextualRequiredDirections},
                             {"contextual_ready_directions", contextualReadyDirections},
                             {"contextual_policy_calibration_converged", contextualPolicyCalibrationConverged},
+                            {"completion_required_directions", completionRequiredDirections},
+                            {"completion_complete_directions", completionCompleteDirections},
+                            {"completion_policy_calibration_converged", completionPolicyCalibrationConverged},
                             {"calibration_converged", calibrationConverged}});
                         ++ingestedLines;
                         continue;

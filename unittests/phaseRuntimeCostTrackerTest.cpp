@@ -553,6 +553,54 @@ TEST(PhaseContextualCompletionCalibrationTest, AuthorityRequiresHeldOutDirection
     EXPECT_FALSE(tracker.contextualCompletionAuthorityReady(PhaseContextualPairDirection::kDecodeToPrefill, reverse));
 }
 
+TEST(PhaseContextualCompletionCalibrationTest, ReportsBoundedChronologicalCalibrationStages)
+{
+    EXPECT_STREQ(phaseContextualCompletionCalibrationStageName(
+                     PhaseContextualCompletionCalibrationStage::kUncertaintyCalibration),
+        "uncertainty_calibration");
+    PhaseRuntimeCostTrackerConfig config;
+    config.contextualEp.minimumObservations = 2U;
+    config.completionCalibration.enabled = true;
+    config.completionCalibration.active = true;
+    config.completionCalibration.minimumObservations = 2U;
+    config.completionCalibration.authorityMinimumObservations = 2U;
+    config.completionCalibration.windowSize = 4U;
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseContextualPdFeatures const features = phaseContextualPairFeatures(
+        {4000.0, 8000.0, 100000.0, 2, 8, 8, 64, 128, 128, 1, 2, PhaseExecutionVariant::kEager});
+    PhaseContextualPairDirection const direction = PhaseContextualPairDirection::kEncoderToPrefill;
+
+    auto progress = tracker.contextualCompletionCalibrationProgress(direction);
+    EXPECT_EQ(progress.stage, PhaseContextualCompletionCalibrationStage::kPosteriorFit);
+    EXPECT_FALSE(tracker.contextualCompletionAuthorityEvidenceComplete(direction));
+
+    for (size_t sample{}; sample < 2U; ++sample)
+    {
+        ASSERT_TRUE(tracker.observeContextualCompletionDirection(direction, features, 4000.0, 8000.0, 4000.0, 8000.0));
+    }
+    progress = tracker.contextualCompletionCalibrationProgress(direction);
+    EXPECT_EQ(progress.stage, PhaseContextualCompletionCalibrationStage::kUncertaintyCalibration);
+    EXPECT_EQ(progress.posteriorObservations, 2U);
+
+    for (size_t sample{}; sample < 2U; ++sample)
+    {
+        ASSERT_TRUE(tracker.observeContextualCompletionDirection(direction, features, 4000.0, 8000.0, 4000.0, 8000.0));
+    }
+    progress = tracker.contextualCompletionCalibrationProgress(direction);
+    EXPECT_EQ(progress.stage, PhaseContextualCompletionCalibrationStage::kAuthorityValidation);
+    EXPECT_EQ(progress.uncertaintyObservations, 2U);
+
+    for (size_t sample{}; sample < 2U; ++sample)
+    {
+        ASSERT_TRUE(tracker.observeContextualCompletionDirection(direction, features, 4000.0, 8000.0, 4000.0, 8000.0));
+    }
+    progress = tracker.contextualCompletionCalibrationProgress(direction);
+    EXPECT_EQ(progress.stage, PhaseContextualCompletionCalibrationStage::kComplete);
+    EXPECT_EQ(progress.authorityObservations, 2U);
+    EXPECT_TRUE(tracker.contextualCompletionAuthorityEvidenceComplete(direction));
+    EXPECT_TRUE(tracker.contextualCompletionAuthorityEvidenceReady(direction));
+}
+
 TEST(PhaseContextualCompletionCalibrationTest, SupportsPolicyOnlyAuthorityAblations)
 {
     rt::PhaseRuntimeCostTrackerConfig config;

@@ -2167,11 +2167,16 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
         bool const needsCompletionCalibration = mGlobalWarmupProbeMode
             && mRuntimeCostTracker->contextualCompletionAuthorityEnabled()
-            && !mRuntimeCostTracker->contextualCompletionAuthorityEvidenceReady(completionDirection);
+            && !mRuntimeCostTracker->contextualCompletionAuthorityEvidenceComplete(completionDirection);
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples
             || needsCompletionCalibration;
-        bool calibrationTarget = !mGlobalWarmupProbeMode;
+        // Continuous completion-direction calibration is independent of the
+        // bounded sparse exact-key registry.  A late-arriving E/P/D shape may
+        // be unable to claim another exact key while still providing the
+        // low-dimensional posterior/conformal/held-out sample that warmup
+        // needs.  Coupling both budgets silently starves such directions.
+        bool calibrationTarget = !mGlobalWarmupProbeMode || needsCompletionCalibration;
         if (mGlobalWarmupProbeMode)
         {
             PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);

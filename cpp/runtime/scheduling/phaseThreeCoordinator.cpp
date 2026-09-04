@@ -28,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <tuple>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -2869,11 +2870,15 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         bool const needsCompletionCalibration = mGlobalWarmupProbeMode
             && mRuntimeCostTracker->contextualCompletionAuthorityEnabled()
-            && !mRuntimeCostTracker->contextualCompletionAuthorityEvidenceReady(completionDirection);
+            && !mRuntimeCostTracker->contextualCompletionAuthorityEvidenceComplete(completionDirection);
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples
             || needsCompletionCalibration;
-        bool calibrationTarget = !mGlobalWarmupProbeMode;
+        // Keep continuous direction calibration independent of the bounded
+        // exact-key registry.  E+D often becomes executable only after P+D
+        // and E+P shapes have filled that registry; it must still be allowed
+        // to produce a low-dimensional completion sample.
+        bool calibrationTarget = !mGlobalWarmupProbeMode || needsCompletionCalibration;
         if (mGlobalWarmupProbeMode)
         {
             PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
@@ -3237,28 +3242,64 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     if (mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
-        auto const calibration
-            = std::min_element(candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
-                  auto sampleCount = [&](auto const& candidate) {
-                      if (!candidate.calibrationProbe)
-                      {
-                          return std::numeric_limits<size_t>::max();
-                      }
-                      if ((candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-                              || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode)
-                          && candidate.contextualEncoderPairFeatureValid)
-                      {
-                          // Natural calibration trains a continuous pair
-                          // model, so balance evidence by direction instead
-                          // of spreading probes over sparse exact CUDA keys.
-                          return mRuntimeCostTracker
-                              ->contextualDirectionTelemetry(candidate.contextualEncoderPairDirection)
-                              .observations;
-                      }
-                      return mRuntimeCostTracker->overlapDiagnostic(candidate.key).sampleCount;
-                  };
-                  return sampleCount(left) < sampleCount(right);
-              });
+        auto const calibration = std::min_element(
+            candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
+                auto calibrationProgress = [&](auto const& candidate) {
+                    if (!candidate.calibrationProbe)
+                    {
+                        return std::tuple{std::numeric_limits<size_t>::max(), 1.0, std::numeric_limits<size_t>::max()};
+                    }
+                    std::optional<PhaseContextualPairDirection> direction;
+                    if (candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+                        || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode)
+                    {
+                        if (candidate.contextualEncoderPairFeatureValid)
+                        {
+                            direction = candidate.contextualEncoderPairDirection;
+                        }
+                    }
+                    else if (candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode
+                        && candidate.contextualPdFeatureValid)
+                    {
+                        direction = phaseContextualPairDirection(candidate.key.kind, candidate.key.residualAnchor);
+                    }
+                    if (direction.has_value() && mRuntimeCostTracker->contextualCompletionAuthorityEnabled())
+                    {
+                        // Calibration is chronological: posterior fit,
+                        // pair-family conformal scale, then held-out ordered
+                        // authority evidence.  Rank the least-complete stage
+                        // instead of sparse exact keys or scalar samples so
+                        // E directions cannot stop exactly when their
+                        // posterior first becomes ready.
+                        PhaseContextualCompletionCalibrationProgress const progress
+                            = mRuntimeCostTracker->contextualCompletionCalibrationProgress(*direction);
+                        size_t observations{};
+                        size_t minimum{1U};
+                        switch (progress.stage)
+                        {
+                        case PhaseContextualCompletionCalibrationStage::kPosteriorFit:
+                            observations = progress.posteriorObservations;
+                            minimum = progress.posteriorMinimumObservations;
+                            break;
+                        case PhaseContextualCompletionCalibrationStage::kUncertaintyCalibration:
+                            observations = progress.uncertaintyObservations;
+                            minimum = progress.uncertaintyMinimumObservations;
+                            break;
+                        case PhaseContextualCompletionCalibrationStage::kAuthorityValidation:
+                            observations = progress.authorityObservations;
+                            minimum = progress.authorityMinimumObservations;
+                            break;
+                        case PhaseContextualCompletionCalibrationStage::kComplete: observations = minimum; break;
+                        }
+                        double const fraction
+                            = std::min(1.0, static_cast<double>(observations) / static_cast<double>(minimum));
+                        return std::tuple{static_cast<size_t>(progress.stage), fraction, observations};
+                    }
+                    size_t const exactSamples = mRuntimeCostTracker->overlapDiagnostic(candidate.key).sampleCount;
+                    return std::tuple{size_t{4U}, 0.0, exactSamples};
+                };
+                return calibrationProgress(left) < calibrationProgress(right);
+            });
         if (calibration != candidates.end())
         {
             if (calibration->calibrationProbe)

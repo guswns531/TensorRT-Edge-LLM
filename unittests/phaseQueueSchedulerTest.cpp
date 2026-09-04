@@ -316,6 +316,39 @@ TEST(PhaseQueueSchedulerTest, GlobalWarmupUsesProcessLocalOverlapObservations)
         scheduler.globalCalibrationDiagnostics().front().diagnostic.status, PhaseGlobalOverlapCostStatus::kEligible);
 }
 
+TEST(PhaseQueueSchedulerTest, CompletionCalibrationDoesNotShareTheSparseExactKeyBudget)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kActive;
+    trackerConfig.completionCalibration.enabled = true;
+    trackerConfig.completionCalibration.active = true;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalCalibrationMaxOverlapKeys = 1U;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setGlobalWarmupProbeMode(true);
+
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(first.globalSafeProbe);
+    scheduler.completePrefill(first.prefillBatch.front(), 32, true);
+    scheduler.completeDecode(first.decodeBatch.front(), 129, true);
+
+    // This is a different exact action key after the registry is full.  It is
+    // still a valid sample for the shared continuous completion direction.
+    scheduler.enqueuePrefill({3, 64});
+    scheduler.enqueueDecode({4, 256});
+    PhaseDispatchPlan const second = scheduler.next();
+    EXPECT_EQ(second.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(second.globalSafeProbe);
+    EXPECT_EQ(scheduler.globalCalibrationDiagnostics().size(), 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalPrioritizesKnownOverlapTransition)
 {
     PhaseRuntimeCostTrackerConfig trackerConfig;

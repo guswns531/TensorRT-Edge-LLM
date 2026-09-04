@@ -55,6 +55,33 @@ enum class PhaseRuntimeCostConfidence
     kReady,
 };
 
+//! Chronological completion-policy calibration stage for one ordered phase
+//! direction.  A direction first fits its posterior, then contributes to the
+//! pair-family conformal scale, and only then supplies held-out authority
+//! evidence.  The final stage means that the bounded evidence window is full
+//! enough to make a validation decision; it does not imply that validation
+//! passed.
+enum class PhaseContextualCompletionCalibrationStage
+{
+    kPosteriorFit,
+    kUncertaintyCalibration,
+    kAuthorityValidation,
+    kComplete,
+};
+
+char const* phaseContextualCompletionCalibrationStageName(PhaseContextualCompletionCalibrationStage stage) noexcept;
+
+struct PhaseContextualCompletionCalibrationProgress
+{
+    PhaseContextualCompletionCalibrationStage stage{PhaseContextualCompletionCalibrationStage::kPosteriorFit};
+    size_t posteriorObservations{};
+    size_t posteriorMinimumObservations{};
+    size_t uncertaintyObservations{};
+    size_t uncertaintyMinimumObservations{};
+    size_t authorityObservations{};
+    size_t authorityMinimumObservations{};
+};
+
 //! Process-local measurements used by the next scheduling decision.
 //!
 //! The tracker neither persists observations nor assigns policy authority.
@@ -118,6 +145,8 @@ public:
     PhaseContextualCompletionAuthorityEvidence contextualCompletionAuthorityEvidence(
         PhaseContextualPairDirection direction) const noexcept;
     PhaseContextualCompletionCalibrationEstimate contextualCompletionCalibration(PhaseContextualPairKind kind) const;
+    PhaseContextualCompletionCalibrationProgress contextualCompletionCalibrationProgress(
+        PhaseContextualPairDirection direction) const noexcept;
     bool contextualCompletionAuthorityEnabled() const noexcept
     {
         return mConfig.completionCalibration.enabled && mConfig.completionCalibration.active;
@@ -125,6 +154,10 @@ public:
     //! Return true only after the ordered direction and its conformal
     //! uncertainty have enough held-out evidence for policy authority.
     bool contextualCompletionAuthorityEvidenceReady(PhaseContextualPairDirection direction) const noexcept;
+    //! Return true once enough held-out evidence exists to either promote or
+    //! reject authority.  Unlike EvidenceReady(), a completed but failed
+    //! validation is terminal for bounded warmup rather than an endless probe.
+    bool contextualCompletionAuthorityEvidenceComplete(PhaseContextualPairDirection direction) const noexcept;
     bool contextualCompletionAuthorityReady(
         PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate const& estimate) const noexcept;
     bool contextualCompletionAuthorityPredictsIncumbent() const noexcept
