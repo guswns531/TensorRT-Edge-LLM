@@ -172,6 +172,11 @@ action fidelity는 참이었다.
 Active의 run별 H1 action change는 1/4/6회, completion authority application은 31/36/36회였다. D-containing
 decision record는 Scalar 142/164/143, Active 124/153/157로 일관된 fragmentation 감소가 아니었다.
 
+Cross-repeat exact token trace는 Scalar가 3개 모두 달랐고 Active는 3개 중 2개만 같았다. 각 repeat 내부는
+deterministic으로 보고됐지만, 40-request 비동기 row/cohort ordering이 repeat 사이 greedy branch를 바꾼다. 따라서
+이 결과는 성능/trajectory characterization에는 사용할 수 있어도 exact cross-policy correctness promotion
+근거로는 사용할 수 없다. canonical row-order gate를 별도로 유지한다.
+
 해석은 두 가지다.
 
 1. richer physical model은 평균 TPOT/E2E를 개선할 수 있다.
@@ -189,6 +194,7 @@ decision record는 Scalar 142/164/143, Active 124/153/157로 일관된 fragmenta
 | strict forced branch causal pair | 실패 | 공통 full strict pre-branch 0 |
 | scaled multi-image natural evidence | 통과 | 40 requests x 3, Active의 mixed mean/tail trade-off 재현 |
 | two-boundary mechanism correctness | 통과 | DAG/vision/KV transition 단위 테스트 |
+| scaled exact cross-repeat identity | 실패 | Scalar hash 3종, Active hash 2종(2/3만 동일) |
 | transition rollout active promotion | 보류 | causal pair와 realization gate 미통과 |
 | 12-workload active gate | 실행하지 않음 | 이전 gate 미통과 |
 | fresh vLLM rerun | 실행하지 않음 | workload 계약이 바뀐 최종 후보가 없음 |
