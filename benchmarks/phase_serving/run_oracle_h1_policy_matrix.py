@@ -109,6 +109,25 @@ POLICY_ENVIRONMENTS = {
         "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "1",
         "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "1",
     },
+    # Causal P+D branches retain the same E policy and change only the
+    # experimental P+D selector. They are research controls, not production
+    # workload profiles.
+    "pd_force_serial": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+        "TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT": "0",
+    },
+    "pd_force_overlap": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+        "TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT": "100",
+    },
     "myopic": {
         "TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER": "0",
     },

@@ -113,6 +113,17 @@ def test_materializes_pd_only_authority() -> None:
     assert values["TRT_EDGELLM_CONTEXTUAL_ED"] == "shadow"
 
 
+def test_materializes_pd_causal_branch_without_forcing_encoder_pairs() -> None:
+    result = materialize_command(entry(), "pd_force_overlap",
+                                 Path("/host/out"), Path("/host"),
+                                 Path("/workspace"), "/workspace/plugin.so",
+                                 "/workspace/build/llm_phase_context_smoke")
+    values = environment(result["command"])
+    assert values["TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT"] == "100"
+    assert "TRT_EDGELLM_EXPERIMENTAL_ENCODER_PREFILL_OVERLAP_PERCENT" not in values
+    assert "TRT_EDGELLM_EXPERIMENTAL_ENCODER_DECODE_OVERLAP_PERCENT" not in values
+
+
 def test_materializes_full_request_timeline() -> None:
     result = materialize_command(entry(), "current", Path("/host/out"),
                                  Path("/host"), Path("/workspace"),
