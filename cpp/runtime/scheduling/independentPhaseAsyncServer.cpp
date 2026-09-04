@@ -34,6 +34,39 @@
 
 namespace trt_edgellm::rt
 {
+namespace
+{
+
+constexpr uint64_t kSTATE_HASH_OFFSET = 14695981039346656037ULL;
+constexpr uint64_t kSTATE_HASH_PRIME = 1099511628211ULL;
+
+void addStateHash(uint64_t& hash, uint64_t value) noexcept
+{
+    hash ^= value;
+    hash *= kSTATE_HASH_PRIME;
+}
+
+void addVisionPayloadHash(uint64_t& hash, PhaseVisionPayload const* payload) noexcept
+{
+    addStateHash(hash, payload != nullptr ? 1U : 0U);
+    if (payload == nullptr)
+    {
+        return;
+    }
+    addStateHash(hash, payload->byteSize());
+    addStateHash(hash, payload->prefillByteSize());
+    addStateHash(hash, payload->tokenIds.size());
+    for (std::vector<int32_t> const& ids : payload->tokenIds)
+    {
+        addStateHash(hash, ids.size());
+        for (int32_t const id : ids)
+        {
+            addStateHash(hash, static_cast<uint64_t>(id));
+        }
+    }
+}
+
+} // namespace
 
 size_t phaseDecodeAlignedAdmissionCapacity(size_t requestedCapacity, size_t decodeBatchCapacity) noexcept
 {
@@ -1784,6 +1817,47 @@ IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrati
         result.decodeRequestIds = queue.decodeRequestIds;
         result.decodeContextLengths = queue.decodeContextLengths;
         result.visionPayloadBytes = visionPayloadBytes();
+
+        std::vector<uint64_t> activeRequestIds;
+        activeRequestIds.reserve(mRequests.size());
+        for (auto const& [requestId, request] : mRequests)
+        {
+            static_cast<void>(request);
+            activeRequestIds.push_back(requestId);
+        }
+        std::sort(activeRequestIds.begin(), activeRequestIds.end());
+        result.kvOwnershipSignature = kSTATE_HASH_OFFSET;
+        result.visionLeaseSignature = kSTATE_HASH_OFFSET;
+        addStateHash(result.kvOwnershipSignature, activeRequestIds.size());
+        addStateHash(result.visionLeaseSignature, activeRequestIds.size());
+        for (uint64_t const requestId : activeRequestIds)
+        {
+            RequestState const& request = mRequests.at(requestId);
+            addStateHash(result.kvOwnershipSignature, requestId);
+            addStateHash(result.kvOwnershipSignature, static_cast<uint64_t>(request.kvSlotId));
+            if (request.kvSlotId >= 0 && mOwnership.leased(request.kvSlotId))
+            {
+                addStateHash(result.kvOwnershipSignature, mOwnership.leaseGeneration(request.kvSlotId));
+                addStateHash(result.kvOwnershipSignature, static_cast<uint64_t>(mOwnership.length(request.kvSlotId)));
+                std::vector<int32_t> const& pages = mOwnership.pages(request.kvSlotId);
+                addStateHash(result.kvOwnershipSignature, pages.size());
+                for (int32_t const page : pages)
+                {
+                    addStateHash(result.kvOwnershipSignature, static_cast<uint64_t>(page));
+                }
+            }
+            addStateHash(result.visionLeaseSignature, requestId);
+            addStateHash(result.visionLeaseSignature, request.awaitingVisionPayload ? 1U : 0U);
+            addStateHash(result.visionLeaseSignature, request.visionPrefixComplete ? 1U : 0U);
+            addVisionPayloadHash(result.visionLeaseSignature, request.visionPayload.get());
+            addVisionPayloadHash(result.visionLeaseSignature, request.pendingVisionPayload.get());
+        }
+        addStateHash(result.visionLeaseSignature, mPendingRequests.size());
+        for (PendingRequest const& request : mPendingRequests)
+        {
+            addStateHash(result.visionLeaseSignature, request.requestId);
+            addVisionPayloadHash(result.visionLeaseSignature, request.visionPayload.get());
+        }
     }
     result.prefillOldestRequestAgeUs = queue.prefillOldestRequestAgeUs;
     result.prefillMinTtftSlackUs = queue.prefillMinTtftSlackUs;

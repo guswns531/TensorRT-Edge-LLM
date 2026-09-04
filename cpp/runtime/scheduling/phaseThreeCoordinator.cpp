@@ -1549,6 +1549,8 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.pagePoolAllocatedBundles = server.pagePoolAllocatedBundles;
     event.pageReservationGuaranteedBundles = server.pageReservationGuaranteedBundles;
     event.visionPayloadBytes = server.visionPayloadBytes + mReadyPrefillBytes + mEstimatedEncodedBytes;
+    event.kvOwnershipSignature = server.kvOwnershipSignature;
+    event.visionLeaseSignature = server.visionLeaseSignature;
     auto appendCandidate = [&event](PhaseGlobalActionCandidate const& source) {
         PhaseUnifiedCandidateSnapshot snapshot;
         snapshot.actionId = source.candidateId;
@@ -1617,6 +1619,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         }
     }
     event.snapshotSignature = phaseUnifiedSnapshotSignature(event);
+    event.strictSnapshotSignature = phaseUnifiedStrictSnapshotSignature(event);
     mUnifiedDecisionByPlan[plan.planId] = event;
     emitUnifiedEvent(std::move(event));
 }

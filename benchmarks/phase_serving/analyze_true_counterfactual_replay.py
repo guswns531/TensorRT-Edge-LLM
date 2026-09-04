@@ -36,7 +36,7 @@ def open_text(path: Path) -> TextIO:
 
 
 def load_branch(paths: list[Path]) -> dict[int, list[dict[str, Any]]]:
-    """Index decision and completion records by deterministic snapshot hash."""
+    """Index decision and completion records by strict pre-branch hash."""
     plans: dict[tuple[str, int], dict[str, Any]] = {}
     completions: dict[tuple[str, int], list[dict[str,
                                                  Any]]] = defaultdict(list)
@@ -59,7 +59,9 @@ def load_branch(paths: list[Path]) -> dict[int, list[dict[str, Any]]]:
                      if "gpu_start_us" in item and "gpu_end_us" in item]
         if not intervals:
             continue
-        snapshots[int(decision.get("snapshot_signature", 0))].append({
+        signature = int(decision.get("strict_snapshot_signature",
+                                     decision.get("snapshot_signature", 0)))
+        snapshots[signature].append({
             "action":
             decision.get("action_kind", "unknown"),
             "request_ids":
@@ -99,7 +101,7 @@ def main() -> int:
                     or lhs["token_work"] != rhs["token_work"]):
                 continue
             pairs.append({
-                "snapshot_signature":
+                "strict_snapshot_signature":
                 signature,
                 args.name_a:
                 lhs,

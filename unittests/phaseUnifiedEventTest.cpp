@@ -163,5 +163,42 @@ TEST(PhaseUnifiedEventTest, SnapshotSignatureIgnoresTransientIdsAndCanonicalizes
     EXPECT_NE(phaseUnifiedSnapshotSignature(left), phaseUnifiedSnapshotSignature(right));
 }
 
+TEST(PhaseUnifiedEventTest, StrictSnapshotSignatureIncludesOwnershipAndExactCandidateFrontier)
+{
+    PhaseUnifiedEvent left;
+    left.ready.prefillRows = 2;
+    left.readyPrefillRequestIds = {11U, 12U};
+    left.readyPrefillTokenCounts = {128, 128};
+    left.kvOwnershipSignature = 101U;
+    left.visionLeaseSignature = 202U;
+    PhaseUnifiedCandidateSnapshot candidate;
+    candidate.key.kind = PhaseGlobalActionKind::kPrefill;
+    candidate.key.primaryBatchSize = 2;
+    candidate.key.chunkLength = 128;
+    candidate.requestIds = {11U, 12U};
+    left.candidates.push_back(candidate);
+    left.snapshotSignature = phaseUnifiedSnapshotSignature(left);
+
+    PhaseUnifiedEvent right = left;
+    right.selectedActionId = 999U;
+    EXPECT_EQ(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+
+    right = left;
+    ++right.kvOwnershipSignature;
+    EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+    right = left;
+    ++right.visionLeaseSignature;
+    EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+    right = left;
+    right.candidates.front().requestIds = {12U, 11U};
+    EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+    right = left;
+    ++right.candidates.front().key.chunkLength;
+    EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+    right = left;
+    right.candidates.front().legal = false;
+    EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+}
+
 } // namespace
 } // namespace trt_edgellm::rt

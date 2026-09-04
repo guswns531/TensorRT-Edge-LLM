@@ -44,7 +44,8 @@ def _candidate_signature(candidate: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _frontier_signature(decision: dict[str, Any]) -> tuple[Any, ...]:
-    return (int(decision.get("snapshot_signature", 0)),
+    return (int(decision.get("strict_snapshot_signature",
+                             decision.get("snapshot_signature", 0))),
             tuple(sorted(_candidate_signature(candidate)
                          for candidate in decision.get("candidates", []))))
 
@@ -132,7 +133,7 @@ def main() -> int:
             })
         action_rows.sort(key=lambda row: row["median_horizon_us"])
         frontiers.append({
-            "snapshot_signature": frontier[0],
+            "strict_snapshot_signature": frontier[0],
             "candidate_frontier": frontier[1],
             "actions": action_rows,
             "best_action": action_rows[0]["action"],

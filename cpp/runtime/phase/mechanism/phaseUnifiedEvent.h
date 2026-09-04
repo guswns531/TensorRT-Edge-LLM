@@ -25,6 +25,7 @@
 #include <limits>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace trt_edgellm::rt
@@ -441,7 +442,12 @@ struct PhaseUnifiedEvent
     int32_t pagePoolAllocatedBundles{};
     int32_t pageReservationGuaranteedBundles{};
     size_t visionPayloadBytes{};
+    uint64_t kvOwnershipSignature{};
+    uint64_t visionLeaseSignature{};
     uint64_t snapshotSignature{};
+    //! Snapshot plus exact candidate frontier and persistent ownership.
+    //! This is the pre-branch identity required by forced causal replay.
+    uint64_t strictSnapshotSignature{};
     PhaseUnifiedWork cohort;
     std::vector<uint64_t> requestIds;
     PhaseInFlightSnapshot inFlight;
@@ -534,6 +540,64 @@ inline uint64_t phaseUnifiedSnapshotSignature(PhaseUnifiedEvent const& event)
         add(static_cast<uint64_t>(work->work.decodeRows));
         add(static_cast<uint64_t>(work->work.decodeContextTokens));
         addIds(work->requestIds);
+    }
+    return result;
+}
+
+//! Strict cross-run identity for causal branch replay. Unlike the mechanism
+//! snapshot signature, this includes the complete candidate frontier and
+//! persistent KV/vision ownership but still excludes timestamps and the
+//! selected action.
+inline uint64_t phaseUnifiedStrictSnapshotSignature(PhaseUnifiedEvent const& event)
+{
+    constexpr uint64_t kFNV_OFFSET = 14695981039346656037ULL;
+    constexpr uint64_t kFNV_PRIME = 1099511628211ULL;
+    uint64_t result{kFNV_OFFSET};
+    auto add = [&](uint64_t value) {
+        result ^= value;
+        result *= kFNV_PRIME;
+    };
+    auto addIds = [&](std::vector<uint64_t> const& ids) {
+        add(ids.size());
+        for (uint64_t const requestId : ids)
+        {
+            add(requestId);
+        }
+    };
+    add(event.snapshotSignature);
+    add(event.kvOwnershipSignature);
+    add(event.visionLeaseSignature);
+    std::vector<PhaseUnifiedCandidateSnapshot const*> candidates;
+    candidates.reserve(event.candidates.size());
+    for (PhaseUnifiedCandidateSnapshot const& candidate : event.candidates)
+    {
+        candidates.push_back(&candidate);
+    }
+    auto sortKey = [](PhaseUnifiedCandidateSnapshot const* candidate) {
+        PhaseGlobalActionKey const& key = candidate->key;
+        return std::tuple{static_cast<int32_t>(key.kind), key.primaryBatchSize, key.secondaryBatchSize, key.chunkLength,
+            key.primaryContextBucket, key.secondaryContextBucket, static_cast<uint8_t>(key.executionVariant),
+            key.primaryWorkClass, key.residualAugmentation, static_cast<uint8_t>(key.residualAnchor), candidate->legal,
+            candidate->requestIds};
+    };
+    std::sort(candidates.begin(), candidates.end(),
+        [&](auto const* left, auto const* right) { return sortKey(left) < sortKey(right); });
+    add(candidates.size());
+    for (PhaseUnifiedCandidateSnapshot const* candidate : candidates)
+    {
+        PhaseGlobalActionKey const& key = candidate->key;
+        add(static_cast<uint64_t>(key.kind));
+        add(static_cast<uint64_t>(key.primaryBatchSize));
+        add(static_cast<uint64_t>(key.secondaryBatchSize));
+        add(static_cast<uint64_t>(key.chunkLength));
+        add(static_cast<uint64_t>(key.primaryContextBucket));
+        add(static_cast<uint64_t>(key.secondaryContextBucket));
+        add(static_cast<uint8_t>(key.executionVariant));
+        add(static_cast<uint64_t>(key.primaryWorkClass));
+        add(key.residualAugmentation ? 1U : 0U);
+        add(static_cast<uint8_t>(key.residualAnchor));
+        add(candidate->legal ? 1U : 0U);
+        addIds(candidate->requestIds);
     }
     return result;
 }

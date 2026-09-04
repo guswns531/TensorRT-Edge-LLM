@@ -4294,6 +4294,13 @@ int main(int argc, char** argv)
                             };
                             candidates.push_back({{"action_id", candidate.actionId},
                                 {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
+                                {"primary_batch_size", candidate.key.primaryBatchSize},
+                                {"secondary_batch_size", candidate.key.secondaryBatchSize},
+                                {"chunk_length", candidate.key.chunkLength},
+                                {"primary_context_bucket", candidate.key.primaryContextBucket},
+                                {"secondary_context_bucket", candidate.key.secondaryContextBucket},
+                                {"execution_variant", rt::phaseExecutionVariantName(candidate.key.executionVariant)},
+                                {"primary_work_class", candidate.key.primaryWorkClass},
                                 {"action_direction",
                                     candidate.key.kind == rt::PhaseGlobalActionKind::kEncoderPrefill
                                             || candidate.key.kind == rt::PhaseGlobalActionKind::kEncoderDecode
@@ -4351,7 +4358,10 @@ int main(int argc, char** argv)
                         }
                         record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
                             {"snapshot_signature", event.snapshotSignature}, {"plan_id", event.planId},
-                            {"action_id", event.actionId}, {"incremental_action_id", event.incrementalActionId},
+                            {"strict_snapshot_signature", event.strictSnapshotSignature},
+                            {"kv_ownership_signature", event.kvOwnershipSignature},
+                            {"vision_lease_signature", event.visionLeaseSignature}, {"action_id", event.actionId},
+                            {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
                             {"requested_action_direction",
                                 rt::phaseUnifiedActionDirectionName(event.requestedDirection)},

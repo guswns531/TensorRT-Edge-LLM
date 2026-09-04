@@ -47,6 +47,21 @@
       "type": "integer",
       "minimum": 1
     },
+    "strict_snapshot_signature": {
+      "description": "Cross-run identity of the snapshot, full candidate frontier, exact row order, and persistent KV/vision ownership. The selected action and timestamps are excluded.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "kv_ownership_signature": {
+      "description": "Cross-run identity of request-to-slot/page leases, generation, and committed KV length.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "vision_lease_signature": {
+      "description": "Cross-run identity of active and pending vision payload lifetimes.",
+      "type": "integer",
+      "minimum": 1
+    },
     "plan_id": {
       "type": "integer",
       "minimum": 1

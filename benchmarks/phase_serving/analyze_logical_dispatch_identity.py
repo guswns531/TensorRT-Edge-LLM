@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import collections
 import gzip
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -47,15 +48,26 @@ def _cohort(value: Any) -> tuple[int, ...]:
 def _candidate(candidate: dict[str, Any]) -> tuple[Any, ...]:
     return (str(candidate.get("action_kind", "none")),
             str(candidate.get("action_direction", "none")),
+            int(candidate.get("primary_batch_size", 0)),
+            int(candidate.get("secondary_batch_size", 0)),
+            int(candidate.get("chunk_length", 0)),
+            int(candidate.get("primary_context_bucket", 0)),
+            int(candidate.get("secondary_context_bucket", 0)),
+            str(candidate.get("execution_variant", "eager")),
+            int(candidate.get("primary_work_class", 0)),
             tuple(int(value) for value in candidate.get("request_ids", [])),
             str(candidate.get("residual_anchor", "none")),
-            bool(candidate.get("residual_augmentation", False)))
+            bool(candidate.get("residual_augmentation", False)),
+            bool(candidate.get("legal", True)))
 
 
 def _decision(event: dict[str, Any]) -> tuple[Any, ...]:
     candidates = tuple(sorted(_candidate(item)
                               for item in event.get("candidates", [])))
-    return (int(event.get("snapshot_signature", 0)),
+    return (int(event.get("strict_snapshot_signature",
+                          event.get("snapshot_signature", 0))),
+            int(event.get("kv_ownership_signature", 0)),
+            int(event.get("vision_lease_signature", 0)),
             str(event.get("action_kind", "none")),
             tuple(int(value) for value in event.get("request_ids", [])),
             _cohort(event.get("selected_cohort")),
@@ -69,7 +81,14 @@ def _dispatch(event: dict[str, Any]) -> tuple[Any, ...]:
             str(event.get("action_direction", "none")),
             str(event.get("dispatch_mode", "none")),
             int(event.get("requested_start_skew_percent", -1)),
+            int(event.get("observed_start_skew_percent", -1)),
             int(event.get("planned_outstanding_mask", 0)))
+
+
+def _signature(records: list[tuple[Any, ...]]) -> str:
+    """Hash stable logical records while excluding all host/GPU timestamps."""
+    payload = json.dumps(records, separators=(",", ":"), sort_keys=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _load_decision_cost(path: Path) -> dict[str, Any] | None:
@@ -118,6 +137,8 @@ def load(path: Path) -> dict[str, Any]:
         "path": str(path),
         "decisions": decisions,
         "dispatches": dispatches,
+        "decision_signature": _signature(decisions),
+        "dispatch_signature": _signature(dispatches),
         "decision_cost": _load_decision_cost(path),
         "scalar_selection_comparisons": scalar_selection_comparisons,
         "scalar_selection_mismatches": scalar_selection_mismatches,
@@ -171,6 +192,8 @@ def main() -> int:
                     "scalar_selection_mismatches"],
                 "completion_changed_actions": left[
                     "completion_changed_actions"],
+                "logical_decision_signature": left["decision_signature"],
+                "logical_dispatch_signature": left["dispatch_signature"],
             },
             args.right_name: {
                 "path": right["path"],
@@ -181,6 +204,8 @@ def main() -> int:
                     "scalar_selection_mismatches"],
                 "completion_changed_actions": right[
                     "completion_changed_actions"],
+                "logical_decision_signature": right["decision_signature"],
+                "logical_dispatch_signature": right["dispatch_signature"],
             },
             "decisions": _compare_sequence(left["decisions"],
                                            right["decisions"]),

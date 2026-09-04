@@ -306,6 +306,11 @@ struct IndependentPhaseServerArbitrationSnapshot
     int32_t pagePoolAllocatedBundles{};
     int32_t pageReservationGuaranteedBundles{};
     size_t visionPayloadBytes{};
+    //! Cross-run stable request-to-slot/page lease identity. Populated only
+    //! for detailed research snapshots so production arbitration stays O(1).
+    uint64_t kvOwnershipSignature{};
+    //! Cross-run stable request-to-vision-payload lifetime identity.
+    uint64_t visionLeaseSignature{};
     double prefillOldestRequestAgeUs{};
     double prefillMinTtftSlackUs{};
     double decodeOldestWaitUs{};
