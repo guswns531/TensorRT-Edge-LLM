@@ -385,6 +385,18 @@ struct PhaseUnifiedCandidateSnapshot
     double contextualIncumbentReferenceUs{};
     double contextualNewcomerReferenceUs{};
     double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};
+    bool completionPolicyEvaluated{};
+    bool completionAuthorityReady{};
+    bool completionAuthorityApplied{};
+    bool scalarDecisionCostKnown{};
+    bool activeDecisionCostKnown{};
+    double scalarDecisionMakespanUs{};
+    double activeDecisionMakespanUs{};
+    double completionAggregateBlendWeight{};
+    double completionIncumbentBlendWeight{};
+    double completionNewcomerBlendWeight{};
+    std::vector<PhaseProtectedCompletion> scalarProtectedCompletions;
+    std::vector<PhaseProtectedCompletion> activeProtectedCompletions;
 };
 
 struct PhaseUnifiedEvent
@@ -435,6 +447,11 @@ struct PhaseUnifiedEvent
     PhaseInFlightSnapshot inFlight;
     std::vector<PhaseUnifiedCandidateSnapshot> candidates;
     uint64_t selectedActionId{};
+    //! H=1 selector result with completion authority as evaluated online.
+    uint64_t activeH1SelectedActionId{};
+    //! H=1 selector result after restoring completion-sensitive candidate
+    //! fields to their scalar values over this exact frontier.
+    uint64_t scalarSelectedActionId{};
     uint64_t enqueueHostNs{};
     uint64_t prepareStartHostNs{};
     uint64_t prepareEndHostNs{};

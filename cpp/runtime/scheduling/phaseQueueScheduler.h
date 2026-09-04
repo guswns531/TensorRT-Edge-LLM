@@ -839,6 +839,9 @@ public:
     size_t decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept;
     //! Keep runtime decode refinement out of latency mode while retaining recent samples.
     void setDecodeComponentObservationActive(bool active) noexcept;
+    //! Retain scalar completion-policy inputs only while detailed research
+    //! telemetry is enabled. Production decisions avoid diagnostic vector copies.
+    void setCompletionAttributionEnabled(bool enabled) noexcept;
     //! Update a scheduler-external resource drain hint. Disabled schedulers retain legacy decisions.
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Temporarily exclude prefill dispatch while an external encoder owns overlapping context memory.
@@ -945,6 +948,7 @@ private:
     //! Mechanism previews only read recent histories through the shared tracker.
     std::shared_ptr<RecentDecodeTpot> mRecentDecodeTpotUs;
     bool mDecodeComponentObservationActive{};
+    bool mCompletionAttributionEnabled{};
     bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};
     int32_t mConsecutiveOverlapBatches{};

@@ -195,6 +195,17 @@
       "type": "integer",
       "minimum": 1
     },
+    "active_h1_selected_action_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "scalar_h1_selected_action_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "completion_changed_h1_action": {
+      "type": "boolean"
+    },
     "enqueue_host_ns": {
       "type": "integer",
       "minimum": 0
@@ -422,6 +433,37 @@
       },
       "uniqueItems": true
     },
+    "protectedCompletion": {
+      "type": "object",
+      "required": [
+        "kind",
+        "slack_us",
+        "predicted_completion_us",
+        "uncertainty_us"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "unknown",
+            "encoder",
+            "prefill",
+            "decode"
+          ]
+        },
+        "slack_us": {
+          "type": "number"
+        },
+        "predicted_completion_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "uncertainty_us": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "inflight": {
       "type": "object",
       "required": [
@@ -591,6 +633,56 @@
         "max_slo_violation_us": {
           "type": "number",
           "minimum": 0
+        },
+        "completion_policy_evaluated": {
+          "type": "boolean"
+        },
+        "completion_authority_ready": {
+          "type": "boolean"
+        },
+        "completion_authority_applied": {
+          "type": "boolean"
+        },
+        "scalar_decision_cost_known": {
+          "type": "boolean"
+        },
+        "active_decision_cost_known": {
+          "type": "boolean"
+        },
+        "scalar_decision_makespan_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "active_decision_makespan_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "completion_aggregate_blend_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "completion_incumbent_blend_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "completion_newcomer_blend_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "scalar_protected_completions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/protectedCompletion"
+          }
+        },
+        "active_protected_completions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/protectedCompletion"
+          }
         }
       },
       "additionalProperties": true

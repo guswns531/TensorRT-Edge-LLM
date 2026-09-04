@@ -2313,14 +2313,26 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         }
         candidate.protectedCompletions.push_back(
             {decodeSlack, overlapDecodeCompletionUs, overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode});
+        if (mCompletionAttributionEnabled && candidate.contextualCompletionFeatureValid)
+        {
+            phaseCaptureScalarCompletionPolicy(candidate);
+        }
         if (mRuntimeCostTracker->contextualCompletionAuthorityReady(
                 contextualDirection, candidate.contextualCompletion))
         {
+            candidate.completionAuthorityReady = true;
             PhaseContextualCompletionEstimate const authority
                 = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(
                     contextualDirection, candidate.contextualCompletion);
             double const completionWeight
                 = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(contextualDirection);
+            candidate.completionAggregateBlendWeight = completionWeight;
+            candidate.completionIncumbentBlendWeight
+                = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(contextualDirection, true);
+            candidate.completionNewcomerBlendWeight
+                = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(contextualDirection, false);
+            candidate.completionAuthorityApplied = completionWeight > 0.0
+                || candidate.completionIncumbentBlendWeight > 0.0 || candidate.completionNewcomerBlendWeight > 0.0;
             double const scalarMakespanUs
                 = candidate.decisionCostKnown ? candidate.decisionMakespanUs : candidate.predictedMakespanUs;
             candidate.decisionCostKnown = true;
@@ -2342,6 +2354,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
             }
         }
+        candidate.activeDecisionCostKnown = candidate.decisionCostKnown;
+        candidate.activeDecisionMakespanUs = candidate.decisionMakespanUs;
         if (decodeFormation.has_value())
         {
             double const currentActionUs
@@ -2999,11 +3013,23 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     appendProtected(*missing);
     PhaseContextualPairDirection const direction
         = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+    if (mCompletionAttributionEnabled && overlap.contextualCompletionFeatureValid)
+    {
+        phaseCaptureScalarCompletionPolicy(overlap);
+    }
     if (mRuntimeCostTracker->contextualCompletionAuthorityReady(direction, overlap.contextualCompletion))
     {
+        overlap.completionAuthorityReady = true;
         PhaseContextualCompletionEstimate const authority
             = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
         double const completionWeight = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(direction);
+        overlap.completionAggregateBlendWeight = completionWeight;
+        overlap.completionIncumbentBlendWeight
+            = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, true);
+        overlap.completionNewcomerBlendWeight
+            = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, false);
+        overlap.completionAuthorityApplied = completionWeight > 0.0 || overlap.completionIncumbentBlendWeight > 0.0
+            || overlap.completionNewcomerBlendWeight > 0.0;
         double const scalarMakespanUs
             = overlap.decisionCostKnown ? overlap.decisionMakespanUs : overlap.predictedMakespanUs;
         overlap.decisionCostKnown = true;
@@ -3024,6 +3050,8 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
                 incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
         }
     }
+    overlap.activeDecisionCostKnown = overlap.decisionCostKnown;
+    overlap.activeDecisionMakespanUs = overlap.decisionMakespanUs;
 
     // Compare equal work horizons. Leaving the incumbent single phase active
     // does not discard the ready peer phase; it executes that phase at the
@@ -4288,6 +4316,11 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseQueueScheduler::globalCalibration
 void PhaseQueueScheduler::setDecodeComponentObservationActive(bool active) noexcept
 {
     mDecodeComponentObservationActive = mConfig.enableDecodeComponentObservation && active;
+}
+
+void PhaseQueueScheduler::setCompletionAttributionEnabled(bool enabled) noexcept
+{
+    mCompletionAttributionEnabled = enabled;
 }
 
 void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference preference) noexcept

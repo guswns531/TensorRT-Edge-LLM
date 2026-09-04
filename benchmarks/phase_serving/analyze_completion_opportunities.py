@@ -74,6 +74,99 @@ def action_mode(candidate: dict[str, Any]) -> str:
                                                     False) else "co_launch"
 
 
+def completion_authority_attribution(
+        decisions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Attribute active completion authority over each unchanged H1 frontier."""
+    evaluated = 0
+    ready = 0
+    applied = 0
+    comparable_costs: list[float] = []
+    protected_robust_deltas: collections.defaultdict[str, list[float]] = \
+        collections.defaultdict(list)
+    by_direction: collections.defaultdict[str, collections.Counter[str]] = \
+        collections.defaultdict(collections.Counter)
+    comparable_decisions = 0
+    changed_decisions = 0
+    active_to_final_changes = 0
+    scalar_to_final_changes = 0
+
+    for decision in decisions:
+        active_id = int(decision.get("active_h1_selected_action_id", 0))
+        scalar_id = int(decision.get("scalar_h1_selected_action_id", 0))
+        if active_id > 0 and scalar_id > 0:
+            comparable_decisions += 1
+            changed_decisions += active_id != scalar_id
+            final_id = int(decision.get("selected_action_id", 0))
+            active_to_final_changes += final_id > 0 and active_id != final_id
+            scalar_to_final_changes += final_id > 0 and scalar_id != final_id
+        for candidate in decision.get("candidates", []):
+            if not candidate.get("completion_policy_evaluated", False):
+                continue
+            evaluated += 1
+            direction = str(candidate.get("contextual_direction", "none"))
+            direction_counts = by_direction[direction]
+            direction_counts["evaluated"] += 1
+            if candidate.get("completion_authority_ready", False):
+                ready += 1
+                direction_counts["ready"] += 1
+            if candidate.get("completion_authority_applied", False):
+                applied += 1
+                direction_counts["applied"] += 1
+            if candidate.get("scalar_decision_cost_known",
+                             False) and candidate.get(
+                                 "active_decision_cost_known", False):
+                cost_delta = float(
+                    candidate.get("active_decision_makespan_us", 0.0)) - float(
+                        candidate.get("scalar_decision_makespan_us", 0.0))
+                comparable_costs.append(cost_delta)
+                direction_counts["cost_comparable"] += 1
+                direction_counts["cost_increased"] += cost_delta > 0.0
+                direction_counts["cost_decreased"] += cost_delta < 0.0
+
+            scalar_components = candidate.get("scalar_protected_completions",
+                                              [])
+            active_components = candidate.get("active_protected_completions",
+                                              [])
+            for scalar, active in zip(scalar_components, active_components):
+                if scalar.get("kind") != active.get("kind"):
+                    continue
+                scalar_robust = float(scalar.get("predicted_completion_us", 0.0)) \
+                    + float(scalar.get("uncertainty_us", 0.0))
+                active_robust = float(active.get("predicted_completion_us", 0.0)) \
+                    + float(active.get("uncertainty_us", 0.0))
+                protected_robust_deltas[str(active.get(
+                    "kind", "unknown"))].append(active_robust - scalar_robust)
+
+    return {
+        "evaluated_candidates": evaluated,
+        "authority_ready_candidates": ready,
+        "authority_applied_candidates": applied,
+        "active_minus_scalar_decision_makespan_us":
+        distribution(comparable_costs),
+        "active_minus_scalar_protected_robust_us": {
+            kind: distribution(values)
+            for kind, values in sorted(protected_robust_deltas.items())
+        },
+        "h1_action_attribution": {
+            "comparable_decisions":
+            comparable_decisions,
+            "changed_decisions":
+            changed_decisions,
+            "changed_fraction":
+            changed_decisions /
+            comparable_decisions if comparable_decisions else None,
+            "active_to_final_changes":
+            active_to_final_changes,
+            "scalar_to_final_changes":
+            scalar_to_final_changes,
+        },
+        "by_direction": {
+            direction: dict(sorted(counts.items()))
+            for direction, counts in sorted(by_direction.items())
+        },
+    }
+
+
 def analyze(events: list[dict[str, Any]],
             confidence_beta: float) -> dict[str, Any]:
     """Build opportunity, selection, coverage, disagreement, and replay metrics."""
@@ -240,6 +333,8 @@ def analyze(events: list[dict[str, Any]],
             "count": disagreements,
             "fraction": disagreements / comparable if comparable else None,
         },
+        "completion_authority_attribution":
+        completion_authority_attribution(decisions),
         "replay_regret_us":
         distribution(regrets),
         "conformal_false_safe":

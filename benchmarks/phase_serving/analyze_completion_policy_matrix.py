@@ -41,8 +41,14 @@ def load_policy(name: str, root: Path, ttft_ms: float, tpot_ms: float,
     for aggregate_path in sorted(root.glob("*/worker-4/aggregate.json")):
         workload = aggregate_path.parents[1].name
         aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
-        request_csv = aggregate_path.parent / "run-001/client/run-001/requests.csv"
-        slo = summarize_slo(request_csv, ttft_ms, tpot_ms, e2e_ms)
+        request_csvs = sorted(
+            aggregate_path.parent.glob("run-*/client/run-*/requests.csv"))
+        if not request_csvs:
+            raise ValueError(f"{aggregate_path.parent} has no request CSV")
+        slo_runs = [
+            summarize_slo(request_csv, ttft_ms, tpot_ms, e2e_ms)
+            for request_csv in request_csvs
+        ]
         rows.append({
             "policy":
             name,
@@ -65,15 +71,17 @@ def load_policy(name: str, root: Path, ttft_ms: float, tpot_ms: float,
             "e2e_p95_ms":
             float(aggregate["e2e_p95_median_ms"]),
             "joint_slo_pass_rate":
-            float(slo["pass_rate"]),
+            statistics.median(float(slo["pass_rate"]) for slo in slo_runs),
             "joint_slo_goodput_req_s":
-            float(slo["request_goodput_per_s"]),
+            statistics.median(
+                float(slo["request_goodput_per_s"]) for slo in slo_runs),
+            "slo_repeats":
+            len(slo_runs),
             "token_trace_sha256":
             list(aggregate.get("token_trace_sha256_per_run", [])),
             "aggregate":
             str(aggregate_path),
-            "requests_csv":
-            str(request_csv),
+            "requests_csv": [str(request_csv) for request_csv in request_csvs],
         })
     return rows
 

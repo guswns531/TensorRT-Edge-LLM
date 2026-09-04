@@ -382,6 +382,8 @@ public:
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
+    //! Enable same-frontier scalar/completion attribution while the server is idle.
+    void setCompletionAttributionEnabled(bool enabled) noexcept;
     //! Configure an opt-in M2 directional launch experiment while idle.
     void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
     cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;

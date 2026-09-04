@@ -4281,6 +4281,17 @@ int main(int argc, char** argv)
                         nlohmann::json candidates = nlohmann::json::array();
                         for (rt::PhaseUnifiedCandidateSnapshot const& candidate : event.candidates)
                         {
+                            auto protectedCompletions = [](auto const& completions) {
+                                nlohmann::json result = nlohmann::json::array();
+                                for (rt::PhaseProtectedCompletion const& completion : completions)
+                                {
+                                    result.push_back({{"kind", rt::phaseProtectedKindName(completion.kind)},
+                                        {"slack_us", completion.slackUs},
+                                        {"predicted_completion_us", completion.predictedCompletionUs},
+                                        {"uncertainty_us", completion.uncertaintyUs}});
+                                }
+                                return result;
+                            };
                             candidates.push_back({{"action_id", candidate.actionId},
                                 {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
                                 {"action_direction",
@@ -4318,7 +4329,21 @@ int main(int argc, char** argv)
                                 {"contextual_uncertainty_calibrated",
                                     candidate.contextualCompletion.uncertaintyCalibrated},
                                 {"contextual_incumbent_reference_us", candidate.contextualIncumbentReferenceUs},
-                                {"contextual_newcomer_reference_us", candidate.contextualNewcomerReferenceUs}});
+                                {"contextual_newcomer_reference_us", candidate.contextualNewcomerReferenceUs},
+                                {"completion_policy_evaluated", candidate.completionPolicyEvaluated},
+                                {"completion_authority_ready", candidate.completionAuthorityReady},
+                                {"completion_authority_applied", candidate.completionAuthorityApplied},
+                                {"scalar_decision_cost_known", candidate.scalarDecisionCostKnown},
+                                {"active_decision_cost_known", candidate.activeDecisionCostKnown},
+                                {"scalar_decision_makespan_us", candidate.scalarDecisionMakespanUs},
+                                {"active_decision_makespan_us", candidate.activeDecisionMakespanUs},
+                                {"completion_aggregate_blend_weight", candidate.completionAggregateBlendWeight},
+                                {"completion_incumbent_blend_weight", candidate.completionIncumbentBlendWeight},
+                                {"completion_newcomer_blend_weight", candidate.completionNewcomerBlendWeight},
+                                {"scalar_protected_completions",
+                                    protectedCompletions(candidate.scalarProtectedCompletions)},
+                                {"active_protected_completions",
+                                    protectedCompletions(candidate.activeProtectedCompletions)}});
                             if (std::isfinite(candidate.contextualMinimumSlackUs))
                             {
                                 candidates.back()["contextual_minimum_slack_us"] = candidate.contextualMinimumSlackUs;
@@ -4344,7 +4369,12 @@ int main(int argc, char** argv)
                             {"page_reservation_guaranteed_bundles", event.pageReservationGuaranteedBundles},
                             {"vision_payload_bytes", event.visionPayloadBytes}, {"request_ids", event.requestIds},
                             {"inflight", std::move(inflight)}, {"candidates", std::move(candidates)},
-                            {"selected_action_id", event.selectedActionId}});
+                            {"selected_action_id", event.selectedActionId},
+                            {"active_h1_selected_action_id", event.activeH1SelectedActionId},
+                            {"scalar_h1_selected_action_id", event.scalarSelectedActionId},
+                            {"completion_changed_h1_action",
+                                event.scalarSelectedActionId > 0U && event.activeH1SelectedActionId > 0U
+                                    && event.scalarSelectedActionId != event.activeH1SelectedActionId}});
                     }
                     else if (event.kind == rt::PhaseUnifiedEventKind::kDispatch)
                     {

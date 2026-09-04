@@ -748,6 +748,11 @@ void IndependentPhaseAsyncServer::setActivityTimeline(PhaseActivityTimelineRecor
     mCoordinator.setActivityTimeline(timeline);
 }
 
+void IndependentPhaseAsyncServer::setCompletionAttributionEnabled(bool enabled) noexcept
+{
+    mCoordinator.scheduler().setCompletionAttributionEnabled(enabled);
+}
+
 void IndependentPhaseAsyncServer::setDirectionalInjectionControl(PhaseDirectionalInjectionControl control)
 {
     ELLM_CHECK(mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty(),

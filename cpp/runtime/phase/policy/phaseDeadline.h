@@ -29,6 +29,18 @@ enum class PhaseProtectedKind
     kDecode,
 };
 
+inline char const* phaseProtectedKindName(PhaseProtectedKind kind) noexcept
+{
+    switch (kind)
+    {
+    case PhaseProtectedKind::kUnknown: return "unknown";
+    case PhaseProtectedKind::kEncoder: return "encoder";
+    case PhaseProtectedKind::kPrefill: return "prefill";
+    case PhaseProtectedKind::kDecode: return "decode";
+    }
+    return "unknown";
+}
+
 //! One request deadline protected while evaluating an action. Completion may
 //! include a required follow-up phase when the candidate does not advance the
 //! request owning this deadline.

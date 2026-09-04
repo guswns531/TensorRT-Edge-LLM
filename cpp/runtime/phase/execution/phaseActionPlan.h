@@ -74,6 +74,20 @@ struct PhaseGlobalActionCandidate
     double contextualCompletionNewcomerReferenceUs{};
     double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
     PhaseContextualCompletionEstimate contextualCompletion{};
+    //! Same-snapshot scalar counterfactual captured immediately before
+    //! completion-vector authority changes decision or protected completion
+    //! estimates. This is diagnostic state, not a second policy authority.
+    bool completionPolicyEvaluated{};
+    bool completionAuthorityReady{};
+    bool completionAuthorityApplied{};
+    bool scalarDecisionCostKnown{};
+    bool activeDecisionCostKnown{};
+    double scalarDecisionMakespanUs{};
+    double activeDecisionMakespanUs{};
+    double completionAggregateBlendWeight{};
+    double completionIncumbentBlendWeight{};
+    double completionNewcomerBlendWeight{};
+    std::vector<PhaseProtectedCompletion> scalarProtectedCompletions;
     //! Encoder pair policy evidence is consumed by the three-phase global
     //! coordinator and recorded with the matching E+P or E+D completion.
     PhaseContextualPdFeatures contextualEncoderPairFeatures{};
@@ -119,6 +133,31 @@ struct PhaseGlobalActionCandidate
     double requestServiceLagUs{};
     PhaseActionMemoryHorizon memory;
 };
+
+//! Capture scalar policy inputs after protected completions are materialized
+//! and before completion-vector authority is projected into the candidate.
+inline void phaseCaptureScalarCompletionPolicy(PhaseGlobalActionCandidate& candidate)
+{
+    candidate.completionPolicyEvaluated = true;
+    candidate.scalarDecisionCostKnown = candidate.decisionCostKnown;
+    candidate.activeDecisionCostKnown = candidate.decisionCostKnown;
+    candidate.scalarDecisionMakespanUs = candidate.decisionMakespanUs;
+    candidate.activeDecisionMakespanUs = candidate.decisionMakespanUs;
+    candidate.scalarProtectedCompletions = candidate.protectedCompletions;
+}
+
+//! Restore an immutable candidate copy to its scalar policy inputs for
+//! same-frontier shadow attribution or controlled replay.
+inline void phaseRestoreScalarCompletionPolicy(PhaseGlobalActionCandidate& candidate)
+{
+    if (!candidate.completionPolicyEvaluated)
+    {
+        return;
+    }
+    candidate.decisionCostKnown = candidate.scalarDecisionCostKnown;
+    candidate.decisionMakespanUs = candidate.scalarDecisionMakespanUs;
+    candidate.protectedCompletions = candidate.scalarProtectedCompletions;
+}
 
 //! Return a deterministic identity without changing phase-local row order.
 uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noexcept;

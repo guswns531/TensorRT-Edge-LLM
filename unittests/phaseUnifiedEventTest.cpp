@@ -33,6 +33,9 @@ TEST(PhaseUnifiedEventTest, ReportsStableSchemaAndNames)
     EXPECT_STREQ(phaseUnifiedPhaseName(PhaseUnifiedPhase::kEncoder), "encoder");
     EXPECT_STREQ(phaseUnifiedPhaseName(PhaseUnifiedPhase::kPrefill), "prefill");
     EXPECT_STREQ(phaseUnifiedPhaseName(PhaseUnifiedPhase::kDecode), "decode");
+    EXPECT_STREQ(phaseProtectedKindName(PhaseProtectedKind::kEncoder), "encoder");
+    EXPECT_STREQ(phaseProtectedKindName(PhaseProtectedKind::kPrefill), "prefill");
+    EXPECT_STREQ(phaseProtectedKindName(PhaseProtectedKind::kDecode), "decode");
     EXPECT_STREQ(phaseInFlightStatusName(PhaseInFlightStatus::kCompletionReady), "completion_ready");
     EXPECT_EQ(phaseUnifiedActionDirectionFromName("prefill_to_decode"), PhaseUnifiedActionDirection::kPrefillToDecode);
     EXPECT_FALSE(phaseUnifiedActionDirectionFromName("prefill_decode").has_value());

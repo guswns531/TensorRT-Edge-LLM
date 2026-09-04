@@ -1370,6 +1370,7 @@ void PhaseThreeCoordinator::setUnifiedEventCallback(
     ELLM_CHECK(empty(), "Three-phase unified event callback can only change while idle");
     mUnifiedEventCallback = std::move(unifiedEventCallback);
     mUnifiedDetailedDecisionSnapshots = detailedDecisionSnapshots;
+    mServer.setCompletionAttributionEnabled(mUnifiedEventCallback && mUnifiedDetailedDecisionSnapshots);
     mPreviousUnifiedInFlight.reset();
     mUnifiedDecisionByPlan.clear();
     mUnifiedAllowedOutstandingByExecution.clear();
@@ -1572,6 +1573,18 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         snapshot.contextualIncumbentReferenceUs = source.contextualCompletionIncumbentReferenceUs;
         snapshot.contextualNewcomerReferenceUs = source.contextualCompletionNewcomerReferenceUs;
         snapshot.contextualMinimumSlackUs = source.contextualCompletionMinimumSlackUs;
+        snapshot.completionPolicyEvaluated = source.completionPolicyEvaluated;
+        snapshot.completionAuthorityReady = source.completionAuthorityReady;
+        snapshot.completionAuthorityApplied = source.completionAuthorityApplied;
+        snapshot.scalarDecisionCostKnown = source.scalarDecisionCostKnown;
+        snapshot.activeDecisionCostKnown = source.activeDecisionCostKnown;
+        snapshot.scalarDecisionMakespanUs = source.scalarDecisionMakespanUs;
+        snapshot.activeDecisionMakespanUs = source.activeDecisionMakespanUs;
+        snapshot.completionAggregateBlendWeight = source.completionAggregateBlendWeight;
+        snapshot.completionIncumbentBlendWeight = source.completionIncumbentBlendWeight;
+        snapshot.completionNewcomerBlendWeight = source.completionNewcomerBlendWeight;
+        snapshot.scalarProtectedCompletions = source.scalarProtectedCompletions;
+        snapshot.activeProtectedCompletions = source.protectedCompletions;
         event.candidates.push_back(std::move(snapshot));
     };
     if (mUnifiedDetailedDecisionSnapshots && candidateFrontier != nullptr)
@@ -1584,6 +1597,24 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     else if (mUnifiedDetailedDecisionSnapshots)
     {
         appendCandidate(candidate);
+    }
+    if (candidateFrontier != nullptr)
+    {
+        PhaseGlobalDecision const activeH1Decision = mGlobalScheduler.select(*candidateFrontier);
+        if (activeH1Decision.selectedIndex.has_value())
+        {
+            event.activeH1SelectedActionId = (*candidateFrontier)[*activeH1Decision.selectedIndex].candidateId;
+        }
+        std::vector<PhaseGlobalActionCandidate> scalarFrontier = *candidateFrontier;
+        for (PhaseGlobalActionCandidate& scalar : scalarFrontier)
+        {
+            phaseRestoreScalarCompletionPolicy(scalar);
+        }
+        PhaseGlobalDecision const scalarDecision = mGlobalScheduler.select(scalarFrontier);
+        if (scalarDecision.selectedIndex.has_value())
+        {
+            event.scalarSelectedActionId = scalarFrontier[*scalarDecision.selectedIndex].candidateId;
+        }
     }
     event.snapshotSignature = phaseUnifiedSnapshotSignature(event);
     mUnifiedDecisionByPlan[plan.planId] = event;
@@ -2312,11 +2343,23 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     }
     PhaseContextualPairDirection const direction
         = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
+    if (mUnifiedEventCallback && mUnifiedDetailedDecisionSnapshots && overlap.contextualCompletionFeatureValid)
+    {
+        phaseCaptureScalarCompletionPolicy(overlap);
+    }
     if (mRuntimeCostTracker->contextualCompletionAuthorityReady(direction, overlap.contextualCompletion))
     {
+        overlap.completionAuthorityReady = true;
         PhaseContextualCompletionEstimate const authority
             = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
         double const completionWeight = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(direction);
+        overlap.completionAggregateBlendWeight = completionWeight;
+        overlap.completionIncumbentBlendWeight
+            = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, true);
+        overlap.completionNewcomerBlendWeight
+            = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, false);
+        overlap.completionAuthorityApplied = completionWeight > 0.0 || overlap.completionIncumbentBlendWeight > 0.0
+            || overlap.completionNewcomerBlendWeight > 0.0;
         double const scalarMakespanUs
             = overlap.decisionCostKnown ? overlap.decisionMakespanUs : overlap.predictedMakespanUs;
         overlap.decisionCostKnown = true;
@@ -2337,6 +2380,8 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
                 incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
         }
     }
+    overlap.activeDecisionCostKnown = overlap.decisionCostKnown;
+    overlap.activeDecisionMakespanUs = overlap.decisionMakespanUs;
 
     ++mGlobalDecisionSequence;
     ++mGlobalDecisions;
@@ -3063,19 +3108,37 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             overlap.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
                 overlap.contextualEncoderPairDirection, overlap.contextualEncoderCompletionFeatures,
                 overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
+            if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
+            {
+                overlap.decisionCostKnown = true;
+                overlap.decisionMakespanUs = phaseContextualDecisionMakespanUs(
+                    overlap.contextualEncoderPairReferenceWorkUs, contextual.lowerConfidenceBound);
+            }
+            if (mUnifiedEventCallback && mUnifiedDetailedDecisionSnapshots)
+            {
+                phaseCaptureScalarCompletionPolicy(overlap);
+            }
             bool const completionAuthorityReady = mRuntimeCostTracker->contextualCompletionAuthorityReady(
                 overlap.contextualEncoderPairDirection, overlap.contextualCompletion);
             if (completionAuthorityReady)
             {
+                overlap.completionAuthorityReady = true;
                 PhaseContextualCompletionEstimate const authority
                     = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(
                         overlap.contextualEncoderPairDirection, overlap.contextualCompletion);
                 double const completionWeight = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(
                     overlap.contextualEncoderPairDirection);
-                double const scalarMakespanUs = contextualMode == PhaseContextualPdMode::kActive && contextual.ready
-                    ? phaseContextualDecisionMakespanUs(
-                          overlap.contextualEncoderPairReferenceWorkUs, contextual.lowerConfidenceBound)
-                    : overlap.predictedMakespanUs;
+                overlap.completionAggregateBlendWeight = completionWeight;
+                overlap.completionIncumbentBlendWeight
+                    = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
+                        overlap.contextualEncoderPairDirection, true);
+                overlap.completionNewcomerBlendWeight
+                    = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
+                        overlap.contextualEncoderPairDirection, false);
+                overlap.completionAuthorityApplied = completionWeight > 0.0
+                    || overlap.completionIncumbentBlendWeight > 0.0 || overlap.completionNewcomerBlendWeight > 0.0;
+                double const scalarMakespanUs
+                    = overlap.decisionCostKnown ? overlap.decisionMakespanUs : overlap.predictedMakespanUs;
                 overlap.decisionCostKnown = true;
                 overlap.decisionMakespanUs = phaseBlendContextualCompletionDecisionMakespanUs(
                     scalarMakespanUs, authority, overlap.contextualEncoderCompletionFeatures, completionWeight);
@@ -3096,13 +3159,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         componentWeight);
                 }
             }
+            overlap.activeDecisionCostKnown = overlap.decisionCostKnown;
+            overlap.activeDecisionMakespanUs = overlap.decisionMakespanUs;
             overlap.contextualEncoderPairExploration = !contextual.ready && safeProbe;
-            if (!completionAuthorityReady && contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
-            {
-                overlap.decisionCostKnown = true;
-                overlap.decisionMakespanUs = phaseContextualDecisionMakespanUs(
-                    overlap.contextualEncoderPairReferenceWorkUs, contextual.lowerConfidenceBound);
-            }
             if (kind == PhaseGlobalActionKind::kEncoderPrefill)
             {
                 mContextualEpReady += contextual.ready ? 1U : 0U;
