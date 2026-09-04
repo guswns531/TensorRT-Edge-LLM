@@ -51,6 +51,10 @@ struct PhaseProjectedRequest
     bool visionOwned{};
     bool kvOwned{};
     bool firstTokenObserved{};
+    //! A request can own persistent state while waiting for sampling or an
+    //! external producer. Only ready requests participate in the successor
+    //! cohort builder; in-flight membership is represented separately.
+    bool ready{true};
 };
 
 struct PhaseProjectedOwnership
@@ -185,6 +189,10 @@ struct PhaseFrozenDecisionSnapshot
     uint64_t scalarPolicyStateSignature{};
     PhaseIncrementalProjectionSnapshot projection;
     std::vector<PhaseIncrementalAction> frontier;
+    //! Work that each frontier action adds to the pre-dispatch projection.
+    //! Empty launch work preserves the legacy already-dispatched replay
+    //! contract used by measured completion tests.
+    std::unordered_map<uint64_t, std::vector<PhaseInFlightWorkSnapshot>> launchedWork;
 };
 
 enum class PhaseFrozenReplayReason : uint8_t
@@ -240,6 +248,15 @@ char const* phaseFrozenReplayReasonName(PhaseFrozenReplayReason reason) noexcept
 //! and the scalar model state supplied by the caller.
 std::optional<PhaseFrozenDecisionSnapshot> phaseFreezeDecisionSnapshot(PhaseIncrementalProjectionSnapshot projection,
     std::vector<PhaseIncrementalAction> frontier, uint64_t scalarPolicyStateSignature) noexcept;
+
+//! Freeze a true pre-dispatch decision frontier. Every launch entry must name
+//! one frontier action and contain exactly the new contexts introduced by
+//! that action. The same immutable snapshot can therefore replay mutually
+//! exclusive branches without cloning live queues or allocators.
+std::optional<PhaseFrozenDecisionSnapshot> phaseFreezeDecisionSnapshot(PhaseIncrementalProjectionSnapshot projection,
+    std::vector<PhaseIncrementalAction> frontier,
+    std::unordered_map<uint64_t, std::vector<PhaseInFlightWorkSnapshot>> launchedWork,
+    uint64_t scalarPolicyStateSignature) noexcept;
 
 //! Build a conservative two-order envelope from a scalar makespan. This never
 //! invents an external arrival or claims to know which component finishes first.

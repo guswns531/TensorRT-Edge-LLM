@@ -186,6 +186,66 @@ def test_prepare_pd_only_changes_authority_without_changing_mode(
     assert "TRT_EDGELLM_POLICY_WARMUP_MODE={policy_warmup_mode}" in result
 
 
+def test_prepare_exact_only_disables_learned_authority(tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "generic",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    policy_variant="exact_only")
+    environments = {
+        result[index + 1].split("=", 1)[0]: result[index + 1].split("=", 1)[1]
+        for index, token in enumerate(result[:-1]) if token == "-e"
+    }
+
+    assert environments["TRT_EDGELLM_CONTEXTUAL_PD"] == "disabled"
+    assert environments["TRT_EDGELLM_CONTEXTUAL_EP"] == "disabled"
+    assert environments["TRT_EDGELLM_CONTEXTUAL_ED"] == "disabled"
+    assert environments["TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE"] == "0"
+
+
+def test_prepare_scalar_transition_enables_only_formation_reasoning(
+        tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "generic",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    policy_variant="scalar_transition")
+    environments = {
+        result[index + 1].split("=", 1)[0]: result[index + 1].split("=", 1)[1]
+        for index, token in enumerate(result[:-1]) if token == "-e"
+    }
+
+    assert environments["TRT_EDGELLM_CONTEXTUAL_PD"] == "active"
+    assert environments["TRT_EDGELLM_CONTEXTUAL_EP"] == "active"
+    assert environments["TRT_EDGELLM_CONTEXTUAL_ED"] == "active"
+    assert environments["TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE"] == "1"
+    assert environments["TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE"] == "0"
+
+
 def test_prepare_overrides_backend_environment(tmp_path: Path) -> None:
     measured = tmp_path / "measured.json"
     generic = tmp_path / "generic.json"
@@ -232,3 +292,37 @@ def test_prepare_overrides_client_max_in_flight(tmp_path: Path) -> None:
                                     client_max_in_flight=80)
 
     assert result[result.index("--max-in-flight") + 1] == "80"
+
+
+def test_prepare_maps_phase_telemetry_to_writable_workspace(
+        tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "-v", f"{tmp_path}:/workspace",
+        "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+    output = tmp_path / "matrix" / "balanced"
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "zero_start",
+                                    output,
+                                    1,
+                                    generic,
+                                    generic,
+                                    capture_phase_telemetry=True)
+
+    environments = {
+        result[index + 1].split("=", 1)[0]: result[index + 1].split("=", 1)[1]
+        for index, token in enumerate(result[:-1]) if token == "-e"
+    }
+    expected = "/workspace/matrix/balanced/activity/run-{run}"
+    assert environments["TRT_EDGELLM_PHASE_ACTIVITY_PREFIX"] == expected
+    assert environments["TRT_EDGELLM_PHASE_TELEMETRY_PATH"] == expected + \
+        "-events.jsonl"
+    assert environments["TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"] == \
+        "counterfactual"

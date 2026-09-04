@@ -1889,6 +1889,75 @@ IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrati
     return result;
 }
 
+std::vector<PhaseProjectedRequest> IndependentPhaseAsyncServer::projectedRequests(size_t bytesPerKVPage) const noexcept
+{
+    PhaseQueueSnapshot const queue = mCoordinator.scheduler().queueSnapshot(true);
+    PhaseInFlightSnapshot const inFlight = mCoordinator.inFlightSnapshot();
+    std::unordered_set<uint64_t> const readyPrefill(queue.prefillRequestIds.begin(), queue.prefillRequestIds.end());
+    std::unordered_set<uint64_t> const readyDecode(queue.decodeRequestIds.begin(), queue.decodeRequestIds.end());
+    std::unordered_map<uint64_t, PhaseUnifiedPhase> inFlightPhase;
+    for (PhaseInFlightWorkSnapshot const& work : inFlight.work)
+    {
+        for (uint64_t const requestId : work.requestIds)
+        {
+            inFlightPhase.emplace(requestId, work.phase);
+        }
+    }
+
+    std::vector<uint64_t> requestIds;
+    requestIds.reserve(mRequests.size());
+    for (auto const& [requestId, request] : mRequests)
+    {
+        static_cast<void>(request);
+        requestIds.push_back(requestId);
+    }
+    std::sort(requestIds.begin(), requestIds.end());
+
+    std::vector<PhaseProjectedRequest> result;
+    result.reserve(requestIds.size());
+    for (uint64_t const requestId : requestIds)
+    {
+        RequestState const& request = mRequests.at(requestId);
+        auto const running = inFlightPhase.find(requestId);
+        PhaseProjectedRequestStage stage = !request.generatedTokens.empty() ? PhaseProjectedRequestStage::kDecode
+                                                                            : PhaseProjectedRequestStage::kPrefill;
+        if (running != inFlightPhase.end())
+        {
+            stage = running->second == PhaseUnifiedPhase::kDecode ? PhaseProjectedRequestStage::kDecode
+                                                                  : PhaseProjectedRequestStage::kPrefill;
+        }
+        else if (readyDecode.count(requestId) != 0U)
+        {
+            stage = PhaseProjectedRequestStage::kDecode;
+        }
+        else if (readyPrefill.count(requestId) != 0U)
+        {
+            stage = PhaseProjectedRequestStage::kPrefill;
+        }
+
+        bool const prefill = stage == PhaseProjectedRequestStage::kPrefill;
+        int32_t const generated = static_cast<int32_t>(request.generatedTokens.size());
+        int32_t const decodeStepsRemaining = std::max(0, request.maxOutputTokens - generated - (prefill ? 1 : 0));
+        size_t visionBytes{};
+        if (request.visionPayload != nullptr)
+        {
+            visionBytes += request.visionPayload->byteSize();
+        }
+        if (request.pendingVisionPayload != nullptr && request.pendingVisionPayload != request.visionPayload)
+        {
+            visionBytes += request.pendingVisionPayload->byteSize();
+        }
+        bool const kvOwned = request.kvSlotId >= 0 && mOwnership.leased(request.kvSlotId);
+        size_t const kvBytes
+            = kvOwned ? static_cast<size_t>(mOwnership.releasablePages(request.kvSlotId)) * bytesPerKVPage : 0U;
+        bool const ready = running == inFlightPhase.end()
+            && (readyPrefill.count(requestId) != 0U || readyDecode.count(requestId) != 0U);
+        result.push_back({requestId, stage, request.kvSlotId, decodeStepsRemaining, generated, visionBytes, kvBytes,
+            visionBytes > 0U, kvOwned, generated > 0, ready});
+    }
+    return result;
+}
+
 bool IndependentPhaseAsyncServer::empty() const noexcept
 {
     return mRequests.empty() && mPendingRequests.empty() && mPendingDecodeRequests.empty() && mSamplingTickets.empty()

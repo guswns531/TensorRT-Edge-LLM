@@ -84,6 +84,7 @@ PhaseProjectedRequest const* findRequest(
 void applyCompletion(
     PhaseProjectedRequest& request, PhaseUnifiedPhase phase, PhaseProjectedOwnership& ownership) noexcept
 {
+    request.ready = true;
     switch (phase)
     {
     case PhaseUnifiedPhase::kEncoder:
@@ -156,7 +157,7 @@ uint64_t readyCohortId(PhaseUnifiedPhase phase, std::vector<PhaseProjectedReques
     bool found{};
     for (PhaseProjectedRequest const& request : requests)
     {
-        if (request.stage != stage || inFlightRequests.count(request.requestId) != 0U)
+        if (!request.ready || request.stage != stage || inFlightRequests.count(request.requestId) != 0U)
         {
             continue;
         }
@@ -439,7 +440,9 @@ bool validFrozenProjection(PhaseIncrementalProjectionSnapshot const& projection)
     std::unordered_set<uint64_t> requestIds;
     for (PhaseProjectedRequest const& request : projection.requests)
     {
-        if (request.requestId == 0U || !requestIds.insert(request.requestId).second)
+        // Public serving traces use zero-based request IDs. Uniqueness, not
+        // non-zero identity, is the request correctness invariant.
+        if (!requestIds.insert(request.requestId).second)
         {
             return false;
         }
@@ -469,7 +472,9 @@ bool validFrozenProjection(PhaseIncrementalProjectionSnapshot const& projection)
 }
 
 uint64_t frozenSnapshotId(PhaseIncrementalProjectionSnapshot const& projection,
-    std::vector<PhaseIncrementalAction> const& frontier, uint64_t scalarPolicyStateSignature) noexcept
+    std::vector<PhaseIncrementalAction> const& frontier,
+    std::unordered_map<uint64_t, std::vector<PhaseInFlightWorkSnapshot>> const& launchedWork,
+    uint64_t scalarPolicyStateSignature) noexcept
 {
     constexpr uint64_t kFROZEN_OFFSET = 1469598103934665603ULL;
     uint64_t result = hashCombine(kFROZEN_OFFSET, projection.epoch);
@@ -496,6 +501,7 @@ uint64_t frozenSnapshotId(PhaseIncrementalProjectionSnapshot const& projection,
         result = hashCombine(result, static_cast<uint64_t>(request.visionOwned));
         result = hashCombine(result, static_cast<uint64_t>(request.kvOwned));
         result = hashCombine(result, static_cast<uint64_t>(request.firstTokenObserved));
+        result = hashCombine(result, static_cast<uint64_t>(request.ready));
     }
     result = hashCombine(result, projection.ownership.visionBytes);
     result = hashCombine(result, projection.ownership.kvBytes);
@@ -503,7 +509,88 @@ uint64_t frozenSnapshotId(PhaseIncrementalProjectionSnapshot const& projection,
     for (PhaseIncrementalAction const& action : frontier)
     {
         result = hashCombine(result, action.actionId);
+        auto const launch = launchedWork.find(action.actionId);
+        if (launch == launchedWork.end())
+        {
+            continue;
+        }
+        for (PhaseInFlightWorkSnapshot const& work : launch->second)
+        {
+            result = hashCombine(result, static_cast<uint64_t>(work.phase));
+            result = hashCombine(result, work.executionId);
+            for (uint64_t const requestId : work.requestIds)
+            {
+                result = hashCombine(result, requestId);
+            }
+        }
     }
+    return result;
+}
+
+bool validateLaunchWork(PhaseIncrementalProjectionSnapshot const& projection, PhaseIncrementalAction const& action,
+    std::vector<PhaseInFlightWorkSnapshot> const& launchedWork) noexcept
+{
+    PhaseExecutionSet const existing = executionSet(projection.inFlight.work);
+    if (existing != action.key.outstandingBefore)
+    {
+        return false;
+    }
+    PhaseExecutionSet launched{PhaseExecutionSet::kNone};
+    std::unordered_set<uint64_t> executionIds;
+    std::unordered_set<uint64_t> requestIds;
+    for (PhaseInFlightWorkSnapshot const& existingWork : projection.inFlight.work)
+    {
+        executionIds.insert(existingWork.executionId);
+        requestIds.insert(existingWork.requestIds.begin(), existingWork.requestIds.end());
+    }
+    for (PhaseInFlightWorkSnapshot const& work : launchedWork)
+    {
+        PhaseExecutionSet const phase = phaseExecutionSetForUnifiedPhase(work.phase);
+        if (!isExecutionPhase(work.phase) || phaseExecutionSetContains(existing, phase) || work.executionId == 0U
+            || work.requestIds.empty() || !executionIds.insert(work.executionId).second)
+        {
+            return false;
+        }
+        launched = launched | phase;
+        for (uint64_t const requestId : work.requestIds)
+        {
+            PhaseProjectedRequest const* request = findRequest(projection.requests, requestId);
+            if (request == nullptr || !stageMatches(request->stage, work.phase) || !requestIds.insert(requestId).second)
+            {
+                return false;
+            }
+        }
+    }
+    return (existing | launched) == action.key.plannedOutstanding;
+}
+
+std::optional<PhaseIncrementalProjectionSnapshot> materializeFrozenAction(
+    PhaseFrozenDecisionSnapshot const& snapshot, PhaseIncrementalAction const& action) noexcept
+{
+    PhaseIncrementalProjectionSnapshot result = snapshot.projection;
+    PhaseExecutionSet const observed = executionSet(result.inFlight.work);
+    if (observed == action.key.plannedOutstanding)
+    {
+        return result;
+    }
+    auto const launch = snapshot.launchedWork.find(action.actionId);
+    if (launch == snapshot.launchedWork.end() || !validateLaunchWork(result, action, launch->second))
+    {
+        return std::nullopt;
+    }
+    for (PhaseInFlightWorkSnapshot work : launch->second)
+    {
+        for (uint64_t const requestId : work.requestIds)
+        {
+            PhaseProjectedRequest* request = findRequest(result.requests, requestId);
+            if (request != nullptr)
+            {
+                request->ready = false;
+            }
+        }
+        result.inFlight.work.push_back(std::move(work));
+    }
+    result.inFlight.outstanding = executionSet(result.inFlight.work);
     return result;
 }
 
@@ -527,9 +614,9 @@ void countReadyRows(PhaseIncrementalProjectionSnapshot const& snapshot, PhaseFro
         {
             continue;
         }
-        trajectory.encoderReadyRows += request.stage == PhaseProjectedRequestStage::kEncoder ? 1U : 0U;
-        trajectory.prefillReadyRows += request.stage == PhaseProjectedRequestStage::kPrefill ? 1U : 0U;
-        trajectory.decodeReadyRows += request.stage == PhaseProjectedRequestStage::kDecode ? 1U : 0U;
+        trajectory.encoderReadyRows += request.ready && request.stage == PhaseProjectedRequestStage::kEncoder ? 1U : 0U;
+        trajectory.prefillReadyRows += request.ready && request.stage == PhaseProjectedRequestStage::kPrefill ? 1U : 0U;
+        trajectory.decodeReadyRows += request.ready && request.stage == PhaseProjectedRequestStage::kDecode ? 1U : 0U;
     }
 }
 
@@ -604,6 +691,14 @@ PhaseCompletionVector effectVector(uint64_t actionId, std::vector<PhaseOutcomeCo
 std::optional<PhaseFrozenDecisionSnapshot> phaseFreezeDecisionSnapshot(PhaseIncrementalProjectionSnapshot projection,
     std::vector<PhaseIncrementalAction> frontier, uint64_t scalarPolicyStateSignature) noexcept
 {
+    return phaseFreezeDecisionSnapshot(std::move(projection), std::move(frontier), {}, scalarPolicyStateSignature);
+}
+
+std::optional<PhaseFrozenDecisionSnapshot> phaseFreezeDecisionSnapshot(PhaseIncrementalProjectionSnapshot projection,
+    std::vector<PhaseIncrementalAction> frontier,
+    std::unordered_map<uint64_t, std::vector<PhaseInFlightWorkSnapshot>> launchedWork,
+    uint64_t scalarPolicyStateSignature) noexcept
+{
     if (!validFrozenProjection(projection) || frontier.empty())
     {
         return std::nullopt;
@@ -615,12 +710,41 @@ std::optional<PhaseFrozenDecisionSnapshot> phaseFreezeDecisionSnapshot(PhaseIncr
         {
             return std::nullopt;
         }
+        auto const launch = launchedWork.find(action.actionId);
+        if (projection.inFlight.outstanding == action.key.outstandingBefore)
+        {
+            if (action.key.noDispatch)
+            {
+                if (launch != launchedWork.end() && !launch->second.empty())
+                {
+                    return std::nullopt;
+                }
+            }
+            else if (launch == launchedWork.end() || !validateLaunchWork(projection, action, launch->second))
+            {
+                return std::nullopt;
+            }
+        }
+        else if (projection.inFlight.outstanding != action.key.plannedOutstanding)
+        {
+            return std::nullopt;
+        }
+    }
+    for (auto const& [actionId, work] : launchedWork)
+    {
+        static_cast<void>(work);
+        if (actionIds.count(actionId) == 0U)
+        {
+            return std::nullopt;
+        }
     }
     PhaseFrozenDecisionSnapshot result;
     result.scalarPolicyStateSignature = scalarPolicyStateSignature;
     result.projection = std::move(projection);
     result.frontier = std::move(frontier);
-    result.snapshotId = frozenSnapshotId(result.projection, result.frontier, scalarPolicyStateSignature);
+    result.launchedWork = std::move(launchedWork);
+    result.snapshotId
+        = frozenSnapshotId(result.projection, result.frontier, result.launchedWork, scalarPolicyStateSignature);
     return result;
 }
 
@@ -756,9 +880,16 @@ PhaseFrozenReplayResult phaseReplayFrozenOutcome(PhaseFrozenDecisionSnapshot con
             result.trajectories.clear();
             return result;
         }
+        std::optional<PhaseIncrementalProjectionSnapshot> const dispatched = materializeFrozenAction(snapshot, *action);
+        if (!dispatched.has_value())
+        {
+            result.reason = PhaseFrozenReplayReason::kActionNotLegal;
+            result.trajectories.clear();
+            return result;
+        }
         PhaseFrozenReplayTrajectory trajectory;
         PhaseIncrementalProjection first
-            = phaseProjectEarliestCompletion(snapshot.projection, *action, completion, uncertaintyScale);
+            = phaseProjectEarliestCompletion(*dispatched, *action, completion, uncertaintyScale);
         if (!first.valid)
         {
             result.reason = PhaseFrozenReplayReason::kInvalidOutcome;

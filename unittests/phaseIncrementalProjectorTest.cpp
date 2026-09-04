@@ -297,6 +297,50 @@ TEST(PhaseFrozenReplayTest, ScalarEnvelopePreservesBothCompletionOrders)
     }
 }
 
+TEST(PhaseFrozenReplayTest, PreDispatchSnapshotReplaysMutuallyExclusiveBranches)
+{
+    PhaseIncrementalProjectionSnapshot projection;
+    projection.epoch = 10U;
+    projection.inFlight.hostSnapshotNs = 2000U;
+    projection.requests = {
+        {0U, PhaseProjectedRequestStage::kEncoder, -1, 2, 0, 100U, 0U},
+        {802U, PhaseProjectedRequestStage::kPrefill, 2, 2, 0, 200U, 2000U, true},
+    };
+    projection.ownership = phaseProjectedOwnership(projection.requests);
+    PhaseIncrementalAction const encoder = phaseIncrementalActionForDispatch(PhaseExecutionSet::kNone, 81U,
+        PhaseGlobalActionKind::kEncoder, PhaseUnifiedActionDirection::kIdleLaunch, PhaseStartSkewBucket::kImmediate);
+    PhaseIncrementalAction const prefill = phaseIncrementalActionForDispatch(PhaseExecutionSet::kNone, 82U,
+        PhaseGlobalActionKind::kPrefill, PhaseUnifiedActionDirection::kIdleLaunch, PhaseStartSkewBucket::kImmediate);
+    std::unordered_map<uint64_t, std::vector<PhaseInFlightWorkSnapshot>> launchedWork{
+        {encoder.actionId, {inFlight(PhaseUnifiedPhase::kEncoder, 91U, {0U})}},
+        {prefill.actionId, {inFlight(PhaseUnifiedPhase::kPrefill, 92U, {802U})}},
+    };
+
+    std::optional<PhaseFrozenDecisionSnapshot> const frozen
+        = phaseFreezeDecisionSnapshot(projection, {encoder, prefill}, launchedWork, 33U);
+    ASSERT_TRUE(frozen.has_value());
+    EXPECT_TRUE(frozen->projection.inFlight.work.empty());
+    EXPECT_TRUE(frozen->projection.requests[0].ready);
+    EXPECT_TRUE(frozen->projection.requests[1].ready);
+
+    PhaseOutcomeEnvelope const encoderEnvelope
+        = phaseScalarOutcomeEnvelope(encoder.actionId, {{PhaseUnifiedPhase::kEncoder, 91U, 5.0, false}}, 5.0, 0.0);
+    PhaseOutcomeEnvelope const prefillEnvelope
+        = phaseScalarOutcomeEnvelope(prefill.actionId, {{PhaseUnifiedPhase::kPrefill, 92U, 7.0, false}}, 7.0, 0.0);
+    PhaseFrozenReplayResult const encoderReplay = phaseReplayFrozenOutcome(*frozen, encoder.actionId, encoderEnvelope);
+    PhaseFrozenReplayResult const prefillReplay = phaseReplayFrozenOutcome(*frozen, prefill.actionId, prefillEnvelope);
+
+    ASSERT_TRUE(encoderReplay.valid) << phaseFrozenReplayReasonName(encoderReplay.reason);
+    ASSERT_TRUE(prefillReplay.valid) << phaseFrozenReplayReasonName(prefillReplay.reason);
+    ASSERT_EQ(encoderReplay.trajectories.size(), 1U);
+    ASSERT_EQ(prefillReplay.trajectories.size(), 1U);
+    EXPECT_EQ(encoderReplay.trajectories.front().prefillReadyRows, 2U);
+    EXPECT_EQ(prefillReplay.trajectories.front().prefillReadyRows, 0U);
+    EXPECT_EQ(prefillReplay.trajectories.front().decodeReadyRows, 1U);
+    EXPECT_EQ(encoderReplay.trajectories.front().ownership.reclaimedVisionBytes, 0U);
+    EXPECT_EQ(prefillReplay.trajectories.front().ownership.reclaimedVisionBytes, 200U);
+}
+
 TEST(PhaseFrozenReplayTest, EffectEnvelopeRetainsOrderUncertainty)
 {
     PhaseIncrementalAction const action

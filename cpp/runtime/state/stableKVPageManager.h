@@ -77,6 +77,10 @@ public:
     std::vector<int32_t> makeActiveLengths(std::vector<int32_t> const& activeStableSlots) const;
 
     std::vector<int32_t> const& pages(int32_t stableSlot) const;
+    //! Pages that would physically return to the pool if this lease ended at
+    //! the current boundary. Shared prefix pages remain owned elsewhere and
+    //! are deliberately excluded from transition-horizon reclamation.
+    int32_t releasablePages(int32_t stableSlot) const;
     //! Monotonic identity of the current lease; changes when a slot is reused.
     uint64_t leaseGeneration(int32_t stableSlot) const;
     bool leased(int32_t stableSlot) const;

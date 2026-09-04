@@ -25,10 +25,33 @@ from typing import Any
 
 MODES = ("graph_only", "zero_start", "generic", "trace_derived")
 POLICY_VARIANTS = {
+    # V0: preserve the common execution substrate but remove contextual
+    # generalization and bounded formation reasoning.
+    "exact_only": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "disabled",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "disabled",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "disabled",
+        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
+    # V1: current production controller. Contextual scalar RLS has action
+    # authority while richer physical outcomes remain shadow diagnostics.
     "full_active": {
         "TRT_EDGELLM_CONTEXTUAL_PD": "active",
         "TRT_EDGELLM_CONTEXTUAL_EP": "active",
         "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "0",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
+    # V2: use the same scalar estimator and candidate frontier as V1, adding
+    # only the existing deterministic bounded formation evaluator.
+    "scalar_transition": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
     },
     "pd_only": {
         "TRT_EDGELLM_CONTEXTUAL_PD": "active",
@@ -123,6 +146,18 @@ def _replace_backend_engine(command: list[str],
     command[binary_index + 1] = backend_engine_dir
 
 
+def _container_workspace_path(command: list[str], path: Path) -> str:
+    """Map a host output path through the command's writable /workspace mount."""
+    for index, token in enumerate(command[:-1]):
+        if token != "-v":
+            continue
+        fields = command[index + 1].split(":")
+        if len(fields) >= 2 and fields[1] == "/workspace":
+            relative = path.resolve().relative_to(Path(fields[0]).resolve())
+            return str(Path("/workspace") / relative)
+    raise ValueError("backend command has no writable /workspace mount")
+
+
 def _is_vision_trace(path: Path) -> bool:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return any(
@@ -143,7 +178,8 @@ def prepare_command(entry: dict[str, Any],
                     backend_engine_dir: str = "",
                     policy_variant: str = "full_active",
                     backend_environment: tuple[str, ...] = (),
-                    client_max_in_flight: int = 0) -> list[str]:
+                    client_max_in_flight: int = 0,
+                    capture_phase_telemetry: bool = False) -> list[str]:
     if policy_variant not in POLICY_VARIANTS:
         raise ValueError(f"unknown policy variant: {policy_variant}")
     command = list(entry["command"])
@@ -160,6 +196,17 @@ def prepare_command(entry: dict[str, Any],
     for assignment in backend_environment:
         name, value = assignment.split("=", 1)
         _set_backend_environment(command, name, value)
+    if capture_phase_telemetry:
+        activity_prefix = _container_workspace_path(
+            command, output_dir / "activity" / "run-{run}")
+        _set_backend_environment(command, "TRT_EDGELLM_EMIT_PHASE_METRICS",
+                                 "1")
+        _set_backend_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL",
+                                 "counterfactual")
+        _set_backend_environment(command, "TRT_EDGELLM_PHASE_ACTIVITY_PREFIX",
+                                 activity_prefix)
+        _set_backend_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_PATH",
+                                 activity_prefix + "-events.jsonl")
     _drop_option(command, "--generic-warmup-trace", True)
     if mode == "generic":
         trace = Path(command[command.index("--trace") + 1])
@@ -199,6 +246,10 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--capture-phase-telemetry",
+        action="store_true",
+        help="write per-run CUDA activity and unified decision side channels")
+    parser.add_argument(
         "--backend-env",
         action="append",
         default=[],
@@ -227,13 +278,12 @@ def main() -> int:
         for entry in entries:
             case = str(entry["case"])
             output = args.output_dir / mode / case / str(entry["variant"])
-            command = prepare_command(entry, mode, output, args.repeats,
-                                      args.generic_text, args.generic_vlm,
-                                      args.backend_build_root,
-                                      args.backend_engine_dir,
-                                      args.policy_variant,
-                                      tuple(args.backend_env),
-                                      args.client_max_in_flight)
+            command = prepare_command(
+                entry, mode, output, args.repeats, args.generic_text,
+                args.generic_vlm, args.backend_build_root,
+                args.backend_engine_dir, args.policy_variant,
+                tuple(args.backend_env), args.client_max_in_flight,
+                args.capture_phase_telemetry)
             commands.append({
                 "mode": mode,
                 "policy_variant": args.policy_variant,

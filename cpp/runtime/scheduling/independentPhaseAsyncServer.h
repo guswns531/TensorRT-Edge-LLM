@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseIncrementalProjector.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phasePrefixReuseCache.h"
 
@@ -487,6 +488,10 @@ public:
     //! Return scalar arbitration state by default. Exact ready/in-flight
     //! vectors are materialized only for decision/event capture.
     IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot(bool includeReadyDetails = false) const noexcept;
+    //! Export immutable request/DAG/lease state for transition-policy shadow
+    //! replay. This is opt-in research state and never participates in the
+    //! production dispatch hot path unless detailed decision telemetry is on.
+    std::vector<PhaseProjectedRequest> projectedRequests(size_t bytesPerKVPage) const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;

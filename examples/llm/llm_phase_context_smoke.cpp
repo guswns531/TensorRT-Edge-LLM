@@ -4273,6 +4273,26 @@ int main(int argc, char** argv)
                             {"prefill_tokens", work.prefillTokens}, {"decode_rows", work.decodeRows},
                             {"decode_context_tokens", work.decodeContextTokens}};
                     };
+                    auto const transitionJson = [](rt::PhaseTransitionReplaySnapshot const& transition) {
+                        return nlohmann::json{{"evaluated", transition.evaluated}, {"valid", transition.valid},
+                            {"alternatives", transition.alternatives},
+                            {"worst_case_robust_horizon_us", transition.worstCaseRobustHorizonUs},
+                            {"first_completed_phase_mask", transition.firstCompletedPhaseMask},
+                            {"min_first_encoder_ready_rows", transition.minFirstEncoderReadyRows},
+                            {"max_first_encoder_ready_rows", transition.maxFirstEncoderReadyRows},
+                            {"min_first_prefill_ready_rows", transition.minFirstPrefillReadyRows},
+                            {"max_first_prefill_ready_rows", transition.maxFirstPrefillReadyRows},
+                            {"min_first_decode_ready_rows", transition.minFirstDecodeReadyRows},
+                            {"max_first_decode_ready_rows", transition.maxFirstDecodeReadyRows},
+                            {"min_encoder_ready_rows", transition.minEncoderReadyRows},
+                            {"max_encoder_ready_rows", transition.maxEncoderReadyRows},
+                            {"min_prefill_ready_rows", transition.minPrefillReadyRows},
+                            {"max_prefill_ready_rows", transition.maxPrefillReadyRows},
+                            {"min_decode_ready_rows", transition.minDecodeReadyRows},
+                            {"max_decode_ready_rows", transition.maxDecodeReadyRows},
+                            {"min_reclaim_bytes", transition.minReclaimBytes},
+                            {"max_reclaim_bytes", transition.maxReclaimBytes}};
+                    };
                     nlohmann::json record{{"schema_version", event.schemaVersion},
                         {"event_kind", rt::phaseUnifiedEventKindName(event.kind)}, {"event_id", event.eventId},
                         {"run_id", schedulerRunId}, {"host_monotonic_ns", event.hostMonotonicNs}};
@@ -4373,7 +4393,11 @@ int main(int argc, char** argv)
                                 {"scalar_protected_completions",
                                     protectedCompletions(candidate.scalarProtectedCompletions)},
                                 {"active_protected_completions",
-                                    protectedCompletions(candidate.activeProtectedCompletions)}});
+                                    protectedCompletions(candidate.activeProtectedCompletions)},
+                                {"transition_action_id", candidate.transitionActionId},
+                                {"scalar_transition", transitionJson(candidate.scalarTransition)},
+                                {"effect_transition", transitionJson(candidate.effectTransition)},
+                                {"completion_transition", transitionJson(candidate.completionTransition)}});
                             if (std::isfinite(candidate.contextualMinimumSlackUs))
                             {
                                 candidates.back()["contextual_minimum_slack_us"] = candidate.contextualMinimumSlackUs;
@@ -4386,6 +4410,9 @@ int main(int argc, char** argv)
                             {"kv_ownership_signature", event.kvOwnershipSignature},
                             {"scalar_policy_state_signature", event.scalarPolicyStateSignature},
                             {"vision_lease_signature", event.visionLeaseSignature},
+                            {"frozen_transition_snapshot_valid", event.frozenTransitionSnapshotValid},
+                            {"frozen_transition_snapshot_id", event.frozenTransitionSnapshotId},
+                            {"frozen_transition_candidates", event.frozenTransitionCandidates},
                             {"causal_replay_forced", event.causalReplayForced}, {"action_id", event.actionId},
                             {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},

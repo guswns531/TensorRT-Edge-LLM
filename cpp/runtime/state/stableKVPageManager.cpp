@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 namespace trt_edgellm
@@ -209,6 +210,14 @@ std::vector<int32_t> const& StableKVPageManager::pages(int32_t stableSlot) const
 {
     validateLease(stableSlot);
     return mSlotPages[static_cast<size_t>(stableSlot)];
+}
+
+int32_t StableKVPageManager::releasablePages(int32_t stableSlot) const
+{
+    validateLease(stableSlot);
+    return static_cast<int32_t>(std::count_if(mSlotPages[static_cast<size_t>(stableSlot)].begin(),
+        mSlotPages[static_cast<size_t>(stableSlot)].end(),
+        [this](int32_t page) { return mPageRefCounts[static_cast<size_t>(page)] == 1; }));
 }
 
 uint64_t StableKVPageManager::leaseGeneration(int32_t stableSlot) const

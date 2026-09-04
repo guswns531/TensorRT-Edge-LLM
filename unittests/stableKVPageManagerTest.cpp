@@ -52,6 +52,22 @@ TEST(StableKVPageManagerTest, ReusesReleasedSlotsAndPagesDeterministically)
     EXPECT_EQ(manager.pages(reusedSlot), (std::vector<int32_t>{0, 1}));
 }
 
+TEST(StableKVPageManagerTest, ReportsOnlyPhysicallyReleasablePages)
+{
+    rt::StableKVPageManager manager = makeManager();
+    int32_t const source = manager.reserve();
+    int32_t const target = manager.reserve();
+    manager.ensureCapacity(source, 256);
+    manager.setLength(source, 256);
+    manager.sharePrefix(source, target, 128);
+    manager.ensureCapacity(target, 256);
+
+    EXPECT_EQ(manager.pages(source).size(), 2U);
+    EXPECT_EQ(manager.pages(target).size(), 2U);
+    EXPECT_EQ(manager.releasablePages(source), 1);
+    EXPECT_EQ(manager.releasablePages(target), 1);
+}
+
 TEST(StableKVPageManagerTest, ExhaustionIsTransactional)
 {
     auto manager = makeManager(4);

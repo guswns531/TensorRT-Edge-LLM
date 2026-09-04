@@ -72,6 +72,20 @@
       "type": "integer",
       "minimum": 1
     },
+    "frozen_transition_snapshot_valid": {
+      "description": "Whether the immutable production DAG/lease snapshot passed validation for transition replay.",
+      "type": "boolean"
+    },
+    "frozen_transition_snapshot_id": {
+      "description": "In-process identity shared by every predictor replayed from this production decision state.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "frozen_transition_candidates": {
+      "description": "Number of hard-safe actions admitted to the common frozen replay frontier.",
+      "type": "integer",
+      "minimum": 0
+    },
     "causal_replay_forced": {
       "type": "boolean"
     },
@@ -492,6 +506,106 @@
       },
       "additionalProperties": false
     },
+    "transitionReplay": {
+      "type": "object",
+      "required": [
+        "evaluated",
+        "valid",
+        "alternatives",
+        "worst_case_robust_horizon_us",
+        "first_completed_phase_mask",
+        "min_first_encoder_ready_rows",
+        "max_first_encoder_ready_rows",
+        "min_first_prefill_ready_rows",
+        "max_first_prefill_ready_rows",
+        "min_first_decode_ready_rows",
+        "max_first_decode_ready_rows",
+        "min_encoder_ready_rows",
+        "max_encoder_ready_rows",
+        "min_prefill_ready_rows",
+        "max_prefill_ready_rows",
+        "min_decode_ready_rows",
+        "max_decode_ready_rows",
+        "min_reclaim_bytes",
+        "max_reclaim_bytes"
+      ],
+      "properties": {
+        "evaluated": {
+          "type": "boolean"
+        },
+        "valid": {
+          "type": "boolean"
+        },
+        "alternatives": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "worst_case_robust_horizon_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "first_completed_phase_mask": {
+          "$ref": "#/$defs/activityMask"
+        },
+        "min_first_encoder_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_first_encoder_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_first_prefill_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_first_prefill_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_first_decode_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_first_decode_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_encoder_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_encoder_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_prefill_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_prefill_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_decode_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_decode_ready_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_reclaim_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_reclaim_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "inflight": {
       "type": "object",
       "required": [
@@ -523,6 +637,19 @@
         },
         "request_ids": {
           "$ref": "#/$defs/requestIds"
+        },
+        "transition_action_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "scalar_transition": {
+          "$ref": "#/$defs/transitionReplay"
+        },
+        "effect_transition": {
+          "$ref": "#/$defs/transitionReplay"
+        },
+        "completion_transition": {
+          "$ref": "#/$defs/transitionReplay"
         },
         "completed_milestone": {
           "type": "string"

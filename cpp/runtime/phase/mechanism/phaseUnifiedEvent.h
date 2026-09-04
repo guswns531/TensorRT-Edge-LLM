@@ -21,6 +21,7 @@
 #include "runtime/phase/policy/phaseGlobalCostModel.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -366,6 +367,32 @@ struct PhaseInFlightSnapshot
     std::vector<PhaseInFlightWorkSnapshot> work;
 };
 
+//! Predictor-independent summary of one immutable transition replay. Min/max
+//! rows preserve uncertainty envelopes without choosing an arbitrary physical
+//! completion order in telemetry.
+struct PhaseTransitionReplaySnapshot
+{
+    bool evaluated{};
+    bool valid{};
+    size_t alternatives{};
+    double worstCaseRobustHorizonUs{};
+    uint8_t firstCompletedPhaseMask{};
+    size_t minFirstEncoderReadyRows{};
+    size_t maxFirstEncoderReadyRows{};
+    size_t minFirstPrefillReadyRows{};
+    size_t maxFirstPrefillReadyRows{};
+    size_t minFirstDecodeReadyRows{};
+    size_t maxFirstDecodeReadyRows{};
+    size_t minEncoderReadyRows{};
+    size_t maxEncoderReadyRows{};
+    size_t minPrefillReadyRows{};
+    size_t maxPrefillReadyRows{};
+    size_t minDecodeReadyRows{};
+    size_t maxDecodeReadyRows{};
+    size_t minReclaimBytes{};
+    size_t maxReclaimBytes{};
+};
+
 struct PhaseUnifiedCandidateSnapshot
 {
     uint64_t actionId{};
@@ -401,6 +428,10 @@ struct PhaseUnifiedCandidateSnapshot
     double completionNewcomerBlendWeight{};
     std::vector<PhaseProtectedCompletion> scalarProtectedCompletions;
     std::vector<PhaseProtectedCompletion> activeProtectedCompletions;
+    uint64_t transitionActionId{};
+    PhaseTransitionReplaySnapshot scalarTransition;
+    PhaseTransitionReplaySnapshot effectTransition;
+    PhaseTransitionReplaySnapshot completionTransition;
 };
 
 struct PhaseUnifiedEvent
@@ -455,6 +486,9 @@ struct PhaseUnifiedEvent
     //! Snapshot plus exact candidate frontier and persistent ownership.
     //! This is the pre-branch identity required by forced causal replay.
     uint64_t strictSnapshotSignature{};
+    bool frozenTransitionSnapshotValid{};
+    uint64_t frozenTransitionSnapshotId{};
+    size_t frozenTransitionCandidates{};
     bool causalReplayForced{};
     PhaseUnifiedWork cohort;
     std::vector<uint64_t> requestIds;

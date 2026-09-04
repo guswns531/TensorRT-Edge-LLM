@@ -226,6 +226,109 @@ PhaseUnifiedWork unifiedCandidateWork(PhaseGlobalActionCandidate const& candidat
     }
     return work;
 }
+
+std::vector<uint64_t> const& candidateRequestIdsForPhase(
+    PhaseGlobalActionCandidate const& candidate, PhaseUnifiedPhase phase) noexcept
+{
+    static std::vector<uint64_t> const kEMPTY;
+    switch (candidate.key.kind)
+    {
+    case PhaseGlobalActionKind::kEncoder:
+        return phase == PhaseUnifiedPhase::kEncoder ? candidate.primaryRequestIds : kEMPTY;
+    case PhaseGlobalActionKind::kPrefill:
+        return phase == PhaseUnifiedPhase::kPrefill ? candidate.primaryRequestIds : kEMPTY;
+    case PhaseGlobalActionKind::kDecode:
+        return phase == PhaseUnifiedPhase::kDecode ? candidate.primaryRequestIds : kEMPTY;
+    case PhaseGlobalActionKind::kEncoderPrefill:
+        return phase == PhaseUnifiedPhase::kEncoder ? candidate.primaryRequestIds
+            : phase == PhaseUnifiedPhase::kPrefill  ? candidate.secondaryRequestIds
+                                                    : kEMPTY;
+    case PhaseGlobalActionKind::kEncoderDecode:
+        return phase == PhaseUnifiedPhase::kEncoder ? candidate.primaryRequestIds
+            : phase == PhaseUnifiedPhase::kDecode   ? candidate.secondaryRequestIds
+                                                    : kEMPTY;
+    case PhaseGlobalActionKind::kPrefillDecode:
+        return phase == PhaseUnifiedPhase::kPrefill ? candidate.primaryRequestIds
+            : phase == PhaseUnifiedPhase::kDecode   ? candidate.secondaryRequestIds
+                                                    : kEMPTY;
+    case PhaseGlobalActionKind::kNone:
+    case PhaseGlobalActionKind::kWait: return kEMPTY;
+    }
+    return kEMPTY;
+}
+
+uint64_t frozenExecutionId(
+    uint64_t candidateId, PhaseUnifiedPhase phase, std::unordered_set<uint64_t> const& existingExecutionIds) noexcept
+{
+    constexpr uint64_t kPAYLOAD_MASK = (uint64_t{1U} << 62U) - 1U;
+    uint64_t result = kTHREE_PHASE_EXECUTION_NAMESPACE
+        | ((candidateId ^ (static_cast<uint64_t>(phase) * 0x9e3779b97f4a7c15ULL)) & kPAYLOAD_MASK);
+    while (result == 0U || existingExecutionIds.count(result) != 0U)
+    {
+        result = kTHREE_PHASE_EXECUTION_NAMESPACE | ((result + 1U) & kPAYLOAD_MASK);
+    }
+    return result;
+}
+
+PhaseTransitionReplaySnapshot transitionReplaySnapshot(PhaseFrozenReplayResult const& replay) noexcept
+{
+    PhaseTransitionReplaySnapshot result;
+    result.evaluated = true;
+    result.valid = replay.valid;
+    result.alternatives = replay.trajectories.size();
+    result.worstCaseRobustHorizonUs = replay.worstCaseRobustHorizonUs;
+    if (!replay.valid || replay.trajectories.empty())
+    {
+        return result;
+    }
+    result.minEncoderReadyRows = std::numeric_limits<size_t>::max();
+    result.minPrefillReadyRows = std::numeric_limits<size_t>::max();
+    result.minDecodeReadyRows = std::numeric_limits<size_t>::max();
+    result.minFirstEncoderReadyRows = std::numeric_limits<size_t>::max();
+    result.minFirstPrefillReadyRows = std::numeric_limits<size_t>::max();
+    result.minFirstDecodeReadyRows = std::numeric_limits<size_t>::max();
+    result.minReclaimBytes = std::numeric_limits<size_t>::max();
+    for (PhaseFrozenReplayTrajectory const& trajectory : replay.trajectories)
+    {
+        PhaseIncrementalProjection const& first = trajectory.boundaries.front();
+        result.firstCompletedPhaseMask |= static_cast<uint8_t>(phaseExecutionSetForUnifiedPhase(first.completed.phase));
+        std::unordered_set<uint64_t> firstInFlight;
+        for (PhaseInFlightWorkSnapshot const& work : first.successor.inFlight.work)
+        {
+            firstInFlight.insert(work.requestIds.begin(), work.requestIds.end());
+        }
+        size_t firstEncoderRows{};
+        size_t firstPrefillRows{};
+        size_t firstDecodeRows{};
+        for (PhaseProjectedRequest const& request : first.successor.requests)
+        {
+            if (!request.ready || firstInFlight.count(request.requestId) != 0U)
+            {
+                continue;
+            }
+            firstEncoderRows += request.stage == PhaseProjectedRequestStage::kEncoder ? 1U : 0U;
+            firstPrefillRows += request.stage == PhaseProjectedRequestStage::kPrefill ? 1U : 0U;
+            firstDecodeRows += request.stage == PhaseProjectedRequestStage::kDecode ? 1U : 0U;
+        }
+        result.minFirstEncoderReadyRows = std::min(result.minFirstEncoderReadyRows, firstEncoderRows);
+        result.maxFirstEncoderReadyRows = std::max(result.maxFirstEncoderReadyRows, firstEncoderRows);
+        result.minFirstPrefillReadyRows = std::min(result.minFirstPrefillReadyRows, firstPrefillRows);
+        result.maxFirstPrefillReadyRows = std::max(result.maxFirstPrefillReadyRows, firstPrefillRows);
+        result.minFirstDecodeReadyRows = std::min(result.minFirstDecodeReadyRows, firstDecodeRows);
+        result.maxFirstDecodeReadyRows = std::max(result.maxFirstDecodeReadyRows, firstDecodeRows);
+        size_t const reclaim
+            = saturatedAdd(trajectory.ownership.reclaimedVisionBytes, trajectory.ownership.reclaimedKvBytes);
+        result.minEncoderReadyRows = std::min(result.minEncoderReadyRows, trajectory.encoderReadyRows);
+        result.maxEncoderReadyRows = std::max(result.maxEncoderReadyRows, trajectory.encoderReadyRows);
+        result.minPrefillReadyRows = std::min(result.minPrefillReadyRows, trajectory.prefillReadyRows);
+        result.maxPrefillReadyRows = std::max(result.maxPrefillReadyRows, trajectory.prefillReadyRows);
+        result.minDecodeReadyRows = std::min(result.minDecodeReadyRows, trajectory.decodeReadyRows);
+        result.maxDecodeReadyRows = std::max(result.maxDecodeReadyRows, trajectory.decodeReadyRows);
+        result.minReclaimBytes = std::min(result.minReclaimBytes, reclaim);
+        result.maxReclaimBytes = std::max(result.maxReclaimBytes, reclaim);
+    }
+    return result;
+}
 } // namespace
 
 std::vector<size_t> phaseEncoderCalibrationBatchSizes(
@@ -1626,6 +1729,249 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     }
     event.snapshotSignature = phaseUnifiedSnapshotSignature(event);
     event.scalarPolicyStateSignature = phaseUnifiedScalarPolicyStateSignature(event);
+    if (mUnifiedDetailedDecisionSnapshots && candidateFrontier != nullptr)
+    {
+        PhaseIncrementalProjectionSnapshot projection;
+        projection.epoch = event.snapshotId;
+        projection.inFlight = event.inFlight;
+        projection.requests = mServer.projectedRequests(mMemoryBroker.config().bytesPerKVPage);
+        auto upsertRequest = [&projection](uint64_t requestId) -> PhaseProjectedRequest& {
+            auto const found = std::find_if(projection.requests.begin(), projection.requests.end(),
+                [requestId](PhaseProjectedRequest const& request) { return request.requestId == requestId; });
+            if (found != projection.requests.end())
+            {
+                return *found;
+            }
+            projection.requests.push_back({});
+            projection.requests.back().requestId = requestId;
+            return projection.requests.back();
+        };
+        auto setEncoderRequest = [&upsertRequest](PendingVisionRequest const& source, bool ready) {
+            PhaseProjectedRequest& request = upsertRequest(source.requestId);
+            request.stage = PhaseProjectedRequestStage::kEncoder;
+            request.decodeStepsRemaining = std::max(0, source.maxOutputTokens - 1);
+            request.generatedTokens = 0;
+            request.visionLeaseBytes = std::max(request.visionLeaseBytes, source.estimatedPayloadBytes);
+            request.visionOwned = false;
+            request.firstTokenObserved = false;
+            request.ready = ready;
+        };
+        for (PendingVisionRequest const& request : mPending)
+        {
+            setEncoderRequest(request, true);
+        }
+        for (PendingVisionRequest const& request : mEncoding)
+        {
+            setEncoderRequest(request, false);
+        }
+        for (ReadyPrefillRequest const& source : mReadyPrefill)
+        {
+            PhaseProjectedRequest& request = upsertRequest(source.requestId);
+            request.stage = PhaseProjectedRequestStage::kPrefill;
+            request.decodeStepsRemaining = std::max(0, source.maxOutputTokens - 1);
+            request.generatedTokens = 0;
+            request.visionLeaseBytes = std::max(request.visionLeaseBytes, source.payloadBytes);
+            request.visionOwned = source.payloadBytes > 0U;
+            request.firstTokenObserved = false;
+            request.ready = true;
+        }
+        for (uint64_t const requestId : event.readyPrefillRequestIds)
+        {
+            PhaseProjectedRequest& request = upsertRequest(requestId);
+            request.stage = PhaseProjectedRequestStage::kPrefill;
+            request.decodeStepsRemaining = std::max(1, request.decodeStepsRemaining);
+            request.ready = true;
+        }
+        for (uint64_t const requestId : event.readyDecodeRequestIds)
+        {
+            PhaseProjectedRequest& request = upsertRequest(requestId);
+            request.stage = PhaseProjectedRequestStage::kDecode;
+            request.decodeStepsRemaining = std::max(1, request.decodeStepsRemaining);
+            request.ready = true;
+        }
+        for (PhaseInFlightWorkSnapshot const& work : projection.inFlight.work)
+        {
+            for (uint64_t const requestId : work.requestIds)
+            {
+                PhaseProjectedRequest& request = upsertRequest(requestId);
+                request.stage = work.phase == PhaseUnifiedPhase::kEncoder ? PhaseProjectedRequestStage::kEncoder
+                    : work.phase == PhaseUnifiedPhase::kPrefill           ? PhaseProjectedRequestStage::kPrefill
+                                                                          : PhaseProjectedRequestStage::kDecode;
+                request.decodeStepsRemaining = work.phase == PhaseUnifiedPhase::kDecode
+                    ? std::max(1, request.decodeStepsRemaining)
+                    : request.decodeStepsRemaining;
+                request.ready = false;
+            }
+        }
+        std::sort(projection.requests.begin(), projection.requests.end(),
+            [](PhaseProjectedRequest const& left, PhaseProjectedRequest const& right) {
+                return left.requestId < right.requestId;
+            });
+        projection.ownership = phaseProjectedOwnership(projection.requests);
+
+        std::vector<PhaseIncrementalAction> incrementalFrontier;
+        std::unordered_map<uint64_t, std::vector<PhaseInFlightWorkSnapshot>> launchedWork;
+        std::unordered_map<uint64_t, uint64_t> transitionActionIds;
+        std::unordered_set<uint64_t> existingExecutionIds;
+        for (PhaseInFlightWorkSnapshot const& work : projection.inFlight.work)
+        {
+            existingExecutionIds.insert(work.executionId);
+        }
+        for (PhaseGlobalActionCandidate const& source : *candidateFrontier)
+        {
+            if (!source.dependencySafe || !source.contextSafe || !source.shapeSafe)
+            {
+                continue;
+            }
+            PhaseExecutionSet const planned = phaseExecutionSetForAction(source.key.kind);
+            PhaseUnifiedActionDirection direction = PhaseUnifiedActionDirection::kNone;
+            if (projection.inFlight.outstanding == PhaseExecutionSet::kNone)
+            {
+                direction = phaseInitialDirection(source.key.kind, {});
+            }
+            else
+            {
+                for (PhaseUnifiedPhase const phase :
+                    {PhaseUnifiedPhase::kEncoder, PhaseUnifiedPhase::kPrefill, PhaseUnifiedPhase::kDecode})
+                {
+                    PhaseExecutionSet const bit = phaseExecutionSetForUnifiedPhase(phase);
+                    if (phaseExecutionSetContains(planned, bit)
+                        && !phaseExecutionSetContains(projection.inFlight.outstanding, bit))
+                    {
+                        direction = phaseUnifiedActionDirection(projection.inFlight.outstanding, phase);
+                        break;
+                    }
+                }
+            }
+            PhaseGlobalDispatchPlan const hypothetical
+                = phaseGlobalDispatchPlan(0U, event.snapshotId, source, projection.inFlight.outstanding, direction,
+                    projection.inFlight.outstanding == PhaseExecutionSet::kNone ? PhaseStartSkewBucket::kImmediate
+                                                                                : PhaseStartSkewBucket::kUnknown);
+            if (!hypothetical.incrementalAction.legal())
+            {
+                continue;
+            }
+            std::vector<PhaseInFlightWorkSnapshot> launch;
+            std::unordered_set<uint64_t> reservedExecutionIds = existingExecutionIds;
+            for (PhaseUnifiedPhase const phase :
+                {PhaseUnifiedPhase::kEncoder, PhaseUnifiedPhase::kPrefill, PhaseUnifiedPhase::kDecode})
+            {
+                PhaseExecutionSet const bit = phaseExecutionSetForUnifiedPhase(phase);
+                if (!phaseExecutionSetContains(hypothetical.allowedOutstanding, bit)
+                    || phaseExecutionSetContains(projection.inFlight.outstanding, bit))
+                {
+                    continue;
+                }
+                std::vector<uint64_t> const& requestIds = candidateRequestIdsForPhase(source, phase);
+                if (requestIds.empty())
+                {
+                    launch.clear();
+                    break;
+                }
+                PhaseInFlightWorkSnapshot work;
+                work.phase = phase;
+                work.status = PhaseInFlightStatus::kSubmitted;
+                work.executionId = frozenExecutionId(source.candidateId, phase, reservedExecutionIds);
+                reservedExecutionIds.insert(work.executionId);
+                work.actionId = hypothetical.incrementalAction.actionId;
+                work.requestIds = requestIds;
+                launch.push_back(std::move(work));
+            }
+            if (!hypothetical.incrementalAction.key.noDispatch && launch.empty()
+                && projection.inFlight.outstanding != hypothetical.allowedOutstanding)
+            {
+                continue;
+            }
+            incrementalFrontier.push_back(hypothetical.incrementalAction);
+            transitionActionIds.emplace(source.candidateId, hypothetical.incrementalAction.actionId);
+            if (!launch.empty())
+            {
+                launchedWork.emplace(hypothetical.incrementalAction.actionId, std::move(launch));
+            }
+        }
+
+        std::optional<PhaseFrozenDecisionSnapshot> const frozen = phaseFreezeDecisionSnapshot(std::move(projection),
+            std::move(incrementalFrontier), std::move(launchedWork), event.scalarPolicyStateSignature);
+        if (frozen.has_value())
+        {
+            event.frozenTransitionSnapshotValid = true;
+            event.frozenTransitionSnapshotId = frozen->snapshotId;
+            event.frozenTransitionCandidates = frozen->frontier.size();
+            for (size_t index{}; index < candidateFrontier->size() && index < event.candidates.size(); ++index)
+            {
+                PhaseGlobalActionCandidate const& source = (*candidateFrontier)[index];
+                PhaseUnifiedCandidateSnapshot& snapshot = event.candidates[index];
+                auto const transitionAction = transitionActionIds.find(source.candidateId);
+                if (transitionAction == transitionActionIds.end())
+                {
+                    continue;
+                }
+                snapshot.transitionActionId = transitionAction->second;
+                auto const action = std::find_if(frozen->frontier.begin(), frozen->frontier.end(),
+                    [&](PhaseIncrementalAction const& value) { return value.actionId == transitionAction->second; });
+                if (action == frozen->frontier.end() || action->key.noDispatch)
+                {
+                    continue;
+                }
+                std::vector<PhaseInFlightWorkSnapshot> work = frozen->projection.inFlight.work;
+                auto const launched = frozen->launchedWork.find(action->actionId);
+                if (launched != frozen->launchedWork.end())
+                {
+                    work.insert(work.end(), launched->second.begin(), launched->second.end());
+                }
+                std::vector<PhaseOutcomeComponentReference> components;
+                components.reserve(work.size());
+                bool const pairReferences = work.size() == 2U && source.contextualCompletionIncumbentReferenceUs > 0.0
+                    && source.contextualCompletionNewcomerReferenceUs > 0.0;
+                double const scalarMakespanUs = source.scalarDecisionCostKnown ? source.scalarDecisionMakespanUs
+                    : source.predictedMakespanUs > 0.0                         ? source.predictedMakespanUs
+                                                                               : source.predictedBlockingUs;
+                for (PhaseInFlightWorkSnapshot const& item : work)
+                {
+                    bool const incumbent = work.size() == 2U && item.phase == action->key.incumbentPhase;
+                    double const referenceUs = pairReferences ? incumbent
+                            ? source.contextualCompletionIncumbentReferenceUs
+                            : source.contextualCompletionNewcomerReferenceUs
+                                                              : scalarMakespanUs;
+                    components.push_back({item.phase, item.executionId, referenceUs, incumbent});
+                }
+                PhaseOutcomeEnvelope const scalarEnvelope
+                    = phaseScalarOutcomeEnvelope(action->actionId, components, scalarMakespanUs, source.uncertaintyUs);
+                snapshot.scalarTransition
+                    = transitionReplaySnapshot(phaseReplayFrozenOutcome(*frozen, action->actionId, scalarEnvelope));
+
+                PhaseEffectOutcomeEstimate effect;
+                effect.compressionMean = source.contextualEffect.compression.mean;
+                effect.compressionUncertainty = source.contextualEffect.compression.uncertainty;
+                effect.incumbentStretchMean = source.contextualEffect.incumbentStretch.mean;
+                effect.incumbentStretchUncertainty = source.contextualEffect.incumbentStretch.uncertainty;
+                effect.orderMarginMean = source.contextualEffect.completionOrderMargin.mean;
+                effect.orderMarginUncertainty = source.contextualEffect.completionOrderMargin.uncertainty;
+                effect.ready = source.contextualEffectValid && source.contextualEffect.ready();
+                PhaseOutcomeEnvelope const effectEnvelope
+                    = phaseEffectOutcomeEnvelope(action->actionId, components, effect);
+                snapshot.effectTransition
+                    = transitionReplaySnapshot(phaseReplayFrozenOutcome(*frozen, action->actionId, effectEnvelope));
+
+                PhaseCompletionVector completion;
+                completion.actionId = action->actionId;
+                for (PhaseOutcomeComponentReference const& component : components)
+                {
+                    bool const incumbent = component.incumbent;
+                    completion.components.push_back({component.phase, component.executionId,
+                        incumbent ? source.contextualCompletion.incumbentMeanUs
+                                  : source.contextualCompletion.newcomerMeanUs,
+                        incumbent ? source.contextualCompletion.incumbentUncertaintyUs
+                                  : source.contextualCompletion.newcomerUncertaintyUs,
+                        incumbent});
+                }
+                PhaseOutcomeEnvelope const completionEnvelope = phaseCompletionOutcomeEnvelope(
+                    std::move(completion), PhaseOutcomeFidelity::kCompletionVector, source.contextualCompletion.ready);
+                snapshot.completionTransition
+                    = transitionReplaySnapshot(phaseReplayFrozenOutcome(*frozen, action->actionId, completionEnvelope));
+            }
+        }
+    }
     event.strictSnapshotSignature = phaseUnifiedStrictSnapshotSignature(event);
     mUnifiedDecisionByPlan[plan.planId] = event;
     emitUnifiedEvent(std::move(event));
