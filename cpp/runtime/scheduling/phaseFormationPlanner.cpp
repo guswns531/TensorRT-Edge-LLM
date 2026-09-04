@@ -458,6 +458,149 @@ bool phaseFormationShouldReplaceMyopic(
         && selectedRegret.predictedRegretUs < myopicRegret.predictedRegretUs;
 }
 
+PhaseFormationTwoBoundaryResult phaseFormationEvaluateCompletionBoundaries(
+    std::vector<PhaseFormationRequestState> requests,
+    std::vector<PhaseFormationPhysicalCompletion> completions) noexcept
+{
+    PhaseFormationTwoBoundaryResult result;
+    if (requests.empty() || completions.empty())
+    {
+        return result;
+    }
+    std::sort(requests.begin(), requests.end(),
+        [](auto const& left, auto const& right) { return left.requestId < right.requestId; });
+    if (std::adjacent_find(requests.begin(), requests.end(),
+            [](auto const& left, auto const& right) { return left.requestId == right.requestId; })
+        != requests.end())
+    {
+        return result;
+    }
+    std::sort(completions.begin(), completions.end(), [](auto const& left, auto const& right) {
+        if (left.completionUs != right.completionUs)
+        {
+            return left.completionUs < right.completionUs;
+        }
+        if (left.phase != right.phase)
+        {
+            return left.phase < right.phase;
+        }
+        return left.requestIds < right.requestIds;
+    });
+    size_t releasedVisionBytes{};
+    size_t releasedKvBytes{};
+    auto apply = [&](PhaseFormationPhysicalCompletion const& completion) {
+        if (!std::isfinite(completion.completionUs) || completion.completionUs < 0.0 || completion.requestIds.empty())
+        {
+            return false;
+        }
+        for (uint64_t const requestId : completion.requestIds)
+        {
+            auto const request = std::lower_bound(requests.begin(), requests.end(), requestId,
+                [](PhaseFormationRequestState const& value, uint64_t id) { return value.requestId < id; });
+            if (request == requests.end() || request->requestId != requestId)
+            {
+                return false;
+            }
+            switch (completion.phase)
+            {
+            case PhaseGlobalActionKind::kEncoder:
+                if (request->stage != PhaseFormationRequestStage::kEncoderReady)
+                {
+                    return false;
+                }
+                request->stage = PhaseFormationRequestStage::kPrefillReady;
+                break;
+            case PhaseGlobalActionKind::kPrefill:
+                if (request->stage != PhaseFormationRequestStage::kPrefillReady || request->decodeStepsRemaining == 0U)
+                {
+                    return false;
+                }
+                request->stage = PhaseFormationRequestStage::kDecodeReady;
+                releasedVisionBytes += request->visionBytes;
+                request->visionBytes = 0U;
+                break;
+            case PhaseGlobalActionKind::kDecode:
+                if (request->stage != PhaseFormationRequestStage::kDecodeReady || request->decodeStepsRemaining == 0U)
+                {
+                    return false;
+                }
+                --request->decodeStepsRemaining;
+                if (request->decodeStepsRemaining == 0U)
+                {
+                    request->stage = PhaseFormationRequestStage::kComplete;
+                    releasedKvBytes += request->kvBytes;
+                    request->kvBytes = 0U;
+                }
+                break;
+            case PhaseGlobalActionKind::kNone:
+            case PhaseGlobalActionKind::kEncoderPrefill:
+            case PhaseGlobalActionKind::kEncoderDecode:
+            case PhaseGlobalActionKind::kPrefillDecode:
+            case PhaseGlobalActionKind::kWait: return false;
+            }
+        }
+        return true;
+    };
+    auto materialize = [&](double boundaryUs, double uncertaintyUs) {
+        PhaseFormationReadyBoundary boundary;
+        boundary.completionUs = boundaryUs;
+        boundary.uncertaintyUs = uncertaintyUs;
+        boundary.releasedVisionBytes = releasedVisionBytes;
+        boundary.releasedKvBytes = releasedKvBytes;
+        for (PhaseFormationRequestState const& request : requests)
+        {
+            switch (request.stage)
+            {
+            case PhaseFormationRequestStage::kEncoderReady:
+                boundary.encoderRequestIds.push_back(request.requestId);
+                break;
+            case PhaseFormationRequestStage::kPrefillReady:
+                boundary.prefillRequestIds.push_back(request.requestId);
+                break;
+            case PhaseFormationRequestStage::kDecodeReady:
+                boundary.decodeRequestIds.push_back(request.requestId);
+                break;
+            case PhaseFormationRequestStage::kComplete: break;
+            }
+        }
+        return boundary;
+    };
+
+    size_t index{};
+    size_t boundaryIndex{};
+    while (index < completions.size() && boundaryIndex < 2U)
+    {
+        double const completionUs = completions[index].completionUs;
+        double uncertaintyUs{};
+        do
+        {
+            uncertaintyUs = std::max(uncertaintyUs, std::max(0.0, completions[index].uncertaintyUs));
+            if (!apply(completions[index]))
+            {
+                return {};
+            }
+            ++index;
+        } while (index < completions.size() && completions[index].completionUs == completionUs);
+        PhaseFormationReadyBoundary boundary = materialize(completionUs, uncertaintyUs);
+        if (boundaryIndex == 0U)
+        {
+            result.first = std::move(boundary);
+        }
+        else
+        {
+            result.second = std::move(boundary);
+        }
+        ++boundaryIndex;
+    }
+    if (boundaryIndex == 1U)
+    {
+        result.second = result.first;
+    }
+    result.feasible = true;
+    result.successorRequests = std::move(requests);
+    return result;
+}
+
 PhaseFormationRealizedTracker::PhaseFormationRealizedTracker(PhaseFormationRealizedTrackerConfig config)
     : mConfig(config)
 {

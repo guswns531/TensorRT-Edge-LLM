@@ -200,6 +200,11 @@ TEST(PhaseUnifiedEventTest, StrictSnapshotSignatureIncludesOwnershipAndExactCand
     right = left;
     right.candidates.front().legal = false;
     EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
+    right = left;
+    right.candidates.front().scalarDecisionCostKnown = true;
+    right.candidates.front().scalarDecisionMakespanUs = 42.0;
+    right.scalarPolicyStateSignature = phaseUnifiedScalarPolicyStateSignature(right);
+    EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
 }
 
 } // namespace

@@ -103,11 +103,13 @@ def test_materializes_warmup_and_replay_overrides() -> None:
         backend_environment={
             "TRT_EDGELLM_REPLAY_DECISION_SEQUENCE": "406",
             "TRT_EDGELLM_REPLAY_ACTION_KIND": "prefill",
-        })
+        },
+        trace_path=Path("/host/scaled.json"))
     command = result["command"]
     values = environment(command)
     assert command[command.index("--warmup-requests") + 1] == "1696"
     assert command[command.index("--phase-calibration-min-requests") + 1] == "1696"
+    assert command[command.index("--trace") + 1] == "/host/scaled.json"
     assert values["TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"] == "counterfactual"
     assert values["TRT_EDGELLM_REPLAY_DECISION_SEQUENCE"] == "406"
     assert values["TRT_EDGELLM_REPLAY_ACTION_KIND"] == "prefill"

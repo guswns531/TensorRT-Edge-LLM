@@ -1623,6 +1623,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         }
     }
     event.snapshotSignature = phaseUnifiedSnapshotSignature(event);
+    event.scalarPolicyStateSignature = phaseUnifiedScalarPolicyStateSignature(event);
     event.strictSnapshotSignature = phaseUnifiedStrictSnapshotSignature(event);
     mUnifiedDecisionByPlan[plan.planId] = event;
     emitUnifiedEvent(std::move(event));

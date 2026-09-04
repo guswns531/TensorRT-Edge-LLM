@@ -4371,6 +4371,7 @@ int main(int argc, char** argv)
                             {"snapshot_id", event.snapshotId}, {"snapshot_signature", event.snapshotSignature},
                             {"plan_id", event.planId}, {"strict_snapshot_signature", event.strictSnapshotSignature},
                             {"kv_ownership_signature", event.kvOwnershipSignature},
+                            {"scalar_policy_state_signature", event.scalarPolicyStateSignature},
                             {"vision_lease_signature", event.visionLeaseSignature},
                             {"causal_replay_forced", event.causalReplayForced}, {"action_id", event.actionId},
                             {"incremental_action_id", event.incrementalActionId},

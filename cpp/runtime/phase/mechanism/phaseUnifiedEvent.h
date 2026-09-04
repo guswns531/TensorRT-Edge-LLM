@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string_view>
@@ -447,6 +448,8 @@ struct PhaseUnifiedEvent
     uint64_t kvOwnershipSignature{};
     uint64_t visionLeaseSignature{};
     uint64_t snapshotSignature{};
+    //! Policy inputs from the scalar evaluator over the exact frontier.
+    uint64_t scalarPolicyStateSignature{};
     //! Snapshot plus exact candidate frontier and persistent ownership.
     //! This is the pre-branch identity required by forced causal replay.
     uint64_t strictSnapshotSignature{};
@@ -547,6 +550,54 @@ inline uint64_t phaseUnifiedSnapshotSignature(PhaseUnifiedEvent const& event)
     return result;
 }
 
+//! Stable fingerprint of policy-relevant scalar inputs over one frontier.
+//! Shadow completion estimates are excluded so this can test whether an
+//! observer perturbs the production-equivalent policy state.
+inline uint64_t phaseUnifiedScalarPolicyStateSignature(PhaseUnifiedEvent const& event)
+{
+    constexpr uint64_t kFNV_OFFSET = 14695981039346656037ULL;
+    constexpr uint64_t kFNV_PRIME = 1099511628211ULL;
+    uint64_t result{kFNV_OFFSET};
+    auto add = [&](uint64_t value) {
+        result ^= value;
+        result *= kFNV_PRIME;
+    };
+    auto addDouble = [&](double value) {
+        uint64_t bits{};
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        add(bits);
+    };
+    std::vector<PhaseUnifiedCandidateSnapshot const*> candidates;
+    candidates.reserve(event.candidates.size());
+    for (PhaseUnifiedCandidateSnapshot const& candidate : event.candidates)
+    {
+        candidates.push_back(&candidate);
+    }
+    std::sort(candidates.begin(), candidates.end(), [](auto const* left, auto const* right) {
+        return std::tie(left->actionId, left->requestIds) < std::tie(right->actionId, right->requestIds);
+    });
+    add(candidates.size());
+    for (PhaseUnifiedCandidateSnapshot const* candidate : candidates)
+    {
+        add(candidate->actionId);
+        add(candidate->scalarDecisionCostKnown ? 1U : 0U);
+        addDouble(candidate->scalarDecisionMakespanUs);
+        addDouble(candidate->predictedCompletionUs);
+        addDouble(candidate->uncertaintyUs);
+        addDouble(candidate->predictedSloViolationUs);
+        add(candidate->scalarProtectedCompletions.size());
+        for (PhaseProtectedCompletion const& completion : candidate->scalarProtectedCompletions)
+        {
+            add(static_cast<uint64_t>(completion.kind));
+            addDouble(completion.slackUs);
+            addDouble(completion.predictedCompletionUs);
+            addDouble(completion.uncertaintyUs);
+        }
+    }
+    return result;
+}
+
 //! Strict cross-run identity for causal branch replay. Unlike the mechanism
 //! snapshot signature, this includes the complete candidate frontier and
 //! persistent KV/vision ownership but still excludes timestamps and the
@@ -570,6 +621,7 @@ inline uint64_t phaseUnifiedStrictSnapshotSignature(PhaseUnifiedEvent const& eve
     add(event.snapshotSignature);
     add(event.kvOwnershipSignature);
     add(event.visionLeaseSignature);
+    add(event.scalarPolicyStateSignature);
     std::vector<PhaseUnifiedCandidateSnapshot const*> candidates;
     candidates.reserve(event.candidates.size());
     for (PhaseUnifiedCandidateSnapshot const& candidate : event.candidates)

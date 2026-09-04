@@ -227,7 +227,8 @@ def materialize_command(entry: dict[str, Any],
                         matrix_repeat: int = 1,
                         telemetry_level: str = "research",
                         warmup_requests: int | None = None,
-                        backend_environment: dict[str, str] | None = None
+                        backend_environment: dict[str, str] | None = None,
+                        trace_path: Path | None = None
                         ) -> dict[str, Any]:
     """Return one event-enabled, one-repeat command without changing its trace contract."""
     if policy not in POLICY_ENVIRONMENTS:
@@ -243,9 +244,10 @@ def materialize_command(entry: dict[str, Any],
         _replace_option(command, "--phase-calibration-min-requests",
                         str(warmup_requests))
     trace_index = command.index("--trace") + 1
-    trace_path = Path(command[trace_index])
-    if not trace_path.is_absolute():
-        command[trace_index] = str(host_workspace / trace_path)
+    selected_trace = trace_path or Path(command[trace_index])
+    if not selected_trace.is_absolute():
+        selected_trace = host_workspace / selected_trace
+    command[trace_index] = str(selected_trace)
 
     _remove_docker_environment(command, POLICY_ENVIRONMENT_NAMES)
     _set_docker_environment(command, "TRT_EDGELLM_EMIT_PHASE_METRICS", "1")
@@ -311,6 +313,8 @@ def main() -> int:
         default=[],
         metavar="NAME=VALUE",
         help="inject a research backend environment variable")
+    parser.add_argument("--trace", type=Path,
+                        help="override the source manifest request trace")
     parser.add_argument("--telemetry-level",
                         choices=("research", "full", "counterfactual"),
                         default="research")
@@ -360,7 +364,7 @@ def main() -> int:
                     entry, args.policy, repeat_root, args.host_workspace,
                     args.container_workspace, args.plugin_path,
                     args.binary_path, matrix_repeat, args.telemetry_level,
-                    args.warmup_requests, backend_environment)
+                    args.warmup_requests, backend_environment, args.trace)
                 for entry in selected)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         command_manifest = args.output_dir / "commands.json"

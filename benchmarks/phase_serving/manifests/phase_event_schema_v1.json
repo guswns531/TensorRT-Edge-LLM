@@ -62,6 +62,11 @@
       "type": "integer",
       "minimum": 1
     },
+    "scalar_policy_state_signature": {
+      "description": "Cross-run identity of scalar cost and deadline inputs over the exact candidate frontier.",
+      "type": "integer",
+      "minimum": 1
+    },
     "vision_lease_signature": {
       "description": "Cross-run identity of active and pending vision payload lifetimes.",
       "type": "integer",

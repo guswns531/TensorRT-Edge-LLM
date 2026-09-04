@@ -134,6 +134,57 @@ struct PhaseFormationRegret
     double oracleProtectedViolationUs{};
 };
 
+//! Request-local state used by the physical-completion transition replay.
+//! It is independent of live queue objects and therefore cannot mutate
+//! ownership or dispatch order.
+enum class PhaseFormationRequestStage : uint8_t
+{
+    kEncoderReady,
+    kPrefillReady,
+    kDecodeReady,
+    kComplete,
+};
+
+struct PhaseFormationRequestState
+{
+    uint64_t requestId{};
+    PhaseFormationRequestStage stage{PhaseFormationRequestStage::kEncoderReady};
+    size_t decodeStepsRemaining{};
+    size_t visionBytes{};
+    size_t kvBytes{};
+};
+
+//! One component of a measured or predicted physical completion vector.
+struct PhaseFormationPhysicalCompletion
+{
+    PhaseGlobalActionKind phase{PhaseGlobalActionKind::kNone};
+    std::vector<uint64_t> requestIds;
+    double completionUs{};
+    double uncertaintyUs{};
+};
+
+struct PhaseFormationReadyBoundary
+{
+    double completionUs{};
+    double uncertaintyUs{};
+    std::vector<uint64_t> encoderRequestIds;
+    std::vector<uint64_t> prefillRequestIds;
+    std::vector<uint64_t> decodeRequestIds;
+    size_t releasedVisionBytes{};
+    size_t releasedKvBytes{};
+};
+
+//! Exactly two request-ready boundaries produced by one physical completion
+//! vector. Equal-time components form one boundary. With only one distinct
+//! completion time, second repeats first rather than inventing future work.
+struct PhaseFormationTwoBoundaryResult
+{
+    bool feasible{};
+    PhaseFormationReadyBoundary first;
+    PhaseFormationReadyBoundary second;
+    std::vector<PhaseFormationRequestState> successorRequests;
+};
+
 //! Metadata fixed when formation-aware selection changes the concrete action
 //! chosen by the otherwise identical myopic frontier.
 struct PhaseFormationRealizedEpisodeStart
@@ -266,5 +317,12 @@ PhaseFormationRegret phaseFormationPredictedRegret(
 //! when the bounded observable frontier predicts a strict improvement.
 bool phaseFormationShouldReplaceMyopic(
     PhaseFormationOracleResult const& result, size_t myopicAction, size_t selectedAction) noexcept;
+
+//! Replay E->P, P->D, and D->D/complete transitions at the first two physical
+//! completion boundaries. No future arrival, learned formation rule, or live
+//! queue mutation is permitted.
+PhaseFormationTwoBoundaryResult phaseFormationEvaluateCompletionBoundaries(
+    std::vector<PhaseFormationRequestState> requests,
+    std::vector<PhaseFormationPhysicalCompletion> completions) noexcept;
 
 } // namespace trt_edgellm::rt

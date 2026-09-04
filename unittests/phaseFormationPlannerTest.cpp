@@ -335,5 +335,63 @@ TEST(PhaseFormationPlannerTest, RecordsAnUnservicedDecodeBudgetViolation)
     EXPECT_EQ(telemetry.decodeServiceViolations, 1U);
 }
 
+TEST(PhaseFormationPlannerTest, ReplaysPhysicalCompletionOrderIntoRequestDagAndOwnership)
+{
+    std::vector<PhaseFormationRequestState> requests{
+        {1U, PhaseFormationRequestStage::kEncoderReady, 2U, 100U, 0U},
+        {2U, PhaseFormationRequestStage::kPrefillReady, 3U, 200U, 20U},
+    };
+    std::vector<PhaseFormationPhysicalCompletion> completions{
+        {PhaseGlobalActionKind::kEncoder, {1U}, 8.0, 1.0},
+        {PhaseGlobalActionKind::kPrefill, {2U}, 5.0, 0.5},
+    };
+
+    PhaseFormationTwoBoundaryResult const result
+        = phaseFormationEvaluateCompletionBoundaries(std::move(requests), std::move(completions));
+
+    ASSERT_TRUE(result.feasible);
+    EXPECT_DOUBLE_EQ(result.first.completionUs, 5.0);
+    EXPECT_EQ(result.first.encoderRequestIds, (std::vector<uint64_t>{1U}));
+    EXPECT_EQ(result.first.decodeRequestIds, (std::vector<uint64_t>{2U}));
+    EXPECT_EQ(result.first.releasedVisionBytes, 200U);
+    EXPECT_DOUBLE_EQ(result.second.completionUs, 8.0);
+    EXPECT_EQ(result.second.prefillRequestIds, (std::vector<uint64_t>{1U}));
+    EXPECT_EQ(result.second.decodeRequestIds, (std::vector<uint64_t>{2U}));
+    EXPECT_EQ(result.second.releasedVisionBytes, 200U);
+}
+
+TEST(PhaseFormationPlannerTest, KeepsDecodeReadyUntilItsLastStepAndThenReleasesKv)
+{
+    std::vector<PhaseFormationRequestState> requests{
+        {7U, PhaseFormationRequestStage::kDecodeReady, 2U, 0U, 4096U},
+        {9U, PhaseFormationRequestStage::kDecodeReady, 1U, 0U, 8192U},
+    };
+    std::vector<PhaseFormationPhysicalCompletion> completions{
+        {PhaseGlobalActionKind::kDecode, {7U}, 3.0, 0.2},
+        {PhaseGlobalActionKind::kDecode, {9U}, 6.0, 0.4},
+    };
+
+    PhaseFormationTwoBoundaryResult const result
+        = phaseFormationEvaluateCompletionBoundaries(std::move(requests), std::move(completions));
+
+    ASSERT_TRUE(result.feasible);
+    EXPECT_EQ(result.first.decodeRequestIds, (std::vector<uint64_t>{7U, 9U}));
+    EXPECT_EQ(result.first.releasedKvBytes, 0U);
+    EXPECT_EQ(result.second.decodeRequestIds, (std::vector<uint64_t>{7U}));
+    EXPECT_EQ(result.second.releasedKvBytes, 8192U);
+}
+
+TEST(PhaseFormationPlannerTest, RejectsACompletionThatViolatesTheRequestDag)
+{
+    std::vector<PhaseFormationRequestState> requests{
+        {1U, PhaseFormationRequestStage::kEncoderReady, 2U, 100U, 0U},
+    };
+    std::vector<PhaseFormationPhysicalCompletion> completions{
+        {PhaseGlobalActionKind::kPrefill, {1U}, 4.0, 0.0},
+    };
+
+    EXPECT_FALSE(phaseFormationEvaluateCompletionBoundaries(std::move(requests), std::move(completions)).feasible);
+}
+
 } // namespace
 } // namespace trt_edgellm::rt
