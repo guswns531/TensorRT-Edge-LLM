@@ -35,8 +35,9 @@ def open_text(path: Path) -> TextIO:
     return path.open(encoding="utf-8", errors="replace")
 
 
-def load_branch(paths: list[Path]) -> dict[int, list[dict[str, Any]]]:
-    """Index decision and completion records by strict pre-branch hash."""
+def load_branch(paths: list[Path],
+                forced_only: bool = False) -> dict[int, list[dict[str, Any]]]:
+    """Index strict pre-branch states and validate each realized dispatch."""
     plans: dict[tuple[str, int], dict[str, Any]] = {}
     completions: dict[tuple[str, int], list[dict[str,
                                                  Any]]] = defaultdict(list)
@@ -48,6 +49,9 @@ def load_branch(paths: list[Path]) -> dict[int, list[dict[str, Any]]]:
                 event = json.loads(line.removeprefix(PREFIX))
                 key = (str(path), int(event.get("plan_id", 0)))
                 if event.get("event_kind") == "decision":
+                    if forced_only and not event.get("causal_replay_forced",
+                                                     False):
+                        continue
                     plans[key] = event
                 elif event.get("event_kind") == "completion":
                     completions[key].append(event)
@@ -59,11 +63,21 @@ def load_branch(paths: list[Path]) -> dict[int, list[dict[str, Any]]]:
                      if "gpu_start_us" in item and "gpu_end_us" in item]
         if not intervals:
             continue
-        signature = int(decision.get("strict_snapshot_signature",
-                                     decision.get("snapshot_signature", 0)))
+        signature = int(
+            decision.get("strict_snapshot_signature",
+                         decision.get("snapshot_signature", 0)))
+        dispatch_signature = int(decision.get("dispatch_signature", 0))
+        completion_dispatch_signatures = [
+            int(item.get("dispatch_signature", 0)) for item in done
+        ]
+        dispatch_identity = dispatch_signature > 0 and all(
+            value == dispatch_signature
+            for value in completion_dispatch_signatures)
         snapshots[signature].append({
             "action":
             decision.get("action_kind", "unknown"),
+            "dispatch_signature":
+            dispatch_signature,
             "request_ids":
             decision.get("request_ids", []),
             "token_work":
@@ -72,7 +86,8 @@ def load_branch(paths: list[Path]) -> dict[int, list[dict[str, Any]]]:
             max(end for _, end in intervals) - min(start
                                                    for start, _ in intervals),
             "fidelity":
-            all(item.get("action_fidelity", False) for item in done),
+            all(item.get("action_fidelity", False) for item in done)
+            and dispatch_identity,
         })
     return snapshots
 
@@ -89,17 +104,21 @@ def main() -> int:
                         required=True)
     parser.add_argument("--name-a", default="branch_a")
     parser.add_argument("--name-b", default="branch_b")
+    parser.add_argument(
+        "--forced-only",
+        action="store_true",
+        help="pair only decisions explicitly selected by causal replay")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    left = load_branch(args.branch_a)
-    right = load_branch(args.branch_b)
+    left = load_branch(args.branch_a, args.forced_only)
+    right = load_branch(args.branch_b, args.forced_only)
     pairs = []
     for signature in sorted(left.keys() & right.keys()):
         for lhs, rhs in zip(left[signature], right[signature]):
-            if (lhs["request_ids"] != rhs["request_ids"]
-                    or lhs["token_work"] != rhs["token_work"]):
-                continue
+            # The strict snapshot already commits the full ready frontier,
+            # row order, policy state, and ownership. Selected request IDs and
+            # work are expected to differ across counterfactual branches.
             pairs.append({
                 "strict_snapshot_signature":
                 signature,
@@ -123,6 +142,9 @@ def main() -> int:
         "action_disagreements":
         sum(pair[args.name_a]["action"] != pair[args.name_b]["action"]
             for pair in pairs),
+        "dispatch_identity_failures":
+        sum(not pair[args.name_a]["fidelity"]
+            or not pair[args.name_b]["fidelity"] for pair in pairs),
         "fidelity_failures":
         sum(not pair[args.name_a]["fidelity"]
             or not pair[args.name_b]["fidelity"] for pair in pairs),

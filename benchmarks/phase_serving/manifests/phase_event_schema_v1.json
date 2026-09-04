@@ -57,6 +57,11 @@
       "type": "integer",
       "minimum": 1
     },
+    "dispatch_signature": {
+      "description": "Exact selected mechanism dispatch identity over the strict snapshot, ordered request/stable-slot candidate, launch direction, and outstanding-set transition.",
+      "type": "integer",
+      "minimum": 1
+    },
     "kv_ownership_signature": {
       "description": "Cross-run identity of request-to-slot/page leases, generation, and committed KV length.",
       "type": "integer",
@@ -85,6 +90,15 @@
       "description": "Number of hard-safe actions admitted to the common frozen replay frontier.",
       "type": "integer",
       "minimum": 0
+    },
+    "scalar_formation": {
+      "$ref": "#/$defs/model_formation"
+    },
+    "effect_formation": {
+      "$ref": "#/$defs/model_formation"
+    },
+    "completion_formation": {
+      "$ref": "#/$defs/model_formation"
     },
     "causal_replay_forced": {
       "type": "boolean"
@@ -601,6 +615,42 @@
         },
         "max_reclaim_bytes": {
           "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "model_formation": {
+      "type": "object",
+      "required": [
+        "evaluated",
+        "valid",
+        "selected_action_id",
+        "selected_horizon_us",
+        "selected_decode_violation_us",
+        "selected_protected_violation_us"
+      ],
+      "properties": {
+        "evaluated": {
+          "type": "boolean"
+        },
+        "valid": {
+          "type": "boolean"
+        },
+        "selected_action_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "selected_horizon_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "selected_decode_violation_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "selected_protected_violation_us": {
+          "type": "number",
           "minimum": 0
         }
       },

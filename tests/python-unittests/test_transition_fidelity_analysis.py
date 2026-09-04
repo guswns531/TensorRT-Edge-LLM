@@ -77,11 +77,31 @@ def test_analyzes_common_snapshot_and_false_safe(tmp_path):
         "event_kind": "decision",
         "decision_id": 1,
         "selected_action_id": 7,
+        "dispatch_signature": 101,
         "frozen_transition_snapshot_valid": True,
+        "scalar_formation": {
+            "evaluated": True,
+            "valid": True,
+            "selected_action_id": 7,
+            "selected_horizon_us": 8.0,
+        },
+        "effect_formation": {
+            "evaluated": True,
+            "valid": True,
+            "selected_action_id": 8,
+            "selected_horizon_us": 7.0,
+        },
+        "completion_formation": {
+            "evaluated": True,
+            "valid": True,
+            "selected_action_id": 7,
+            "selected_horizon_us": 7.2,
+        },
         "candidates": [candidate],
     }, {
         "event_kind": "completion",
         "decision_id": 1,
+        "dispatch_signature": 101,
         "action_kind": "prefill_decode",
         "action_fidelity": True,
         "gpu_start_us": 100.0,
@@ -104,6 +124,10 @@ def test_analyzes_common_snapshot_and_false_safe(tmp_path):
     assert result["selected_physics"]["completion"]["false_safe"] == 1
     assert result["selected_physics"]["scalar"]["makespan_mae_us"] == 3.0
     assert not result["selected_physics"]["effect"]["promotion_gate"]["passed"]
+    assert result["formation"]["effect"]["agreement_with_scalar"] == 0.0
+    assert result["formation"]["completion"]["agreement_with_scalar"] == 1.0
+    assert result["dispatch_signatures"]["matched"] == 1
+    assert result["dispatch_signatures"]["mismatched"] == 0
 
 
 def test_groups_warmup_matrix_by_workload(tmp_path):

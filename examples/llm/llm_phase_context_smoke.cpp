@@ -4293,6 +4293,13 @@ int main(int argc, char** argv)
                             {"min_reclaim_bytes", transition.minReclaimBytes},
                             {"max_reclaim_bytes", transition.maxReclaimBytes}};
                     };
+                    auto const formationJson = [](rt::PhaseModelFormationSnapshot const& formation) {
+                        return nlohmann::json{{"evaluated", formation.evaluated}, {"valid", formation.valid},
+                            {"selected_action_id", formation.selectedActionId},
+                            {"selected_horizon_us", formation.selectedHorizonUs},
+                            {"selected_decode_violation_us", formation.selectedDecodeViolationUs},
+                            {"selected_protected_violation_us", formation.selectedProtectedViolationUs}};
+                    };
                     nlohmann::json record{{"schema_version", event.schemaVersion},
                         {"event_kind", rt::phaseUnifiedEventKindName(event.kind)}, {"event_id", event.eventId},
                         {"run_id", schedulerRunId}, {"host_monotonic_ns", event.hostMonotonicNs}};
@@ -4407,6 +4414,7 @@ int main(int argc, char** argv)
                             {"policy_decision_sequence", event.policyDecisionSequence},
                             {"snapshot_id", event.snapshotId}, {"snapshot_signature", event.snapshotSignature},
                             {"plan_id", event.planId}, {"strict_snapshot_signature", event.strictSnapshotSignature},
+                            {"dispatch_signature", event.dispatchSignature},
                             {"kv_ownership_signature", event.kvOwnershipSignature},
                             {"scalar_policy_state_signature", event.scalarPolicyStateSignature},
                             {"vision_lease_signature", event.visionLeaseSignature},
@@ -4435,6 +4443,9 @@ int main(int argc, char** argv)
                             {"selected_action_id", event.selectedActionId},
                             {"active_h1_selected_action_id", event.activeH1SelectedActionId},
                             {"scalar_h1_selected_action_id", event.scalarSelectedActionId},
+                            {"scalar_formation", formationJson(event.scalarFormation)},
+                            {"effect_formation", formationJson(event.effectFormation)},
+                            {"completion_formation", formationJson(event.completionFormation)},
                             {"completion_changed_h1_action",
                                 event.scalarSelectedActionId > 0U && event.activeH1SelectedActionId > 0U
                                     && event.scalarSelectedActionId != event.activeH1SelectedActionId}});
@@ -4488,8 +4499,10 @@ int main(int argc, char** argv)
                     else
                     {
                         record.update({{"decision_id", event.decisionId}, {"snapshot_id", event.snapshotId},
-                            {"execution_id", event.executionId}, {"plan_id", event.planId},
-                            {"action_id", event.actionId}, {"phase", rt::phaseUnifiedPhaseName(event.phase)},
+                            {"strict_snapshot_signature", event.strictSnapshotSignature},
+                            {"dispatch_signature", event.dispatchSignature}, {"execution_id", event.executionId},
+                            {"plan_id", event.planId}, {"action_id", event.actionId},
+                            {"phase", rt::phaseUnifiedPhaseName(event.phase)},
                             {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
                             {"requested_action_direction",

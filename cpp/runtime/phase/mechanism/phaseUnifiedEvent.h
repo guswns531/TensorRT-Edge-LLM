@@ -393,6 +393,19 @@ struct PhaseTransitionReplaySnapshot
     size_t maxReclaimBytes{};
 };
 
+//! Equal-work H=2 selection made by one physical-outcome representation over
+//! the exact same mechanism frontier. This remains shadow telemetry unless a
+//! separate held-out promotion gate grants that model policy authority.
+struct PhaseModelFormationSnapshot
+{
+    bool evaluated{};
+    bool valid{};
+    uint64_t selectedActionId{};
+    double selectedHorizonUs{};
+    double selectedDecodeViolationUs{};
+    double selectedProtectedViolationUs{};
+};
+
 struct PhaseUnifiedCandidateSnapshot
 {
     uint64_t actionId{};
@@ -486,6 +499,10 @@ struct PhaseUnifiedEvent
     //! Snapshot plus exact candidate frontier and persistent ownership.
     //! This is the pre-branch identity required by forced causal replay.
     uint64_t strictSnapshotSignature{};
+    //! Exact selected dispatch identity. Unlike strictSnapshotSignature this
+    //! includes the chosen candidate, launch direction, and outstanding-set
+    //! transition, while retaining candidateId's stable-slot row ordering.
+    uint64_t dispatchSignature{};
     bool frozenTransitionSnapshotValid{};
     uint64_t frozenTransitionSnapshotId{};
     size_t frozenTransitionCandidates{};
@@ -500,6 +517,9 @@ struct PhaseUnifiedEvent
     //! H=1 selector result after restoring completion-sensitive candidate
     //! fields to their scalar values over this exact frontier.
     uint64_t scalarSelectedActionId{};
+    PhaseModelFormationSnapshot scalarFormation;
+    PhaseModelFormationSnapshot effectFormation;
+    PhaseModelFormationSnapshot completionFormation;
     uint64_t enqueueHostNs{};
     uint64_t prepareStartHostNs{};
     uint64_t prepareEndHostNs{};
@@ -690,6 +710,30 @@ inline uint64_t phaseUnifiedStrictSnapshotSignature(PhaseUnifiedEvent const& eve
         add(candidate->legal ? 1U : 0U);
         addIds(candidate->requestIds);
     }
+    return result;
+}
+
+//! Pair one immutable pre-branch snapshot with the exact mechanism dispatch.
+//! Candidate IDs already cover phase-local request and stable-slot row order;
+//! this function additionally covers the outstanding transition and requested
+//! launch semantics that must be identical in a production replay.
+inline uint64_t phaseUnifiedDispatchSignature(PhaseUnifiedEvent const& event)
+{
+    constexpr uint64_t kFNV_OFFSET = 14695981039346656037ULL;
+    constexpr uint64_t kFNV_PRIME = 1099511628211ULL;
+    uint64_t result{kFNV_OFFSET};
+    auto add = [&](uint64_t value) {
+        result ^= value;
+        result *= kFNV_PRIME;
+    };
+    add(event.strictSnapshotSignature);
+    add(event.selectedActionId);
+    add(event.incrementalActionId);
+    add(static_cast<uint8_t>(event.actionKind));
+    add(static_cast<uint8_t>(event.requestedDirection));
+    add(static_cast<uint8_t>(event.dispatchMode));
+    add(static_cast<uint8_t>(event.outstandingBefore));
+    add(static_cast<uint8_t>(event.plannedOutstanding));
     return result;
 }
 

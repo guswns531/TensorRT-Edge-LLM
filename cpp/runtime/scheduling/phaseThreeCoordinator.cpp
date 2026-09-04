@@ -329,6 +329,68 @@ PhaseTransitionReplaySnapshot transitionReplaySnapshot(PhaseFrozenReplayResult c
     }
     return result;
 }
+
+PhaseModelFormationSnapshot modelFormationSnapshot(
+    PhaseFormationOracleResult const& result, std::vector<PhaseGlobalActionCandidate> const& candidates) noexcept
+{
+    PhaseModelFormationSnapshot snapshot;
+    snapshot.evaluated = true;
+    if (!result.selectedAction.has_value() || *result.selectedAction >= result.sequences.size()
+        || *result.selectedAction >= candidates.size())
+    {
+        return snapshot;
+    }
+    PhaseFormationSequence const& sequence = result.sequences[*result.selectedAction];
+    if (!sequence.feasible || !std::isfinite(sequence.makespanUs))
+    {
+        return snapshot;
+    }
+    snapshot.valid = true;
+    snapshot.selectedActionId = candidates[*result.selectedAction].candidateId;
+    snapshot.selectedHorizonUs = sequence.makespanUs;
+    snapshot.selectedDecodeViolationUs = sequence.decodeServiceViolationUs;
+    snapshot.selectedProtectedViolationUs = sequence.protectedViolationUs;
+    return snapshot;
+}
+
+void applyEffectFormationEstimate(PhaseGlobalActionCandidate& candidate) noexcept
+{
+    phaseRestoreScalarCompletionPolicy(candidate);
+    if (!candidate.contextualEffectValid || !candidate.contextualEffect.ready() || candidate.referenceWorkUs <= 0.0)
+    {
+        return;
+    }
+    candidate.decisionCostKnown = true;
+    candidate.decisionMakespanUs = phaseContextualDecisionMakespanUs(
+        candidate.referenceWorkUs, candidate.contextualEffect.compression.lowerConfidenceBound);
+}
+
+void applyCompletionFormationEstimate(PhaseGlobalActionCandidate& candidate) noexcept
+{
+    phaseRestoreScalarCompletionPolicy(candidate);
+    if (!candidate.contextualCompletion.ready)
+    {
+        return;
+    }
+    PhaseContextualPdFeatures const* features{};
+    if ((candidate.key.kind == PhaseGlobalActionKind::kEncoderPrefill
+            || candidate.key.kind == PhaseGlobalActionKind::kEncoderDecode)
+        && candidate.contextualEncoderCompletionFeatureValid)
+    {
+        features = &candidate.contextualEncoderCompletionFeatures;
+    }
+    else if (candidate.contextualCompletionFeatureValid)
+    {
+        features = &candidate.contextualCompletionFeatures;
+    }
+    if (features == nullptr)
+    {
+        return;
+    }
+    candidate.decisionCostKnown = true;
+    candidate.decisionMakespanUs
+        = phaseContextualCompletionDecisionMakespanUs(candidate.contextualCompletion, *features);
+}
 } // namespace
 
 std::vector<size_t> phaseEncoderCalibrationBatchSizes(
@@ -1727,6 +1789,9 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
             event.scalarSelectedActionId = scalarFrontier[*scalarDecision.selectedIndex].candidateId;
         }
     }
+    event.scalarFormation = mLastScalarFormation;
+    event.effectFormation = mLastEffectFormation;
+    event.completionFormation = mLastCompletionFormation;
     event.snapshotSignature = phaseUnifiedSnapshotSignature(event);
     event.scalarPolicyStateSignature = phaseUnifiedScalarPolicyStateSignature(event);
     if (mUnifiedDetailedDecisionSnapshots && candidateFrontier != nullptr)
@@ -1973,6 +2038,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         }
     }
     event.strictSnapshotSignature = phaseUnifiedStrictSnapshotSignature(event);
+    event.dispatchSignature = phaseUnifiedDispatchSignature(event);
     mUnifiedDecisionByPlan[plan.planId] = event;
     emitUnifiedEvent(std::move(event));
 }
@@ -2062,6 +2128,8 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
         {
             completion.decisionId = decision->second.decisionId;
             completion.snapshotId = decision->second.snapshotId;
+            completion.strictSnapshotSignature = decision->second.strictSnapshotSignature;
+            completion.dispatchSignature = decision->second.dispatchSignature;
             completion.actionKind = decision->second.actionKind;
             completion.incrementalActionId = decision->second.incrementalActionId;
             completion.requestedStartSkewPercent = decision->second.requestedStartSkewPercent;
@@ -3564,17 +3632,28 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     mLastGlobalFormationH2Action = PhaseGlobalActionKind::kNone;
     mLastGlobalFormationOracleAction = PhaseGlobalActionKind::kNone;
     mLastGlobalFormationDecodeViolationUs = 0.0;
+    mLastScalarFormation = {};
+    mLastEffectFormation = {};
+    mLastCompletionFormation = {};
     double formationDecodeServiceBudgetUs = std::numeric_limits<double>::infinity();
     bool formationEvaluated{};
     PhaseFormationOracleResult formationOracle;
-    if (mConfig.enableGlobalFormationAwareSelection && !residualAugmentation && pd.has_value()
-        && !encoderBatchIndices.empty())
+    PhaseFormationWork formationTarget;
+    for (PhaseGlobalActionCandidate const& candidate : candidates)
     {
-        // Compare the exact current E and P/D rows over an immutable equal-work
-        // horizon. No future arrival is inferred: a future row can enter this
-        // snapshot only through a concrete, already-outstanding event.
-        PhaseFormationWork const target
-            = {encoderBatchIndices.size(), phaseFormationWork(*pd).prefillRows, phaseFormationWork(*pd).decodeRows};
+        PhaseFormationWork const work = phaseFormationWork(candidate);
+        formationTarget.encoderRows = std::max(formationTarget.encoderRows, work.encoderRows);
+        formationTarget.prefillRows = std::max(formationTarget.prefillRows, work.prefillRows);
+        formationTarget.decodeRows = std::max(formationTarget.decodeRows, work.decodeRows);
+    }
+    size_t const formationActivePhases = static_cast<size_t>(formationTarget.encoderRows > 0U)
+        + static_cast<size_t>(formationTarget.prefillRows > 0U) + static_cast<size_t>(formationTarget.decodeRows > 0U);
+    if (mConfig.enableGlobalFormationAwareSelection && !residualAugmentation && formationActivePhases >= 2U)
+    {
+        // Compare the largest exact phase-local cohorts exposed by the current
+        // mechanism frontier. This now covers ordinary P+D snapshots as well
+        // as E plus P/D; no workload mode or future arrival enters the target.
+        PhaseFormationWork const target = formationTarget;
         for (PhaseGlobalActionCandidate const& candidate : candidates)
         {
             for (PhaseProtectedCompletion const& completion : candidate.protectedCompletions)
@@ -3609,8 +3688,54 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         PhaseFormationSnapshot const snapshot{
             mGlobalSnapshotEpoch + 1U, target, std::move(knownCompletions), formationDecodeServiceBudgetUs};
-        double const referenceWorkUs = encoder.referenceWorkUs + pd->referenceWorkUs;
+        double encoderReferenceUs{};
+        double prefillReferenceUs{};
+        double decodeReferenceUs{};
+        for (PhaseGlobalActionCandidate const& candidate : candidates)
+        {
+            double const reference
+                = candidate.referenceWorkUs > 0.0 ? candidate.referenceWorkUs : candidate.predictedMakespanUs;
+            switch (candidate.key.kind)
+            {
+            case PhaseGlobalActionKind::kEncoder: encoderReferenceUs = std::max(encoderReferenceUs, reference); break;
+            case PhaseGlobalActionKind::kPrefill: prefillReferenceUs = std::max(prefillReferenceUs, reference); break;
+            case PhaseGlobalActionKind::kDecode: decodeReferenceUs = std::max(decodeReferenceUs, reference); break;
+            case PhaseGlobalActionKind::kNone:
+            case PhaseGlobalActionKind::kEncoderPrefill:
+            case PhaseGlobalActionKind::kEncoderDecode:
+            case PhaseGlobalActionKind::kPrefillDecode:
+            case PhaseGlobalActionKind::kWait: break;
+            }
+        }
+        double const referenceWorkUs = std::max(1.0, encoderReferenceUs + prefillReferenceUs + decodeReferenceUs);
         auto const plannerStart = std::chrono::steady_clock::now();
+        std::vector<PhaseGlobalActionCandidate> scalarCandidates = candidates;
+        for (PhaseGlobalActionCandidate& candidate : scalarCandidates)
+        {
+            phaseRestoreScalarCompletionPolicy(candidate);
+        }
+        PhaseFormationOracleResult const scalarOracle
+            = phaseFormationApplyH2(scalarCandidates, snapshot, target, referenceWorkUs);
+        mLastScalarFormation = modelFormationSnapshot(scalarOracle, scalarCandidates);
+
+        std::vector<PhaseGlobalActionCandidate> effectCandidates = candidates;
+        for (PhaseGlobalActionCandidate& candidate : effectCandidates)
+        {
+            applyEffectFormationEstimate(candidate);
+        }
+        PhaseFormationOracleResult const effectOracle
+            = phaseFormationApplyH2(effectCandidates, snapshot, target, referenceWorkUs);
+        mLastEffectFormation = modelFormationSnapshot(effectOracle, effectCandidates);
+
+        std::vector<PhaseGlobalActionCandidate> completionCandidates = candidates;
+        for (PhaseGlobalActionCandidate& candidate : completionCandidates)
+        {
+            applyCompletionFormationEstimate(candidate);
+        }
+        PhaseFormationOracleResult const completionOracle
+            = phaseFormationApplyH2(completionCandidates, snapshot, target, referenceWorkUs);
+        mLastCompletionFormation = modelFormationSnapshot(completionOracle, completionCandidates);
+
         formationOracle = phaseFormationApplyH2(candidates, snapshot, target, referenceWorkUs);
         mLastGlobalFormationPlannerUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - plannerStart).count();

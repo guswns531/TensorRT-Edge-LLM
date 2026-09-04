@@ -207,5 +207,31 @@ TEST(PhaseUnifiedEventTest, StrictSnapshotSignatureIncludesOwnershipAndExactCand
     EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
 }
 
+TEST(PhaseUnifiedEventTest, DispatchSignatureSeparatesBranchesFromOneStrictSnapshot)
+{
+    PhaseUnifiedEvent left;
+    left.strictSnapshotSignature = 41U;
+    left.selectedActionId = 7U;
+    left.incrementalActionId = 11U;
+    left.actionKind = PhaseGlobalActionKind::kPrefillDecode;
+    left.requestedDirection = PhaseUnifiedActionDirection::kPrefillToDecode;
+    left.dispatchMode = PhaseUnifiedDispatchMode::kCoLaunch;
+    left.outstandingBefore = PhaseExecutionSet::kNone;
+    left.plannedOutstanding = PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode;
+
+    PhaseUnifiedEvent right = left;
+    EXPECT_EQ(phaseUnifiedDispatchSignature(left), phaseUnifiedDispatchSignature(right));
+
+    ++right.selectedActionId;
+    EXPECT_NE(phaseUnifiedDispatchSignature(left), phaseUnifiedDispatchSignature(right));
+    right = left;
+    right.requestedDirection = PhaseUnifiedActionDirection::kDecodeToPrefill;
+    EXPECT_NE(phaseUnifiedDispatchSignature(left), phaseUnifiedDispatchSignature(right));
+    right = left;
+    right.outstandingBefore = PhaseExecutionSet::kPrefill;
+    right.dispatchMode = PhaseUnifiedDispatchMode::kResidualAugmentation;
+    EXPECT_NE(phaseUnifiedDispatchSignature(left), phaseUnifiedDispatchSignature(right));
+}
+
 } // namespace
 } // namespace trt_edgellm::rt

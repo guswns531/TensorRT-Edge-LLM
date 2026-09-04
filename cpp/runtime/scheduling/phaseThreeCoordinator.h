@@ -893,6 +893,9 @@ private:
     PhaseGlobalActionKind mLastGlobalFormationH2Action{PhaseGlobalActionKind::kNone};
     PhaseGlobalActionKind mLastGlobalFormationOracleAction{PhaseGlobalActionKind::kNone};
     double mLastGlobalFormationDecodeViolationUs{};
+    PhaseModelFormationSnapshot mLastScalarFormation;
+    PhaseModelFormationSnapshot mLastEffectFormation;
+    PhaseModelFormationSnapshot mLastCompletionFormation;
     bool mGlobalEncoderArrivalWaitDeferred{};
     std::chrono::steady_clock::time_point mLastVisionArrival;
     double mVisionInterarrivalEwmaUs{};

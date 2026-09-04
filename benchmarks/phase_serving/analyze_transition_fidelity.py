@@ -104,6 +104,45 @@ def _new_physics_stats() -> dict[str, Any]:
     }
 
 
+def _new_formation_stats() -> dict[str, Any]:
+    return {
+        model: {
+            "evaluated": 0,
+            "valid": 0,
+            "selected_action_ids": [],
+            "horizons_us": [],
+            "agreements_with_scalar": 0,
+            "common_with_scalar": 0,
+        }
+        for model in MODELS
+    }
+
+
+def _finalize_formation(stats: dict[str, Any]) -> dict[str, Any]:
+    result = {}
+    scalar = stats["scalar"]
+    for model, values in stats.items():
+        common = int(values["common_with_scalar"])
+        result[model] = {
+            "evaluated":
+            int(values["evaluated"]),
+            "valid":
+            int(values["valid"]),
+            "coverage": (values["valid"] /
+                         values["evaluated"] if values["evaluated"] else 0.0),
+            "agreement_with_scalar":
+            (values["agreements_with_scalar"] / common if common else 0.0),
+            "common_with_scalar":
+            common,
+            "selected_horizon_mean_us":
+            _mean(values["horizons_us"]),
+            "distinct_selected_actions":
+            len(set(values["selected_action_ids"])),
+        }
+    result["scalar_valid"] = int(scalar["valid"])
+    return result
+
+
 def _finalize_physics(stats: dict[str, Any], samples: int,
                       minimum_samples: int, minimum_sign_agreement: float,
                       maximum_false_safe: int) -> dict[str, Any]:
@@ -171,6 +210,13 @@ def _analyze_paths(paths: list[Path], minimum_samples: int,
                                dict[str,
                                     Any]] = defaultdict(_new_physics_stats)
     physics_samples = 0
+    formation = _new_formation_stats()
+    dispatch_signatures = {
+        "decisions_with_signature": 0,
+        "completions_with_signature": 0,
+        "matched": 0,
+        "mismatched": 0,
+    }
     samples_by_direction = defaultdict(int)
     rejected = defaultdict(int)
 
@@ -185,6 +231,28 @@ def _analyze_paths(paths: list[Path], minimum_samples: int,
             decisions[decision_id] = event
             frozen_valid += int(
                 bool(event.get("frozen_transition_snapshot_valid", False)))
+            dispatch_signatures["decisions_with_signature"] += int(
+                int(event.get("dispatch_signature", 0)) > 0)
+            scalar_formation = event.get("scalar_formation", {})
+            scalar_valid = bool(scalar_formation.get("evaluated")) and bool(
+                scalar_formation.get("valid"))
+            scalar_action = int(scalar_formation.get("selected_action_id", 0))
+            for model in MODELS:
+                model_formation = event.get(f"{model}_formation", {})
+                values = formation[model]
+                evaluated = bool(model_formation.get("evaluated"))
+                valid = evaluated and bool(model_formation.get("valid"))
+                values["evaluated"] += int(evaluated)
+                values["valid"] += int(valid)
+                if valid:
+                    action = int(model_formation.get("selected_action_id", 0))
+                    values["selected_action_ids"].append(action)
+                    values["horizons_us"].append(
+                        float(model_formation.get("selected_horizon_us", 0.0)))
+                    if scalar_valid:
+                        values["common_with_scalar"] += 1
+                        values["agreements_with_scalar"] += int(
+                            action == scalar_action)
             for candidate in event.get("candidates", []):
                 candidates_total += 1
                 for model in MODELS:
@@ -218,6 +286,18 @@ def _analyze_paths(paths: list[Path], minimum_samples: int,
                 rejected["action_fidelity"] += 1
                 continue
             decision = decisions.get(int(completion.get("decision_id", 0)))
+            completion_dispatch_signature = int(
+                completion.get("dispatch_signature", 0))
+            if completion_dispatch_signature > 0:
+                dispatch_signatures["completions_with_signature"] += 1
+                decision_dispatch_signature = int(
+                    decision.get("dispatch_signature", 0)) if decision else 0
+                matched = decision_dispatch_signature == completion_dispatch_signature
+                dispatch_signatures["matched"] += int(matched)
+                dispatch_signatures["mismatched"] += int(not matched)
+                if not matched:
+                    rejected["dispatch_signature"] += 1
+                    continue
             candidate = _selected_candidate(decision) if decision else None
             if candidate is None:
                 rejected["candidate"] += 1
@@ -326,6 +406,10 @@ def _analyze_paths(paths: list[Path], minimum_samples: int,
         },
         "transition_disagreement":
         rendered_comparisons,
+        "formation":
+        _finalize_formation(formation),
+        "dispatch_signatures":
+        dispatch_signatures,
         "selected_physics":
         _finalize_physics(physics, physics_samples, minimum_samples,
                           minimum_sign_agreement, maximum_false_safe),
