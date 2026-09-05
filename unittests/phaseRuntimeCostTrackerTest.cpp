@@ -236,6 +236,28 @@ TEST(PhaseContextualPairModelTest, ProjectsEncoderPairsIntoContinuousFeatures)
     EXPECT_NE(encoderPrefill, encoderDecode);
 }
 
+TEST(PhaseContextualPairModelTest, BatchFeaturesUseRuntimeCapacities)
+{
+    PhaseContextualPdInput halfFull{4000.0, 8000.0, 100000.0, 4, 32, 128, 1, 2, PhaseExecutionVariant::kEager};
+    halfFull.prefillBatchCapacity = 8;
+    halfFull.decodeBatchCapacity = 64;
+    PhaseContextualPdInput full = halfFull;
+    full.prefillBatchSize = 8;
+    full.decodeBatchSize = 64;
+    PhaseContextualPdInput widerEngine = full;
+    widerEngine.prefillBatchCapacity = 16;
+    widerEngine.decodeBatchCapacity = 128;
+
+    PhaseContextualPdFeatures const halfFeatures = phaseContextualPdFeatures(halfFull);
+    PhaseContextualPdFeatures const fullFeatures = phaseContextualPdFeatures(full);
+    PhaseContextualPdFeatures const widerFeatures = phaseContextualPdFeatures(widerEngine);
+
+    EXPECT_LT(halfFeatures[5], fullFeatures[5]);
+    EXPECT_LT(halfFeatures[6], fullFeatures[6]);
+    EXPECT_LT(widerFeatures[5], fullFeatures[5]);
+    EXPECT_LT(widerFeatures[6], fullFeatures[6]);
+}
+
 TEST(PhaseContextualPairModelTest, CompletionV2AddsResidualStateWithoutChangingAdvantageFeatures)
 {
     PhaseContextualPairInput early{4000.0, 8000.0, 100000.0, 2, 32, 8, 64, 128, 128, 1, 2,

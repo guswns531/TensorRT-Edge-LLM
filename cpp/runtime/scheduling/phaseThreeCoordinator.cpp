@@ -1751,6 +1751,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         snapshot.completionAuthorityApplied = source.completionAuthorityApplied;
         snapshot.scalarDecisionCostKnown = source.scalarDecisionCostKnown;
         snapshot.activeDecisionCostKnown = source.activeDecisionCostKnown;
+        snapshot.contextualScalarAuthorityApplied = source.contextualScalarAuthorityApplied;
         snapshot.scalarDecisionMakespanUs = source.scalarDecisionMakespanUs;
         snapshot.activeDecisionMakespanUs = source.activeDecisionMakespanUs;
         snapshot.completionAggregateBlendWeight = source.completionAggregateBlendWeight;
@@ -1788,6 +1789,18 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         {
             event.scalarSelectedActionId = scalarFrontier[*scalarDecision.selectedIndex].candidateId;
         }
+        std::vector<PhaseGlobalActionCandidate> nonContextualFrontier = *candidateFrontier;
+        for (PhaseGlobalActionCandidate& fallback : nonContextualFrontier)
+        {
+            phaseRestoreNonContextualPolicy(fallback);
+        }
+        PhaseGlobalDecision const fallbackDecision = mGlobalScheduler.select(nonContextualFrontier);
+        if (fallbackDecision.selectedIndex.has_value())
+        {
+            event.nonContextualSelectedActionId = nonContextualFrontier[*fallbackDecision.selectedIndex].candidateId;
+        }
+        event.contextualSuccessorGuardEvaluated = mLastContextualSuccessorGuardEvaluated;
+        event.contextualSuccessorGuardApplied = mLastContextualSuccessorGuardApplied;
     }
     event.scalarFormation = mLastScalarFormation;
     event.effectFormation = mLastEffectFormation;
@@ -2690,12 +2703,14 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         externalPrefillLineage);
     if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
     {
-        PhaseContextualPdInput const contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
+        PhaseContextualPdInput contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
             protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
             prefill.key.primaryContextBucket, decode.key.primaryContextBucket, overlap.key.executionVariant, true,
             overlap.key.residualAnchor, elapsedUs, incumbentReferenceUs,
             incumbentReferenceUs > 0.0 ? elapsedUs / incumbentReferenceUs : -1.0,
             addDecode ? PhaseExecutionSet::kPrefill : PhaseExecutionSet::kDecode};
+        contextualInput.prefillBatchCapacity = mConfig.contextualPrefillBatchCapacity;
+        contextualInput.decodeBatchCapacity = mConfig.contextualDecodeBatchCapacity;
         overlap.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
         overlap.contextualPdFeatureValid = true;
         overlap.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
@@ -3484,13 +3499,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPairConfig(pairKind).mode;
         if (contextualMode != PhaseContextualPdMode::kDisabled)
         {
-            constexpr int32_t kPrefillBatchCapacity = 8;
-            constexpr int32_t kDecodeBatchCapacity = 64;
             constexpr int32_t kChunkQuantum = 128;
             int32_t const encoderBatchCapacity = static_cast<int32_t>(std::min<size_t>(
                 mConfig.maxEncoderBatchSize, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
-            int32_t const phaseBatchCapacity
-                = kind == PhaseGlobalActionKind::kEncoderPrefill ? kPrefillBatchCapacity : kDecodeBatchCapacity;
+            int32_t const phaseBatchCapacity = kind == PhaseGlobalActionKind::kEncoderPrefill
+                ? mConfig.contextualPrefillBatchCapacity
+                : mConfig.contextualDecodeBatchCapacity;
             double const incumbentReferenceUs = residualAugmentation && mActiveGlobalPdExecution.has_value()
                 ? std::max(mActiveGlobalPdExecution->candidate.predictedMakespanUs,
                       mActiveGlobalPdExecution->candidate.predictedBlockingUs)
@@ -3538,6 +3552,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
             {
                 overlap.decisionCostKnown = true;
+                overlap.contextualScalarAuthorityApplied = true;
                 overlap.decisionMakespanUs = phaseContextualDecisionMakespanUs(
                     overlap.contextualEncoderPairReferenceWorkUs, contextual.lowerConfidenceBound);
             }
@@ -3624,6 +3639,20 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     PhaseGlobalDecision const myopicDecision = mGlobalScheduler.select(candidates);
+    std::optional<size_t> contextualFallbackIndex;
+    if (mConfig.enableContextualSuccessorGuard)
+    {
+        std::vector<PhaseGlobalActionCandidate> fallbackCandidates = candidates;
+        for (PhaseGlobalActionCandidate& fallbackCandidate : fallbackCandidates)
+        {
+            phaseRestoreNonContextualPolicy(fallbackCandidate);
+        }
+        PhaseGlobalDecision const fallbackDecision = mGlobalScheduler.select(fallbackCandidates);
+        contextualFallbackIndex = fallbackDecision.selectedIndex;
+    }
+    bool const contextualFallbackDisagrees = myopicDecision.selectedIndex.has_value()
+        && contextualFallbackIndex.has_value()
+        && candidates[*myopicDecision.selectedIndex].candidateId != candidates[*contextualFallbackIndex].candidateId;
     mLastGlobalFormationPredictedRows = 0U;
     mLastGlobalFormationHorizonUs = 0.0;
     mLastGlobalFormationCostGapUs = 0.0;
@@ -3635,6 +3664,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     mLastScalarFormation = {};
     mLastEffectFormation = {};
     mLastCompletionFormation = {};
+    mLastContextualSuccessorGuardEvaluated = false;
+    mLastContextualSuccessorGuardApplied = false;
     double formationDecodeServiceBudgetUs = std::numeric_limits<double>::infinity();
     bool formationEvaluated{};
     PhaseFormationOracleResult formationOracle;
@@ -3648,7 +3679,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     size_t const formationActivePhases = static_cast<size_t>(formationTarget.encoderRows > 0U)
         + static_cast<size_t>(formationTarget.prefillRows > 0U) + static_cast<size_t>(formationTarget.decodeRows > 0U);
-    if (mConfig.enableGlobalFormationAwareSelection && !residualAugmentation && formationActivePhases >= 2U)
+    bool const formationSelectionActive = mConfig.enableGlobalFormationAwareSelection;
+    bool const formationEvaluationEnabled = formationSelectionActive || contextualFallbackDisagrees;
+    if (formationEvaluationEnabled && !residualAugmentation && formationActivePhases >= 2U)
     {
         // Compare the largest exact phase-local cohorts exposed by the current
         // mechanism frontier. This now covers ordinary P+D snapshots as well
@@ -3736,7 +3769,15 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             = phaseFormationApplyH2(completionCandidates, snapshot, target, referenceWorkUs);
         mLastCompletionFormation = modelFormationSnapshot(completionOracle, completionCandidates);
 
-        formationOracle = phaseFormationApplyH2(candidates, snapshot, target, referenceWorkUs);
+        if (formationSelectionActive)
+        {
+            formationOracle = phaseFormationApplyH2(candidates, snapshot, target, referenceWorkUs);
+        }
+        else
+        {
+            std::vector<PhaseGlobalActionCandidate> guardCandidates = candidates;
+            formationOracle = phaseFormationApplyH2(guardCandidates, snapshot, target, referenceWorkUs);
+        }
         mLastGlobalFormationPlannerUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - plannerStart).count();
         mLastGlobalFormationSnapshotId = phaseFormationSnapshotId(snapshot);
@@ -3751,7 +3792,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     ++mGlobalDecisionSequence;
     PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
-    std::optional<size_t> const h2SelectedIndex = decision.selectedIndex;
+    std::optional<size_t> const h2SelectedIndex
+        = formationSelectionActive ? decision.selectedIndex : formationOracle.selectedAction;
     if (formationEvaluated && h2SelectedIndex.has_value())
     {
         mLastGlobalFormationH2Action = candidates[*h2SelectedIndex].key.kind;
@@ -3771,7 +3813,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     // H=2 is allowed to change production ordering only when the same robust
     // frontier predicts a strict improvement over the myopic action. Equal
     // violation/equal-horizon ties preserve stable mechanism ordering.
-    if (formationEvaluated && selectedIndex.has_value() && myopicDecision.selectedIndex.has_value()
+    if (formationSelectionActive && formationEvaluated && selectedIndex.has_value()
+        && myopicDecision.selectedIndex.has_value()
         && candidates[*selectedIndex].candidateId != candidates[*myopicDecision.selectedIndex].candidateId
         && !phaseFormationShouldReplaceMyopic(formationOracle, *myopicDecision.selectedIndex, *selectedIndex))
     {
@@ -3782,6 +3825,16 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PhaseGlobalActionCandidate const& myopic = candidates[*myopicDecision.selectedIndex];
         PhaseGlobalActionCandidate const& formationAware = candidates[*selectedIndex];
         mGlobalFormationSelectionChanges += myopic.candidateId != formationAware.candidateId ? 1U : 0U;
+    }
+    if (mConfig.enableContextualSuccessorGuard && contextualFallbackDisagrees && formationEvaluated
+        && selectedIndex.has_value() && contextualFallbackIndex.has_value())
+    {
+        mLastContextualSuccessorGuardEvaluated = true;
+        if (phaseFormationShouldReplaceMyopic(formationOracle, *selectedIndex, *contextualFallbackIndex))
+        {
+            selectedIndex = contextualFallbackIndex;
+            mLastContextualSuccessorGuardApplied = true;
+        }
     }
     if (mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {

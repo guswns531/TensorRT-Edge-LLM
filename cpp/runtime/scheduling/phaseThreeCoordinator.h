@@ -127,6 +127,11 @@ struct PhaseThreeCoordinatorConfig
     //! The immutable transition uses only current ready rows and concrete,
     //! already-outstanding completion events. It never predicts future arrivals.
     bool enableGlobalFormationAwareSelection{};
+    //! Let bounded successor reasoning veto a contextual scalar action only
+    //! when the identical non-contextual frontier has strictly lower robust
+    //! two-action cost. Unlike formation-aware selection this cannot promote
+    //! a learned action and therefore preserves the conservative fallback.
+    bool enableContextualSuccessorGuard{};
     //! Number of actual dispatches attributed after an H=2/myopic selection
     //! change. The selected action is the first dispatch in the horizon.
     size_t globalFormationRealizedDispatches{4U};
@@ -138,6 +143,10 @@ struct PhaseThreeCoordinatorConfig
     size_t maxEncodedBytes{};
     //! Maximum logical requests coalesced into one vision encoder execution. One preserves legacy behavior.
     size_t maxEncoderBatchSize{1U};
+    //! Physical P/D engine capacities used only to normalize continuous
+    //! contextual features. They are capabilities, not policy batch targets.
+    int32_t contextualPrefillBatchCapacity{8};
+    int32_t contextualDecodeBatchCapacity{64};
     //! Optional media-item cap for a coalesced encoder batch. Zero disables this guard.
     size_t maxEncoderMediaItems{};
     //! Optional raw image/video input byte cap for one encoder batch. Zero disables this guard.
@@ -896,6 +905,8 @@ private:
     PhaseModelFormationSnapshot mLastScalarFormation;
     PhaseModelFormationSnapshot mLastEffectFormation;
     PhaseModelFormationSnapshot mLastCompletionFormation;
+    bool mLastContextualSuccessorGuardEvaluated{};
+    bool mLastContextualSuccessorGuardApplied{};
     bool mGlobalEncoderArrivalWaitDeferred{};
     std::chrono::steady_clock::time_point mLastVisionArrival;
     double mVisionInterarrivalEwmaUs{};

@@ -105,11 +105,9 @@ PhaseContextualPairDirection phaseContextualPairDirection(
 
 PhaseContextualPdFeatures phaseContextualPdFeatures(PhaseContextualPdInput const& input) noexcept
 {
-    constexpr int32_t kPrefillBatchCapacity = 8;
-    constexpr int32_t kDecodeBatchCapacity = 64;
     constexpr int32_t kChunkQuantum = 128;
     return phaseContextualPairFeatures({input.prefillUs, input.decodeUs, input.minimumSlackUs, input.prefillBatchSize,
-        input.decodeBatchSize, kPrefillBatchCapacity, kDecodeBatchCapacity, input.chunkLength, kChunkQuantum,
+        input.decodeBatchSize, input.prefillBatchCapacity, input.decodeBatchCapacity, input.chunkLength, kChunkQuantum,
         input.prefillContextBucket, input.decodeContextBucket, input.executionVariant, input.residualAugmentation,
         input.residualAnchor, input.incumbentDispatchAgeUs, input.incumbentReferenceUs,
         input.requestedStartSkewFraction, input.outstandingBefore});
@@ -117,12 +115,10 @@ PhaseContextualPdFeatures phaseContextualPdFeatures(PhaseContextualPdInput const
 
 PhaseContextualPdFeatures phaseContextualPdCompletionFeatures(PhaseContextualPdInput const& input) noexcept
 {
-    constexpr int32_t kPrefillBatchCapacity = 8;
-    constexpr int32_t kDecodeBatchCapacity = 64;
     constexpr int32_t kChunkQuantum = 128;
     return phaseContextualCompletionFeatures({input.prefillUs, input.decodeUs, input.minimumSlackUs,
-        input.prefillBatchSize, input.decodeBatchSize, kPrefillBatchCapacity, kDecodeBatchCapacity, input.chunkLength,
-        kChunkQuantum, input.prefillContextBucket, input.decodeContextBucket, input.executionVariant,
+        input.prefillBatchSize, input.decodeBatchSize, input.prefillBatchCapacity, input.decodeBatchCapacity,
+        input.chunkLength, kChunkQuantum, input.prefillContextBucket, input.decodeContextBucket, input.executionVariant,
         input.residualAugmentation, input.residualAnchor, input.incumbentDispatchAgeUs, input.incumbentReferenceUs,
         input.requestedStartSkewFraction, input.outstandingBefore});
 }
@@ -139,11 +135,14 @@ PhaseContextualPdFeatures phaseContextualPairFeatures(PhaseContextualPairInput c
     bool const secondaryGraph = phaseExecutionVariantUsesSecondaryGraph(input.executionVariant);
     double const primaryBatchDenominator = std::log1p(std::max(1, input.primaryBatchCapacity));
     double const secondaryBatchDenominator = std::log1p(std::max(1, input.secondaryBatchCapacity));
+    double const primaryBatchFill
+        = clampFinite(std::log1p(std::max(0, input.primaryBatchSize)) / primaryBatchDenominator, 0.0, 2.0);
+    double const secondaryBatchFill
+        = clampFinite(std::log1p(std::max(0, input.secondaryBatchSize)) / secondaryBatchDenominator, 0.0, 2.0);
     double const workQuantum = static_cast<double>(std::max(1, input.workQuantum));
     return {1.0, clampFinite(std::log1p(primaryUs / 1000.0) / 4.0, 0.0, 2.0),
         clampFinite(std::log1p(secondaryUs / 1000.0) / 4.0, 0.0, 2.0), primaryUs / serialUs, minimumUs / maximumUs,
-        clampFinite(std::log1p(std::max(0, input.primaryBatchSize)) / primaryBatchDenominator, 0.0, 2.0),
-        clampFinite(std::log1p(std::max(0, input.secondaryBatchSize)) / secondaryBatchDenominator, 0.0, 2.0),
+        primaryBatchFill, secondaryBatchFill,
         clampFinite(static_cast<double>(std::max(0, input.workSize)) / workQuantum, 0.0, 4.0),
         clampFinite(static_cast<double>(std::max(0, input.primaryContextBucket)) / 4.0, 0.0, 4.0),
         clampFinite(static_cast<double>(std::max(0, input.secondaryContextBucket)) / 4.0, 0.0, 4.0), slackRatio / 8.0,
@@ -162,13 +161,15 @@ PhaseContextualPdFeatures phaseContextualCompletionFeatures(PhaseContextualPairI
         = input.incumbentReferenceUs > 0.0 ? clampFinite(incumbentAgeUs / input.incumbentReferenceUs, 0.0, 2.0) : 0.0;
     double const primaryBatchDenominator = std::log1p(std::max(1, input.primaryBatchCapacity));
     double const secondaryBatchDenominator = std::log1p(std::max(1, input.secondaryBatchCapacity));
+    double const primaryBatchFill
+        = clampFinite(std::log1p(std::max(0, input.primaryBatchSize)) / primaryBatchDenominator, 0.0, 2.0);
+    double const secondaryBatchFill
+        = clampFinite(std::log1p(std::max(0, input.secondaryBatchSize)) / secondaryBatchDenominator, 0.0, 2.0);
     double const workQuantum = static_cast<double>(std::max(1, input.workQuantum));
     double const slackRatio = clampFinite(input.minimumSlackUs / serialUs, -4.0, 8.0);
     return {1.0, clampFinite(std::log1p(primaryUs / 1000.0) / 4.0, 0.0, 2.0),
-        clampFinite(std::log1p(secondaryUs / 1000.0) / 4.0, 0.0, 2.0), primaryUs / serialUs,
-        clampFinite(std::log1p(std::max(0, input.primaryBatchSize)) / primaryBatchDenominator, 0.0, 2.0),
-        clampFinite(std::log1p(std::max(0, input.secondaryBatchSize)) / secondaryBatchDenominator, 0.0, 2.0),
-        clampFinite(static_cast<double>(std::max(0, input.workSize)) / workQuantum, 0.0, 4.0),
+        clampFinite(std::log1p(secondaryUs / 1000.0) / 4.0, 0.0, 2.0), primaryUs / serialUs, primaryBatchFill,
+        secondaryBatchFill, clampFinite(static_cast<double>(std::max(0, input.workSize)) / workQuantum, 0.0, 4.0),
         clampFinite(
             static_cast<double>(std::max(input.primaryContextBucket, input.secondaryContextBucket)) / 4.0, 0.0, 4.0),
         slackRatio / 8.0, input.residualAugmentation ? 1.0 : 0.0,

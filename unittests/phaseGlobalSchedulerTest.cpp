@@ -87,6 +87,28 @@ TEST(PhaseGlobalSchedulerTest, RestoresSameFrontierScalarCompletionCounterfactua
     EXPECT_DOUBLE_EQ(overlap.protectedCompletions.front().predictedCompletionUs, 5000.0);
 }
 
+TEST(PhaseGlobalSchedulerTest, RestoresNonContextualFallbackWithoutDroppingExactCosts)
+{
+    PhaseGlobalActionCandidate learned = candidate(PhaseGlobalActionKind::kPrefillDecode, 5000.0, 4000.0, 10000.0);
+    learned.decisionCostKnown = true;
+    learned.decisionMakespanUs = 3000.0;
+    learned.contextualScalarAuthorityApplied = true;
+    phaseCaptureScalarCompletionPolicy(learned);
+    learned.completionAuthorityApplied = true;
+    learned.decisionMakespanUs = 2500.0;
+
+    phaseRestoreNonContextualPolicy(learned);
+
+    EXPECT_FALSE(learned.decisionCostKnown);
+    EXPECT_DOUBLE_EQ(learned.decisionMakespanUs, 0.0);
+    PhaseGlobalActionCandidate exact = candidate(PhaseGlobalActionKind::kPrefillDecode, 5000.0, 4000.0, 10000.0);
+    exact.decisionCostKnown = true;
+    exact.decisionMakespanUs = 3500.0;
+    phaseRestoreNonContextualPolicy(exact);
+    EXPECT_TRUE(exact.decisionCostKnown);
+    EXPECT_DOUBLE_EQ(exact.decisionMakespanUs, 3500.0);
+}
+
 TEST(PhaseGlobalSchedulerTest, ContextualDecisionCostCannotBypassExactDeadlineProtection)
 {
     PhaseGlobalScheduler scheduler;

@@ -83,6 +83,7 @@ enum class PhasePolicyWarmupMode
 {
     kGraphOnly,
     kGeneric,
+    kPolicyReset,
     kTraceDerived,
     kZeroStart,
 };
@@ -92,8 +93,9 @@ PhasePolicyWarmupMode phasePolicyWarmupMode()
     std::string const value = std::getenv("TRT_EDGELLM_POLICY_WARMUP_MODE") != nullptr
         ? std::getenv("TRT_EDGELLM_POLICY_WARMUP_MODE")
         : "trace_derived";
-    ELLM_CHECK(value == "graph_only" || value == "generic" || value == "trace_derived" || value == "zero_start",
-        "TRT_EDGELLM_POLICY_WARMUP_MODE must be graph_only, generic, trace_derived, or zero_start");
+    ELLM_CHECK(value == "graph_only" || value == "generic" || value == "policy_reset" || value == "trace_derived"
+            || value == "zero_start",
+        "TRT_EDGELLM_POLICY_WARMUP_MODE must be graph_only, generic, policy_reset, trace_derived, or zero_start");
     if (value == "graph_only")
     {
         return PhasePolicyWarmupMode::kGraphOnly;
@@ -101,6 +103,10 @@ PhasePolicyWarmupMode phasePolicyWarmupMode()
     if (value == "generic")
     {
         return PhasePolicyWarmupMode::kGeneric;
+    }
+    if (value == "policy_reset")
+    {
+        return PhasePolicyWarmupMode::kPolicyReset;
     }
     if (value == "zero_start")
     {
@@ -115,6 +121,7 @@ char const* phasePolicyWarmupModeName(PhasePolicyWarmupMode mode) noexcept
     {
     case PhasePolicyWarmupMode::kGraphOnly: return "graph_only";
     case PhasePolicyWarmupMode::kGeneric: return "generic";
+    case PhasePolicyWarmupMode::kPolicyReset: return "policy_reset";
     case PhasePolicyWarmupMode::kTraceDerived: return "trace_derived";
     case PhasePolicyWarmupMode::kZeroStart: return "zero_start";
     }
@@ -2351,6 +2358,10 @@ int main(int argc, char** argv)
                 semanticCoordinator.scheduler().resetExecutionCostHistory();
                 semanticCoordinator.scheduler().resetPolicyPosterior();
             }
+            else if (policyWarmupMode == PhasePolicyWarmupMode::kPolicyReset)
+            {
+                semanticCoordinator.scheduler().resetPolicyPosterior();
+            }
             if (serverConfig.enableCudaGraphs && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") == nullptr)
             {
                 // Retain the primed graph cache, but do not synchronously capture
@@ -2487,10 +2498,15 @@ int main(int argc, char** argv)
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
+                threePhaseConfig.contextualPrefillBatchCapacity = semanticSchedulerConfig.maxPrefillBatchSize;
+                threePhaseConfig.contextualDecodeBatchCapacity = semanticSchedulerConfig.maxDecodeBatchSize;
                 threePhaseConfig.enableGlobalFormationAwareSelection
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE") != nullptr
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_FORMATION_AWARE") == nullptr;
+                threePhaseConfig.enableContextualSuccessorGuard
+                    = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
+                    && std::getenv("TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_FORMATION_REALIZED_DISPATCHES"))
                 {
                     threePhaseConfig.globalFormationRealizedDispatches = static_cast<size_t>(std::stoull(value));
@@ -2901,6 +2917,10 @@ int main(int argc, char** argv)
                         || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
                     {
                         semanticCoordinator.scheduler().resetExecutionCostHistory();
+                        semanticCoordinator.scheduler().resetPolicyPosterior();
+                    }
+                    else if (policyWarmupMode == PhasePolicyWarmupMode::kPolicyReset)
+                    {
                         semanticCoordinator.scheduler().resetPolicyPosterior();
                     }
                     LOG_INFO(
@@ -3510,6 +3530,10 @@ int main(int argc, char** argv)
                                 || policyWarmupMode == PhasePolicyWarmupMode::kZeroStart)
                             {
                                 semanticCoordinator.scheduler().resetExecutionCostHistory();
+                                semanticCoordinator.scheduler().resetPolicyPosterior();
+                            }
+                            else if (policyWarmupMode == PhasePolicyWarmupMode::kPolicyReset)
+                            {
                                 semanticCoordinator.scheduler().resetPolicyPosterior();
                             }
                             ++measurementEpoch;
@@ -4392,6 +4416,7 @@ int main(int argc, char** argv)
                                 {"completion_authority_applied", candidate.completionAuthorityApplied},
                                 {"scalar_decision_cost_known", candidate.scalarDecisionCostKnown},
                                 {"active_decision_cost_known", candidate.activeDecisionCostKnown},
+                                {"contextual_scalar_authority_applied", candidate.contextualScalarAuthorityApplied},
                                 {"scalar_decision_makespan_us", candidate.scalarDecisionMakespanUs},
                                 {"active_decision_makespan_us", candidate.activeDecisionMakespanUs},
                                 {"completion_aggregate_blend_weight", candidate.completionAggregateBlendWeight},
@@ -4443,6 +4468,9 @@ int main(int argc, char** argv)
                             {"selected_action_id", event.selectedActionId},
                             {"active_h1_selected_action_id", event.activeH1SelectedActionId},
                             {"scalar_h1_selected_action_id", event.scalarSelectedActionId},
+                            {"non_contextual_selected_action_id", event.nonContextualSelectedActionId},
+                            {"contextual_successor_guard_evaluated", event.contextualSuccessorGuardEvaluated},
+                            {"contextual_successor_guard_applied", event.contextualSuccessorGuardApplied},
                             {"scalar_formation", formationJson(event.scalarFormation)},
                             {"effect_formation", formationJson(event.effectFormation)},
                             {"completion_formation", formationJson(event.completionFormation)},

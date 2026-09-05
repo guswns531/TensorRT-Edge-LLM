@@ -126,6 +126,11 @@ struct PhaseGlobalActionCandidate
     //! execution-cost observation.
     bool decisionCostKnown{};
     double decisionMakespanUs{};
+    //! The contextual scalar posterior, rather than an exact execution-cost
+    //! observation, supplied decisionMakespanUs for this candidate. This bit
+    //! permits same-frontier fallback attribution without changing the live
+    //! policy or discarding exact CUDA costs.
+    bool contextualScalarAuthorityApplied{};
     //! Bounded decision-horizon cost. WAIT comparisons use the same future work
     //! on both NOW and WAIT alternatives so dispatching work now is not treated
     //! as if it left no residual work. Zero falls back to the action makespan.
@@ -162,6 +167,19 @@ inline void phaseRestoreScalarCompletionPolicy(PhaseGlobalActionCandidate& candi
     candidate.decisionCostKnown = candidate.scalarDecisionCostKnown;
     candidate.decisionMakespanUs = candidate.scalarDecisionMakespanUs;
     candidate.protectedCompletions = candidate.scalarProtectedCompletions;
+}
+
+//! Remove only contextual scalar authority while retaining exact CUDA cost,
+//! feasibility, SLO, ownership, and row-order state. Completion authority is
+//! restored first because its scalar baseline may itself be contextual.
+inline void phaseRestoreNonContextualPolicy(PhaseGlobalActionCandidate& candidate)
+{
+    phaseRestoreScalarCompletionPolicy(candidate);
+    if (candidate.contextualScalarAuthorityApplied)
+    {
+        candidate.decisionCostKnown = false;
+        candidate.decisionMakespanUs = 0.0;
+    }
 }
 
 //! Return a deterministic identity without changing phase-local row order.

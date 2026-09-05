@@ -2265,10 +2265,12 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             // local P+D head from taking policy authority. Keeping external
             // P out of the feature space made generic text observations
             // unusable precisely when a VLM request reached P+D.
-            PhaseContextualPdInput const contextualInput{overlapPrefill->makespanUs, overlapDecode->makespanUs,
+            PhaseContextualPdInput contextualInput{overlapPrefill->makespanUs, overlapDecode->makespanUs,
                 std::min(prefillSlack, decodeSlack), overlapPrefillRows, overlapDecodeRows, overlapPrefillChunk,
                 overlapKey.primaryContextBucket, overlapKey.secondaryContextBucket, overlapKey.executionVariant,
                 overlapKey.residualAugmentation, overlapKey.residualAnchor};
+            contextualInput.prefillBatchCapacity = mConfig.maxPrefillBatchSize;
+            contextualInput.decodeBatchCapacity = mConfig.maxDecodeBatchSize;
             candidate.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
             candidate.contextualPdFeatureValid = true;
             candidate.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
@@ -2298,6 +2300,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 && phaseContextualPdControlsDecision(producerCriticalPath))
             {
                 candidate.decisionCostKnown = true;
+                candidate.contextualScalarAuthorityApplied = true;
                 candidate.decisionMakespanUs
                     = phaseContextualDecisionMakespanUs(candidate.referenceWorkUs, contextual.lowerConfidenceBound);
             }
@@ -2956,12 +2959,14 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         // runnable. External/VLM rows have already satisfied their E -> P
         // dependency here, and the same completion-vector model can price
         // the remaining P and D work without a workload label.
-        PhaseContextualPdInput const contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
+        PhaseContextualPdInput contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
             protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
             prefill.key.primaryContextBucket, decode.key.primaryContextBucket, overlap.key.executionVariant, true,
             overlap.key.residualAnchor, elapsedUs, std::max(launched.predictedMakespanUs, launched.predictedBlockingUs),
             launched.predictedMakespanUs > 0.0 ? elapsedUs / launched.predictedMakespanUs : -1.0,
             addDecode ? PhaseExecutionSet::kPrefill : PhaseExecutionSet::kDecode};
+        contextualInput.prefillBatchCapacity = mConfig.maxPrefillBatchSize;
+        contextualInput.decodeBatchCapacity = mConfig.maxDecodeBatchSize;
         overlap.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
         overlap.contextualPdFeatureValid = true;
         overlap.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
@@ -2989,6 +2994,7 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
         {
             overlap.decisionCostKnown = true;
+            overlap.contextualScalarAuthorityApplied = true;
             overlap.decisionMakespanUs
                 = phaseContextualDecisionMakespanUs(overlap.referenceWorkUs, contextual.lowerConfidenceBound);
         }

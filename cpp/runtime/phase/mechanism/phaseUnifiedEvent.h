@@ -434,6 +434,7 @@ struct PhaseUnifiedCandidateSnapshot
     bool completionAuthorityApplied{};
     bool scalarDecisionCostKnown{};
     bool activeDecisionCostKnown{};
+    bool contextualScalarAuthorityApplied{};
     double scalarDecisionMakespanUs{};
     double activeDecisionMakespanUs{};
     double completionAggregateBlendWeight{};
@@ -517,6 +518,11 @@ struct PhaseUnifiedEvent
     //! H=1 selector result after restoring completion-sensitive candidate
     //! fields to their scalar values over this exact frontier.
     uint64_t scalarSelectedActionId{};
+    //! H=1 result after removing contextual scalar and completion authority
+    //! from the identical candidate frontier. Exact CUDA costs remain.
+    uint64_t nonContextualSelectedActionId{};
+    bool contextualSuccessorGuardEvaluated{};
+    bool contextualSuccessorGuardApplied{};
     PhaseModelFormationSnapshot scalarFormation;
     PhaseModelFormationSnapshot effectFormation;
     PhaseModelFormationSnapshot completionFormation;

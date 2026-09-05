@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run graph-only/zero/generic/trace-derived policy warmup A/B matrices."""
+"""Run policy-evidence and runtime-lifecycle warmup A/B matrices."""
 
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-MODES = ("graph_only", "zero_start", "generic", "trace_derived")
+MODES = ("graph_only", "zero_start", "generic_reset", "generic",
+         "trace_derived")
 POLICY_VARIANTS = {
     # V0: preserve the common execution substrate but remove contextual
     # generalization and bounded formation reasoning.
@@ -51,6 +52,17 @@ POLICY_VARIANTS = {
         "TRT_EDGELLM_CONTEXTUAL_EP": "active",
         "TRT_EDGELLM_CONTEXTUAL_ED": "active",
         "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "1",
+        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    },
+    # V1 plus a conservative bounded successor veto. The contextual model can
+    # still select an action, but it is rejected when the identical exact-cost
+    # fallback has strictly lower robust two-action regret.
+    "successor_guard": {
+        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
+        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
+        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
+        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "0",
+        "TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD": "1",
         "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
     },
     "pd_only": {
@@ -179,16 +191,27 @@ def prepare_command(entry: dict[str, Any],
                     policy_variant: str = "full_active",
                     backend_environment: tuple[str, ...] = (),
                     client_max_in_flight: int = 0,
-                    capture_phase_telemetry: bool = False) -> list[str]:
+                    capture_phase_telemetry: bool = False,
+                    trace_override: str = "") -> list[str]:
     if policy_variant not in POLICY_VARIANTS:
         raise ValueError(f"unknown policy variant: {policy_variant}")
     command = list(entry["command"])
     _set_option(command, "--output-dir", str(output_dir))
     _set_option(command, "--repeats", str(repeats))
-    _set_option(command, "--policy-warmup-mode", mode)
+    # generic_reset executes the same generic calibration requests as generic,
+    # but policy_reset discards only the contextual policy posterior. Exact
+    # CUDA costs, graphs, TensorRT contexts, allocators, and engine tactics stay
+    # warm, isolating contextual learning from physical/runtime calibration.
+    client_mode = "generic" if mode == "generic_reset" else mode
+    _set_option(command, "--policy-warmup-mode", client_mode)
+    if trace_override:
+        _set_option(command, "--trace", trace_override)
     if client_max_in_flight > 0:
         _set_option(command, "--max-in-flight", str(client_max_in_flight))
     _inject_backend_mode(command)
+    if mode == "generic_reset":
+        _set_backend_environment(command, "TRT_EDGELLM_POLICY_WARMUP_MODE",
+                                 "policy_reset")
     _replace_backend_build(command, backend_build_root)
     _replace_backend_engine(command, backend_engine_dir)
     for name, value in POLICY_VARIANTS[policy_variant].items():
@@ -208,7 +231,7 @@ def prepare_command(entry: dict[str, Any],
         _set_backend_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_PATH",
                                  activity_prefix + "-events.jsonl")
     _drop_option(command, "--generic-warmup-trace", True)
-    if mode == "generic":
+    if mode in ("generic_reset", "generic"):
         trace = Path(command[command.index("--trace") + 1])
         calibration = generic_vlm if _is_vision_trace(trace) else generic_text
         request_count = len(
@@ -238,6 +261,7 @@ def main() -> int:
     parser.add_argument("--backend-build-root", default="")
     parser.add_argument("--backend-engine-dir", default="")
     parser.add_argument("--client-max-in-flight", type=int, default=0)
+    parser.add_argument("--trace-override", type=Path)
     parser.add_argument("--policy-variant",
                         choices=sorted(POLICY_VARIANTS),
                         default="full_active")
@@ -283,7 +307,8 @@ def main() -> int:
                 args.generic_vlm, args.backend_build_root,
                 args.backend_engine_dir, args.policy_variant,
                 tuple(args.backend_env), args.client_max_in_flight,
-                args.capture_phase_telemetry)
+                args.capture_phase_telemetry,
+                str(args.trace_override) if args.trace_override else "")
             commands.append({
                 "mode": mode,
                 "policy_variant": args.policy_variant,

@@ -115,6 +115,8 @@ struct PhaseContextualPdInput
     double incumbentReferenceUs{};
     double requestedStartSkewFraction{-1.0};
     PhaseExecutionSet outstandingBefore{PhaseExecutionSet::kNone};
+    int32_t prefillBatchCapacity{8};
+    int32_t decodeBatchCapacity{64};
 };
 
 //! Project an exact P+D action into a bounded, model- and workload-label-free

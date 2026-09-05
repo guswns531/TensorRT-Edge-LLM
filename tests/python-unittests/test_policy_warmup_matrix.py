@@ -76,6 +76,36 @@ def test_prepare_generic_command_selects_vlm_calibration(
     assert "TRT_EDGELLM_POLICY_WARMUP_MODE={policy_warmup_mode}" in result
 
 
+def test_prepare_generic_reset_warms_runtime_but_resets_policy(
+        tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic_text = tmp_path / "text.json"
+    generic_vlm = tmp_path / "vlm.json"
+    _trace(measured, True)
+    _trace(generic_text, False)
+    _trace(generic_vlm, True)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command}, "generic_reset",
+                                    tmp_path / "out", 3, generic_text,
+                                    generic_vlm)
+
+    assert result[result.index("--policy-warmup-mode") + 1] == "generic"
+    environments = {
+        result[index + 1].split("=", 1)[0]: result[index + 1].split("=", 1)[1]
+        for index, token in enumerate(result[:-1]) if token == "-e"
+    }
+    assert environments["TRT_EDGELLM_POLICY_WARMUP_MODE"] == "policy_reset"
+    assert result[result.index("--generic-warmup-trace") +
+                  1] == str(generic_vlm)
+    assert result[result.index("--warmup-requests") + 1] == "1"
+    assert result[result.index("--phase-calibration-min-requests") + 1] == "1"
+
+
 def test_prepare_replaces_stale_backend_build(tmp_path: Path) -> None:
     measured = tmp_path / "measured.json"
     generic = tmp_path / "generic.json"
@@ -246,6 +276,34 @@ def test_prepare_scalar_transition_enables_only_formation_reasoning(
     assert environments["TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE"] == "0"
 
 
+def test_prepare_successor_guard_keeps_formation_authority_disabled(
+        tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "generic",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    policy_variant="successor_guard")
+    environments = {
+        result[index + 1].split("=", 1)[0]: result[index + 1].split("=", 1)[1]
+        for index, token in enumerate(result[:-1]) if token == "-e"
+    }
+
+    assert environments["TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE"] == "0"
+    assert environments["TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD"] == "1"
+
+
 def test_prepare_overrides_backend_environment(tmp_path: Path) -> None:
     measured = tmp_path / "measured.json"
     generic = tmp_path / "generic.json"
@@ -292,6 +350,30 @@ def test_prepare_overrides_client_max_in_flight(tmp_path: Path) -> None:
                                     client_max_in_flight=80)
 
     assert result[result.index("--max-in-flight") + 1] == "80"
+
+
+def test_prepare_overrides_measured_trace(tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    replacement = tmp_path / "replacement.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(replacement, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "zero_start",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    trace_override=str(replacement))
+
+    assert result[result.index("--trace") + 1] == str(replacement)
 
 
 def test_prepare_maps_phase_telemetry_to_writable_workspace(
