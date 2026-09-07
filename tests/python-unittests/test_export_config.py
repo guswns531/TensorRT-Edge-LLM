@@ -38,6 +38,18 @@ _LLM_EXPORT_PATH = os.path.normpath(
                  "checkpoint_utils.py"))
 _CONFIG_PATH = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "config.py"))
+_EXPORT_CLI_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "scripts",
+                 "export.py"))
+_ATTENTION_OP_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "models",
+                 "ops.py"))
+_ATTENTION_TRANSLATION_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "onnx",
+                 "dynamo_translations.py"))
+_ATTENTION_SCHEMA_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "onnx",
+                 "onnx_custom_schemas.py"))
 
 
 def _load_source():
@@ -87,6 +99,27 @@ def _simulate_draft_dtype_write(draft_config):
     """Replicates the dtype-writing line in `export_draft_model`."""
     draft_config['kv_cache_dtype'] = 'fp16'
     return draft_config
+
+
+def test_packed_prefill_metadata_and_cli_are_wired():
+    config_source = _load_config_source()
+    with open(_EXPORT_CLI_PATH, "r", encoding="utf-8") as source_file:
+        cli_source = source_file.read()
+    assert re.search(r"packed_prefill:\s*bool\s*=\s*False", config_source)
+    assert re.search(r"packed_prefill_max_chunk_tokens:\s*int\s*=\s*128",
+                     config_source)
+    assert '"--packed-prefill"' in cli_source
+    assert '"--packed-prefill-max-chunk-tokens"' in cli_source
+    assert "model.config.packed_prefill = packed_prefill" in cli_source
+
+
+def test_packed_prefill_attention_attributes_are_wired_end_to_end():
+    for path in (_ATTENTION_OP_PATH, _ATTENTION_TRANSLATION_PATH,
+                 _ATTENTION_SCHEMA_PATH):
+        with open(path, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+        assert "enable_packed_prefill" in source
+        assert "packed_prefill_max_chunk_tokens" in source
 
 
 # ---------------------------------------------------------------------------

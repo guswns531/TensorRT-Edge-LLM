@@ -47,9 +47,15 @@ enum LLMBuildOptionId : int
     MAX_DRAFT_TREE_SIZE = 712,
     PROFILING_DETAILED = 713,
     MAX_KV_POOL_PAGES = 714,
-    TP_SIZE = 715,
-    TP_RANK = 716,
-    LOCAL_DEVICE = 717
+    MAX_PREFILL_CHUNK_TOKENS = 715,
+    MAX_PREFILL_BATCH_SIZE = 716,
+    MAX_DECODE_BATCH_SIZE = 717,
+    ALLOW_KV_POOL_UNDERCOMMIT = 718,
+    MAX_VISION_PREFILL_CHUNK_TOKENS = 719,
+    MAX_VISION_PREFILL_BATCH_SIZE = 720,
+    TP_SIZE = 721,
+    TP_RANK = 722,
+    LOCAL_DEVICE = 723
 };
 
 struct LLMBuildArgs
@@ -60,14 +66,20 @@ struct LLMBuildArgs
     int64_t maxInputLen{1024};
     int64_t maxKVCacheCapacity{4096};
     int64_t maxKVPoolPages{0};
+    int64_t maxPrefillChunkTokens{128};
+    int64_t maxVisionPrefillChunkTokens{};
     bool debug{false};
     int64_t maxBatchSize{4};
+    int64_t maxPrefillBatchSize{};
+    int64_t maxDecodeBatchSize{};
+    int64_t maxVisionPrefillBatchSize{};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
     bool specDraft{false};
     bool specBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
+    bool allowKVPoolUndercommit{false};
     int tpSize{1};
     int tpRank{0};
     int localDevice{0};
@@ -91,8 +103,11 @@ void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
-                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
+                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--maxPrefillBatchSize <int>] "
+                 "[--maxDecodeBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  " [--maxKVPoolPages <int>]"
+                 " [--allowKVPoolUndercommit] [--maxPrefillChunkTokens <int>]"
+                 " [--maxVisionPrefillChunkTokens <int>] [--maxVisionPrefillBatchSize <int>]"
                  " [--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed] [--tpSize <int> --tpRank <int>] "
                  "[--localDevice <int>]"
@@ -111,6 +126,14 @@ void printUsage(char const* programName)
                  "(minimum active pages)"
               << std::endl;
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
+    std::cerr << "  --maxPrefillBatchSize     Maximum prefill profile batch size. Default = maxBatchSize" << std::endl;
+    std::cerr << "  --maxDecodeBatchSize      Maximum decode profile batch size. Default = maxBatchSize" << std::endl;
+    std::cerr << "  --allowKVPoolUndercommit  Allow an explicit page pool below worst-case profile capacity"
+              << std::endl;
+    std::cerr << "  --maxPrefillChunkTokens   Maximum logical packed-prefill row length. Default = 128" << std::endl;
+    std::cerr << "  --maxVisionPrefillChunkTokens  Optional external-prefill row length. Default = 0" << std::endl;
+    std::cerr << "  --maxVisionPrefillBatchSize    Optional external-prefill profile batch size. Default = prefill"
+              << std::endl;
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
               << std::endl;
@@ -146,8 +169,14 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"maxInputLen", required_argument, 0, LLMBuildOptionId::MAX_INPUT_LEN},
         {"maxKVCacheCapacity", required_argument, 0, LLMBuildOptionId::MAX_KV_CACHE_CAPACITY},
         {"maxKVPoolPages", required_argument, 0, LLMBuildOptionId::MAX_KV_POOL_PAGES},
+        {"maxPrefillChunkTokens", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS},
+        {"maxVisionPrefillChunkTokens", required_argument, 0, LLMBuildOptionId::MAX_VISION_PREFILL_CHUNK_TOKENS},
+        {"maxVisionPrefillBatchSize", required_argument, 0, LLMBuildOptionId::MAX_VISION_PREFILL_BATCH_SIZE},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
+        {"maxPrefillBatchSize", required_argument, 0, LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE},
+        {"maxDecodeBatchSize", required_argument, 0, LLMBuildOptionId::MAX_DECODE_BATCH_SIZE},
+        {"allowKVPoolUndercommit", no_argument, 0, LLMBuildOptionId::ALLOW_KV_POOL_UNDERCOMMIT},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
         {"specDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT},
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT}, // deprecated alias
@@ -206,6 +235,29 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxKVPoolPages = std::stoll(optarg);
             }
             break;
+        case LLMBuildOptionId::MAX_PREFILL_CHUNK_TOKENS:
+            if (optarg)
+            {
+                args.maxPrefillChunkTokens = std::stoll(optarg);
+            }
+            else
+            {
+                LOG_ERROR("--maxPrefillChunkTokens requires option argument.");
+                return false;
+            }
+            break;
+        case LLMBuildOptionId::MAX_VISION_PREFILL_CHUNK_TOKENS:
+            if (optarg)
+            {
+                args.maxVisionPrefillChunkTokens = std::stoll(optarg);
+            }
+            break;
+        case LLMBuildOptionId::MAX_VISION_PREFILL_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxVisionPrefillBatchSize = std::stoll(optarg);
+            }
+            break;
         case LLMBuildOptionId::DEBUG: args.debug = true; break;
         case LLMBuildOptionId::MAX_BATCH_SIZE:
             if (optarg)
@@ -213,6 +265,19 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxBatchSize = std::stoi(optarg);
             }
             break;
+        case LLMBuildOptionId::MAX_PREFILL_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxPrefillBatchSize = std::stoll(optarg);
+            }
+            break;
+        case LLMBuildOptionId::MAX_DECODE_BATCH_SIZE:
+            if (optarg)
+            {
+                args.maxDecodeBatchSize = std::stoll(optarg);
+            }
+            break;
+        case LLMBuildOptionId::ALLOW_KV_POOL_UNDERCOMMIT: args.allowKVPoolUndercommit = true; break;
         case LLMBuildOptionId::MAX_LORA_RANK:
             if (optarg)
             {
@@ -274,6 +339,40 @@ int main(int argc, char** argv)
     {
         printUsage(argv[0]);
         return EXIT_SUCCESS;
+    }
+
+    int64_t const maxPrefillBatchSize = args.maxPrefillBatchSize > 0 ? args.maxPrefillBatchSize : args.maxBatchSize;
+    int64_t const maxDecodeBatchSize = args.maxDecodeBatchSize > 0 ? args.maxDecodeBatchSize : args.maxBatchSize;
+    if (args.maxBatchSize <= 0 || maxPrefillBatchSize <= 0 || maxDecodeBatchSize <= 0
+        || maxPrefillBatchSize > args.maxBatchSize || maxDecodeBatchSize > args.maxBatchSize)
+    {
+        LOG_ERROR("Phase batch limits must be positive and no greater than --maxBatchSize.");
+        return EXIT_FAILURE;
+    }
+    if ((args.specBase || args.specDraft) && (args.maxPrefillBatchSize > 0 || args.maxDecodeBatchSize > 0))
+    {
+        LOG_ERROR("Asymmetric phase batch limits currently support vanilla engines only.");
+        return EXIT_FAILURE;
+    }
+    int64_t const maxVisionPrefillBatchSize
+        = args.maxVisionPrefillBatchSize > 0 ? args.maxVisionPrefillBatchSize : maxPrefillBatchSize;
+    if (args.maxVisionPrefillChunkTokens < 0 || args.maxVisionPrefillBatchSize < 0
+        || (args.maxVisionPrefillChunkTokens > 0
+            && (maxVisionPrefillBatchSize <= 0 || maxVisionPrefillBatchSize > args.maxBatchSize))
+        || (args.maxVisionPrefillChunkTokens == 0 && args.maxVisionPrefillBatchSize > 0))
+    {
+        LOG_ERROR("Vision prefill profile limits must be jointly enabled and fit --maxBatchSize.");
+        return EXIT_FAILURE;
+    }
+    if ((args.specBase || args.specDraft) && args.maxVisionPrefillChunkTokens > 0)
+    {
+        LOG_ERROR("An additional vision prefill profile currently supports vanilla engines only.");
+        return EXIT_FAILURE;
+    }
+    if (args.allowKVPoolUndercommit && args.maxKVPoolPages <= 0)
+    {
+        LOG_ERROR("--allowKVPoolUndercommit requires an explicit positive --maxKVPoolPages.");
+        return EXIT_FAILURE;
     }
 
     if (args.debug)
@@ -359,7 +458,13 @@ int main(int argc, char** argv)
     config.maxInputLen = args.maxInputLen;
     config.maxKVCacheCapacity = args.maxKVCacheCapacity;
     config.maxKVPoolPages = args.maxKVPoolPages;
+    config.maxPrefillChunkTokens = args.maxPrefillChunkTokens;
+    config.maxVisionPrefillChunkTokens = args.maxVisionPrefillChunkTokens;
+    config.maxVisionPrefillBatchSize = args.maxVisionPrefillBatchSize;
     config.maxBatchSize = args.maxBatchSize;
+    config.maxPrefillBatchSize = args.maxPrefillBatchSize;
+    config.maxDecodeBatchSize = args.maxDecodeBatchSize;
+    config.allowKVPoolUndercommit = args.allowKVPoolUndercommit;
     config.maxLoraRank = args.maxLoraRank;
     config.specDraft = args.specDraft;
     config.specBase = args.specBase;

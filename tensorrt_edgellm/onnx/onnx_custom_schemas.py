@@ -124,6 +124,13 @@ _attention_plugin_schema = OpSchema(
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
         OpSchema.FormalParameter(
+            name="packed_prefill_chunk_limit",
+            description="Profile-local packed-prefill limit carrier (optional): "
+            "1-D INT8 dummy whose length is the selected profile's fixed chunk limit; data never read.",
+            type_str="tensor(int8)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
             name="skip_softmax_scale",
             description="Runtime skip-softmax override carrier (optional): 1-D "
             "INT8 dummy whose LENGTH is the integer scale-factor override "
@@ -254,6 +261,26 @@ _attention_plugin_schema = OpSchema(
             description=
             "Whether this layer reads K/V from a donated (shared) cache; the packed qkv "
             "input then carries Q only [B, S, Hq*D] (0(false), 1(true)).",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_packed_prefill",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Treat a [1, total_tokens] context input as packed logical rows.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="packed_prefill_max_chunk_tokens",
+            type=OpSchema.AttrType.INT,
+            description="Maximum logical row length for packed prefill.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_profile_local_packed_prefill",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether the runtime packed-prefill chunk-limit carrier is wired.",
             required=False,
         ),
     ],

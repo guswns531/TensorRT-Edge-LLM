@@ -26,7 +26,7 @@ namespace kernel
 
 __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, int32_t const* kvCacheStartIndices,
     int32_t* cuQSeqlen, int32_t* cuKVSeqLens, int32_t* kvCacheEndIndices, int32_t* paddedCuKVSeqLens,
-    int32_t runtimeSeqLen, int32_t batchSize)
+    int32_t runtimeSeqLen, int32_t batchSize, bool packedPrefill)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
@@ -54,7 +54,8 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
             runningCuKvCacheLen += (kvCacheStartIdx + inputSeqLen[i]);
             cuKVSeqLens[i + 1] = runningCuKvCacheLen;
             // To keep semantic consistency with the packed QKV layout for RoPE, use runtimeSeqLen here.
-            int32_t const kvEndIdx = kvCacheStartIdx + runtimeSeqLen;
+            int32_t const physicalRowLen = packedPrefill ? inputSeqLen[i] : runtimeSeqLen;
+            int32_t const kvEndIdx = kvCacheStartIdx + physicalRowLen;
             kvCacheEndIndices[i] = kvEndIdx;
 
             if (paddedCuKVSeqLens != nullptr)
@@ -68,7 +69,7 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
-    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream)
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream, bool packedPrefill)
 {
     int32_t const runtimeBatchSize = static_cast<int32_t>(inputSeqLen.getShape()[0]);
 
@@ -100,7 +101,55 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     calCuQCuKVSeqLensAndKVEndIdxsKernel<<<1, 1, 0, stream>>>(inputSeqLen.dataPointer<int32_t>(),
         kvCacheStartIndices.dataPointer<int32_t>(), cuQSeqLens.dataPointer<int32_t>(),
         cuKVSeqLens.dataPointer<int32_t>(), kvCacheEndIdxs.dataPointer<int32_t>(), paddedPtr, runtimeSeqLen,
-        runtimeBatchSize);
+        runtimeBatchSize, packedPrefill);
+}
+
+namespace
+{
+
+__global__ void gatherDenseRowsToPackedKernel(half const* dense, int32_t const* cuSeqLens, half* packed,
+    int32_t batchSize, int32_t denseSeqLen, int32_t featuresPerToken, int32_t totalTokens)
+{
+    int32_t const token = static_cast<int32_t>(blockIdx.x);
+    if (token >= totalTokens)
+    {
+        return;
+    }
+    int32_t batch{};
+    while (batch + 1 < batchSize && token >= cuSeqLens[batch + 1])
+    {
+        ++batch;
+    }
+    int32_t const row = token - cuSeqLens[batch];
+    int64_t const denseBase = (static_cast<int64_t>(batch) * denseSeqLen + row) * featuresPerToken;
+    int64_t const packedBase = static_cast<int64_t>(token) * featuresPerToken;
+    for (int32_t feature = static_cast<int32_t>(threadIdx.x); feature < featuresPerToken;
+        feature += static_cast<int32_t>(blockDim.x))
+    {
+        packed[packedBase + feature] = dense[denseBase + feature];
+    }
+}
+
+} // namespace
+
+void gatherDenseRowsToPacked(
+    rt::Tensor const& dense, rt::Tensor const& cuSeqLens, rt::Tensor& packed, cudaStream_t stream)
+{
+    check::check(dense.getDataType() == nvinfer1::DataType::kHALF && packed.getDataType() == nvinfer1::DataType::kHALF,
+        "Dense/packed attention tensors must be FP16");
+    check::check(dense.getShape().getNumDims() == 4 && packed.getShape().getNumDims() == 4 && packed.getShape()[0] == 1
+            && dense.getShape()[2] == packed.getShape()[2] && dense.getShape()[3] == packed.getShape()[3],
+        "Dense/packed attention tensor shapes are incompatible");
+    int32_t const batchSize = static_cast<int32_t>(dense.getShape()[0]);
+    int32_t const totalTokens = static_cast<int32_t>(packed.getShape()[1]);
+    check::check(cuSeqLens.getDataType() == nvinfer1::DataType::kINT32 && cuSeqLens.getShape().getNumDims() == 1
+            && cuSeqLens.getShape()[0] == batchSize + 1,
+        "Packed attention cumulative sequence lengths must have shape [B+1]");
+    int32_t const featuresPerToken = static_cast<int32_t>(dense.getShape()[2] * dense.getShape()[3]);
+    constexpr int32_t kTHREADS = 256;
+    gatherDenseRowsToPackedKernel<<<totalTokens, kTHREADS, 0, stream>>>(dense.dataPointer<half>(),
+        cuSeqLens.dataPointer<int32_t>(), packed.dataPointer<half>(), batchSize,
+        static_cast<int32_t>(dense.getShape()[1]), featuresPerToken, totalTokens);
 }
 
 namespace

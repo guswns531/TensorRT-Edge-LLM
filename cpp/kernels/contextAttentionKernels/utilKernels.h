@@ -66,7 +66,12 @@ void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* 
 //! \throws std::runtime_error if tensor shapes are invalid
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
-    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream,
+    bool packedPrefill = false);
+
+//! Gather valid rows from dense [B, Smax, H, D] output into compact [1, totalTokens, H, D] order.
+void gatherDenseRowsToPacked(
+    rt::Tensor const& dense, rt::Tensor const& cuSeqLens, rt::Tensor& packed, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

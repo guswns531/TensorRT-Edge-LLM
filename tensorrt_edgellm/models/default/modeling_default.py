@@ -92,7 +92,8 @@ def _make_flat_wrapper(model: nn.Module,
                        Na: int,
                        Nd: int,
                        eagle_base: bool = False,
-                       emit_hidden_states: bool = False) -> nn.Module:
+                       emit_hidden_states: bool = False,
+                       packed_prefill: bool = False) -> nn.Module:
     """Build a wrapper with an explicit flat forward signature (no ``*args``).
 
     Using ``*flat_args`` in ``forward`` triggers a PyTorch 2.10 bug where the
@@ -123,6 +124,8 @@ def _make_flat_wrapper(model: nn.Module,
         ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
+    if packed_prefill:
+        param_names += ["packed_prefill_chunk_limit"]
     param_names += ["skip_softmax_scale"]
 
     past_kv_tuple = "({},)".format(", ".join(
@@ -134,6 +137,8 @@ def _make_flat_wrapper(model: nn.Module,
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
     skip_kwarg = ", skip_softmax_scale=skip_softmax_scale"
+    packed_kwarg = (", packed_prefill_chunk_limit=packed_prefill_chunk_limit"
+                    if packed_prefill else "")
 
     if has_hidden_output:
         body = (
@@ -141,7 +146,7 @@ def _make_flat_wrapper(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids"
-            f"{ds_kwarg}{eagle_kwargs}{skip_kwarg})\n"
+            f"{ds_kwarg}{eagle_kwargs}{packed_kwarg}{skip_kwarg})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
@@ -150,7 +155,7 @@ def _make_flat_wrapper(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids"
-            f"{ds_kwarg}{skip_kwarg})\n"
+            f"{ds_kwarg}{packed_kwarg}{skip_kwarg})\n"
             f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -226,6 +231,9 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_packed_prefill = bool(config.packed_prefill)
+        self.packed_prefill_max_chunk_tokens = int(
+            config.packed_prefill_max_chunk_tokens)
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
         # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled).
         self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
@@ -317,6 +325,7 @@ class Attention(nn.Module):
         kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        packed_prefill_chunk_limit: "torch.Tensor | None" = None,
         skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
@@ -348,12 +357,17 @@ class Attention(nn.Module):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
+            "enable_packed_prefill": int(self.enable_packed_prefill),
+            "packed_prefill_max_chunk_tokens":
+            self.packed_prefill_max_chunk_tokens,
             "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
         # Wire the runtime override carrier iff skip-softmax is enabled (scale
         # factor > 0).
         if skip_softmax_scale is not None and self.skip_softmax_scale_factor > 0.0:
             kwargs["skip_softmax_scale"] = skip_softmax_scale
+        if packed_prefill_chunk_limit is not None and self.enable_packed_prefill:
+            kwargs["packed_prefill_chunk_limit"] = packed_prefill_chunk_limit
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
@@ -609,6 +623,7 @@ class DecoderLayer(nn.Module):
         kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        packed_prefill_chunk_limit: "torch.Tensor | None" = None,
         skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
@@ -621,6 +636,7 @@ class DecoderLayer(nn.Module):
             kv_page_table,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            packed_prefill_chunk_limit=packed_prefill_chunk_limit,
             skip_softmax_scale=skip_softmax_scale,
         )
         hidden_states = residual + attn_output
@@ -675,6 +691,7 @@ class Transformer(nn.Module):
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        packed_prefill_chunk_limit: "torch.Tensor | None" = None,
         skip_softmax_scale: "torch.Tensor | None" = None,
         output_hidden_states: bool = False,
         dflash_target_layer_ids: "List[int] | None" = None,
@@ -698,6 +715,7 @@ class Transformer(nn.Module):
                 kv_page_table,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
+                packed_prefill_chunk_limit=packed_prefill_chunk_limit,
                 skip_softmax_scale=skip_softmax_scale,
             )
             present_key_values_list.append(next_key_value)
@@ -875,6 +893,9 @@ class CausalLM(nn.Module):
         ]
 
         skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
+        packed_prefill_chunk_limit = torch.zeros(1,
+                                                 dtype=torch.int8,
+                                                 device=device)
 
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
                 context_lengths, kvcache_start_index, kv_page_table,
@@ -892,6 +913,8 @@ class CausalLM(nn.Module):
                             [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
+        token_batch = (torch.export.Dim("token_batch", min=1, max=256)
+                       if config.packed_prefill else batch)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
@@ -900,9 +923,9 @@ class CausalLM(nn.Module):
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
-        num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if eagle_base else None
-        all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
+        num_selected = (torch.export.Dim("num_selected", min=1, max=256)
+                        if eagle_base or config.packed_prefill else None)
+        all_shapes: list = [{0: token_batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
             all_shapes.append({1:
                                num_pages})  # past_key_values_i (pool-shaped)
@@ -910,12 +933,15 @@ class CausalLM(nn.Module):
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
         all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
-        if eagle_base:
-            all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
+        if eagle_base or config.packed_prefill:
+            all_shapes.append({
+                0: token_batch,
+                1: num_selected
+            })  # last_token_ids
         else:
             all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nd):
-            all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
+            all_shapes.append({0: token_batch, 1: seq})  # deepstack_embeds_i
 
         # EAGLE3 base: add tree-attention inputs and hidden_states output.
         if eagle_base:
@@ -947,6 +973,13 @@ class CausalLM(nn.Module):
                 2: mask_kv_len
             })  # attention_mask
 
+        if config.packed_prefill:
+            packed_chunk_dim = torch.export.Dim(
+                "packed_prefill_chunk_limit_len", min=1, max=32768)
+            args = args + (packed_prefill_chunk_limit, )
+            input_names = input_names + ["packed_prefill_chunk_limit"]
+            all_shapes.append({0: packed_chunk_dim})
+
         # Trailing runtime skip-softmax override input.
         skip_dim = torch.export.Dim("skip_softmax_scale_len",
                                     min=0,
@@ -960,7 +993,8 @@ class CausalLM(nn.Module):
             Na,
             Nd,
             eagle_base=eagle_base,
-            emit_hidden_states=self.emit_hidden_states)
+            emit_hidden_states=self.emit_hidden_states,
+            packed_prefill=config.packed_prefill)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -981,6 +1015,7 @@ class CausalLM(nn.Module):
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        packed_prefill_chunk_limit: "torch.Tensor | None" = None,
         skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
@@ -1011,6 +1046,7 @@ class CausalLM(nn.Module):
             deepstack_embeds,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            packed_prefill_chunk_limit=packed_prefill_chunk_limit,
             skip_softmax_scale=skip_softmax_scale,
             output_hidden_states=eagle_base and not target_hidden_base,
             dflash_target_layer_ids=target_layer_ids

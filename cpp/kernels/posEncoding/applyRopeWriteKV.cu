@@ -720,7 +720,8 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     T const* __restrict__ kNormGamma, float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig,
     float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t numPages, uint32_t numQHead,
     uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq)
+    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq, int32_t logicalBatchSize, int32_t qScratchSeqLen,
+    bool packedPrefill)
 {
     // Thread mapping (same as existing kernels for proven memory coalescing):
     //   blockDim.x = headDim / vec_size  (threads per token, cover head vector)
@@ -741,19 +742,33 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     bool const isTailToken = (tokenIdx >= static_cast<uint32_t>(totalNumTokens));
     uint32_t const clampedTokenIdx = isTailToken ? static_cast<uint32_t>(totalNumTokens - 1) : tokenIdx;
 
-    int32_t const batchIdx = clampedTokenIdx / qSeqLen;
+    int32_t batchIdx{};
+    int32_t rowInBatch{};
+    int32_t actualQSeqLen = qSeqLen;
+    if (packedPrefill)
+    {
+        while (batchIdx + 1 < logicalBatchSize && clampedTokenIdx >= static_cast<uint32_t>(cuQSeqLens[batchIdx + 1]))
+        {
+            ++batchIdx;
+        }
+        rowInBatch = static_cast<int32_t>(clampedTokenIdx) - cuQSeqLens[batchIdx];
+        actualQSeqLen = cuQSeqLens[batchIdx + 1] - cuQSeqLens[batchIdx];
+    }
+    else
+    {
+        batchIdx = static_cast<int32_t>(clampedTokenIdx) / qSeqLen;
+        rowInBatch = static_cast<int32_t>(clampedTokenIdx) % qSeqLen;
+        if (cuQSeqLens != nullptr)
+        {
+            actualQSeqLen = cuQSeqLens[batchIdx + 1] - cuQSeqLens[batchIdx];
+        }
+    }
     int64_t const combinedHeads = static_cast<int64_t>(numQHead) + 2 * static_cast<int64_t>(numKVHead);
 
     // RoPE position: prefill (kvCacheEndLens - qSeqLen + offset), decode
     // (kvCacheEndLens[b] - 1), or tree (tokenPosIds; -1 = padding token, zeroed).
     // Ragged prefill padding must be identified before page-table or RoPE-cache
     // indexing. It cannot early-return because fused qk_norm uses warp collectives.
-    int32_t const rowInBatch = static_cast<int32_t>(clampedTokenIdx % qSeqLen);
-    int32_t actualQSeqLen = qSeqLen;
-    if (cuQSeqLens != nullptr)
-    {
-        actualQSeqLen = cuQSeqLens[batchIdx + 1] - cuQSeqLens[batchIdx];
-    }
     int32_t sinCosCachePos{};
     bool const isPaddingToken = (tokenPosIds != nullptr && tokenPosIds[clampedTokenIdx] == -1)
         || (cuQSeqLens != nullptr && rowInBatch >= actualQSeqLen);
@@ -767,7 +782,8 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     }
     else
     {
-        int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
+        int32_t const insertedRowLen = packedPrefill ? actualQSeqLen : qSeqLen;
+        int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - insertedRowLen : 0;
         int32_t const maxActualRow = actualQSeqLen > 0 ? actualQSeqLen - 1 : 0;
         int32_t const ropeRow = isPaddingToken && rowInBatch > maxActualRow ? maxActualRow : rowInBatch;
         sinCosCachePos = posStartId + ropeRow;
@@ -799,7 +815,9 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         //     write to qScratch (or fp8QOut) ---
         uint32_t const qHeadIdx = headIdx;
         int64_t const packedQOffset = tokenBaseInPacked + static_cast<int64_t>(qHeadIdx) * headDim;
-        int32_t const scratchQOffset = clampedTokenIdx * numQHead * headDim + qHeadIdx * headDim;
+        int64_t const scratchToken = packedPrefill ? static_cast<int64_t>(batchIdx) * qScratchSeqLen + rowInBatch
+                                                   : static_cast<int64_t>(clampedTokenIdx);
+        int64_t const scratchQOffset = scratchToken * numQHead * headDim + qHeadIdx * headDim;
 
         DVec<T> qRoped;
         if (qNormGamma != nullptr)
@@ -892,8 +910,9 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
             }
 
             // Always write K and V to the KV cache.
-            int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
-            int32_t const tokenIdxInCache = kvCacheStartIdx + clampedTokenIdx % qSeqLen;
+            int32_t const insertedRowLen = packedPrefill ? actualQSeqLen : qSeqLen;
+            int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - insertedRowLen : 0;
+            int32_t const tokenIdxInCache = kvCacheStartIdx + rowInBatch;
             int32_t const pageRow = tokenIdxInCache / rt::kTOKENS_PER_PAGE;
             int32_t const inPage = tokenIdxInCache % rt::kTOKENS_PER_PAGE;
             int32_t const kPage = pageTable[(batchIdx * 2 + 0) * maxPagesPerSeq + pageRow];
@@ -927,19 +946,23 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     constexpr uint32_t kTHREADS_PER_CTA = 128;
 
     // packedQKV: [B, S, Hq+2*Hkv, D]
-    int64_t const batchSize = packedQKV.getShape()[0];
+    int64_t const physicalBatchSize = packedQKV.getShape()[0];
     int64_t const runtimeSeqLen = packedQKV.getShape()[1];
     int64_t const combinedHeads = packedQKV.getShape()[2];
     int64_t const headDim = kvCache.getShape()[4];
     int64_t const numKVHeads = kvCache.getShape()[3];
     int64_t const numQHeads = combinedHeads - 2 * numKVHeads;
     int64_t const numPages = kvCache.getShape()[1];
-    int64_t const totalNumTokens = batchSize * runtimeSeqLen;
+    int64_t const totalNumTokens = physicalBatchSize * runtimeSeqLen;
+    bool const packedPrefill
+        = cuQSeqLens.has_value() && cuQSeqLens.value().get().getShape()[0] != physicalBatchSize + 1;
+    int64_t const logicalBatchSize = packedPrefill ? cuQSeqLens.value().get().getShape()[0] - 1 : physicalBatchSize;
 
     check::check(numQHeads > 0, "Packed QKV combined heads must exceed 2x KV heads.");
-    check::check(qScratch.getShape()[0] == batchSize && qScratch.getShape()[1] == runtimeSeqLen
+    check::check(qScratch.getShape()[0] == logicalBatchSize && (!packedPrefill || qScratch.getShape()[1] > 0)
+            && (!packedPrefill || physicalBatchSize == 1) && (packedPrefill || qScratch.getShape()[1] == runtimeSeqLen)
             && qScratch.getShape()[2] == numQHeads && qScratch.getShape()[3] == headDim,
-        "qScratch shape shall be [B, S, Hq, D].");
+        "qScratch shape shall be dense [logicalBatch, S, Hq, D].");
     check::check(
         packedQKV.getShape()[3] == headDim, "Head dimension shall be consistent between packed QKV and KV pool.");
     validatePagedKvPool(kvCache, numKVHeads, headDim, pageTable, maxPagesPerSeq);
@@ -947,23 +970,24 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     int64_t const cosSinCacheBatchSize = cosSinCache.getShape()[0];
     int64_t const cosSinCacheSeqLen = cosSinCache.getShape()[1];
     int64_t const rotaryDim = cosSinCache.getShape()[2];
-    check::check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize,
+    check::check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == logicalBatchSize,
         "CosSinCache shall have batch size 1 or equal to runtime batch size");
 
     if (kvCacheEndLens.has_value())
     {
-        check::check(kvCacheEndLens.value().get().getShape()[0] == batchSize,
+        check::check(kvCacheEndLens.value().get().getShape()[0] == logicalBatchSize,
             "kvCacheEndLens shall have consistent batch size.");
     }
     if (tokenPosIds.has_value())
     {
-        check::check(tokenPosIds.value().get().getShape()[0] == batchSize
+        check::check(tokenPosIds.value().get().getShape()[0] == physicalBatchSize
                 && tokenPosIds.value().get().getShape()[1] == runtimeSeqLen,
             "tokenPosIds shape shall be [B, S].");
     }
     if (cuQSeqLens.has_value())
     {
-        check::check(cuQSeqLens.value().get().getShape()[0] == batchSize + 1, "cuQSeqLens shape shall be [B + 1].");
+        check::check(cuQSeqLens.value().get().getShape()[0] == logicalBatchSize + 1,
+            "cuQSeqLens shape shall be [logicalBatch + 1].");
         check::check(cuQSeqLens.value().get().getDataType() == nvinfer1::DataType::kINT32,
             "cuQSeqLens shall have INT32 data type.");
     }
@@ -1009,7 +1033,8 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
             static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
             static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq);
+            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize),
+            static_cast<int32_t>(qScratch.getShape()[1]), packedPrefill);
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -1021,7 +1046,8 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
             static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
             static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq);
+            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize),
+            static_cast<int32_t>(qScratch.getShape()[1]), packedPrefill);
     }
 #endif
     else
