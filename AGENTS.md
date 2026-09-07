@@ -21,7 +21,8 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 
 ## Local Research Workflow
 
-- Work from the repository root on `codex/v010-phase-forward-port`; do not create a nested source worktree under `.local/`.
+- Work from the repository root on `codex/v010-phase-forward-port`. A detached `.local/upstream-*` checkout may be
+  retained as a read-only comparison baseline, but it must never become the development root.
 - Put reproducible scripts in `benchmarks/` or `scripts/`, and numbered conclusions in `notes/NNN-topic-YYYYMMDD.md`.
 - Keep ignored runtime artifacts under `.local/`. Use `.local/results/` as the index of retained experiments and
   `.local/scratch/` for disposable runs.
