@@ -24,15 +24,10 @@
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SCHEDULER"))
         {
             std::string const mode(value);
-            ELLM_CHECK(mode == "disabled" || mode == "shadow" || mode == "active",
-                "TRT_EDGELLM_GLOBAL_SCHEDULER must be disabled, shadow, or active");
+            ELLM_CHECK(mode == "disabled" || mode == "active",
+                "TRT_EDGELLM_GLOBAL_SCHEDULER must be disabled or active");
             semanticSchedulerConfig.globalSchedulerMode = mode == "active" ? rt::PhaseGlobalSchedulerMode::kActive
-                : mode == "shadow"                                         ? rt::PhaseGlobalSchedulerMode::kShadow
-                                                                           : rt::PhaseGlobalSchedulerMode::kDisabled;
-        }
-        if (std::getenv("TRT_EDGELLM_GLOBAL_LEGACY_COMPATIBILITY") != nullptr)
-        {
-            semanticSchedulerConfig.globalSelectionMode = rt::PhaseGlobalSelectionMode::kLegacyCompatibility;
+                                                                            : rt::PhaseGlobalSchedulerMode::kDisabled;
         }
         // Keep the semantic P/D queue and the three-phase coordinator on one
         // decode-service contract.  The vision-facing millisecond option is
@@ -117,16 +112,10 @@
         {
             semanticSchedulerConfig.globalSafeProbeInterval = static_cast<size_t>(std::stoull(value));
         }
-        if (char const* value = std::getenv("TRT_EDGELLM_EXPERIMENTAL_OVERLAP_PERCENT"))
-        {
-            semanticSchedulerConfig.globalExperimentalOverlapPercent = std::stoi(value);
-        }
         semanticSchedulerConfig.elideVacuousGlobalDecisions
             = std::getenv("TRT_EDGELLM_DISABLE_VACUOUS_GLOBAL_ELISION") == nullptr;
         semanticSchedulerConfig.enableDecodeFormationHorizon
             = std::getenv("TRT_EDGELLM_DISABLE_DECODE_FORMATION_HORIZON") == nullptr;
-        semanticSchedulerConfig.enableExternalContextualPd
-            = std::getenv("TRT_EDGELLM_DISABLE_EXTERNAL_CONTEXTUAL_PD") == nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference
             = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr
             && std::getenv("TRT_EDGELLM_DISABLE_PHASE_MEMORY_DRAIN") == nullptr;
@@ -210,8 +199,4 @@
             // P8/D64 undercommitted-pool profile, measured from decode-only CUDA-event samples.
             semanticSchedulerConfig.decodeBatchCosts.insert(semanticSchedulerConfig.decodeBatchCosts.end(),
                 {{40, 2048, 7.949F}, {47, 2048, 8.126F}, {63, 2048, 9.861F}, {64, 2048, 9.764F}});
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_SCHEDULER_COST_JSON"))
-        {
-            loadSchedulerCostModel(value, semanticSchedulerConfig);
         }

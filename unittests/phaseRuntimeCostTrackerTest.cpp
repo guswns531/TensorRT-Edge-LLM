@@ -119,6 +119,7 @@ TEST(PhaseRuntimeCostTrackerTest, ResetDropsAllProcessLocalMeasurements)
 TEST(PhaseRuntimeCostTrackerTest, ExecutionAndPolicyStateResetIndependently)
 {
     PhaseRuntimeCostTrackerConfig config;
+    config.policyMode = PhasePolicyMode::kContextualScalar;
     config.actionMinimumSamples = 1U;
     config.contextualPd.mode = PhaseContextualPdMode::kActive;
     config.contextualPd.minimumObservations = 1U;
@@ -261,6 +262,7 @@ TEST(PhaseContextualPairModelTest, BatchFeaturesUseRuntimeCapacities)
 TEST(PhaseContextualPairModelTest, KeepsEncoderPrefillAndDecodeEvidenceIndependent)
 {
     PhaseRuntimeCostTrackerConfig config;
+    config.policyMode = PhasePolicyMode::kContextualScalar;
     config.contextualEp.mode = PhaseContextualPdMode::kActive;
     config.contextualEp.minimumObservations = 2U;
     config.contextualEp.confidenceBeta = 0.0;
@@ -289,7 +291,8 @@ TEST(PhaseContextualPairModelTest, KeepsEncoderPrefillAndDecodeEvidenceIndepende
 TEST(PhaseContextualPairModelTest, KeepsOppositeDirectionsIndependent)
 {
     PhaseRuntimeCostTrackerConfig config;
-    config.contextualPd.mode = PhaseContextualPdMode::kShadow;
+    config.policyMode = PhasePolicyMode::kContextualScalar;
+    config.contextualPd.mode = PhaseContextualPdMode::kActive;
     config.contextualPd.minimumObservations = 2U;
     config.contextualPd.confidenceBeta = 0.0;
     PhaseRuntimeCostTracker tracker(config);
@@ -327,6 +330,38 @@ TEST(PhaseContextualPairModelTest, CalibratesBeforeUpdatingAndCountsFalseSafe)
     EXPECT_EQ(telemetry.falseSafeObservations, 1U);
     EXPECT_GT(telemetry.absoluteErrorSum, 0.0);
     EXPECT_LT(telemetry.lastPredictionError, 0.0);
+}
+
+TEST(PhasePolicyModeTest, ParsesOnlyCanonicalProductionVariants)
+{
+    EXPECT_EQ(phasePolicyModeFromName("exact"), PhasePolicyMode::kExact);
+    EXPECT_EQ(phasePolicyModeFromName("scalar"), PhasePolicyMode::kContextualScalar);
+    EXPECT_EQ(phasePolicyModeFromName("scalar-transition"), PhasePolicyMode::kContextualScalarTransition);
+    EXPECT_FALSE(phasePolicyModeFromName("completion").has_value());
+    EXPECT_FALSE(phasePolicyModeFromName("selective").has_value());
+
+    EXPECT_FALSE(phasePolicyUsesContextualScalar(PhasePolicyMode::kExact));
+    EXPECT_TRUE(phasePolicyUsesContextualScalar(PhasePolicyMode::kContextualScalar));
+    EXPECT_TRUE(phasePolicyUsesContextualScalar(PhasePolicyMode::kContextualScalarTransition));
+    EXPECT_FALSE(phasePolicyUsesTransition(PhasePolicyMode::kContextualScalar));
+    EXPECT_TRUE(phasePolicyUsesTransition(PhasePolicyMode::kContextualScalarTransition));
+}
+
+TEST(PhasePolicyModeTest, ExactModeCannotAccidentallyEnableContextualAuthority)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.policyMode = PhasePolicyMode::kExact;
+    config.contextualPd.mode = PhaseContextualPdMode::kActive;
+    config.contextualEp.mode = PhaseContextualPdMode::kActive;
+    config.contextualEd.mode = PhaseContextualPdMode::kActive;
+
+    PhaseRuntimeCostTracker tracker(config);
+
+    EXPECT_EQ(tracker.contextualPdConfig().mode, PhaseContextualPdMode::kDisabled);
+    EXPECT_EQ(
+        tracker.contextualPairConfig(PhaseContextualPairKind::kEncoderPrefill).mode, PhaseContextualPdMode::kDisabled);
+    EXPECT_EQ(
+        tracker.contextualPairConfig(PhaseContextualPairKind::kEncoderDecode).mode, PhaseContextualPdMode::kDisabled);
 }
 
 } // namespace

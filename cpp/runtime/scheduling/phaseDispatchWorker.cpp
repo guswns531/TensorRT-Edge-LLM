@@ -35,14 +35,6 @@ namespace rt
 namespace
 {
 
-uint64_t remainingDirectionalDelayUs(uint64_t requestedDelayUs, uint64_t incumbentEnqueueHostNs) noexcept
-{
-    uint64_t const currentTimestampNs = phaseTimelineNowNs();
-    uint64_t const elapsedUs
-        = currentTimestampNs > incumbentEnqueueHostNs ? (currentTimestampNs - incumbentEnqueueHostNs) / 1000U : 0U;
-    return requestedDelayUs > elapsedUs ? requestedDelayUs - elapsedUs : 0U;
-}
-
 CUcontext getStreamCudaContext(cudaStream_t stream)
 {
     check::check(stream != nullptr, "Phase execution requires explicit non-default CUDA streams.");
@@ -209,17 +201,6 @@ PhaseDispatchWorker::~PhaseDispatchWorker() noexcept
     static_cast<void>(cudaEventDestroy(mPrefillDone));
     static_cast<void>(cudaEventDestroy(mDecodeStart));
     static_cast<void>(cudaEventDestroy(mDecodeDone));
-}
-
-void PhaseDispatchWorker::setDirectionalInjectionControl(PhaseDirectionalInjectionControl control)
-{
-    check::check(!mBusy, "Phase directional injection control cannot change while work is in flight.");
-    check::check(!control.enabled() || mExecutionMode == PhaseTensorRTContextMode::kIndependentConcurrent,
-        "Directional injection requires independent TensorRT execution contexts.");
-    check::check(control.targetFraction >= 0.0 && control.targetFraction <= 1.0,
-        "Directional injection target fraction must be within [0, 1].");
-    mDirectionalInjection = control;
-    mDirectionalInjectionConsumed = false;
 }
 
 cudaStream_t PhaseDispatchWorker::phaseStream(PhaseUnifiedPhase phase) const noexcept
@@ -459,43 +440,13 @@ bool PhaseDispatchWorker::dispatchNext()
             CUDA_CHECK(cudaEventRecord(mDecodeDone, mDecodeStream));
         }
     };
-    bool const decodeFirst = mHasPrefill && mHasDecode
-        && mExecutionMode == PhaseTensorRTContextMode::kIndependentConcurrent
-        && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill;
-    if (decodeFirst)
+    if (mHasPrefill)
     {
-        enqueueDecode();
-        if (mDirectionalInjection.enabled()
-            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill
-            && !mDirectionalInjectionConsumed)
-        {
-            mDirectionalCudaGate.enqueue(mPrefillStream, mDecodeStart,
-                remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mDecodeEnqueueHostNs));
-            mDirectionalInjectionConsumed = true;
-        }
         enqueuePrefill();
     }
-    else
+    if (mHasDecode)
     {
-        if (mHasPrefill)
-        {
-            enqueuePrefill();
-        }
-        if (mHasPrefill && mHasDecode)
-        {
-            if (mDirectionalInjection.enabled()
-                && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode
-                && !mDirectionalInjectionConsumed)
-            {
-                mDirectionalCudaGate.enqueue(mDecodeStream, mPrefillStart,
-                    remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mPrefillEnqueueHostNs));
-                mDirectionalInjectionConsumed = true;
-            }
-        }
-        if (mHasDecode)
-        {
-            enqueueDecode();
-        }
+        enqueueDecode();
     }
     mCurrentMetrics.hostSubmissionEndNs = phaseTimelineNowNs();
     mBusy = true;
@@ -532,14 +483,6 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
 
     if (addsPrefill)
     {
-        if (mDirectionalInjection.enabled()
-            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToPrefill
-            && !mDirectionalInjectionConsumed)
-        {
-            mDirectionalCudaGate.enqueue(mPrefillStream, mDecodeStart,
-                remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mDecodeEnqueueHostNs));
-            mDirectionalInjectionConsumed = true;
-        }
         mInFlight.prefillBatch = std::move(additional.prefillBatch);
         mHasPrefill = true;
         mPrefillPlanId = effectivePlanId;
@@ -554,14 +497,6 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
     }
     else
     {
-        if (mDirectionalInjection.enabled()
-            && mDirectionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToDecode
-            && !mDirectionalInjectionConsumed)
-        {
-            mDirectionalCudaGate.enqueue(mDecodeStream, mPrefillStart,
-                remainingDirectionalDelayUs(mDirectionalInjection.requestedDelayUs, mPrefillEnqueueHostNs));
-            mDirectionalInjectionConsumed = true;
-        }
         mInFlight.decodeBatch = std::move(additional.decodeBatch);
         preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
         mPreviousDecodeRowRequestIds.clear();

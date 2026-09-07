@@ -48,7 +48,7 @@ def test_prepare_budget_command_uses_exact_budget(tmp_path: Path) -> None:
     ]
     result = SWEEP.prepare_budget_command(
         {"command": command}, 10, tmp_path / "out", 2, trace, trace, "",
-        "", "full_active", (), 0)
+        "", "v2_scalar_transition", (), 0)
 
     assert result[result.index("--warmup-requests") + 1] == "10"
     assert result[result.index("--phase-calibration-min-requests") + 1] == "10"

@@ -85,7 +85,7 @@ def main() -> int:
     parser.add_argument("--policy-variant",
                         choices=sorted(
                             run_policy_warmup_matrix.POLICY_VARIANTS),
-                        default="full_active")
+                        default="v2_scalar_transition")
     parser.add_argument("--cases", default="")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")

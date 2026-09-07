@@ -57,22 +57,10 @@ bool phaseExecutionSetContains(PhaseExecutionSet set, PhaseExecutionSet phase) n
 bool phaseExecutionSetIsSubset(PhaseExecutionSet subset, PhaseExecutionSet superset) noexcept;
 PhaseExecutionSet phaseExecutionSetForAction(PhaseGlobalActionKind kind) noexcept;
 
-//! Staged activation keeps legacy serving behavior available while a global
-//! decision stream is validated against the same live queue snapshots.
 enum class PhaseGlobalSchedulerMode
 {
     kDisabled,
-    kShadow,
     kActive,
-};
-
-//! Selection authority used after the common deterministic builders run.
-//! Compatibility mode is an evaluation control and never classifies a
-//! workload; it replays the legacy P/D phase choice on the same snapshot.
-enum class PhaseGlobalSelectionMode
-{
-    kProfileFree,
-    kLegacyCompatibility,
 };
 
 //! CUDA launch path used by one action. Primary and secondary refer to the

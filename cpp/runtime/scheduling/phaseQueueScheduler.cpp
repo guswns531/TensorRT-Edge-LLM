@@ -31,58 +31,6 @@ namespace trt_edgellm
 namespace rt
 {
 
-namespace
-{
-
-void applySchedulerProfile(PhaseQueueSchedulerConfig& config)
-{
-    // Active global scheduling is deliberately profile-free. Legacy presets
-    // remain available for the legacy path and for shadow comparisons, while
-    // explicit engine/shape limits below remain common to every mode.
-    if (config.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
-        || config.profile == PhaseSchedulerProfile::kCustom)
-    {
-        return;
-    }
-    if (config.profile == PhaseSchedulerProfile::kThroughputBalanced)
-    {
-        config.enableTpotHardGuard = true;
-        config.requireDirectOverlapCost = true;
-        config.enableCostAwareOverlapAdmission = true;
-        config.enableTpotHysteresis = true;
-        return;
-    }
-
-    config.enableDynamicDecodeBatching = true;
-    config.enableDynamicPrefillBatching = true;
-    config.enableTpotHardGuard = true;
-    config.requireDirectOverlapCost
-        = config.requireDirectOverlapCost || config.profile == PhaseSchedulerProfile::kLatencySafe;
-    config.enablePrefillSloRecovery = config.profile == PhaseSchedulerProfile::kLongPrefill;
-    config.enableWavefrontPrefillBatching = config.profile == PhaseSchedulerProfile::kLongPrefill;
-    config.decodeRecoveryPressureThreshold = config.profile == PhaseSchedulerProfile::kLatencySafe ? 0.9F : 0.8F;
-    if (config.profile == PhaseSchedulerProfile::kLatencySafe)
-    {
-        config.maxConsecutiveOverlapBatches = 1;
-        config.maxPredictedDecodeDebtUs = 10000.0;
-    }
-    else if (config.profile == PhaseSchedulerProfile::kBalanced || config.profile == PhaseSchedulerProfile::kAuto)
-    {
-        config.maxConsecutiveOverlapBatches = 2;
-        config.maxPredictedDecodeDebtUs = 25000.0;
-    }
-    if (config.profile == PhaseSchedulerProfile::kBalanced || config.profile == PhaseSchedulerProfile::kAuto)
-    {
-        config.minDynamicPrefillBatchSize = std::min(2, config.maxPrefillBatchSize);
-    }
-    else if (config.profile == PhaseSchedulerProfile::kLatencySafe)
-    {
-        config.minDynamicPrefillBatchSize = 1;
-    }
-}
-
-} // namespace
-
 size_t phaseDecodeReplacementRows(
     std::vector<uint64_t> const& selectedRequestIds, std::vector<uint64_t> const& previousRequestIds)
 {
@@ -119,7 +67,6 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     , mRecentDecodeTpotUs(std::make_shared<RecentDecodeTpot>())
     , mDecodeComponentObservationActive(mConfig.enableDecodeComponentObservation)
 {
-    applySchedulerProfile(mConfig);
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(
         mConfig.maxExternalPrefillBatchSize >= 0 && mConfig.maxExternalPrefillBatchSize <= mConfig.maxPrefillBatchSize,
@@ -132,8 +79,6 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     check::check(
         std::isfinite(mConfig.globalSafeProbeSlackMultiplier) && mConfig.globalSafeProbeSlackMultiplier >= 0.0F,
         "Global safe-probe slack multiplier must be finite and non-negative");
-    check::check(mConfig.globalExperimentalOverlapPercent >= -1 && mConfig.globalExperimentalOverlapPercent <= 100,
-        "Global experimental overlap percentage must be -1 or within [0, 100]");
     check::check(mConfig.globalCalibrationMaxOverlapKeys > 0U, "Global calibration overlap-key limit must be positive");
     check::check(mConfig.maxContinuationPrefillBatchSize >= 0
             && mConfig.maxContinuationPrefillBatchSize <= mConfig.maxPrefillBatchSize,
@@ -215,10 +160,6 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
         "Runtime contended decode cost multiplier must be finite and at least one");
     check::check(std::isfinite(mConfig.maxPredictedDecodeDebtUs) && mConfig.maxPredictedDecodeDebtUs >= 0.0,
         "Maximum predicted decode debt must be finite and non-negative");
-    check::check(mConfig.autoLongPrefillBacklogTokens > 0, "Auto-profile prefill backlog threshold must be positive");
-    check::check(std::isfinite(mConfig.autoDecodePressureLimit) && mConfig.autoDecodePressureLimit >= 0.0F
-            && mConfig.autoDecodePressureLimit <= 1.0F,
-        "Auto-profile decode pressure limit must be in [0, 1]");
     check::check(mConfig.maxPrefillCohortSize > 0, "Prefill cohort size must be positive");
     check::check(mConfig.maxPrefillCohortTurns > 0, "Prefill cohort turn limit must be positive");
     check::check(std::isfinite(mConfig.decodeSlackSafetyFactor) && mConfig.decodeSlackSafetyFactor > 0.0F
@@ -533,11 +474,6 @@ PhaseQueueSnapshot PhaseQueueScheduler::queueSnapshot(bool includeReadyDetails) 
 PhaseGlobalSchedulerMode PhaseQueueScheduler::globalSchedulerMode() const noexcept
 {
     return mConfig.globalSchedulerMode;
-}
-
-PhaseGlobalSelectionMode PhaseQueueScheduler::globalSelectionMode() const noexcept
-{
-    return mConfig.globalSelectionMode;
 }
 
 uint64_t PhaseQueueScheduler::globalPlanSequence() const noexcept
@@ -936,16 +872,9 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     double const remainingDecodeUs
         = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
     double const allowedInterferenceUs = remainingDecodeUs * mConfig.decodeSlackSafetyFactor;
-    bool const automaticLongPrefillRecovery = mConfig.profile == PhaseSchedulerProfile::kAuto
-        && state.prefillRemainingTokens >= mConfig.autoLongPrefillBacklogTokens
-        && state.decodeMaxSloPressure < mConfig.autoDecodePressureLimit;
-    bool const prefillRecovery = (mConfig.enablePrefillSloRecovery || automaticLongPrefillRecovery)
+    bool const prefillRecovery = mConfig.enablePrefillSloRecovery
         && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
-    // The opt-in experiment exposes every executable P+D shape to the global
-    // hard-feasibility filter. Production interference/debt policy remains the
-    // default and is still measured by the ordinary -1 configuration.
-    bool const experimentalEnvelope = overlap && mConfig.globalExperimentalOverlapPercent >= 0;
-    if (!experimentalEnvelope && overlap && mConfig.enableTpotHardGuard
+    if (overlap && mConfig.enableTpotHardGuard
         && mConsecutiveOverlapBatches >= mConfig.maxConsecutiveOverlapBatches)
     {
         return -1;
@@ -956,9 +885,8 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         double const candidateInterferenceUs = static_cast<double>(candidate.decodeInterferenceMs) * 1000.0;
         bool const debtFeasible = mConfig.maxPredictedDecodeDebtUs == 0.0
             || mPredictedDecodeDebtUs + candidateInterferenceUs <= mConfig.maxPredictedDecodeDebtUs;
-        bool const feasible = experimentalEnvelope
-            || ((prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
-                && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible));
+        bool const feasible = (prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
+            && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible);
         if (!feasible)
         {
             continue;
@@ -1586,7 +1514,7 @@ PhaseDispatchPlan PhaseQueueScheduler::previewMechanismPlan(PhaseDispatchKind ki
 
 std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::selectGlobalQueueAction(
     PhaseQueueSnapshot const& state, bool allowPrefill, bool allowDecode, bool allowOverlap,
-    std::optional<PhaseDispatchKind> compatibilityKind)
+    std::optional<PhaseDispatchKind> requiredKind)
 {
     if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled)
     {
@@ -2003,8 +1931,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         }
     };
     std::vector<PhaseGlobalActionCandidate> candidates;
-    std::optional<size_t> experimentalOverlapIndex;
-    bool experimentalOverlapMode{};
     if (allowPrefill && prefill.has_value())
     {
         PhaseGlobalActionCandidate candidate;
@@ -2105,9 +2031,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         && overlapDecode.has_value())
     {
         ++mTelemetry.globalOverlapOpportunityCount;
-        experimentalOverlapMode = !mGlobalWarmupProbeMode
-            && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
-            && mConfig.globalExperimentalOverlapPercent >= 0;
         PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows, overlapDecodeRows,
             overlapPrefillChunk, contextBucket(overlapPrefillPastKV), contextBucket(overlapDecodeMaxContext)};
         overlapKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
@@ -2242,7 +2165,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         phaseGlobalFinalizeCandidate(candidate);
         candidate.overlapCostKnown = overlapMeasured;
         candidate.overlapCostProfitable = overlapProfitable;
-        candidate.safeProbeEligible = safeProbe || experimentalOverlapMode;
+        candidate.safeProbeEligible = safeProbe;
         candidate.calibrationProbe = calibrationProbe;
         candidate.predictedBlockingUs = overlap.makespanUs;
         candidate.predictedMakespanUs = overlap.makespanUs;
@@ -2258,9 +2181,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
         PhaseContextualPairDirection const contextualDirection
             = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
-        bool const contextualLineageEnabled
-            = overlapPrefillClass != PhasePrefillClass::kExternal || mConfig.enableExternalContextualPd;
-        if (contextualMode != PhaseContextualPdMode::kDisabled && contextualLineageEnabled)
+        if (contextualMode != PhaseContextualPdMode::kDisabled)
         {
             // Once E has completed, an external/VLM prefill is ordinary P
             // work for this pair action. Its TTFT remains protected below,
@@ -2317,10 +2238,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 = prefill->makespanUs + decode->makespanUs + decodeFormation->newlyProduced.makespanUs;
         }
         candidates.push_back(std::move(candidate));
-        if (experimentalOverlapMode)
-        {
-            experimentalOverlapIndex = candidates.size() - 1U;
-        }
     }
 
     ++mGlobalDecisionSequence;
@@ -2345,8 +2262,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             decision = mGlobalScheduler.select(candidates);
         }
     }
-    else if (mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
-        && compatibilityKind.has_value())
+    else if (requiredKind.has_value())
     {
         auto candidateKind = [](PhaseGlobalActionKind kind) {
             PhaseDispatchKind result{PhaseDispatchKind::kNone};
@@ -2367,11 +2283,11 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         decision.hardFeasibleCandidates = candidates.size();
         decision.deadlineSafeCandidates = candidates.size();
         auto const selected = std::find_if(candidates.begin(), candidates.end(),
-            [&](auto const& candidate) { return candidateKind(candidate.key.kind) == *compatibilityKind; });
+            [&](auto const& candidate) { return candidateKind(candidate.key.kind) == *requiredKind; });
         if (selected != candidates.end())
         {
             decision.selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), selected));
-            decision.reason = PhaseGlobalDecisionReason::kLegacyCompatibility;
+            decision.reason = PhaseGlobalDecisionReason::kDeadlineSafeEfficiency;
             double const makespanUs
                 = selected->predictedHorizonUs > 0.0 ? selected->predictedHorizonUs : selected->predictedMakespanUs;
             double const referenceUs
@@ -2387,7 +2303,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         decision = mGlobalScheduler.select(candidates);
     }
-    if (!mGlobalWarmupProbeMode && !experimentalOverlapMode
+    if (!mGlobalWarmupProbeMode
         && mRuntimeCostTracker->contextualPdConfig().mode != PhaseContextualPdMode::kDisabled)
     {
         auto const overlap = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
@@ -2401,7 +2317,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 && candidates[*decision.selectedIndex].key.kind == PhaseGlobalActionKind::kPrefillDecode;
             bool const contextualControlsDecision = phaseContextualPdControlsDecision(producerCriticalPath);
             bool const contextualOverlap = overlap->contextualPdLowerConfidenceBound > 0.0;
-            mTelemetry.contextualPdShadowDisagreementCount
+            mTelemetry.contextualPdDecisionDisagreementCount
                 += contextualControlsDecision && contextualOverlap != selectedOverlap ? 1U : 0U;
             if (contextualControlsDecision)
             {
@@ -2409,46 +2325,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     = phaseContextualPairDirection(overlap->key.kind, overlap->key.residualAnchor);
                 mRuntimeCostTracker->recordContextualDirectionSelection(
                     direction, selectedOverlap, overlap->contextualPdExploration);
-            }
-        }
-    }
-    if (experimentalOverlapMode)
-    {
-        bool overlapSelected{};
-        if (experimentalOverlapIndex.has_value())
-        {
-            PhaseGlobalDecision const feasible = mGlobalScheduler.select({candidates[*experimentalOverlapIndex]});
-            if (feasible.selectedIndex.has_value())
-            {
-                ++mTelemetry.globalExperimentalOverlapOpportunityCount;
-                bool const experimentalSelection = phaseGlobalSelectExperimentalOverlap(
-                    mConfig.globalExperimentalOverlapPercent, mGlobalExperimentalOverlapAccumulator);
-                if (experimentalSelection)
-                {
-                    decision = feasible;
-                    decision.selectedIndex = *experimentalOverlapIndex;
-                    decision.reason = PhaseGlobalDecisionReason::kExperimentalOverlap;
-                    overlapSelected = true;
-                    ++mTelemetry.globalExperimentalOverlapSelectionCount;
-                }
-            }
-        }
-        if (!overlapSelected)
-        {
-            std::vector<PhaseGlobalActionCandidate> serialCandidates;
-            std::vector<size_t> serialIndices;
-            for (size_t index{}; index < candidates.size(); ++index)
-            {
-                if (candidates[index].key.kind != PhaseGlobalActionKind::kPrefillDecode)
-                {
-                    serialCandidates.push_back(candidates[index]);
-                    serialIndices.push_back(index);
-                }
-            }
-            decision = mGlobalScheduler.select(serialCandidates);
-            if (decision.selectedIndex.has_value())
-            {
-                decision.selectedIndex = serialIndices[*decision.selectedIndex];
             }
         }
     }
@@ -2489,9 +2365,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     case PhaseGlobalActionKind::kPrefillDecode: kind = PhaseDispatchKind::kOverlap; break;
     default: break;
     }
-    bool const experimentalSelection = decision.reason == PhaseGlobalDecisionReason::kExperimentalOverlap;
-    bool const safeProbe = experimentalSelection || selected.calibrationProbe
-        || (selected.safeProbeEligible && !selected.overlapCostKnown);
+    bool const safeProbe
+        = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
@@ -2766,10 +2641,7 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
 std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalAction()
 {
     PhaseQueueSnapshot const state = snapshot();
-    std::optional<GlobalQueueSelection> const selection = selectGlobalQueueAction(state, true, true, true,
-        mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
-            ? std::optional<PhaseDispatchKind>(legacyQueueDecision(state))
-            : std::nullopt);
+    std::optional<GlobalQueueSelection> const selection = selectGlobalQueueAction(state, true, true, true);
     mLastGlobalPreviewCandidates
         = selection.has_value() ? selection->candidateFrontier : std::vector<PhaseGlobalActionCandidate>{};
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
@@ -2798,7 +2670,6 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     PhaseGlobalActionCandidate const& launched, double elapsedUs)
 {
     if (mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kActive
-        || mConfig.globalSelectionMode != PhaseGlobalSelectionMode::kProfileFree
         || (launched.key.kind != PhaseGlobalActionKind::kPrefill
             && launched.key.kind != PhaseGlobalActionKind::kDecode))
     {
@@ -2896,10 +2767,7 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         && (deadlineRecovery || slackSafe);
 
     PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
-    bool const contextualLineageEnabled
-        = prefill.key.primaryWorkClass != static_cast<int32_t>(PhasePrefillClass::kExternal)
-        || mConfig.enableExternalContextualPd;
-    if (contextualMode != PhaseContextualPdMode::kDisabled && contextualLineageEnabled)
+    if (contextualMode != PhaseContextualPdMode::kDisabled)
     {
         // Residual P+D augmentation is producer-agnostic once the P row is
         // runnable. External/VLM rows have already satisfied their E -> P
@@ -3188,9 +3056,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     auto const decisionStart = std::chrono::steady_clock::now();
     refreshExternalDrainPreference();
     PhaseQueueSnapshot const state = snapshot();
-    bool const profileFreeProduction = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
-        && mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kProfileFree
-        && !mConfig.enableExternalDrainPreference;
+    bool const profileFreeProduction
+        = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && !mConfig.enableExternalDrainPreference;
     PhaseDispatchKind const baseline = profileFreeProduction ? PhaseDispatchKind::kNone : legacyQueueDecision(state);
     bool drainPreferenceApplied{};
     PhaseDispatchKind const legacyKind = profileFreeProduction
@@ -3208,7 +3075,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     bool const singleLocalPhase = (state.prefillQueued > 0U) != (state.decodeQueued > 0U);
     bool const workConservingSinglePhase = mConfig.elideVacuousGlobalDecisions
         && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
-        && mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kProfileFree && singleLocalPhase
+        && singleLocalPhase
         && (!mConfig.globalMemoryHorizonSupplier || mConfig.globalDispatchUsesPreReservedMemory)
         && !mGlobalWarmupProbeMode && !mNextGlobalAction.has_value();
     if (mNextGlobalAction.has_value())
@@ -3257,10 +3124,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         kind = state.prefillQueued > 0U ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
         drainPreferenceApplied = false;
     }
-    else if (std::optional<GlobalQueueSelection> const global = selectGlobalQueueAction(state, true, true, true,
-                 mConfig.globalSelectionMode == PhaseGlobalSelectionMode::kLegacyCompatibility
-                     ? std::optional<PhaseDispatchKind>(legacyKind)
-                     : std::nullopt))
+    else if (std::optional<GlobalQueueSelection> const global = selectGlobalQueueAction(state, true, true, true))
     {
         plan.globalDecisionEvaluated = true;
         plan.globalSelectedAction = global->candidate.key;
@@ -3275,11 +3139,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.contextualPdUncertainty = global->candidate.contextualPdUncertainty;
         plan.contextualPdLowerConfidenceBound = global->candidate.contextualPdLowerConfidenceBound;
         plan.globalSafeProbe = global->safeProbe;
-        if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kShadow)
-        {
-            mTelemetry.globalShadowDisagreementCount += global->kind != legacyKind ? 1U : 0U;
-        }
-        else if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
+        if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
         {
             kind = global->kind;
             appliedGlobalAction = global->candidate;
@@ -4220,7 +4080,6 @@ void PhaseQueueScheduler::resetSchedulingHistory()
     mGlobalPlanSequence = 0U;
     mGlobalSnapshotEpoch = 0U;
     mLastGlobalSafeProbeSequence = 0U;
-    mGlobalExperimentalOverlapAccumulator = 0U;
     mNextGlobalAction.reset();
     mNextGlobalDispatchPlan.reset();
 }

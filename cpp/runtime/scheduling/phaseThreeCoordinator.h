@@ -20,7 +20,6 @@
 #include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/phase/policy/phaseFormationPlanner.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
-#include "runtime/scheduling/phaseCudaDirectionalGate.h"
 #include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 
@@ -106,18 +105,6 @@ struct PhaseThreeCoordinatorConfig
     //! Zero explicitly disables production probes.
     float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
-    //! Research-only exact percentage of hard-feasible residual P+D opportunities.
-    //! Negative preserves production policy; zero through 100 controls the sweep.
-    int32_t globalExperimentalOverlapPercent{-1};
-    //! Research-only exact percentage of hard-feasible E+P opportunities.
-    int32_t globalExperimentalEncoderPrefillOverlapPercent{-1};
-    //! Research-only exact percentage of hard-feasible E+D opportunities.
-    int32_t globalExperimentalEncoderDecodeOverlapPercent{-1};
-    //! Research-only one-shot causal branch override. Zero disables replay.
-    size_t globalReplayDecisionSequence{};
-    PhaseGlobalActionKind globalReplayActionKind{PhaseGlobalActionKind::kNone};
-    //! Research-only M2 launch order and host-delay control. Disabled by default.
-    PhaseDirectionalInjectionControl directionalInjection;
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     int32_t globalDecodeContextBucketTokens{512};
@@ -125,10 +112,6 @@ struct PhaseThreeCoordinatorConfig
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
     bool enableGlobalEncoderPrefillAction{};
-    //! Compare serial and overlap actions over the same bounded current-plus-successor work.
-    //! The immutable transition uses only current ready rows and concrete,
-    //! already-outstanding completion events. It never predicts future arrivals.
-    bool enableGlobalFormationAwareSelection{};
     //! Number of actual dispatches attributed after an H=2/myopic selection
     //! change. The selected action is the first dispatch in the horizon.
     size_t globalFormationRealizedDispatches{4U};
@@ -309,7 +292,6 @@ struct PhaseThreeCoordinatorMetrics
     size_t exclusiveEncoderBatches{};
     size_t exclusiveEncoderPrefillDeferrals{};
     size_t globalDecisions{};
-    size_t globalShadowDisagreements{};
     size_t globalEncoderSelections{};
     size_t globalEncoderPrefillSelections{};
     size_t globalEncoderDecodeSelections{};
@@ -327,12 +309,6 @@ struct PhaseThreeCoordinatorMetrics
     size_t globalResidualMeasuredUnprofitableOpportunities{};
     size_t globalResidualMeasuredUnprofitableSelections{};
     size_t globalResidualCoveringCostHits{};
-    size_t globalExperimentalResidualPrefillDecodeOpportunities{};
-    size_t globalExperimentalResidualPrefillDecodeSelections{};
-    size_t globalExperimentalEncoderPrefillOpportunities{};
-    size_t globalExperimentalEncoderPrefillSelections{};
-    size_t globalExperimentalEncoderDecodeOpportunities{};
-    size_t globalExperimentalEncoderDecodeSelections{};
     size_t globalPdSelections{};
     size_t globalSafeProbes{};
     size_t globalEncoderOverlapOpportunities{};
@@ -406,7 +382,7 @@ struct PhaseThreeCoordinatorMetrics
     double lastGlobalFormationRealizedHorizonCompletionVisibleUs{};
     double lastGlobalFormationRealizedDecodeServiceViolationUs{};
     size_t contextualEpReady{};
-    size_t contextualEpShadowDisagreements{};
+    size_t contextualEpDecisionDisagreements{};
     size_t contextualEpPredictions{};
     size_t contextualEpObservations{};
     size_t contextualEpRejectedObservations{};
@@ -418,7 +394,7 @@ struct PhaseThreeCoordinatorMetrics
     double contextualEpLastUncertainty{};
     double contextualEpLastLowerConfidenceBound{};
     size_t contextualEdReady{};
-    size_t contextualEdShadowDisagreements{};
+    size_t contextualEdDecisionDisagreements{};
     size_t contextualEdPredictions{};
     size_t contextualEdObservations{};
     size_t contextualEdRejectedObservations{};
@@ -666,7 +642,6 @@ private:
     IndependentPhaseAsyncServer& mServer;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
     PhaseThreeCoordinatorConfig mConfig;
-    PhaseCudaDirectionalGate mDirectionalCudaGate;
     PhaseGlobalScheduler mGlobalScheduler;
     std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
     PhaseMemoryBroker mMemoryBroker;
@@ -754,8 +729,6 @@ private:
     uint64_t mEncoderPlanId{};
     uint64_t mEncoderActionId{};
     PhaseGlobalActionKind mEncoderActionKind{PhaseGlobalActionKind::kNone};
-    bool mDirectionalInjectionFrontierReleased{};
-    std::optional<uint64_t> mDirectionalInjectionPlanId;
     size_t mReadyPrefillTokens{};
     size_t mAdmissionProfilePrefillTokens{};
     size_t mEstimatedPromptTokens{};
@@ -819,7 +792,6 @@ private:
     PhaseMemoryBrokerReason mMemoryBrokerLastReason{PhaseMemoryBrokerReason::kDisabled};
     std::chrono::steady_clock::time_point mLastForcedEncoderStart;
     size_t mGlobalDecisions{};
-    size_t mGlobalShadowDisagreements{};
     size_t mGlobalEncoderSelections{};
     size_t mGlobalEncoderPrefillSelections{};
     size_t mGlobalEncoderDecodeSelections{};
@@ -837,15 +809,6 @@ private:
     size_t mGlobalResidualMeasuredUnprofitableOpportunities{};
     size_t mGlobalResidualMeasuredUnprofitableSelections{};
     size_t mGlobalResidualCoveringCostHits{};
-    size_t mGlobalExperimentalResidualPrefillDecodeOpportunities{};
-    size_t mGlobalExperimentalResidualPrefillDecodeSelections{};
-    size_t mGlobalExperimentalResidualPrefillDecodeAccumulator{};
-    size_t mGlobalExperimentalEncoderPrefillOpportunities{};
-    size_t mGlobalExperimentalEncoderPrefillSelections{};
-    size_t mGlobalExperimentalEncoderPrefillAccumulator{};
-    size_t mGlobalExperimentalEncoderDecodeOpportunities{};
-    size_t mGlobalExperimentalEncoderDecodeSelections{};
-    size_t mGlobalExperimentalEncoderDecodeAccumulator{};
     size_t mGlobalPdSelections{};
     size_t mGlobalSafeProbes{};
     size_t mGlobalEncoderOverlapOpportunities{};
@@ -883,9 +846,9 @@ private:
     double mGlobalFormationPredictedRegretUs{};
     double mMaxGlobalFormationPredictedRegretUs{};
     size_t mContextualEpReady{};
-    size_t mContextualEpShadowDisagreements{};
+    size_t mContextualEpDecisionDisagreements{};
     size_t mContextualEdReady{};
-    size_t mContextualEdShadowDisagreements{};
+    size_t mContextualEdDecisionDisagreements{};
     size_t mLastGlobalFormationPredictedRows{};
     double mLastGlobalFormationHorizonUs{};
     double mLastGlobalFormationCostGapUs{};
@@ -911,7 +874,6 @@ private:
     std::unordered_map<uint64_t, PhaseExecutionSet> mUnifiedAllowedOutstandingByExecution;
     size_t mLastGlobalSafeProbeSequence{};
     bool mGlobalWarmupProbeMode{};
-    bool mGlobalReplayApplied{};
 };
 
 } // namespace trt_edgellm::rt

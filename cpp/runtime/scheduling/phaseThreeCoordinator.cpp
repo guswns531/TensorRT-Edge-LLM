@@ -41,16 +41,7 @@ namespace
 constexpr uint64_t kTHREE_PHASE_PLAN_NAMESPACE = uint64_t{1U} << 63U;
 constexpr uint64_t kTHREE_PHASE_EXECUTION_NAMESPACE = uint64_t{1U} << 62U;
 
-uint64_t remainingDirectionalDelayUs(uint64_t requestedDelayUs, uint64_t incumbentDispatchHostNs) noexcept
-{
-    uint64_t const currentTimestampNs = phaseTimelineNowNs();
-    uint64_t const elapsedUs
-        = currentTimestampNs > incumbentDispatchHostNs ? (currentTimestampNs - incumbentDispatchHostNs) / 1000U : 0U;
-    return requestedDelayUs > elapsedUs ? requestedDelayUs - elapsedUs : 0U;
-}
-
-PhaseUnifiedActionDirection phaseInitialDirection(
-    PhaseGlobalActionKind action, PhaseDirectionalInjectionControl const& injection) noexcept
+PhaseUnifiedActionDirection phaseInitialDirection(PhaseGlobalActionKind action) noexcept
 {
     PhaseUnifiedActionDirection canonical{PhaseUnifiedActionDirection::kIdleLaunch};
     switch (action)
@@ -64,20 +55,11 @@ PhaseUnifiedActionDirection phaseInitialDirection(
     case PhaseGlobalActionKind::kDecode:
     case PhaseGlobalActionKind::kWait: break;
     }
-    if (injection.enabled() && phaseUnifiedDirectionsSharePair(canonical, injection.direction))
-    {
-        return injection.direction;
-    }
     return canonical;
 }
 
-PhaseStartSkewBucket phaseRequestedStartSkew(PhaseDirectionalInjectionControl const& injection,
-    PhaseUnifiedActionDirection direction, double elapsedUs = 0.0, double referenceUs = 0.0) noexcept
+PhaseStartSkewBucket phaseRequestedStartSkew(double elapsedUs = 0.0, double referenceUs = 0.0) noexcept
 {
-    if (injection.enabled() && phaseUnifiedDirectionsSharePair(direction, injection.direction))
-    {
-        return phaseStartSkewBucketFromFraction(injection.targetFraction, true);
-    }
     if (referenceUs > 0.0)
     {
         return phaseStartSkewBucketFromFraction(elapsedUs / referenceUs, true);
@@ -713,31 +695,6 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         "Global vision-prefill cold-start cost must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.globalSafeProbeSlackMultiplier) && mConfig.globalSafeProbeSlackMultiplier >= 0.0F,
         "Global overlap safe-probe slack multiplier must be finite and non-negative");
-    ELLM_CHECK(mConfig.globalExperimentalOverlapPercent >= -1 && mConfig.globalExperimentalOverlapPercent <= 100,
-        "Global experimental overlap percentage must be -1 or between zero and 100");
-    ELLM_CHECK(mConfig.globalExperimentalEncoderPrefillOverlapPercent >= -1
-            && mConfig.globalExperimentalEncoderPrefillOverlapPercent <= 100,
-        "Global experimental E+P overlap percentage must be -1 or between zero and 100");
-    ELLM_CHECK(mConfig.globalExperimentalEncoderDecodeOverlapPercent >= -1
-            && mConfig.globalExperimentalEncoderDecodeOverlapPercent <= 100,
-        "Global experimental E+D overlap percentage must be -1 or between zero and 100");
-    // The deterministic P6 static-policy ablation intentionally controls
-    // both E+P and E+D. Each family is filtered in order below and the final
-    // selection still passes the normal feasibility and single-inflight
-    // checks, so enabling both does not weaken execution correctness.
-    ELLM_CHECK(std::isfinite(mConfig.directionalInjection.targetFraction)
-            && mConfig.directionalInjection.targetFraction >= 0.0 && mConfig.directionalInjection.targetFraction <= 1.0,
-        "Directional injection target fraction must be finite and within [0, 1]");
-    ELLM_CHECK(std::isfinite(mConfig.directionalInjection.incumbentReferenceUs)
-            && mConfig.directionalInjection.incumbentReferenceUs >= 0.0,
-        "Directional injection incumbent reference must be finite and non-negative");
-    ELLM_CHECK(std::isfinite(mConfig.directionalInjection.newcomerReferenceUs)
-            && mConfig.directionalInjection.newcomerReferenceUs >= 0.0,
-        "Directional injection newcomer reference must be finite and non-negative");
-    ELLM_CHECK(!mConfig.directionalInjection.enabled()
-            || (mConfig.directionalInjection.incumbentReferenceUs > 0.0
-                && mConfig.directionalInjection.newcomerReferenceUs > 0.0),
-        "Enabled directional injection requires positive isolated phase references");
     ELLM_CHECK(mConfig.globalCalibrationMaxOverlapKeys > 0U, "Global calibration overlap-key limit must be positive");
     ELLM_CHECK(mConfig.globalFormationRealizedDispatches > 0U, "Global formation realized horizon must be positive");
     ELLM_CHECK(mConfig.globalDecodeContextBucketTokens > 0, "Global overlap context bucket must be positive");
@@ -872,7 +829,6 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
             return horizon;
         });
     }
-    mServer.setDirectionalInjectionControl(mConfig.directionalInjection);
     mEffectiveEncodedCapacity = mConfig.maxEncodedInFlight;
     mMaxEffectiveEncodedCapacity = mEffectiveEncodedCapacity;
 }
@@ -987,8 +943,8 @@ bool PhaseThreeCoordinator::poll()
         && mRequestIds.empty() && mPending.empty() && mEncoding.empty() && mReadyPrefill.empty()
         && mDownstreamRequestBytes.empty() && !mVision.busy() && !mEncoderPreparation.valid()
         && mPreparedEncoder == nullptr && !mGlobalExecutionLease.has_value()
-        && !mPendingGlobalOverlapObservation.has_value() && !mConfig.enableGlobalFormationAwareSelection
-        && !mConfig.directionalInjection.enabled() && !mUnifiedEventCallback && !mFormationEpisodeCallback;
+        && !mPendingGlobalOverlapObservation.has_value() && !phasePolicyUsesTransition(mConfig.policyMode)
+        && !mUnifiedEventCallback && !mFormationEpisodeCallback;
     if (pdOnlyFastPath)
     {
         // Project an E-empty global state directly onto the common P/D actor.
@@ -1057,18 +1013,6 @@ bool PhaseThreeCoordinator::poll()
         }
         bool const globalProgress = dispatchGlobalAction();
         progressed = globalProgress || progressed;
-        if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kShadow)
-        {
-            if (!mConfig.enableEncoderDispatchArbitration)
-            {
-                progressed = startNextEncoder() || progressed;
-            }
-            progressed = mServer.dispatchReady() || progressed;
-            if (mConfig.enableEncoderDispatchArbitration)
-            {
-                progressed = startNextEncoder() || progressed;
-            }
-        }
     }
     else if (mConfig.enableEncoderDispatchArbitration)
     {
@@ -1172,7 +1116,6 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.exclusiveEncoderBatches = mExclusiveEncoderBatches;
     result.exclusiveEncoderPrefillDeferrals = mExclusiveEncoderPrefillDeferrals;
     result.globalDecisions = mGlobalDecisions;
-    result.globalShadowDisagreements = mGlobalShadowDisagreements;
     result.globalEncoderSelections = mGlobalEncoderSelections;
     result.globalEncoderPrefillSelections = mGlobalEncoderPrefillSelections;
     result.globalEncoderDecodeSelections = mGlobalEncoderDecodeSelections;
@@ -1190,12 +1133,6 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.globalResidualMeasuredUnprofitableOpportunities = mGlobalResidualMeasuredUnprofitableOpportunities;
     result.globalResidualMeasuredUnprofitableSelections = mGlobalResidualMeasuredUnprofitableSelections;
     result.globalResidualCoveringCostHits = mGlobalResidualCoveringCostHits;
-    result.globalExperimentalResidualPrefillDecodeOpportunities = mGlobalExperimentalResidualPrefillDecodeOpportunities;
-    result.globalExperimentalResidualPrefillDecodeSelections = mGlobalExperimentalResidualPrefillDecodeSelections;
-    result.globalExperimentalEncoderPrefillOpportunities = mGlobalExperimentalEncoderPrefillOpportunities;
-    result.globalExperimentalEncoderPrefillSelections = mGlobalExperimentalEncoderPrefillSelections;
-    result.globalExperimentalEncoderDecodeOpportunities = mGlobalExperimentalEncoderDecodeOpportunities;
-    result.globalExperimentalEncoderDecodeSelections = mGlobalExperimentalEncoderDecodeSelections;
     result.globalPdSelections = mGlobalPdSelections;
     result.globalSafeProbes = mGlobalSafeProbes;
     result.globalEncoderOverlapOpportunities = mGlobalEncoderOverlapOpportunities;
@@ -1286,7 +1223,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     PhaseContextualPdTelemetry const& epTelemetry
         = mRuntimeCostTracker->contextualPairTelemetry(PhaseContextualPairKind::kEncoderPrefill);
     result.contextualEpReady = mContextualEpReady;
-    result.contextualEpShadowDisagreements = mContextualEpShadowDisagreements;
+    result.contextualEpDecisionDisagreements = mContextualEpDecisionDisagreements;
     result.contextualEpPredictions = epTelemetry.predictions;
     result.contextualEpObservations = epTelemetry.observations;
     result.contextualEpRejectedObservations = epTelemetry.rejectedObservations;
@@ -1300,7 +1237,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     PhaseContextualPdTelemetry const& edTelemetry
         = mRuntimeCostTracker->contextualPairTelemetry(PhaseContextualPairKind::kEncoderDecode);
     result.contextualEdReady = mContextualEdReady;
-    result.contextualEdShadowDisagreements = mContextualEdShadowDisagreements;
+    result.contextualEdDecisionDisagreements = mContextualEdDecisionDisagreements;
     result.contextualEdPredictions = edTelemetry.predictions;
     result.contextualEdObservations = edTelemetry.observations;
     result.contextualEdRejectedObservations = edTelemetry.rejectedObservations;
@@ -1524,9 +1461,6 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.requestedStartSkewPercent = static_cast<int32_t>(plan.incrementalAction.key.startSkew);
     event.requestedDirection = plan.incrementalAction.key.direction;
     event.actionKind = candidate.key.kind;
-    event.causalReplayForced = mConfig.globalReplayDecisionSequence > 0U
-        && mGlobalDecisionSequence == mConfig.globalReplayDecisionSequence
-        && candidate.key.kind == mConfig.globalReplayActionKind;
     event.selectedActionId = candidate.candidateId;
     event.cohort = unifiedCandidateWork(candidate);
     event.requestIds = candidate.requestIds;
@@ -1886,24 +1820,6 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
             dispatch.incumbentPhase = incumbent->phase;
             dispatch.incumbentExecutionId = incumbent->executionId;
         }
-        bool const injectionPair
-            = phaseUnifiedDirectionsSharePair(dispatch.direction, mConfig.directionalInjection.direction);
-        if (injectionPair && !mDirectionalInjectionPlanId.has_value())
-        {
-            mDirectionalInjectionPlanId = dispatch.planId;
-        }
-        bool const selectedInjectionPlan
-            = mDirectionalInjectionPlanId.has_value() && dispatch.planId == *mDirectionalInjectionPlanId;
-        bool const plannedInjectionNewcomer
-            = work.phase == phaseUnifiedDirectionNewcomerPhase(mConfig.directionalInjection.direction);
-        if (selectedInjectionPlan && plannedInjectionNewcomer)
-        {
-            dispatch.injectionTargetFraction = mConfig.directionalInjection.targetFraction;
-            dispatch.injectionRequestedDirection = mConfig.directionalInjection.direction;
-            dispatch.injectionIncumbentReferenceUs = mConfig.directionalInjection.incumbentReferenceUs;
-            dispatch.injectionNewcomerReferenceUs = mConfig.directionalInjection.newcomerReferenceUs;
-            dispatch.requestedInjectionDelayUs = mConfig.directionalInjection.requestedDelayUs;
-        }
         dispatch.cohort = work.work;
         dispatch.requestIds = work.requestIds;
         dispatch.enqueueHostNs = work.dispatchHostNs;
@@ -2047,9 +1963,8 @@ PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(
 {
     ELLM_CHECK(!mGlobalExecutionLease.has_value(), "A global execution lease is already active");
     PhaseExecutionSet const outstandingBefore = observedGlobalExecution();
-    PhaseUnifiedActionDirection const direction
-        = phaseInitialDirection(candidate.key.kind, mConfig.directionalInjection);
-    PhaseStartSkewBucket const startSkew = phaseRequestedStartSkew(mConfig.directionalInjection, direction);
+    PhaseUnifiedActionDirection const direction = phaseInitialDirection(candidate.key.kind);
+    PhaseStartSkewBucket const startSkew = phaseRequestedStartSkew();
     PhaseGlobalDispatchPlan plan = phaseGlobalDispatchPlan(kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence,
         kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch, candidate, outstandingBefore, direction, startSkew);
     ELLM_CHECK(plan.allowedOutstanding != PhaseExecutionSet::kNone, "A dispatch lease requires executable phases");
@@ -2141,7 +2056,6 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         return false;
     }
     mActiveGlobalPdExecution->lastResidualPdCandidateId = missing->candidateId;
-    bool const experimentalMode = !mGlobalWarmupProbeMode && mConfig.globalExperimentalOverlapPercent >= 0;
     ++mGlobalResidualPrefillDecodeOpportunities;
 
     double const elapsedUs = std::chrono::duration<double, std::micro>(
@@ -2270,7 +2184,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
             || protectedSlackUs < robustSerialUs);
     overlap.overlapCostKnown = overlapMeasured;
     overlap.overlapCostProfitable = overlapProfitable;
-    overlap.safeProbeEligible = safeProbe || experimentalMode;
+    overlap.safeProbeEligible = safeProbe;
     PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
     bool const externalPrefillLineage
         = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
@@ -2349,7 +2263,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     ++mGlobalDecisions;
     std::vector<PhaseGlobalActionCandidate> const candidates{active, overlap};
     PhaseGlobalDecision decision = mGlobalScheduler.select(candidates);
-    if (!experimentalMode && contextualMode != PhaseContextualPdMode::kDisabled)
+    if (contextualMode != PhaseContextualPdMode::kDisabled)
     {
         bool const selectedOverlap = decision.selectedIndex.has_value() && *decision.selectedIndex == 1U;
         bool const contextualControlsDecision = phaseContextualPdControlsDecision(producerCriticalPath);
@@ -2360,24 +2274,6 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
             mRuntimeCostTracker->recordContextualDirectionSelection(
                 direction, selectedOverlap, overlap.contextualPdExploration);
         }
-    }
-    if (experimentalMode)
-    {
-        PhaseGlobalDecision const feasible = mGlobalScheduler.select({overlap});
-        if (!feasible.selectedIndex.has_value())
-        {
-            return false;
-        }
-        ++mGlobalExperimentalResidualPrefillDecodeOpportunities;
-        bool const experimentalSelection = phaseGlobalSelectExperimentalOverlap(
-            mConfig.globalExperimentalOverlapPercent, mGlobalExperimentalResidualPrefillDecodeAccumulator);
-        if (!experimentalSelection)
-        {
-            return false;
-        }
-        decision = feasible;
-        decision.selectedIndex = 1U;
-        decision.reason = PhaseGlobalDecisionReason::kExperimentalOverlap;
     }
     bool const effectiveSafeProbe = safeProbe;
     if (!decision.selectedIndex.has_value() || *decision.selectedIndex != 1U)
@@ -2394,10 +2290,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     uint64_t const snapshotEpoch = kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch;
     double const referenceUs = std::max(mActiveGlobalPdExecution->candidate.predictedMakespanUs,
         mActiveGlobalPdExecution->candidate.predictedBlockingUs);
-    PhaseUnifiedActionDirection const incrementalDirection
-        = addDecode ? PhaseUnifiedActionDirection::kPrefillToDecode : PhaseUnifiedActionDirection::kDecodeToPrefill;
-    PhaseStartSkewBucket const startSkew
-        = phaseRequestedStartSkew(mConfig.directionalInjection, incrementalDirection, elapsedUs, referenceUs);
+    PhaseStartSkewBucket const startSkew = phaseRequestedStartSkew(elapsedUs, referenceUs);
     std::optional<PhaseGlobalDispatchPlan> const augmented
         = phaseGlobalAugmentedDispatchPlan(planId, snapshotEpoch, *mGlobalExecutionLease, overlap, startSkew);
     ELLM_CHECK(augmented.has_value(), "Residual P/D augmentation does not match the active phase rows");
@@ -2407,10 +2300,6 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     {
         mUnifiedDecisionByPlan.erase(planId);
         return false;
-    }
-    if (experimentalMode)
-    {
-        ++mGlobalExperimentalResidualPrefillDecodeSelections;
     }
     mGlobalExecutionLease = *augmented;
     mActiveGlobalPdExecution.reset();
@@ -2523,32 +2412,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     auto const& encoderRequest = [&](size_t index) -> PendingVisionRequest const& {
         return preparedEncoderReady ? mEncoding[index] : mPending[index];
     };
-    PhaseUnifiedPhase const requestedIncumbent
-        = phaseUnifiedDirectionIncumbentPhase(mConfig.directionalInjection.direction);
-    PhaseUnifiedPhase const requestedNewcomer
-        = phaseUnifiedDirectionNewcomerPhase(mConfig.directionalInjection.direction);
-    if (!mDirectionalInjectionFrontierReleased && requestedIncumbent == PhaseUnifiedPhase::kEncoder
-        && ((requestedNewcomer == PhaseUnifiedPhase::kPrefill && !prefillForEncoder.has_value())
-            || (requestedNewcomer == PhaseUnifiedPhase::kDecode && !decodeForEncoder.has_value())))
-    {
-        // Let prerequisite phase work mature without consuming the queued E
-        // cohort that defines the controlled incumbent frontier.
-        encoderBatchIndices.clear();
-    }
-    if (!mDirectionalInjectionFrontierReleased && encoderBatchIndices.empty() && pd.has_value()
-        && requestedIncumbent == PhaseUnifiedPhase::kEncoder)
-    {
-        PhaseUnifiedPhase const heldPhase = pd->key.kind == PhaseGlobalActionKind::kPrefill
-            ? PhaseUnifiedPhase::kPrefill
-            : pd->key.kind == PhaseGlobalActionKind::kDecode ? PhaseUnifiedPhase::kDecode
-                                                             : PhaseUnifiedPhase::kNone;
-        if (heldPhase == requestedNewcomer)
-        {
-            // M2 needs a fixed ready frontier before it can launch E as the
-            // incumbent. Production never enables directional injection.
-            return false;
-        }
-    }
     if (encoderBatchIndices.empty() && !pd.has_value())
     {
         return false;
@@ -2860,21 +2723,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         case PhaseGlobalOverlapCostStatus::kEligible: break;
         case PhaseGlobalOverlapCostStatus::kUnprofitable: ++mGlobalEncoderOverlapUnprofitable; break;
         }
-        PhaseContextualPairDirection contextualDirection
+        PhaseContextualPairDirection const contextualDirection
             = phaseContextualPairDirection(kind, overlapKey.residualAnchor);
-        if (!residualAugmentation)
-        {
-            PhaseUnifiedActionDirection const launchDirection
-                = phaseInitialDirection(kind, mConfig.directionalInjection);
-            if (launchDirection == PhaseUnifiedActionDirection::kPrefillToEncoder)
-            {
-                contextualDirection = PhaseContextualPairDirection::kPrefillToEncoder;
-            }
-            else if (launchDirection == PhaseUnifiedActionDirection::kDecodeToEncoder)
-            {
-                contextualDirection = PhaseContextualPairDirection::kDecodeToEncoder;
-            }
-        }
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
             || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
         bool calibrationTarget = !mGlobalWarmupProbeMode;
@@ -2979,11 +2829,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         PhaseGlobalActionCandidate overlap;
         overlap.key = overlapKey;
         overlap.overlapCostKnown = overlapKnown;
-        int32_t const experimentalPercent = kind == PhaseGlobalActionKind::kEncoderPrefill
-            ? mConfig.globalExperimentalEncoderPrefillOverlapPercent
-            : mConfig.globalExperimentalEncoderDecodeOverlapPercent;
-        bool const experimentalMode = !mGlobalWarmupProbeMode && experimentalPercent >= 0;
-        overlap.safeProbeEligible = safeProbe || experimentalMode;
+        overlap.safeProbeEligible = safeProbe;
         overlap.calibrationProbe = calibrationProbe;
         overlap.predictedBlockingUs = overlapMakespanUs;
         overlap.predictedMakespanUs = overlapMakespanUs;
@@ -3026,8 +2872,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 : 0.0;
             double const requestedSkewFraction = residualAugmentation && incumbentReferenceUs > 0.0
                 ? residualElapsedUs / incumbentReferenceUs
-                : mConfig.directionalInjection.enabled() ? mConfig.directionalInjection.targetFraction
-                                                         : -1.0;
+                : -1.0;
             PhaseExecutionSet const contextualOutstanding = residualAugmentation
                 ? phase.key.kind == PhaseGlobalActionKind::kPrefill ? PhaseExecutionSet::kPrefill
                                                                     : PhaseExecutionSet::kDecode
@@ -3113,7 +2958,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     size_t const formationActivePhases = static_cast<size_t>(formationTarget.encoderRows > 0U)
         + static_cast<size_t>(formationTarget.prefillRows > 0U) + static_cast<size_t>(formationTarget.decodeRows > 0U);
-    bool const formationSelectionActive = mConfig.enableGlobalFormationAwareSelection;
+    bool const formationSelectionActive = phasePolicyUsesTransition(mConfig.policyMode)
+        && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive;
     bool const formationEvaluationEnabled = formationSelectionActive;
     if (formationEvaluationEnabled && !residualAugmentation && formationActivePhases >= 2U)
     {
@@ -3275,75 +3121,16 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             {
                 if (kind == PhaseContextualPairKind::kEncoderPrefill)
                 {
-                    ++mContextualEpShadowDisagreements;
+                    ++mContextualEpDecisionDisagreements;
                 }
                 else
                 {
-                    ++mContextualEdShadowDisagreements;
+                    ++mContextualEdDecisionDisagreements;
                 }
             }
             mRuntimeCostTracker->recordContextualDirectionSelection(
                 candidate.contextualEncoderPairDirection, selectedOverlap, candidate.contextualEncoderPairExploration);
         }
-    }
-    auto applyExperimentalEncoderOverlap = [&](PhaseGlobalActionKind kind, int32_t percent, size_t& opportunities,
-                                               size_t& selections, size_t& accumulator) {
-        if (mGlobalWarmupProbeMode || percent < 0)
-        {
-            return;
-        }
-        auto const overlap = std::find_if(
-            candidates.begin(), candidates.end(), [kind](auto const& candidate) { return candidate.key.kind == kind; });
-        if (overlap == candidates.end())
-        {
-            return;
-        }
-        PhaseGlobalDecision const feasible = mGlobalScheduler.select({*overlap});
-        if (!feasible.selectedIndex.has_value())
-        {
-            return;
-        }
-        ++opportunities;
-        if (phaseGlobalSelectExperimentalOverlap(percent, accumulator))
-        {
-            selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), overlap));
-            ++selections;
-            return;
-        }
-
-        std::vector<PhaseGlobalActionCandidate> fallbackCandidates;
-        std::vector<size_t> fallbackIndices;
-        fallbackCandidates.reserve(candidates.size() - 1U);
-        fallbackIndices.reserve(candidates.size() - 1U);
-        for (size_t index = 0U; index < candidates.size(); ++index)
-        {
-            if (candidates[index].key.kind != kind)
-            {
-                fallbackCandidates.push_back(candidates[index]);
-                fallbackIndices.push_back(index);
-            }
-        }
-        PhaseGlobalDecision const fallback = mGlobalScheduler.select(fallbackCandidates);
-        selectedIndex = fallback.selectedIndex.has_value()
-            ? std::optional<size_t>{fallbackIndices[*fallback.selectedIndex]}
-            : std::nullopt;
-    };
-    applyExperimentalEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill,
-        mConfig.globalExperimentalEncoderPrefillOverlapPercent, mGlobalExperimentalEncoderPrefillOpportunities,
-        mGlobalExperimentalEncoderPrefillSelections, mGlobalExperimentalEncoderPrefillAccumulator);
-    applyExperimentalEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode,
-        mConfig.globalExperimentalEncoderDecodeOverlapPercent, mGlobalExperimentalEncoderDecodeOpportunities,
-        mGlobalExperimentalEncoderDecodeSelections, mGlobalExperimentalEncoderDecodeAccumulator);
-    if (!mGlobalReplayApplied && mConfig.globalReplayDecisionSequence > 0U
-        && mGlobalDecisionSequence == mConfig.globalReplayDecisionSequence)
-    {
-        auto const replay = std::find_if(candidates.begin(), candidates.end(),
-            [&](auto const& candidate) { return candidate.key.kind == mConfig.globalReplayActionKind; });
-        ELLM_CHECK(replay != candidates.end(), "Causal replay action is absent from the exact decision frontier");
-        PhaseGlobalDecision const feasible = mGlobalScheduler.select({*replay});
-        ELLM_CHECK(feasible.selectedIndex.has_value(), "Causal replay action is not feasible at the target decision");
-        selectedIndex = static_cast<size_t>(std::distance(candidates.begin(), replay));
-        mGlobalReplayApplied = true;
     }
     std::optional<PhaseFormationRegret> formationRegret;
     if (formationEvaluated && selectedIndex.has_value())
@@ -3403,13 +3190,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
         ++mGlobalSafeProbes;
     }
-    if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kShadow)
-    {
-        PhaseGlobalActionKind const legacyAction = pd.has_value() ? pd->key.kind : PhaseGlobalActionKind::kEncoder;
-        mGlobalShadowDisagreements += selected.key.kind != legacyAction ? 1U : 0U;
-        return false;
-    }
-
     if (formationEvaluated && myopicDecision.selectedIndex.has_value()
         && candidates[*myopicDecision.selectedIndex].candidateId != selected.candidateId)
     {
@@ -3441,29 +3221,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             "Residual lease augmentation selected an unsupported action");
         ELLM_CHECK(mGlobalExecutionLease.has_value() && mActiveGlobalPdExecution.has_value(),
             "Residual lease augmentation lost its active phase");
-        bool const controlledPhaseFirstInjection
-            = (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-                  && mConfig.directionalInjection.direction == PhaseUnifiedActionDirection::kPrefillToEncoder)
-            || (selected.key.kind == PhaseGlobalActionKind::kEncoderDecode
-                && mConfig.directionalInjection.direction == PhaseUnifiedActionDirection::kDecodeToEncoder);
-        if (controlledPhaseFirstInjection && !mDirectionalInjectionPlanId.has_value())
-        {
-            // E submission can exceed one short P/D residual. Preserve the
-            // prepared E cohort and realize the controlled action at the next
-            // P/D boundary, where E can be prequeued behind a device gate.
-            return false;
-        }
         double const phaseElapsedMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - mActiveGlobalPdExecution->startedAt)
                                           .count();
         double const phaseReferenceUs = std::max(mActiveGlobalPdExecution->candidate.predictedMakespanUs,
             mActiveGlobalPdExecution->candidate.predictedBlockingUs);
-        PhaseUnifiedActionDirection const injectionDirection
-            = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-            ? PhaseUnifiedActionDirection::kPrefillToEncoder
-            : PhaseUnifiedActionDirection::kDecodeToEncoder;
-        PhaseStartSkewBucket const startSkew = phaseRequestedStartSkew(
-            mConfig.directionalInjection, injectionDirection, phaseElapsedMs * 1000.0, phaseReferenceUs);
+        PhaseStartSkewBucket const startSkew = phaseRequestedStartSkew(phaseElapsedMs * 1000.0, phaseReferenceUs);
         std::optional<PhaseGlobalDispatchPlan> const augmented
             = phaseGlobalAugmentedDispatchPlan(kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence,
                 kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch, *mGlobalExecutionLease, selected, startSkew);
@@ -3486,27 +3249,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         observation.contextualLowerConfidenceBound = selected.contextualEncoderPairLowerConfidenceBound;
         observation.planId = augmented->planId;
         mPendingGlobalOverlapObservation = observation;
-        PhaseUnifiedPhase const incumbentPhase = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-            ? PhaseUnifiedPhase::kPrefill
-            : PhaseUnifiedPhase::kDecode;
-        if (mConfig.directionalInjection.enabled() && mConfig.directionalInjection.direction == injectionDirection)
-        {
-            mDirectionalCudaGate.enqueue(mVision.stream(), mServer.phaseStartEvent(incumbentPhase),
-                mConfig.directionalInjection.requestedDelayUs > static_cast<uint64_t>(phaseElapsedMs * 1000.0)
-                    ? mConfig.directionalInjection.requestedDelayUs - static_cast<uint64_t>(phaseElapsedMs * 1000.0)
-                    : 0U);
-        }
         bool const started = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
         if (!started)
         {
             mPendingGlobalOverlapObservation.reset();
             mUnifiedDecisionByPlan.erase(augmented->planId);
             return false;
-        }
-        if (!mDirectionalInjectionPlanId.has_value()
-            && phaseUnifiedDirectionsSharePair(injectionDirection, mConfig.directionalInjection.direction))
-        {
-            mDirectionalInjectionPlanId = augmented->planId;
         }
         mGlobalFormationRealizedTracker.remapPlan(mGlobalExecutionLease->planId, augmented->planId);
         mGlobalExecutionLease = *augmented;
@@ -3568,101 +3316,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         observation.contextualLowerConfidenceBound = selected.contextualEncoderPairLowerConfidenceBound;
         observation.planId = executionPlan.planId;
         mPendingGlobalOverlapObservation = observation;
-        PhaseUnifiedPhase const phaseKind = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-            ? PhaseUnifiedPhase::kPrefill
-            : PhaseUnifiedPhase::kDecode;
-        PhaseUnifiedActionDirection const encoderFirstDirection
-            = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-            ? PhaseUnifiedActionDirection::kEncoderToPrefill
-            : PhaseUnifiedActionDirection::kEncoderToDecode;
-        PhaseUnifiedActionDirection const phaseFirstDirection
-            = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill
-            ? PhaseUnifiedActionDirection::kPrefillToEncoder
-            : PhaseUnifiedActionDirection::kDecodeToEncoder;
-        bool const launchPhaseFirst = mConfig.directionalInjection.direction == phaseFirstDirection;
-        bool const selectInjectionPlan = mConfig.directionalInjection.enabled()
-            && phaseUnifiedDirectionsSharePair(encoderFirstDirection, mConfig.directionalInjection.direction)
-            && !mDirectionalInjectionPlanId.has_value();
-        if (selectInjectionPlan)
-        {
-            mDirectionalInjectionPlanId = executionPlan.planId;
-        }
-        bool encoderStarted{};
-        bool phaseStarted{};
-        if (launchPhaseFirst)
-        {
-            bool const controlledInjection = mConfig.directionalInjection.enabled()
-                && mConfig.directionalInjection.direction == phaseFirstDirection
-                && mDirectionalInjectionPlanId == executionPlan.planId;
-            if (controlledInjection)
-            {
-                // Host submission order need not equal GPU execution order.
-                // Prequeue slow E submission behind a device semaphore, then
-                // signal it immediately before the P/D dispatch.
-                ELLM_CHECK(preparedEncoderReady && mPreparedEncoder != nullptr && !mEncoding.empty() && !mVision.busy(),
-                    "Controlled phase-first encoder launch requires a prepared encoder batch");
-                mDirectionalCudaGate.arm(mVision.stream(), mConfig.directionalInjection.requestedDelayUs);
-                std::shared_ptr<PhaseVisionPreparedBatch> prepared = std::move(mPreparedEncoder);
-                mEncoderDispatchHostNs = phaseTimelineNowNs();
-                mEncoderExecuteStartHostNs = mEncoderDispatchHostNs;
-                CUcontext const cudaContext = mVision.cudaContext();
-                std::future<bool> encoderSubmission
-                    = std::async(std::launch::async, [this, cudaContext, prepared = std::move(prepared)]() mutable {
-                          ScopedCudaContext context(cudaContext);
-                          return mVision.submitPrepared(std::move(prepared));
-                      });
-                mServer.setNextDispatchPreamble(
-                    phaseKind, [this](cudaStream_t stream) { mDirectionalCudaGate.signal(stream); });
-                phaseStarted = mServer.dispatchGlobalAction(
-                    std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
-                encoderStarted = encoderSubmission.get();
-                mEncoderExecuteEndHostNs = phaseTimelineNowNs();
-                if (encoderStarted)
-                {
-                    mServer.setExternalEncoderActive(true);
-                    markUnifiedEncoderSubmitted();
-                }
-            }
-            else
-            {
-                phaseStarted = mServer.dispatchGlobalAction(
-                    std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
-                if (phaseStarted)
-                {
-                    encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
-                }
-            }
-        }
-        else
-        {
-            bool const controlledEncoderFirst = mConfig.directionalInjection.enabled()
-                && mConfig.directionalInjection.direction == encoderFirstDirection
-                && mDirectionalInjectionPlanId == executionPlan.planId;
-            if (controlledEncoderFirst)
-            {
-                encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
-                if (encoderStarted)
-                {
-                    mDirectionalCudaGate.enqueue(mServer.phaseStream(phaseKind), mVision.startEvent(),
-                        remainingDirectionalDelayUs(
-                            mConfig.directionalInjection.requestedDelayUs, mEncoderDispatchHostNs));
-                    phaseStarted = mServer.dispatchGlobalAction(
-                        std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
-                }
-            }
-            else
-            {
-                // Preserve the production encoder-first action semantics.
-                // Controlled directional injection uses the prepared device
-                // gate above when exact cross-phase start placement is needed.
-                encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
-                if (encoderStarted)
-                {
-                    phaseStarted = mServer.dispatchGlobalAction(
-                        std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
-                }
-            }
-        }
+        bool const encoderStarted = preparedEncoderReady ? submitPreparedEncoder() : startNextEncoder();
+        bool const phaseStarted = encoderStarted
+            && mServer.dispatchGlobalAction(std::move(*phase), executionPlan.planId, executionPlan.snapshotEpoch);
         if (!encoderStarted || !phaseStarted)
         {
             mPendingGlobalOverlapObservation.reset();
@@ -3673,16 +3329,6 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             }
             ++mGlobalActionFidelityViolations;
             ELLM_CHECK(false, "Global overlap launched only a subset of the selected phases");
-        }
-        if (!mDirectionalInjectionPlanId.has_value()
-            && phaseUnifiedDirectionsSharePair(encoderFirstDirection, mConfig.directionalInjection.direction))
-        {
-            mDirectionalInjectionPlanId = executionPlan.planId;
-        }
-        if (phaseUnifiedDirectionIncumbentPhase(mConfig.directionalInjection.direction) == PhaseUnifiedPhase::kEncoder
-            && phaseUnifiedDirectionNewcomerPhase(mConfig.directionalInjection.direction) == phaseKind)
-        {
-            mDirectionalInjectionFrontierReleased = true;
         }
         validateGlobalExecutionLaunch();
         if (selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill)

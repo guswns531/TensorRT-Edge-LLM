@@ -462,12 +462,6 @@ PhaseInFlightSnapshot IndependentPhaseCoordinator::inFlightSnapshot(uint64_t hos
     return mWorker->inFlightSnapshot(hostSnapshotNs);
 }
 
-void IndependentPhaseCoordinator::setDirectionalInjectionControl(PhaseDirectionalInjectionControl control)
-{
-    ELLM_CHECK(!busy(), "Phase directional injection control cannot change while work is in flight");
-    mWorker->setDirectionalInjectionControl(control);
-}
-
 TensorMap& IndependentPhaseCoordinator::prefillTensorMap() noexcept
 {
     return mPrefillMap;

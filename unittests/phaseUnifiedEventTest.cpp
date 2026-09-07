@@ -96,7 +96,7 @@ TEST(PhaseUnifiedEventTest, AccumulatesObservedPhaseMask)
     EXPECT_EQ(phaseExecutionSetForUnifiedPhase(PhaseUnifiedPhase::kCopy), PhaseExecutionSet::kNone);
 }
 
-TEST(PhaseUnifiedEventTest, ReportsDirectionalInjectionEndpoints)
+TEST(PhaseUnifiedEventTest, ReportsActionDirectionEndpoints)
 {
     EXPECT_EQ(phaseUnifiedDirectionIncumbentPhase(PhaseUnifiedActionDirection::kEncoderToPrefill),
         PhaseUnifiedPhase::kEncoder);
@@ -106,10 +106,6 @@ TEST(PhaseUnifiedEventTest, ReportsDirectionalInjectionEndpoints)
         phaseUnifiedDirectionIncumbentPhase(PhaseUnifiedActionDirection::kDecodeToEncoder), PhaseUnifiedPhase::kDecode);
     EXPECT_EQ(
         phaseUnifiedDirectionNewcomerPhase(PhaseUnifiedActionDirection::kDecodeToEncoder), PhaseUnifiedPhase::kEncoder);
-    EXPECT_TRUE(phaseUnifiedDirectionsSharePair(
-        PhaseUnifiedActionDirection::kEncoderToDecode, PhaseUnifiedActionDirection::kDecodeToEncoder));
-    EXPECT_FALSE(phaseUnifiedDirectionsSharePair(
-        PhaseUnifiedActionDirection::kEncoderToDecode, PhaseUnifiedActionDirection::kEncoderToPrefill));
 }
 
 TEST(PhaseUnifiedEventTest, SnapshotSignatureIgnoresTransientIdsAndCanonicalizesInflightOrder)

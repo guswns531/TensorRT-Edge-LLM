@@ -39,17 +39,10 @@ enum class PhaseGlobalDecisionReason
     kDeadlineSafeEfficiency,
     kBoundedExploration,
     kMinimumViolation,
-    kLegacyCompatibility,
-    kExperimentalOverlap,
     //! Every feasible action misses the same protected phase set; select the
     //! action that clears the common work horizon most efficiently.
     kAllLateEfficiencyRecovery,
 };
-
-//! Return a deterministic experimental selection with the requested long-run percentage.
-//! A negative percentage disables the experiment. The caller owns one accumulator per
-//! opportunity stream so that production policy state remains untouched.
-bool phaseGlobalSelectExperimentalOverlap(int32_t percent, size_t& accumulator);
 
 //! Result of one bounded global scheduling decision.
 struct PhaseGlobalDecision

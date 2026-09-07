@@ -27,15 +27,31 @@
 namespace trt_edgellm::rt
 {
 
+namespace
+{
+
+PhaseRuntimeCostTrackerConfig normalizePolicyConfig(PhaseRuntimeCostTrackerConfig config) noexcept
+{
+    if (!phasePolicyUsesContextualScalar(config.policyMode))
+    {
+        config.contextualPd.mode = PhaseContextualPdMode::kDisabled;
+        config.contextualEp.mode = PhaseContextualPdMode::kDisabled;
+        config.contextualEd.mode = PhaseContextualPdMode::kDisabled;
+    }
+    return config;
+}
+
+} // namespace
+
 PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig config)
-    : mConfig(config)
-    , mActions(config.action)
-    , mContextualPd(config.contextualPd)
-    , mContextualDp(config.contextualPd)
-    , mContextualEp(config.contextualEp)
-    , mContextualPe(config.contextualEp)
-    , mContextualEd(config.contextualEd)
-    , mContextualDe(config.contextualEd)
+    : mConfig(normalizePolicyConfig(config))
+    , mActions(mConfig.action)
+    , mContextualPd(mConfig.contextualPd)
+    , mContextualDp(mConfig.contextualPd)
+    , mContextualEp(mConfig.contextualEp)
+    , mContextualPe(mConfig.contextualEp)
+    , mContextualEd(mConfig.contextualEd)
+    , mContextualDe(mConfig.contextualEd)
 {
     ELLM_CHECK(mConfig.actionMinimumSamples > 0U, "Runtime action minimum sample count must be positive");
     ELLM_CHECK(mConfig.actionMinimumSamples <= mConfig.action.windowSize,

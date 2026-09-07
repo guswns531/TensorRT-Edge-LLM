@@ -117,7 +117,6 @@ def load(path: Path) -> dict[str, Any]:
     dispatches = []
     scalar_selection_comparisons = 0
     scalar_selection_mismatches = 0
-    completion_changed_actions = 0
     with _open(path) as source:
         for line in source:
             if line.startswith(PREFIX):
@@ -129,8 +128,6 @@ def load(path: Path) -> dict[str, Any]:
                     if scalar is not None and selected is not None:
                         scalar_selection_comparisons += 1
                         scalar_selection_mismatches += scalar != selected
-                    completion_changed_actions += bool(
-                        event.get("completion_changed_h1_action", False))
                 elif event.get("event_kind") == "dispatch":
                     dispatches.append(_dispatch(event))
     return {
@@ -142,7 +139,6 @@ def load(path: Path) -> dict[str, Any]:
         "decision_cost": _load_decision_cost(path),
         "scalar_selection_comparisons": scalar_selection_comparisons,
         "scalar_selection_mismatches": scalar_selection_mismatches,
-        "completion_changed_actions": completion_changed_actions,
     }
 
 
@@ -190,8 +186,6 @@ def main() -> int:
                     "scalar_selection_comparisons"],
                 "scalar_selection_mismatches": left[
                     "scalar_selection_mismatches"],
-                "completion_changed_actions": left[
-                    "completion_changed_actions"],
                 "logical_decision_signature": left["decision_signature"],
                 "logical_dispatch_signature": left["dispatch_signature"],
             },
@@ -202,8 +196,6 @@ def main() -> int:
                     "scalar_selection_comparisons"],
                 "scalar_selection_mismatches": right[
                     "scalar_selection_mismatches"],
-                "completion_changed_actions": right[
-                    "completion_changed_actions"],
                 "logical_decision_signature": right["decision_signature"],
                 "logical_dispatch_signature": right["dispatch_signature"],
             },

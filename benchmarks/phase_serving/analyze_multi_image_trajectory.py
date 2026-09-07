@@ -238,13 +238,13 @@ def analyze_run(aggregate: Path, coherent_decode_max: int,
     action_counts = Counter(
         str(event.get("action_kind", "unknown")) for event in decisions)
     fallback_disagreements = sum(
-        int(event.get("active_h1_selected_action_id", 0)) > 0
+        int(event.get("scalar_h1_selected_action_id", 0)) > 0
         and int(event.get("non_contextual_selected_action_id", 0)) > 0
-        and event.get("active_h1_selected_action_id") != event.get(
+        and event.get("scalar_h1_selected_action_id") != event.get(
             "non_contextual_selected_action_id") for event in decisions)
     fallback_pairs: Counter[str] = Counter()
     for event in decisions:
-        learned_id = event.get("active_h1_selected_action_id")
+        learned_id = event.get("scalar_h1_selected_action_id")
         fallback_id = event.get("non_contextual_selected_action_id")
         if not learned_id or not fallback_id or learned_id == fallback_id:
             continue
@@ -327,14 +327,6 @@ def analyze_run(aggregate: Path, coherent_decode_max: int,
         scalar_known,
         "contextual_fallback_disagreements":
         fallback_disagreements,
-        "successor_guard_evaluations":
-        sum(
-            bool(event.get("contextual_successor_guard_evaluated", False))
-            for event in decisions),
-        "successor_guard_overrides":
-        sum(
-            bool(event.get("contextual_successor_guard_applied", False))
-            for event in decisions),
         "action_counts":
         dict(sorted(action_counts.items())),
         "learned_to_fallback_pairs":

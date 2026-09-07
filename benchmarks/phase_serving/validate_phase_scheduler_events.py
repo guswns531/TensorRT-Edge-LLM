@@ -28,7 +28,7 @@ from typing import Any
 RECORD_PREFIX = "PHASE_SCHEDULER_EVENT\t"
 EVENT_KINDS = {"decision", "dispatch", "completion"}
 PHASES = {"encoder", "prefill", "decode", "copy"}
-DIRECTIONAL_INJECTIONS = {
+ACTION_DIRECTIONS = {
     "encoder_to_prefill",
     "prefill_to_encoder",
     "encoder_to_decode",
@@ -210,7 +210,7 @@ def _validate(
                     f"{event['_source']}: incremental_action_id must be a positive integer"
                 )
             if event.get("requested_action_direction"
-                         ) not in DIRECTIONAL_INJECTIONS | {
+                         ) not in ACTION_DIRECTIONS | {
                              "idle_launch", "none"
                          }:
                 errors.append(
@@ -370,34 +370,6 @@ def _validate(
                 errors.append(
                     f"{event['_source']}: planned and observed outstanding sets differ"
                 )
-            if "injection_target_fraction" in event:
-                _require(
-                    event, {
-                        "incumbent_phase", "incumbent_execution_id",
-                        "injection_requested_direction",
-                        "injection_incumbent_reference_us",
-                        "injection_newcomer_reference_us",
-                        "requested_injection_delay_us"
-                    }, errors)
-                if event.get("action_direction") not in DIRECTIONAL_INJECTIONS:
-                    errors.append(
-                        f"{event['_source']}: injection metadata requires a directional action"
-                    )
-                if event.get("injection_requested_direction"
-                             ) not in DIRECTIONAL_INJECTIONS:
-                    errors.append(
-                        f"{event['_source']}: injection metadata has an invalid requested direction"
-                    )
-                target = float(event["injection_target_fraction"])
-                if target < 0.0 or target > 1.0:
-                    errors.append(
-                        f"{event['_source']}: injection target must be within [0, 1]"
-                    )
-                if float(event.get("injection_incumbent_reference_us", 0.0)) <= 0.0 \
-                        or float(event.get("injection_newcomer_reference_us", 0.0)) <= 0.0:
-                    errors.append(
-                        f"{event['_source']}: injection references must be positive"
-                    )
             if execution_key in dispatches:
                 errors.append(
                     f"{event['_source']}: duplicate dispatch for execution {execution_key}"

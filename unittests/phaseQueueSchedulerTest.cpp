@@ -52,24 +52,6 @@ TEST(PhaseQueueSchedulerTest, BatchesQueuesIndependently)
     EXPECT_EQ(plan.decodeBatch[0].requestId, 3U);
 }
 
-TEST(PhaseQueueSchedulerTest, GlobalShadowPreservesLegacyDispatch)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kShadow;
-    config.globalSafeProbeSlackMultiplier = 0.0F;
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
-    scheduler.enqueueDecode({2, 128});
-
-    PhaseDispatchPlan const plan = scheduler.next();
-
-    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_TRUE(plan.globalDecisionEvaluated);
-    EXPECT_FALSE(plan.globalDecisionApplied);
-    EXPECT_EQ(scheduler.telemetry().globalDecisionCount, 1U);
-    EXPECT_EQ(scheduler.telemetry().globalShadowDisagreementCount, 1U);
-}
-
 TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
 {
     size_t legacyPolicyCalls{};
@@ -97,103 +79,6 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     EXPECT_TRUE(plan.globalActionFidelity);
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
     EXPECT_EQ(legacyPolicyCalls, 0U);
-}
-
-TEST(PhaseQueueSchedulerTest, ExperimentalOverlapHundredPercentForcesHardFeasibleCandidate)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.globalSafeProbeSlackMultiplier = 0.0F;
-    config.globalExperimentalOverlapPercent = 100;
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
-    scheduler.enqueueDecode({2, 128});
-
-    PhaseDispatchPlan const plan = scheduler.next();
-
-    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_EQ(plan.globalDecisionReason, PhaseGlobalDecisionReason::kExperimentalOverlap);
-    EXPECT_TRUE(plan.globalSafeProbe);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 1U);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 1U);
-}
-
-TEST(PhaseQueueSchedulerTest, ExperimentalOverlapZeroPercentSelectsSerialCandidate)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.globalSafeProbeSlackMultiplier = 0.0F;
-    config.globalExperimentalOverlapPercent = 0;
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
-    scheduler.enqueueDecode({2, 128});
-
-    PhaseDispatchPlan const plan = scheduler.next();
-
-    EXPECT_NE(plan.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 1U);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 0U);
-}
-
-TEST(PhaseQueueSchedulerTest, ExperimentalOverlapDoesNotCountOrSelectMemoryInfeasibleCandidate)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.globalSafeProbeSlackMultiplier = 0.0F;
-    config.globalExperimentalOverlapPercent = 100;
-    config.globalMemoryHorizonSupplier = [](PhaseGlobalActionKey const& key, std::vector<uint64_t> const&) {
-        return key.kind == PhaseGlobalActionKind::kPrefillDecode
-            ? PhaseActionMemoryHorizon{1U, 1U, 0U, 0U, 0U, 1U, false}
-            : PhaseActionMemoryHorizon{};
-    };
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
-    scheduler.enqueueDecode({2, 128});
-
-    PhaseDispatchPlan const plan = scheduler.next();
-
-    EXPECT_NE(plan.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 0U);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 0U);
-}
-
-TEST(PhaseQueueSchedulerTest, ExperimentalOverlapFiftyPercentUsesDeterministicOpportunityAccumulator)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.globalSafeProbeSlackMultiplier = 0.0F;
-    config.globalExperimentalOverlapPercent = 50;
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
-    scheduler.enqueueDecode({2, 128});
-
-    PhaseDispatchPlan const first = scheduler.next();
-    ASSERT_NE(first.kind, PhaseDispatchKind::kOverlap);
-    if (!first.prefillBatch.empty())
-    {
-        scheduler.completePrefill(first.prefillBatch.front(), 32, true);
-    }
-    else
-    {
-        scheduler.completeDecode(first.decodeBatch.front(), 129, true);
-    }
-    PhaseDispatchPlan const remainder = scheduler.next();
-    if (!remainder.prefillBatch.empty())
-    {
-        scheduler.completePrefill(remainder.prefillBatch.front(), 32, true);
-    }
-    else
-    {
-        scheduler.completeDecode(remainder.decodeBatch.front(), 129, true);
-    }
-    scheduler.enqueuePrefill({3, 32});
-    scheduler.enqueueDecode({4, 128});
-
-    PhaseDispatchPlan const second = scheduler.next();
-
-    EXPECT_EQ(second.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapOpportunityCount, 2U);
-    EXPECT_EQ(scheduler.telemetry().globalExperimentalOverlapSelectionCount, 1U);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalActiveElidesVacuousSinglePhaseDecision)
@@ -346,54 +231,6 @@ TEST(PhaseQueueSchedulerTest, GlobalPrioritizesKnownOverlapTransition)
 
     EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
     EXPECT_EQ(scheduler.telemetry().globalKnownOverlapPriorityCount, 1U);
-}
-
-TEST(PhaseQueueSchedulerTest, GlobalCompatibilityReplaysLegacyPhaseChoice)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.globalSelectionMode = PhaseGlobalSelectionMode::kLegacyCompatibility;
-    config.globalSafeProbeSlackMultiplier = 0.0F;
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32, 3});
-    scheduler.enqueueDecode({2, 128, 0});
-
-    PhaseDispatchPlan const plan = scheduler.next();
-
-    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
-    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefillDecode);
-    EXPECT_EQ(plan.globalDecisionReason, PhaseGlobalDecisionReason::kLegacyCompatibility);
-    EXPECT_EQ(scheduler.globalSelectionMode(), PhaseGlobalSelectionMode::kLegacyCompatibility);
-    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode);
-    EXPECT_TRUE(plan.globalCandidateParity);
-    EXPECT_TRUE(plan.globalActionFidelity);
-}
-
-TEST(PhaseQueueSchedulerTest, GlobalActiveIgnoresLegacyServingProfiles)
-{
-    std::vector<PhaseSchedulerProfile> const profiles{PhaseSchedulerProfile::kCustom,
-        PhaseSchedulerProfile::kLatencySafe, PhaseSchedulerProfile::kBalanced,
-        PhaseSchedulerProfile::kThroughputBalanced, PhaseSchedulerProfile::kLongPrefill, PhaseSchedulerProfile::kAuto};
-    std::optional<PhaseGlobalActionKey> reference;
-    for (PhaseSchedulerProfile const profile : profiles)
-    {
-        PhaseQueueSchedulerConfig config;
-        config.profile = profile;
-        config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-        config.globalSafeProbeSlackMultiplier = 0.0F;
-        PhaseQueueScheduler scheduler(config);
-        scheduler.enqueuePrefill({1, 32});
-
-        PhaseDispatchPlan const plan = scheduler.next();
-
-        ASSERT_TRUE(plan.globalDecisionApplied);
-        if (!reference.has_value())
-        {
-            reference = plan.globalSelectedAction;
-        }
-        EXPECT_EQ(plan.globalSelectedAction, *reference);
-        EXPECT_EQ(plan.prefillBatch.size(), 1U);
-    }
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalCostKeyUsesExecutionVariantSupplier)
@@ -754,11 +591,11 @@ TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
 TEST(PhaseQueueSchedulerTest, ExternalPrefillResidualUsesSharedContextualModel)
 {
     PhaseRuntimeCostTrackerConfig trackerConfig;
-    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kShadow;
+    trackerConfig.policyMode = PhasePolicyMode::kContextualScalar;
+    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kActive;
     auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.enableExternalContextualPd = true;
     config.globalSafeProbeSlackMultiplier = 0.0F;
     config.runtimeCostTracker = tracker;
     PhaseQueueScheduler scheduler(config);
@@ -1007,22 +844,6 @@ TEST(PhaseQueueSchedulerTest, GlobalWaitIncludesResidualDecodeAfterDispatchNow)
     EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
     EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
     EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 0U);
-}
-
-TEST(PhaseQueueSchedulerTest, GlobalWaitShadowDoesNotDelayDispatch)
-{
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kShadow;
-    config.maxDecodeBatchSize = 4;
-    config.decodeQueueWaitTargetUs = 10000.0;
-    config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueueDecode({1, 128});
-
-    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {2U, 3U, 4U}, {128, 128, 128}};
-    EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
-    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 1U);
-    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalWaitKeepsAtMostTwoCompletionHorizons)
@@ -3285,10 +3106,13 @@ TEST(PhaseQueueSchedulerTest, CostAwareAdmissionPreservesLegacyOverlapInsideStat
     EXPECT_FALSE(plan.overlapEvaluatedByCost);
 }
 
-TEST(PhaseQueueSchedulerTest, ThroughputBalancedProfileEnablesCostAwareOverlap)
+TEST(PhaseQueueSchedulerTest, ExplicitConfigurationEnablesCostAwareOverlap)
 {
     PhaseQueueSchedulerConfig config;
-    config.profile = PhaseSchedulerProfile::kThroughputBalanced;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.enableTpotHysteresis = true;
     config.maxPrefillBatchSize = 2;
     config.maxDecodeBatchSize = 1;
     config.maxPrefillChunkTokens = 128;
@@ -3313,7 +3137,10 @@ TEST(PhaseQueueSchedulerTest, ThroughputBalancedProfileEnablesCostAwareOverlap)
 TEST(PhaseQueueSchedulerTest, TpotHysteresisFallsBackAndRecovers)
 {
     PhaseQueueSchedulerConfig config;
-    config.profile = PhaseSchedulerProfile::kThroughputBalanced;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.enableTpotHysteresis = true;
     config.maxPrefillBatchSize = 2;
     config.maxDecodeBatchSize = 1;
     config.maxPrefillChunkTokens = 128;

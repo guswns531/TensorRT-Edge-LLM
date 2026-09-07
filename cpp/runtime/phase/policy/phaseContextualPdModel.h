@@ -32,7 +32,6 @@ namespace trt_edgellm::rt
 enum class PhaseContextualPdMode
 {
     kDisabled,
-    kShadow,
     kActive,
 };
 

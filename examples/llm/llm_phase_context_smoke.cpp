@@ -273,25 +273,6 @@ PhaseIpcInput parsePhaseIpcInput(std::string const& line, int32_t defaultMaxOutp
     return result;
 }
 
-rt::PhasePrefillClass parsePrefillClass(nlohmann::json const& point)
-{
-    std::string const value = point.value("prefill_class", std::string{"any"});
-    if (value == "any")
-    {
-        return rt::PhasePrefillClass::kAny;
-    }
-    if (value == "text")
-    {
-        return rt::PhasePrefillClass::kText;
-    }
-    if (value == "external")
-    {
-        return rt::PhasePrefillClass::kExternal;
-    }
-    ELLM_CHECK(false, "Unknown phase prefill class: " + value);
-    return rt::PhasePrefillClass::kAny;
-}
-
 std::vector<rt::IndependentPhaseAdmissionCost> parseAdmissionCosts(std::string const& value)
 {
     std::vector<rt::IndependentPhaseAdmissionCost> result;
@@ -307,106 +288,6 @@ std::vector<rt::IndependentPhaseAdmissionCost> parseAdmissionCosts(std::string c
     }
     ELLM_CHECK(!result.empty(), "Phase admission cost table cannot be empty");
     return result;
-}
-
-void loadSchedulerCostModel(std::filesystem::path const& path, rt::PhaseQueueSchedulerConfig& config)
-{
-    std::ifstream stream(path);
-    ELLM_CHECK(stream.good(), "Failed to open phase scheduler cost model: " + path.string());
-    nlohmann::json const root = nlohmann::json::parse(stream);
-    ELLM_CHECK(root.value("prefill_layout", std::string{}) == "packed",
-        "Phase scheduler cost model must use packed prefill layout");
-    config.decodeBatchCosts.clear();
-    for (nlohmann::json const& point : root.at("decode"))
-    {
-        config.decodeBatchCosts.push_back(
-            {point.at("batch_size").get<int32_t>(), point.at("max_context_length").get<int32_t>(),
-                point.at("p95_gpu_ms").get<float>(), point.value("max_total_context_tokens", int64_t{})});
-    }
-    for (nlohmann::json const& point : root.at("prefill"))
-    {
-        config.prefillBatchCosts.push_back({point.at("batch_size").get<int32_t>(),
-            point.at("chunk_length").get<int32_t>(), point.at("max_past_kv_length").get<int32_t>(),
-            point.at("max_concurrent_decode_batch_size").get<int32_t>(), point.at("initial_chunk").get<bool>(),
-            point.at("p95_gpu_ms").get<float>(), point.at("decode_slowdown_p95_ms").get<float>(),
-            parsePrefillClass(point)});
-    }
-    for (nlohmann::json const& point : root.at("overlap"))
-    {
-        config.overlapBatchCosts.push_back({point.at("prefill_batch_size").get<int32_t>(),
-            point.at("decode_batch_size").get<int32_t>(), point.at("chunk_length").get<int32_t>(),
-            point.at("max_prefill_past_kv_length").get<int32_t>(), point.at("max_decode_context_length").get<int32_t>(),
-            point.at("initial_chunk").get<bool>(), point.at("prefill_p95_gpu_ms").get<float>(),
-            point.at("decode_p95_gpu_ms").get<float>(), point.at("makespan_p95_gpu_ms").get<float>(),
-            point.at("decode_slowdown_p95_ms").get<float>(), parsePrefillClass(point)});
-    }
-    ELLM_CHECK(
-        !config.decodeBatchCosts.empty() && !config.prefillBatchCosts.empty() && !config.overlapBatchCosts.empty(),
-        "Phase scheduler cost model is incomplete");
-    config.profile = rt::PhaseSchedulerProfile::kThroughputBalanced;
-}
-
-void loadPrefillFormationCostModel(std::filesystem::path const& path, rt::IndependentPhaseServerConfig& config)
-{
-    std::ifstream stream(path);
-    ELLM_CHECK(stream.good(), "Failed to open prefill formation cost model: " + path.string());
-    nlohmann::json const root = nlohmann::json::parse(stream);
-    ELLM_CHECK(root.contains("formation") && root.at("formation").is_array(),
-        "Prefill formation cost model has no formation table");
-    config.prefillFormationCosts.clear();
-    for (nlohmann::json const& point : root.at("formation"))
-    {
-        config.prefillFormationCosts.push_back({point.at("max_prompt_tokens").get<int32_t>(),
-            point.at("max_output_tokens").get<int32_t>(), point.at("max_decode_rows").get<size_t>(),
-            point.value("max_decode_tpot_pressure", 0.0F), point.at("target_batch_size").get<size_t>(),
-            point.at("window_us").get<double>(), point.value("ttft_target_us", 0.0),
-            point.value("ttft_guard_us", 1000.0), point.at("throughput_gain_pct").get<double>()});
-    }
-    ELLM_CHECK(!config.prefillFormationCosts.empty(), "Prefill formation cost table cannot be empty");
-}
-
-void loadEncoderCostModel(std::filesystem::path const& path, rt::PhaseThreeCoordinatorConfig& config)
-{
-    std::ifstream stream(path);
-    ELLM_CHECK(stream.good(), "Failed to open phase encoder cost model: " + path.string());
-    nlohmann::json const root = nlohmann::json::parse(stream);
-    ELLM_CHECK(
-        root.contains("encoder") && root.at("encoder").is_array(), "Phase encoder cost model has no encoder table");
-    config.encoderBatchCosts.clear();
-    for (nlohmann::json const& point : root.at("encoder"))
-    {
-        size_t const batchSize = point.at("batch_size").get<size_t>();
-        if (batchSize <= config.maxEncoderBatchSize)
-        {
-            config.encoderBatchCosts.push_back(
-                {batchSize, point.at("max_input_tokens").get<size_t>(), point.at("p95_gpu_ms").get<float>()});
-        }
-    }
-    ELLM_CHECK(!config.encoderBatchCosts.empty(), "Phase encoder cost table cannot be empty");
-    config.globalEncoderPrefillCosts.clear();
-    if (root.contains("encoder_prefill"))
-    {
-        ELLM_CHECK(root.at("encoder_prefill").is_array(), "Phase E+P cost table must be an array");
-        for (nlohmann::json const& point : root.at("encoder_prefill"))
-        {
-            config.globalEncoderPrefillCosts.push_back({point.at("encoder_batch_size").get<size_t>(),
-                point.at("prefill_batch_size").get<int32_t>(), point.at("max_encoder_input_tokens").get<size_t>(),
-                point.at("max_prefill_chunk_length").get<int32_t>(),
-                point.at("max_prefill_past_kv_length").get<int32_t>(), point.at("makespan_p95_gpu_ms").get<float>()});
-        }
-    }
-    config.globalEncoderDecodeCosts.clear();
-    if (root.contains("encoder_decode"))
-    {
-        ELLM_CHECK(root.at("encoder_decode").is_array(), "Phase E+D cost table must be an array");
-        for (nlohmann::json const& point : root.at("encoder_decode"))
-        {
-            config.globalEncoderDecodeCosts.push_back({point.at("encoder_batch_size").get<size_t>(),
-                point.at("decode_batch_size").get<int32_t>(), point.at("max_encoder_input_tokens").get<size_t>(),
-                point.at("max_decode_context_length").get<int32_t>(), point.at("makespan_p95_gpu_ms").get<float>()});
-        }
-    }
-    config.enableCostAwareEncoderBatching = true;
 }
 
 struct PhaseTiming
@@ -1841,10 +1722,6 @@ int main(int argc, char** argv)
         {
             serverConfig.prefillFormationTtftGuardUs = std::stod(value);
         }
-        if (char const* value = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_COST_JSON"))
-        {
-            loadPrefillFormationCostModel(value, serverConfig);
-        }
         serverConfig.enableAdaptiveAdmission = std::getenv("TRT_EDGELLM_ADAPTIVE_ADMISSION") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_LATENCY_INFLIGHT"))
         {
@@ -2377,62 +2254,14 @@ int main(int argc, char** argv)
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
-                threePhaseConfig.globalExperimentalOverlapPercent
-                    = semanticSchedulerConfig.globalExperimentalOverlapPercent;
-                if (char const* value = std::getenv("TRT_EDGELLM_EXPERIMENTAL_ENCODER_PREFILL_OVERLAP_PERCENT"))
-                {
-                    threePhaseConfig.globalExperimentalEncoderPrefillOverlapPercent = std::stoi(value);
-                }
-                if (char const* value = std::getenv("TRT_EDGELLM_EXPERIMENTAL_ENCODER_DECODE_OVERLAP_PERCENT"))
-                {
-                    threePhaseConfig.globalExperimentalEncoderDecodeOverlapPercent = std::stoi(value);
-                }
-                if (char const* value = std::getenv("TRT_EDGELLM_REPLAY_DECISION_SEQUENCE"))
-                {
-                    threePhaseConfig.globalReplayDecisionSequence = std::stoull(value);
-                    char const* action = std::getenv("TRT_EDGELLM_REPLAY_ACTION_KIND");
-                    ELLM_CHECK(action != nullptr, "Causal replay decision requires an action kind");
-                    std::optional<rt::PhaseGlobalActionKind> const kind = rt::phaseGlobalActionKindFromName(action);
-                    ELLM_CHECK(kind.has_value() && *kind != rt::PhaseGlobalActionKind::kNone,
-                        "Unknown or empty causal replay action kind");
-                    threePhaseConfig.globalReplayActionKind = *kind;
-                }
-                if (char const* value = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION"))
-                {
-                    std::optional<rt::PhaseUnifiedActionDirection> const direction
-                        = rt::phaseUnifiedActionDirectionFromName(value);
-                    ELLM_CHECK(direction.has_value(), "Unknown directional-injection phase order");
-                    threePhaseConfig.directionalInjection.direction = *direction;
-                    char const* target = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_TARGET");
-                    char const* incumbent = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_INCUMBENT_US");
-                    char const* newcomer = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_NEWCOMER_US");
-                    ELLM_CHECK(target != nullptr && incumbent != nullptr && newcomer != nullptr,
-                        "Directional injection requires target, incumbent, and newcomer references");
-                    threePhaseConfig.directionalInjection.targetFraction = std::stod(target);
-                    threePhaseConfig.directionalInjection.incumbentReferenceUs = std::stod(incumbent);
-                    threePhaseConfig.directionalInjection.newcomerReferenceUs = std::stod(newcomer);
-                    if (char const* delay = std::getenv("TRT_EDGELLM_DIRECTIONAL_INJECTION_DELAY_US"))
-                    {
-                        threePhaseConfig.directionalInjection.requestedDelayUs = std::stoull(delay);
-                    }
-                    else
-                    {
-                        threePhaseConfig.directionalInjection.requestedDelayUs
-                            = static_cast<uint64_t>(std::llround(threePhaseConfig.directionalInjection.targetFraction
-                                * threePhaseConfig.directionalInjection.incumbentReferenceUs));
-                    }
-                }
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
                 threePhaseConfig.contextualPrefillBatchCapacity = semanticSchedulerConfig.maxPrefillBatchSize;
                 threePhaseConfig.contextualDecodeBatchCapacity = semanticSchedulerConfig.maxDecodeBatchSize;
-                threePhaseConfig.enableGlobalFormationAwareSelection
-                    = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
-                    && rt::phasePolicyUsesTransition(phasePolicyMode);
                 threePhaseConfig.policyMode = phasePolicyMode;
                 LOG_INFO("Phase policy: mode=%s formation_aware=%s", rt::phasePolicyModeName(phasePolicyMode),
-                    threePhaseConfig.enableGlobalFormationAwareSelection ? "enabled" : "disabled");
+                    rt::phasePolicyUsesTransition(phasePolicyMode) ? "enabled" : "disabled");
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_FORMATION_REALIZED_DISPATCHES"))
                 {
                     threePhaseConfig.globalFormationRealizedDispatches = static_cast<size_t>(std::stoull(value));
@@ -2648,16 +2477,6 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_SAFETY_BYTES"))
                 {
                     threePhaseConfig.memoryBroker.safetyReserveBytes = static_cast<size_t>(std::stoull(value));
-                }
-                char const* encoderCostPath = std::getenv("TRT_EDGELLM_VISION_ENCODER_COST_JSON");
-                if (encoderCostPath == nullptr)
-                {
-                    encoderCostPath = std::getenv("TRT_EDGELLM_SCHEDULER_COST_JSON");
-                }
-                if (encoderCostPath != nullptr
-                    && std::getenv("TRT_EDGELLM_DISABLE_COST_AWARE_ENCODER_BATCHING") == nullptr)
-                {
-                    loadEncoderCostModel(encoderCostPath, threePhaseConfig);
                 }
                 if (encoderCalibrationImage != nullptr)
                 {
@@ -3619,8 +3438,6 @@ int main(int argc, char** argv)
                         {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
                         {"global_active_decisions",
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
-                        {"global_shadow_disagreements",
-                            semanticCoordinator.scheduler().telemetry().globalShadowDisagreementCount},
                         {"global_overlap_opportunities",
                             semanticCoordinator.scheduler().telemetry().globalOverlapOpportunityCount},
                         {"global_overlap_known_costs",
@@ -3646,8 +3463,8 @@ int main(int argc, char** argv)
                         {"contextual_pd_predictions",
                             semanticCoordinator.scheduler().telemetry().contextualPdPredictionCount},
                         {"contextual_pd_ready", semanticCoordinator.scheduler().telemetry().contextualPdReadyCount},
-                        {"contextual_pd_shadow_disagreements",
-                            semanticCoordinator.scheduler().telemetry().contextualPdShadowDisagreementCount},
+                        {"contextual_pd_decision_disagreements",
+                            semanticCoordinator.scheduler().telemetry().contextualPdDecisionDisagreementCount},
                         {"contextual_pd_observations",
                             semanticCoordinator.scheduler().telemetry().contextualPdObservationCount},
                         {"contextual_pd_rejected_observations",
@@ -3683,7 +3500,7 @@ int main(int argc, char** argv)
                             directionObservations(rt::PhaseContextualPairDirection::kDecodeToPrefill)},
                         {"contextual_ep_predictions", visionMetrics.contextualEpPredictions},
                         {"contextual_ep_ready", visionMetrics.contextualEpReady},
-                        {"contextual_ep_shadow_disagreements", visionMetrics.contextualEpShadowDisagreements},
+                        {"contextual_ep_decision_disagreements", visionMetrics.contextualEpDecisionDisagreements},
                         {"contextual_ep_observations", visionMetrics.contextualEpObservations},
                         {"contextual_ep_rejected_observations", visionMetrics.contextualEpRejectedObservations},
                         {"contextual_ep_positive_selections", visionMetrics.contextualEpPositiveSelections},
@@ -3711,7 +3528,7 @@ int main(int argc, char** argv)
                             directionObservations(rt::PhaseContextualPairDirection::kPrefillToEncoder)},
                         {"contextual_ed_predictions", visionMetrics.contextualEdPredictions},
                         {"contextual_ed_ready", visionMetrics.contextualEdReady},
-                        {"contextual_ed_shadow_disagreements", visionMetrics.contextualEdShadowDisagreements},
+                        {"contextual_ed_decision_disagreements", visionMetrics.contextualEdDecisionDisagreements},
                         {"contextual_ed_observations", visionMetrics.contextualEdObservations},
                         {"contextual_ed_rejected_observations", visionMetrics.contextualEdRejectedObservations},
                         {"contextual_ed_positive_selections", visionMetrics.contextualEdPositiveSelections},
@@ -3751,10 +3568,6 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalResidualPrefillAnchorObservationCount},
                         {"global_residual_decode_anchor_observations",
                             semanticCoordinator.scheduler().telemetry().globalResidualDecodeAnchorObservationCount},
-                        {"global_experimental_overlap_opportunities",
-                            semanticCoordinator.scheduler().telemetry().globalExperimentalOverlapOpportunityCount},
-                        {"global_experimental_overlap_selections",
-                            semanticCoordinator.scheduler().telemetry().globalExperimentalOverlapSelectionCount},
                         {"global_prefill_formation_opportunities",
                             semanticCoordinator.scheduler().telemetry().globalPrefillFormationOpportunityCount},
                         {"global_prefill_formation_decode_selections",
@@ -3903,7 +3716,6 @@ int main(int argc, char** argv)
                         {"vision_encoder_exclusive_batches", visionMetrics.exclusiveEncoderBatches},
                         {"vision_encoder_exclusive_prefill_deferrals", visionMetrics.exclusiveEncoderPrefillDeferrals},
                         {"vision_global_decisions", visionMetrics.globalDecisions},
-                        {"vision_global_shadow_disagreements", visionMetrics.globalShadowDisagreements},
                         {"vision_global_encoder_selections", visionMetrics.globalEncoderSelections},
                         {"vision_global_encoder_prefill_selections", visionMetrics.globalEncoderPrefillSelections},
                         {"vision_global_residual_augmentation_opportunities",
@@ -3933,18 +3745,6 @@ int main(int argc, char** argv)
                         {"vision_global_residual_measured_unprofitable_selections",
                             visionMetrics.globalResidualMeasuredUnprofitableSelections},
                         {"vision_global_residual_covering_cost_hits", visionMetrics.globalResidualCoveringCostHits},
-                        {"vision_global_experimental_residual_prefill_decode_opportunities",
-                            visionMetrics.globalExperimentalResidualPrefillDecodeOpportunities},
-                        {"vision_global_experimental_residual_prefill_decode_selections",
-                            visionMetrics.globalExperimentalResidualPrefillDecodeSelections},
-                        {"vision_global_experimental_encoder_prefill_opportunities",
-                            visionMetrics.globalExperimentalEncoderPrefillOpportunities},
-                        {"vision_global_experimental_encoder_prefill_selections",
-                            visionMetrics.globalExperimentalEncoderPrefillSelections},
-                        {"vision_global_experimental_encoder_decode_opportunities",
-                            visionMetrics.globalExperimentalEncoderDecodeOpportunities},
-                        {"vision_global_experimental_encoder_decode_selections",
-                            visionMetrics.globalExperimentalEncoderDecodeSelections},
                         {"vision_global_encoder_decode_selections", visionMetrics.globalEncoderDecodeSelections},
                         {"vision_global_pd_selections", visionMetrics.globalPdSelections},
                         {"vision_global_safe_probes", visionMetrics.globalSafeProbes},
@@ -4159,7 +3959,7 @@ int main(int argc, char** argv)
                             {"kv_ownership_signature", event.kvOwnershipSignature},
                             {"scalar_policy_state_signature", event.scalarPolicyStateSignature},
                             {"vision_lease_signature", event.visionLeaseSignature},
-                            {"causal_replay_forced", event.causalReplayForced}, {"action_id", event.actionId},
+                            {"action_id", event.actionId},
                             {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
                             {"requested_action_direction",
@@ -4218,15 +4018,6 @@ int main(int argc, char** argv)
                         {
                             record["newcomer_phase"] = rt::phaseUnifiedPhaseName(event.newcomerPhase);
                             record["newcomer_execution_id"] = event.newcomerExecutionId;
-                        }
-                        if (event.injectionTargetFraction.has_value())
-                        {
-                            record["injection_target_fraction"] = *event.injectionTargetFraction;
-                            record["injection_requested_direction"]
-                                = rt::phaseUnifiedActionDirectionName(event.injectionRequestedDirection);
-                            record["injection_incumbent_reference_us"] = event.injectionIncumbentReferenceUs;
-                            record["injection_newcomer_reference_us"] = event.injectionNewcomerReferenceUs;
-                            record["requested_injection_delay_us"] = event.requestedInjectionDelayUs;
                         }
                     }
                     else
@@ -4479,7 +4270,7 @@ int main(int argc, char** argv)
                     schedulerMetrics.globalMeasuredUnprofitableOverlapSelectionCount,
                     schedulerMetrics.globalSafeProbeCount, schedulerMetrics.globalWaitDecisionCount,
                     schedulerMetrics.globalWaitSelectedCount, schedulerMetrics.contextualPdPredictionCount,
-                    schedulerMetrics.contextualPdReadyCount, schedulerMetrics.contextualPdShadowDisagreementCount,
+                    schedulerMetrics.contextualPdReadyCount, schedulerMetrics.contextualPdDecisionDisagreementCount,
                     schedulerMetrics.globalActionFidelityViolationCount);
                 LOG_INFO(
                     "Phase vision cost: starts=%zu completions=%zu batches=%zu batch_last=%zu batch_max=%zu "

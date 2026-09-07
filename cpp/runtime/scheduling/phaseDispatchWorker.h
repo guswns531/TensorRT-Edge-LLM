@@ -18,7 +18,6 @@
 #pragma once
 
 #include "runtime/phase/mechanism/phaseUnifiedEvent.h"
-#include "runtime/scheduling/phaseCudaDirectionalGate.h"
 #include "runtime/scheduling/phaseQueueScheduler.h"
 #include "runtime/scheduling/phaseTimeline.h"
 
@@ -159,9 +158,6 @@ public:
     //! and is not consumed by the current scheduling policy.
     PhaseInFlightSnapshot inFlightSnapshot(uint64_t hostSnapshotNs = 0U) const noexcept;
 
-    //! Configure an opt-in M2 launch-order/delay experiment while idle.
-    void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
-
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
 
@@ -216,9 +212,6 @@ private:
     size_t mDispatchCount{};
     std::vector<uint64_t> mPreviousDecodeRowRequestIds;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
-    PhaseDirectionalInjectionControl mDirectionalInjection;
-    bool mDirectionalInjectionConsumed{};
-    PhaseCudaDirectionalGate mDirectionalCudaGate;
     std::function<void(cudaStream_t)> mNextPrefillDispatchPreamble;
     std::function<void(cudaStream_t)> mNextDecodeDispatchPreamble;
 };

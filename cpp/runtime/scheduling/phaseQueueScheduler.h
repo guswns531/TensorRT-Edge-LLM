@@ -253,7 +253,6 @@ struct PhaseSchedulerTelemetry
     PhaseDrainPreference activeDrainPreference{PhaseDrainPreference::kNone};
     size_t globalDecisionCount{};
     size_t globalActiveDecisionCount{};
-    size_t globalShadowDisagreementCount{};
     size_t globalNoFeasibleDecisionCount{};
     size_t globalSafeProbeCount{};
     size_t globalOverlapOpportunityCount{};
@@ -269,7 +268,7 @@ struct PhaseSchedulerTelemetry
     size_t globalOverlapSelectionCount{};
     size_t contextualPdPredictionCount{};
     size_t contextualPdReadyCount{};
-    size_t contextualPdShadowDisagreementCount{};
+    size_t contextualPdDecisionDisagreementCount{};
     size_t contextualPdObservationCount{};
     size_t contextualPdRejectedObservationCount{};
     size_t contextualPdPositiveSelectionCount{};
@@ -285,8 +284,6 @@ struct PhaseSchedulerTelemetry
     size_t globalCostKeyParityViolationCount{};
     size_t globalResidualPrefillAnchorObservationCount{};
     size_t globalResidualDecodeAnchorObservationCount{};
-    size_t globalExperimentalOverlapOpportunityCount{};
-    size_t globalExperimentalOverlapSelectionCount{};
     size_t globalCandidateParityViolationCount{};
     size_t globalActionFidelityViolationCount{};
     size_t globalPrefillFormationOpportunityCount{};
@@ -393,26 +390,12 @@ struct PhaseOverlapBatchCost
     PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
 };
 
-enum class PhaseSchedulerProfile
-{
-    kCustom,
-    kLatencySafe,
-    kBalanced,
-    kThroughputBalanced,
-    kLongPrefill,
-    kAuto,
-};
-
 struct PhaseQueueSchedulerConfig
 {
-    //! Production presets only select scheduler policy behavior. Model and
-    //! engine shape limits remain explicit in the fields below.
-    PhaseSchedulerProfile profile{PhaseSchedulerProfile::kCustom};
     //! Profile-free P/D action selection. Shadow mode observes the same queue
     //! state without changing legacy dispatch; active mode owns the decision.
     PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
     //! Evaluation-only policy control over the common deterministic builders.
-    PhaseGlobalSelectionMode globalSelectionMode{PhaseGlobalSelectionMode::kProfileFree};
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};
     //! Optional process-local tracker shared by E/P/D schedulers. A private
@@ -427,10 +410,6 @@ struct PhaseQueueSchedulerConfig
     //! on serial execution. Zero disables production probes.
     float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
-    //! Research-only deterministic P+D opportunity sweep. Minus one keeps
-    //! production policy; 0--100 selects that percentage of hard-feasible
-    //! overlap opportunities without applying the deadline/cost objective.
-    int32_t globalExperimentalOverlapPercent{-1};
     //! Maximum distinct P+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     //! Optional ownership-aware memory horizon in one caller-defined unit.
@@ -543,8 +522,6 @@ struct PhaseQueueSchedulerConfig
     size_t minTpotHysteresisSamples{8};
     int32_t maxConsecutiveOverlapBatches{4};
     double maxPredictedDecodeDebtUs{50000.0};
-    int64_t autoLongPrefillBacklogTokens{4096};
-    float autoDecodePressureLimit{0.5F};
     //! Keep a bounded set of requests advancing at similar chunk frontiers.
     bool enableWavefrontPrefillBatching{};
     int32_t maxPrefillCohortSize{8};
@@ -604,8 +581,6 @@ struct PhaseQueueSchedulerConfig
     bool elideVacuousGlobalDecisions{};
     //! Include final-P rows in a bounded prediction of the immediately following D cohort.
     bool enableDecodeFormationHorizon{};
-    //! Apply the contextual P+D controller after an external producer has completed E -> P.
-    bool enableExternalContextualPd{};
     double prefillQueueWaitTargetUs{5000.0};
     double decodeQueueWaitTargetUs{2000.0};
     //! Default next-token deadline for bounded WAIT/refill decisions when a
@@ -779,7 +754,6 @@ public:
     //! vectors are materialized only for opt-in decision/event capture.
     PhaseQueueSnapshot queueSnapshot(bool includeReadyDetails = false) const;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
-    PhaseGlobalSelectionMode globalSelectionMode() const noexcept;
     //! Return the last IDs consumed by direct or externally coordinated dispatch.
     uint64_t globalPlanSequence() const noexcept;
     uint64_t globalSnapshotEpoch() const noexcept;
@@ -879,7 +853,7 @@ private:
 
     std::optional<GlobalQueueSelection> selectGlobalQueueAction(PhaseQueueSnapshot const& snapshot,
         bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true,
-        std::optional<PhaseDispatchKind> compatibilityKind = std::nullopt);
+        std::optional<PhaseDispatchKind> requiredKind = std::nullopt);
     PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
     PhaseDispatchKind legacyQueueDecision(PhaseQueueSnapshot const& snapshot) const;
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
@@ -958,7 +932,6 @@ private:
     uint64_t mGlobalPlanSequence{};
     uint64_t mGlobalSnapshotEpoch{};
     size_t mLastGlobalSafeProbeSequence{};
-    size_t mGlobalExperimentalOverlapAccumulator{};
     bool mGlobalWarmupProbeMode{};
     std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;
     std::vector<size_t> mGlobalCalibrationOpportunities;

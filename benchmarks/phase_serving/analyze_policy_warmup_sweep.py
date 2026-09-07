@@ -61,8 +61,7 @@ def _load_calibration(case_dir: Path) -> dict[str, Any]:
     observations = [float(item.get("observations", 0))
                     for item in directions]
     required = [item for item in directions if item.get("required", False)]
-    ready = [item for item in required
-             if item.get("completion_authority_validated", False)]
+    ready = [item for item in required if item.get("ready", False)]
     summary = {
         "calibration_runs": len(records),
         "overall_converged_fraction": (
@@ -72,33 +71,26 @@ def _load_calibration(case_dir: Path) -> dict[str, Any]:
             sum(bool(record.get("contextual_policy_calibration_converged",
                                 False)) for record in records) /
             len(records) if records else 0.0),
-        "completion_converged_fraction": (
-            sum(bool(record.get("completion_policy_calibration_converged",
-                                False)) for record in records) /
-            len(records) if records else 0.0),
         "direction_observations_median": (
             statistics.median(observations) if observations else 0.0),
         "required_directions": len(required),
         "ready_required_directions": len(ready),
         "authority_ready_fraction": (len(ready) / len(required)
                                      if required else 0.0),
-        "false_safe": sum(int(item.get("completion_authority_false_safe", 0))
-                          for item in directions),
     }
     for name in DIRECTIONS:
         matching = [item for item in directions if item.get("direction") == name]
         observations = [float(item.get("observations", 0))
                         for item in matching]
-        blend = [float(item.get("completion_authority_blend_weight", 0.0))
-                 for item in matching]
+        predictions = [float(item.get("predictions", 0))
+                       for item in matching]
         summary[f"{name}_observations_median"] = (
             statistics.median(observations) if observations else 0.0)
         summary[f"{name}_ready_fraction"] = (
-            sum(bool(item.get("completion_authority_validated", False))
-                for item in matching) /
+            sum(bool(item.get("ready", False)) for item in matching) /
             len(matching) if matching else 0.0)
-        summary[f"{name}_blend_median"] = (
-            statistics.median(blend) if blend else 0.0)
+        summary[f"{name}_predictions_median"] = (
+            statistics.median(predictions) if predictions else 0.0)
     return summary
 
 

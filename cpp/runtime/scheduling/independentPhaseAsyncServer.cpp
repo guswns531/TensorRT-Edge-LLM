@@ -781,13 +781,6 @@ void IndependentPhaseAsyncServer::setActivityTimeline(PhaseActivityTimelineRecor
     mCoordinator.setActivityTimeline(timeline);
 }
 
-void IndependentPhaseAsyncServer::setDirectionalInjectionControl(PhaseDirectionalInjectionControl control)
-{
-    ELLM_CHECK(mRequests.empty() && mPendingRequests.empty() && mSamplingTickets.empty(),
-        "Phase directional injection control can only change while the server is idle");
-    mCoordinator.setDirectionalInjectionControl(control);
-}
-
 cudaStream_t IndependentPhaseAsyncServer::phaseStream(PhaseUnifiedPhase phase) const noexcept
 {
     return mCoordinator.phaseStream(phase);
@@ -925,8 +918,8 @@ bool IndependentPhaseAsyncServer::dispatchReady()
     {
         ++mDecodeRefillWaitCount;
     }
-    bool const profileFreeGlobal = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive
-        && mCoordinator.scheduler().globalSelectionMode() == PhaseGlobalSelectionMode::kProfileFree;
+    bool const profileFreeGlobal
+        = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive;
     bool const waitForPrefillFormation = profileFreeGlobal ? false : shouldWaitForPrefillFormation();
     bool const phaseQueued
         = mCoordinator.scheduler().prefillQueueSize() > 0U || mCoordinator.scheduler().decodeQueueSize() > 0U;
@@ -1183,12 +1176,6 @@ bool IndependentPhaseAsyncServer::shouldWaitForGlobalDecodeRefill()
         return false;
     }
     bool const globalWait = mCoordinator.scheduler().shouldWaitForDecodeEvents(previews);
-    bool const useLegacyWait = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kShadow
-        || mCoordinator.scheduler().globalSelectionMode() == PhaseGlobalSelectionMode::kLegacyCompatibility;
-    if (useLegacyWait)
-    {
-        return legacyWait;
-    }
     return mConfig.enableGlobalWaitAuthority && globalWait;
 }
 

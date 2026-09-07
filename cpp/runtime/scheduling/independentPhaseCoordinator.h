@@ -110,8 +110,6 @@ public:
     PhaseGlobalActionCandidate const* inFlightGlobalCandidate() const noexcept;
     //! Read-only P/D context state for global shadow telemetry.
     PhaseInFlightSnapshot inFlightSnapshot(uint64_t hostSnapshotNs = 0U) const noexcept;
-    //! Configure an opt-in M2 directional launch experiment while idle.
-    void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
     TensorMap& prefillTensorMap() noexcept;
     TensorMap& decodeTensorMap() noexcept;
     PhaseQueueScheduler& scheduler() noexcept;

@@ -26,55 +26,28 @@ from typing import Any
 MODES = ("graph_only", "zero_start", "generic_reset", "generic",
          "trace_derived")
 POLICY_VARIANTS = {
-    # V0: preserve the common execution substrate but remove contextual
-    # generalization and bounded formation reasoning.
-    "exact_only": {
-        "TRT_EDGELLM_CONTEXTUAL_PD": "disabled",
-        "TRT_EDGELLM_CONTEXTUAL_EP": "disabled",
-        "TRT_EDGELLM_CONTEXTUAL_ED": "disabled",
-        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "0",
-        "TRT_EDGELLM_COMPLETION_CONFORMAL": "0",
-        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    # V0--V2 share the exact same candidate, feasibility, SLO, ownership, and
+    # dispatch mechanisms.  This single environment setting changes only the
+    # decision-cost authority and bounded transition evaluation.
+    "v0_exact": {
+        "TRT_EDGELLM_PHASE_POLICY": "exact",
     },
-    # V1: current production controller. Contextual scalar RLS has action
-    # authority while richer physical outcomes remain shadow diagnostics.
-    "full_active": {
-        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
-        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
-        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
-        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "0",
-        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    "v1_scalar": {
+        "TRT_EDGELLM_PHASE_POLICY": "scalar",
     },
-    # V2: use the same scalar estimator and candidate frontier as V1, adding
-    # only the existing deterministic bounded formation evaluator.
-    "scalar_transition": {
-        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
-        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
-        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
-        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "1",
-        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
+    "v2_scalar_transition": {
+        "TRT_EDGELLM_PHASE_POLICY": "scalar-transition",
     },
-    # V1 plus a conservative bounded successor veto. The contextual model can
-    # still select an action, but it is rejected when the identical exact-cost
-    # fallback has strictly lower robust two-action regret.
-    "successor_guard": {
-        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
-        "TRT_EDGELLM_CONTEXTUAL_EP": "active",
-        "TRT_EDGELLM_CONTEXTUAL_ED": "active",
-        "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE": "0",
-        "TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD": "1",
-        "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE": "0",
-    },
-    "pd_only": {
-        "TRT_EDGELLM_CONTEXTUAL_PD": "active",
-        "TRT_EDGELLM_CONTEXTUAL_EP": "shadow",
-        "TRT_EDGELLM_CONTEXTUAL_ED": "shadow",
-    },
-    "full_shadow": {
-        "TRT_EDGELLM_CONTEXTUAL_PD": "shadow",
-        "TRT_EDGELLM_CONTEXTUAL_EP": "shadow",
-        "TRT_EDGELLM_CONTEXTUAL_ED": "shadow",
-    },
+}
+
+DEPRECATED_POLICY_ENVIRONMENT = {
+    "TRT_EDGELLM_CONTEXTUAL_PD",
+    "TRT_EDGELLM_CONTEXTUAL_EP",
+    "TRT_EDGELLM_CONTEXTUAL_ED",
+    "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE",
+    "TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD",
+    "TRT_EDGELLM_COMPLETION_CONFORMAL",
+    "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE",
 }
 
 
@@ -119,6 +92,15 @@ def _set_backend_environment(command: list[str], name: str,
         index for index, token in enumerate(command)
         if token.startswith("nvcr.io/") or token.startswith("docker.io/"))
     command[image:image] = ["-e", f"{name}={value}"]
+
+
+def _drop_backend_environment(command: list[str], name: str) -> None:
+    index = 0
+    while index + 1 < len(command):
+        if command[index] == "-e" and command[index + 1].split("=", 1)[0] == name:
+            del command[index:index + 2]
+            continue
+        index += 1
 
 
 def _replace_backend_build(command: list[str],
@@ -188,11 +170,12 @@ def prepare_command(entry: dict[str, Any],
                     generic_vlm: Path,
                     backend_build_root: str = "",
                     backend_engine_dir: str = "",
-                    policy_variant: str = "full_active",
+                    policy_variant: str = "v2_scalar_transition",
                     backend_environment: tuple[str, ...] = (),
                     client_max_in_flight: int = 0,
                     capture_phase_telemetry: bool = False,
-                    trace_override: str = "") -> list[str]:
+                    trace_override: str = "",
+                    generic_calibration_max_rounds: int = 1) -> list[str]:
     if policy_variant not in POLICY_VARIANTS:
         raise ValueError(f"unknown policy variant: {policy_variant}")
     command = list(entry["command"])
@@ -214,6 +197,8 @@ def prepare_command(entry: dict[str, Any],
                                  "policy_reset")
     _replace_backend_build(command, backend_build_root)
     _replace_backend_engine(command, backend_engine_dir)
+    for name in DEPRECATED_POLICY_ENVIRONMENT:
+        _drop_backend_environment(command, name)
     for name, value in POLICY_VARIANTS[policy_variant].items():
         _set_backend_environment(command, name, value)
     if capture_phase_telemetry:
@@ -240,7 +225,8 @@ def prepare_command(entry: dict[str, Any],
         request_count = len(
             json.loads(calibration.read_text(encoding="utf-8"))["requests"])
         _set_option(command, "--generic-warmup-trace", str(calibration))
-        _set_option(command, "--warmup-requests", str(request_count))
+        _set_option(command, "--warmup-requests",
+                    str(request_count * generic_calibration_max_rounds))
         # The generic trace encodes action coverage in both request ordering
         # and arrival offsets. Execute the complete trace as one calibration
         # round so the client cannot truncate a later phase-order cycle or
@@ -264,10 +250,16 @@ def main() -> int:
     parser.add_argument("--backend-build-root", default="")
     parser.add_argument("--backend-engine-dir", default="")
     parser.add_argument("--client-max-in-flight", type=int, default=0)
+    parser.add_argument(
+        "--generic-calibration-max-rounds",
+        type=int,
+        default=1,
+        help=("repeat the workload-agnostic calibration trace until authority "
+              "converges, up to this many complete rounds"))
     parser.add_argument("--trace-override", type=Path)
     parser.add_argument("--policy-variant",
                         choices=sorted(POLICY_VARIANTS),
-                        default="full_active")
+                        default="v2_scalar_transition")
     parser.add_argument("--modes", default=",".join(MODES))
     parser.add_argument("--cases", default="")
     parser.add_argument("--repeats", type=int, default=3)
@@ -285,9 +277,11 @@ def main() -> int:
     modes = tuple(value for value in args.modes.split(",") if value)
     if not modes or any(mode not in MODES for mode in modes):
         parser.error(f"modes must be drawn from {','.join(MODES)}")
-    if args.repeats <= 0 or args.client_max_in_flight < 0:
+    if (args.repeats <= 0 or args.client_max_in_flight < 0
+            or args.generic_calibration_max_rounds <= 0):
         parser.error(
-            "repeats must be positive and client-max-in-flight cannot be negative"
+            "repeats and generic-calibration-max-rounds must be positive; "
+            "client-max-in-flight cannot be negative"
         )
     if any("=" not in assignment or not assignment.split("=", 1)[0]
            for assignment in args.backend_env):
@@ -311,7 +305,8 @@ def main() -> int:
                 args.backend_engine_dir, args.policy_variant,
                 tuple(args.backend_env), args.client_max_in_flight,
                 args.capture_phase_telemetry,
-                str(args.trace_override) if args.trace_override else "")
+                str(args.trace_override) if args.trace_override else "",
+                args.generic_calibration_max_rounds)
             commands.append({
                 "mode": mode,
                 "policy_variant": args.policy_variant,

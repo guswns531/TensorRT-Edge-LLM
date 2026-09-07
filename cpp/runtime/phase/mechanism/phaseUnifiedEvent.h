@@ -189,34 +189,6 @@ inline PhaseUnifiedPhase phaseUnifiedDirectionNewcomerPhase(PhaseUnifiedActionDi
     return PhaseUnifiedPhase::kNone;
 }
 
-inline bool phaseUnifiedDirectionsSharePair(
-    PhaseUnifiedActionDirection left, PhaseUnifiedActionDirection right) noexcept
-{
-    PhaseUnifiedPhase const leftIncumbent = phaseUnifiedDirectionIncumbentPhase(left);
-    PhaseUnifiedPhase const leftNewcomer = phaseUnifiedDirectionNewcomerPhase(left);
-    PhaseUnifiedPhase const rightIncumbent = phaseUnifiedDirectionIncumbentPhase(right);
-    PhaseUnifiedPhase const rightNewcomer = phaseUnifiedDirectionNewcomerPhase(right);
-    return leftIncumbent != PhaseUnifiedPhase::kNone && rightIncumbent != PhaseUnifiedPhase::kNone
-        && ((leftIncumbent == rightIncumbent && leftNewcomer == rightNewcomer)
-            || (leftIncumbent == rightNewcomer && leftNewcomer == rightIncumbent));
-}
-
-//! Research-only launch control for the M2 directional-injection benchmark.
-//! Production leaves direction at kNone, so no launch order or delay changes.
-struct PhaseDirectionalInjectionControl
-{
-    PhaseUnifiedActionDirection direction{PhaseUnifiedActionDirection::kNone};
-    double targetFraction{};
-    double incumbentReferenceUs{};
-    double newcomerReferenceUs{};
-    uint64_t requestedDelayUs{};
-
-    bool enabled() const noexcept
-    {
-        return direction != PhaseUnifiedActionDirection::kNone;
-    }
-};
-
 inline char const* phaseInFlightStatusName(PhaseInFlightStatus status) noexcept
 {
     switch (status)
@@ -451,7 +423,6 @@ struct PhaseUnifiedEvent
     //! includes the chosen candidate, launch direction, and outstanding-set
     //! transition, while retaining candidateId's stable-slot row ordering.
     uint64_t dispatchSignature{};
-    bool causalReplayForced{};
     PhaseUnifiedWork cohort;
     std::vector<uint64_t> requestIds;
     PhaseInFlightSnapshot inFlight;
@@ -469,11 +440,6 @@ struct PhaseUnifiedEvent
     uint64_t executeStartHostNs{};
     uint64_t executeEndHostNs{};
     bool graphReplay{};
-    std::optional<double> injectionTargetFraction;
-    PhaseUnifiedActionDirection injectionRequestedDirection{PhaseUnifiedActionDirection::kNone};
-    double injectionIncumbentReferenceUs{};
-    double injectionNewcomerReferenceUs{};
-    uint64_t requestedInjectionDelayUs{};
     std::optional<double> gpuStartUs;
     std::optional<double> gpuEndUs;
     std::optional<double> incumbentGpuCompletionUs;

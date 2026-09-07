@@ -39,7 +39,7 @@
       "minimum": 1
     },
     "policy_decision_sequence": {
-      "description": "Monotonic policy invocation sequence used only to address one-shot causal replay branches.",
+      "description": "Monotonic policy invocation sequence within one serving process.",
       "type": "integer",
       "minimum": 1
     },
@@ -77,31 +77,8 @@
       "type": "integer",
       "minimum": 1
     },
-    "frozen_transition_snapshot_valid": {
-      "description": "Whether the immutable production DAG/lease snapshot passed validation for transition replay.",
-      "type": "boolean"
-    },
-    "frozen_transition_snapshot_id": {
-      "description": "In-process identity shared by every predictor replayed from this production decision state.",
-      "type": "integer",
-      "minimum": 0
-    },
-    "frozen_transition_candidates": {
-      "description": "Number of hard-safe actions admitted to the common frozen replay frontier.",
-      "type": "integer",
-      "minimum": 0
-    },
     "scalar_formation": {
       "$ref": "#/$defs/model_formation"
-    },
-    "effect_formation": {
-      "$ref": "#/$defs/model_formation"
-    },
-    "completion_formation": {
-      "$ref": "#/$defs/model_formation"
-    },
-    "causal_replay_forced": {
-      "type": "boolean"
     },
     "plan_id": {
       "type": "integer",
@@ -251,16 +228,13 @@
       "type": "integer",
       "minimum": 1
     },
-    "active_h1_selected_action_id": {
-      "type": "integer",
-      "minimum": 0
-    },
     "scalar_h1_selected_action_id": {
       "type": "integer",
       "minimum": 0
     },
-    "completion_changed_h1_action": {
-      "type": "boolean"
+    "non_contextual_selected_action_id": {
+      "type": "integer",
+      "minimum": 0
     },
     "enqueue_host_ns": {
       "type": "integer",
@@ -294,33 +268,6 @@
         90,
         100
       ]
-    },
-    "injection_target_fraction": {
-      "type": "number",
-      "minimum": 0,
-      "maximum": 1
-    },
-    "injection_requested_direction": {
-      "enum": [
-        "encoder_to_prefill",
-        "prefill_to_encoder",
-        "encoder_to_decode",
-        "decode_to_encoder",
-        "prefill_to_decode",
-        "decode_to_prefill"
-      ]
-    },
-    "injection_incumbent_reference_us": {
-      "type": "number",
-      "exclusiveMinimum": 0
-    },
-    "injection_newcomer_reference_us": {
-      "type": "number",
-      "exclusiveMinimum": 0
-    },
-    "requested_injection_delay_us": {
-      "type": "integer",
-      "minimum": 0
     },
     "gpu_start_us": {
       "type": "number",
@@ -520,106 +467,6 @@
       },
       "additionalProperties": false
     },
-    "transitionReplay": {
-      "type": "object",
-      "required": [
-        "evaluated",
-        "valid",
-        "alternatives",
-        "worst_case_robust_horizon_us",
-        "first_completed_phase_mask",
-        "min_first_encoder_ready_rows",
-        "max_first_encoder_ready_rows",
-        "min_first_prefill_ready_rows",
-        "max_first_prefill_ready_rows",
-        "min_first_decode_ready_rows",
-        "max_first_decode_ready_rows",
-        "min_encoder_ready_rows",
-        "max_encoder_ready_rows",
-        "min_prefill_ready_rows",
-        "max_prefill_ready_rows",
-        "min_decode_ready_rows",
-        "max_decode_ready_rows",
-        "min_reclaim_bytes",
-        "max_reclaim_bytes"
-      ],
-      "properties": {
-        "evaluated": {
-          "type": "boolean"
-        },
-        "valid": {
-          "type": "boolean"
-        },
-        "alternatives": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "worst_case_robust_horizon_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "first_completed_phase_mask": {
-          "$ref": "#/$defs/activityMask"
-        },
-        "min_first_encoder_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_first_encoder_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "min_first_prefill_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_first_prefill_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "min_first_decode_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_first_decode_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "min_encoder_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_encoder_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "min_prefill_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_prefill_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "min_decode_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_decode_ready_rows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "min_reclaim_bytes": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_reclaim_bytes": {
-          "type": "integer",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false
-    },
     "model_formation": {
       "type": "object",
       "required": [
@@ -688,19 +535,6 @@
         "request_ids": {
           "$ref": "#/$defs/requestIds"
         },
-        "transition_action_id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "scalar_transition": {
-          "$ref": "#/$defs/transitionReplay"
-        },
-        "effect_transition": {
-          "$ref": "#/$defs/transitionReplay"
-        },
-        "completion_transition": {
-          "$ref": "#/$defs/transitionReplay"
-        },
         "completed_milestone": {
           "type": "string"
         }
@@ -712,7 +546,6 @@
       "required": [
         "action_id",
         "action_kind",
-        "action_direction",
         "request_ids",
         "legal"
       ],
@@ -723,9 +556,6 @@
         },
         "action_kind": {
           "$ref": "#/properties/action_kind"
-        },
-        "action_direction": {
-          "$ref": "#/properties/action_direction"
         },
         "residual_augmentation": {
           "type": "boolean"
@@ -757,160 +587,21 @@
             "minimum": 0
           }
         },
-        "contextual_completion_valid": {
-          "type": "boolean"
-        },
-        "contextual_completion_feature_v2_valid": {
-          "type": "boolean"
-        },
-        "contextual_completion_features": {
-          "type": "array",
-          "minItems": 16,
-          "maxItems": 16,
-          "items": {
-            "type": "number"
-          }
-        },
-        "contextual_direction": {
-          "enum": [
-            "encoder_to_prefill",
-            "prefill_to_encoder",
-            "encoder_to_decode",
-            "decode_to_encoder",
-            "prefill_to_decode",
-            "decode_to_prefill"
-          ]
-        },
-        "contextual_completion_ready": {
-          "type": "boolean"
-        },
-        "contextual_effect_valid": {
-          "type": "boolean"
-        },
-        "contextual_effect_ready": {
-          "type": "boolean"
-        },
-        "contextual_effect_compression_mean": {
-          "type": "number"
-        },
-        "contextual_effect_compression_uncertainty": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_effect_incumbent_stretch_mean": {
-          "type": "number"
-        },
-        "contextual_effect_incumbent_stretch_uncertainty": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_effect_order_margin_mean": {
-          "type": "number"
-        },
-        "contextual_effect_order_margin_uncertainty": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_incumbent_mean_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_incumbent_uncertainty_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_newcomer_mean_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_newcomer_uncertainty_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_pair_observations": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "contextual_direction_observations": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "contextual_direction_weight": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "contextual_uncertainty_scale": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_uncertainty_calibration_observations": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "contextual_uncertainty_calibrated": {
-          "type": "boolean"
-        },
-        "contextual_incumbent_reference_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_newcomer_reference_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "contextual_minimum_slack_us": {
-          "type": "number"
-        },
         "max_slo_violation_us": {
           "type": "number",
           "minimum": 0
         },
-        "completion_policy_evaluated": {
-          "type": "boolean"
-        },
-        "completion_authority_ready": {
-          "type": "boolean"
-        },
-        "completion_authority_applied": {
-          "type": "boolean"
-        },
         "scalar_decision_cost_known": {
           "type": "boolean"
         },
-        "active_decision_cost_known": {
+        "contextual_scalar_authority_applied": {
           "type": "boolean"
         },
         "scalar_decision_makespan_us": {
           "type": "number",
           "minimum": 0
         },
-        "active_decision_makespan_us": {
-          "type": "number",
-          "minimum": 0
-        },
-        "completion_aggregate_blend_weight": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "completion_incumbent_blend_weight": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "completion_newcomer_blend_weight": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
         "scalar_protected_completions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/protectedCompletion"
-          }
-        },
-        "active_protected_completions": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/protectedCompletion"
