@@ -56,17 +56,16 @@ struct PhaseVisionPreparedBatch
 
 namespace
 {
-void resizeTensor(Tensor& destination, Tensor const& source, std::string const& name)
+void resizeTensor(Tensor& destination, MultimodalOutputSpec const& spec, std::string const& name)
 {
-    int64_t const requiredBytes
-        = source.getShape().volume() * static_cast<int64_t>(utils::getTypeSize(source.getDataType()));
-    if (destination.isEmpty() || destination.getDataType() != source.getDataType()
+    int64_t const requiredBytes = spec.shape.volume() * static_cast<int64_t>(utils::getTypeSize(spec.dataType));
+    if (destination.isEmpty() || destination.getDataType() != spec.dataType
         || destination.getMemoryCapacity() < requiredBytes)
     {
-        destination = Tensor(source.getShape(), DeviceType::kGPU, source.getDataType(), name);
+        destination = Tensor(spec.shape, DeviceType::kGPU, spec.dataType, name);
         return;
     }
-    ELLM_CHECK(destination.reshape(source.getShape()), "Failed to reshape retained vision tensor");
+    ELLM_CHECK(destination.reshape(spec.shape), "Failed to reshape retained vision tensor");
 }
 
 size_t storageByteSize(PhaseVisionBatchStorage const& storage) noexcept
@@ -216,6 +215,7 @@ PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Toke
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mCopyStream, &copyContext));
     ELLM_CHECK(copyContext == mCudaContext, "Phase vision copy stream must share the encoder CUDA context");
     CUDA_CHECK(cudaEventCreateWithFlags(&mEncoderDoneEvent, cudaEventDisableTiming));
+    mRequiresExternalOutputStorage = mRunner.releaseInternalOutputStorage();
 }
 
 PhaseVisionAdapter::~PhaseVisionAdapter() noexcept
@@ -277,7 +277,7 @@ void PhaseVisionAdapter::copyRunnerOutputs(PhaseVisionBatchStorage& storage, Ten
     OptionalInputTensors const& deepstackFeatures, cudaStream_t stream)
 {
     auto retain = [&](Tensor const& source, Tensor& destination, std::string const& name) {
-        resizeTensor(destination, source, name);
+        resizeTensor(destination, {source.getShape(), source.getDataType()}, name);
         size_t const copyBytes
             = static_cast<size_t>(source.getShape().volume()) * utils::getTypeSize(source.getDataType());
         CUDA_CHECK(cudaMemcpyAsync(
@@ -411,21 +411,21 @@ std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vecto
         prepared->embeddingRows = phaseVisionEmbeddingRows(prepared->tokenIds, mConfig.imageTokenId);
         int64_t const totalEmbeddingRows
             = std::accumulate(prepared->embeddingRows.begin(), prepared->embeddingRows.end(), int64_t{});
-        Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
-        ELLM_CHECK(outputEmbedding.getShape().getNumDims() > 0 && outputEmbedding.getShape()[0] == totalEmbeddingRows,
+        MultimodalOutputSpec const outputSpec = mRunner.getOutputEmbeddingSpec();
+        ELLM_CHECK(outputSpec.shape.getNumDims() > 0 && outputSpec.shape[0] == totalEmbeddingRows,
             "Phase vision embedding rows do not match expanded image-token rows");
-        OptionalInputTensors const deepstackFeatures = mRunner.getDeepstackFeatures();
-        for (Tensor const& feature : deepstackFeatures)
+        std::vector<MultimodalOutputSpec> const deepstackSpecs = mRunner.getDeepstackOutputSpecs();
+        for (MultimodalOutputSpec const& spec : deepstackSpecs)
         {
-            ELLM_CHECK(feature.getShape().getNumDims() > 0 && feature.getShape()[0] == totalEmbeddingRows,
+            ELLM_CHECK(spec.shape.getNumDims() > 0 && spec.shape[0] == totalEmbeddingRows,
                 "Phase vision deepstack rows do not match expanded image-token rows");
         }
-        resizeTensor(prepared->storage->outputEmbedding, outputEmbedding, "phase_vision_batch_output");
-        prepared->storage->deepstackFeatures.resize(deepstackFeatures.size());
-        for (size_t index{}; index < deepstackFeatures.size(); ++index)
+        resizeTensor(prepared->storage->outputEmbedding, outputSpec, "phase_vision_batch_output");
+        prepared->storage->deepstackFeatures.resize(deepstackSpecs.size());
+        for (size_t index{}; index < deepstackSpecs.size(); ++index)
         {
             resizeTensor(
-                prepared->storage->deepstackFeatures[index], deepstackFeatures[index], "phase_vision_batch_deepstack");
+                prepared->storage->deepstackFeatures[index], deepstackSpecs[index], "phase_vision_batch_deepstack");
         }
     }
     catch (...)
@@ -453,16 +453,16 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
     {
         int64_t const totalEmbeddingRows
             = std::accumulate(prepared->embeddingRows.begin(), prepared->embeddingRows.end(), int64_t{});
-        Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
-        OptionalInputTensors const deepstackFeatures = mRunner.getDeepstackFeatures();
         std::vector<std::reference_wrapper<Tensor>> externalDeepstack;
-        externalDeepstack.reserve(deepstackFeatures.size());
-        for (size_t index{}; index < deepstackFeatures.size(); ++index)
+        externalDeepstack.reserve(prepared->storage->deepstackFeatures.size());
+        for (Tensor& feature : prepared->storage->deepstackFeatures)
         {
-            externalDeepstack.emplace_back(prepared->storage->deepstackFeatures[index]);
+            externalDeepstack.emplace_back(feature);
         }
         bool const directOutput
             = mRunner.bindExternalOutputStorage(prepared->storage->outputEmbedding, externalDeepstack);
+        ELLM_CHECK(!mRequiresExternalOutputStorage || directOutput,
+            "Multimodal runner released its internal outputs but rejected request-owned storage");
         bool inferenceSucceeded{};
         uint64_t const correlationId = prepared->submissions.front().requestId;
         CUDA_CHECK(cudaEventRecord(mEncoderStartEvent, mStream));
@@ -488,6 +488,8 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
         }
         else
         {
+            Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
+            OptionalInputTensors const deepstackFeatures = mRunner.getDeepstackFeatures();
             CUDA_CHECK(cudaEventRecord(mEncoderDoneEvent, mStream));
             CUDA_CHECK(cudaStreamWaitEvent(mCopyStream, mEncoderDoneEvent));
             recordActivity(PhaseActivityKind::kCopy, "encoder_output_copy", correlationId, mCopyStream,

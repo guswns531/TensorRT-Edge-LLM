@@ -32,6 +32,7 @@ public:
     using QwenViTRunner::QwenViTRunner;
 
     rt::OptionalInputTensors getDeepstackFeatures() override;
+    std::vector<MultimodalOutputSpec> getDeepstackOutputSpecs() const override;
 
 protected:
     bool validateExtraConfig(nlohmann::json const& jsonConfig) override;
@@ -40,6 +41,7 @@ protected:
         cudaStream_t stream) override;
     bool bindExtraInputShapes() override;
     bool bindExtraOutputStorage(std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
+    void releaseExtraOutputStorage() override;
 
     //! Video splits into per-frame sub-spans (each vit.gridT==1), unlike the base single flat span.
     std::tuple<int64_t, int64_t> computeVisionSpans(
@@ -60,6 +62,7 @@ protected:
     rt::Tensor mFastPosEmbIdx{};                  //!< Fast position embeddings index tensor
     rt::Tensor mFastPosEmbWeight{};               //!< Fast position embeddings weight tensor
     std::vector<rt::Tensor> mDeepstackFeatures{}; //!< Deepstack features tensors (empty for Qwen3.5)
+    Coords mDeepstackOutputShape{};               //!< Active deepstack shape for request-owned storage
 };
 
 } // namespace rt

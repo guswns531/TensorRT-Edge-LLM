@@ -199,6 +199,7 @@ private:
     PhaseVisionMemoryStats mMemoryStats;
     std::function<void(PhaseVisionDebugSnapshot const&)> mDebugCallback;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
+    bool mRequiresExternalOutputStorage{};
 };
 
 } // namespace trt_edgellm::rt

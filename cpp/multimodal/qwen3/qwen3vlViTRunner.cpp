@@ -62,6 +62,7 @@ bool Qwen3VLViTRunner::allocateExtraBuffers(int64_t maxImageTokens)
         setTensorAddressStatus
             &= mVisualContext->setTensorAddress(deepstackFeatureName.c_str(), mDeepstackFeatures.back().rawPointer());
     }
+    mDeepstackOutputShape = {maxImageTokens, mConfig.outHiddenSize};
     return setTensorAddressStatus;
 }
 
@@ -80,7 +81,11 @@ void Qwen3VLViTRunner::buildExtraInputs(
 
     for (int64_t i = 0; i < mNumDeepstackFeatures; ++i)
     {
-        check::check(mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+        mDeepstackOutputShape = {totalImageTokens, mConfig.outHiddenSize};
+        if (!mDeepstackFeatures[i].isEmpty())
+        {
+            check::check(mDeepstackFeatures[i].reshape(mDeepstackOutputShape), "Tensor reshape failed");
+        }
     }
 }
 
@@ -103,13 +108,12 @@ bool Qwen3VLViTRunner::bindExtraOutputStorage(std::vector<std::reference_wrapper
     for (size_t index{}; index < deepstackFeatures.size(); ++index)
     {
         rt::Tensor& external = deepstackFeatures[index].get();
-        rt::Tensor const& internal = mDeepstackFeatures[index];
         check::check(
             external.getDeviceType() == rt::DeviceType::kGPU, "External deepstack output storage must be a GPU tensor");
-        check::check(external.getDataType() == internal.getDataType(),
+        check::check(external.getDataType() == nvinfer1::DataType::kHALF,
             "External deepstack output storage has the wrong data type");
         check::check(
-            external.getShape() == internal.getShape(), "External deepstack output storage has the wrong shape");
+            external.getShape() == mDeepstackOutputShape, "External deepstack output storage has the wrong shape");
     }
     for (size_t index{}; index < deepstackFeatures.size(); ++index)
     {
@@ -187,6 +191,25 @@ rt::OptionalInputTensors Qwen3VLViTRunner::getDeepstackFeatures()
         refs.emplace_back(std::cref(tensor));
     }
     return refs;
+}
+
+std::vector<MultimodalOutputSpec> Qwen3VLViTRunner::getDeepstackOutputSpecs() const
+{
+    std::vector<MultimodalOutputSpec> result;
+    result.reserve(static_cast<size_t>(mNumDeepstackFeatures));
+    for (int64_t index{}; index < mNumDeepstackFeatures; ++index)
+    {
+        result.push_back({mDeepstackOutputShape, nvinfer1::DataType::kHALF});
+    }
+    return result;
+}
+
+void Qwen3VLViTRunner::releaseExtraOutputStorage()
+{
+    for (rt::Tensor& feature : mDeepstackFeatures)
+    {
+        feature = rt::Tensor{};
+    }
 }
 
 void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,

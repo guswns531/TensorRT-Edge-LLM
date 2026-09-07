@@ -347,6 +347,22 @@ rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
     return {};
 }
 
+MultimodalOutputSpec MultimodalRunner::getOutputEmbeddingSpec() const
+{
+    ELLM_CHECK(!mOutputEmbedding.isEmpty(), "Multimodal output specification requires allocated output storage");
+    return {mOutputEmbedding.getShape(), mOutputEmbedding.getDataType()};
+}
+
+std::vector<MultimodalOutputSpec> MultimodalRunner::getDeepstackOutputSpecs() const
+{
+    return {};
+}
+
+bool MultimodalRunner::releaseInternalOutputStorage()
+{
+    return false;
+}
+
 bool MultimodalRunner::bindExternalOutputStorage(
     rt::Tensor& /*outputEmbedding*/, std::vector<std::reference_wrapper<rt::Tensor>> const& /*deepstackFeatures*/)
 {

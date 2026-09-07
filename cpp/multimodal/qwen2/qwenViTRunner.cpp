@@ -258,6 +258,7 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     auto const maxImageTokens = mConfig.maxHW / (mConfig.mergeSize * mConfig.mergeSize);
     mOutputEmbedding = rt::Tensor({maxImageTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "QwenViTRunner::mOutputEmbedding");
+    mOutputEmbeddingShape = mOutputEmbedding.getShape();
     setTensorAddressStatus
         &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
 
@@ -431,7 +432,11 @@ void QwenViTRunner::imagePreprocessSpansOnly(
     if (totalSeqLength > 0)
     {
         int64_t const totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
-        check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+        mOutputEmbeddingShape = {totalImageTokens, mConfig.outHiddenSize};
+        if (!mOutputEmbedding.isEmpty())
+        {
+            check::check(mOutputEmbedding.reshape(mOutputEmbeddingShape), "Tensor reshape failed");
+        }
     }
 }
 
@@ -482,7 +487,11 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std
     // Reshape tensors
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
     check::check(mVitInput.reshape({totalSeqLength, mConfig.inputDim}), "Tensor reshape failed");
-    check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    mOutputEmbeddingShape = {totalImageTokens, mConfig.outHiddenSize};
+    if (!mOutputEmbedding.isEmpty())
+    {
+        check::check(mOutputEmbedding.reshape(mOutputEmbeddingShape), "Tensor reshape failed");
+    }
     // Record performance data
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
@@ -927,15 +936,28 @@ rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
     return {};
 }
 
+MultimodalOutputSpec QwenViTRunner::getOutputEmbeddingSpec() const
+{
+    ELLM_CHECK(mOutputEmbeddingShape.getNumDims() > 0, "Qwen vision output shape is not available");
+    return {mOutputEmbeddingShape, nvinfer1::DataType::kHALF};
+}
+
+bool QwenViTRunner::releaseInternalOutputStorage()
+{
+    mOutputEmbedding = rt::Tensor{};
+    releaseExtraOutputStorage();
+    return true;
+}
+
 bool QwenViTRunner::bindExternalOutputStorage(
     rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures)
 {
     check::check(
         outputEmbedding.getDeviceType() == rt::DeviceType::kGPU, "External vision output storage must be a GPU tensor");
-    check::check(outputEmbedding.getDataType() == mOutputEmbedding.getDataType(),
+    check::check(outputEmbedding.getDataType() == nvinfer1::DataType::kHALF,
         "External vision output storage has the wrong data type");
-    check::check(outputEmbedding.getShape() == mOutputEmbedding.getShape(),
-        "External vision output storage has the wrong shape");
+    check::check(
+        outputEmbedding.getShape() == mOutputEmbeddingShape, "External vision output storage has the wrong shape");
     if (!bindExtraOutputStorage(deepstackFeatures))
     {
         return false;
@@ -947,6 +969,8 @@ bool QwenViTRunner::bindExtraOutputStorage(std::vector<std::reference_wrapper<rt
 {
     return deepstackFeatures.empty();
 }
+
+void QwenViTRunner::releaseExtraOutputStorage() {}
 
 } // namespace rt
 } // namespace trt_edgellm

@@ -153,6 +153,9 @@ public:
     //! \return Optional input tensors vector containing deepstack features
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
+    MultimodalOutputSpec getOutputEmbeddingSpec() const override;
+    bool releaseInternalOutputStorage() override;
+
     bool bindExternalOutputStorage(
         rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
 
@@ -192,6 +195,9 @@ protected:
 
     //! Bind model-specific outputs such as Qwen3-VL deepstack features.
     virtual bool bindExtraOutputStorage(std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures);
+
+    //! Release model-specific encoder outputs while retaining their active metadata.
+    virtual void releaseExtraOutputStorage();
 
     //! \brief Append this image buffer's vision spans. \see VisionSpan.
     //! \return {totalSeqLen, totalGridT} of the appended spans (Σ gridT*gridH*gridW, Σ gridT) for formatPatch.
@@ -292,6 +298,7 @@ protected:
     rt::Tensor mResizeTmpDevice{};        //!< Float scratch (horizontal pass) for the GPU resize
     rt::Tensor mMropePositionIdsHost{};   //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{}; //!< MRoPE position IDs device tensor
+    Coords mOutputEmbeddingShape{};       //!< Active output shape when request-owned storage is bound
     // Model-specific ViT-input tensors live in the per-model subclasses.
 
     std::string mEngineDir;           //!< Visual engine dir (kept for the deferred initialize() config load)

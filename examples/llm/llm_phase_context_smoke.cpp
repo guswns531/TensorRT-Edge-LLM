@@ -1829,6 +1829,11 @@ int main(int argc, char** argv)
         char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
         char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
         char const* encoderCalibrationImage = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE");
+        int32_t visionRunnerBatchSize = config.maxSupportedBatchSize;
+        if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE"))
+        {
+            visionRunnerBatchSize = std::min(visionRunnerBatchSize, std::max(1, std::stoi(value)));
+        }
         rt::PhaseVisionStoragePolicy visionStoragePolicy;
         visionStoragePolicy.splitMropeLease = serverConfig.releaseVisionPrefillStorage;
         if (char const* value = std::getenv("TRT_EDGELLM_VISION_IDLE_SLABS"))
@@ -1894,8 +1899,8 @@ int main(int argc, char** argv)
                 CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
             }
             {
-                auto runner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
-                    config.maxKVCacheCapacity, encoderStream, checkpointDir);
+                auto runner = rt::MultimodalRunner::create(
+                    visionEngineDir, visionRunnerBatchSize, config.maxKVCacheCapacity, encoderStream, checkpointDir);
                 configureVisionContextMemory(*runner);
                 rt::PhaseVisionAdapter visionAdapter(
                     *runner, tokenizer, phaseConfig, encoderStream, visionStoragePolicy, copyStream);
@@ -2230,8 +2235,8 @@ int main(int argc, char** argv)
                 {
                     CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
                 }
-                ipcVisionRunner = rt::MultimodalRunner::create(visionEngineDir, config.maxSupportedBatchSize,
-                    config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
+                ipcVisionRunner = rt::MultimodalRunner::create(
+                    visionEngineDir, visionRunnerBatchSize, config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
                 configureVisionContextMemory(*ipcVisionRunner);
                 ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
                     *ipcVisionRunner, tokenizer, phaseConfig, ipcEncoderStream, visionStoragePolicy, copyStream);

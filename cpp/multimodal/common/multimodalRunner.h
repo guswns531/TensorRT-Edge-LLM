@@ -41,6 +41,13 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Shape and data type of one multimodal encoder output without requiring backing storage.
+struct MultimodalOutputSpec
+{
+    Coords shape;
+    nvinfer1::DataType dataType{nvinfer1::DataType::kFLOAT};
+};
+
 //! @brief Client input errors, which preprocess catch blocks rethrow: collapsing them to
 //!        `return false` leaves the pybind layer nothing to report but a generic 500.
 inline bool isCallerActionable(std::exception const& e) noexcept
@@ -169,6 +176,13 @@ public:
     //! @brief Get deepstack features for Qwen3-VL models
     //! @return Optional deepstack features vector (raw features before embedding lookup)
     virtual rt::OptionalInputTensors getDeepstackFeatures();
+
+    //! Describe the active encoder outputs independently of their backing allocation.
+    virtual MultimodalOutputSpec getOutputEmbeddingSpec() const;
+    virtual std::vector<MultimodalOutputSpec> getDeepstackOutputSpecs() const;
+
+    //! Release internal outputs when every subsequent inference will bind request-owned storage.
+    virtual bool releaseInternalOutputStorage();
 
     //! Bind request-owned output storage for the next encoder inference when supported.
     virtual bool bindExternalOutputStorage(

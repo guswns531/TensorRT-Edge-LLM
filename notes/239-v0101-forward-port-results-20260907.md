@@ -440,3 +440,124 @@ principally encoder cohort formation rather than copy elimination.
 Against the unchanged frozen vLLM token-throughput table, E4 V0/V1/V2 are -19.57%/-17.09%/-18.13% geometric mean.
 That improves substantially on the E1 port's -40.26%/-38.76%/-39.22%, but remains below the retained v0.10.0 E4/D64
 configuration, which was +15.16% for V2 on the same frozen table. D32 remains the dominant portability difference.
+
+## 12. Single-buffered vision output and the recovered D64 frontier
+
+The remaining reusable v0.10.0 mechanisms were audited before adding another policy change. Stable indexed page
+ownership, independent E/P/D contexts, packed P128, async preparation, direct encoder output, early vision-storage
+release, shared E/D context memory, canonical row ordering, CUDA graphs, and the V0/V1/V2 policy surface were already
+present in this forward port. The missing memory property was narrower: direct output removed the device-to-device
+copy but still kept the Qwen/Cosmos runner's maximum-size internal outputs alive.
+
+The implementation now separates output metadata from output backing:
+
+```text
+preprocess
+   |
+   +--> active output specs (shape, dtype)
+   |
+PhaseVisionAdapter
+   +--> request-owned main embedding
+   +--> request-owned deepstack[0..2]
+   |
+bindExternalOutputStorage()
+   |
+TensorRT vision context writes directly into request-owned storage
+   |
+E completion event --> P-ready queue --> release after P consumption
+
+Qwen/Cosmos internal maximum outputs: released once at adapter construction
+```
+
+For Cosmos-Reason2-2B, the released maximum backing is 2,048 rows x 2,048 hidden x FP16 for the main output and each
+of three deepstack outputs: 8 MiB x 4 = 32 MiB. The runner retains only active shape/type metadata. Legacy runners
+that cannot bind external output storage keep their internal outputs and the copy fallback, so the optimization does
+not change their contract.
+
+The phase smoke runtime also constructs the vision runner at the declared encoder batch limit instead of the LLM's
+80-slot capacity. At E4 this reduces the Qwen M-RoPE position-ID device tensor from B80 to B4, saving about 3.6 MiB of
+device memory and the same amount of pinned host backing. These two changes are enough to cross the allocation cliff:
+
+| Configuration after change | Result |
+|---|---|
+| E4/P8/D64, encoded capacity 4 | succeeds on all 12 workloads |
+| E4/P8/D64, encoded capacity 8 | CUDA OOM at the first vision-heavy measurement wave |
+| E4/P8/D64, encoded capacity 16/throughput cap 80 | CUDA OOM at the first vision-heavy measurement wave |
+| E4/P8/D64 with 48 MiB byte admission gate | no progress; count/byte lifetime coupling over-constrains admission |
+
+The byte-gate experiment was rejected rather than promoted. It prevented the OOM but produced a scheduler progress
+cycle, so it is not a safe substitute for lifetime-aware byte admission. Capacity 4 is therefore a measured hardware
+frontier for this 10 GB configuration, not a workload-tuned preference.
+
+### 12.1 D64 V0/V1/V2 one-run gate
+
+All variants below use the same v0.10.1 binary and engine, E4, P8, fixed P128, D64, encoded-vision capacity 4, generic
+workload-agnostic calibration, traces, request ordering, and memory settings. Only `TRT_EDGELLM_PHASE_POLICY` changes.
+The table reports milliseconds for latency and one-run engineering results rather than confidence intervals.
+
+| Workload | Variant | req/s | token/s | TTFT mean / p95 | TPOT mean / p95 | E2E mean / p95 | Peak MiB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| short | V0 | 108.771 | 2356.7 | 104.1 / 189.2 | 13.71 / 27.97 | 354.8 / 435.1 | 9819 |
+|  | V1 | 106.688 | 2311.6 | 110.7 / 194.4 | 13.17 / 22.32 | 358.3 / 441.0 | 9819 |
+|  | V2 | 104.490 | 2264.0 | 112.1 / 198.2 | 13.69 / 23.02 | 368.9 / 453.3 | 9819 |
+| balanced | V0 | 46.300 | 4012.7 | 69.8 / 181.1 | 13.91 / 16.08 | 1255.7 / 1957.6 | 9819 |
+|  | V1 | 48.414 | 4195.9 | 70.7 / 177.3 | 13.18 / 15.50 | 1192.6 / 1925.7 | 9819 |
+|  | V2 | 46.264 | 4009.5 | 78.5 / 189.0 | 13.76 / 15.53 | 1250.1 / 1951.0 | 9819 |
+| decode-heavy | V0 | 19.009 | 4942.4 | 74.9 / 199.4 | 11.29 / 12.05 | 2991.1 / 4615.6 | 9819 |
+|  | V1 | 19.135 | 4975.2 | 76.5 / 197.8 | 11.17 / 11.85 | 2962.5 / 4507.2 | 9819 |
+|  | V2 | 18.071 | 4698.5 | 76.3 / 209.1 | 11.91 / 12.62 | 3149.1 / 4819.7 | 9819 |
+| long-prefill | V0 | 12.385 | 1073.4 | 2280.4 / 3095.4 | 29.93 / 34.90 | 4851.1 / 7045.1 | 9819 |
+|  | V1 | 13.806 | 1196.5 | 2129.1 / 2657.4 | 25.84 / 30.83 | 4325.1 / 6072.8 | 9819 |
+|  | V2 | 11.973 | 1037.6 | 2403.1 / 3331.1 | 30.75 / 38.07 | 5026.6 / 7603.5 | 9819 |
+| bimodal | V0 | 11.740 | 1800.1 | 2026.8 / 4457.3 | 19.04 / 29.20 | 4675.3 / 9668.8 | 9819 |
+|  | V1 | 11.918 | 1827.4 | 2035.8 / 4364.9 | 18.12 / 26.52 | 4599.5 / 9900.1 | 9819 |
+|  | V2 | 11.734 | 1799.3 | 2059.3 / 4411.6 | 18.90 / 28.39 | 4673.2 / 9755.2 | 9819 |
+| text-heavy | V0 | 27.434 | 1454.0 | 431.7 / 1771.7 | 15.52 / 21.53 | 1258.0 / 2218.3 | 9869 |
+|  | V1 | 27.373 | 1450.8 | 430.9 / 1841.8 | 14.94 / 20.31 | 1224.8 / 2216.7 | 9863 |
+|  | V2 | 26.027 | 1379.5 | 422.2 / 1855.9 | 17.19 / 21.58 | 1343.4 / 2334.4 | 9871 |
+| mixed | V0 | 14.655 | 670.4 | 1138.8 / 3766.4 | 14.14 / 17.44 | 1784.4 / 4242.8 | 9869 |
+|  | V1 | 14.788 | 676.6 | 1156.3 / 3764.0 | 13.23 / 16.84 | 1770.7 / 4198.7 | 9865 |
+|  | V2 | 15.066 | 689.3 | 1068.5 / 3639.6 | 14.05 / 18.39 | 1724.1 / 4106.4 | 9867 |
+| poisson | V0 | 22.307 | 1628.4 | 336.7 / 1720.6 | 18.88 / 24.06 | 1718.5 / 2468.6 | 9863 |
+|  | V1 | 22.735 | 1659.7 | 338.4 / 1694.8 | 17.37 / 21.92 | 1623.6 / 2357.0 | 9873 |
+|  | V2 | 22.065 | 1610.8 | 336.8 / 1756.5 | 19.84 / 26.28 | 1786.8 / 2513.7 | 9859 |
+| vision-heavy | V0 | 9.964 | 383.6 | 2358.5 / 5835.5 | 13.74 / 16.17 | 2878.5 / 6294.6 | 9869 |
+|  | V1 | 10.017 | 385.6 | 2358.1 / 5793.2 | 13.38 / 16.42 | 2869.9 / 6242.6 | 9873 |
+|  | V2 | 10.424 | 401.3 | 2271.6 / 5573.8 | 12.66 / 16.10 | 2764.3 / 5995.3 | 9865 |
+| wave-drain | V0 | 2.942 | 94.1 | 286.8 / 561.8 | 8.04 / 10.72 | 536.1 / 769.0 | 9865 |
+|  | V1 | 2.948 | 94.3 | 290.5 / 583.6 | 8.15 / 10.85 | 543.0 / 790.6 | 9863 |
+|  | V2 | 2.947 | 94.3 | 287.9 / 550.6 | 8.01 / 10.73 | 536.2 / 757.6 | 9865 |
+| late-vision | V0 | 16.326 | 2355.1 | 143.1 / 584.3 | 10.00 / 10.05 | 1575.0 / 1957.9 | 9859 |
+|  | V1 | 16.433 | 2370.5 | 146.7 / 599.1 | 9.93 / 9.98 | 1568.9 / 1945.4 | 9863 |
+|  | V2 | 16.319 | 2354.1 | 147.0 / 593.6 | 10.00 / 10.06 | 1579.0 / 1956.8 | 9863 |
+| multi-image | V0 | 6.503 | 208.1 | 290.7 / 494.7 | 7.24 / 8.74 | 515.2 / 717.4 | 9855 |
+|  | V1 | 6.188 | 198.0 | 316.1 / 534.9 | 9.72 / 11.31 | 617.4 / 767.7 | 9855 |
+|  | V2 | 6.275 | 200.8 | 309.4 / 524.4 | 9.50 / 10.82 | 603.8 / 756.7 | 9855 |
+
+V1 is the D64 aggregate winner: +1.22% token-throughput geometric mean over V0 with 9/12 wins. V2 is -1.25% with
+3/12 wins, although it is best on mixed and vision-heavy. V1 improves 8/12 workloads over its D32 result and gains
++11.47% geometric-mean request throughput; balanced and decode-heavy improve by 51.96% and 50.77%. Multi-image and
+vision-heavy regress by 2.76% and 3.06%, showing that a wider D frontier is not useful when E dominates or the cohort
+is tiny.
+
+The strict comparison tool rejects this matrix because cross-policy greedy identity is 9/12. Mixed, text-heavy, and
+vision-heavy differ; all other traces are exact. Therefore V1 is the performance candidate, not a production
+promotion. Relative to the unchanged frozen vLLM token-throughput table, V0/V1/V2 are -8.70%/-7.58%/-9.84%
+geometric mean, with V1 winning 4/12. D64 removes most of the text-path gap, but v0.10.1 still cannot sustain the
+v0.10.0 C16/C80 vision admission frontier within 10 GB. The remaining external gap is primarily VLM capacity, not
+evidence that V2 transition reasoning is universally beneficial.
+
+After formatting, the final source was rebuilt and both runtime suites were rerun: `unitTestRuntime` passed 619 tests
+with the single two-GPU NCCL test skipped, and `unitTestRuntimeState` passed all 74 tests. A final D64 multi-image V1
+inference reproduced the retained token SHA-256 `cd7c5ff866b12e39907ec334e1ccf81dc41f1d98a0aebf67653b3889a8a1da9f`.
+
+### 12.2 Revised next work
+
+1. Keep V1 as the default research candidate and V0 as the conservative exact-cost baseline; V2 remains an ablation.
+2. Resolve the three E4 cross-policy numerical divergences before production promotion.
+3. Recover roughly 0.6 GiB of v0.10.0's memory advantage. The leading architectural difference is the v0.10.1
+   standard ONNX/embedded-weight engine versus the retained v0.10.0 external-weight path; the memory delta prevents
+   C8/C16 vision admission even after output-backing reclamation.
+4. Add lifetime-aware byte admission only with an explicit progress invariant; the tested byte gate deadlocks.
+5. Repeat the decisive D64 points for confidence intervals before any paper headline claim.
+6. Run a fresh vLLM comparison only after the model/engine/request/memory contract is made genuinely equal.
