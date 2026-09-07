@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "baseline_id": "inflight-m0-cosmos-reason2-2b-20260901",
+  "frozen_at_utc": "2026-09-01T07:50:33Z",
+  "purpose": "Freeze the pre-incremental-dispatch myopic production baseline and the final H2 research result.",
+  "repository": {
+    "path_from_workspace": ".local/upstream-v010",
+    "branch": "codex/v010-phase-forward-port",
+    "head_commit": "e182359ffff431fd30aebc2d64221123ea78e3cf",
+    "upstream_version": "v0.10.0",
+    "upstream_commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
+    "working_tree_dirty": true,
+    "status_porcelain_sha256": "300b5744c205f7bafcb2c37b622bc75bcad095f6d437a2331ac87c8080f86f9c",
+    "tracked_phase_diff_sha256": "6b0a80c1365c6d0079a8e605629624c20b52f464deee6636f170b6f5bb6e6666",
+    "note": "The executable and source artifact hashes, rather than HEAD alone, identify this intentionally dirty research snapshot."
+  },
+  "platform": {
+    "gpu": "NVIDIA GeForce RTX 3080",
+    "compute_capability": "8.6",
+    "gpu_memory_mib": 10240,
+    "driver_version": "610.43.02",
+    "host_kernel": "Linux 6.8.0-138-generic x86_64",
+    "cuda_compiler": "13.3",
+    "cxx_compiler": "Ubuntu GCC 13.3.0",
+    "container_image": "nvcr.io/nvidia/tensorrt:26.06-py3",
+    "container_digest": "sha256:7cd94ee931d2b5b85ad1c5af723d485b2625f6ce167e1e4abe577850b96ceac3",
+    "tensorrt_version": "11.0.0.114"
+  },
+  "model_contract": {
+    "model_id": "nvidia/Cosmos-Reason2-2B",
+    "precision": "unquantized checkpoint with FP16 TensorRT engine and FP16 KV cache",
+    "text_engine": {
+      "max_batch_size": 80,
+      "max_prefill_batch_size": 8,
+      "max_decode_batch_size": 64,
+      "max_prefill_chunk_tokens": 128,
+      "max_input_length": 1024,
+      "max_kv_cache_capacity": 2048,
+      "max_kv_pool_pages": 256,
+      "packed_prefill": true,
+      "indexed_paged_kv": true,
+      "tied_external_embedding_lm_head": true
+    },
+    "vision_engine": {
+      "max_encoder_batch_size": 8,
+      "max_image_tokens": 2048,
+      "max_image_tokens_per_image": 512
+    }
+  },
+  "request_contract": {
+    "transport": "OpenAI-compatible HTTP gateway backed by PhaseAsyncServer IPC",
+    "trace": "long-lived-permuted-phase-trace",
+    "requests_per_run": 384,
+    "prompt_tokens_per_run": 133134,
+    "requested_output_tokens_per_run": 17568,
+    "repeats": 3,
+    "max_in_flight": 80,
+    "ignore_eos": true,
+    "sampling": "greedy",
+    "correctness": "exact token trace SHA256 plus semantic VLM checks",
+    "fixed_prefill_chunk_tokens": 128,
+    "prefill_batch_cap": 8,
+    "decode_batch_cap": 64,
+    "encoder_batch_cap": 8,
+    "async_request_adapter_workers": 8
+  },
+  "policy_contract": {
+    "shared": {
+      "global_scheduler": "active",
+      "contextual_pd": "active",
+      "contextual_ep": "active",
+      "contextual_ed": "active",
+      "safe_probe_slack_multiplier": 2.0,
+      "safe_probe_interval": 1,
+      "overlap_warmup": false,
+      "realized_episode_dispatch_limit": 4
+    },
+    "production_default": {
+      "name": "transition-safe myopic",
+      "formation_aware": false,
+      "commands_artifact": "myopic_commands"
+    },
+    "research_opt_in": {
+      "name": "final-action-dominant H2 plus concrete sampling boundary",
+      "formation_aware": true,
+      "commands_artifact": "h2_commands",
+      "promotion_status": "not production default",
+      "reason": "9 of 9 episodes with known D budgets violated the local D service budget."
+    }
+  },
+  "frozen_results": {
+    "token_trace_sha256": "5c0aa22ee6aa52638fa1ea09c5d4b7fc2ec225a7870d8870aaf1693bd5fa6e21",
+    "myopic": {
+      "generated_token_s": 584.5614486449558,
+      "ttft_mean_ms": 1136.0890788229167,
+      "ttft_p95_ms": 3391.8403224999993,
+      "tpot_mean_ms": 25.253432697701417,
+      "tpot_p95_ms": 39.92324153650794,
+      "e2e_mean_ms": 2277.8552685416666,
+      "e2e_p95_ms": 4132.74931105,
+      "peak_vram_mib": 9481,
+      "token_deterministic": true
+    },
+    "h2": {
+      "generated_token_s": 586.1791449952553,
+      "ttft_mean_ms": 1102.249210731771,
+      "ttft_p95_ms": 3289.7551234999996,
+      "tpot_mean_ms": 25.287388847461102,
+      "tpot_p95_ms": 39.441413676984126,
+      "e2e_mean_ms": 2250.373329440104,
+      "e2e_p95_ms": 4049.494719099997,
+      "peak_vram_mib": 9473,
+      "token_deterministic": true,
+      "realized_episodes": 10,
+      "known_decode_budgets": 9,
+      "decode_budget_violations": 9,
+      "predicted_regret_decode_gap_correlation": 0.38831766072107277
+    }
+  },
+  "telemetry_contract": {
+    "schema_version": 1,
+    "record_prefix": "PHASE_SCHEDULER_EVENT",
+    "clock_domains": {
+      "host_monotonic_ns": "CLOCK_MONOTONIC",
+      "gpu_duration_us": "phase-local CUDA event elapsed time",
+      "gpu_start_us": "optional elapsed time from the per-run CUDA event origin",
+      "gpu_end_us": "optional elapsed time from the per-run CUDA event origin"
+    },
+    "required_event_kinds": [
+      "decision",
+      "dispatch",
+      "completion"
+    ],
+    "schema_artifact": "phase_event_schema"
+  },
+  "artifacts": [
+    {
+      "id": "phase_event_schema",
+      "base": "repository",
+      "path": "benchmarks/phase_serving/manifests/phase_event_schema_v1.json",
+      "bytes": 7411,
+      "sha256": "305c87a44f3260bff49a4462f6233c1d540711b59052328f3ce030689b3e7298"
+    },
+    {
+      "id": "runtime_binary",
+      "base": "workspace",
+      "path": ".local/upstream-v010/.local/build-v010-forward-sm86/examples/llm/llm_phase_context_smoke",
+      "bytes": 21810680,
+      "sha256": "c6404b35efe1d4597c1e0b4b9211b6b3a39b78d17fc919c3a3a902e82a20b7d8"
+    },
+    {
+      "id": "plugin_library",
+      "base": "workspace",
+      "path": ".local/upstream-v010/.local/build-v010-forward-sm86/libNvInfer_edgellm_plugin.so.1.0",
+      "bytes": 32508632,
+      "sha256": "b78c59b1ee8f760062eb22bddd152dc76a022945b43b7bd45f2d8f7d932f7a70"
+    },
+    {
+      "id": "text_engine_config",
+      "base": "workspace",
+      "path": ".local/profile-local-prefill-20260827/engine-p128-v1024-kv256-tied/config.json",
+      "bytes": 2647,
+      "sha256": "725ab58f52991fea9a7bb40507355309d7232497a6f755d350f5a7692d971293"
+    },
+    {
+      "id": "text_engine",
+      "base": "workspace",
+      "path": ".local/profile-local-prefill-20260827/engine-p128-v1024-kv256-tied/llm.engine",
+      "bytes": 2839069516,
+      "sha256": "96393b233813fe0b956a55441d4ca0bdbe6a6de6ae6b2f50fd2db0f7bab298df"
+    },
+    {
+      "id": "external_embedding",
+      "base": "workspace",
+      "path": ".local/profile-local-prefill-20260827/engine-p128-v1024-kv256-tied/embedding.safetensors",
+      "bytes": 622329960,
+      "sha256": "6d12ebbdb7f011db8744eed3d85d81b3b04bd9009510effdb1beb041c566afce"
+    },
+    {
+      "id": "vision_engine_config",
+      "base": "workspace",
+      "path": ".local/atomic-packed-vision-runtime-20260824/direct-visual-max2048/visual/config.json",
+      "bytes": 155384,
+      "sha256": "b3aed1a49b125679db55b958d99d16bd558ad9fab230e320e0dcbced3b7a10a6"
+    },
+    {
+      "id": "vision_engine",
+      "base": "workspace",
+      "path": ".local/atomic-packed-vision-runtime-20260824/direct-visual-max2048/visual/visual.engine",
+      "bytes": 19833476,
+      "sha256": "ea090592762a96d2dc82f10c167b60f4f85fa6ccc4810cb362cef22556fcf99d"
+    },
+    {
+      "id": "model_config",
+      "base": "workspace",
+      "path": ".local/cosmos-reason2-2b/hf/config.json",
+      "bytes": 1505,
+      "sha256": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b"
+    },
+    {
+      "id": "model_weights",
+      "base": "workspace",
+      "path": ".local/cosmos-reason2-2b/hf/model.safetensors",
+      "bytes": 4877470304,
+      "sha256": "fa5a6e6ef4fce40216b185cc48a3b24d31637ac3e2ba69c107ed1f389c1e6ede"
+    },
+    {
+      "id": "long_lived_trace",
+      "base": "workspace",
+      "path": ".local/transition-aware-20260830/p68-long-lived/traces/permuted-6epoch.json",
+      "bytes": 277625,
+      "sha256": "94d8d5299063b6ed2ffa808c1cc37edc152d1d35735399de4a69eb40afc1f207"
+    },
+    {
+      "id": "h2_commands",
+      "base": "workspace",
+      "path": ".local/transition-aware-20260830/p101-final-dominance-h2-long-3x/commands.json",
+      "sha256": "2dcca6b1e892ff5eb3193844622fe5cb632fff28bd5d1aeb4999c1d6a2f04ff1"
+    },
+    {
+      "id": "h2_aggregate",
+      "base": "workspace",
+      "path": ".local/transition-aware-20260830/p101-final-dominance-h2-long-3x/long-lived/worker-8/aggregate.json",
+      "sha256": "0e6709d161e38fa57d1129ac1bb67a649d3e92b0dde8daf08678bef64200957a"
+    },
+    {
+      "id": "h2_formation_summary",
+      "base": "workspace",
+      "path": ".local/transition-aware-20260830/p101-final-dominance-h2-long-3x/formation-summary.json",
+      "sha256": "41bf6cac151c11d0b035986209ca9b4513e4b436ffefbaa88023e7af9145af18"
+    },
+    {
+      "id": "myopic_commands",
+      "base": "workspace",
+      "path": ".local/transition-aware-20260830/p102-final-myopic-long-3x/commands.json",
+      "sha256": "a291af9ecd3ddfcbe231fa0b08f21fb0eb741186b1c37c792319aac77a57e70f"
+    },
+    {
+      "id": "myopic_aggregate",
+      "base": "workspace",
+      "path": ".local/transition-aware-20260830/p102-final-myopic-long-3x/long-lived/worker-8/aggregate.json",
+      "sha256": "46efd464940ca69ff6f4b0ccc0982b2cb18ef1874406385ba2fa513fa2cf3204"
+    },
+    {
+      "id": "source_phase_queue_scheduler",
+      "base": "repository",
+      "path": "cpp/runtime/scheduling/phaseQueueScheduler.cpp",
+      "sha256": "a8ddcfa35adb46e51c931b95fc218cd0ede999d02077f161566e53eac48faeb2"
+    },
+    {
+      "id": "source_phase_coordinator",
+      "base": "repository",
+      "path": "cpp/runtime/scheduling/phaseThreeCoordinator.cpp",
+      "sha256": "fd92d75a2a0be7c149a7bd240026142dcc3c5952f088fdf7cd5c62db570370d3"
+    },
+    {
+      "id": "source_async_server",
+      "base": "repository",
+      "path": "cpp/runtime/scheduling/independentPhaseAsyncServer.cpp",
+      "sha256": "48508a4281a5ca4573f0b559d1d52f0fba946b61f44ad2bbe61f893f1dd5b4cb"
+    },
+    {
+      "id": "source_formation_planner",
+      "base": "repository",
+      "path": "cpp/runtime/scheduling/phaseFormationPlanner.cpp",
+      "sha256": "aaca6e0ad55e98bb894f3b12ec6251943b69921df6ac60b15a432f7b23b88d6b"
+    },
+    {
+      "id": "source_contextual_model",
+      "base": "repository",
+      "path": "cpp/runtime/scheduling/phaseContextualPdModel.cpp",
+      "sha256": "c9ccfcd8a6d05950b1ffa0f3c71f4888ee7f93214ed44ab79a525b58b05f8391"
+    },
+    {
+      "id": "source_phase_action_plan",
+      "base": "repository",
+      "path": "cpp/runtime/phase/execution/phaseActionPlan.h",
+      "sha256": "a7e87803e7a412e9847bb83beb6342b0d0c8e61bdc9e814d67038fd07d8fa054"
+    },
+    {
+      "id": "source_formation_planner_header",
+      "base": "repository",
+      "path": "cpp/runtime/phase/policy/phaseFormationPlanner.h",
+      "sha256": "60d70fc32f9f31f4ea57a0d009b8e966054cba5337bfbf2f972742601e4f2d4e"
+    },
+    {
+      "id": "source_contextual_model_header",
+      "base": "repository",
+      "path": "cpp/runtime/phase/policy/phaseContextualPdModel.h",
+      "sha256": "9c92d025b8e161aad8fd25871bbdbb2b2a3bc4e551649370707c07ffbdbf7e86"
+    },
+    {
+      "id": "source_phase_smoke",
+      "base": "repository",
+      "path": "examples/llm/llm_phase_context_smoke.cpp",
+      "sha256": "c5e244a8816fb16d9c72a7a9e1ef43a20fb569504a5575ae62ebee68fc5c2fd6"
+    },
+    {
+      "id": "source_formation_tests",
+      "base": "repository",
+      "path": "unittests/phaseFormationPlannerTest.cpp",
+      "sha256": "3f6375dff23c3fa52f523a568aebae99edc692497c52d159b94a36f54cb4d51f"
+    }
+  ]
+}

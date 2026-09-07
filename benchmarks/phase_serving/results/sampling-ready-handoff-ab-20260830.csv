@@ -1,0 +1,4 @@
+runtime,completion_mode,runs,raw_req_s,raw_req_s_ci95,slo_pass_percent,slo_pass_ci95_pp,goodput_req_s,goodput_req_s_ci95,scheduled_ttft_mean_ms,scheduled_ttft_p95_ms,tpot_mean_ms,tpot_p95_ms,scheduled_e2e_mean_ms,scheduled_e2e_p95_ms,peak_mib,token_hash,promotion
+current,cuda_event_poll,5,37.865,0.122,75.972,4.966,28.769,1.930,240.952,618.517,15.821,17.869,1587.267,2356.125,9081,f51d448d5824038f5237cdee55dc50799de5c5cb5a228fcf1166ff1ed30875ca,retained
+current,cuda_host_callback_signal,5,37.553,0.248,71.667,3.934,26.918,1.643,247.149,669.355,15.935,18.102,1601.633,2388.565,9081,f51d448d5824038f5237cdee55dc50799de5c5cb5a228fcf1166ff1ed30875ca,rejected
+vllm,frozen,5,40.908,0.029,100.000,0.000,40.908,0.029,51.445,84.174,13.528,17.650,1205.871,2119.430,9039,not-cross-runtime-comparable,reference

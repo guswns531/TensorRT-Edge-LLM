@@ -1,0 +1,5 @@
+runtime,server_admission,runs,raw_req_s,raw_req_s_ci95,slo_pass_percent,slo_pass_ci95_pp,goodput_req_s,goodput_req_s_ci95,scheduled_ttft_mean_ms,scheduled_ttft_p95_ms,tpot_mean_ms,tpot_p95_ms,scheduled_e2e_mean_ms,scheduled_e2e_p95_ms,peak_mib,token_hash,notes
+current,64,5,37.865,0.122,76.0,5.0,28.769,1.930,240.952,618.517,15.821,17.869,1587.267,2356.125,9081,f51d448d5824038f5237cdee55dc50799de5c5cb5a228fcf1166ff1ed30875ca,default decode-aligned admission
+current,72,5,33.948,0.291,49.8,1.9,16.906,0.795,442.612,1344.367,19.644,24.012,2114.858,3310.105,9081,f51d448d5824038f5237cdee55dc50799de5c5cb5a228fcf1166ff1ed30875ca,capacity-safe overflow enabled
+current,80,5,35.810,0.167,52.8,1.4,18.900,0.552,291.620,865.654,19.808,25.349,1963.019,3042.513,9081,f51d448d5824038f5237cdee55dc50799de5c5cb5a228fcf1166ff1ed30875ca,capacity-safe overflow enabled
+vllm,frozen,5,40.908,0.029,100.0,0.0,40.908,0.029,51.445,84.174,13.528,17.650,1205.871,2119.430,9039,not-cross-runtime-comparable,frozen Note 187 baseline

@@ -1,0 +1,131 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "common/tensor.h"
+#include "runtime/exec/engineExecutor.h"
+
+#include <cstdint>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <memory>
+
+namespace trt_edgellm
+{
+namespace rt
+{
+
+class MultimodalRunner;
+
+struct TieredVisionContextMemoryInfo
+{
+    int64_t arenaBytes{};
+    int64_t prefillBytes{};
+    int64_t smallVisionBytes{};
+    int64_t largeVisionBytes{};
+};
+
+//! @brief Resources required to run two phases concurrently on one CUDA context.
+struct IndependentEngineExecutorPairConfig
+{
+    int32_t prefillProfile{0};
+    int32_t decodeProfile{1};
+    int32_t visionPrefillProfile{-1};
+    //! Create a serialized external-prefill context even when it reuses the
+    //! text prefill optimization profile.
+    bool dedicatedExternalPrefillContext{};
+    cudaStream_t setupStream{};
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    //! Reuse one TensorRT execution context/workspace and serialize phase enqueues.
+    bool sharedExecutionContext{};
+};
+
+//! @brief Two independent TensorRT contexts over one deserialized engine.
+//!
+//! The pair is deliberately model agnostic. Callers construct the first
+//! EngineExecutor with the model-specific registry/factory, then pass it here.
+//! The sibling shares immutable TRT weights and the ICudaEngine, but owns a
+//! different IExecutionContext, auxiliary streams, CUDA graph cache, and
+//! profile-sized workspace. This is the resource boundary required before
+//! prefill and decode can be enqueued concurrently.
+class IndependentEngineExecutorPair
+{
+public:
+    //! Build a pair from an already configured executor.
+    static std::unique_ptr<IndependentEngineExecutorPair> create(
+        std::unique_ptr<EngineExecutor> prefillExecutor, IndependentEngineExecutorPairConfig config);
+
+    IndependentEngineExecutorPair(IndependentEngineExecutorPair const&) = delete;
+    IndependentEngineExecutorPair& operator=(IndependentEngineExecutorPair const&) = delete;
+
+    EngineExecutor& prefillExecutor() noexcept;
+    EngineExecutor const& prefillExecutor() const noexcept;
+    //! Dedicated external-prefill context when profile 2 is present. It shares
+    //! the prefill workspace, so text and external prefill remain serialized.
+    EngineExecutor& externalPrefillExecutor() noexcept;
+    EngineExecutor const& externalPrefillExecutor() const noexcept;
+    bool hasExternalPrefillExecutor() const noexcept;
+    int32_t externalPrefillProfile() const noexcept;
+    EngineExecutor& decodeExecutor() noexcept;
+    EngineExecutor const& decodeExecutor() const noexcept;
+
+    //! Profile-specific USER_MANAGED TensorRT context memory.
+    Tensor& prefillContextMemory() noexcept;
+    Tensor& decodeContextMemory() noexcept;
+
+    //! Replace the independent prefill workspace with an E/P tiered arena.
+    //!
+    //! Small vision batches use a disjoint suffix and may overlap prefill.
+    //! Large vision batches use the complete arena and therefore require the
+    //! scheduler to exclude prefill until their CUDA completion event fires.
+    TieredVisionContextMemoryInfo configureTieredVisionContextMemory(
+        MultimodalRunner& vision, int32_t smallVisionProfile, int32_t largeVisionProfile);
+
+    //! Replace the independent prefill workspace with one arena shared by a
+    //! single-profile vision context. E/P dispatch must be serialized while
+    //! either context uses this arena.
+    TieredVisionContextMemoryInfo configureSharedVisionContextMemory(MultimodalRunner& vision, int32_t visionProfile);
+
+    //! The CUDA context owning all three supplied streams.
+    CUcontext cudaContext() const noexcept;
+
+    IndependentEngineExecutorPairConfig const& config() const noexcept;
+    bool sharedExecutionContext() const noexcept;
+
+private:
+    IndependentEngineExecutorPair(
+        std::unique_ptr<EngineExecutor> prefillExecutor, IndependentEngineExecutorPairConfig config);
+
+    static CUcontext streamContext(cudaStream_t stream);
+    static void validateStreams(IndependentEngineExecutorPairConfig const& config, CUcontext& context);
+    int64_t maxPrefillContextMemoryBytes() const;
+
+    //! Declared before non-owning subviews so it is destroyed after them.
+    Tensor mTieredContextMemoryArena;
+    Tensor mPrefillContextMemory;
+    Tensor mDecodeContextMemory;
+    std::unique_ptr<EngineExecutor> mPrefillExecutor;
+    std::unique_ptr<EngineExecutor> mExternalPrefillExecutor;
+    std::unique_ptr<EngineExecutor> mDecodeExecutor;
+    IndependentEngineExecutorPairConfig mConfig;
+    CUcontext mCudaContext{};
+};
+
+} // namespace rt
+} // namespace trt_edgellm

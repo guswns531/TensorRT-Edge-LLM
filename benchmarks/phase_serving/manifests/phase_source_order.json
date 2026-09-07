@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "golden_runtime_commit": "b2a01f0a8ae9216d5e2b92661c058152e253b949",
+  "build_directory": ".local/build-v010-forward-sm86",
+  "target": "edgellmCore",
+  "collection_mode": "cpp/CMakeLists.txt file(GLOB_RECURSE RUNTIME_CPP_SRCS runtime/*.cpp)",
+  "ordered_objects": [
+    {
+      "source": "cpp/runtime/scheduling/independentEngineExecutorPair.cpp",
+      "sha256": "3e3cdbbee1d8061b3f58b799bf5674d9b11eeca7ea2c1d270b537100924f6c27"
+    },
+    {
+      "source": "cpp/runtime/scheduling/independentPhaseAsyncServer.cpp",
+      "sha256": "74601039263804020a783852479818bdc367887b5879eef028cfa8b8777ab9fe"
+    },
+    {
+      "source": "cpp/runtime/scheduling/independentPhaseCoordinator.cpp",
+      "sha256": "ed7af887bf65fc63705b3b4e0ee6fcbb067f0ca75aaeac07dfd10c4944298f52"
+    },
+    {
+      "source": "cpp/runtime/scheduling/packedPrefillActiveView.cpp",
+      "sha256": "4ff1fd86d20c9d3f601fa87fce4cdef73aae51a9fdc1fc26d639fa35665aa8a1"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseContinuousLoadGenerator.cpp",
+      "sha256": "d86a1c48d7ae64ab7a568dcf85d763603202b3f3db05affd3ffe8af3d4bc930c"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseDispatchWorker.cpp",
+      "sha256": "6340cbc34fa7528d4747e27c1a5ab007afa10d9aab9eeb8de3dbd313f7c212f0"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseGlobalScheduler.cpp",
+      "sha256": "1aa55a478498333742a105670ae94c2cc1760eebc3931f4085f8fca7b6d3371e"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseKVActiveView.cpp",
+      "sha256": "84d37522cb0276ace1d404bbc63121db5dda0d61eddf52c3e0f12ad702c47cba"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseKernelGroupRecorder.cpp",
+      "sha256": "3498b4c24c986187647f40e017529d9c32e4f6265deccf5f1aa2bd4615823661"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseMemoryBroker.cpp",
+      "sha256": "b13e8b25b9fde132876eeb934eaa1c1fc2febceae5625efe4577842a28f00010"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phasePrefixReuseCache.cpp",
+      "sha256": "eddeea50c0fca6834ad121d52b9fb519b33f433b7028c2e3abe2a105787a77b3"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseQueueScheduler.cpp",
+      "sha256": "964e19d1bb518edfa1d4dfd517da6a584b68f03c2e2e198872e46d456a85409f"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseRuntimeCostTracker.cpp",
+      "sha256": "11e4cacbaef398b9d121b264db32d354beeb740f15fe7c5c1d72d4273fba1b97"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseThreeCoordinator.cpp",
+      "sha256": "99621a679edadb9eadcd878e9f47ec4eee0bce4d2153cb2393dbbc21f4301483"
+    },
+    {
+      "source": "cpp/runtime/scheduling/phaseVisionAdapter.cpp",
+      "sha256": "0092efccd0268d9b08c349983b91e183b6c2f0e3416455b35ae13dc1896e12af"
+    },
+    {
+      "source": "cpp/runtime/state/stableKVPageManager.cpp",
+      "sha256": "751973e027a96f39c82df183867ff4ff39b783680bf5c0caa27baa3bef397709"
+    }
+  ]
+}

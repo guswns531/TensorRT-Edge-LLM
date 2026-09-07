@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "baseline_id": "profile-free-learning-p0-cosmos-reason2-2b-20260903",
+  "frozen_at_utc": "2026-09-03T00:00:00Z",
+  "purpose": "Freeze the process-local controller before warmup-state separation and P0-P9 learning-stability evaluation.",
+  "repository": {
+    "path_from_workspace": ".local/upstream-v010",
+    "branch": "codex/v010-phase-forward-port",
+    "baseline_commit": "3908810270dee65ac331e517c010b02095ada765",
+    "upstream_version": "v0.10.0",
+    "upstream_commit": "71dd1bae032e70771265917ec74d3ff4cad07a10"
+  },
+  "platform": {
+    "gpu": "NVIDIA GeForce RTX 3080",
+    "compute_capability": "8.6",
+    "gpu_memory_mib": 10240,
+    "driver_version": "610.43.02",
+    "cuda_compiler": "13.3",
+    "cxx_compiler": "Ubuntu GCC 13.3.0",
+    "container_image": "nvcr.io/nvidia/tensorrt:26.06-py3",
+    "container_digest": "sha256:7cd94ee931d2b5b85ad1c5af723d485b2625f6ce167e1e4abe577850b96ceac3",
+    "tensorrt_version": "11.0.0.114"
+  },
+  "model_contract": {
+    "model_id": "nvidia/Cosmos-Reason2-2B",
+    "precision": "FP16 TensorRT engine and FP16 KV cache",
+    "max_batch_size": 80,
+    "max_prefill_batch_size": 8,
+    "max_decode_batch_size": 64,
+    "max_encoder_batch_size": 8,
+    "fixed_prefill_chunk_tokens": 128,
+    "indexed_paged_kv": true,
+    "stable_slots": 80,
+    "text_engine_sha256": "96393b233813fe0b956a55441d4ca0bdbe6a6de6ae6b2f50fd2db0f7bab298df",
+    "external_embedding_sha256": "6d12ebbdb7f011db8744eed3d85d81b3b04bd9009510effdb1beb041c566afce",
+    "vision_engine_sha256": "ea090592762a96d2dc82f10c167b60f4f85fa6ccc4810cb362cef22556fcf99d"
+  },
+  "trace_sha256": {
+    "short": "3f689b4349d50ebed4ac1248a3b13d9f84becab88fc149576f8722236187c7bd",
+    "balanced": "290d34061a173c13440e10247f55bd442a131e525a40c30a52d0b39a549d6538",
+    "decode-heavy": "68f523eaf5ffed74938e003a8f8c52897a18fc5821bd8dca1200cc3b9da349af",
+    "long-prefill": "7d713d97c2ec50a1b92b327e2e524c66f7d0b10a4139222968b6659f79886ec3",
+    "bimodal": "b3e8ab2195e46143e789aa533c8adde8cbc8488643ab211a9fbad1ad55e0d29c",
+    "text-heavy": "b75dcc2b476cafd8672ed1a4690ba195190b4095505e35c69b6a750777f53c77",
+    "mixed": "14ded9bae4d8ee0c76fc22c5e0c37f0055f2e4b25379963776229da3a37a869c",
+    "vision-heavy": "10ba864f2485a1c813a0691aab093ede78fc6c769a0433e6f972388443e59a07",
+    "poisson": "4c8615109006e49d63da1eb48615f0bc33e036cff70169393610c58f68c09480",
+    "wave-drain": "af1edbd08e93e1909d55d20fb1327c6c0ecea71984d38b22c4d78366ea396d55",
+    "multi-image": "70fbd8c78f68514cb21f64321210666278b759f6d0abe418fd4567ff5117eb6c",
+    "late-vision": "f9f8613d8082f9d7c393bc18147ff97a043445bff6c5ba56dba4d002e38f7ae6",
+    "load-48.8": "c9d64ed7e84fea87352c9b4acedb309932c8f0e9cae71d527fc2f868ec90849d"
+  },
+  "generic_calibration": {
+    "text_trace_sha256": "e9fa25b1e03ec7e667060a3111531df9ac086d11faf7f56815df4518045f1867",
+    "vision_two_cycle_trace_sha256": "ccf0f9b03816f95ea5c7c6166f4fe4c94abfd507b2575746a9f1a11a8a7eeb45",
+    "vision_four_cycle_trace_sha256": "b32daad4f65a6540ad16287c68883591ceb2da0b34c181f0c2bb37de02f44ad6",
+    "selected_vision_trace": "four_cycle",
+    "selection_reason": "The two-cycle trace produced fewer than four observations for some encoder pair directions."
+  },
+  "frozen_results": {
+    "current_load_48_8": {
+      "repeats": 5,
+      "request_throughput_mean": 41.85125,
+      "request_throughput_ci95": [41.78427, 41.91823],
+      "ttft_mean_ms": 35.80,
+      "ttft_p95_ms": 60.97,
+      "tpot_mean_ms": 12.68,
+      "tpot_p95_ms": 15.18,
+      "e2e_mean_ms": 1114.65,
+      "e2e_p95_ms": 1812.27,
+      "peak_memory_mib": 9237
+    },
+    "vllm_load_48_8": {
+      "request_throughput": 40.908,
+      "ttft_mean_ms": 51.44,
+      "ttft_p95_ms": 84.27,
+      "tpot_mean_ms": 13.53,
+      "tpot_p95_ms": 17.66,
+      "e2e_mean_ms": 1205.87,
+      "e2e_p95_ms": 2121.30,
+      "peak_memory_mib": 9039
+    }
+  },
+  "warmup_contract_before_p1": {
+    "shape_warmup_batches": 32,
+    "synthetic_requests": 1628,
+    "overlap_samples": 155,
+    "execution_and_policy_state_survived_reset": true,
+    "trace_derived_calibration": true
+  },
+  "p0_p9_contract": {
+    "headline_mode": "generic",
+    "cold_adaptation_mode": "zero_start",
+    "upper_reference_mode": "trace_derived",
+    "mechanism_baseline_mode": "graph_only",
+    "persisted_policy_state": false,
+    "workload_labels": false,
+    "external_cost_registry": false
+  }
+}

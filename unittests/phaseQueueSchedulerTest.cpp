@@ -1,0 +1,3709 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "runtime/scheduling/phaseQueueScheduler.h"
+#include "runtime/scheduling/phaseMemoryBroker.h"
+#include "runtime/scheduling/phaseThreeCoordinator.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <set>
+
+namespace trt_edgellm
+{
+namespace rt
+{
+namespace
+{
+
+TEST(PhaseQueueSchedulerTest, BatchesQueuesIndependently)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 3;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueuePrefill({2, 32});
+    scheduler.enqueueDecode({3, 128});
+    scheduler.enqueueDecode({4, 128});
+    scheduler.enqueueDecode({5, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    ASSERT_EQ(plan.decodeBatch.size(), 3U);
+    EXPECT_EQ(plan.prefillBatch[0].requestId, 1U);
+    EXPECT_EQ(plan.decodeBatch[0].requestId, 3U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
+{
+    size_t legacyPolicyCalls{};
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.policy = [&](PhaseQueueSnapshot const&) {
+        ++legacyPolicyCalls;
+        return PhaseDispatchKind::kPrefill;
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(plan.globalDecisionEvaluated);
+    EXPECT_TRUE(plan.globalDecisionApplied);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_NE(plan.globalPlanId, 0U);
+    EXPECT_NE(plan.globalSnapshotEpoch, 0U);
+    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kDecode);
+    EXPECT_TRUE(plan.globalActionFidelity);
+    EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
+    EXPECT_EQ(legacyPolicyCalls, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveElidesVacuousSinglePhaseDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.elideVacuousGlobalDecisions = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_FALSE(plan.globalDecisionEvaluated);
+    EXPECT_FALSE(plan.globalDecisionApplied);
+    EXPECT_EQ(scheduler.telemetry().globalDecisionCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveElidesPreReservedSinglePhaseDecision)
+{
+    size_t memoryQueries{};
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.elideVacuousGlobalDecisions = true;
+    config.globalDispatchUsesPreReservedMemory = true;
+    config.globalMemoryHorizonSupplier = [&](PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+        ++memoryQueries;
+        return PhaseActionMemoryHorizon{};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_FALSE(plan.globalDecisionEvaluated);
+    EXPECT_EQ(memoryQueries, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalSyntheticWarmupForcesUnknownPrefillDecodeProbe)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setGlobalWarmupProbeMode(true);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_TRUE(plan.globalSafeProbe);
+    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode);
+    EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWarmupStopsProbingCalibratedUnprofitableOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.globalCostModelConfig.overlapMinSamples = 2U;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kOverlap;
+    sample.prefillBatchSize = 1;
+    sample.prefillClass = PhasePrefillClass::kText;
+    sample.prefillTokens = 32;
+    sample.prefillPaddedTokens = 32;
+    sample.decodeBatchSize = 1;
+    sample.plannedDecodeMaxContextLength = 128;
+    sample.prefillGpuMs = 2.0F;
+    sample.decodeGpuMs = 1.0F;
+    sample.makespanGpuMs = 3.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.observeMetrics(sample);
+
+    scheduler.setGlobalWarmupProbeMode(true);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kOverlap);
+    ASSERT_EQ(scheduler.globalCalibrationDiagnostics().size(), 1U);
+    EXPECT_EQ(scheduler.globalCalibrationDiagnostics().front().diagnostic.status,
+        PhaseGlobalOverlapCostStatus::kUnprofitable);
+    EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWarmupUsesProcessLocalOverlapObservations)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.action.overlapMinSamples = 2U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
+    key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+    tracker->observe(key, {4.0F, 2.0F});
+    tracker->observe(key, {4.0F, 2.0F});
+
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalCostModelConfig.overlapMinSamples = 2U;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setGlobalWarmupProbeMode(true);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_FALSE(plan.globalSafeProbe);
+    ASSERT_EQ(scheduler.globalCalibrationDiagnostics().size(), 1U);
+    EXPECT_EQ(
+        scheduler.globalCalibrationDiagnostics().front().diagnostic.status, PhaseGlobalOverlapCostStatus::kEligible);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPrioritizesKnownOverlapTransition)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.action.overlapMinSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseGlobalActionKey prefillKey{PhaseGlobalActionKind::kPrefill, 2, 0, 32, 0, 0};
+    prefillKey.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+    tracker->observe(prefillKey, {8.0F, 2.0F});
+    PhaseGlobalActionKey decodeKey{PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0};
+    tracker->observe(decodeKey, {1.0F, 1.0F});
+    PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, 2, 1, 32, 0, 1};
+    overlapKey.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+    tracker->observe(overlapKey, {4.0F, 2.0F});
+
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalCostModelConfig = trackerConfig.action;
+    config.runtimeCostTracker = tracker;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueuePrefill({2, 32});
+    scheduler.enqueueDecode({3, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(scheduler.telemetry().globalKnownOverlapPriorityCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalCostKeyUsesExecutionVariantSupplier)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    int32_t observedTokens{};
+    scheduler.setGlobalExecutionVariantSupplier([&](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
+        EXPECT_EQ(key.kind, PhaseGlobalActionKind::kPrefill);
+        observedTokens = primaryTokenCount;
+        return PhaseExecutionVariant::kPrimaryGraph;
+    });
+    scheduler.enqueuePrefill({1, 32});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(observedTokens, 32);
+    EXPECT_EQ(plan.globalSelectedAction.executionVariant, PhaseExecutionVariant::kPrimaryGraph);
+}
+
+TEST(PhaseQueueSchedulerTest, RejectsStaleExternalGlobalPlanEpoch)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    std::optional<PhaseGlobalActionCandidate> candidate = scheduler.previewGlobalDecodeAction();
+    ASSERT_TRUE(candidate.has_value());
+
+    scheduler.setNextGlobalAction(*candidate, 10U, 20U);
+    EXPECT_EQ(scheduler.globalPlanSequence(), 10U);
+    EXPECT_EQ(scheduler.globalSnapshotEpoch(), 20U);
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    EXPECT_THROW(scheduler.setNextGlobalAction(*candidate, 11U, 20U), std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, PreservesExternalCalibrationProbeWithKnownPortableCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 3});
+    scheduler.enqueueDecode({2, 128, 4});
+    PhaseGlobalActionCandidate candidate;
+    candidate.key = {PhaseGlobalActionKind::kPrefillDecode, 1, 1, 32, 0, 1};
+    candidate.primaryRequestIds = {1U};
+    candidate.secondaryRequestIds = {2U};
+    candidate.primaryStableSlotIds = {3};
+    candidate.secondaryStableSlotIds = {4};
+    candidate.requestIds = {1U, 2U};
+    candidate.overlapCostKnown = true;
+    candidate.safeProbeEligible = true;
+    candidate.calibrationProbe = true;
+    phaseGlobalFinalizeCandidate(candidate);
+    scheduler.setNextGlobalAction(std::move(candidate), 1U, 1U);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(plan.globalSafeProbe);
+}
+
+TEST(PhaseQueueSchedulerTest, AcceptsCoordinatorPlanNamespaceAfterLocalWarmup)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    PhaseDispatchPlan const warmup = scheduler.next();
+    scheduler.completeDecode(warmup.decodeBatch.front(), 129, true);
+
+    scheduler.enqueueDecode({2, 128});
+    std::optional<PhaseGlobalActionCandidate> candidate = scheduler.previewGlobalDecodeAction();
+    ASSERT_TRUE(candidate.has_value());
+    constexpr uint64_t kCoordinatorNamespace = uint64_t{1U} << 63U;
+    scheduler.setNextGlobalAction(*candidate, kCoordinatorNamespace | 1U, kCoordinatorNamespace | 1U);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.globalPlanId, kCoordinatorNamespace | 1U);
+    EXPECT_EQ(plan.globalSnapshotEpoch, kCoordinatorNamespace | 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalGlobalLeaseIsNotReformedByNewReadyWork)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enablePriorityBatching = true;
+    config.maxPrefillBatchSize = 1;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 3});
+    std::optional<PhaseGlobalActionCandidate> candidate = scheduler.previewGlobalPrefillAction();
+    ASSERT_TRUE(candidate.has_value());
+    ASSERT_EQ(candidate->primaryRequestIds, (std::vector<uint64_t>{1U}));
+    PhaseSchedulingHints urgent;
+    urgent.priority = 3;
+    scheduler.enqueuePrefill({2, 32, 4, 0, 0, true, urgent});
+    scheduler.setNextGlobalAction(*candidate, 1U, 1U);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+    EXPECT_TRUE(plan.globalCandidateParity);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 256;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32, 3});
+    scheduler.enqueuePrefill({2, 128, 0});
+    scheduler.enqueuePrefill({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    ASSERT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(plan.prefillBatch[1].requestId, 3U);
+    EXPECT_EQ(plan.prefillBatch[0].kvSlotId, 0);
+    EXPECT_EQ(plan.prefillBatch[1].kvSlotId, 2);
+    EXPECT_TRUE(plan.globalCandidateParity);
+    EXPECT_TRUE(plan.globalActionFidelity);
+    EXPECT_NE(plan.globalCandidateId, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalCandidateParityViolationCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.globalColdPrefillMsPerToken = 0.01F;
+    config.globalColdDecodeMs = 2.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_TRUE(candidate->key.kind == PhaseGlobalActionKind::kPrefill
+        || candidate->key.kind == PhaseGlobalActionKind::kDecode);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 3280.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 3280.0, 1.0e-3);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPricesFinalPrefillAsObservableDecodeFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableDecodeFormationHorizon = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 3, 0, 128, true, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueueDecode({2, 512, 4});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 12500.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 14000.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationCombinedCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationProducedCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationPrefillSelectionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationDecodeSelectionCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationOverlapSelectionCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationMaxProducedRows, 1U);
+    std::vector<PhaseGlobalActionCandidate> const& frontier = scheduler.lastGlobalPreviewCandidates();
+    auto const decode = std::find_if(frontier.begin(), frontier.end(),
+        [](PhaseGlobalActionCandidate const& action) { return action.key.kind == PhaseGlobalActionKind::kDecode; });
+    ASSERT_NE(decode, frontier.end());
+    EXPECT_NEAR(decode->predictedHorizonUs, 14000.0, 1.0e-3);
+    EXPECT_NEAR(decode->horizonReferenceWorkUs, 14000.0, 1.0e-3);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationUsesSerialPrefillWhenOverlapFrontierDiffers)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableDecodeFormationHorizon = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxOverlapPrefillBatchSize = 1;
+    config.maxPrefillBatchTokens = 1024;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{2, 512, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}, {3, 1024, 3.0F, 3072}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 512, 1, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueuePrefill({2, 512, 2, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueueDecode({3, 512, 3});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_EQ(candidate->key.primaryBatchSize, 2);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 13000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 14500.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationMaxProducedRows, 2U);
+    std::vector<PhaseGlobalActionCandidate> const& frontier = scheduler.lastGlobalPreviewCandidates();
+    auto const overlap = std::find_if(frontier.begin(), frontier.end(), [](PhaseGlobalActionCandidate const& action) {
+        return action.key.kind == PhaseGlobalActionKind::kPrefillDecode;
+    });
+    ASSERT_NE(overlap, frontier.end());
+    EXPECT_EQ(overlap->key.primaryBatchSize, 1);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPreviewRetainsTheCompletePolicyNeutralCandidateFrontier)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 1.0F;
+    config.globalSafeProbeInterval = 1U;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    ASSERT_TRUE(scheduler.previewGlobalAction().has_value());
+    std::vector<PhaseGlobalActionCandidate> const& frontier = scheduler.lastGlobalPreviewCandidates();
+    EXPECT_EQ(frontier.size(), 3U);
+    EXPECT_TRUE(std::any_of(frontier.begin(), frontier.end(), [](PhaseGlobalActionCandidate const& candidate) {
+        return candidate.key.kind == PhaseGlobalActionKind::kPrefill;
+    }));
+    EXPECT_TRUE(std::any_of(frontier.begin(), frontier.end(), [](PhaseGlobalActionCandidate const& candidate) {
+        return candidate.key.kind == PhaseGlobalActionKind::kDecode;
+    }));
+    EXPECT_TRUE(std::any_of(frontier.begin(), frontier.end(), [](PhaseGlobalActionCandidate const& candidate) {
+        return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode;
+    }));
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setPendingPrefillProducerRows(1U, 0U, 2000.0, 500.0, 7U);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    EXPECT_EQ(scheduler.queueSnapshot().prefillPendingProducerRows, 1U);
+    EXPECT_EQ(scheduler.queueSnapshot().prefillPendingTextProducerRows, 1U);
+    EXPECT_DOUBLE_EQ(scheduler.queueSnapshot().prefillProducerReadyWaitUs, 2000.0);
+    EXPECT_EQ(scheduler.queueSnapshot().prefillProducerReadyEventId, 7U);
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 13000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 21000.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationDecodeSelectionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationProducerSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationCombinedCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationResidualCostHitCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationMaxPendingRows, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPrefillFormationRequiresCompatibleProducerClass)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setPendingPrefillProducerRows(0U, 1U, 100.0, 10.0, 9U);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationProducerSnapshotCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDoesNotSpeculateOnUnmeasuredPrefillFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 256, 1.0F, 256}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.setPendingPrefillProducerRows(1U);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_NEAR(candidate->predictedHorizonUs, 11000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 11000.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationOpportunityCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationDecodeSelectionCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationProducerSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationCombinedCostHitCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalPrefillFormationResidualCostHitCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalCandidateIdentityIncludesStableSlotOrder)
+{
+    PhaseGlobalActionCandidate first;
+    first.key = {PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0};
+    first.primaryRequestIds = {1U, 2U};
+    first.primaryStableSlotIds = {3, 0};
+    phaseGlobalFinalizeCandidate(first);
+
+    PhaseGlobalActionCandidate second = first;
+    second.primaryStableSlotIds = {0, 3};
+    phaseGlobalFinalizeCandidate(second);
+
+    EXPECT_NE(first.candidateId, second.candidateId);
+    PhaseGlobalDispatchPlan const plan = phaseGlobalDispatchPlan(1U, 1U, first);
+    EXPECT_EQ(plan.primaryStableSlotIds, (std::vector<int32_t>{3, 0}));
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalPrefillResidualUsesSharedContextualModel)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.policyMode = PhasePolicyMode::kContextualScalar;
+    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kActive;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({2, 128, 4});
+
+    PhaseGlobalActionCandidate launched;
+    launched.key = {PhaseGlobalActionKind::kPrefill, 1, 0, 128, 0, 0};
+    launched.key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kExternal);
+    launched.primaryRequestIds = {1U};
+    launched.primaryStableSlotIds = {3};
+    launched.predictedBlockingUs = 4000.0;
+    launched.predictedMakespanUs = 4000.0;
+    launched.referenceWorkUs = 4000.0;
+    phaseGlobalFinalizeCandidate(launched);
+
+    std::optional<PhaseGlobalResidualSelection> const residual
+        = scheduler.previewGlobalResidualAction(launched, 1000.0);
+
+    ASSERT_TRUE(residual.has_value());
+    EXPECT_EQ(residual->aggregate.key.kind, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_EQ(residual->aggregate.key.primaryWorkClass, static_cast<int32_t>(PhasePrefillClass::kExternal));
+    EXPECT_TRUE(residual->aggregate.contextualPdFeatureValid);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDeadlineProtectsCompleteRemainingPrefillPath)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillChunkTokens = 128;
+    config.prefillQueueWaitTargetUs = 5000.0;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.globalColdPrefillMsPerToken = 0.01F;
+    config.globalColdDecodeMs = 2.0F;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints urgent;
+    urgent.submittedAt = std::chrono::steady_clock::now();
+    urgent.ttftTargetUs = 5000.0;
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512, true, urgent});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseQueueSnapshot const snapshot = scheduler.queueSnapshot();
+    EXPECT_EQ(snapshot.prefillMinimumSlackRequestId, 1U);
+    EXPECT_EQ(snapshot.prefillCriticalPathRemainingTokens, 512);
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalExpiredTtftPreservesPackedPrefillFormation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.enablePrefillTtftHardGuard = true;
+    config.enableRaggedPrefillBatching = true;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 256;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints expired;
+    expired.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(10);
+    expired.ttftTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, expired});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({3, 128, 2, 0, 128});
+    scheduler.enqueueDecode({4, 128, 3});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kDecode);
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(plan.prefillBatch[1].requestId, 3U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalExpiredTtftSuppressesDecodeOnlyPreview)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enablePrefillTtftHardGuard = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints expired;
+    expired.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(10);
+    expired.ttftTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, expired});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    EXPECT_FALSE(scheduler.previewGlobalDecodeAction().has_value());
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalSelectionProtectsDecodeTpotInsteadOfFormationWait)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 5000.0;
+    config.decodeQueueWaitTargetUs = 1.0;
+    config.globalDecodeTpotTargetUs = 100000.0;
+    config.globalColdPrefillMsPerToken = 0.01F;
+    config.globalColdDecodeMs = 2.0F;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints urgent;
+    urgent.submittedAt = std::chrono::steady_clock::now();
+    urgent.ttftTargetUs = 5000.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, urgent});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, ServingEpochResetCanPreserveGlobalWarmupCosts)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kPrefill;
+    sample.prefillClass = PhasePrefillClass::kText;
+    sample.prefillBatchSize = 1;
+    sample.prefillTokens = 128;
+    sample.prefillPaddedTokens = 128;
+    sample.prefillGpuMs = 3.0F;
+    sample.makespanGpuMs = 3.0F;
+    scheduler.observeMetrics(sample);
+
+    ASSERT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
+    scheduler.resetHistory(true);
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
+    scheduler.resetHistory();
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, ServingEpochCanResetMechanismAndCostPlanesSeparately)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kPrefill;
+    sample.prefillClass = PhasePrefillClass::kText;
+    sample.prefillBatchSize = 1;
+    sample.prefillTokens = 128;
+    sample.prefillPaddedTokens = 128;
+    sample.prefillGpuMs = 3.0F;
+    sample.makespanGpuMs = 3.0F;
+    scheduler.observeMetrics(sample);
+
+    scheduler.resetSchedulingHistory();
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 1U);
+    scheduler.resetExecutionCostHistory();
+    EXPECT_EQ(scheduler.estimateGlobalPrefillCost(1, 128, 0, PhasePrefillClass::kText).sampleCount, 0U);
+    EXPECT_NO_THROW(scheduler.resetPolicyPosterior());
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDecodePreviewExcludesPrefillDuringEncoderFlight)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const action = scheduler.previewGlobalDecodeAction();
+
+    ASSERT_TRUE(action.has_value());
+    EXPECT_EQ(action->key.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_EQ(action->requestIds, std::vector<uint64_t>{2U});
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalPrefillPreviewExcludesDecodeForBoundedEncoderOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    std::optional<PhaseGlobalActionCandidate> const action = scheduler.previewGlobalPrefillAction();
+
+    ASSERT_TRUE(action.has_value());
+    EXPECT_EQ(action->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_EQ(action->requestIds, std::vector<uint64_t>{1U});
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitComparesEventAndFutureDenseDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {2U, 3U, 4U}, {128, 128, 128}};
+    EXPECT_TRUE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().lastGlobalSelectedAction, PhaseGlobalActionKind::kWait);
+    EXPECT_EQ(scheduler.telemetry().globalWaitFutureRows, 4);
+    EXPECT_EQ(scheduler.telemetry().globalWaitCurrentRows, 1);
+    EXPECT_EQ(scheduler.telemetry().globalWaitGraphBucket, 4);
+    EXPECT_EQ(scheduler.telemetry().globalWaitRequestIds, (std::vector<uint64_t>{1U, 2U, 3U, 4U}));
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitHoldsOverflowUntilCurrentCohortCompletes)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    ASSERT_EQ(scheduler.queueSnapshot().decodeQueued, 0U);
+
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {1U, 2U, 3U, 4U}, {128, 128, 128, 128}};
+
+    EXPECT_TRUE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitCurrentRows, 0);
+    EXPECT_EQ(scheduler.telemetry().globalWaitFutureRows, 4);
+    EXPECT_EQ(scheduler.telemetry().globalWaitEventId, 7U);
+    EXPECT_EQ(scheduler.telemetry().lastGlobalSelectedAction, PhaseGlobalActionKind::kWait);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitIncludesResidualDecodeAfterDispatchNow)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {3, 4096, 2.1F}, {4, 4096, 4.2F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {2U, 3U, 4U}, {128, 128, 128}};
+
+    EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitDecisionCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitKeepsAtMostTwoCompletionHorizons)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 8;
+    config.globalDecodeTpotTargetUs = 10000.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {2, 4096, 2.2F}, {4, 4096, 2.5F}, {8, 4096, 3.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    std::vector<PhaseDecodeCompletionPreview> const previews{
+        {7U, 100.0, 0.0, {2U}, {128}},
+        {8U, 200.0, 0.0, {2U, 3U, 4U}, {128, 128, 128}},
+        {9U, 300.0, 0.0, {2U, 3U, 4U, 5U, 6U, 7U, 8U}, {128, 128, 128, 128, 128, 128, 128}},
+    };
+
+    EXPECT_TRUE(scheduler.shouldWaitForDecodeEvents(previews));
+    EXPECT_EQ(scheduler.telemetry().globalWaitCandidateCount, 2U);
+    EXPECT_NE(scheduler.telemetry().globalWaitEventId, 9U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitProtectsExplicitNextTokenSlack)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.globalDecodeTpotTargetUs = 2500.0;
+    config.decodeBatchCosts = {{1, 4096, 2.0F}, {4, 4096, 3.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {2U, 3U, 4U}, {128, 128, 128}};
+
+    EXPECT_FALSE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalWaitUsesSingletonReferenceBeyondItsTotalTokenCoverage)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxDecodeBatchSize = 4;
+    config.globalDecodeTpotTargetUs = 20000.0;
+    config.decodeBatchCosts = {{1, 2048, 2.0F}, {4, 2048, 3.0F, 8192}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 1024});
+    PhaseDecodeCompletionPreview const preview{7U, 100.0, 0.0, {2U, 3U, 4U}, {1024, 1024, 1024}};
+
+    EXPECT_TRUE(scheduler.shouldWaitForDecodeEvents({preview}));
+    EXPECT_EQ(scheduler.telemetry().globalWaitSelectedCount, 1U);
+    EXPECT_GT(scheduler.telemetry().globalWaitPreviewCompression, 2.0);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalAdmissionUsesCoveredDecodeP95)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 8;
+    config.decodeBatchCosts = {{1, 2048, 1.0F}, {2, 2048, 1.3F}, {4, 2048, 1.8F}, {8, 2048, 3.2F}};
+    PhaseQueueScheduler scheduler(config);
+
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 1024), 4U);
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(4000.0, 1024), 8U);
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 4096), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalFuturePrefillEstimateCoversCompleteChunkedCriticalPath)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.prefillBatchCosts = {
+        {2, 128, 0, 0, true, 3.0F, 0.0F, PhasePrefillClass::kExternal},
+        {2, 128, 256, 0, false, 4.0F, 0.0F, PhasePrefillClass::kExternal},
+    };
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseGlobalCostEstimate const estimate
+        = scheduler.estimateGlobalPrefillDrainCost(2, 256, PhasePrefillClass::kExternal);
+
+    EXPECT_FLOAT_EQ(estimate.makespanMedianMs, 7.0F);
+    EXPECT_FLOAT_EQ(estimate.makespanP95Ms, 7.0F);
+    EXPECT_FLOAT_EQ(estimate.uncertaintyMs, 0.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalActiveDoesNotBypassMemoryFeasibility)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalMemoryHorizonSupplier = [](PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+        return PhaseActionMemoryHorizon{1U, 1U, 0U, 0U, 0U, 1U, false};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kNone);
+    EXPECT_TRUE(plan.globalDecisionApplied);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalMemoryHorizonReceivesStableRequestOwnership)
+{
+    std::vector<uint64_t> observedIds;
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalMemoryHorizonSupplier = [&](PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds) {
+        observedIds = requestIds;
+        return PhaseActionMemoryHorizon{};
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({17, 32});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(observedIds, std::vector<uint64_t>{17U});
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalArenaBlockExcludesOnlyPrefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 2;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    scheduler.setPrefillDispatchBlocked(true);
+    PhaseDispatchPlan decodeOnly = scheduler.next();
+    ASSERT_EQ(decodeOnly.kind, PhaseDispatchKind::kDecode);
+    ASSERT_EQ(decodeOnly.decodeBatch.size(), 1U);
+    EXPECT_TRUE(decodeOnly.prefillBatch.empty());
+    scheduler.completeDecode(decodeOnly.decodeBatch.front(), 129, true);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    scheduler.setPrefillDispatchBlocked(false);
+    PhaseDispatchPlan prefill = scheduler.next();
+    ASSERT_EQ(prefill.kind, PhaseDispatchKind::kPrefill);
+    ASSERT_EQ(prefill.prefillBatch.size(), 1U);
+    EXPECT_EQ(prefill.prefillBatch.front().requestId, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDeadlineBlockWaitsAtDispatchBoundary)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    scheduler.setDispatchBlocked(true);
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 1U);
+
+    scheduler.setDispatchBlocked(false);
+    EXPECT_NE(scheduler.next().kind, PhaseDispatchKind::kNone);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeReplacementCostPreservesWarmRowsWhenBatchGrowthIsTransientlyExpensive)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 2;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeBatchCosts = {{1, 4096, 1.0F}, {2, 4096, 1.5F}};
+    config.decodeRowReplacementCostMs = 10.0F;
+    rt::PhaseQueueScheduler scheduler(config);
+
+    scheduler.enqueueDecode({1, 128});
+    rt::PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 1U);
+    scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+    scheduler.enqueueDecode({2, 128});
+
+    rt::PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.decodeBatch.size(), 1U);
+    EXPECT_EQ(second.decodeBatch.front().requestId, 1U);
+    EXPECT_EQ(second.predictedDecodeReplacementRows, 0);
+    EXPECT_EQ(rt::phaseDecodeReplacementRows({1, 3, 4}, {1, 2, 3}), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeReplacementCostUsesTheActiveCohortInsteadOfQueueOrder)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeCohortBatching = true;
+    config.decodeBatchCosts = {{2, 4096, 1.0F}, {4, 4096, 1.0F}};
+    config.decodeRowReplacementCostMs = 1.0F;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    rt::PhaseQueueScheduler scheduler(config);
+
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    rt::PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    for (uint64_t requestId = 5; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    for (rt::PhaseWorkItem const& item : first.decodeBatch)
+    {
+        scheduler.completeDecode(item, 129, false);
+    }
+
+    rt::PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.decodeBatch.size(), 4U);
+    EXPECT_EQ(second.predictedDecodeReplacementRows, 0);
+    for (size_t index = 0; index < second.decodeBatch.size(); ++index)
+    {
+        EXPECT_EQ(second.decodeBatch[index].requestId, index + 1U);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, LimitsOnlyConcurrentPrefillRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxDecodeBatchSize = 4;
+    config.maxOverlapPrefillBatchSize = 2;
+    config.maxOverlapPrefillTokens = 256;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128});
+    }
+    scheduler.enqueueDecode({9, 128});
+
+    PhaseDispatchPlan const overlap = scheduler.next();
+    EXPECT_EQ(overlap.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(overlap.prefillBatch.size(), 2U);
+    EXPECT_EQ(overlap.decodeBatch.size(), 1U);
+
+    PhaseQueueScheduler standalone(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        standalone.enqueuePrefill({requestId, 128});
+    }
+    PhaseDispatchPlan const prefill = standalone.next();
+    EXPECT_EQ(prefill.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(prefill.prefillBatch.size(), 8U);
+}
+
+TEST(PhaseQueueSchedulerTest, GivesLongPrefillDecodePriority)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({1, 512});
+    scheduler.enqueueDecode({2, 512});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(plan.prefillBatch.empty());
+    EXPECT_EQ(plan.decodeBatch.size(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, BurstLimitPreventsPrefillStarvation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.decodeBurstLimit = 2;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 512});
+    scheduler.enqueueDecode({2, 512});
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    scheduler.enqueueDecode({3, 512});
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    scheduler.enqueueDecode({4, 512});
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, SupportsCustomPolicy)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 1024});
+    scheduler.enqueueDecode({2, 128});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDrainPreferenceSelectsRunnablePhase)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 0U;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+
+    PhaseQueueScheduler prefillScheduler(config);
+    prefillScheduler.enqueuePrefill({1, 32});
+    prefillScheduler.enqueueDecode({2, 128});
+    prefillScheduler.setExternalDrainPreference(PhaseDrainPreference::kPrefill);
+    PhaseDispatchPlan const prefill = prefillScheduler.next();
+    EXPECT_EQ(prefill.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(prefill.drainPreference, PhaseDrainPreference::kPrefill);
+    EXPECT_TRUE(prefill.drainPreferenceApplied);
+
+    PhaseQueueScheduler decodeScheduler(config);
+    decodeScheduler.enqueuePrefill({1, 32});
+    decodeScheduler.enqueueDecode({2, 128});
+    decodeScheduler.setExternalDrainPreference(PhaseDrainPreference::kDecode);
+    PhaseDispatchPlan const decode = decodeScheduler.next();
+    EXPECT_EQ(decode.kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(decode.drainPreference, PhaseDrainPreference::kDecode);
+    EXPECT_TRUE(decode.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDrainPreferencePreservesExpiredSloDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 0U;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints overduePrefill;
+    overduePrefill.ttftTargetUs = 1.0;
+    overduePrefill.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(10);
+    scheduler.enqueuePrefill({1, 32, -1, 0, 0, true, overduePrefill});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kDecode);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_FALSE(plan.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, PrefillTtftHardGuardOverridesMoreOverdueDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enablePrefillTtftHardGuard = true;
+    PhaseQueueScheduler scheduler(config);
+    auto const now = std::chrono::steady_clock::now();
+    PhaseSchedulingHints prefillScheduling;
+    prefillScheduling.ttftTargetUs = 1000.0;
+    prefillScheduling.submittedAt = now - std::chrono::milliseconds(10);
+    PhaseSchedulingHints decodeScheduling;
+    decodeScheduling.tpotTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, -1, 0, 0, true, prefillScheduling});
+    scheduler.enqueueDecode({2, 128, -1, 0, 0, true, decodeScheduling});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalPrefillDrainPreservesPagePressureGuard)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 0U;
+    config.pagePressureDecodeThreshold = 0.8F;
+    config.resourceSupplier = [] { return PhaseQueueResourceSnapshot{10, 9, 1, 0, 0}; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kPrefill);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_FALSE(plan.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, ExternalDrainPreferenceIsBoundedAndHasMinimumDwell)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.enableExternalDrainPreference = true;
+    config.externalDrainPreferenceMinDwellDispatches = 2U;
+    config.externalDrainPreferenceMaxConsecutiveDispatches = 2U;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 32});
+        scheduler.enqueueDecode({requestId + 4U, 128});
+    }
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kPrefill);
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.kind, PhaseDispatchKind::kPrefill);
+    scheduler.completePrefill(first.prefillBatch.front(), 32, true);
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kDecode);
+
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.kind, PhaseDispatchKind::kPrefill);
+    scheduler.completePrefill(second.prefillBatch.front(), 32, true);
+
+    PhaseDispatchPlan third = scheduler.next();
+    EXPECT_EQ(third.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(third.drainPreferenceApplied);
+    EXPECT_EQ(scheduler.telemetry().drainPreferenceTransitions, 2U);
+
+    scheduler.completeDecode(third.decodeBatch.front(), 129, true);
+    PhaseDispatchPlan fourth = scheduler.next();
+    ASSERT_EQ(fourth.kind, PhaseDispatchKind::kDecode);
+    scheduler.completeDecode(fourth.decodeBatch.front(), 129, true);
+    PhaseDispatchPlan const bounded = scheduler.next();
+    EXPECT_EQ(bounded.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_FALSE(bounded.drainPreferenceApplied);
+}
+
+TEST(PhaseQueueSchedulerTest, UsesEwmaCostToAvoidExpensiveOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.minMetricsSamples = 1;
+    config.metricsEwmaAlpha = 1.0F;
+    config.maxPredictedOverlapPrefillMs = 5.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kPrefill;
+    sample.prefillTokens = 100;
+    sample.prefillGpuMs = 10.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 512});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(scheduler.telemetry().sampleCount, 1U);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().prefillGpuMsPerToken, 0.1F);
+}
+
+TEST(PhaseQueueSchedulerTest, SupportsCustomMetricsPolicyAndEwmaTelemetry)
+{
+    bool called{};
+    PhaseQueueSchedulerConfig config;
+    config.metricsEwmaAlpha = 0.5F;
+    config.metricsPolicy = [&](PhaseQueueSnapshot const& state, PhaseSchedulerTelemetry const& telemetry) {
+        called = true;
+        EXPECT_EQ(state.prefillQueued, 1U);
+        EXPECT_EQ(state.decodeQueued, 1U);
+        EXPECT_EQ(telemetry.sampleCount, 2U);
+        EXPECT_NEAR(telemetry.prefillGpuMsPerToken, 0.15F, 1.0e-6F);
+        EXPECT_NEAR(telemetry.decodeGpuMsPerContextToken, 0.15F, 1.0e-6F);
+        EXPECT_NEAR(telemetry.overlapRatio, 0.3F, 1.0e-6F);
+        return PhaseDispatchKind::kPrefill;
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics first;
+    first.kind = PhaseDispatchKind::kOverlap;
+    first.prefillBatchSize = 1;
+    first.decodeBatchSize = 1;
+    first.prefillTokens = 100;
+    first.decodeContextTokens = 100;
+    first.prefillGpuMs = 10.0F;
+    first.decodeGpuMs = 10.0F;
+    first.overlapRatio = 0.4F;
+    scheduler.observeMetrics(first);
+    PhaseDispatchMetrics second = first;
+    second.prefillGpuMs = 20.0F;
+    second.decodeGpuMs = 20.0F;
+    second.overlapRatio = 0.2F;
+    scheduler.observeMetrics(second);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 512});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+    EXPECT_TRUE(called);
+    ASSERT_TRUE(scheduler.telemetry().lastDispatch.has_value());
+    EXPECT_FLOAT_EQ(scheduler.telemetry().lastDispatch->overlapRatio, 0.2F);
+}
+
+TEST(PhaseQueueSchedulerTest, RejectsResidualCostObservationWithWrongAnchor)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kOverlap;
+    metrics.prefillBatchSize = 2;
+    metrics.decodeBatchSize = 4;
+    metrics.prefillPaddedTokens = 256;
+    metrics.prefillPastKVMax = 128;
+    metrics.plannedDecodeMaxContextLength = 512;
+    metrics.prefillGpuMs = 4.0F;
+    metrics.decodeGpuMs = 3.0F;
+    metrics.makespanGpuMs = 5.0F;
+    metrics.globalDecisionApplied = true;
+    metrics.globalCandidateParity = true;
+    metrics.globalActionFidelity = true;
+    metrics.globalSelectedAction = {PhaseGlobalActionKind::kPrefillDecode, 2, 4, 128, 1, 1};
+    metrics.globalSelectedAction.residualAugmentation = true;
+    metrics.globalSelectedAction.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    metrics.globalObservedResidualAnchor = PhaseGlobalResidualAnchor::kDecode;
+
+    scheduler.observeMetrics(metrics);
+
+    EXPECT_EQ(scheduler.telemetry().globalCostKeyObservationCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalCostKeyParityViolationCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalResidualPrefillAnchorObservationCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().globalResidualDecodeAnchorObservationCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, ResetsObservedHistoryOnlyWhileIdle)
+{
+    PhaseQueueScheduler scheduler;
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kOverlap;
+    sample.prefillBatchSize = 1;
+    sample.decodeBatchSize = 1;
+    sample.prefillTokens = 128;
+    sample.decodeContextTokens = 256;
+    sample.prefillGpuMs = 4.0F;
+    sample.decodeGpuMs = 2.0F;
+    sample.overlapRatio = 0.5F;
+    scheduler.observeMetrics(sample);
+    ASSERT_EQ(scheduler.telemetry().sampleCount, 1U);
+
+    scheduler.resetHistory();
+
+    EXPECT_EQ(scheduler.telemetry().sampleCount, 0U);
+    EXPECT_EQ(scheduler.telemetry().overlapSampleCount, 0U);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().prefillGpuMsPerToken, 0.0F);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().decodeGpuMsPerContextToken, 0.0F);
+    EXPECT_FALSE(scheduler.telemetry().lastDispatch.has_value());
+
+    scheduler.enqueuePrefill({1, 128});
+    EXPECT_THROW(scheduler.resetHistory(), std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, UsesPerRequestSloAndBoundedPriorityForUrgentQueues)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.priorityPressureWeight = 0.25;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem prefill{1, 512};
+    prefill.scheduling = {3, 0.001, 0.0};
+    PhaseWorkItem decode{2, 128};
+    decode.scheduling = {0, 0.0, 0.001};
+    scheduler.enqueuePrefill(prefill);
+    scheduler.enqueueDecode(decode);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
+}
+
+TEST(PhaseQueueSchedulerTest, ExposesSloAndPriorityToCustomPolicy)
+{
+    bool called{};
+    PhaseQueueSchedulerConfig config;
+    config.metricsPolicy = [&](PhaseQueueSnapshot const& state, PhaseSchedulerTelemetry const&) {
+        called = true;
+        EXPECT_EQ(state.prefillHighestPriority, 1);
+        EXPECT_EQ(state.decodeHighestPriority, 2);
+        EXPECT_GT(state.prefillMaxSloPressure, 0.0);
+        EXPECT_GT(state.decodeMaxSloPressure, 0.0);
+        return PhaseDispatchKind::kDecode;
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem prefill{1, 32};
+    prefill.scheduling = {1, 1000000.0, 0.0};
+    PhaseWorkItem decode{2, 128};
+    decode.scheduling = {2, 0.0, 1000000.0};
+    scheduler.enqueuePrefill(prefill);
+    scheduler.enqueueDecode(decode);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(called);
+}
+
+TEST(PhaseQueueSchedulerTest, BatchesHigherPriorityWithinEachPhase)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.enablePriorityBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem low{1, 32};
+    low.scheduling.priority = 0;
+    PhaseWorkItem high{2, 64};
+    high.scheduling.priority = 3;
+    PhaseWorkItem medium{3, 64};
+    medium.scheduling.priority = 2;
+    scheduler.enqueuePrefill(low);
+    scheduler.enqueuePrefill(high);
+    scheduler.enqueuePrefill(medium);
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 2U);
+    EXPECT_EQ(first.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(first.prefillBatch[1].requestId, 3U);
+    PhaseDispatchPlan const second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch[0].requestId, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, RejectsDuplicateQueuedRequest)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({7, 32});
+    EXPECT_THROW(scheduler.enqueueDecode({7, 32}), std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, BucketsPrefillByChunkLengthAndInitialState)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 3;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 300, 0, 0, 300});
+    scheduler.enqueuePrefill({2, 64, 1, 0, 64});
+    scheduler.enqueuePrefill({3, 128, 2, 128, 256});
+    scheduler.enqueuePrefill({4, 256, 3, 0, 256});
+
+    PhaseDispatchPlan const initial128 = scheduler.next();
+    ASSERT_EQ(initial128.prefillBatch.size(), 2U);
+    EXPECT_EQ(initial128.prefillBatch[0].requestId, 1U);
+    EXPECT_EQ(initial128.prefillBatch[1].requestId, 4U);
+    EXPECT_EQ(initial128.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(initial128.prefillBatch[1].tokenCount, 128);
+
+    PhaseDispatchPlan const initial64 = scheduler.next();
+    ASSERT_EQ(initial64.prefillBatch.size(), 1U);
+    EXPECT_EQ(initial64.prefillBatch[0].requestId, 2U);
+    EXPECT_EQ(initial64.prefillBatch[0].tokenCount, 64);
+
+    PhaseDispatchPlan const continuation128 = scheduler.next();
+    ASSERT_EQ(continuation128.prefillBatch.size(), 1U);
+    EXPECT_EQ(continuation128.prefillBatch[0].requestId, 3U);
+    EXPECT_EQ(continuation128.prefillBatch[0].tokenOffset, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, CapsContinuationWithoutNarrowingInitialPrefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxContinuationPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256});
+    }
+    PhaseDispatchPlan const initial = scheduler.next();
+    ASSERT_EQ(initial.prefillBatch.size(), 8U);
+    for (PhaseWorkItem const& item : initial.prefillBatch)
+    {
+        scheduler.completePrefill(item, 128, false);
+    }
+
+    PhaseDispatchPlan const continuation = scheduler.next();
+    ASSERT_EQ(continuation.prefillBatch.size(), 4U);
+    EXPECT_TRUE(std::all_of(continuation.prefillBatch.begin(), continuation.prefillBatch.end(),
+        [](PhaseWorkItem const& item) { return item.tokenOffset == 128; }));
+}
+
+TEST(PhaseQueueSchedulerTest, AppliesPrefillTokenBudgetWithoutChangingChunkCompatibility)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 256;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({3, 128, 2, 0, 128});
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 2U);
+    EXPECT_EQ(first.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(first.prefillBatch[1].tokenCount, 128);
+    EXPECT_EQ(scheduler.prefillQueueSize(), 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, PackedPrefillAcceptsAnyPositiveEngineChunkContract)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 0;
+    config.enablePackedPrefillTokenLayout = true;
+    EXPECT_THROW(PhaseQueueScheduler scheduler(config), std::runtime_error);
+
+    config.maxPrefillChunkTokens = 256;
+    EXPECT_NO_THROW(PhaseQueueScheduler scheduler(config));
+}
+
+TEST(PhaseQueueSchedulerTest, RightPadsRaggedPrefillWithinPaddedTokenBudget)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 384;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 96, 1, 0, 96});
+    scheduler.enqueuePrefill({3, 64, 2, 0, 64});
+    scheduler.enqueuePrefill({4, 128, 3, 128, 256});
+
+    PhaseDispatchPlan const initial = scheduler.next();
+    ASSERT_EQ(initial.prefillBatch.size(), 3U);
+    EXPECT_EQ(initial.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(initial.prefillBatch[1].tokenCount, 96);
+    EXPECT_EQ(initial.prefillBatch[2].tokenCount, 64);
+    EXPECT_TRUE(std::all_of(initial.prefillBatch.begin(), initial.prefillBatch.end(),
+        [](PhaseWorkItem const& item) { return item.tokenOffset == 0; }));
+
+    PhaseDispatchPlan const continuation = scheduler.next();
+    ASSERT_EQ(continuation.prefillBatch.size(), 1U);
+    EXPECT_EQ(continuation.prefillBatch[0].requestId, 4U);
+    EXPECT_EQ(continuation.prefillBatch[0].tokenOffset, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, RaggedPrefillDoesNotPadAtomicRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128, true});
+    scheduler.enqueuePrefill({2, 64, 1, 0, 64, false});
+
+    PhaseDispatchPlan const text = scheduler.next();
+    ASSERT_EQ(text.prefillBatch.size(), 1U);
+    EXPECT_EQ(text.prefillBatch[0].requestId, 1U);
+    PhaseDispatchPlan const atomic = scheduler.next();
+    ASSERT_EQ(atomic.prefillBatch.size(), 1U);
+    EXPECT_EQ(atomic.prefillBatch[0].requestId, 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, RaggedOverlapPressureUsesPaddedTokenFootprint)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.policy = [](PhaseQueueSnapshot const& state) {
+        EXPECT_EQ(state.prefillCandidateTokens, 160);
+        return PhaseDispatchKind::kOverlap;
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 80, 0, 0, 80});
+    scheduler.enqueuePrefill({2, 40, 1, 0, 40});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, TokenBudgetSelectsTheMostProductiveCompatibleBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 256;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64, 0, 0, 64});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({3, 128, 2, 0, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(plan.prefillBatch[1].tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, CompletionBonusSelectsFinalContinuationBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    config.prefillCompletionBonusTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+    for (uint64_t requestId = 5; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 3, static_cast<int32_t>(requestId - 1), 128, 131});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    for (PhaseWorkItem const& item : plan.prefillBatch)
+    {
+        EXPECT_EQ(item.tokenOffset, 128);
+        EXPECT_EQ(item.tokenCount, 3);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, CompletionBonusDoesNotPromoteNearlyFullContinuationChunks)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    config.prefillCompletionBonusTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 2; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 109, static_cast<int32_t>(requestId - 1), 0, 109});
+    }
+    for (uint64_t requestId = 5; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 108, static_cast<int32_t>(requestId - 1), 128, 236});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    for (PhaseWorkItem const& item : plan.prefillBatch)
+    {
+        EXPECT_EQ(item.tokenOffset, 0);
+        EXPECT_EQ(item.tokenCount, 109);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, UsesLargerQueueDrainChunkOnlyWhileDecodeIsEmpty)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxOverlapPrefillTokens = 256;
+    config.maxPrefillChunkTokens = 256;
+    config.decodeActivePrefillChunkTokens = 128;
+
+    PhaseQueueScheduler queueDrainScheduler(config);
+    queueDrainScheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    PhaseDispatchPlan const queueDrain = queueDrainScheduler.next();
+    ASSERT_EQ(queueDrain.prefillBatch.size(), 1U);
+    EXPECT_EQ(queueDrain.prefillBatch.front().tokenCount, 256);
+
+    PhaseQueueScheduler steadyStateScheduler(config);
+    steadyStateScheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    steadyStateScheduler.enqueueDecode({2, 512, 1});
+    PhaseDispatchPlan const steadyState = steadyStateScheduler.next();
+    ASSERT_EQ(steadyState.prefillBatch.size(), 1U);
+    EXPECT_EQ(steadyState.prefillBatch.front().tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsLargeChunksUntilPrefillBacklogDrains)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxOverlapPrefillTokens = 256;
+    config.maxPrefillChunkTokens = 256;
+    config.decodeActivePrefillChunkTokens = 128;
+    config.largePrefillChunkQueueThreshold = 2;
+
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueuePrefill({2, 256, 1, 0, 256});
+    scheduler.enqueueDecode({3, 512, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 256);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchWithinDeadline)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}, {4, 512, 2.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+    scheduler.enqueueDecode({4, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, MeasuredDecodeCostsPreserveStaticDecisionIdentity)
+{
+    std::vector<PhaseDecodeBatchCost> const costs{{1, 512, 2.0F}, {2, 512, 3.0F}, {3, 512, 3.5F}, {4, 512, 4.0F}};
+    PhaseQueueSchedulerConfig staticConfig;
+    staticConfig.maxDecodeBatchSize = 4;
+    staticConfig.enableDynamicDecodeBatching = true;
+    staticConfig.decodeQueueWaitTargetUs = 1.0;
+    staticConfig.decodeBatchCosts = costs;
+
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    for (PhaseDecodeBatchCost const& cost : costs)
+    {
+        PhaseGlobalActionKey const key{PhaseGlobalActionKind::kDecode, cost.batchSize, 0, 1, 1, 0};
+        tracker->observe(key, {cost.p95GpuMs * static_cast<float>(cost.batchSize), cost.p95GpuMs});
+    }
+    PhaseQueueSchedulerConfig measuredSchedulerConfig = staticConfig;
+    measuredSchedulerConfig.decodeBatchCosts.clear();
+    measuredSchedulerConfig.enableMeasuredDecodeBatching = true;
+    measuredSchedulerConfig.runtimeCostTracker = std::move(tracker);
+
+    PhaseQueueScheduler staticScheduler(staticConfig);
+    PhaseQueueScheduler measuredScheduler(measuredSchedulerConfig);
+    for (uint64_t requestId = 1; requestId <= 3; ++requestId)
+    {
+        staticScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
+        measuredScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
+    }
+
+    PhaseDispatchPlan const staticPlan = staticScheduler.next();
+    PhaseDispatchPlan const measuredPlan = measuredScheduler.next();
+
+    ASSERT_EQ(measuredPlan.decodeBatch.size(), staticPlan.decodeBatch.size());
+    for (size_t row{}; row < staticPlan.decodeBatch.size(); ++row)
+    {
+        EXPECT_EQ(measuredPlan.decodeBatch[row].requestId, staticPlan.decodeBatch[row].requestId);
+        EXPECT_EQ(measuredPlan.decodeBatch[row].kvSlotId, staticPlan.decodeBatch[row].kvSlotId);
+    }
+    EXPECT_FLOAT_EQ(measuredPlan.predictedDecodeDrainGpuMs, staticPlan.predictedDecodeDrainGpuMs);
+    EXPECT_EQ(measuredPlan.predictedDecodeDrainTurns, staticPlan.predictedDecodeDrainTurns);
+}
+
+TEST(PhaseQueueSchedulerTest, SparseMeasuredDecodeCoveragePreservesLargestBatch)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    tracker->observe({PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0}, {2.0F, 2.0F});
+    tracker->observe({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, {4.0F, 3.0F});
+
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableMeasuredDecodeBatching = true;
+    config.runtimeCostTracker = std::move(tracker);
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, MeasuredPrefillCostsPreserveProducerClassAndDenseBatch)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    for (int32_t const batchSize : {1, 2, 4})
+    {
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, 128, 0, 0};
+        key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+        tracker->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
+    }
+
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableMeasuredPrefillBatching = true;
+    config.runtimeCostTracker = std::move(tracker);
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        PhaseWorkItem item{requestId, 128};
+        item.prefillClass = PhasePrefillClass::kText;
+        scheduler.enqueuePrefill(item);
+    }
+
+    EXPECT_EQ(scheduler.next().prefillBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, SparseMeasuredPrefillCoveragePreservesLargestBatch)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    for (int32_t const batchSize : {1, 2})
+    {
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, 128, 0, 0};
+        key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+        tracker->observe(key, {static_cast<float>(batchSize) * 4.0F, 3.0F + static_cast<float>(batchSize)});
+    }
+
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableMeasuredPrefillBatching = true;
+    config.runtimeCostTracker = std::move(tracker);
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        PhaseWorkItem item{requestId, 128};
+        item.prefillClass = PhasePrefillClass::kText;
+        scheduler.enqueuePrefill(item);
+    }
+
+    EXPECT_EQ(scheduler.next().prefillBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, ConfidentRuntimeDecodeCostRefinesStaticPrior)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeComponentObservation = true;
+    config.decodeComponentMinSamples = 2;
+    config.decodeComponentWindow = 4;
+    config.decodeComponentMaxAdjustmentRatio = 0.5F;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 10.0F}, {2, 512, 9.0F}, {4, 512, 20.0F}};
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kDecode;
+    sample.decodeBatchSize = 4;
+    sample.decodeContextTokens = 1024;
+    sample.plannedDecodeMaxContextLength = 256;
+    sample.decodeGpuMs = 5.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.observeMetrics(sample);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+    EXPECT_EQ(scheduler.telemetry().runtimeDecodeCostSampleCount, 2U);
+    EXPECT_EQ(scheduler.telemetry().runtimeDecodeCostBucketCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortReplacesRowsOnlyAfterCompletion)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+
+    auto ids = [](std::vector<PhaseWorkItem> const& batch) {
+        std::set<uint64_t> result;
+        for (PhaseWorkItem const& item : batch)
+        {
+            result.insert(item.requestId);
+        }
+        return result;
+    };
+    PhaseDispatchPlan first = scheduler.next();
+    EXPECT_EQ(ids(first.decodeBatch), (std::set<uint64_t>{1, 2, 3, 4}));
+    EXPECT_EQ(scheduler.decodeCohortSize(), 4U);
+    for (PhaseWorkItem const& item : first.decodeBatch)
+    {
+        scheduler.completeDecode(item, 129, false);
+    }
+    PhaseDispatchPlan second = scheduler.next();
+    EXPECT_EQ(ids(second.decodeBatch), (std::set<uint64_t>{1, 2, 3, 4}));
+    for (PhaseWorkItem const& item : second.decodeBatch)
+    {
+        scheduler.completeDecode(item, 130, item.requestId == 1);
+    }
+    PhaseDispatchPlan third = scheduler.next();
+    EXPECT_EQ(ids(third.decodeBatch), (std::set<uint64_t>{2, 3, 4, 5}));
+    EXPECT_EQ(scheduler.decodeCohortSize(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortKeepsOverflowQueuedWhileCurrentRowsAreInFlight)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 2U);
+    EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 0U);
+
+    PhaseDispatchPlan const blocked = scheduler.next();
+    EXPECT_EQ(blocked.kind, PhaseDispatchKind::kNone);
+    EXPECT_TRUE(blocked.decodeBatch.empty());
+    EXPECT_EQ(scheduler.decodeQueueSize(), 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortSelectsOnlyReadyMembersDuringPartialRefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDecodeCohortBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.decodeBatch.size(), 4U);
+    scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+
+    EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 1U);
+    PhaseDispatchPlan const refill = scheduler.next();
+    ASSERT_EQ(refill.decodeBatch.size(), 1U);
+    EXPECT_EQ(refill.decodeBatch.front().requestId, first.decodeBatch.front().requestId);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, DecodeCohortSupportsActiveCapacityAboveBatchLimit)
+{
+    for (uint64_t const activeRequests : {65U, 72U, 80U})
+    {
+        PhaseQueueSchedulerConfig config;
+        config.maxDecodeBatchSize = 64;
+        config.enableDecodeCohortBatching = true;
+        PhaseQueueScheduler scheduler(config);
+        for (uint64_t requestId = 1; requestId <= activeRequests; ++requestId)
+        {
+            scheduler.enqueueDecode({requestId, 128});
+        }
+
+        PhaseDispatchPlan const first = scheduler.next();
+        ASSERT_EQ(first.decodeBatch.size(), 64U) << "active requests=" << activeRequests;
+        scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+
+        EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 1U) << "active requests=" << activeRequests;
+        PhaseDispatchPlan const refill = scheduler.next();
+        ASSERT_EQ(refill.decodeBatch.size(), 1U) << "active requests=" << activeRequests;
+        EXPECT_EQ(refill.decodeBatch.front().requestId, first.decodeBatch.front().requestId)
+            << "active requests=" << activeRequests;
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesMostEfficientBatchToRecoverAfterDeadline)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 0.001;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}, {4, 512, 2.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+    scheduler.enqueueDecode({4, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesEfficientBatchWhenIdleDeadlineIsImpossible)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 2000.0;
+    config.decodeBatchCosts = {{1, 512, 6.2F}, {2, 512, 6.3F}, {4, 512, 6.5F}};
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints scheduling;
+    scheduling.submittedAt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256, -1, 0, 0, true, scheduling});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodePricesTheRemainderAfterRuntimeObservation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 8;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeComponentObservation = true;
+    config.decodeComponentMinSamples = 2;
+    config.decodeComponentWindow = 4;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 512, 6.2F}, {2, 512, 6.3F}, {4, 512, 6.35F}, {7, 512, 6.4F}, {8, 512, 6.4F}};
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kDecode;
+    sample.decodeBatchSize = 8;
+    sample.decodeContextTokens = 2048;
+    sample.plannedDecodeMaxContextLength = 256;
+    sample.decodeGpuMs = 10.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.observeMetrics(sample);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 8U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodePricesEveryTurnNeededToServiceRunnableRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 12;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0;
+    config.decodeBatchCosts = {{1, 512, 2.0F}, {4, 512, 4.0F}, {5, 512, 5.0F}, {12, 512, 15.0F}};
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 12; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 256});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 4U);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeDrainGpuMs, 12.0F);
+    EXPECT_EQ(plan.predictedDecodeDrainTurns, 3);
+}
+
+TEST(PhaseQueueSchedulerTest, RuntimeDecodeObservationSeparatesEncoderContention)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeComponentObservation = true;
+    config.decodeComponentMinSamples = 2;
+    config.decodeComponentWindow = 4;
+    config.decodeQueueWaitTargetUs = 1.0;
+    config.decodeBatchCosts = {{1, 512, 1.0F}, {2, 512, 1.5F}};
+    PhaseDispatchMetrics sample;
+    sample.kind = PhaseDispatchKind::kDecode;
+    sample.decodeBatchSize = 2;
+    sample.decodeContextTokens = 512;
+    sample.plannedDecodeMaxContextLength = 256;
+    sample.decodeGpuMs = 5.0F;
+    sample.externalEncoderActive = true;
+
+    PhaseQueueScheduler isolated(config);
+    isolated.observeMetrics(sample);
+    isolated.observeMetrics(sample);
+    isolated.enqueueDecode({1, 256});
+    isolated.enqueueDecode({2, 256});
+    PhaseDispatchPlan const isolatedPlan = isolated.next();
+    EXPECT_EQ(isolatedPlan.decodeBatch.size(), 2U);
+    EXPECT_FALSE(isolatedPlan.externalEncoderActive);
+
+    PhaseQueueScheduler contended(config);
+    contended.observeMetrics(sample);
+    contended.observeMetrics(sample);
+    contended.setExternalEncoderActive(true);
+    contended.enqueueDecode({1, 256});
+    contended.enqueueDecode({2, 256});
+    PhaseDispatchPlan const contendedPlan = contended.next();
+    EXPECT_EQ(contendedPlan.decodeBatch.size(), 1U);
+    EXPECT_TRUE(contendedPlan.externalEncoderActive);
+    EXPECT_EQ(contended.telemetry().encoderContendedDecodeCostSampleCount, 2U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeDoesNotShrinkFromSparseContextCoverage)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{1, 2048, 1.0F}, {2, 512, 1.5F}, {4, 512, 2.0F}};
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 1024});
+    }
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesUpperBucketForCurrentActiveRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{2, 512, 1.5F}, {4, 512, 2.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 3U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeInterpolatesPartiallyFilledProfileBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{2, 512, 1.5F}, {4, 512, 2.4F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 256});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 256});
+
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 3U);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeUsesSelectedRowsTotalContextShape)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.decodeBatchCosts = {{2, 1024, 1.5F, 1200}, {4, 1024, 1.8F, 1200}, {4, 1024, 4.0F, 1600}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 1024});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.enqueueDecode({3, 128});
+    scheduler.enqueueDecode({4, 128});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_EQ(plan.plannedDecodeContextTokens, 1152);
+    EXPECT_EQ(plan.plannedDecodeMaxContextLength, 1024);
+}
+
+TEST(PhaseQueueSchedulerTest, SnapshotReportsRunnableDecodeShapeAndLivePagePressure)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    config.metricsPolicy = [](PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const&) {
+        EXPECT_EQ(snapshot.decodeCandidateContextTokens, 384);
+        EXPECT_EQ(snapshot.decodeCandidateMaxContextLength, 256);
+        EXPECT_EQ(snapshot.pagePoolTotalBundles, 256);
+        EXPECT_EQ(snapshot.pagePoolAllocatedBundles, 200);
+        EXPECT_EQ(snapshot.pagePoolAvailableBundles, 56);
+        EXPECT_EQ(snapshot.pageReservationGuaranteedBundles, 224);
+        EXPECT_EQ(snapshot.pageReservationAvailableBundles, 32);
+        return PhaseDispatchKind::kDecode;
+    };
+    config.resourceSupplier = []() { return PhaseQueueResourceSnapshot{256, 200, 56, 224, 32}; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    scheduler.enqueueDecode({2, 256});
+    scheduler.enqueueDecode({3, 1024});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_EQ(plan.plannedDecodeContextTokens, 384);
+    EXPECT_EQ(plan.plannedDecodeMaxContextLength, 256);
+}
+
+TEST(PhaseQueueSchedulerTest, MaterializesReadyRowsOnlyForDetailedSnapshots)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseQueueSnapshot const aggregate = scheduler.queueSnapshot();
+    EXPECT_EQ(aggregate.prefillQueued, 1U);
+    EXPECT_EQ(aggregate.decodeQueued, 1U);
+    EXPECT_TRUE(aggregate.prefillRequestIds.empty());
+    EXPECT_TRUE(aggregate.prefillTokenCounts.empty());
+    EXPECT_TRUE(aggregate.decodeRequestIds.empty());
+    EXPECT_TRUE(aggregate.decodeContextLengths.empty());
+
+    PhaseQueueSnapshot const detailed = scheduler.queueSnapshot(true);
+    EXPECT_EQ(detailed.prefillRequestIds, std::vector<uint64_t>{1U});
+    EXPECT_EQ(detailed.prefillTokenCounts, std::vector<int32_t>{64});
+    EXPECT_EQ(detailed.decodeRequestIds, std::vector<uint64_t>{2U});
+    EXPECT_EQ(detailed.decodeContextLengths, std::vector<int32_t>{128});
+}
+
+TEST(PhaseQueueSchedulerTest, PagePressurePrefersDecodeWithoutOverridingAnExpiredPrefill)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics pressure;
+    pressure.pagePoolTotalBundles = 100;
+    pressure.pagePoolAllocatedBundles = 90;
+    scheduler.observeMetrics(pressure);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kDecode);
+}
+
+TEST(PhaseQueueSchedulerTest, RequeuesChunksAndTransitionsToDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({42, 300, 3});
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    EXPECT_EQ(first.prefillBatch[0].kvSlotId, 3);
+    EXPECT_EQ(first.prefillBatch[0].tokenOffset, 0);
+    EXPECT_EQ(first.prefillBatch[0].tokenCount, 128);
+    EXPECT_EQ(first.prefillBatch[0].promptTokenCount, 300);
+    scheduler.completePrefill(first.prefillBatch[0], 128);
+
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch[0].tokenOffset, 128);
+    EXPECT_EQ(second.prefillBatch[0].tokenCount, 128);
+    scheduler.completePrefill(second.prefillBatch[0], 256);
+
+    PhaseDispatchPlan third = scheduler.next();
+    ASSERT_EQ(third.prefillBatch.size(), 1U);
+    EXPECT_EQ(third.prefillBatch[0].tokenOffset, 256);
+    EXPECT_EQ(third.prefillBatch[0].tokenCount, 44);
+    scheduler.completePrefill(third.prefillBatch[0], 300);
+
+    EXPECT_EQ(scheduler.prefillQueueSize(), 0U);
+    EXPECT_EQ(scheduler.decodeQueueSize(), 1U);
+    PhaseDispatchPlan decode = scheduler.next();
+    ASSERT_EQ(decode.decodeBatch.size(), 1U);
+    EXPECT_EQ(decode.decodeBatch[0].kvSlotId, 3);
+    EXPECT_EQ(decode.decodeBatch[0].tokenCount, 300);
+    scheduler.completeDecode(decode.decodeBatch[0], 301, true);
+    EXPECT_FALSE(scheduler.hasRequest(42));
+}
+
+TEST(PhaseQueueSchedulerTest, UsesChunkCostForOverlapDecision)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 1024, 0});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kOverlap);
+}
+
+TEST(PhaseQueueSchedulerTest, AdaptsChunkSizeFromObservedGpuCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.minPrefillChunkTokens = 16;
+    config.prefillChunkAlignment = 16;
+    config.maxPredictedOverlapPrefillMs = 5.0F;
+    config.metricsEwmaAlpha = 1.0F;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.prefillTokens = 100;
+    sample.prefillGpuMs = 10.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 48);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsLargestBoundedChunkWithoutDecodePressure)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.minPrefillChunkTokens = 32;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.maxPredictedOverlapPrefillMs = 5.0F;
+    config.metricsEwmaAlpha = 1.0F;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.prefillTokens = 128;
+    sample.prefillGpuMs = 12.8F;
+    scheduler.observeMetrics(sample);
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, IgnoresTinyTailForBoundedChunkCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.maxPredictedOverlapPrefillMs = 5.0F;
+    config.metricsEwmaAlpha = 1.0F;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.prefillTokens = 21;
+    sample.prefillGpuMs = 15.0F;
+    scheduler.observeMetrics(sample);
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, AllowsFinalTailBelowBoundedChunkCandidates)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 48, 0, 0, 48});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 48);
+}
+
+TEST(PhaseQueueSchedulerTest, CompletesTailBetweenBoundedChunkCandidates)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 100, 0, 0, 100});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 100);
+}
+
+TEST(PhaseQueueSchedulerTest, UsesSmallBoundedChunkUnderDecodeQueuePressure)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.minPrefillChunkTokens = 64;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.adaptivePrefillChunkDecodePressureThreshold = 0.5F;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.decodeBatchSize = 2;
+    sample.decodeContextTokens = 1024;
+    sample.decodeGpuMs = 1.0F;
+    sample.decodeQueueWaitUs = 1000.0;
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        scheduler.observeMetrics(sample);
+    }
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+    scheduler.enqueueDecode({2, 512, 1});
+    scheduler.enqueueDecode({3, 512, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 64);
+}
+
+TEST(PhaseQueueSchedulerTest, SplitsCompletionOnlyWhenExplicitlyEnabledUnderPressure)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.adaptivePrefillChunkDecodePressureThreshold = 0.5F;
+    config.allowAdaptivePrefillCompletionSplit = true;
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics sample;
+    sample.decodeBatchSize = 1;
+    sample.decodeContextTokens = 512;
+    sample.decodeGpuMs = 1.0F;
+    sample.decodeQueueWaitUs = 1000.0;
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        scheduler.observeMetrics(sample);
+    }
+    scheduler.enqueuePrefill({1, 100, 0, 0, 100});
+    scheduler.enqueueDecode({2, 512, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 64);
+}
+
+TEST(PhaseQueueSchedulerTest, RejectsInvalidAdaptiveChunkCandidates)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 64};
+    EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
+
+    config.adaptivePrefillChunkCandidates = {64, 256};
+    EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
+
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableAdaptivePrefillChunking = false;
+    EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
+
+    config.adaptivePrefillChunkCandidates.clear();
+    config.allowAdaptivePrefillCompletionSplit = true;
+    EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapeTradesThroughputForDecodeInterference)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.decodeQueueWaitTargetUs = 50000.0;
+    config.prefillBatchCosts = {
+        {4, 64, 0, 1, true, 8.0F, 1.0F},
+        {4, 128, 0, 1, true, 12.0F, 8.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+    scheduler.enqueueDecode({10, 128, 4});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 64);
+    EXPECT_EQ(plan.prefillCostLookupChunkLength, 64);
+    EXPECT_EQ(plan.prefillShapeCandidatesEvaluated, 2);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 8.0F);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 1.0F);
+    EXPECT_NEAR(plan.predictedPrefillShapeScore, 256.0F / 9.0F, 1.0e-5F);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapeCanMaximizePrefillThroughput)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillShapeDecodePenaltyWeight = 0.0F;
+    config.decodeQueueWaitTargetUs = 50000.0;
+    config.prefillBatchCosts = {
+        {4, 64, 0, 1, true, 8.0F, 1.0F},
+        {4, 128, 0, 1, true, 12.0F, 8.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+    scheduler.enqueueDecode({10, 128, 4});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+    EXPECT_EQ(plan.prefillCostLookupChunkLength, 128);
+    EXPECT_NEAR(plan.predictedPrefillShapeScore, 512.0F / 12.0F, 1.0e-5F);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapeDrainsLargeBacklogWithMaximumProgress)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillShapeDrainBacklogTokens = 512;
+    config.prefillBatchCosts = {
+        {4, 64, 0, 0, true, 4.0F, 0.0F},
+        {4, 128, 0, 0, true, 20.0F, 0.0F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+    EXPECT_TRUE(plan.prefillShapeDrainMode);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapePreservesUnsplitCompletion)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 8.0F, 0.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 100, 0, 0, 100});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 100);
+}
+
+TEST(PhaseQueueSchedulerTest, JointPrefillShapePreservesProductiveCompletionBucket)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableAdaptivePrefillChunking = true;
+    config.adaptivePrefillChunkCandidates = {64, 128};
+    config.enableDynamicPrefillBatching = true;
+    config.enableCostAwarePrefillShapeSelection = true;
+    config.prefillBatchCosts = {
+        {2, 128, 0, 0, true, 4.0F, 0.0F},
+        {4, 128, 0, 0, true, 20.0F, 0.0F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueuePrefill({2, 256, 1, 0, 256});
+    for (uint64_t requestId = 3; requestId <= 6; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 117, static_cast<int32_t>(requestId - 1), 0, 117});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 117);
+    EXPECT_EQ(plan.prefillCostLookupChunkLength, 117);
+    EXPECT_EQ(plan.prefillShapeCandidatesEvaluated, 0);
+}
+
+TEST(PhaseQueueSchedulerTest, RejectsIncompleteJointPrefillShapeConfiguration)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableCostAwarePrefillShapeSelection = true;
+    EXPECT_THROW(PhaseQueueScheduler{config}, std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsNonChunkableMultimodalPrefillAtomic)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.enableAdaptivePrefillChunking = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem multimodal{1, 300, 0, 0, 300};
+    multimodal.allowChunkedPrefill = false;
+    scheduler.enqueuePrefill(multimodal);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 300);
+}
+
+TEST(PhaseQueueSchedulerTest, BatchesRaggedAtomicMultimodalPrefills)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 2048;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem first{1, 509, 0, 0, 509};
+    PhaseWorkItem second{2, 1015, 1, 0, 1015};
+    first.allowChunkedPrefill = false;
+    second.allowChunkedPrefill = false;
+    scheduler.enqueuePrefill(first);
+    scheduler.enqueuePrefill(second);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_EQ(plan.prefillBatch[0].tokenCount, 1015);
+    EXPECT_EQ(plan.prefillBatch[1].tokenCount, 509);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsTextAndExternalPrefillInSeparateBatches)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem text{1, 128, 0, 0, 128};
+    PhaseWorkItem external{2, 128, 1, 0, 128};
+    external.prefillClass = PhasePrefillClass::kExternal;
+    scheduler.enqueuePrefill(text);
+    scheduler.enqueuePrefill(external);
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    EXPECT_EQ(first.prefillBatch.front().prefillClass, PhasePrefillClass::kText);
+    scheduler.completePrefill(first.prefillBatch.front(), 128, true);
+    PhaseDispatchPlan const second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch.front().prefillClass, PhasePrefillClass::kExternal);
+}
+
+TEST(PhaseQueueSchedulerTest, CapsExternalPrefillAtItsTensorRtProfile)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxExternalPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler textScheduler(config);
+    PhaseQueueScheduler externalScheduler(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        textScheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128});
+        PhaseWorkItem external{requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128};
+        external.prefillClass = PhasePrefillClass::kExternal;
+        externalScheduler.enqueuePrefill(external);
+    }
+
+    EXPECT_EQ(textScheduler.next().prefillBatch.size(), 8U);
+    EXPECT_EQ(externalScheduler.next().prefillBatch.size(), 4U);
+}
+
+TEST(PhaseQueueSchedulerTest, ChunksExclusiveMultimodalPrefillWithoutBatchingRows)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    config.enableWavefrontPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem first{1, 300, 0, 0, 300};
+    PhaseWorkItem second{2, 300, 1, 0, 300};
+    first.exclusivePrefill = true;
+    second.exclusivePrefill = true;
+    scheduler.enqueuePrefill(first);
+    scheduler.enqueuePrefill(second);
+
+    int32_t dispatches{};
+    while (!scheduler.empty())
+    {
+        PhaseDispatchPlan const plan = scheduler.next();
+        ASSERT_EQ(plan.prefillBatch.size(), 1U);
+        EXPECT_TRUE(plan.prefillBatch.front().exclusivePrefill);
+        EXPECT_LE(plan.prefillBatch.front().tokenCount, 128);
+        PhaseWorkItem const& item = plan.prefillBatch.front();
+        int32_t const length = item.tokenOffset + item.tokenCount;
+        scheduler.completePrefill(item, length, length == item.promptTokenCount);
+        ++dispatches;
+    }
+    EXPECT_EQ(dispatches, 6);
+}
+
+TEST(PhaseQueueSchedulerTest, DoesNotFragmentEfficientChunkForDecodeQueueWait)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.minPrefillChunkTokens = 32;
+    config.prefillChunkAlignment = 16;
+    config.enableAdaptivePrefillChunking = true;
+    config.decodeQueueWaitTargetUs = 0.001;
+    config.maxPredictedOverlapPrefillMs = 30.0F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueueDecode({2, 128, 1});
+    PhaseDispatchMetrics observed;
+    observed.prefillTokens = 128;
+    observed.prefillGpuMs = 12.8F;
+    observed.decodeContextTokens = 128;
+    observed.decodeGpuMs = 4.0F;
+    scheduler.observeMetrics(observed);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().tokenCount, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsInFlightRequestUnique)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueuePrefill({7, 32});
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_THROW(scheduler.enqueueDecode({7, 32}), std::runtime_error);
+}
+
+TEST(PhaseQueueSchedulerTest, KeepsIneligibleWorkQueuedUntilItsGrowthLeaseOpens)
+{
+    uint64_t eligibleRequest{2};
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.eligibilityPolicy = [&](PhaseWorkItem const& item, bool prefill) {
+        EXPECT_TRUE(prefill);
+        return item.requestId == eligibleRequest;
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueuePrefill({2, 32});
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    EXPECT_EQ(first.prefillBatch.front().requestId, 2U);
+    scheduler.completePrefill(first.prefillBatch.front(), 32, true);
+
+    eligibleRequest = 1;
+    PhaseDispatchPlan second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 1U);
+    EXPECT_EQ(second.prefillBatch.front().requestId, 1U);
+    scheduler.completePrefill(second.prefillBatch.front(), 32, true);
+    EXPECT_TRUE(scheduler.empty());
+}
+
+TEST(PhaseQueueSchedulerTest, PreservesCumulativeTtftAgeAcrossChunkRequeue)
+{
+    int32_t observations{};
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    config.metricsPolicy = [&](PhaseQueueSnapshot const& state, PhaseSchedulerTelemetry const&) {
+        ++observations;
+        EXPECT_GT(state.prefillOldestRequestAgeUs, 1000000.0);
+        EXPECT_LT(state.prefillMinTtftSlackUs, 0.0);
+        EXPECT_GT(state.prefillMaxSloPressure, 1.0);
+        return PhaseDispatchKind::kPrefill;
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem item{1, 256, 0, 0, 256};
+    item.scheduling.ttftTargetUs = 1000000.0;
+    item.scheduling.submittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+    scheduler.enqueuePrefill(item);
+
+    PhaseDispatchPlan first = scheduler.next();
+    scheduler.completePrefill(first.prefillBatch.front(), 128);
+    PhaseDispatchPlan const second = scheduler.next();
+    EXPECT_EQ(second.prefillBatch.front().tokenOffset, 128);
+    EXPECT_EQ(observations, 2);
+}
+
+TEST(PhaseQueueSchedulerTest, WavefrontKeepsARequestCohortAcrossChunks)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableWavefrontPrefillBatching = true;
+    config.maxPrefillCohortSize = 2;
+    config.maxPrefillCohortTurns = 4;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 256, static_cast<int32_t>(requestId - 1), 0, 256});
+    }
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 2U);
+    EXPECT_EQ(first.prefillCohortSize, 2);
+    scheduler.completePrefill(first.prefillBatch[0], 128);
+    scheduler.completePrefill(first.prefillBatch[1], 128);
+    PhaseDispatchPlan const second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 2U);
+    EXPECT_EQ(second.prefillBatch[0].requestId, first.prefillBatch[0].requestId);
+    EXPECT_EQ(second.prefillBatch[1].requestId, first.prefillBatch[1].requestId);
+    EXPECT_EQ(second.prefillBatch[0].tokenOffset, 128);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesLargestBatchInsideDecodeSlack)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.decodeQueueWaitTargetUs = 5000.0;
+    config.decodeSlackSafetyFactor = 1.0F;
+    config.prefillBatchCosts
+        = {{1, 128, 0, 4, true, 10.0F, 1.0F}, {2, 128, 0, 4, true, 15.0F, 4.0F}, {4, 128, 0, 4, true, 20.0F, 10.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128});
+    }
+    scheduler.enqueueDecode({10, 128, 4});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 15.0F);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 4.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesProducerSpecificCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kAny},
+        {1, 128, 0, 0, true, 20.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseWorkItem external{1, 128, 0, 0, 128};
+    external.prefillClass = PhasePrefillClass::kExternal;
+    scheduler.enqueuePrefill(external);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 20.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicRaggedPrefillUsesUsefulTokenEfficiency)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableRaggedPrefillBatching = true;
+    config.enableDynamicPrefillBatching = true;
+    config.prefillBatchCosts = {{1, 128, 0, 0, true, 10.0F, 0.0F}, {2, 128, 0, 0, true, 11.0F, 0.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 1, 1, 0, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 10.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, PrefillOnlyDynamicBatchIgnoresQueuedDecodeCoverage)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 8;
+    config.maxDecodeBatchSize = 32;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.decodeQueueWaitTargetUs = 100000.0;
+    config.prefillBatchCosts = {{4, 128, 0, 32, true, 20.0F, 10.0F}, {8, 128, 0, 0, true, 32.0F, 0.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kPrefill; };
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128});
+    }
+    for (uint64_t requestId = 9; requestId <= 40; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128, static_cast<int32_t>(requestId - 9)});
+    }
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.prefillBatch.size(), 8U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 32.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesThroughputEfficientBatchToRecoverExpiredTtft)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enablePrefillSloRecovery = true;
+    config.prefillQueueWaitTargetUs = 1.0;
+    config.decodeQueueWaitTargetUs = 5000.0;
+    config.prefillBatchCosts
+        = {{1, 128, 0, 4, true, 10.0F, 1.0F}, {2, 128, 0, 4, true, 15.0F, 4.0F}, {4, 128, 0, 4, true, 20.0F, 10.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints overdue;
+    overdue.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128, true, overdue});
+    }
+    scheduler.enqueueDecode({10, 128, 4});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.prefillBatch.size(), 4U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 20.0F);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 10.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillHonorsConfiguredBatchFloor)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.minDynamicPrefillBatchSize = 2;
+    config.decodeQueueWaitTargetUs = 2000.0;
+    config.decodeSlackSafetyFactor = 1.0F;
+    config.prefillBatchCosts = {{1, 128, 0, 2, true, 10.0F, 1.0F}, {2, 128, 0, 2, true, 15.0F, 4.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({10, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 15.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillDoesNotOverrideAnExpiredDecodeSlo)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.minDynamicPrefillBatchSize = 2;
+    config.enablePrefillSloRecovery = true;
+    config.prefillQueueWaitTargetUs = 1.0;
+    config.decodeQueueWaitTargetUs = 0.000001;
+    config.prefillBatchCosts = {{2, 128, 0, 4, true, 15.0F, 4.0F}, {4, 128, 0, 4, true, 20.0F, 10.0F}};
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints overdue;
+    overdue.submittedAt = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128, true, overdue});
+    }
+    scheduler.enqueueDecode({10, 128, 4, 0, 0, true, overdue});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 15.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, TpotHardGuardConvertsUnsafeOverlapToDecodeOnly)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.decodeQueueWaitTargetUs = 1000.0;
+    config.decodeSlackSafetyFactor = 1.0F;
+    config.prefillBatchCosts = {{1, 128, 0, 2, true, 10.0F, 4.0F}, {2, 128, 0, 2, true, 15.0F, 6.0F}};
+    config.overlapBatchCosts = {
+        {1, 2, 128, 0, 512, true, 10.0F, 5.0F, 10.0F, 4.0F},
+        {2, 2, 128, 0, 512, true, 15.0F, 7.0F, 15.0F, 6.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({10, 128, 2});
+    scheduler.enqueueDecode({11, 128, 3});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(plan.prefillBatch.empty());
+    EXPECT_EQ(plan.decodeBatch.size(), 2U);
+    EXPECT_TRUE(plan.prefillDeferredForTpot);
+}
+
+TEST(PhaseQueueSchedulerTest, CostAwareAdmissionCanExceedStaticOverlapCap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}, {2, 128, 0, 1, true, 12.0F, 0.8F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F},
+        {2, 1, 128, 0, 512, true, 12.0F, 2.5F, 12.0F, 0.8F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_TRUE(plan.overlapEvaluatedByCost);
+}
+
+TEST(PhaseQueueSchedulerTest, CostAwareAdmissionDefersUncoveredShape)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 64;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}};
+    config.overlapBatchCosts = {{1, 1, 64, 0, 512, true, 4.0F, 2.0F, 4.0F, 0.5F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(plan.prefillBatch.empty());
+    EXPECT_TRUE(plan.prefillDeferredForTpot);
+    EXPECT_TRUE(plan.prefillCostCoverageMiss);
+    EXPECT_TRUE(plan.overlapEvaluatedByCost);
+}
+
+TEST(PhaseQueueSchedulerTest, CostAwareAdmissionPreservesLegacyOverlapInsideStaticCap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}};
+    config.overlapBatchCosts = {{1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64, 0, 0, 64});
+    scheduler.enqueuePrefill({2, 64, 1, 0, 64});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_FALSE(plan.prefillDeferredForTpot);
+    EXPECT_FALSE(plan.prefillCostCoverageMiss);
+    EXPECT_FALSE(plan.overlapEvaluatedByCost);
+}
+
+TEST(PhaseQueueSchedulerTest, ExplicitConfigurationEnablesCostAwareOverlap)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.enableTpotHysteresis = true;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}, {2, 128, 0, 1, true, 12.0F, 0.8F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F},
+        {2, 1, 128, 0, 512, true, 12.0F, 2.5F, 12.0F, 0.8F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({3, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.prefillBatch.size(), 2U);
+    EXPECT_TRUE(plan.overlapEvaluatedByCost);
+    EXPECT_FALSE(plan.latencySafeFallback);
+}
+
+TEST(PhaseQueueSchedulerTest, TpotHysteresisFallsBackAndRecovers)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.enableCostAwareOverlapAdmission = true;
+    config.enableTpotHysteresis = true;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.maxOverlapPrefillTokens = 128;
+    config.decodeQueueWaitTargetUs = 50000.0;
+    config.tpotHysteresisEnterRatio = 0.8F;
+    config.tpotHysteresisExitRatio = 0.5F;
+    config.tpotHysteresisWindow = 3;
+    config.minTpotHysteresisSamples = 3;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 8.0F, 0.5F}, {2, 128, 0, 1, true, 12.0F, 0.8F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 8.0F, 2.0F, 8.0F, 0.5F},
+        {2, 1, 128, 0, 512, true, 12.0F, 2.5F, 12.0F, 0.8F},
+    };
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics highTpot;
+    highTpot.decodeBatchSize = 1;
+    highTpot.decodeContextTokens = 128;
+    highTpot.decodeQueueWaitUs = 35000.0;
+    highTpot.decodeGpuMs = 10.0F;
+    scheduler.observeMetrics(highTpot);
+    scheduler.observeMetrics(highTpot);
+    scheduler.observeMetrics(highTpot);
+    EXPECT_TRUE(scheduler.telemetry().latencySafeFallback);
+    EXPECT_NEAR(scheduler.telemetry().recentDecodeTpotPressure, 0.9F, 1.0e-6F);
+    EXPECT_EQ(scheduler.telemetry().tpotHysteresisTransitions, 1U);
+
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 1, 0, 128});
+    scheduler.enqueueDecode({3, 128, 2});
+    PhaseDispatchPlan const fallback = scheduler.next();
+    EXPECT_EQ(fallback.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(fallback.latencySafeFallback);
+    EXPECT_FALSE(fallback.overlapEvaluatedByCost);
+    ASSERT_EQ(fallback.decodeBatch.size(), 1U);
+    scheduler.completeDecode(fallback.decodeBatch.front(), 129, false);
+
+    PhaseDispatchMetrics recoveredTpot = highTpot;
+    recoveredTpot.decodeQueueWaitUs = 0.0;
+    recoveredTpot.decodeGpuMs = 10.0F;
+    scheduler.observeMetrics(recoveredTpot);
+    scheduler.observeMetrics(recoveredTpot);
+    scheduler.observeMetrics(recoveredTpot);
+    EXPECT_FALSE(scheduler.telemetry().latencySafeFallback);
+    EXPECT_NEAR(scheduler.telemetry().recentDecodeTpotPressure, 0.2F, 1.0e-6F);
+    EXPECT_EQ(scheduler.telemetry().tpotHysteresisTransitions, 2U);
+
+    PhaseDispatchPlan const restored = scheduler.next();
+    EXPECT_EQ(restored.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_TRUE(restored.overlapEvaluatedByCost);
+    EXPECT_FALSE(restored.latencySafeFallback);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesDirectCostForPlannedDecodeBatch)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 2;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.prefillBatchCosts = {{1, 128, 0, 2, true, 10.0F, 1.0F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 9.0F, 2.0F, 9.0F, 0.5F},
+        {1, 2, 128, 0, 512, true, 11.0F, 5.0F, 11.0F, 4.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 0, 0, 128});
+    scheduler.enqueueDecode({10, 128, 1});
+    scheduler.enqueueDecode({11, 128, 2});
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kOverlap);
+    EXPECT_EQ(plan.plannedDecodeBatchSize, 2);
+    EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 11.0F);
+    EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 4.0F);
+}
+
+TEST(PhaseQueueSchedulerTest, TpotHardGuardBoundsConsecutiveOverlapTurns)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 1;
+    config.maxPrefillChunkTokens = 128;
+    config.enableDynamicPrefillBatching = true;
+    config.enableTpotHardGuard = true;
+    config.requireDirectOverlapCost = true;
+    config.maxConsecutiveOverlapBatches = 1;
+    config.decodeQueueWaitTargetUs = 10000.0;
+    config.prefillBatchCosts = {{1, 128, 0, 1, true, 10.0F, 1.0F}, {1, 128, 128, 1, false, 12.0F, 1.0F}};
+    config.overlapBatchCosts = {
+        {1, 1, 128, 0, 512, true, 10.0F, 3.0F, 10.0F, 1.0F},
+        {1, 1, 128, 128, 512, false, 12.0F, 3.0F, 12.0F, 1.0F},
+    };
+    config.policy = [](PhaseQueueSnapshot const&) { return PhaseDispatchKind::kOverlap; };
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 256, 0, 0, 256});
+    scheduler.enqueueDecode({10, 128, 1});
+
+    PhaseDispatchPlan first = scheduler.next();
+    ASSERT_EQ(first.kind, PhaseDispatchKind::kOverlap);
+    scheduler.completePrefill(first.prefillBatch.front(), 128);
+    scheduler.completeDecode(first.decodeBatch.front(), 129, false);
+    PhaseDispatchPlan const second = scheduler.next();
+    EXPECT_EQ(second.kind, PhaseDispatchKind::kDecode);
+    EXPECT_TRUE(second.prefillBatch.empty());
+    EXPECT_TRUE(second.prefillDeferredForTpot);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, PreservesArrivalAndAppliesVisionTtftDefault)
+{
+    auto const arrival = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
+    PhaseSchedulingHints scheduling;
+    scheduling = phaseVisionSchedulingHints(scheduling, 2500000.0, arrival);
+    EXPECT_EQ(scheduling.submittedAt, arrival);
+    EXPECT_DOUBLE_EQ(scheduling.ttftTargetUs, 2500000.0);
+
+    auto const originalArrival = arrival - std::chrono::milliseconds(10);
+    scheduling.submittedAt = originalArrival;
+    scheduling.ttftTargetUs = 500000.0;
+    scheduling = phaseVisionSchedulingHints(scheduling, 2500000.0, arrival);
+    EXPECT_EQ(scheduling.submittedAt, originalArrival);
+    EXPECT_DOUBLE_EQ(scheduling.ttftTargetUs, 500000.0);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, GatesEncoderByCountAndEstimatedPayloadBytes)
+{
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 2, 0, 100, 0));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 2, 0, 100, 500));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(1, 2, 40, 100, 50));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(2, 2, 80, 100, 20));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(1, 2, 60, 100, 50));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(1, 2, 60, 0, 500));
+    EXPECT_TRUE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 100, 40, 2));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 30, 100, 40, 2));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(3, 4, 0, 0, 0, 2));
+    EXPECT_FALSE(phaseVisionEncoderCapacityAvailable(0, 4, 0, 0, 0, 0));
+}
+
+TEST(PhaseMemoryBrokerTest, PreservesCandidateBatchWhileDisabled)
+{
+    PhaseMemoryBroker broker;
+    PhaseMemoryBrokerDecision const decision = broker.planEncoder({0, 900, 500}, {100, 200, 300});
+    EXPECT_EQ(decision.encoderBatchSize, 3U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kDisabled);
+    EXPECT_STREQ(phaseMemoryBrokerReasonName(decision.reason), "disabled");
+    EXPECT_FALSE(decision.reclaimIdleVision);
+}
+
+TEST(PhaseMemoryBrokerTest, ContractsAndBlocksEncoderAtKVWatermarks)
+{
+    PhaseMemoryBrokerConfig config;
+    config.enabled = true;
+    config.kvReservePages = 8;
+    config.kvPressurePages = 24;
+    config.pressureMaxEncoderBatchSize = 1;
+    PhaseMemoryBroker broker(config);
+
+    PhaseMemoryBrokerDecision decision = broker.planEncoder({16, 0, 0}, {100, 100, 100, 100});
+    EXPECT_EQ(decision.encoderBatchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kKVPressure);
+    EXPECT_TRUE(decision.preferDecode);
+
+    decision = broker.planEncoder({8, 0, 0}, {100, 100});
+    EXPECT_EQ(decision.encoderBatchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kKVReserve);
+    EXPECT_TRUE(decision.preferDecode);
+}
+
+TEST(PhaseMemoryBrokerTest, ReclaimsIdleVisionBeforeApplyingByteBackpressure)
+{
+    PhaseMemoryBrokerConfig config;
+    config.enabled = true;
+    config.maxManagedBytes = 1000;
+    config.safetyReserveBytes = 100;
+    config.committedKVPages = 2;
+    config.bytesPerKVPage = 100;
+    PhaseMemoryBroker broker(config);
+
+    PhaseMemoryBrokerDecision const decision = broker.planEncoder({32, 300, 250}, {200, 200, 200});
+    EXPECT_EQ(decision.encoderBatchSize, 2U);
+    EXPECT_EQ(decision.predictedManagedBytes, 900U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kManagedByteLimit);
+    EXPECT_TRUE(decision.reclaimIdleVision);
+    EXPECT_TRUE(decision.preferPrefill);
+}
+
+TEST(PhaseMemoryBrokerTest, RetainsIdleVisionWhenReclaimIsDisabled)
+{
+    PhaseMemoryBrokerConfig config;
+    config.enabled = true;
+    config.maxManagedBytes = 1000;
+    config.safetyReserveBytes = 100;
+    config.committedKVPages = 2;
+    config.bytesPerKVPage = 100;
+    config.reclaimIdleVision = false;
+    PhaseMemoryBroker broker(config);
+
+    PhaseMemoryBrokerDecision const decision = broker.planEncoder({32, 300, 250}, {100, 100});
+    EXPECT_EQ(decision.encoderBatchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseMemoryBrokerReason::kManagedByteLimit);
+    EXPECT_FALSE(decision.reclaimIdleVision);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, BuildsBoundedRepresentativeEncoderCalibrationShapes)
+{
+    EXPECT_EQ(phaseEncoderCalibrationBatchSizes(8U), (std::vector<size_t>{1U, 2U, 4U, 8U}));
+    EXPECT_EQ(phaseEncoderCalibrationBatchSizes(6U), (std::vector<size_t>{1U, 2U, 4U, 6U}));
+    EXPECT_EQ(phaseEncoderCalibrationBatchSizes(8U, {8U, 2U, 2U}), (std::vector<size_t>{2U, 8U}));
+    EXPECT_THROW(phaseEncoderCalibrationBatchSizes(0U), std::runtime_error);
+    EXPECT_THROW(phaseEncoderCalibrationBatchSizes(8U, {9U}), std::runtime_error);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, BatchesEncoderByMediaAndRawInputBytes)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{{1, 64}, {2, 96}, {1, 32}, {1, 16}};
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 0), 4U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 2, 0, 0), 2U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 3, 0), 2U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 159), 1U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 4, 0, 160), 2U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 1024}, {1, 16}}, 4, 1, 128), 1U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize(inputs, 0, 0, 0), 0U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2049}}, 4, 0, 0, 4096), 1U);
+    EXPECT_EQ(phaseVisionEncoderBatchSize({{1, 64, 2048}, {1, 64, 2048}}, 4, 0, 0, 4096), 2U);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, SelectsMeasuredEncoderDrainInsteadOfLargestBatch)
+{
+    std::vector<PhaseVisionEncoderBatchCost> const costs{
+        {1, 2048, 23.25F}, {2, 4096, 45.75F}, {4, 8192, 90.65F}, {8, 16384, 203.25F}};
+    PhaseVisionEncoderBatchChoice const choice = phaseVisionSelectEncoderBatch(std::vector<size_t>(8, 2048U), costs);
+    EXPECT_EQ(choice.batchSize, 4U);
+    EXPECT_NEAR(choice.predictedDrainGpuMs, 181.3F, 1.0e-3F);
+    EXPECT_EQ(choice.predictedDrainTurns, 2U);
+    EXPECT_FALSE(choice.coverageMiss);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, EncoderDrainSelectionUsesVisualTokenCoverage)
+{
+    std::vector<PhaseVisionEncoderBatchCost> const costs{
+        {1, 2048, 25.0F}, {1, 4096, 50.0F}, {2, 4096, 48.0F}, {4, 8192, 94.0F}};
+    PhaseVisionEncoderBatchChoice const covered = phaseVisionSelectEncoderBatch({2048, 2048}, costs);
+    EXPECT_EQ(covered.batchSize, 2U);
+    EXPECT_FLOAT_EQ(covered.predictedDrainGpuMs, 48.0F);
+
+    PhaseVisionEncoderBatchChoice const uncovered = phaseVisionSelectEncoderBatch({9000}, costs);
+    EXPECT_EQ(uncovered.batchSize, 1U);
+    EXPECT_TRUE(uncovered.coverageMiss);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, AccumulatesEncoderCreditsWithinBound)
+{
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 0.0, 0.0));
+    EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 999.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 4, 4, 1000.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(4, 4, 4, 0.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(2, 4, 2, 0.0, 1000.0));
+    EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 2, 4, 0.0, 1000.0));
+    EXPECT_TRUE(phaseVisionShouldAccumulateEncoderCredits(1, 1, 4, 0.0, 1000.0));
+    EXPECT_FALSE(phaseVisionShouldAccumulateEncoderCredits(1, 1, 0, 0.0, 1000.0));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, GlobalEncoderArrivalWaitRequiresGainAndFirstTokenSlack)
+{
+    EXPECT_TRUE(phaseVisionShouldWaitForGlobalEncoderArrival(100.0, 10000.0, 3000.0, 5000.0, 3100.0));
+    EXPECT_FALSE(phaseVisionShouldWaitForGlobalEncoderArrival(100.0, 2500.0, 3000.0, 5000.0, 3100.0));
+    EXPECT_FALSE(phaseVisionShouldWaitForGlobalEncoderArrival(100.0, 10000.0, 3000.0, 3000.0, 3100.0));
+    EXPECT_FALSE(phaseVisionShouldWaitForGlobalEncoderArrival(0.0, 10000.0, 3000.0, 5000.0, 3000.0));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadForHomogeneousEncoderGeometry)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 64, 1024, {1, 480, 640, 3}},
+    };
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 0, true), (std::vector<size_t>{0, 2, 3}));
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 2048, true), (std::vector<size_t>{0, 2}));
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 0, false), (std::vector<size_t>{0, 1, 2}));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, SelectsOneQueuedEncoderCohortAfterCurrentLookaheadBatch)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+        {1, 64, 1024, {1, 480, 640, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+        {1, 32, 512, {1, 512, 512, 3}},
+    };
+    EXPECT_EQ(phaseVisionNextQueuedEncoderBatchIndices(inputs, {0, 2}, 2, 0, 0, 0, true), (std::vector<size_t>{1, 3}));
+    EXPECT_EQ(phaseVisionNextQueuedEncoderBatchIndices(inputs, {0, 2}, 2, 0, 0, 768, true), (std::vector<size_t>{1}));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, LooksAheadPastNonFittingEncoderRequests)
+{
+    std::vector<PhaseVisionEncoderInput> const inputs{
+        {1, 64, 2048},
+        {1, 64, 2500},
+        {1, 64, 1024},
+        {1, 64, 1024},
+    };
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 4096), (std::vector<size_t>{0}));
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 4096, false, true), (std::vector<size_t>{0, 2, 3}));
+    EXPECT_EQ(phaseVisionEncoderBatchIndices(inputs, 3, 0, 0, 4096, false, true, 3), (std::vector<size_t>{0, 2}));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, ReleasesReadyPrefillByCountTokenBudgetOrAge)
+{
+    std::vector<int32_t> const promptTokens{128, 256, 512, 64};
+    std::vector<int32_t> const partialPromptTokens{128, 256, 512};
+
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(partialPromptTokens, 4, 0, 50.0, 100.0), 0U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(partialPromptTokens, 4, 0, 100.0, 100.0), 3U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 4, 0, 0.0, 100.0), 4U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 2, 0, 0.0, 100.0), 2U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 4, 400, 0.0, 100.0), 2U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 4, 64, 0.0, 100.0), 1U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize({}, 4, 0, 100.0, 100.0), 0U);
+    EXPECT_EQ(phaseVisionReadyPrefillBatchSize(promptTokens, 0, 0, 100.0, 100.0), 0U);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, AdaptsReadyPrefillToLoadCapacityAndDecodePressure)
+{
+    std::vector<int32_t> const one{128};
+    std::vector<int32_t> const two{128, 256};
+    std::vector<int32_t> const four{128, 256, 512, 64};
+
+    auto decision = phaseVisionAdaptiveReadyPrefillDecision(
+        one, 4, 4096, 0.0, 50000.0, true, 2, 0, 8, 256, 0.2F, 0.8F, 100, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kLowLoad);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        two, 4, 4096, 0.0, 50000.0, true, 2, 2, 8, 256, 0.2F, 0.8F, 200, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 2U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kBacklog);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 1, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kCapacity);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 4, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 4U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kBacklog);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 2, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 2U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kCapacity);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 0.0, 50000.0, true, 2, 4, 8, 256, 0.8F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeProtection);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 200000.0, 50000.0, false, 2, 4, 8, 256, 0.8F, 0.8F, 400, 1000, 0.8, true, 250000.0);
+    EXPECT_EQ(decision.batchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeDeferral);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 250000.0, 50000.0, true, 2, 4, 8, 256, 0.8F, 0.8F, 400, 1000, 0.8, true, 250000.0);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kDecodeProtection);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        one, 4, 4096, 50000.0, 50000.0, true, 2, 1, 8, 256, 0.2F, 0.8F, 100, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kAge);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        one, 4, 4096, 0.0, 50000.0, true, 2, 1, 8, 256, 0.2F, 0.8F, 800, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 1U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kBytePressure);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 100000.0, 50000.0, true, 2, 4, 0, 256, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kNone);
+
+    decision = phaseVisionAdaptiveReadyPrefillDecision(
+        four, 4, 4096, 100000.0, 50000.0, true, 2, 4, 8, 0, 0.2F, 0.8F, 400, 1000, 0.8);
+    EXPECT_EQ(decision.batchSize, 0U);
+    EXPECT_EQ(decision.reason, PhaseVisionPrefillAdmissionReason::kNone);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, EscalatesVisionLookaheadBehindDecodeTpotGuard)
+{
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, false, 900000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, false, 1000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 4);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, true, 0.0, 2500000.0, 0.4, 0.2F, 0.8F), 4);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 4, true, 2000000.0, 2500000.0, 0.4, 0.8F, 0.8F), 2);
+    EXPECT_EQ(phaseVisionEffectiveEncodedCapacity(2, 0, true, 2000000.0, 2500000.0, 0.4, 0.2F, 0.8F), 2);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, HoldsEncodedCapacityBetweenDecodePressureThresholds)
+{
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(8, 8, 16, true, 0.0, 2500000.0, 0.4, 0.7F, 1.0F, 0.6F), 8);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(8, 8, 16, true, 0.0, 2500000.0, 0.4, 0.6F, 1.0F, 0.6F), 16);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(16, 8, 16, true, 0.0, 2500000.0, 0.4, 0.9F, 1.0F, 0.6F), 16);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(16, 8, 16, true, 0.0, 2500000.0, 0.4, 1.0F, 1.0F, 0.6F), 8);
+    EXPECT_EQ(phaseVisionNextEncodedCapacity(16, 8, 16, false, 0.0, 2500000.0, 0.4, 0.2F, 1.0F, 0.6F), 8);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, NormalizesDecodePressureOnlyWithAnExplicitTarget)
+{
+    EXPECT_FLOAT_EQ(phaseVisionDecodeTpotPressure(40000.0, 50000.0), 0.8F);
+    EXPECT_FLOAT_EQ(phaseVisionDecodeTpotPressure(40000.0, 0.0), 0.0F);
+    EXPECT_FLOAT_EQ(phaseVisionDecodeTpotPressure(0.0, 50000.0), 0.0F);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, SerializesEncoderWhenPredictedCompletionCrossesVisionDeadline)
+{
+    EXPECT_FALSE(phaseVisionEncoderSerializationDue(100000.0, 500000.0, 1.0, 50000.0));
+    EXPECT_TRUE(phaseVisionEncoderSerializationDue(450000.0, 500000.0, 1.0, 50000.0));
+    EXPECT_TRUE(phaseVisionEncoderSerializationDue(350000.0, 500000.0, 0.8, 50000.0));
+    EXPECT_FALSE(phaseVisionEncoderSerializationDue(500000.0, 0.0, 1.0, 50000.0));
+    EXPECT_FALSE(phaseVisionEncoderSerializationDue(500000.0, 500000.0, 0.0, 50000.0));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, ArbitratesEncoderByTextDecodeDebtAndBoundedStarvation)
+{
+    auto decision = phaseVisionEncoderDispatchDecision(
+        false, 0.0, 0.0, 500000.0, 100000.0, 1000000.0, 50000.0, 250000.0, 2.0F, 0.9F, true, true);
+    EXPECT_TRUE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kLegacy);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 100000.0, 1000000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 0.2F, 0.9F, false, false);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kTextGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0, 1.0F, 0.9F, false, false);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kDecodeGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0, 0.0F, 0.9F, false, true);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kDecodeGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 600000.0, 50000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 1.0F, 0.9F, true, true);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kTextGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(
+        true, 600000.0, 100000.0, 500000.0, 100000.0, 210000.0, 55000.0, 250000.0, 1.0F, 0.9F, true, true);
+    EXPECT_TRUE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kAgeForced);
+
+    decision = phaseVisionEncoderDispatchDecision(true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0,
+        0.2F, 0.9F, false, false, 50000.0, false);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kPrefillGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0,
+        0.2F, 0.9F, false, false, 100000.0, true);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kPrefillGuard);
+
+    decision = phaseVisionEncoderDispatchDecision(true, 100000.0, 1000000.0, 500000.0, 100000.0, 0.0, 55000.0, 250000.0,
+        0.2F, 0.9F, false, false, 100000.0, false);
+    EXPECT_TRUE(decision.allowed);
+    EXPECT_EQ(decision.reason, PhaseVisionEncoderDispatchReason::kAllowed);
+}
+
+TEST(PhaseQueueSchedulerTest, CollectsDecodeTpotForExternalPolicyWithoutHysteresis)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableDecodeTpotTelemetry = true;
+    config.tpotHysteresisWindow = 2;
+    config.minTpotHysteresisSamples = 2;
+    config.decodeQueueWaitTargetUs = 2000.0;
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kDecode;
+    metrics.decodeBatchSize = 4;
+    metrics.decodeGpuMs = 4.0F;
+    scheduler.observeMetrics(metrics);
+    scheduler.observeMetrics(metrics);
+
+    EXPECT_EQ(scheduler.telemetry().decodeTpotSampleCount, 2);
+    EXPECT_FLOAT_EQ(scheduler.telemetry().recentDecodeTpotPressure, 2.0F);
+    EXPECT_FALSE(scheduler.telemetry().latencySafeFallback);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, CountsPerRequestVisionEmbeddingRows)
+{
+    std::vector<std::vector<int32_t>> const tokenIds{{1, 7, 7, 2}, {7, 3}, {4, 5}};
+    EXPECT_EQ(phaseVisionEmbeddingRows(tokenIds, 7), (std::vector<int64_t>{2, 1, 0}));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, StagesOnlyNewMropePrefix)
+{
+    PhaseMropeStagingRange range = phaseMropeStagingRange(true, 2048, 257, 2048, 128);
+    EXPECT_EQ(range.offsetPositions, 0);
+    EXPECT_EQ(range.countPositions, 384);
+    EXPECT_EQ(range.validPositions, 384);
+
+    range = phaseMropeStagingRange(false, range.validPositions, 385, 2048, 128);
+    EXPECT_EQ(range.offsetPositions, 384);
+    EXPECT_EQ(range.countPositions, 128);
+    EXPECT_EQ(range.validPositions, 512);
+
+    range = phaseMropeStagingRange(false, range.validPositions, 500, 2048, 128);
+    EXPECT_EQ(range.countPositions, 0);
+    EXPECT_EQ(range.validPositions, 512);
+
+    range = phaseMropeStagingRange(true, range.validPositions, 2048, 2048, 128);
+    EXPECT_EQ(range.offsetPositions, 0);
+    EXPECT_EQ(range.countPositions, 2048);
+    EXPECT_EQ(range.validPositions, 2048);
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, RejectsPrefixBeforeVisionForMrope)
+{
+    EXPECT_TRUE(phaseVisionSupportsPrefixBeforeVision(RopeType::kDefault));
+    EXPECT_FALSE(phaseVisionSupportsPrefixBeforeVision(RopeType::kMRope));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, RetainsLegacyVisionSlabForMrope)
+{
+    std::byte storage{};
+    PhaseVisionPayload payload;
+    payload.outputEmbedding = Tensor(&storage, {2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    payload.deepstackFeatures.emplace_back(&storage, Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    payload.mropeCosSin = Tensor(&storage, {1, 4, 2}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+
+    EXPECT_EQ(payload.prefillByteSize(), 64U);
+    EXPECT_EQ(payload.byteSize(), 96U);
+    EXPECT_EQ(payload.releasePrefillStorage(), 0U);
+    EXPECT_FALSE(payload.outputEmbedding.isEmpty());
+    EXPECT_FALSE(payload.deepstackFeatures.empty());
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, ReleasesNonMropePrefillVisionStorage)
+{
+    std::byte storage{};
+    PhaseVisionPayload payload;
+    payload.outputEmbedding = Tensor(&storage, {2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    payload.deepstackFeatures.emplace_back(&storage, Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+
+    EXPECT_EQ(payload.prefillByteSize(), 64U);
+    EXPECT_EQ(payload.byteSize(), 64U);
+    EXPECT_EQ(payload.releasePrefillStorage(), 64U);
+    EXPECT_TRUE(payload.outputEmbedding.isEmpty());
+    EXPECT_TRUE(payload.deepstackFeatures.empty());
+    EXPECT_EQ(payload.byteSize(), 0U);
+    EXPECT_EQ(payload.releasePrefillStorage(), 0U);
+}
+
+} // namespace
+} // namespace rt
+} // namespace trt_edgellm
