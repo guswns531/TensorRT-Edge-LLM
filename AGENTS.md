@@ -18,6 +18,18 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 - Git submodules must be initialized: `git submodule update --init` (googletest, nlohmann/json, NVTX)
 - Model validation must exercise `export -> build -> inference` in that order. Export-only checks are useful smoke
   tests, but they are not sufficient evidence that a model works.
+
+## Local Research Workflow
+
+- Work from the repository root on `codex/v010-phase-forward-port`; do not create a nested source worktree under `.local/`.
+- Put reproducible scripts in `benchmarks/` or `scripts/`, and numbered conclusions in `notes/NNN-topic-YYYYMMDD.md`.
+- Keep ignored runtime artifacts under `.local/`. Use `.local/results/` as the index of retained experiments and
+  `.local/scratch/` for disposable runs.
+- A retained experiment needs its command/config, commit and engine identity, workload, repeat count, and summary
+  metrics. Keep raw traces only when a documented result depends on them.
+- Compare V0/V1/V2 with the same binary, engine, requests, calibration, and memory limits. Reuse a frozen vLLM result
+  when that contract is unchanged; rerun vLLM when it changes.
+- Before deleting an artifact, check references from `notes/`. Never commit models, engines, tokens, or `.local/` data.
 - Source comments must be precise and sparse. Add comments only for non-obvious invariants, ownership/lifetime
   constraints, math/precision assumptions, platform constraints, or surprising control flow. Do not add AI-style
   narration that restates the code, long block comments that do not change maintainability, or repeated comments
