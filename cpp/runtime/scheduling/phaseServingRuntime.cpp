@@ -1,0 +1,482 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "runtime/scheduling/phaseServingRuntime.h"
+
+#include "common/bindingNames.h"
+#include "common/checkMacros.h"
+#include "runtime/config/llmEngineConfig.h"
+#include "runtime/exec/engineExecutor.h"
+#include "runtime/phase/cost/phaseRuntimeCostTracker.h"
+#include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/scheduling/independentEngineExecutorPair.h"
+#include "runtime/scheduling/independentPhaseCoordinator.h"
+#include "runtime/state/pipelineIO.h"
+#include "runtime/state/sharedResources.h"
+#include "runtime/state/stableKVPageManager.h"
+#include "sampler/sampling.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <memory>
+#include <utility>
+
+namespace trt_edgellm::rt
+{
+namespace
+{
+
+class PhaseSamplingSlotPool
+{
+public:
+    struct Slot
+    {
+        explicit Slot(int32_t maxRows)
+            : hostIds({maxRows}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_serving_host_sample_ids")
+        {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        }
+
+        ~Slot() noexcept
+        {
+            if (ready != nullptr)
+            {
+                static_cast<void>(cudaEventDestroy(ready));
+            }
+        }
+
+        Tensor hostIds;
+        cudaEvent_t ready{};
+        bool busy{};
+    };
+
+    explicit PhaseSamplingSlotPool(int32_t maxRows)
+        : mMaxRows(maxRows)
+    {
+    }
+
+    Slot& acquire()
+    {
+        for (auto& slot : mSlots)
+        {
+            if (!slot->busy)
+            {
+                slot->busy = true;
+                return *slot;
+            }
+        }
+        mSlots.push_back(std::make_unique<Slot>(mMaxRows));
+        mSlots.back()->busy = true;
+        return *mSlots.back();
+    }
+
+    void release(Slot& slot) noexcept
+    {
+        slot.busy = false;
+    }
+
+private:
+    int32_t mMaxRows{};
+    std::vector<std::unique_ptr<Slot>> mSlots;
+};
+
+PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& serving, LLMEngineConfig const& engine)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxPrefillBatchSize = engine.maxSupportedPrefillBatchSize;
+    config.maxExternalPrefillBatchSize = engine.maxSupportedVisionPrefillBatchSize;
+    config.maxDecodeBatchSize = engine.maxSupportedDecodeBatchSize;
+    int32_t const engineChunkLimit
+        = engine.packedPrefill ? engine.maxPackedPrefillChunkTokens : engine.maxSupportedInputLength;
+    config.maxPrefillChunkTokens = std::min(serving.maxPrefillChunkTokens, engineChunkLimit);
+    config.maxOverlapPrefillTokens = config.maxPrefillChunkTokens;
+    config.maxPrefillBatchTokens = serving.maxPrefillBatchTokens > 0
+        ? serving.maxPrefillBatchTokens
+        : config.maxPrefillBatchSize * config.maxPrefillChunkTokens;
+    config.enableRaggedPrefillBatching = engine.packedPrefill;
+    config.enablePackedPrefillTokenLayout = engine.packedPrefill;
+    config.prefillCompletionBonusTokens = config.maxPrefillChunkTokens;
+    config.enableWavefrontPrefillBatching = true;
+    config.maxPrefillCohortSize = config.maxPrefillBatchSize;
+    config.enableMetricsPolicy = true;
+    config.elideVacuousGlobalDecisions = true;
+    config.enableDecodeFormationHorizon = true;
+    config.supportsChunkedPrefill = engine.packedPrefill;
+    config.globalDispatchUsesPreReservedMemory = true;
+
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.policyMode = serving.policyMode;
+    trackerConfig.action = config.globalCostModelConfig;
+    trackerConfig.decodeMinimumSamples = config.decodeComponentMinSamples;
+    trackerConfig.decodeWindowSize = config.decodeComponentWindow;
+    trackerConfig.decodeContextBucketTokens = config.runtimeDecodeContextBucketTokens;
+    if (phasePolicyUsesContextualScalar(serving.policyMode))
+    {
+        trackerConfig.contextualPd.mode = PhaseContextualPdMode::kActive;
+        trackerConfig.contextualEp.mode = PhaseContextualPdMode::kActive;
+        trackerConfig.contextualEd.mode = PhaseContextualPdMode::kActive;
+    }
+    config.runtimeCostTracker = std::make_shared<PhaseRuntimeCostTracker>(std::move(trackerConfig));
+    return config;
+}
+
+IndependentPhaseServerConfig makeServerConfig(
+    PhaseServingRuntimeConfig const& serving, LLMEngineConfig const& engine, int32_t maxStableSlots)
+{
+    IndependentPhaseServerConfig config;
+    config.maxInFlightRequests
+        = serving.maxInFlightRequests > 0 ? serving.maxInFlightRequests : static_cast<size_t>(maxStableSlots);
+    config.maxPendingRequests
+        = serving.maxPendingRequests > 0 ? serving.maxPendingRequests : static_cast<size_t>(maxStableSlots);
+    config.defaultMaxOutputTokens = 128;
+    config.eosTokenIds = engine.eosTokenIds;
+    config.enableCudaGraphs = serving.enableCudaGraphs;
+    config.pageReservationMode = IndependentPhasePageReservationMode::kHeadroom;
+    config.outputHeadroomTokens = 128;
+    config.maxConcurrentPageGrowthRequests = std::max(1, engine.maxSupportedDecodeBatchSize);
+    config.enableGlobalWaitActions = true;
+    config.enableGlobalWaitAuthority = true;
+    config.enableCompletionAwareAdmissionProjection = phasePolicyUsesTransition(serving.policyMode);
+    return config;
+}
+
+} // namespace
+
+class PhaseServingRuntime::Impl
+{
+public:
+    Impl(PhaseServingRuntimeConfig servingConfig, LLMEngineConfig const& engineConfig,
+        std::unique_ptr<EngineExecutor> executor, SharedResources& resources, EmbeddingData const& embedding,
+        cudaStream_t setupStream)
+        : mServingConfig(std::move(servingConfig))
+        , mEngineConfig(engineConfig)
+        , mResources(resources)
+        , mEmbeddingPreprocessor(embedding, engineConfig)
+        , mSamplingSlots(std::max(engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedDecodeBatchSize))
+    {
+        ELLM_CHECK(executor != nullptr, "Phase serving requires a base executor");
+        ELLM_CHECK(setupStream != nullptr, "Phase serving requires an explicit setup stream");
+        ELLM_CHECK(engineConfig.kvPoolPages > 0, "Phase serving requires a paged-KV engine");
+        ELLM_CHECK(!engineConfig.isSpecDecodeBase && !engineConfig.isDiffusionBackbone,
+            "Phase serving supports vanilla autoregressive engines only");
+        ELLM_CHECK(engineConfig.numLinearAttnLayers == 0, "Phase serving does not yet support recurrent layers");
+        ELLM_CHECK(!engineConfig.pleEnabled, "Phase serving does not yet support PLE inputs");
+        ELLM_CHECK(engineConfig.maxSupportedLoraRank == 0, "Phase serving does not yet support LoRA switching");
+        ELLM_CHECK(mServingConfig.maxPrefillChunkTokens > 0, "Phase serving prefill chunk must be positive");
+
+        CUDA_CHECK(cudaStreamCreateWithFlags(&mPrefillStream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&mDecodeStream, cudaStreamNonBlocking));
+
+        IndependentEngineExecutorPairConfig pairConfig;
+        pairConfig.setupStream = setupStream;
+        pairConfig.prefillStream = mPrefillStream;
+        pairConfig.decodeStream = mDecodeStream;
+        pairConfig.visionPrefillProfile = engineConfig.visionPrefillProfile;
+        pairConfig.sharedExecutionContext = mServingConfig.sharedExecutionContext;
+        mExecutors = IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
+
+        mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(engineConfig,
+            engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedInputLength, setupStream));
+        mDecodeIO = std::make_unique<PipelineIO>(
+            PipelineIO::createForLLMPhase(engineConfig, engineConfig.maxSupportedDecodeBatchSize, 1, setupStream));
+        buildTensorMap(mPrefillMap, *mPrefillIO, resources, engineConfig, 0);
+        buildTensorMap(mDecodeMap, *mDecodeIO, resources, engineConfig, 0);
+        resources.externalWeightManager->validateAgainstEngine(mExecutors->prefillExecutor(), "phase-base");
+        resources.externalWeightManager->registerTensorMapEntries(mPrefillMap);
+        resources.externalWeightManager->registerTensorMapEntries(mDecodeMap);
+
+        int32_t const maxPhaseBatch
+            = std::max(engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedDecodeBatchSize);
+        int32_t const maxStableSlots
+            = mServingConfig.maxStableSlots > 0 ? mServingConfig.maxStableSlots : engineConfig.maxSupportedBatchSize;
+        ELLM_CHECK(maxStableSlots >= maxPhaseBatch, "Phase stable-slot capacity must cover the largest phase batch");
+        mOwnership = std::make_unique<StableKVPageManager>(StableKVPageManager::Config{
+            maxStableSlots, maxPhaseBatch, engineConfig.kvPoolPages, engineConfig.maxKVCacheCapacity, 128});
+
+        int32_t const prefillTokenCapacity = engineConfig.packedPrefill ? engineConfig.maxPackedPrefillChunkTokens
+                                                                        : engineConfig.maxSupportedInputLength;
+        mHostPrefillIds = Tensor({engineConfig.maxSupportedPrefillBatchSize, prefillTokenCapacity}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "phase_serving_host_prefill_ids");
+        mDevicePrefillIds = Tensor({engineConfig.maxSupportedPrefillBatchSize, prefillTokenCapacity}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "phase_serving_prefill_ids");
+        mHostDecodeIds = Tensor({engineConfig.maxSupportedDecodeBatchSize, 1}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "phase_serving_host_decode_ids");
+        mDeviceDecodeIds = Tensor({engineConfig.maxSupportedDecodeBatchSize, 1}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "phase_serving_decode_ids");
+        mPrefillSelectedIds = Tensor({engineConfig.maxSupportedPrefillBatchSize, 1}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "phase_serving_prefill_selected_ids");
+        mDecodeSelectedIds = Tensor({engineConfig.maxSupportedDecodeBatchSize, 1}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "phase_serving_decode_selected_ids");
+        mPrefillCompactedLogits = Tensor({engineConfig.maxSupportedPrefillBatchSize, engineConfig.outputVocabSize},
+            DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_serving_prefill_compacted_logits");
+
+        PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, engineConfig);
+        schedulerConfig.globalMemoryHorizonSupplier = [this](
+                                                          PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+            PhaseActionMemoryHorizon horizon;
+            horizon.managedBytes = static_cast<size_t>(mOwnership->config().numPages - mOwnership->availablePages());
+            horizon.budgetBytes = static_cast<size_t>(mOwnership->config().numPages);
+            return horizon;
+        };
+        IndependentPhaseCoordinatorCallbacks seedCallbacks;
+        seedCallbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
+        mCoordinator = std::make_unique<IndependentPhaseCoordinator>(engineConfig, std::move(schedulerConfig),
+            *mExecutors, *mOwnership, *mPrefillIO, *mDecodeIO, mPrefillMap, mDecodeMap, mPrefillStream, mDecodeStream,
+            std::move(seedCallbacks));
+        mCoordinator->setGraphCaptureEnabled(mServingConfig.enableCudaGraphs);
+        mCoordinator->setPersistentDecodeSelectEnabled(mServingConfig.enablePersistentDecodeSelect);
+        mCoordinator->setPersistentPageBindingsEnabled(mServingConfig.enablePersistentPageBindings);
+
+        IndependentPhaseRequestAdapter adapter;
+        adapter.stagePrefill = [this](std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io,
+                                   TensorMap& map, cudaStream_t stream) { stageTokens(views, io, map, stream, true); };
+        adapter.stageDecode = [this](std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io,
+                                  TensorMap& map, cudaStream_t stream) { stageTokens(views, io, map, stream, false); };
+        adapter.submitSampling
+            = [this](std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream,
+                  bool fromPrefill) { return submitSampling(views, io, stream, fromPrefill); };
+        IndependentPhaseServerConfig serverConfig = makeServerConfig(mServingConfig, engineConfig, maxStableSlots);
+        mServer = std::make_unique<IndependentPhaseAsyncServer>(
+            std::move(serverConfig), *mCoordinator, *mOwnership, std::move(adapter));
+        CUDA_CHECK(cudaStreamSynchronize(setupStream));
+    }
+
+    ~Impl() noexcept
+    {
+        if (mPrefillStream != nullptr)
+        {
+            static_cast<void>(cudaStreamSynchronize(mPrefillStream));
+        }
+        if (mDecodeStream != nullptr)
+        {
+            static_cast<void>(cudaStreamSynchronize(mDecodeStream));
+        }
+        mServer.reset();
+        mCoordinator.reset();
+        mOwnership.reset();
+        mExecutors.reset();
+        mPrefillIO.reset();
+        mDecodeIO.reset();
+        if (mPrefillStream != nullptr)
+        {
+            static_cast<void>(cudaStreamDestroy(mPrefillStream));
+        }
+        if (mDecodeStream != nullptr)
+        {
+            static_cast<void>(cudaStreamDestroy(mDecodeStream));
+        }
+    }
+
+    void stageTokens(std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, TensorMap& map,
+        cudaStream_t stream, bool prefill)
+    {
+        ELLM_CHECK(!views.empty(), "Phase token staging requires a non-empty batch");
+        int32_t totalTokens{};
+        for (IndependentPhaseRequestView const& view : views)
+        {
+            totalTokens += prefill ? view.work.tokenCount : 1;
+        }
+        Coords const tokenShape = prefill
+            ? (mEngineConfig.packedPrefill ? Coords{1, totalTokens}
+                                           : Coords{static_cast<int64_t>(views.size()), views.front().work.tokenCount})
+            : Coords{static_cast<int64_t>(views.size()), 1};
+        Tensor& hostIds = prefill ? mHostPrefillIds : mHostDecodeIds;
+        Tensor& deviceIds = prefill ? mDevicePrefillIds : mDeviceDecodeIds;
+        ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape), "Phase token staging reshape failed");
+
+        int32_t* destination = hostIds.dataPointer<int32_t>();
+        int32_t destinationOffset{};
+        for (IndependentPhaseRequestView const& view : views)
+        {
+            if (prefill)
+            {
+                ELLM_CHECK(view.promptTokens != nullptr, "Phase prefill request has no prompt tokens");
+                std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
+                    destination + destinationOffset);
+                destinationOffset += view.work.tokenCount;
+            }
+            else
+            {
+                ELLM_CHECK(view.generatedTokens != nullptr && !view.generatedTokens->empty(),
+                    "Phase decode request has no sampled input token");
+                destination[destinationOffset++] = view.generatedTokens->back();
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
+            static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        mEmbeddingPreprocessor.embed(deviceIds, std::nullopt, std::nullopt, io, stream);
+        mEmbeddingPreprocessor.prepareDeepstack(deviceIds, {}, io, stream);
+        if (prefill)
+        {
+            for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
+            {
+                map.set(binding_names::formatDeepstackEmbedsName(index), io.deepstackEmbeds[index]);
+            }
+        }
+    }
+
+    std::unique_ptr<IndependentPhaseSampleTicket> submitSampling(
+        std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream, bool fromPrefill)
+    {
+        int32_t const batchSize = static_cast<int32_t>(views.size());
+        Tensor& selectedIds = fromPrefill ? mPrefillSelectedIds : mDecodeSelectedIds;
+        PhaseSamplingSlotPool::Slot& slot = mSamplingSlots.acquire();
+        ELLM_CHECK(io.outputLogits.reshape({batchSize, mEngineConfig.outputVocabSize})
+                && selectedIds.reshape({batchSize, 1}) && slot.hostIds.reshape({batchSize}),
+            "Phase sampling reshape failed");
+        Tensor* logits = &io.outputLogits;
+        bool const denseRows = std::all_of(views.begin(), views.end(),
+            [row = size_t{}](auto const& view) mutable { return view.phaseBatchRow == row++; });
+        if (fromPrefill && !denseRows)
+        {
+            ELLM_CHECK(mPrefillCompactedLogits.reshape({batchSize, mEngineConfig.outputVocabSize}),
+                "Phase compacted-logits reshape failed");
+            size_t const rowBytes = static_cast<size_t>(mEngineConfig.outputVocabSize) * sizeof(float);
+            auto const* source = static_cast<std::byte const*>(io.outputLogits.rawPointer());
+            auto* destination = static_cast<std::byte*>(mPrefillCompactedLogits.rawPointer());
+            for (size_t row{}; row < views.size(); ++row)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(destination + row * rowBytes, source + views[row].phaseBatchRow * rowBytes,
+                    rowBytes, cudaMemcpyDeviceToDevice, stream));
+            }
+            logits = &mPrefillCompactedLogits;
+        }
+        selectArgmax(*logits, selectedIds, stream);
+        CUDA_CHECK(cudaMemcpyAsync(slot.hostIds.rawPointer(), selectedIds.rawPointer(),
+            static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaEventRecord(slot.ready, stream));
+
+        auto ticket = std::make_unique<IndependentPhaseSampleTicket>();
+        ticket->ready = slot.ready;
+        ticket->fromPrefill = fromPrefill;
+        ticket->requestIds.reserve(views.size());
+        for (IndependentPhaseRequestView const& view : views)
+        {
+            ticket->requestIds.push_back(view.requestId);
+        }
+        ticket->collect = [&slot, batchSize]() {
+            int32_t const* selected = slot.hostIds.dataPointer<int32_t>();
+            return std::vector<int32_t>(selected, selected + batchSize);
+        };
+        ticket->release = [this, &slot]() { mSamplingSlots.release(slot); };
+        return ticket;
+    }
+
+    PhaseServingRuntimeConfig mServingConfig;
+    LLMEngineConfig mEngineConfig;
+    SharedResources& mResources;
+    cudaStream_t mPrefillStream{};
+    cudaStream_t mDecodeStream{};
+    std::unique_ptr<IndependentEngineExecutorPair> mExecutors;
+    std::unique_ptr<PipelineIO> mPrefillIO;
+    std::unique_ptr<PipelineIO> mDecodeIO;
+    TensorMap mPrefillMap;
+    TensorMap mDecodeMap;
+    std::unique_ptr<StableKVPageManager> mOwnership;
+    EmbeddingPreprocessor mEmbeddingPreprocessor;
+    Tensor mHostPrefillIds;
+    Tensor mDevicePrefillIds;
+    Tensor mHostDecodeIds;
+    Tensor mDeviceDecodeIds;
+    Tensor mPrefillSelectedIds;
+    Tensor mDecodeSelectedIds;
+    Tensor mPrefillCompactedLogits;
+    PhaseSamplingSlotPool mSamplingSlots;
+    std::unique_ptr<IndependentPhaseCoordinator> mCoordinator;
+    std::unique_ptr<IndependentPhaseAsyncServer> mServer;
+};
+
+std::unique_ptr<PhaseServingRuntime> PhaseServingRuntime::create(PhaseServingRuntimeConfig config,
+    LLMEngineConfig const& engineConfig, std::unique_ptr<EngineExecutor> executor, SharedResources& resources,
+    EmbeddingData const& embedding, cudaStream_t setupStream)
+{
+    return std::unique_ptr<PhaseServingRuntime>(new PhaseServingRuntime(std::make_unique<Impl>(
+        std::move(config), engineConfig, std::move(executor), resources, embedding, setupStream)));
+}
+
+PhaseServingRuntime::PhaseServingRuntime(std::unique_ptr<Impl> impl)
+    : mImpl(std::move(impl))
+{
+}
+
+PhaseServingRuntime::~PhaseServingRuntime() noexcept = default;
+
+IndependentPhaseServerSubmission PhaseServingRuntime::submit(
+    uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    return mImpl->mServer->submit(requestId, std::move(promptTokens), maxOutputTokens, scheduling);
+}
+
+IndependentPhaseServerSubmission PhaseServingRuntime::submitOrQueue(
+    uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    return mImpl->mServer->submitOrQueue(requestId, std::move(promptTokens), maxOutputTokens, scheduling);
+}
+
+bool PhaseServingRuntime::cancel(uint64_t requestId)
+{
+    return mImpl->mServer->cancel(requestId);
+}
+
+bool PhaseServingRuntime::poll()
+{
+    return mImpl->mServer->poll();
+}
+
+void PhaseServingRuntime::runUntilIdle(size_t maxPolls)
+{
+    mImpl->mServer->runUntilIdle(maxPolls);
+}
+
+std::optional<IndependentPhaseServerToken> PhaseServingRuntime::tryPopToken()
+{
+    return mImpl->mServer->tryPopToken();
+}
+
+std::optional<IndependentPhaseServerCompletion> PhaseServingRuntime::tryPopCompletion()
+{
+    return mImpl->mServer->tryPopCompletion();
+}
+
+bool PhaseServingRuntime::empty() const noexcept
+{
+    return mImpl->mServer->empty();
+}
+
+size_t PhaseServingRuntime::inFlightCount() const noexcept
+{
+    return mImpl->mServer->inFlightCount();
+}
+
+size_t PhaseServingRuntime::pendingCount() const noexcept
+{
+    return mImpl->mServer->pendingCount();
+}
+
+CUcontext PhaseServingRuntime::cudaContext() const noexcept
+{
+    return mImpl->mServer->cudaContext();
+}
+
+PhaseSchedulerTelemetry const& PhaseServingRuntime::schedulerTelemetry() const noexcept
+{
+    return mImpl->mServer->schedulerTelemetry();
+}
+
+} // namespace trt_edgellm::rt

@@ -44,7 +44,6 @@ namespace trt_edgellm
 namespace rt
 {
 
-
 RuntimeCoordinator::RuntimeCoordinator(Config config)
     : mConfig(std::move(config))
     , mParallelConfig(mConfig.parallelConfig)
@@ -779,6 +778,60 @@ void RuntimeCoordinator::setVisualPrunerConfig(VisualPrunerConfig const& config)
     int32_t const rank = mLocalRanks.front();
     CUDA_CHECK(cudaSetDevice(deviceForRank(rank)));
     rootRuntime().setVisualPrunerConfig(config);
+}
+
+void RuntimeCoordinator::enablePhaseServing(PhaseServingRuntimeConfig const& config, cudaStream_t setupStream)
+{
+    ELLM_CHECK(mInlineSingleRank && mWorldSize == 1 && mLocalRanks.size() == 1,
+        "Asynchronous phase serving currently requires inline single-rank execution.");
+    int32_t const rank = mLocalRanks.front();
+    CUDA_CHECK(cudaSetDevice(deviceForRank(rank)));
+    rootRuntime().enablePhaseServing(config, setupStream != nullptr ? setupStream : mStreams[rank]);
+}
+
+IndependentPhaseServerSubmission RuntimeCoordinator::submitPhaseRequest(uint64_t requestId,
+    LLMGenerationRequest::Request const& request, int32_t maxOutputTokens, bool applyChatTemplate,
+    bool addGenerationPrompt, bool enableThinking, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().submitPhaseRequest(requestId, request, maxOutputTokens, applyChatTemplate, addGenerationPrompt,
+        enableThinking, std::move(scheduling));
+}
+
+IndependentPhaseServerSubmission RuntimeCoordinator::submitPhaseTokens(
+    uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().submitPhaseTokens(requestId, std::move(promptTokens), maxOutputTokens, std::move(scheduling));
+}
+
+bool RuntimeCoordinator::cancelPhaseRequest(uint64_t requestId)
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().cancelPhaseRequest(requestId);
+}
+
+bool RuntimeCoordinator::pollPhaseServing()
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().pollPhaseServing();
+}
+
+std::optional<IndependentPhaseServerToken> RuntimeCoordinator::tryPopPhaseToken()
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().tryPopPhaseToken();
+}
+
+std::optional<IndependentPhaseServerCompletion> RuntimeCoordinator::tryPopPhaseCompletion()
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().tryPopPhaseCompletion();
+}
+
+bool RuntimeCoordinator::phaseServingEmpty() const noexcept
+{
+    return mInlineSingleRank && rootRuntime().phaseServingEmpty();
 }
 
 bool RuntimeCoordinator::dispatchRequest(

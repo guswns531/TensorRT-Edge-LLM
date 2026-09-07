@@ -156,6 +156,57 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     return succeeded;
 }
 
+void LLMInferenceRuntime::enablePhaseServing(PhaseServingRuntimeConfig const& config, cudaStream_t setupStream)
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    mCoordinator->enablePhaseServing(config, setupStream);
+}
+
+IndependentPhaseServerSubmission LLMInferenceRuntime::submitPhaseRequest(uint64_t requestId,
+    LLMGenerationRequest::Request const& request, int32_t maxOutputTokens, bool applyChatTemplate,
+    bool addGenerationPrompt, bool enableThinking, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->submitPhaseRequest(requestId, request, maxOutputTokens, applyChatTemplate, addGenerationPrompt,
+        enableThinking, std::move(scheduling));
+}
+
+IndependentPhaseServerSubmission LLMInferenceRuntime::submitPhaseTokens(
+    uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->submitPhaseTokens(requestId, std::move(promptTokens), maxOutputTokens, std::move(scheduling));
+}
+
+bool LLMInferenceRuntime::cancelPhaseRequest(uint64_t requestId)
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->cancelPhaseRequest(requestId);
+}
+
+bool LLMInferenceRuntime::pollPhaseServing()
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->pollPhaseServing();
+}
+
+std::optional<IndependentPhaseServerToken> LLMInferenceRuntime::tryPopPhaseToken()
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->tryPopPhaseToken();
+}
+
+std::optional<IndependentPhaseServerCompletion> LLMInferenceRuntime::tryPopPhaseCompletion()
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->tryPopPhaseCompletion();
+}
+
+bool LLMInferenceRuntime::phaseServingEmpty() const noexcept
+{
+    return mCoordinator == nullptr || mCoordinator->phaseServingEmpty();
+}
+
 std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest const& request) const
 {
     return rootRuntime().countPromptTokens(request);

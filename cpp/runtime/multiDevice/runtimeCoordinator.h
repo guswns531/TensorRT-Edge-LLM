@@ -21,6 +21,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/modelArtifacts.h"
 #include "runtime/multiDevice/parallelConfig.h"
+#include "runtime/scheduling/phaseServingRuntime.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 
 #include <atomic>
@@ -87,6 +88,17 @@ public:
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream = nullptr);
     void setVisualPrunerConfig(VisualPrunerConfig const& config);
+    void enablePhaseServing(PhaseServingRuntimeConfig const& config, cudaStream_t setupStream = nullptr);
+    IndependentPhaseServerSubmission submitPhaseRequest(uint64_t requestId,
+        LLMGenerationRequest::Request const& request, int32_t maxOutputTokens, bool applyChatTemplate = true,
+        bool addGenerationPrompt = true, bool enableThinking = false, PhaseSchedulingHints scheduling = {});
+    IndependentPhaseServerSubmission submitPhaseTokens(uint64_t requestId, std::vector<int32_t> promptTokens,
+        int32_t maxOutputTokens, PhaseSchedulingHints scheduling = {});
+    bool cancelPhaseRequest(uint64_t requestId);
+    bool pollPhaseServing();
+    std::optional<IndependentPhaseServerToken> tryPopPhaseToken();
+    std::optional<IndependentPhaseServerCompletion> tryPopPhaseCompletion();
+    bool phaseServingEmpty() const noexcept;
 
     LLMGenerationResponse takeRankResponse(int32_t globalRank);
 

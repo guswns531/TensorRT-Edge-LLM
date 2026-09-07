@@ -856,6 +856,8 @@ bool LLMRankRuntime::synchronizeCancellationStates(DecodingInferenceContext& con
 bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
     cudaStream_t stream, bool outputThinkerEmbeddings, TokenBroadcastFn tokenBroadcast, int32_t parallelRank)
 {
+    ELLM_CHECK(mPhaseServingRuntime == nullptr,
+        "handleRequest() is unavailable after the runtime switches to asynchronous phase serving.");
     bool expected = false;
     if (!mHandleRequestInProgress.compare_exchange_strong(
             expected, true, std::memory_order_acquire, std::memory_order_relaxed))
@@ -1677,6 +1679,87 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     }
 
     return true;
+}
+
+void LLMRankRuntime::enablePhaseServing(PhaseServingRuntimeConfig const& config, cudaStream_t setupStream)
+{
+    ELLM_CHECK(mPhaseServingRuntime == nullptr, "Phase serving is already enabled.");
+    ELLM_CHECK(!mHandleRequestInProgress.load(), "Cannot enable phase serving while handleRequest() is active.");
+    ELLM_CHECK(mMapping.worldSize == 1, "Phase serving currently requires a single-rank runtime.");
+    ELLM_CHECK(mBaseExecutor != nullptr && mSharedResources != nullptr, "Base runtime resources are unavailable.");
+    ELLM_CHECK(!hasDraftModel(), "Phase serving currently supports vanilla decoding only.");
+    ELLM_CHECK(
+        mContextCache == nullptr, "Phase serving owns stable KV leases and cannot share the legacy context cache.");
+    ELLM_CHECK(mVisionRunner == nullptr && mAudioRunner == nullptr && mActionRunner == nullptr,
+        "Use the three-phase adapter for multimodal phase serving.");
+
+    mDecoderRegistry.reset();
+    mDecodingRuntimeContext.reset();
+    auto executor = std::move(mBaseExecutor);
+    mPhaseServingRuntime = PhaseServingRuntime::create(
+        config, mDeployment.base, std::move(executor), *mSharedResources, mEmbedding, setupStream);
+
+    mDeepstack.reset();
+    mGemma4Ple.reset();
+    mPipelineIO.reset();
+    mSharedExecContextMemory = Tensor{};
+}
+
+IndependentPhaseServerSubmission LLMRankRuntime::submitPhaseRequest(uint64_t requestId,
+    LLMGenerationRequest::Request const& request, int32_t maxOutputTokens, bool applyChatTemplate,
+    bool addGenerationPrompt, bool enableThinking, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    ELLM_CHECK(request.imageBuffers.empty() && request.audioBuffers.empty(),
+        "Text phase submission does not accept multimodal payloads.");
+    LLMGenerationRequest::FormattedRequest formatted;
+    ELLM_CHECK(
+        mTokenizer->applyChatTemplate(request, formatted, applyChatTemplate, addGenerationPrompt, enableThinking),
+        "Failed to format the phase request.");
+    return submitPhaseTokens(
+        requestId, mTokenizer->encode(formatted.formattedCompleteRequest, false), maxOutputTokens, scheduling);
+}
+
+IndependentPhaseServerSubmission LLMRankRuntime::submitPhaseTokens(
+    uint64_t requestId, std::vector<int32_t> promptTokens, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    return mPhaseServingRuntime->submitOrQueue(
+        requestId, std::move(promptTokens), maxOutputTokens, std::move(scheduling));
+}
+
+bool LLMRankRuntime::cancelPhaseRequest(uint64_t requestId)
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    return mPhaseServingRuntime->cancel(requestId);
+}
+
+bool LLMRankRuntime::pollPhaseServing()
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    return mPhaseServingRuntime->poll();
+}
+
+std::optional<IndependentPhaseServerToken> LLMRankRuntime::tryPopPhaseToken()
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    return mPhaseServingRuntime->tryPopToken();
+}
+
+std::optional<IndependentPhaseServerCompletion> LLMRankRuntime::tryPopPhaseCompletion()
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    return mPhaseServingRuntime->tryPopCompletion();
+}
+
+bool LLMRankRuntime::phaseServingEmpty() const noexcept
+{
+    return mPhaseServingRuntime == nullptr || mPhaseServingRuntime->empty();
+}
+
+bool LLMRankRuntime::phaseServingEnabled() const noexcept
+{
+    return mPhaseServingRuntime != nullptr;
 }
 
 bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)

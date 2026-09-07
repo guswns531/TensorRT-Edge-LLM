@@ -24,6 +24,7 @@
 #include "runtime/modelArtifacts.h"
 #include "runtime/multiDevice/parallelConfig.h"
 #include "runtime/preprocess/visualTokenPruner.h"
+#include "runtime/scheduling/phaseServingRuntime.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 #include "runtime/state/contextCache/contextCacheMetrics.h"
 
@@ -92,6 +93,19 @@ public:
 
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream,
         bool outputThinkerEmbeddings = false);
+
+    //! Permanently switch this runtime from batched handleRequest() to continuous phase serving.
+    void enablePhaseServing(PhaseServingRuntimeConfig const& config = {}, cudaStream_t setupStream = nullptr);
+    IndependentPhaseServerSubmission submitPhaseRequest(uint64_t requestId,
+        LLMGenerationRequest::Request const& request, int32_t maxOutputTokens, bool applyChatTemplate = true,
+        bool addGenerationPrompt = true, bool enableThinking = false, PhaseSchedulingHints scheduling = {});
+    IndependentPhaseServerSubmission submitPhaseTokens(uint64_t requestId, std::vector<int32_t> promptTokens,
+        int32_t maxOutputTokens, PhaseSchedulingHints scheduling = {});
+    bool cancelPhaseRequest(uint64_t requestId);
+    bool pollPhaseServing();
+    std::optional<IndependentPhaseServerToken> tryPopPhaseToken();
+    std::optional<IndependentPhaseServerCompletion> tryPopPhaseCompletion();
+    bool phaseServingEmpty() const noexcept;
 
     /*! \brief Return the input size for an explicit text token-count request. */
     std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;
