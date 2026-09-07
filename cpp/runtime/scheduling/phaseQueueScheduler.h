@@ -226,15 +226,10 @@ struct PhaseDispatchMetrics
     double globalReferenceWorkMs{};
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
-    PhaseContextualPdFeatures contextualCompletionFeatures{};
-    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
     double contextualPdMean{};
     double contextualPdUncertainty{};
     double contextualPdLowerConfidenceBound{};
-    double contextualCompletionIncumbentReferenceUs{};
-    double contextualCompletionNewcomerReferenceUs{};
-    double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
 };
 
 struct PhaseSchedulerTelemetry
@@ -723,12 +718,7 @@ struct PhaseDispatchPlan
     double globalReferenceWorkMs{};
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
-    PhaseContextualPdFeatures contextualCompletionFeatures{};
-    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
-    double contextualCompletionIncumbentReferenceUs{};
-    double contextualCompletionNewcomerReferenceUs{};
-    double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
     double contextualPdMean{};
     double contextualPdUncertainty{};
     double contextualPdLowerConfidenceBound{};
@@ -839,9 +829,6 @@ public:
     size_t decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept;
     //! Keep runtime decode refinement out of latency mode while retaining recent samples.
     void setDecodeComponentObservationActive(bool active) noexcept;
-    //! Retain scalar completion-policy inputs only while detailed research
-    //! telemetry is enabled. Production decisions avoid diagnostic vector copies.
-    void setCompletionAttributionEnabled(bool enabled) noexcept;
     //! Update a scheduler-external resource drain hint. Disabled schedulers retain legacy decisions.
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Temporarily exclude prefill dispatch while an external encoder owns overlapping context memory.
@@ -869,9 +856,6 @@ public:
     //! Reset only the contextual online policy posterior. The scheduler must
     //! be idle; exact CUDA execution observations remain available.
     void resetPolicyPosterior();
-    //! Retain the generic posterior but require measurement-local held-out
-    //! evidence before completion predictions influence scheduling.
-    void resetCompletionAuthorityEvidence();
     //! Reset only exact CUDA execution observations. The scheduler must be
     //! idle; contextual policy state remains available.
     void resetExecutionCostHistory();
@@ -948,7 +932,6 @@ private:
     //! Mechanism previews only read recent histories through the shared tracker.
     std::shared_ptr<RecentDecodeTpot> mRecentDecodeTpotUs;
     bool mDecodeComponentObservationActive{};
-    bool mCompletionAttributionEnabled{};
     bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};
     int32_t mConsecutiveOverlapBatches{};

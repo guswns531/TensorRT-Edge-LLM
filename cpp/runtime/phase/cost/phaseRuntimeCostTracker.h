@@ -44,10 +44,6 @@ struct PhaseRuntimeCostTrackerConfig
     PhaseContextualPdModelConfig contextualPd;
     PhaseContextualPdModelConfig contextualEp;
     PhaseContextualPdModelConfig contextualEd;
-    //! Pair-common evidence is worth this many virtual observations when it
-    //! is blended with a direction-specific completion posterior.
-    double completionDirectionPseudoObservations{4.0};
-    PhaseContextualCompletionCalibrationConfig completionCalibration;
 };
 
 enum class PhaseRuntimeCostConfidence
@@ -55,33 +51,6 @@ enum class PhaseRuntimeCostConfidence
     kUnknown,
     kWarming,
     kReady,
-};
-
-//! Chronological completion-policy calibration stage for one ordered phase
-//! direction.  A direction first fits its posterior, then contributes to the
-//! pair-family conformal scale, and only then supplies held-out authority
-//! evidence.  The final stage means that the bounded evidence window is full
-//! enough to make a validation decision; it does not imply that validation
-//! passed.
-enum class PhaseContextualCompletionCalibrationStage
-{
-    kPosteriorFit,
-    kUncertaintyCalibration,
-    kAuthorityValidation,
-    kComplete,
-};
-
-char const* phaseContextualCompletionCalibrationStageName(PhaseContextualCompletionCalibrationStage stage) noexcept;
-
-struct PhaseContextualCompletionCalibrationProgress
-{
-    PhaseContextualCompletionCalibrationStage stage{PhaseContextualCompletionCalibrationStage::kPosteriorFit};
-    size_t posteriorObservations{};
-    size_t posteriorMinimumObservations{};
-    size_t uncertaintyObservations{};
-    size_t uncertaintyMinimumObservations{};
-    size_t authorityObservations{};
-    size_t authorityMinimumObservations{};
 };
 
 //! Process-local measurements used by the next scheduling decision.
@@ -133,60 +102,6 @@ public:
     PhaseContextualPdTelemetry const& contextualDirectionTelemetry(
         PhaseContextualPairDirection direction) const noexcept;
 
-    PhaseContextualEffectEstimate predictContextualEffectDirection(
-        PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features);
-    //! Convert one common-epoch physical pair observation into the three
-    //! normalized Effect-Vector targets and update them atomically.
-    bool observeContextualEffectDirection(PhaseContextualPairDirection direction,
-        PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
-        double incumbentCompletionUs, double newcomerCompletionUs, double weight = 1.0);
-    PhaseContextualEffectModel const& contextualEffectDirectionModel(
-        PhaseContextualPairDirection direction) const noexcept;
-
-    PhaseContextualCompletionEstimate predictContextualCompletionDirection(PhaseContextualPairDirection direction,
-        PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs);
-    bool observeContextualCompletionDirection(PhaseContextualPairDirection direction,
-        PhaseContextualPdFeatures const& features, double incumbentReferenceUs, double newcomerReferenceUs,
-        double incumbentCompletionUs, double newcomerCompletionUs,
-        double minimumSlackUs = std::numeric_limits<double>::infinity(),
-        double scalarDecisionMakespanUs = std::numeric_limits<double>::quiet_NaN());
-    PhaseContextualCompletionTelemetry const& contextualCompletionDirectionTelemetry(
-        PhaseContextualPairDirection direction) const noexcept;
-    PhaseContextualCompletionTelemetry const& contextualCompletionPairTelemetry(
-        PhaseContextualPairKind kind) const noexcept;
-    PhaseContextualCompletionAuthorityEvidence contextualCompletionAuthorityEvidence(
-        PhaseContextualPairDirection direction) const noexcept;
-    PhaseContextualCompletionCalibrationEstimate contextualCompletionCalibration(PhaseContextualPairKind kind) const;
-    PhaseContextualCompletionCalibrationProgress contextualCompletionCalibrationProgress(
-        PhaseContextualPairDirection direction) const noexcept;
-    bool contextualCompletionAuthorityEnabled() const noexcept
-    {
-        return mConfig.completionCalibration.enabled && mConfig.completionCalibration.active;
-    }
-    //! Return true only after the ordered direction and its conformal
-    //! uncertainty have enough held-out evidence for policy authority.
-    bool contextualCompletionAuthorityEvidenceReady(PhaseContextualPairDirection direction) const noexcept;
-    //! Return true once enough held-out evidence exists to either promote or
-    //! reject authority.  Unlike EvidenceReady(), a completed but failed
-    //! validation is terminal for bounded warmup rather than an endless probe.
-    bool contextualCompletionAuthorityEvidenceComplete(PhaseContextualPairDirection direction) const noexcept;
-    bool contextualCompletionAuthorityReady(
-        PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate const& estimate) const noexcept;
-    bool contextualCompletionAuthorityPredictsIncumbent() const noexcept
-    {
-        return mConfig.completionCalibration.authorityPredictsIncumbent;
-    }
-    //! Return an empirical-risk blend. Held-out completion error must improve
-    //! on the isolated scalar prior; the relative improvement continuously
-    //! determines how much of the configured maximum authority is granted.
-    double contextualCompletionAuthorityBlendWeight(PhaseContextualPairDirection direction) const noexcept;
-    //! Grant each completion boundary authority from its own held-out risk.
-    //! One accurate component cannot hide or force authority on a harmful peer.
-    double contextualCompletionAuthorityComponentBlendWeight(
-        PhaseContextualPairDirection direction, bool incumbent) const noexcept;
-    PhaseContextualCompletionEstimate contextualCompletionAuthorityEstimate(
-        PhaseContextualPairDirection direction, PhaseContextualCompletionEstimate estimate) const noexcept;
-
     //! Record the decode component separately from a combined action makespan.
     void observeDecode(
         int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive, float gpuMs);
@@ -202,47 +117,13 @@ public:
     //! contextual policy posterior. CUDA graph/profile state is owned by the
     //! execution coordinator and is therefore unaffected.
     void resetExecutionCostHistory();
-    //! Drop contextual action-value, completion, and uncertainty-calibration
+    //! Drop contextual action-value
     //! state while preserving exact execution observations.
     void resetPolicyPosterior();
-    //! Start a new serving-distribution validation epoch while retaining the
-    //! generic posterior and conformal calibration learned during warmup.
-    //! Completion estimates regain authority only from held-out observations
-    //! collected in the new epoch.
-    void resetCompletionAuthorityEvidence() noexcept;
     //! Drop every process-local execution and policy observation.
     void reset();
 
 private:
-    PhaseContextualPdFeatures contextualCompletionFeaturesForPolicy(PhaseContextualPdFeatures features) const noexcept;
-
-    struct CompletionAuthorityEvidenceSample
-    {
-        bool incumbentCovered{};
-        bool newcomerCovered{};
-        bool predictedSafe{};
-        bool falseSafe{};
-        double completionAbsoluteErrorUs{};
-        double referenceAbsoluteErrorUs{};
-        double incumbentCompletionAbsoluteErrorUs{};
-        double incumbentReferenceAbsoluteErrorUs{};
-        double newcomerCompletionAbsoluteErrorUs{};
-        double newcomerReferenceAbsoluteErrorUs{};
-    };
-
-    struct CompletionAuthorityEvidenceWindow
-    {
-        std::deque<CompletionAuthorityEvidenceSample> samples;
-        PhaseContextualCompletionAuthorityEvidence aggregate;
-    };
-
-    void observeContextualCompletionAuthorityEvidence(PhaseContextualPairDirection direction,
-        PhaseContextualCompletionEstimate const& prediction, PhaseContextualPdFeatures const& features,
-        double incumbentReferenceUs, double newcomerReferenceUs, double incumbentCompletionUs,
-        double newcomerCompletionUs, double minimumSlackUs, double scalarDecisionMakespanUs) noexcept;
-    bool contextualCompletionAuthorityEvidenceSatisfies(
-        PhaseContextualCompletionAuthorityEvidence const& evidence, double coverageTolerance) const noexcept;
-
     struct DecodeKey
     {
         int32_t batchSize{};
@@ -269,26 +150,6 @@ private:
     PhaseContextualPdModel mContextualPe;
     PhaseContextualPdModel mContextualEd;
     PhaseContextualPdModel mContextualDe;
-    PhaseContextualEffectModel mEffectPd;
-    PhaseContextualEffectModel mEffectDp;
-    PhaseContextualEffectModel mEffectEp;
-    PhaseContextualEffectModel mEffectPe;
-    PhaseContextualEffectModel mEffectEd;
-    PhaseContextualEffectModel mEffectDe;
-    PhaseContextualCompletionModel mCompletionPd;
-    PhaseContextualCompletionModel mCompletionDp;
-    PhaseContextualCompletionModel mCompletionEp;
-    PhaseContextualCompletionModel mCompletionPe;
-    PhaseContextualCompletionModel mCompletionEd;
-    PhaseContextualCompletionModel mCompletionDe;
-    PhaseContextualCompletionModel mCompletionPdPair;
-    PhaseContextualCompletionModel mCompletionEpPair;
-    PhaseContextualCompletionModel mCompletionEdPair;
-    PhaseContextualCompletionCalibrator mCompletionPdCalibration;
-    PhaseContextualCompletionCalibrator mCompletionEpCalibration;
-    PhaseContextualCompletionCalibrator mCompletionEdCalibration;
-    std::array<PhaseContextualCompletionTelemetry, 6U> mCompletionHierarchicalTelemetry{};
-    std::array<CompletionAuthorityEvidenceWindow, 6U> mCompletionAuthorityEvidence{};
     std::unordered_map<DecodeKey, std::deque<float>, DecodeKeyHash> mDecodeComponents;
 };
 

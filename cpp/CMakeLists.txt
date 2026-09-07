@@ -68,8 +68,6 @@ set(PHASE_RUNTIME_CPP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseFormationPlanner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseGlobalScheduler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseIncrementalAction.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseIncrementalProjector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseOracleH1Selector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseKVActiveView.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseKernelGroupRecorder.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseMemoryBroker.cpp"

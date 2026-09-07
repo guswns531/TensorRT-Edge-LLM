@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include "runtime/phase/mechanism/phaseIncrementalProjector.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phasePrefixReuseCache.h"
 
@@ -389,7 +388,6 @@ public:
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
     //! Enable same-frontier scalar/completion attribution while the server is idle.
-    void setCompletionAttributionEnabled(bool enabled) noexcept;
     //! Configure an opt-in M2 directional launch experiment while idle.
     void setDirectionalInjectionControl(PhaseDirectionalInjectionControl control);
     cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
@@ -488,10 +486,6 @@ public:
     //! Return scalar arbitration state by default. Exact ready/in-flight
     //! vectors are materialized only for decision/event capture.
     IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot(bool includeReadyDetails = false) const noexcept;
-    //! Export immutable request/DAG/lease state for transition-policy shadow
-    //! replay. This is opt-in research state and never participates in the
-    //! production dispatch hot path unless detailed decision telemetry is on.
-    std::vector<PhaseProjectedRequest> projectedRequests(size_t bytesPerKVPage) const noexcept;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;

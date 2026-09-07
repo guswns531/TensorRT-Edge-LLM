@@ -357,15 +357,10 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.globalReferenceWorkMs = mInFlight.globalReferenceWorkMs;
     mCurrentMetrics.contextualPdFeatures = mInFlight.contextualPdFeatures;
     mCurrentMetrics.contextualPdFeatureValid = mInFlight.contextualPdFeatureValid;
-    mCurrentMetrics.contextualCompletionFeatures = mInFlight.contextualCompletionFeatures;
-    mCurrentMetrics.contextualCompletionFeatureValid = mInFlight.contextualCompletionFeatureValid;
     mCurrentMetrics.contextualPdExploration = mInFlight.contextualPdExploration;
     mCurrentMetrics.contextualPdMean = mInFlight.contextualPdMean;
     mCurrentMetrics.contextualPdUncertainty = mInFlight.contextualPdUncertainty;
     mCurrentMetrics.contextualPdLowerConfidenceBound = mInFlight.contextualPdLowerConfidenceBound;
-    mCurrentMetrics.contextualCompletionIncumbentReferenceUs = mInFlight.contextualCompletionIncumbentReferenceUs;
-    mCurrentMetrics.contextualCompletionNewcomerReferenceUs = mInFlight.contextualCompletionNewcomerReferenceUs;
-    mCurrentMetrics.contextualCompletionMinimumSlackUs = mInFlight.contextualCompletionMinimumSlackUs;
     mCurrentMetrics.decodeCohortSize = static_cast<int32_t>(mScheduler.decodeCohortSize());
     int64_t prefillPastKVSum{};
     mCurrentMetrics.prefillPastKVMin = mInFlight.prefillBatch.empty() ? 0 : std::numeric_limits<int32_t>::max();
@@ -611,15 +606,10 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mInFlight.globalReferenceWorkMs = aggregate.referenceWorkUs / 1000.0;
     mInFlight.contextualPdFeatures = aggregate.contextualPdFeatures;
     mInFlight.contextualPdFeatureValid = aggregate.contextualPdFeatureValid;
-    mInFlight.contextualCompletionFeatures = aggregate.contextualCompletionFeatures;
-    mInFlight.contextualCompletionFeatureValid = aggregate.contextualCompletionFeatureValid;
     mInFlight.contextualPdExploration = aggregate.contextualPdExploration;
     mInFlight.contextualPdMean = aggregate.contextualPdMean;
     mInFlight.contextualPdUncertainty = aggregate.contextualPdUncertainty;
     mInFlight.contextualPdLowerConfidenceBound = aggregate.contextualPdLowerConfidenceBound;
-    mInFlight.contextualCompletionIncumbentReferenceUs = aggregate.contextualCompletionIncumbentReferenceUs;
-    mInFlight.contextualCompletionNewcomerReferenceUs = aggregate.contextualCompletionNewcomerReferenceUs;
-    mInFlight.contextualCompletionMinimumSlackUs = aggregate.contextualCompletionMinimumSlackUs;
     mInFlight.globalServiceCompression
         = aggregate.referenceWorkUs / std::max(aggregate.predictedMakespanUs, std::numeric_limits<double>::epsilon());
     mInFlight.concurrentPrefillActive = true;
@@ -726,15 +716,10 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mCurrentMetrics.globalServiceCompression = mInFlight.globalServiceCompression;
     mCurrentMetrics.contextualPdFeatures = mInFlight.contextualPdFeatures;
     mCurrentMetrics.contextualPdFeatureValid = mInFlight.contextualPdFeatureValid;
-    mCurrentMetrics.contextualCompletionFeatures = mInFlight.contextualCompletionFeatures;
-    mCurrentMetrics.contextualCompletionFeatureValid = mInFlight.contextualCompletionFeatureValid;
     mCurrentMetrics.contextualPdExploration = mInFlight.contextualPdExploration;
     mCurrentMetrics.contextualPdMean = mInFlight.contextualPdMean;
     mCurrentMetrics.contextualPdUncertainty = mInFlight.contextualPdUncertainty;
     mCurrentMetrics.contextualPdLowerConfidenceBound = mInFlight.contextualPdLowerConfidenceBound;
-    mCurrentMetrics.contextualCompletionIncumbentReferenceUs = mInFlight.contextualCompletionIncumbentReferenceUs;
-    mCurrentMetrics.contextualCompletionNewcomerReferenceUs = mInFlight.contextualCompletionNewcomerReferenceUs;
-    mCurrentMetrics.contextualCompletionMinimumSlackUs = mInFlight.contextualCompletionMinimumSlackUs;
 }
 
 bool PhaseDispatchWorker::eventReady(cudaEvent_t event) const

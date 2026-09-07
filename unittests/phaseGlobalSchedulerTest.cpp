@@ -61,41 +61,12 @@ TEST(PhaseGlobalSchedulerTest, ContextualDecisionCostCanGeneralizeAnUnknownOverl
     EXPECT_EQ(*decision.selectedIndex, 1U);
 }
 
-TEST(PhaseGlobalSchedulerTest, RestoresSameFrontierScalarCompletionCounterfactual)
-{
-    PhaseGlobalScheduler scheduler;
-    PhaseGlobalActionCandidate serial = candidate(PhaseGlobalActionKind::kPrefill, 4000.0, 4000.0, 10000.0);
-    PhaseGlobalActionCandidate overlap = candidate(PhaseGlobalActionKind::kPrefillDecode, 5000.0, 5000.0, 10000.0);
-    overlap.decisionCostKnown = true;
-    overlap.decisionMakespanUs = 5000.0;
-    overlap.protectedCompletions.push_back({10000.0, 5000.0, 0.0, PhaseProtectedKind::kDecode});
-    phaseCaptureScalarCompletionPolicy(overlap);
-    overlap.completionAuthorityReady = true;
-    overlap.completionAuthorityApplied = true;
-    overlap.decisionMakespanUs = 3000.0;
-    overlap.activeDecisionMakespanUs = 3000.0;
-    overlap.protectedCompletions.front().predictedCompletionUs = 3000.0;
-
-    PhaseGlobalDecision const active = scheduler.select({serial, overlap});
-    ASSERT_TRUE(active.selectedIndex.has_value());
-    EXPECT_EQ(*active.selectedIndex, 1U);
-
-    phaseRestoreScalarCompletionPolicy(overlap);
-    PhaseGlobalDecision const scalar = scheduler.select({serial, overlap});
-    ASSERT_TRUE(scalar.selectedIndex.has_value());
-    EXPECT_EQ(*scalar.selectedIndex, 0U);
-    EXPECT_DOUBLE_EQ(overlap.protectedCompletions.front().predictedCompletionUs, 5000.0);
-}
-
 TEST(PhaseGlobalSchedulerTest, RestoresNonContextualFallbackWithoutDroppingExactCosts)
 {
     PhaseGlobalActionCandidate learned = candidate(PhaseGlobalActionKind::kPrefillDecode, 5000.0, 4000.0, 10000.0);
     learned.decisionCostKnown = true;
     learned.decisionMakespanUs = 3000.0;
     learned.contextualScalarAuthorityApplied = true;
-    phaseCaptureScalarCompletionPolicy(learned);
-    learned.completionAuthorityApplied = true;
-    learned.decisionMakespanUs = 2500.0;
 
     phaseRestoreNonContextualPolicy(learned);
 

@@ -3302,16 +3302,10 @@ int main(int argc, char** argv)
                         }
                         size_t contextualRequiredDirections{};
                         size_t contextualReadyDirections{};
-                        size_t completionRequiredDirections{};
-                        size_t completionCompleteDirections{};
                         auto const contextualDirectionCalibration = [&](rt::PhaseContextualPairDirection direction,
                                                                         size_t minimumObservations) {
                             rt::PhaseContextualPdTelemetry const& telemetry
                                 = runtimeCostTracker->contextualDirectionTelemetry(direction);
-                            rt::PhaseContextualCompletionTelemetry const& completion
-                                = runtimeCostTracker->contextualCompletionDirectionTelemetry(direction);
-                            rt::PhaseContextualCompletionAuthorityEvidence const authority
-                                = runtimeCostTracker->contextualCompletionAuthorityEvidence(direction);
                             // Candidate generation may predict a residual or
                             // reverse direction that never becomes a legal
                             // dispatched action.  Such a direction remains on
@@ -3319,65 +3313,11 @@ int main(int argc, char** argv)
                             // calibration epoch from terminating.
                             bool const required = telemetry.observations > 0U;
                             bool const ready = required && telemetry.observations >= minimumObservations;
-                            rt::PhaseContextualCompletionCalibrationProgress const progress
-                                = runtimeCostTracker->contextualCompletionCalibrationProgress(direction);
-                            bool const completionRequired
-                                = runtimeCostTracker->contextualCompletionAuthorityEnabled() && required;
-                            bool const completionComplete = completionRequired
-                                && runtimeCostTracker->contextualCompletionAuthorityEvidenceComplete(direction);
                             contextualRequiredDirections += required ? 1U : 0U;
                             contextualReadyDirections += ready ? 1U : 0U;
-                            completionRequiredDirections += completionRequired ? 1U : 0U;
-                            completionCompleteDirections += completionComplete ? 1U : 0U;
                             return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
                                 {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
-                                {"minimum_observations", minimumObservations}, {"required", required}, {"ready", ready},
-                                {"completion_ready_observations", completion.readyCalibrationObservations},
-                                {"completion_conformal_observations", completion.conformalCalibrationObservations},
-                                {"completion_conformal_false_safe", completion.conformalFalseSafeObservations},
-                                {"completion_authority_window_observations", authority.observations},
-                                {"completion_authority_minimum_observations",
-                                    runtimeCostConfig.completionCalibration.authorityMinimumObservations},
-                                {"completion_authority_blend_weight",
-                                    runtimeCostConfig.completionCalibration.authorityBlendWeight},
-                                {"completion_authority_incumbent_covered", authority.incumbentIntervalCovered},
-                                {"completion_authority_newcomer_covered", authority.newcomerIntervalCovered},
-                                {"completion_authority_predicted_safe", authority.predictedSafeObservations},
-                                {"completion_authority_false_safe", authority.falseSafeObservations},
-                                {"completion_authority_completion_absolute_error_us",
-                                    authority.completionAbsoluteErrorUs},
-                                {"completion_authority_reference_absolute_error_us",
-                                    authority.referenceAbsoluteErrorUs},
-                                {"completion_authority_empirical_blend_weight",
-                                    runtimeCostTracker->contextualCompletionAuthorityBlendWeight(direction)},
-                                {"completion_authority_incumbent_completion_absolute_error_us",
-                                    authority.incumbentCompletionAbsoluteErrorUs},
-                                {"completion_authority_incumbent_reference_absolute_error_us",
-                                    authority.incumbentReferenceAbsoluteErrorUs},
-                                {"completion_authority_newcomer_completion_absolute_error_us",
-                                    authority.newcomerCompletionAbsoluteErrorUs},
-                                {"completion_authority_newcomer_reference_absolute_error_us",
-                                    authority.newcomerReferenceAbsoluteErrorUs},
-                                {"completion_authority_incumbent_blend_weight",
-                                    runtimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
-                                        direction, true)},
-                                {"completion_authority_newcomer_blend_weight",
-                                    runtimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
-                                        direction, false)},
-                                {"completion_authority_promotions", authority.promotions},
-                                {"completion_authority_demotions", authority.demotions},
-                                {"completion_authority_validated", authority.validated},
-                                {"completion_authority_evidence_ready",
-                                    runtimeCostTracker->contextualCompletionAuthorityEvidenceReady(direction)},
-                                {"completion_calibration_stage",
-                                    rt::phaseContextualCompletionCalibrationStageName(progress.stage)},
-                                {"completion_candidate_seen", telemetry.predictions > 0U},
-                                {"completion_posterior_observations", progress.posteriorObservations},
-                                {"completion_posterior_minimum_observations", progress.posteriorMinimumObservations},
-                                {"completion_uncertainty_observations", progress.uncertaintyObservations},
-                                {"completion_uncertainty_minimum_observations",
-                                    progress.uncertaintyMinimumObservations},
-                                {"completion_authority_evidence_complete", completionComplete}};
+                                {"minimum_observations", minimumObservations}, {"required", required}, {"ready", ready}};
                         };
                         auto const contextualFamilyCalibration = [&](rt::PhaseContextualPairKind kind,
                                                                      rt::PhaseContextualPairDirection first,
@@ -3418,11 +3358,8 @@ int main(int argc, char** argv)
                             = requiredCostKeys > 0U && calibratedCostKeys == requiredCostKeys;
                         bool const contextualPolicyCalibrationConverged = contextualRequiredDirections > 0U
                             && contextualReadyDirections == contextualRequiredDirections;
-                        bool const completionPolicyCalibrationConverged = completionRequiredDirections > 0U
-                            && completionCompleteDirections == completionRequiredDirections;
-                        bool const calibrationConverged = runtimeCostTracker->contextualCompletionAuthorityEnabled()
-                            ? contextualPolicyCalibrationConverged && completionPolicyCalibrationConverged
-                            : exactCostCalibrationConverged || contextualPolicyCalibrationConverged;
+                        bool const calibrationConverged
+                            = exactCostCalibrationConverged || contextualPolicyCalibrationConverged;
                         bool const changesCalibration = input.kind != PhaseIpcKind::kCalibrationStatus;
                         if (changesCalibration)
                         {
@@ -3509,9 +3446,6 @@ int main(int argc, char** argv)
                             {"contextual_required_directions", contextualRequiredDirections},
                             {"contextual_ready_directions", contextualReadyDirections},
                             {"contextual_policy_calibration_converged", contextualPolicyCalibrationConverged},
-                            {"completion_required_directions", completionRequiredDirections},
-                            {"completion_complete_directions", completionCompleteDirections},
-                            {"completion_policy_calibration_converged", completionPolicyCalibrationConverged},
                             {"calibration_converged", calibrationConverged}});
                         ++ingestedLines;
                         continue;
@@ -3625,64 +3559,6 @@ int main(int argc, char** argv)
                     auto const directionObservations = [&](rt::PhaseContextualPairDirection direction) {
                         return runtimeCostTracker->contextualDirectionTelemetry(direction).observations;
                     };
-                    auto const completionTelemetryJson = [](rt::PhaseContextualCompletionTelemetry const& telemetry) {
-                        return nlohmann::json{{"predictions", telemetry.predictions},
-                            {"observations", telemetry.observations},
-                            {"ready_calibration_observations", telemetry.readyCalibrationObservations},
-                            {"incumbent_interval_covered", telemetry.incumbentIntervalCovered},
-                            {"newcomer_interval_covered", telemetry.newcomerIntervalCovered},
-                            {"ready_incumbent_interval_covered", telemetry.readyIncumbentIntervalCovered},
-                            {"ready_newcomer_interval_covered", telemetry.readyNewcomerIntervalCovered},
-                            {"conformal_calibration_observations", telemetry.conformalCalibrationObservations},
-                            {"conformal_incumbent_interval_covered", telemetry.conformalIncumbentIntervalCovered},
-                            {"conformal_newcomer_interval_covered", telemetry.conformalNewcomerIntervalCovered},
-                            {"conformal_predicted_safe", telemetry.conformalPredictedSafeObservations},
-                            {"conformal_false_safe", telemetry.conformalFalseSafeObservations},
-                            {"predicted_safe", telemetry.predictedSafeObservations},
-                            {"false_safe", telemetry.falseSafeObservations},
-                            {"incumbent_absolute_error_us", telemetry.incumbentAbsoluteErrorUs},
-                            {"incumbent_squared_error_us", telemetry.incumbentSquaredErrorUs},
-                            {"newcomer_absolute_error_us", telemetry.newcomerAbsoluteErrorUs},
-                            {"newcomer_squared_error_us", telemetry.newcomerSquaredErrorUs},
-                            {"ready_incumbent_absolute_error_us", telemetry.readyIncumbentAbsoluteErrorUs},
-                            {"ready_incumbent_squared_error_us", telemetry.readyIncumbentSquaredErrorUs},
-                            {"ready_newcomer_absolute_error_us", telemetry.readyNewcomerAbsoluteErrorUs},
-                            {"ready_newcomer_squared_error_us", telemetry.readyNewcomerSquaredErrorUs}};
-                    };
-                    nlohmann::json completionCalibration = nlohmann::json::object();
-                    for (rt::PhaseContextualPairDirection const direction :
-                        {rt::PhaseContextualPairDirection::kPrefillToDecode,
-                            rt::PhaseContextualPairDirection::kDecodeToPrefill,
-                            rt::PhaseContextualPairDirection::kEncoderToPrefill,
-                            rt::PhaseContextualPairDirection::kPrefillToEncoder,
-                            rt::PhaseContextualPairDirection::kEncoderToDecode,
-                            rt::PhaseContextualPairDirection::kDecodeToEncoder})
-                    {
-                        rt::PhaseContextualCompletionTelemetry const& telemetry
-                            = runtimeCostTracker->contextualCompletionDirectionTelemetry(direction);
-                        completionCalibration[rt::phaseContextualPairDirectionName(direction)]
-                            = completionTelemetryJson(telemetry);
-                    }
-                    nlohmann::json completionPairCalibration
-                        = {{"prefill_decode",
-                               completionTelemetryJson(runtimeCostTracker->contextualCompletionPairTelemetry(
-                                   rt::PhaseContextualPairKind::kPrefillDecode))},
-                            {"encoder_prefill",
-                                completionTelemetryJson(runtimeCostTracker->contextualCompletionPairTelemetry(
-                                    rt::PhaseContextualPairKind::kEncoderPrefill))},
-                            {"encoder_decode",
-                                completionTelemetryJson(runtimeCostTracker->contextualCompletionPairTelemetry(
-                                    rt::PhaseContextualPairKind::kEncoderDecode))}};
-                    auto const conformalCalibrationJson = [&](rt::PhaseContextualPairKind kind) {
-                        rt::PhaseContextualCompletionCalibrationEstimate const estimate
-                            = runtimeCostTracker->contextualCompletionCalibration(kind);
-                        return nlohmann::json{{"scale", estimate.scale}, {"observations", estimate.observations},
-                            {"ready", estimate.ready}};
-                    };
-                    nlohmann::json completionConformalCalibration
-                        = {{"prefill_decode", conformalCalibrationJson(rt::PhaseContextualPairKind::kPrefillDecode)},
-                            {"encoder_prefill", conformalCalibrationJson(rt::PhaseContextualPairKind::kEncoderPrefill)},
-                            {"encoder_decode", conformalCalibrationJson(rt::PhaseContextualPairKind::kEncoderDecode)}};
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"measurement_epoch", measurementEpoch},
                         {"policy_warmup_mode", phasePolicyWarmupModeName(policyWarmupMode)},
@@ -3740,13 +3616,6 @@ int main(int argc, char** argv)
                         {"contextual_pd_mean", metrics.contextualPdMean},
                         {"contextual_pd_uncertainty", metrics.contextualPdUncertainty},
                         {"contextual_pd_lcb", metrics.contextualPdLowerConfidenceBound},
-                        {"contextual_completion_incumbent_reference_us",
-                            metrics.contextualCompletionIncumbentReferenceUs},
-                        {"contextual_completion_newcomer_reference_us",
-                            metrics.contextualCompletionNewcomerReferenceUs},
-                        {"contextual_completion", std::move(completionCalibration)},
-                        {"contextual_completion_pair", std::move(completionPairCalibration)},
-                        {"contextual_completion_conformal", std::move(completionConformalCalibration)},
                         {"global_decisions", semanticCoordinator.scheduler().telemetry().globalDecisionCount},
                         {"global_active_decisions",
                             semanticCoordinator.scheduler().telemetry().globalActiveDecisionCount},
@@ -4225,26 +4094,6 @@ int main(int argc, char** argv)
                             {"prefill_tokens", work.prefillTokens}, {"decode_rows", work.decodeRows},
                             {"decode_context_tokens", work.decodeContextTokens}};
                     };
-                    auto const transitionJson = [](rt::PhaseTransitionReplaySnapshot const& transition) {
-                        return nlohmann::json{{"evaluated", transition.evaluated}, {"valid", transition.valid},
-                            {"alternatives", transition.alternatives},
-                            {"worst_case_robust_horizon_us", transition.worstCaseRobustHorizonUs},
-                            {"first_completed_phase_mask", transition.firstCompletedPhaseMask},
-                            {"min_first_encoder_ready_rows", transition.minFirstEncoderReadyRows},
-                            {"max_first_encoder_ready_rows", transition.maxFirstEncoderReadyRows},
-                            {"min_first_prefill_ready_rows", transition.minFirstPrefillReadyRows},
-                            {"max_first_prefill_ready_rows", transition.maxFirstPrefillReadyRows},
-                            {"min_first_decode_ready_rows", transition.minFirstDecodeReadyRows},
-                            {"max_first_decode_ready_rows", transition.maxFirstDecodeReadyRows},
-                            {"min_encoder_ready_rows", transition.minEncoderReadyRows},
-                            {"max_encoder_ready_rows", transition.maxEncoderReadyRows},
-                            {"min_prefill_ready_rows", transition.minPrefillReadyRows},
-                            {"max_prefill_ready_rows", transition.maxPrefillReadyRows},
-                            {"min_decode_ready_rows", transition.minDecodeReadyRows},
-                            {"max_decode_ready_rows", transition.maxDecodeReadyRows},
-                            {"min_reclaim_bytes", transition.minReclaimBytes},
-                            {"max_reclaim_bytes", transition.maxReclaimBytes}};
-                    };
                     auto const formationJson = [](rt::PhaseModelFormationSnapshot const& formation) {
                         return nlohmann::json{{"evaluated", formation.evaluated}, {"valid", formation.valid},
                             {"selected_action_id", formation.selectedActionId},
@@ -4290,78 +4139,17 @@ int main(int argc, char** argv)
                                 {"secondary_context_bucket", candidate.key.secondaryContextBucket},
                                 {"execution_variant", rt::phaseExecutionVariantName(candidate.key.executionVariant)},
                                 {"primary_work_class", candidate.key.primaryWorkClass},
-                                {"action_direction",
-                                    candidate.key.kind == rt::PhaseGlobalActionKind::kEncoderPrefill
-                                            || candidate.key.kind == rt::PhaseGlobalActionKind::kEncoderDecode
-                                            || candidate.key.kind == rt::PhaseGlobalActionKind::kPrefillDecode
-                                        ? rt::phaseContextualPairDirectionName(candidate.contextualDirection)
-                                        : "none"},
                                 {"residual_augmentation", candidate.key.residualAugmentation},
                                 {"residual_anchor", rt::phaseGlobalResidualAnchorName(candidate.key.residualAnchor)},
                                 {"legal", candidate.legal}, {"request_ids", candidate.requestIds},
                                 {"predicted_completion_us", nlohmann::json::array({candidate.predictedCompletionUs})},
                                 {"uncertainty_us", nlohmann::json::array({candidate.uncertaintyUs})},
                                 {"max_slo_violation_us", candidate.predictedSloViolationUs},
-                                {"contextual_completion_valid", candidate.contextualCompletionValid},
-                                {"contextual_completion_feature_v2_valid",
-                                    candidate.contextualCompletionFeatureV2Valid},
-                                {"contextual_completion_features", candidate.contextualCompletionFeatures},
-                                {"contextual_direction",
-                                    rt::phaseContextualPairDirectionName(candidate.contextualDirection)},
-                                {"contextual_completion_ready", candidate.contextualCompletion.ready},
-                                {"contextual_effect_valid", candidate.contextualEffectValid},
-                                {"contextual_effect_ready", candidate.contextualEffect.ready()},
-                                {"contextual_effect_compression_mean", candidate.contextualEffect.compression.mean},
-                                {"contextual_effect_compression_uncertainty",
-                                    candidate.contextualEffect.compression.uncertainty},
-                                {"contextual_effect_incumbent_stretch_mean",
-                                    candidate.contextualEffect.incumbentStretch.mean},
-                                {"contextual_effect_incumbent_stretch_uncertainty",
-                                    candidate.contextualEffect.incumbentStretch.uncertainty},
-                                {"contextual_effect_order_margin_mean",
-                                    candidate.contextualEffect.completionOrderMargin.mean},
-                                {"contextual_effect_order_margin_uncertainty",
-                                    candidate.contextualEffect.completionOrderMargin.uncertainty},
-                                {"contextual_incumbent_mean_us", candidate.contextualCompletion.incumbentMeanUs},
-                                {"contextual_incumbent_uncertainty_us",
-                                    candidate.contextualCompletion.incumbentUncertaintyUs},
-                                {"contextual_newcomer_mean_us", candidate.contextualCompletion.newcomerMeanUs},
-                                {"contextual_newcomer_uncertainty_us",
-                                    candidate.contextualCompletion.newcomerUncertaintyUs},
-                                {"contextual_pair_observations", candidate.contextualCompletion.pairObservations},
-                                {"contextual_direction_observations",
-                                    candidate.contextualCompletion.directionObservations},
-                                {"contextual_direction_weight", candidate.contextualCompletion.directionWeight},
-                                {"contextual_uncertainty_scale", candidate.contextualCompletion.uncertaintyScale},
-                                {"contextual_uncertainty_calibration_observations",
-                                    candidate.contextualCompletion.uncertaintyCalibrationObservations},
-                                {"contextual_uncertainty_calibrated",
-                                    candidate.contextualCompletion.uncertaintyCalibrated},
-                                {"contextual_incumbent_reference_us", candidate.contextualIncumbentReferenceUs},
-                                {"contextual_newcomer_reference_us", candidate.contextualNewcomerReferenceUs},
-                                {"completion_policy_evaluated", candidate.completionPolicyEvaluated},
-                                {"completion_authority_ready", candidate.completionAuthorityReady},
-                                {"completion_authority_applied", candidate.completionAuthorityApplied},
                                 {"scalar_decision_cost_known", candidate.scalarDecisionCostKnown},
-                                {"active_decision_cost_known", candidate.activeDecisionCostKnown},
                                 {"contextual_scalar_authority_applied", candidate.contextualScalarAuthorityApplied},
                                 {"scalar_decision_makespan_us", candidate.scalarDecisionMakespanUs},
-                                {"active_decision_makespan_us", candidate.activeDecisionMakespanUs},
-                                {"completion_aggregate_blend_weight", candidate.completionAggregateBlendWeight},
-                                {"completion_incumbent_blend_weight", candidate.completionIncumbentBlendWeight},
-                                {"completion_newcomer_blend_weight", candidate.completionNewcomerBlendWeight},
                                 {"scalar_protected_completions",
-                                    protectedCompletions(candidate.scalarProtectedCompletions)},
-                                {"active_protected_completions",
-                                    protectedCompletions(candidate.activeProtectedCompletions)},
-                                {"transition_action_id", candidate.transitionActionId},
-                                {"scalar_transition", transitionJson(candidate.scalarTransition)},
-                                {"effect_transition", transitionJson(candidate.effectTransition)},
-                                {"completion_transition", transitionJson(candidate.completionTransition)}});
-                            if (std::isfinite(candidate.contextualMinimumSlackUs))
-                            {
-                                candidates.back()["contextual_minimum_slack_us"] = candidate.contextualMinimumSlackUs;
-                            }
+                                    protectedCompletions(candidate.scalarProtectedCompletions)}});
                         }
                         record.update({{"decision_id", event.decisionId},
                             {"policy_decision_sequence", event.policyDecisionSequence},
@@ -4371,9 +4159,6 @@ int main(int argc, char** argv)
                             {"kv_ownership_signature", event.kvOwnershipSignature},
                             {"scalar_policy_state_signature", event.scalarPolicyStateSignature},
                             {"vision_lease_signature", event.visionLeaseSignature},
-                            {"frozen_transition_snapshot_valid", event.frozenTransitionSnapshotValid},
-                            {"frozen_transition_snapshot_id", event.frozenTransitionSnapshotId},
-                            {"frozen_transition_candidates", event.frozenTransitionCandidates},
                             {"causal_replay_forced", event.causalReplayForced}, {"action_id", event.actionId},
                             {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
@@ -4394,17 +4179,9 @@ int main(int argc, char** argv)
                             {"vision_payload_bytes", event.visionPayloadBytes}, {"request_ids", event.requestIds},
                             {"inflight", std::move(inflight)}, {"candidates", std::move(candidates)},
                             {"selected_action_id", event.selectedActionId},
-                            {"active_h1_selected_action_id", event.activeH1SelectedActionId},
                             {"scalar_h1_selected_action_id", event.scalarSelectedActionId},
                             {"non_contextual_selected_action_id", event.nonContextualSelectedActionId},
-                            {"contextual_successor_guard_evaluated", event.contextualSuccessorGuardEvaluated},
-                            {"contextual_successor_guard_applied", event.contextualSuccessorGuardApplied},
-                            {"scalar_formation", formationJson(event.scalarFormation)},
-                            {"effect_formation", formationJson(event.effectFormation)},
-                            {"completion_formation", formationJson(event.completionFormation)},
-                            {"completion_changed_h1_action",
-                                event.scalarSelectedActionId > 0U && event.activeH1SelectedActionId > 0U
-                                    && event.scalarSelectedActionId != event.activeH1SelectedActionId}});
+                            {"scalar_formation", formationJson(event.scalarFormation)}});
                     }
                     else if (event.kind == rt::PhaseUnifiedEventKind::kDispatch)
                     {

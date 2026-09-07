@@ -161,12 +161,9 @@
     "telemetry": {
       "kind": "new_phase_runtime",
       "paths": [
-                "benchmarks/phase_serving/analyze_oracle_h1_snapshot_coverage.py",
-                "benchmarks/phase_serving/build_oracle_h1_snapshot_coverage.py",
-                "benchmarks/phase_serving/run_oracle_h1_policy_matrix.py",
-                "benchmarks/phase_serving/validate_phase_scheduler_events.py",
-                "cpp/runtime/phase/mechanism/phaseUnifiedEvent.h",
-                "cpp/runtime/phase/mechanism/phaseIncrementalAction.h",
+        "benchmarks/phase_serving/validate_phase_scheduler_events.py",
+        "cpp/runtime/phase/mechanism/phaseUnifiedEvent.h",
+        "cpp/runtime/phase/mechanism/phaseIncrementalAction.h",
         "cpp/runtime/scheduling/phaseActivityTimeline.cpp",
         "cpp/runtime/scheduling/phaseActivityTimeline.h",
         "cpp/runtime/scheduling/phaseKernelGroupRecorder.cpp",

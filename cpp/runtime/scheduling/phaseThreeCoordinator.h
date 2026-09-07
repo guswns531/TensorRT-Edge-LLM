@@ -129,11 +129,6 @@ struct PhaseThreeCoordinatorConfig
     //! The immutable transition uses only current ready rows and concrete,
     //! already-outstanding completion events. It never predicts future arrivals.
     bool enableGlobalFormationAwareSelection{};
-    //! Let bounded successor reasoning veto a contextual scalar action only
-    //! when the identical non-contextual frontier has strictly lower robust
-    //! two-action cost. Unlike formation-aware selection this cannot promote
-    //! a learned action and therefore preserves the conservative fallback.
-    bool enableContextualSuccessorGuard{};
     //! Number of actual dispatches attributed after an H=2/myopic selection
     //! change. The selected action is the first dispatch in the horizon.
     size_t globalFormationRealizedDispatches{4U};
@@ -698,16 +693,11 @@ private:
         float phaseElapsedMs{};
         bool residualAugmentation{};
         PhaseContextualPdFeatures contextualFeatures{};
-        PhaseContextualPdFeatures contextualCompletionFeatures{};
         PhaseContextualPairDirection contextualDirection{PhaseContextualPairDirection::kEncoderToPrefill};
         bool contextualFeatureValid{};
-        bool contextualCompletionFeatureValid{};
         bool contextualExploration{};
         float contextualReferenceWorkMs{};
         double contextualLowerConfidenceBound{};
-        double contextualIncumbentReferenceUs{};
-        double contextualNewcomerReferenceUs{};
-        double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};
         //! Mechanism-owned plan joining the independently completed E and P/D
         //! measurements. Runtime state such as externalEncoderActive may be
         //! cleared before the slower member completes and is not a stable join
@@ -905,10 +895,6 @@ private:
     PhaseGlobalActionKind mLastGlobalFormationOracleAction{PhaseGlobalActionKind::kNone};
     double mLastGlobalFormationDecodeViolationUs{};
     PhaseModelFormationSnapshot mLastScalarFormation;
-    PhaseModelFormationSnapshot mLastEffectFormation;
-    PhaseModelFormationSnapshot mLastCompletionFormation;
-    bool mLastContextualSuccessorGuardEvaluated{};
-    bool mLastContextualSuccessorGuardApplied{};
     bool mGlobalEncoderArrivalWaitDeferred{};
     std::chrono::steady_clock::time_point mLastVisionArrival;
     double mVisionInterarrivalEwmaUs{};

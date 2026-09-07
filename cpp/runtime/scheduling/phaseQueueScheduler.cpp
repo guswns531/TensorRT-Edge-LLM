@@ -2177,20 +2177,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         case PhaseGlobalOverlapCostStatus::kUnprofitable: ++mTelemetry.globalOverlapUnprofitableCount; break;
         }
         mTelemetry.globalOverlapCoveringCostCount += overlapCovered ? 1U : 0U;
-        PhaseContextualPairDirection const completionDirection
-            = phaseContextualPairDirection(overlapKey.kind, overlapKey.residualAnchor);
-        bool const needsCompletionCalibration = mGlobalWarmupProbeMode
-            && mRuntimeCostTracker->contextualCompletionAuthorityEnabled()
-            && !mRuntimeCostTracker->contextualCompletionAuthorityEvidenceComplete(completionDirection);
         bool const needsLocalCalibration = localDiagnostic.status == PhaseGlobalOverlapCostStatus::kNoSamples
-            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples
-            || needsCompletionCalibration;
-        // Continuous completion-direction calibration is independent of the
-        // bounded sparse exact-key registry.  A late-arriving E/P/D shape may
-        // be unable to claim another exact key while still providing the
-        // low-dimensional posterior/conformal/held-out sample that warmup
-        // needs.  Coupling both budgets silently starves such directions.
-        bool calibrationTarget = !mGlobalWarmupProbeMode || needsCompletionCalibration;
+            || localDiagnostic.status == PhaseGlobalOverlapCostStatus::kInsufficientSamples;
+        bool calibrationTarget = !mGlobalWarmupProbeMode;
         if (mGlobalWarmupProbeMode)
         {
             PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
@@ -2287,20 +2276,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             contextualInput.decodeBatchCapacity = mConfig.maxDecodeBatchSize;
             candidate.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
             candidate.contextualPdFeatureValid = true;
-            candidate.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
-            candidate.contextualCompletionFeatureValid = true;
-            bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
-            candidate.contextualCompletionIncumbentReferenceUs
-                = decodeIncumbent ? overlapDecode->makespanUs : overlapPrefill->makespanUs;
-            candidate.contextualCompletionNewcomerReferenceUs
-                = decodeIncumbent ? overlapPrefill->makespanUs : overlapDecode->makespanUs;
-            candidate.contextualCompletionMinimumSlackUs = std::min(prefillSlack, decodeSlack);
-            candidate.contextualCompletion = mRuntimeCostTracker->predictContextualCompletionDirection(
-                contextualDirection, candidate.contextualCompletionFeatures,
-                candidate.contextualCompletionIncumbentReferenceUs, candidate.contextualCompletionNewcomerReferenceUs);
-            candidate.contextualEffect = mRuntimeCostTracker->predictContextualEffectDirection(
-                contextualDirection, candidate.contextualCompletionFeatures);
-            candidate.contextualEffectValid = true;
             PhaseContextualPdEstimate const contextual
                 = mRuntimeCostTracker->predictContextualDirection(contextualDirection, candidate.contextualPdFeatures);
             candidate.contextualPdMean = contextual.mean;
@@ -2333,49 +2308,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         }
         candidate.protectedCompletions.push_back(
             {decodeSlack, overlapDecodeCompletionUs, overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode});
-        if (mCompletionAttributionEnabled && candidate.contextualCompletionFeatureValid)
-        {
-            phaseCaptureScalarCompletionPolicy(candidate);
-        }
-        if (mRuntimeCostTracker->contextualCompletionAuthorityReady(
-                contextualDirection, candidate.contextualCompletion))
-        {
-            candidate.completionAuthorityReady = true;
-            PhaseContextualCompletionEstimate const authority
-                = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(
-                    contextualDirection, candidate.contextualCompletion);
-            double const completionWeight
-                = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(contextualDirection);
-            candidate.completionAggregateBlendWeight = completionWeight;
-            candidate.completionIncumbentBlendWeight
-                = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(contextualDirection, true);
-            candidate.completionNewcomerBlendWeight
-                = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(contextualDirection, false);
-            candidate.completionAuthorityApplied = completionWeight > 0.0
-                || candidate.completionIncumbentBlendWeight > 0.0 || candidate.completionNewcomerBlendWeight > 0.0;
-            double const scalarMakespanUs
-                = candidate.decisionCostKnown ? candidate.decisionMakespanUs : candidate.predictedMakespanUs;
-            candidate.decisionCostKnown = true;
-            candidate.decisionMakespanUs = phaseBlendContextualCompletionDecisionMakespanUs(
-                scalarMakespanUs, authority, candidate.contextualCompletionFeatures, completionWeight);
-            bool const decodeIncumbent = contextualDirection == PhaseContextualPairDirection::kDecodeToPrefill;
-            for (PhaseProtectedCompletion& completion : candidate.protectedCompletions)
-            {
-                bool const incumbent
-                    = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
-                if (incumbent && !mRuntimeCostTracker->contextualCompletionAuthorityPredictsIncumbent())
-                {
-                    continue;
-                }
-                double const componentWeight = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(
-                    contextualDirection, incumbent);
-                phaseBlendContextualCompletionComponent(completion.predictedCompletionUs, completion.uncertaintyUs,
-                    incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs,
-                    incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
-            }
-        }
-        candidate.activeDecisionCostKnown = candidate.decisionCostKnown;
-        candidate.activeDecisionMakespanUs = candidate.decisionMakespanUs;
         if (decodeFormation.has_value())
         {
             double const currentActionUs
@@ -2971,8 +2903,7 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     {
         // Residual P+D augmentation is producer-agnostic once the P row is
         // runnable. External/VLM rows have already satisfied their E -> P
-        // dependency here, and the same completion-vector model can price
-        // the remaining P and D work without a workload label.
+        // dependency here.
         PhaseContextualPdInput contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
             protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
             prefill.key.primaryContextBucket, decode.key.primaryContextBucket, overlap.key.executionVariant, true,
@@ -2983,22 +2914,8 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         contextualInput.decodeBatchCapacity = mConfig.maxDecodeBatchSize;
         overlap.contextualPdFeatures = phaseContextualPdFeatures(contextualInput);
         overlap.contextualPdFeatureValid = true;
-        overlap.contextualCompletionFeatures = phaseContextualPdCompletionFeatures(contextualInput);
-        overlap.contextualCompletionFeatureValid = true;
         PhaseContextualPairDirection const direction
             = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
-        bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
-        overlap.contextualCompletionIncumbentReferenceUs
-            = decodeIncumbent ? decode.predictedMakespanUs : prefill.predictedMakespanUs;
-        overlap.contextualCompletionNewcomerReferenceUs
-            = decodeIncumbent ? prefill.predictedMakespanUs : decode.predictedMakespanUs;
-        overlap.contextualCompletionMinimumSlackUs = protectedSlackUs;
-        overlap.contextualCompletion
-            = mRuntimeCostTracker->predictContextualCompletionDirection(direction, overlap.contextualCompletionFeatures,
-                overlap.contextualCompletionIncumbentReferenceUs, overlap.contextualCompletionNewcomerReferenceUs);
-        overlap.contextualEffect
-            = mRuntimeCostTracker->predictContextualEffectDirection(direction, overlap.contextualCompletionFeatures);
-        overlap.contextualEffectValid = true;
         PhaseContextualPdEstimate const contextual
             = mRuntimeCostTracker->predictContextualDirection(direction, overlap.contextualPdFeatures);
         overlap.contextualPdMean = contextual.mean;
@@ -3037,48 +2954,6 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     };
     appendProtected(active);
     appendProtected(*missing);
-    PhaseContextualPairDirection const direction
-        = phaseContextualPairDirection(overlap.key.kind, overlap.key.residualAnchor);
-    if (mCompletionAttributionEnabled && overlap.contextualCompletionFeatureValid)
-    {
-        phaseCaptureScalarCompletionPolicy(overlap);
-    }
-    if (mRuntimeCostTracker->contextualCompletionAuthorityReady(direction, overlap.contextualCompletion))
-    {
-        overlap.completionAuthorityReady = true;
-        PhaseContextualCompletionEstimate const authority
-            = mRuntimeCostTracker->contextualCompletionAuthorityEstimate(direction, overlap.contextualCompletion);
-        double const completionWeight = mRuntimeCostTracker->contextualCompletionAuthorityBlendWeight(direction);
-        overlap.completionAggregateBlendWeight = completionWeight;
-        overlap.completionIncumbentBlendWeight
-            = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, true);
-        overlap.completionNewcomerBlendWeight
-            = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, false);
-        overlap.completionAuthorityApplied = completionWeight > 0.0 || overlap.completionIncumbentBlendWeight > 0.0
-            || overlap.completionNewcomerBlendWeight > 0.0;
-        double const scalarMakespanUs
-            = overlap.decisionCostKnown ? overlap.decisionMakespanUs : overlap.predictedMakespanUs;
-        overlap.decisionCostKnown = true;
-        overlap.decisionMakespanUs = phaseBlendContextualCompletionDecisionMakespanUs(
-            scalarMakespanUs, authority, overlap.contextualCompletionFeatures, completionWeight);
-        bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
-        for (PhaseProtectedCompletion& completion : overlap.protectedCompletions)
-        {
-            bool const incumbent = completion.kind == PhaseProtectedKind::kDecode ? decodeIncumbent : !decodeIncumbent;
-            if (incumbent && !mRuntimeCostTracker->contextualCompletionAuthorityPredictsIncumbent())
-            {
-                continue;
-            }
-            double const componentWeight
-                = mRuntimeCostTracker->contextualCompletionAuthorityComponentBlendWeight(direction, incumbent);
-            phaseBlendContextualCompletionComponent(completion.predictedCompletionUs, completion.uncertaintyUs,
-                incumbent ? authority.incumbentMeanUs : authority.newcomerMeanUs,
-                incumbent ? authority.incumbentUncertaintyUs : authority.newcomerUncertaintyUs, componentWeight);
-        }
-    }
-    overlap.activeDecisionCostKnown = overlap.decisionCostKnown;
-    overlap.activeDecisionMakespanUs = overlap.decisionMakespanUs;
-
     // Compare equal work horizons. Leaving the incumbent single phase active
     // does not discard the ready peer phase; it executes that phase at the
     // immediately following boundary. A one-action incumbent would therefore
@@ -3351,15 +3226,10 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalReferenceWorkMs = global.referenceWorkUs / 1000.0;
         plan.contextualPdFeatures = global.contextualPdFeatures;
         plan.contextualPdFeatureValid = global.contextualPdFeatureValid;
-        plan.contextualCompletionFeatures = global.contextualCompletionFeatures;
-        plan.contextualCompletionFeatureValid = global.contextualCompletionFeatureValid;
         plan.contextualPdExploration = global.contextualPdExploration;
         plan.contextualPdMean = global.contextualPdMean;
         plan.contextualPdUncertainty = global.contextualPdUncertainty;
         plan.contextualPdLowerConfidenceBound = global.contextualPdLowerConfidenceBound;
-        plan.contextualCompletionIncumbentReferenceUs = global.contextualCompletionIncumbentReferenceUs;
-        plan.contextualCompletionNewcomerReferenceUs = global.contextualCompletionNewcomerReferenceUs;
-        plan.contextualCompletionMinimumSlackUs = global.contextualCompletionMinimumSlackUs;
         double const predictedMakespanUs
             = global.predictedMakespanUs > 0.0 ? global.predictedMakespanUs : global.predictedBlockingUs;
         plan.globalServiceCompression
@@ -3400,15 +3270,10 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalReferenceWorkMs = global->candidate.referenceWorkUs / 1000.0;
         plan.contextualPdFeatures = global->candidate.contextualPdFeatures;
         plan.contextualPdFeatureValid = global->candidate.contextualPdFeatureValid;
-        plan.contextualCompletionFeatures = global->candidate.contextualCompletionFeatures;
-        plan.contextualCompletionFeatureValid = global->candidate.contextualCompletionFeatureValid;
         plan.contextualPdExploration = global->candidate.contextualPdExploration;
         plan.contextualPdMean = global->candidate.contextualPdMean;
         plan.contextualPdUncertainty = global->candidate.contextualPdUncertainty;
         plan.contextualPdLowerConfidenceBound = global->candidate.contextualPdLowerConfidenceBound;
-        plan.contextualCompletionIncumbentReferenceUs = global->candidate.contextualCompletionIncumbentReferenceUs;
-        plan.contextualCompletionNewcomerReferenceUs = global->candidate.contextualCompletionNewcomerReferenceUs;
-        plan.contextualCompletionMinimumSlackUs = global->candidate.contextualCompletionMinimumSlackUs;
         plan.globalSafeProbe = global->safeProbe;
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kShadow)
         {
@@ -4289,22 +4154,6 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
                 {
                     ++mTelemetry.contextualPdRejectedObservationCount;
                 }
-                bool const decodeIncumbent = direction == PhaseContextualPairDirection::kDecodeToPrefill;
-                double const incumbentCompletionUs
-                    = static_cast<double>(decodeIncumbent ? metrics.decodeCompletionMs : metrics.prefillCompletionMs)
-                    * 1000.0;
-                double const newcomerCompletionUs
-                    = static_cast<double>(decodeIncumbent ? metrics.prefillCompletionMs : metrics.decodeCompletionMs)
-                    * 1000.0;
-                if (metrics.contextualCompletionFeatureValid)
-                {
-                    double const scalarDecisionMakespanUs = phaseContextualDecisionMakespanUs(
-                        static_cast<double>(referenceWorkMs) * 1000.0, metrics.contextualPdLowerConfidenceBound);
-                    static_cast<void>(mRuntimeCostTracker->observeContextualCompletionDirection(direction,
-                        metrics.contextualCompletionFeatures, metrics.contextualCompletionIncumbentReferenceUs,
-                        metrics.contextualCompletionNewcomerReferenceUs, incumbentCompletionUs, newcomerCompletionUs,
-                        metrics.contextualCompletionMinimumSlackUs, scalarDecisionMakespanUs));
-                }
             }
         }
     }
@@ -4344,11 +4193,6 @@ void PhaseQueueScheduler::setDecodeComponentObservationActive(bool active) noexc
     mDecodeComponentObservationActive = mConfig.enableDecodeComponentObservation && active;
 }
 
-void PhaseQueueScheduler::setCompletionAttributionEnabled(bool enabled) noexcept
-{
-    mCompletionAttributionEnabled = enabled;
-}
-
 void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
 {
     mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
@@ -4386,13 +4230,6 @@ void PhaseQueueScheduler::resetPolicyPosterior()
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Policy posterior can only be reset while the scheduler is idle");
     mRuntimeCostTracker->resetPolicyPosterior();
-}
-
-void PhaseQueueScheduler::resetCompletionAuthorityEvidence()
-{
-    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
-        "Completion authority evidence can only be reset while the scheduler is idle");
-    mRuntimeCostTracker->resetCompletionAuthorityEvidence();
 }
 
 void PhaseQueueScheduler::resetExecutionCostHistory()

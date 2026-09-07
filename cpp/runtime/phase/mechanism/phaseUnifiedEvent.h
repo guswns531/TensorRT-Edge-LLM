@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "runtime/phase/policy/phaseContextualPdModel.h"
+#include "runtime/phase/policy/phaseDeadline.h"
 #include "runtime/phase/policy/phaseGlobalCostModel.h"
 
 #include <algorithm>
@@ -370,32 +370,6 @@ struct PhaseInFlightSnapshot
 //! Predictor-independent summary of one immutable transition replay. Min/max
 //! rows preserve uncertainty envelopes without choosing an arbitrary physical
 //! completion order in telemetry.
-struct PhaseTransitionReplaySnapshot
-{
-    bool evaluated{};
-    bool valid{};
-    size_t alternatives{};
-    double worstCaseRobustHorizonUs{};
-    uint8_t firstCompletedPhaseMask{};
-    size_t minFirstEncoderReadyRows{};
-    size_t maxFirstEncoderReadyRows{};
-    size_t minFirstPrefillReadyRows{};
-    size_t maxFirstPrefillReadyRows{};
-    size_t minFirstDecodeReadyRows{};
-    size_t maxFirstDecodeReadyRows{};
-    size_t minEncoderReadyRows{};
-    size_t maxEncoderReadyRows{};
-    size_t minPrefillReadyRows{};
-    size_t maxPrefillReadyRows{};
-    size_t minDecodeReadyRows{};
-    size_t maxDecodeReadyRows{};
-    size_t minReclaimBytes{};
-    size_t maxReclaimBytes{};
-};
-
-//! Equal-work H=2 selection made by one physical-outcome representation over
-//! the exact same mechanism frontier. This remains shadow telemetry unless a
-//! separate held-out promotion gate grants that model policy authority.
 struct PhaseModelFormationSnapshot
 {
     bool evaluated{};
@@ -415,37 +389,10 @@ struct PhaseUnifiedCandidateSnapshot
     double predictedCompletionUs{};
     double uncertaintyUs{};
     double predictedSloViolationUs{};
-    //! Pre-update contextual completion evidence for this exact decision
-    //! frontier.  Keeping every legal candidate here lets offline replay join
-    //! cross-run measured labels without reconstructing process-local model
-    //! state or treating the selected action as the whole frontier.
-    bool contextualCompletionValid{};
-    bool contextualCompletionFeatureV2Valid{};
-    PhaseContextualPdFeatures contextualCompletionFeatures{};
-    PhaseContextualPairDirection contextualDirection{PhaseContextualPairDirection::kPrefillToDecode};
-    PhaseContextualCompletionEstimate contextualCompletion;
-    bool contextualEffectValid{};
-    PhaseContextualEffectEstimate contextualEffect;
-    double contextualIncumbentReferenceUs{};
-    double contextualNewcomerReferenceUs{};
-    double contextualMinimumSlackUs{std::numeric_limits<double>::infinity()};
-    bool completionPolicyEvaluated{};
-    bool completionAuthorityReady{};
-    bool completionAuthorityApplied{};
     bool scalarDecisionCostKnown{};
-    bool activeDecisionCostKnown{};
     bool contextualScalarAuthorityApplied{};
     double scalarDecisionMakespanUs{};
-    double activeDecisionMakespanUs{};
-    double completionAggregateBlendWeight{};
-    double completionIncumbentBlendWeight{};
-    double completionNewcomerBlendWeight{};
     std::vector<PhaseProtectedCompletion> scalarProtectedCompletions;
-    std::vector<PhaseProtectedCompletion> activeProtectedCompletions;
-    uint64_t transitionActionId{};
-    PhaseTransitionReplaySnapshot scalarTransition;
-    PhaseTransitionReplaySnapshot effectTransition;
-    PhaseTransitionReplaySnapshot completionTransition;
 };
 
 struct PhaseUnifiedEvent
@@ -504,28 +451,18 @@ struct PhaseUnifiedEvent
     //! includes the chosen candidate, launch direction, and outstanding-set
     //! transition, while retaining candidateId's stable-slot row ordering.
     uint64_t dispatchSignature{};
-    bool frozenTransitionSnapshotValid{};
-    uint64_t frozenTransitionSnapshotId{};
-    size_t frozenTransitionCandidates{};
     bool causalReplayForced{};
     PhaseUnifiedWork cohort;
     std::vector<uint64_t> requestIds;
     PhaseInFlightSnapshot inFlight;
     std::vector<PhaseUnifiedCandidateSnapshot> candidates;
     uint64_t selectedActionId{};
-    //! H=1 selector result with completion authority as evaluated online.
-    uint64_t activeH1SelectedActionId{};
-    //! H=1 selector result after restoring completion-sensitive candidate
-    //! fields to their scalar values over this exact frontier.
+    //! H=1 contextual-scalar selector result over this exact frontier.
     uint64_t scalarSelectedActionId{};
-    //! H=1 result after removing contextual scalar and completion authority
+    //! H=1 result after removing contextual scalar authority
     //! from the identical candidate frontier. Exact CUDA costs remain.
     uint64_t nonContextualSelectedActionId{};
-    bool contextualSuccessorGuardEvaluated{};
-    bool contextualSuccessorGuardApplied{};
     PhaseModelFormationSnapshot scalarFormation;
-    PhaseModelFormationSnapshot effectFormation;
-    PhaseModelFormationSnapshot completionFormation;
     uint64_t enqueueHostNs{};
     uint64_t prepareStartHostNs{};
     uint64_t prepareEndHostNs{};

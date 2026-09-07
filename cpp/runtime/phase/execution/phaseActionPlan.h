@@ -64,41 +64,14 @@ struct PhaseGlobalActionCandidate
     bool calibrationProbe{};
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
-    PhaseContextualPdFeatures contextualCompletionFeatures{};
-    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
     double contextualPdMean{};
     double contextualPdUncertainty{};
     double contextualPdLowerConfidenceBound{};
-    double contextualCompletionIncumbentReferenceUs{};
-    double contextualCompletionNewcomerReferenceUs{};
-    double contextualCompletionMinimumSlackUs{std::numeric_limits<double>::infinity()};
-    PhaseContextualCompletionEstimate contextualCompletion{};
-    //! Shadow-only decision-relevant physical effects. These are collected
-    //! from the same common-epoch labels as Completion-Vector but do not gain
-    //! scheduling authority until frozen replay gates pass.
-    bool contextualEffectValid{};
-    PhaseContextualEffectEstimate contextualEffect{};
-    //! Same-snapshot scalar counterfactual captured immediately before
-    //! completion-vector authority changes decision or protected completion
-    //! estimates. This is diagnostic state, not a second policy authority.
-    bool completionPolicyEvaluated{};
-    bool completionAuthorityReady{};
-    bool completionAuthorityApplied{};
-    bool scalarDecisionCostKnown{};
-    bool activeDecisionCostKnown{};
-    double scalarDecisionMakespanUs{};
-    double activeDecisionMakespanUs{};
-    double completionAggregateBlendWeight{};
-    double completionIncumbentBlendWeight{};
-    double completionNewcomerBlendWeight{};
-    std::vector<PhaseProtectedCompletion> scalarProtectedCompletions;
     //! Encoder pair policy evidence is consumed by the three-phase global
     //! coordinator and recorded with the matching E+P or E+D completion.
     PhaseContextualPdFeatures contextualEncoderPairFeatures{};
     bool contextualEncoderPairFeatureValid{};
-    PhaseContextualPdFeatures contextualEncoderCompletionFeatures{};
-    bool contextualEncoderCompletionFeatureValid{};
     bool contextualEncoderPairReady{};
     bool contextualEncoderPairExploration{};
     double contextualEncoderPairMean{};
@@ -144,37 +117,11 @@ struct PhaseGlobalActionCandidate
     PhaseActionMemoryHorizon memory;
 };
 
-//! Capture scalar policy inputs after protected completions are materialized
-//! and before completion-vector authority is projected into the candidate.
-inline void phaseCaptureScalarCompletionPolicy(PhaseGlobalActionCandidate& candidate)
-{
-    candidate.completionPolicyEvaluated = true;
-    candidate.scalarDecisionCostKnown = candidate.decisionCostKnown;
-    candidate.activeDecisionCostKnown = candidate.decisionCostKnown;
-    candidate.scalarDecisionMakespanUs = candidate.decisionMakespanUs;
-    candidate.activeDecisionMakespanUs = candidate.decisionMakespanUs;
-    candidate.scalarProtectedCompletions = candidate.protectedCompletions;
-}
-
-//! Restore an immutable candidate copy to its scalar policy inputs for
-//! same-frontier shadow attribution or controlled replay.
-inline void phaseRestoreScalarCompletionPolicy(PhaseGlobalActionCandidate& candidate)
-{
-    if (!candidate.completionPolicyEvaluated)
-    {
-        return;
-    }
-    candidate.decisionCostKnown = candidate.scalarDecisionCostKnown;
-    candidate.decisionMakespanUs = candidate.scalarDecisionMakespanUs;
-    candidate.protectedCompletions = candidate.scalarProtectedCompletions;
-}
-
 //! Remove only contextual scalar authority while retaining exact CUDA cost,
 //! feasibility, SLO, ownership, and row-order state. Completion authority is
 //! restored first because its scalar baseline may itself be contextual.
 inline void phaseRestoreNonContextualPolicy(PhaseGlobalActionCandidate& candidate)
 {
-    phaseRestoreScalarCompletionPolicy(candidate);
     if (candidate.contextualScalarAuthorityApplied)
     {
         candidate.decisionCostKnown = false;
@@ -208,8 +155,6 @@ struct PhaseGlobalDispatchPlan
     std::vector<int32_t> secondaryStableSlotIds;
     PhaseContextualPdFeatures contextualPdFeatures{};
     bool contextualPdFeatureValid{};
-    PhaseContextualPdFeatures contextualCompletionFeatures{};
-    bool contextualCompletionFeatureValid{};
     bool contextualPdExploration{};
 
     bool permits(PhaseExecutionSet phases) const noexcept;
