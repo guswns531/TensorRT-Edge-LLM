@@ -34,7 +34,16 @@
         {
             semanticSchedulerConfig.globalSelectionMode = rt::PhaseGlobalSelectionMode::kLegacyCompatibility;
         }
-        if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
+        // Keep the semantic P/D queue and the three-phase coordinator on one
+        // decode-service contract.  The vision-facing millisecond option is
+        // the composition-root SLO when it is present; request metadata can
+        // still override it per row.  Previously only the coordinator read
+        // this value, leaving the queue on its unrelated 20 ms default.
+        if (char const* value = std::getenv("TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS"))
+        {
+            semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value) * 1000.0;
+        }
+        else if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value);
         }
