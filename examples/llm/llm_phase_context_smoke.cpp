@@ -1294,16 +1294,6 @@ int main(int argc, char** argv)
             std::vector<std::vector<rt::Tensor>> segmentedDeepstackViews;
             std::vector<rt::OptionalInputTensors> segmentedDeepstackSegments;
             std::vector<rt::IndependentPhaseRequestView const*> visionViews;
-            if (prefill)
-            {
-                for (rt::IndependentPhaseRequestView const& view : views)
-                {
-                    if (view.visionPayload != nullptr)
-                    {
-                        visionViews.push_back(&view);
-                    }
-                }
-            }
             auto imageRange = [&](rt::IndependentPhaseRequestView const& view) {
                 auto const chunkBegin = view.promptTokens->begin() + view.work.tokenOffset;
                 auto const chunkEnd = chunkBegin + view.work.tokenCount;
@@ -1311,6 +1301,16 @@ int main(int argc, char** argv)
                 int64_t const count = std::count(chunkBegin, chunkEnd, config.imageTokenId);
                 return std::pair<int64_t, int64_t>{offset, count};
             };
+            if (prefill)
+            {
+                for (rt::IndependentPhaseRequestView const& view : views)
+                {
+                    if (view.visionPayload != nullptr && imageRange(view).second > 0)
+                    {
+                        visionViews.push_back(&view);
+                    }
+                }
+            }
             auto makeFeatureView = [&](rt::Tensor& feature, int64_t imageOffset, int64_t imageTokens,
                                        std::string const& name) {
                 rt::Coords const shape = feature.getShape();

@@ -39,6 +39,7 @@ protected:
     void buildExtraInputs(std::vector<VisionSpan> const& spans, int64_t totalSeqLength, int64_t totalImageTokens,
         cudaStream_t stream) override;
     bool bindExtraInputShapes() override;
+    bool bindExtraOutputStorage(std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
 
     //! Video splits into per-frame sub-spans (each vit.gridT==1), unlike the base single flat span.
     std::tuple<int64_t, int64_t> computeVisionSpans(

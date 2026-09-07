@@ -927,5 +927,26 @@ rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
     return {};
 }
 
+bool QwenViTRunner::bindExternalOutputStorage(
+    rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures)
+{
+    check::check(
+        outputEmbedding.getDeviceType() == rt::DeviceType::kGPU, "External vision output storage must be a GPU tensor");
+    check::check(outputEmbedding.getDataType() == mOutputEmbedding.getDataType(),
+        "External vision output storage has the wrong data type");
+    check::check(outputEmbedding.getShape() == mOutputEmbedding.getShape(),
+        "External vision output storage has the wrong shape");
+    if (!bindExtraOutputStorage(deepstackFeatures))
+    {
+        return false;
+    }
+    return mVisualContext->setTensorAddress(binding_names::kVisualOutput, outputEmbedding.rawPointer());
+}
+
+bool QwenViTRunner::bindExtraOutputStorage(std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures)
+{
+    return deepstackFeatures.empty();
+}
+
 } // namespace rt
 } // namespace trt_edgellm

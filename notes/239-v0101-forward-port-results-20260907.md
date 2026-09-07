@@ -18,11 +18,16 @@ The completed path includes:
 - identical greedy token traces across V0/V1/V2 for all 12 retained workloads;
 - one-image and two-image semantic VLM inference through the public executable;
 - three-repeat V0/V1/V2 measurements using one binary, engine, request set, calibration contract, and memory limit.
+- request-owned Qwen/Cosmos encoder outputs bound directly as TensorRT output tensors, eliminating the retained-output
+  device copy;
+- a follow-up E4/P8/D32 single-run matrix that restores encoder batching while preserving the same binary, engine,
+  traces, and policy calibration.
 
-The port is functionally complete for the declared v1 scope. It is not yet a performance replacement for the retained
-v0.10.0 configuration: v0.10.1 workspace growth forces the 10 GiB GPU from the old E4/P8/D64 frontier to E1/P8/D32.
-Within this new frontier V1 is the best general default. V2 is valuable for long-prefill and bimodal traces but is not
-a universal winner.
+The port is functionally complete for the declared v1 scope. Direct encoder-output binding restores E4 when decode is
+limited to D32, but it does not recover E4/D64: the runner's internal maximum-size output tensors remain resident even
+when TensorRT writes into request-owned storage. E4/D32 is therefore a measured high-throughput frontier with only
+23--35 MiB of framebuffer headroom, while E1/D32 remains the conservative configuration. V1 is the best general
+default in both frontiers. V2 is valuable for long-prefill and bimodal traces but is not a universal winner.
 
 ## 2. Source and artifact identity
 
@@ -36,7 +41,8 @@ a universal winner.
 | TensorRT / CUDA | 11.0.0 / 13.3 |
 | GPU | NVIDIA GeForce RTX 3080, 10 GiB, SM86 |
 | Text engine | max B80, P8, D64, vision-P4, KV capacity 2048, 256 pages, packed chunk 128 |
-| Runtime-safe VLM frontier | E1, P8, D32, at most one encoded vision request resident |
+| Conservative VLM frontier | E1, P8, D32, at most one encoded vision request resident |
+| Measured high-throughput frontier | E4, P8, D32; 9,839--9,851 MiB peak, not a 512 MiB-headroom production setting |
 
 Retained local artifacts are indexed by `.local/results/v0101-forward-port/build-manifest.txt`. The text ONNX and
 engine hashes are recorded there. The 4 GiB ONNX external-data sidecar was deleted only after hashing and successful
@@ -143,6 +149,7 @@ Legacy `handleRequest()` is rejected for an undercommitted pool so that it canno
 | External weights | `cpp/runtime/state/externalWeightManager.*` | One validation with multiple phase tensor maps |
 | Export/build metadata | `tensorrt_edgellm/checkpoint/checkpoint_utils.py`, `cpp/builder/llmBuilder.cpp` | Packed-prefill and asymmetric profile metadata propagation |
 | Comparison tool | `benchmarks/phase_serving/compare_http_policy_variants.py` | Contract checks, token-hash identity, absolute and relative CSV/JSON |
+| Direct encoder output | `cpp/multimodal/qwen2/qwenViTRunner.*`, `cpp/multimodal/qwen3/qwen3vlViTRunner.*` | Main and deepstack outputs bind directly to request-owned leases |
 
 The branch is split into reviewable stages:
 
@@ -184,7 +191,7 @@ The retained two-image semantic run is
 The output refers to both images rather than asking the caller to provide an image again. This closes the previous
 multi-image placement issue for the tested Cosmos contract.
 
-A final rebuild and validation pass produced:
+A final rebuild and validation pass after the direct-output port produced:
 
 | Check | Result |
 |---|---:|
@@ -193,6 +200,12 @@ A final rebuild and validation pass produced:
 | `test_export_config.py` | 16 passed |
 | Pre-commit hooks | all passed |
 | Result analyzer regeneration | byte-identical JSON to the retained comparison |
+
+The direct-output integration was also exercised by the real HTTP multi-image path. The E1 run recorded five direct
+encoder batches, 48,300,032 bytes of direct output, and zero retained-output D2D operations or bytes. The previous
+fallback path performed 20 D2D operations for the same 48,300,032 bytes. The request-owned lease and its CUDA-ready
+event remain unchanged: P cannot consume the tensors before E completion, and the storage pool cannot reuse them
+until every P consumer has completed.
 
 The rebuilt `llm_phase_context_smoke` then completed a 48-request short HTTP/IPC trace with 1,040 generated tokens,
 94.293 req/s, deterministic token hash `9e44a8e...6726a`, 95.320/182.339 ms TTFT mean/p95,
@@ -310,25 +323,28 @@ No separate clean-v0.10.1 engine was built. Doing so would require another rough
 was free. The source baseline and source delta are documented in `237-upstream-v0101-code-comparison-20260907.md`;
 performance claims are deliberately deferred instead of using the Current engine as a clean-upstream proxy.
 
-## 8. Memory frontier and failed alternatives
+## 8. Direct-output memory frontier
 
 The following are real allocation outcomes, not scheduler estimates:
 
 | Configuration | Outcome |
 |---|---|
-| E2/P8/D32, encoded vision 2 | CUDA OOM |
-| E2/P4/D16, KV/runtime cap 64 | CUDA OOM |
-| E1/P8/D32, encoded vision 1 | success, ready 9,803 MiB, peak 9,821 MiB |
-| E1/P8/D16, runtime cap 16 | success, but needlessly reduces D concurrency |
+| E1/P8/D32 | success, 9,821 MiB in the retained matrix and 9,821 MiB in the direct-output E1 check |
+| E2/P8/D32 | success, 9,825 MiB peak; multi-image 5.107 req/s |
+| E4/P8/D32 | success, 9,839 MiB in the focused run and up to 9,851 MiB in the 12-workload matrix |
+| E1/P8/D64 | success, 9,871 MiB peak and approximately 3 MiB allocatable headroom |
+| E2/P8/D64 | CUDA OOM while allocating measurement-request storage |
+| E4/P8/D64 | CUDA OOM while allocating measurement-request storage |
 
-E2 still fails because the visual runner output and request-owned persistent vision payload coexist during handoff.
-Workspace aliasing removed hundreds of MiB but did not remove this duplicate payload lifetime. The next memory task is
-a completion-gated zero-copy E-to-P lease or a preallocated shared vision slab. That must preserve the invariant that
-E cannot overwrite a feature buffer until every P consumer has completed.
+The new binding removes the transient runner-output-to-retained-payload transfer, but it does not release the Qwen3
+runner's internal maximum output and three deepstack buffers. This distinction matters: the data path is copy-free,
+but the static memory footprint is not yet single-buffered. Recovering D64 together with E4 requires eliminating or
+right-sizing that internal backing, reducing another persistent pool, or changing the engine/runtime memory contract.
+E1/D64 is an allocation boundary probe, not a deployable configuration.
 
 ## 9. Promotion decision
 
-The port passes functional and output-fidelity gates for its supported scope:
+The conservative E1 port passes functional and output-fidelity gates for its supported scope:
 
 - single-GPU vanilla text and vision requests;
 - continuous admission and asynchronous token/completion polling;
@@ -336,26 +352,91 @@ The port passes functional and output-fidelity gates for its supported scope:
 - one-image and two-image placement;
 - V0/V1/V2 identical greedy token traces on all retained workloads.
 
-It does not pass the performance portability gate relative to the retained v0.10.0 system or frozen vLLM. The default
-policy should therefore be V1 Scalar for the current branch, while V2 remains an experimental variant.
+The E4 follow-up passes completion and semantic VLM checks, but exact cross-policy token identity is 9/12. The three
+exceptions are mixed, text-heavy, and vision-heavy; 3/64, 4/64, and 4/64 requests respectively differ, all in vision
+rows. The outputs remain semantically image-conditioned, but E4 cannot replace the conservative exact-identity gate
+until canonical execution/row-order sensitivity is resolved or a stated numerical-fidelity contract replaces exact
+greedy identity.
+
+Neither frontier passes the performance portability gate relative to the retained v0.10.0 E4/P8/D64 system or frozen
+vLLM. V1 Scalar remains the default policy candidate, while V2 remains an experimental transition ablation.
 
 Unsupported paths remain explicit: speculative decoding, audio, tensor parallel phase serving, context reuse, DART,
 and calling legacy `handleRequest()` on an undercommitted KV pool.
 
 ## 10. Next ordered work
 
-1. **Zero-copy vision lease.** Remove the runner-output to persistent-payload duplication and re-test E2/E4 memory.
-2. **Recover D64.** Right-size remaining decode logits/sampling/IO buffers and expand CUDA graph buckets only after
-   memory validation.
-3. **Re-run the same 12 workloads.** Require identical token hashes and no regression outside the intended frontier.
-4. **Re-evaluate V2.** Fix balanced/decode-heavy transition overvaluation without workload-name rules; retain V1 as
+1. **Make direct output single-buffered.** Remove or lazily allocate the now-unused Qwen/Cosmos internal output and
+   deepstack backing while retaining the request-owned double-buffering needed for E/P pipelining.
+2. **Recover D64 with headroom.** Right-size decode logits/sampling/IO buffers and expand CUDA graph buckets only after
+   proving at least 512 MiB of deployable headroom or explicitly adopting a lower memory target.
+3. **Resolve E4 numerical sensitivity.** Canonicalize row/cohort ordering and repeat the three divergent VLM traces;
+   keep the strict comparison tool unchanged.
+4. **Make E cohort formation state-driven.** Preserve E4's burst benefit without using workload names, and bound E
+   wait by first-token slack and observable ready/event state.
+5. **Re-evaluate V2.** Fix balanced/decode-heavy transition overvaluation without workload-name rules; retain V1 as
    fallback until V2 wins the gate.
-5. **Fair external comparison.** Run clean v0.10.1, Current, and vLLM with equal model, precision, request arrival,
+6. **Fair external comparison.** Run clean v0.10.1, Current, and vLLM with equal model, precision, request arrival,
    output contract, memory budget, E/P/D limits, and graph mode.
-6. **Fresh visual pipeline.** When disk permits, execute visual export, build, and inference entirely from this branch.
-7. **Broaden scope only after promotion.** Add context reuse and multi-rank support after the single-GPU gate passes.
+7. **Fresh visual pipeline.** When disk permits, execute visual export, build, and inference entirely from this branch.
+8. **Broaden scope only after promotion.** Add context reuse and multi-rank support after the single-GPU gate passes.
 
 The research conclusion is narrower but stronger than an aggregate speedup claim: the v0.10.1 execution substrate can
-host the independent phase architecture with full output fidelity, but context workspace and payload lifetimes are now
-the limiting resource. Scheduler comparisons are meaningful only after that memory-induced E/D frontier change is
-controlled.
+host the independent phase architecture and direct request-owned vision output. The limiting resource is now static
+context/IO/output storage rather than the E-to-P copy itself. Scheduler comparisons remain meaningful only when the
+memory-induced E/D frontier and numerical-order contract are reported explicitly.
+
+## 11. E4/P8/D32 follow-up matrix
+
+This matrix is a one-run engineering sweep performed after direct output was enabled. It reuses one binary, one engine,
+the same 12 traces, the same 319-request VLM/260-request text generic calibration, fixed P128, P8, D32, and identical
+memory settings. Only the policy authority changes. It complements rather than replaces the three-repeat E1 matrix.
+
+| Workload | Policy | req/s | token/s | TTFT mean/p95 ms | TPOT mean/p95 ms | E2E mean/p95 ms | peak MiB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| short | V0 | 92.864 | 2012.1 | 98.7 / 186.4 | 15.66 / 29.49 | 384.4 / 484.2 | 9803 |
+|  | V1 | 93.499 | 2025.8 | 101.2 / 186.5 | 15.20 / 25.23 | 381.7 / 483.6 | 9803 |
+|  | V2 | 91.052 | 1972.8 | 106.0 / 202.7 | 15.59 / 29.27 | 390.3 / 494.3 | 9803 |
+| balanced | V0 | 31.278 | 2710.8 | 54.5 / 186.3 | 21.63 / 25.59 | 1900.1 / 3161.8 | 9803 |
+|  | V1 | 31.859 | 2761.2 | 59.0 / 189.9 | 21.12 / 24.95 | 1858.2 / 3085.1 | 9803 |
+|  | V2 | 30.551 | 2647.8 | 60.0 / 190.5 | 22.01 / 26.25 | 1936.5 / 3212.2 | 9803 |
+| decode-heavy | V0 | 12.538 | 3259.9 | 56.1 / 202.8 | 18.01 / 19.72 | 4705.4 / 7503.0 | 9803 |
+|  | V1 | 12.692 | 3300.0 | 60.0 / 202.5 | 17.76 / 19.16 | 4642.7 / 7316.6 | 9803 |
+|  | V2 | 11.979 | 3114.5 | 61.3 / 205.3 | 18.89 / 20.86 | 4937.0 / 7926.6 | 9803 |
+| long-prefill | V0 | 10.477 | 908.0 | 2664.8 / 3294.1 | 36.84 / 50.24 | 5770.9 / 8233.9 | 9803 |
+|  | V1 | 12.639 | 1095.4 | 2303.3 / 3282.2 | 28.92 / 40.43 | 4753.1 / 7047.9 | 9803 |
+|  | V2 | 13.966 | 1210.4 | 2109.8 / 2788.3 | 25.51 / 33.13 | 4272.7 / 6003.2 | 9803 |
+| bimodal | V0 | 10.268 | 1574.4 | 2339.3 / 5389.8 | 22.54 / 39.65 | 5431.2 / 11469.2 | 9803 |
+|  | V1 | 11.190 | 1715.8 | 2173.4 / 4561.2 | 20.83 / 33.60 | 4984.7 / 10221.1 | 9803 |
+|  | V2 | 11.412 | 1749.8 | 2119.3 / 4765.1 | 19.69 / 30.22 | 4825.0 / 10091.9 | 9803 |
+| text-heavy | V0 | 24.473 | 1297.1 | 481.9 / 2022.2 | 17.32 / 20.47 | 1397.1 / 2494.4 | 9847 |
+|  | V1 | 24.359 | 1291.0 | 491.6 / 2042.6 | 16.61 / 20.93 | 1371.7 / 2500.3 | 9851 |
+|  | V2 | 22.570 | 1196.2 | 475.5 / 2165.3 | 19.07 / 23.28 | 1485.4 / 2685.7 | 9841 |
+| mixed | V0 | 14.220 | 650.6 | 1175.2 / 3867.1 | 14.26 / 17.02 | 1816.0 / 4342.2 | 9849 |
+|  | V1 | 14.196 | 649.5 | 1192.9 / 3809.8 | 13.95 / 18.15 | 1829.0 / 4313.4 | 9849 |
+|  | V2 | 14.192 | 649.3 | 1152.8 / 3911.2 | 14.70 / 18.31 | 1830.5 / 4350.6 | 9849 |
+| poisson | V0 | 20.541 | 1499.5 | 391.9 / 2024.1 | 19.66 / 26.43 | 1808.2 / 2657.9 | 9847 |
+|  | V1 | 20.652 | 1507.6 | 396.5 / 2047.4 | 18.92 / 24.37 | 1752.6 / 2598.4 | 9847 |
+|  | V2 | 20.205 | 1474.9 | 385.9 / 2069.4 | 20.32 / 25.82 | 1850.7 / 2682.6 | 9843 |
+| vision-heavy | V0 | 10.026 | 386.0 | 2322.2 / 5796.5 | 13.82 / 15.80 | 2847.6 / 6254.9 | 9851 |
+|  | V1 | 10.333 | 397.8 | 2305.8 / 5668.5 | 12.22 / 16.23 | 2776.1 / 6046.7 | 9851 |
+|  | V2 | 10.070 | 387.7 | 2337.5 / 5770.9 | 13.20 / 16.48 | 2846.5 / 6217.7 | 9849 |
+| wave-drain | V0 | 2.948 | 94.3 | 288.6 / 555.2 | 7.99 / 10.66 | 536.3 / 761.6 | 9847 |
+|  | V1 | 2.948 | 94.3 | 285.7 / 548.2 | 8.01 / 10.85 | 533.9 / 754.7 | 9847 |
+|  | V2 | 2.947 | 94.3 | 287.7 / 551.4 | 8.00 / 10.67 | 535.7 / 757.6 | 9847 |
+| late-vision | V0 | 16.485 | 2378.0 | 149.0 / 603.6 | 9.90 / 9.95 | 1566.9 / 1938.8 | 9849 |
+|  | V1 | 16.497 | 2379.7 | 148.5 / 597.2 | 9.86 / 9.91 | 1561.7 / 1935.0 | 9849 |
+|  | V2 | 16.345 | 2357.7 | 144.9 / 577.5 | 9.95 / 10.01 | 1570.0 / 1954.7 | 9849 |
+| multi-image | V0 | 6.219 | 199.0 | 317.6 / 531.9 | 9.48 / 10.80 | 611.3 / 763.8 | 9839 |
+|  | V1 | 6.364 | 203.6 | 290.7 / 512.4 | 7.93 / 9.74 | 536.5 / 741.7 | 9847 |
+|  | V2 | 6.294 | 201.4 | 307.6 / 521.5 | 9.47 / 10.77 | 601.3 / 753.3 | 9839 |
+
+Geometric-mean request throughput relative to V0 is +3.08% for V1 with 9/12 wins and +1.79% for V2 with 4/12
+wins. Compared with each policy's retained E1 matrix, E4 is +34.64%/+35.38%/+34.71% for V0/V1/V2, but that is not
+a pure batch-size ablation: the E1 results predate direct output and are three-run medians, whereas E4 is one run.
+The focused direct-output E1 run changed multi-image throughput by less than one percent, so the large VLM increase is
+principally encoder cohort formation rather than copy elimination.
+
+Against the unchanged frozen vLLM token-throughput table, E4 V0/V1/V2 are -19.57%/-17.09%/-18.13% geometric mean.
+That improves substantially on the E1 port's -40.26%/-38.76%/-39.22%, but remains below the retained v0.10.0 E4/D64
+configuration, which was +15.16% for V2 on the same frozen table. D32 remains the dominant portability difference.

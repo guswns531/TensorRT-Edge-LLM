@@ -94,6 +94,34 @@ bool Qwen3VLViTRunner::bindExtraInputShapes()
     return setEngineIOStatus;
 }
 
+bool Qwen3VLViTRunner::bindExtraOutputStorage(std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures)
+{
+    if (deepstackFeatures.size() != mDeepstackFeatures.size())
+    {
+        return false;
+    }
+    for (size_t index{}; index < deepstackFeatures.size(); ++index)
+    {
+        rt::Tensor& external = deepstackFeatures[index].get();
+        rt::Tensor const& internal = mDeepstackFeatures[index];
+        check::check(
+            external.getDeviceType() == rt::DeviceType::kGPU, "External deepstack output storage must be a GPU tensor");
+        check::check(external.getDataType() == internal.getDataType(),
+            "External deepstack output storage has the wrong data type");
+        check::check(
+            external.getShape() == internal.getShape(), "External deepstack output storage has the wrong shape");
+    }
+    for (size_t index{}; index < deepstackFeatures.size(); ++index)
+    {
+        std::string const name = binding_names::formatDeepstackFeaturesName(index);
+        if (!mVisualContext->setTensorAddress(name.c_str(), deepstackFeatures[index].get().rawPointer()))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::tuple<int64_t, int64_t> Qwen3VLViTRunner::getResizedImageSize(
     int64_t numFrames, bool isVideo, int64_t height, int64_t width, int64_t maxRatio)
 {
