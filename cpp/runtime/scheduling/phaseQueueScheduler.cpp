@@ -1624,6 +1624,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     int32_t prefillPastKV{};
     int32_t prefillUsefulTokens{};
     bool prefillInitial{};
+    bool prefillAllFinal{!prefillPlan.prefillBatch.empty()};
     PhasePrefillClass prefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> prefillRequestIds;
     std::vector<int32_t> prefillStableSlotIds;
@@ -1632,6 +1633,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         prefillChunk = std::max(prefillChunk, item.tokenCount);
         prefillPastKV = std::max(prefillPastKV, item.tokenOffset);
         prefillUsefulTokens += item.tokenCount;
+        prefillAllFinal = prefillAllFinal && item.tokenOffset + item.tokenCount == item.promptTokenCount;
         prefillRequestIds.push_back(item.requestId);
         prefillStableSlotIds.push_back(item.kvSlotId);
     }
@@ -1671,7 +1673,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     int32_t overlapDecodeMaxContext{};
     int32_t overlapPrefillUsefulTokens{};
     bool overlapPrefillInitial{};
-    bool overlapPrefillAllFinal{!overlapPlan.prefillBatch.empty()};
     PhasePrefillClass overlapPrefillClass{PhasePrefillClass::kAny};
     std::vector<uint64_t> overlapPrefillRequestIds;
     std::vector<uint64_t> overlapDecodeRequestIds;
@@ -1682,7 +1683,6 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         overlapPrefillChunk = std::max(overlapPrefillChunk, item.tokenCount);
         overlapPrefillPastKV = std::max(overlapPrefillPastKV, item.tokenOffset);
         overlapPrefillUsefulTokens += item.tokenCount;
-        overlapPrefillAllFinal = overlapPrefillAllFinal && item.tokenOffset + item.tokenCount == item.promptTokenCount;
         overlapPrefillRequestIds.push_back(item.requestId);
         overlapPrefillStableSlotIds.push_back(item.kvSlotId);
     }
@@ -1801,6 +1801,23 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         double const uncertaintyMs = selected != nullptr ? 0.0 : mConfig.globalCostModelConfig.coldStartUncertaintyMs;
         return {makespanMs * 1000.0, uncertaintyMs * 1000.0, referenceMs * 1000.0, selected != nullptr};
     };
+    auto predictDecodeSuccessor
+        = [&](PhaseGlobalActionKey const& key, int32_t rows, int32_t maxContext, int64_t contextTokens) {
+              Prediction prediction = predictDecode(key, rows, maxContext, contextTokens);
+              if (prediction.directlyKnown)
+              {
+                  return prediction;
+              }
+              std::optional<PhaseGlobalCostEstimate> const covering
+                  = mRuntimeCostTracker->trustedEstimatePrimaryBatchCoveringContext(key);
+              if (!covering.has_value())
+              {
+                  return prediction;
+              }
+              return Prediction{static_cast<double>(covering->makespanMedianMs) * 1000.0,
+                  static_cast<double>(covering->uncertaintyMs) * 1000.0,
+                  static_cast<double>(covering->referenceWorkMedianMs) * 1000.0, true};
+          };
 
     std::optional<Prediction> const prefill = prefillRows > 0
         ? std::optional<Prediction>(predictPrefill(
@@ -1836,11 +1853,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         Prediction newlyProduced;
     };
     std::optional<DecodeFormationPrediction> decodeFormation;
-    bool const commonPairFrontier = prefillRequestIds == overlapPrefillRequestIds
-        && decodeRequestIds == overlapDecodeRequestIds && prefillRows == overlapPrefillRows
-        && decodeRows == overlapDecodeRows;
-    if (mConfig.enableDecodeFormationHorizon && prefill.has_value() && decode.has_value() && commonPairFrontier
-        && overlapPrefillAllFinal && decodeRows < mConfig.maxDecodeBatchSize)
+    if (mConfig.enableDecodeFormationHorizon && prefill.has_value() && decode.has_value() && prefillAllFinal
+        && decodeRows < mConfig.maxDecodeBatchSize)
     {
         ++mTelemetry.globalDecodeFormationSnapshotCount;
         int32_t combinedRows = decodeRows;
@@ -1849,7 +1863,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         int32_t producedRows{};
         int64_t producedContextTokens{};
         int32_t producedMaxContext{};
-        for (PhaseWorkItem const& item : overlapPlan.prefillBatch)
+        for (PhaseWorkItem const& item : prefillPlan.prefillBatch)
         {
             if (combinedRows >= mConfig.maxDecodeBatchSize)
             {
@@ -1873,9 +1887,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 PhaseGlobalActionKind::kDecode, producedRows, 0, 1, contextBucket(producedMaxContext), 0};
             producedKey.executionVariant = executionVariant(producedKey, 0);
             Prediction const combined
-                = predictDecode(combinedKey, combinedRows, combinedMaxContext, combinedContextTokens);
+                = predictDecodeSuccessor(combinedKey, combinedRows, combinedMaxContext, combinedContextTokens);
             Prediction const produced
-                = predictDecode(producedKey, producedRows, producedMaxContext, producedContextTokens);
+                = predictDecodeSuccessor(producedKey, producedRows, producedMaxContext, producedContextTokens);
             mTelemetry.globalDecodeFormationCombinedCostHitCount += combined.directlyKnown ? 1U : 0U;
             mTelemetry.globalDecodeFormationProducedCostHitCount += produced.directlyKnown ? 1U : 0U;
             // The bounded transition is used only when both successor shapes

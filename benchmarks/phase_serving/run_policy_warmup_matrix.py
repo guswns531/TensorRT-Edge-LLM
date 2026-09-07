@@ -216,9 +216,6 @@ def prepare_command(entry: dict[str, Any],
     _replace_backend_engine(command, backend_engine_dir)
     for name, value in POLICY_VARIANTS[policy_variant].items():
         _set_backend_environment(command, name, value)
-    for assignment in backend_environment:
-        name, value = assignment.split("=", 1)
-        _set_backend_environment(command, name, value)
     if capture_phase_telemetry:
         activity_prefix = _container_workspace_path(
             command, output_dir / "activity" / "run-{run}")
@@ -230,6 +227,12 @@ def prepare_command(entry: dict[str, Any],
                                  activity_prefix)
         _set_backend_environment(command, "TRT_EDGELLM_PHASE_TELEMETRY_PATH",
                                  activity_prefix + "-events.jsonl")
+    # Explicit caller overrides are applied last.  In particular, callers may
+    # request full request-lineage telemetry while retaining the activity-file
+    # plumbing installed by capture_phase_telemetry.
+    for assignment in backend_environment:
+        name, value = assignment.split("=", 1)
+        _set_backend_environment(command, name, value)
     _drop_option(command, "--generic-warmup-trace", True)
     if mode in ("generic_reset", "generic"):
         trace = Path(command[command.index("--trace") + 1])

@@ -228,6 +228,21 @@ struct PhaseFrozenReplayResult
     double worstCaseRobustHorizonUs{};
 };
 
+//! Paired immutable replay result for two physical outcomes of the same
+//! action. Logical signatures intentionally exclude elapsed time so the
+//! comparison isolates completion-order/DAG effects from timing magnitude.
+struct PhaseFrozenBranchComparison
+{
+    bool valid{};
+    bool divergent{};
+    size_t firstDivergentBoundary{};
+    bool terminalReconverged{};
+    PhaseUnifiedPhase leftFirstCompleted{PhaseUnifiedPhase::kNone};
+    PhaseUnifiedPhase rightFirstCompleted{PhaseUnifiedPhase::kNone};
+    double leftRobustHorizonUs{};
+    double rightRobustHorizonUs{};
+};
+
 //! Decision-relevant effect estimate used to materialize an outcome envelope.
 //! Margins are normalized by the sum of isolated component references.
 struct PhaseEffectOutcomeEstimate
@@ -279,5 +294,12 @@ PhaseOutcomeEnvelope phaseCompletionOutcomeEnvelope(
 //! trajectories remain available for dominance and diagnostic analysis.
 PhaseFrozenReplayResult phaseReplayFrozenOutcome(PhaseFrozenDecisionSnapshot const& snapshot, uint64_t actionId,
     PhaseOutcomeEnvelope const& envelope, double uncertaintyScale = 1.0) noexcept;
+
+//! Compare two unambiguous physical branches against one immutable decision
+//! state. Each envelope must contain exactly one outcome. The first divergent
+//! request-ready boundary and eventual logical reconvergence are reported.
+PhaseFrozenBranchComparison phaseCompareFrozenOutcomeBranches(PhaseFrozenDecisionSnapshot const& snapshot,
+    uint64_t actionId, PhaseOutcomeEnvelope const& left, PhaseOutcomeEnvelope const& right,
+    double uncertaintyScale = 1.0) noexcept;
 
 } // namespace trt_edgellm::rt

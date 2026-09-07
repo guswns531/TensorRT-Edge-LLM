@@ -408,3 +408,34 @@ def test_prepare_maps_phase_telemetry_to_writable_workspace(
         "-events.jsonl"
     assert environments["TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"] == \
         "counterfactual"
+
+
+def test_prepare_allows_explicit_full_telemetry_override(
+        tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "-v", f"{tmp_path}:/workspace",
+        "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command(
+        {"command": command},
+        "zero_start",
+        tmp_path / "matrix" / "balanced",
+        1,
+        generic,
+        generic,
+        backend_environment=("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL=full", ),
+        capture_phase_telemetry=True)
+
+    environments = {
+        result[index + 1].split("=", 1)[0]: result[index + 1].split("=", 1)[1]
+        for index, token in enumerate(result[:-1]) if token == "-e"
+    }
+    assert environments["TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"] == "full"
+    assert "TRT_EDGELLM_PHASE_ACTIVITY_PREFIX" in environments

@@ -620,6 +620,42 @@ TEST(PhaseQueueSchedulerTest, GlobalPricesFinalPrefillAsObservableDecodeFormatio
     EXPECT_NEAR(decode->horizonReferenceWorkUs, 14000.0, 1.0e-3);
 }
 
+TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationUsesSerialPrefillWhenOverlapFrontierDiffers)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableDecodeFormationHorizon = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxOverlapPrefillBatchSize = 1;
+    config.maxPrefillBatchTokens = 1024;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{2, 512, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}, {3, 1024, 3.0F, 3072}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 512, 1, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueuePrefill({2, 512, 2, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueueDecode({3, 512, 3});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_EQ(candidate->key.primaryBatchSize, 2);
+    EXPECT_NEAR(candidate->predictedHorizonUs, 13000.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 14500.0, 1.0e-3);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationSnapshotCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationOpportunityCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalDecodeFormationMaxProducedRows, 2U);
+    std::vector<PhaseGlobalActionCandidate> const& frontier = scheduler.lastGlobalPreviewCandidates();
+    auto const overlap = std::find_if(frontier.begin(), frontier.end(), [](PhaseGlobalActionCandidate const& action) {
+        return action.key.kind == PhaseGlobalActionKind::kPrefillDecode;
+    });
+    ASSERT_NE(overlap, frontier.end());
+    EXPECT_EQ(overlap->key.primaryBatchSize, 1);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalPreviewRetainsTheCompletePolicyNeutralCandidateFrontier)
 {
     PhaseQueueSchedulerConfig config;

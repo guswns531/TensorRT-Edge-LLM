@@ -371,5 +371,34 @@ TEST(PhaseFrozenReplayTest, RejectsOutcomeForADifferentAction)
     EXPECT_EQ(replay.reason, PhaseFrozenReplayReason::kEnvelopeActionMismatch);
 }
 
+TEST(PhaseFrozenReplayTest, ComparesCompletionOrderDivergenceUntilLogicalReconvergence)
+{
+    PhaseIncrementalAction const action
+        = pairAction(PhaseGlobalActionKind::kEncoderPrefill, PhaseUnifiedActionDirection::kEncoderToPrefill);
+    std::optional<PhaseFrozenDecisionSnapshot> const frozen
+        = phaseFreezeDecisionSnapshot(encoderPrefillProjection(), {action}, 17U);
+    ASSERT_TRUE(frozen.has_value());
+    PhaseOutcomeEnvelope const encoderFirst = phaseCompletionOutcomeEnvelope(
+        {action.actionId,
+            {{PhaseUnifiedPhase::kEncoder, 71U, 2.0, 0.0, true}, {PhaseUnifiedPhase::kPrefill, 72U, 8.0, 0.0, false}}},
+        PhaseOutcomeFidelity::kMeasuredReplay);
+    PhaseOutcomeEnvelope const prefillFirst = phaseCompletionOutcomeEnvelope(
+        {action.actionId,
+            {{PhaseUnifiedPhase::kEncoder, 71U, 8.0, 0.0, true}, {PhaseUnifiedPhase::kPrefill, 72U, 2.0, 0.0, false}}},
+        PhaseOutcomeFidelity::kMeasuredReplay);
+
+    PhaseFrozenBranchComparison const comparison
+        = phaseCompareFrozenOutcomeBranches(*frozen, action.actionId, encoderFirst, prefillFirst);
+
+    ASSERT_TRUE(comparison.valid);
+    EXPECT_TRUE(comparison.divergent);
+    EXPECT_EQ(comparison.firstDivergentBoundary, 1U);
+    EXPECT_EQ(comparison.leftFirstCompleted, PhaseUnifiedPhase::kEncoder);
+    EXPECT_EQ(comparison.rightFirstCompleted, PhaseUnifiedPhase::kPrefill);
+    EXPECT_TRUE(comparison.terminalReconverged);
+    EXPECT_DOUBLE_EQ(comparison.leftRobustHorizonUs, 8.0);
+    EXPECT_DOUBLE_EQ(comparison.rightRobustHorizonUs, 8.0);
+}
+
 } // namespace
 } // namespace trt_edgellm::rt

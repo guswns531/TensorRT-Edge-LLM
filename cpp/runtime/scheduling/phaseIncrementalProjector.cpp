@@ -620,6 +620,37 @@ void countReadyRows(PhaseIncrementalProjectionSnapshot const& snapshot, PhaseFro
     }
 }
 
+uint64_t logicalProjectionSignature(PhaseIncrementalProjectionSnapshot const& snapshot) noexcept
+{
+    constexpr uint64_t kLOGICAL_OFFSET = 1099511628211ULL;
+    uint64_t result = hashCombine(kLOGICAL_OFFSET, static_cast<uint64_t>(snapshot.inFlight.outstanding));
+    for (PhaseInFlightWorkSnapshot const& work : snapshot.inFlight.work)
+    {
+        result = hashCombine(result, static_cast<uint64_t>(work.phase));
+        for (uint64_t const requestId : work.requestIds)
+        {
+            result = hashCombine(result, requestId);
+        }
+    }
+    for (PhaseProjectedRequest const& request : snapshot.requests)
+    {
+        result = hashCombine(result, request.requestId);
+        result = hashCombine(result, static_cast<uint64_t>(request.stage));
+        result = hashCombine(result, static_cast<uint64_t>(request.stableKvSlotId + 1));
+        result = hashCombine(result, static_cast<uint64_t>(request.decodeStepsRemaining));
+        result = hashCombine(result, static_cast<uint64_t>(request.generatedTokens));
+        result = hashCombine(result, static_cast<uint64_t>(request.visionOwned));
+        result = hashCombine(result, static_cast<uint64_t>(request.kvOwned));
+        result = hashCombine(result, static_cast<uint64_t>(request.firstTokenObserved));
+        result = hashCombine(result, static_cast<uint64_t>(request.ready));
+    }
+    result = hashCombine(result, snapshot.ownership.visionBytes);
+    result = hashCombine(result, snapshot.ownership.kvBytes);
+    result = hashCombine(result, snapshot.ownership.reclaimedVisionBytes);
+    result = hashCombine(result, snapshot.ownership.reclaimedKvBytes);
+    return result;
+}
+
 PhaseCompletionVector physicalVector(uint64_t actionId, std::vector<PhaseOutcomeComponentReference> const& components,
     size_t firstIndex, double makespanUs, double uncertaintyUs) noexcept
 {
@@ -929,6 +960,55 @@ PhaseFrozenReplayResult phaseReplayFrozenOutcome(PhaseFrozenDecisionSnapshot con
     }
     result.valid = true;
     result.reason = PhaseFrozenReplayReason::kReplayed;
+    return result;
+}
+
+PhaseFrozenBranchComparison phaseCompareFrozenOutcomeBranches(PhaseFrozenDecisionSnapshot const& snapshot,
+    uint64_t actionId, PhaseOutcomeEnvelope const& left, PhaseOutcomeEnvelope const& right,
+    double uncertaintyScale) noexcept
+{
+    PhaseFrozenBranchComparison result;
+    if (left.alternatives.size() != 1U || right.alternatives.size() != 1U)
+    {
+        return result;
+    }
+    PhaseFrozenReplayResult const leftReplay = phaseReplayFrozenOutcome(snapshot, actionId, left, uncertaintyScale);
+    PhaseFrozenReplayResult const rightReplay = phaseReplayFrozenOutcome(snapshot, actionId, right, uncertaintyScale);
+    if (!leftReplay.valid || !rightReplay.valid || leftReplay.trajectories.size() != 1U
+        || rightReplay.trajectories.size() != 1U)
+    {
+        return result;
+    }
+    PhaseFrozenReplayTrajectory const& leftTrajectory = leftReplay.trajectories.front();
+    PhaseFrozenReplayTrajectory const& rightTrajectory = rightReplay.trajectories.front();
+    if (leftTrajectory.boundaries.empty() || rightTrajectory.boundaries.empty())
+    {
+        return result;
+    }
+    result.leftFirstCompleted = leftTrajectory.boundaries.front().completed.phase;
+    result.rightFirstCompleted = rightTrajectory.boundaries.front().completed.phase;
+    result.leftRobustHorizonUs = leftTrajectory.robustHorizonUs;
+    result.rightRobustHorizonUs = rightTrajectory.robustHorizonUs;
+    size_t const commonBoundaries = std::min(leftTrajectory.boundaries.size(), rightTrajectory.boundaries.size());
+    for (size_t index{}; index < commonBoundaries; ++index)
+    {
+        uint64_t const leftSignature = logicalProjectionSignature(leftTrajectory.boundaries[index].successor);
+        uint64_t const rightSignature = logicalProjectionSignature(rightTrajectory.boundaries[index].successor);
+        if (leftSignature != rightSignature)
+        {
+            result.divergent = true;
+            result.firstDivergentBoundary = index + 1U;
+            break;
+        }
+    }
+    if (!result.divergent && leftTrajectory.boundaries.size() != rightTrajectory.boundaries.size())
+    {
+        result.divergent = true;
+        result.firstDivergentBoundary = commonBoundaries + 1U;
+    }
+    result.terminalReconverged = logicalProjectionSignature(leftTrajectory.boundaries.back().successor)
+        == logicalProjectionSignature(rightTrajectory.boundaries.back().successor);
+    result.valid = true;
     return result;
 }
 

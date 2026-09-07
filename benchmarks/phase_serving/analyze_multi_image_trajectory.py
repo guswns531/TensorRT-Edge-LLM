@@ -25,6 +25,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+TIMELINE_MARKER = "PHASE_TIMELINE\t"
+
 
 def _run_number(aggregate: Path) -> int:
     return int(aggregate.parents[1].name.removeprefix("run-"))
@@ -59,6 +61,132 @@ def _read_intervals(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(stream))
 
 
+def _read_measured_timelines(
+        path: Path, request_count: int) -> dict[int, list[dict[str, Any]]]:
+    """Return the last complete lifecycle for each measured request ID."""
+    records: dict[int, list[dict[str, Any]]] = {}
+    if not path.is_file():
+        return records
+    lifecycles: dict[int, list[list[dict[str, Any]]]] = {}
+    current: dict[int, list[dict[str, Any]]] = {}
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.startswith(TIMELINE_MARKER):
+                continue
+            event = json.loads(line.split("\t", 1)[1])
+            request_id = int(event["request_index"])
+            if request_id >= request_count:
+                continue
+            current.setdefault(request_id, []).append(event)
+            if event.get("stage") == "completion":
+                lifecycles.setdefault(request_id,
+                                      []).append(current.pop(request_id))
+    for request_id, request_lifecycles in lifecycles.items():
+        records[request_id] = request_lifecycles[-1]
+    return records
+
+
+def _cohorts(lifecycles: dict[int, list[dict[str, Any]]],
+             stage: str) -> list[dict[str, Any]]:
+    events = [
+        event for lifecycle in lifecycles.values() for event in lifecycle
+        if event.get("stage") == stage
+    ]
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for event in events:
+        dispatch_index = int(event.get("dispatch_index", 0))
+        # Encoder batches have no dispatch sequence but deliberately share one
+        # timestamp across all request records in the batch.
+        timestamp_key = round(float(event["timestamp_us"])) \
+            if dispatch_index == 0 else 0
+        grouped.setdefault((dispatch_index, timestamp_key), []).append(event)
+    cohorts = []
+    for (dispatch_index, _), members in grouped.items():
+        members.sort(key=lambda event: int(event["request_index"]))
+        cohorts.append({
+            "timestamp_us":
+            min(float(event["timestamp_us"]) for event in members),
+            "dispatch_index":
+            dispatch_index,
+            "batch_size":
+            max(int(event.get("batch_size", 0)) for event in members),
+            "request_ids": [int(event["request_index"]) for event in members],
+        })
+    return sorted(cohorts,
+                  key=lambda cohort:
+                  (cohort["timestamp_us"], cohort["dispatch_index"]))
+
+
+def _first_stage(lifecycle: list[dict[str, Any]],
+                 stage: str) -> dict[str, Any] | None:
+    return next((event for event in lifecycle if event.get("stage") == stage),
+                None)
+
+
+def _analyze_transition_lineage(
+        lifecycles: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
+    if not lifecycles:
+        return {}
+    encoder_cohorts = _cohorts(lifecycles, "encoder_start")
+    prefill_cohorts = _cohorts(lifecycles, "prefill_start")
+    decode_cohorts = _cohorts(lifecycles, "decode_start")
+    first_tokens = {
+        request_id: _first_stage(lifecycle, "first_token")
+        for request_id, lifecycle in lifecycles.items()
+    }
+    first_tokens = {
+        request_id: event
+        for request_id, event in first_tokens.items() if event is not None
+    }
+    if not first_tokens or not decode_cohorts:
+        return {
+            "encoder_cohorts": encoder_cohorts,
+            "prefill_cohorts": prefill_cohorts,
+            "decode_cohorts": decode_cohorts,
+        }
+    first_ready_us = min(
+        float(event["timestamp_us"]) for event in first_tokens.values())
+    first_decode = decode_cohorts[0]
+    first_decode_us = float(first_decode["timestamp_us"])
+    ready_before_first_decode = sorted(
+        request_id for request_id, event in first_tokens.items()
+        if float(event["timestamp_us"]) <= first_decode_us)
+    singleton_prefix = 0
+    for cohort in decode_cohorts:
+        if int(cohort["batch_size"]) != 1:
+            break
+        singleton_prefix += 1
+    full_cohort = next((cohort for cohort in decode_cohorts
+                        if int(cohort["batch_size"]) >= len(lifecycles)), None)
+    return {
+        "encoder_cohorts":
+        encoder_cohorts,
+        "prefill_cohorts":
+        prefill_cohorts,
+        "decode_cohorts":
+        decode_cohorts,
+        "first_decode_ready_request_id":
+        min(first_tokens,
+            key=lambda request_id: float(first_tokens[request_id][
+                "timestamp_us"])),
+        "first_decode_ready_to_start_ms":
+        max(0.0, (first_decode_us - first_ready_us) / 1000.0),
+        "ready_request_ids_before_first_decode":
+        ready_before_first_decode,
+        "ready_rows_before_first_decode":
+        len(ready_before_first_decode),
+        "first_decode_batch_size":
+        int(first_decode["batch_size"]),
+        "first_decode_request_ids":
+        first_decode["request_ids"],
+        "decode_singleton_prefix_dispatches":
+        singleton_prefix,
+        "first_ready_to_full_decode_cohort_ms":
+        ((float(full_cohort["timestamp_us"]) - first_ready_us) /
+         1000.0) if full_cohort is not None else None,
+    }
+
+
 def analyze_run(aggregate: Path, coherent_decode_max: int,
                 fragmented_decode_min: int) -> dict[str, Any]:
     metrics = json.loads(aggregate.read_text(encoding="utf-8"))
@@ -88,6 +216,8 @@ def analyze_run(aggregate: Path, coherent_decode_max: int,
         sum(
             float(value.get("requests", 0.0))
             for value in metrics.get("by_request_class", {}).values()))
+    lineage = _analyze_transition_lineage(
+        _read_measured_timelines(_event_path(aggregate), request_count))
     # Calibration and measured traces allocate request IDs from separate
     # zero-based epochs. When telemetry spans both, the last calibration ID
     # (>= measured request count) is an unambiguous boundary. Keep only the
@@ -211,12 +341,18 @@ def analyze_run(aggregate: Path, coherent_decode_max: int,
         dict(sorted(fallback_pairs.items())),
         "direction_observations":
         dict(sorted(direction_observations.items())),
+        "transition_lineage":
+        lineage,
         "event_path":
         str(_event_path(aggregate)),
     }
 
 
 def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
+
+    def median_present(values: list[float | int]) -> float | None:
+        return statistics.median(values) if values else None
+
     families: dict[str, dict[str, Any]] = {}
     for family in sorted({str(run["trajectory_family"]) for run in runs}):
         members = [run for run in runs if run["trajectory_family"] == family]
@@ -235,6 +371,27 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
             statistics.median(float(run["ttft_mean_ms"]) for run in members),
             "median_e2e_mean_ms":
             statistics.median(float(run["e2e_mean_ms"]) for run in members),
+            "median_first_decode_ready_to_start_ms":
+            median_present([
+                float(run["transition_lineage"]
+                      ["first_decode_ready_to_start_ms"]) for run in members
+                if run["transition_lineage"].get(
+                    "first_decode_ready_to_start_ms") is not None
+            ]),
+            "median_ready_rows_before_first_decode":
+            median_present([
+                int(run["transition_lineage"]
+                    ["ready_rows_before_first_decode"]) for run in members
+                if run["transition_lineage"].get(
+                    "ready_rows_before_first_decode") is not None
+            ]),
+            "median_decode_singleton_prefix_dispatches":
+            median_present([
+                int(run["transition_lineage"]
+                    ["decode_singleton_prefix_dispatches"]) for run in members
+                if run["transition_lineage"].get(
+                    "decode_singleton_prefix_dispatches") is not None
+            ]),
         }
     return {"runs": runs, "trajectory_families": families}
 
