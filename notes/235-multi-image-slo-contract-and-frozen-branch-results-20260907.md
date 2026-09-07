@@ -194,6 +194,26 @@ note 234의 workload별 최종/반복값이며 frozen vLLM은 request trace와 r
 P23은 single run이므로 paper confidence interval이 아니다. 다만 multi-image 5회와 Poisson 3회가 가장 큰 두
 variance 위험을 보완한다.
 
+### 5.1 48.8 req/s saturation 반복
+
+동일 materialized HTTP trace를 `P8/D64`, stable slots/in-flight 80, common TPOT fallback 80ms로 다시 실행했다.
+두 warmup 계약을 분리했다. P25는 대상 trace를 warmup에도 사용하는 trace-derived upper bound이고, P26은
+12-workload와 독립적으로 고정한 `generic-text-v7-small-d.json`만 사용한 primary profile-free 결과다.
+
+| 초기 knowledge | repeats | req/s mean / median | CV | 95% t-CI | joint-SLO | TTFT mean/p95 ms | TPOT mean/p95 ms | E2E mean/p95 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Trace-derived, P25 | 5 | 41.779 / 41.778 | 0.066% | [41.745, 41.813] | 1,440/1,440 | 36.27 / 60.28 | 12.73 / 15.80 | 1121.48 / 1841.08 |
+| Generic, P26 | 5 | 41.582 / 41.580 | 0.352% | [41.400, 41.764] | 1,440/1,440 | 35.48 / 60.09 | 13.28 / 17.52 | 1168.67 / 1978.78 |
+| Frozen vLLM | 5 | 40.908 | 약 0.07% | 이전 반복값 | 1,440/1,440 | 51.44 / 84.27 | 13.53 / 17.66 | 1205.87 / 2121.30 |
+
+Primary generic Current는 frozen vLLM보다 request/SLO goodput이 **+1.64%** 높다. 95% Current CI의 하한
+`41.400`도 이전 vLLM 반복 구간의 상한보다 높다. TTFT mean/p95는 각각 `-31.0%/-28.7%`, TPOT
+mean/p95는 `-1.8%/-0.8%`, E2E mean/p95는 `-3.1%/-6.7%`다. Trace-derived는 generic보다 median
+`+0.48%`이므로 initialization effect는 작지만 0은 아니다. 따라서 논문 primary 결과는 P26 generic을 사용하고
+P25는 ceiling/upper-bound로만 사용한다.
+
+모든 10회에서 generated token hash가 동일했고, peak memory median은 `9237MiB`였다.
+
 ## 6. 검증
 
 ```text
@@ -210,6 +230,10 @@ Python tests:
   16/16 PASS
   - test_multi_image_trajectory.py
   - test_policy_warmup_matrix.py
+
+48.8 HTTP saturation:
+  generic 5/5 joint-SLO PASS, exact token hash
+  trace-derived 5/5 joint-SLO PASS, exact token hash
 ```
 
 ## 7. 최종 architecture 판단
@@ -246,12 +270,17 @@ Frozen completion-vector and H2 transition components는 production authority가
 
 ## 8. 다음 계획
 
-1. multi-image와 Poisson을 5--10회로 늘려 confidence interval을 확정한다.
-2. configured target과 per-request metadata target을 startup/decision telemetry에 명시해 향후 split-brain을 자동 검출한다.
-3. `Scalar+Transition`의 1/5 regression을 frozen branch replay로 재현하고 H2가 실제로 선택을 바꾼 경우만 causal하게
-   분석한다. production authority는 그 전까지 비활성이다.
-4. 48.8 req/s saturation을 공통 TPOT contract로 다시 5회 확인한다.
-5. 동일 HTTP contract의 최종 paper run에서는 Current와 vLLM을 모두 fresh 5회 실행하고 bootstrap confidence
-   interval, joint-SLO goodput, memory를 함께 보고한다.
-6. 디스크 headroom 확보 후 selected multi-image run 하나만 full Nsight/lineage로 수집한다.
+완료:
 
+1. multi-image는 5회, 48.8 saturation은 generic/trace-derived 각각 5회 반복했다.
+2. configured decode TPOT fallback과 설정 출처를 startup log 및 decision telemetry에 추가했다. per-request target이
+   fallback보다 우선한다는 contract도 startup log에 명시한다.
+
+남은 순서:
+
+1. Poisson을 5회 이상으로 늘려 confidence interval을 확정한다.
+2. `Scalar+Transition`의 1/5 regression을 frozen branch replay로 재현하고 H2가 실제로 선택을 바꾼 경우만 causal하게
+   분석한다. production authority는 그 전까지 비활성이다.
+3. 동일 HTTP contract의 최종 paper run에서는 Current와 vLLM을 모두 fresh 5회 실행하고 bootstrap confidence
+   interval, joint-SLO goodput, memory를 함께 보고한다.
+4. 디스크 headroom 확보 후 selected multi-image run 하나만 full Nsight/lineage로 수집한다.

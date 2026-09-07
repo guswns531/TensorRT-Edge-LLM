@@ -39,14 +39,19 @@
         // the composition-root SLO when it is present; request metadata can
         // still override it per row.  Previously only the coordinator read
         // this value, leaving the queue on its unrelated 20 ms default.
+        char const* decodeTpotTargetSource = "built_in_default";
         if (char const* value = std::getenv("TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS"))
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value) * 1000.0;
+            decodeTpotTargetSource = "vision_decode_tpot_target_ms";
         }
         else if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value);
+            decodeTpotTargetSource = "global_decode_tpot_target_us";
         }
+        LOG_INFO("Phase request SLO contract: decode_tpot_fallback_us=%.3f source=%s request_override=enabled",
+            semanticSchedulerConfig.globalDecodeTpotTargetUs, decodeTpotTargetSource);
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_OVERLAP_MIN_SAMPLES"))
         {
             semanticSchedulerConfig.globalCostModelConfig.overlapMinSamples = static_cast<size_t>(std::stoull(value));

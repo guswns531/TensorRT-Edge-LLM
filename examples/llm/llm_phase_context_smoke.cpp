@@ -3760,6 +3760,8 @@ int main(int argc, char** argv)
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"measurement_epoch", measurementEpoch},
                         {"policy_warmup_mode", phasePolicyWarmupModeName(policyWarmupMode)},
+                        {"decode_tpot_fallback_us", semanticSchedulerConfig.globalDecodeTpotTargetUs},
+                        {"decode_tpot_fallback_source", decodeTpotTargetSource},
                         {"kind", static_cast<int32_t>(metrics.kind)}, {"prefill_batch", metrics.prefillBatchSize},
                         {"host_scheduler_decision_us", metrics.hostSchedulerDecisionUs},
                         {"host_dispatch_start_us", static_cast<double>(metrics.hostDispatchStartNs) / 1000.0},
