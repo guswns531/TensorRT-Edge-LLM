@@ -805,6 +805,14 @@ IndependentPhaseServerSubmission RuntimeCoordinator::submitPhaseTokens(
     return rootRuntime().submitPhaseTokens(requestId, std::move(promptTokens), maxOutputTokens, std::move(scheduling));
 }
 
+PhaseThreeSubmissionStatus RuntimeCoordinator::submitPhaseVisionRequest(
+    uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
+    return rootRuntime().submitPhaseVisionRequest(
+        requestId, std::move(request), maxOutputTokens, std::move(scheduling));
+}
+
 bool RuntimeCoordinator::cancelPhaseRequest(uint64_t requestId)
 {
     ELLM_CHECK(mInlineSingleRank, "Asynchronous phase serving requires inline single-rank execution.");
@@ -832,6 +840,16 @@ std::optional<IndependentPhaseServerCompletion> RuntimeCoordinator::tryPopPhaseC
 bool RuntimeCoordinator::phaseServingEmpty() const noexcept
 {
     return mInlineSingleRank && rootRuntime().phaseServingEmpty();
+}
+
+bool RuntimeCoordinator::phaseVisionServingEnabled() const noexcept
+{
+    return mInlineSingleRank && rootRuntime().phaseVisionServingEnabled();
+}
+
+std::optional<PhaseThreeCoordinatorMetrics> RuntimeCoordinator::phaseVisionMetrics() const noexcept
+{
+    return mInlineSingleRank ? rootRuntime().phaseVisionMetrics() : std::nullopt;
 }
 
 bool RuntimeCoordinator::dispatchRequest(

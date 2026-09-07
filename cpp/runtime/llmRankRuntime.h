@@ -141,12 +141,16 @@ public:
         bool addGenerationPrompt = true, bool enableThinking = false, PhaseSchedulingHints scheduling = {});
     IndependentPhaseServerSubmission submitPhaseTokens(uint64_t requestId, std::vector<int32_t> promptTokens,
         int32_t maxOutputTokens, PhaseSchedulingHints scheduling = {});
+    PhaseThreeSubmissionStatus submitPhaseVisionRequest(uint64_t requestId, LLMGenerationRequest request,
+        int32_t maxOutputTokens, PhaseSchedulingHints scheduling = {});
     bool cancelPhaseRequest(uint64_t requestId);
     bool pollPhaseServing();
     std::optional<IndependentPhaseServerToken> tryPopPhaseToken();
     std::optional<IndependentPhaseServerCompletion> tryPopPhaseCompletion();
     bool phaseServingEmpty() const noexcept;
     bool phaseServingEnabled() const noexcept;
+    bool phaseVisionServingEnabled() const noexcept;
+    std::optional<PhaseThreeCoordinatorMetrics> phaseVisionMetrics() const noexcept;
 
     /*! \brief Return the input size for an explicit text token-count request. */
     std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;

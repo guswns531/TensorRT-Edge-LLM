@@ -1690,14 +1690,14 @@ void LLMRankRuntime::enablePhaseServing(PhaseServingRuntimeConfig const& config,
     ELLM_CHECK(!hasDraftModel(), "Phase serving currently supports vanilla decoding only.");
     ELLM_CHECK(
         mContextCache == nullptr, "Phase serving owns stable KV leases and cannot share the legacy context cache.");
-    ELLM_CHECK(mVisionRunner == nullptr && mAudioRunner == nullptr && mActionRunner == nullptr,
-        "Use the three-phase adapter for multimodal phase serving.");
+    ELLM_CHECK(mAudioRunner == nullptr && mActionRunner == nullptr,
+        "Phase serving currently supports text and vision inputs only.");
 
     mDecoderRegistry.reset();
     mDecodingRuntimeContext.reset();
     auto executor = std::move(mBaseExecutor);
-    mPhaseServingRuntime = PhaseServingRuntime::create(
-        config, mDeployment.base, std::move(executor), *mSharedResources, mEmbedding, setupStream);
+    mPhaseServingRuntime = PhaseServingRuntime::create(config, mDeployment.base, std::move(executor), *mSharedResources,
+        mEmbedding, setupStream, std::move(mVisionRunner), mTokenizer);
 
     mDeepstack.reset();
     mGemma4Ple.reset();
@@ -1726,6 +1726,16 @@ IndependentPhaseServerSubmission LLMRankRuntime::submitPhaseTokens(
     ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
     return mPhaseServingRuntime->submitOrQueue(
         requestId, std::move(promptTokens), maxOutputTokens, std::move(scheduling));
+}
+
+PhaseThreeSubmissionStatus LLMRankRuntime::submitPhaseVisionRequest(
+    uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mPhaseServingRuntime != nullptr, "Phase serving is not enabled.");
+    ELLM_CHECK(request.requests.size() == 1U, "One phase vision submission must contain one logical request.");
+    ELLM_CHECK(!request.requests.front().imageBuffers.empty(), "Phase vision submission requires an image.");
+    ELLM_CHECK(request.requests.front().audioBuffers.empty(), "Phase vision serving does not accept audio.");
+    return mPhaseServingRuntime->submitVision(requestId, std::move(request), maxOutputTokens, std::move(scheduling));
 }
 
 bool LLMRankRuntime::cancelPhaseRequest(uint64_t requestId)
@@ -1760,6 +1770,16 @@ bool LLMRankRuntime::phaseServingEmpty() const noexcept
 bool LLMRankRuntime::phaseServingEnabled() const noexcept
 {
     return mPhaseServingRuntime != nullptr;
+}
+
+bool LLMRankRuntime::phaseVisionServingEnabled() const noexcept
+{
+    return mPhaseServingRuntime != nullptr && mPhaseServingRuntime->visionEnabled();
+}
+
+std::optional<PhaseThreeCoordinatorMetrics> LLMRankRuntime::phaseVisionMetrics() const noexcept
+{
+    return mPhaseServingRuntime != nullptr ? mPhaseServingRuntime->visionMetrics() : std::nullopt;
 }
 
 bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)

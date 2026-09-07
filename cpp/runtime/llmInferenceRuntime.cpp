@@ -178,6 +178,14 @@ IndependentPhaseServerSubmission LLMInferenceRuntime::submitPhaseTokens(
     return mCoordinator->submitPhaseTokens(requestId, std::move(promptTokens), maxOutputTokens, std::move(scheduling));
 }
 
+PhaseThreeSubmissionStatus LLMInferenceRuntime::submitPhaseVisionRequest(
+    uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->submitPhaseVisionRequest(
+        requestId, std::move(request), maxOutputTokens, std::move(scheduling));
+}
+
 bool LLMInferenceRuntime::cancelPhaseRequest(uint64_t requestId)
 {
     ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
@@ -205,6 +213,16 @@ std::optional<IndependentPhaseServerCompletion> LLMInferenceRuntime::tryPopPhase
 bool LLMInferenceRuntime::phaseServingEmpty() const noexcept
 {
     return mCoordinator == nullptr || mCoordinator->phaseServingEmpty();
+}
+
+bool LLMInferenceRuntime::phaseVisionServingEnabled() const noexcept
+{
+    return mCoordinator != nullptr && mCoordinator->phaseVisionServingEnabled();
+}
+
+std::optional<PhaseThreeCoordinatorMetrics> LLMInferenceRuntime::phaseVisionMetrics() const noexcept
+{
+    return mCoordinator != nullptr ? mCoordinator->phaseVisionMetrics() : std::nullopt;
 }
 
 std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest const& request) const

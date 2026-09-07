@@ -19,12 +19,15 @@
 
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
+#include "multimodal/common/multimodalRunner.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/phase/cost/phaseRuntimeCostTracker.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
+#include "runtime/scheduling/phaseVisionAdapter.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "runtime/state/stableKVPageManager.h"
@@ -34,6 +37,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -153,6 +157,45 @@ IndependentPhaseServerConfig makeServerConfig(
     config.enableGlobalWaitActions = true;
     config.enableGlobalWaitAuthority = true;
     config.enableCompletionAwareAdmissionProjection = phasePolicyUsesTransition(serving.policyMode);
+    config.allowChunkedVisionPrefill = serving.enableChunkedVisionPrefill && engine.packedPrefill;
+    config.allowBatchedVisionPrefill = serving.enableBatchedVisionPrefill;
+    config.releaseVisionPrefillStorage = serving.releaseVisionPrefillStorage;
+    return config;
+}
+
+PhaseThreeCoordinatorConfig makeVisionConfig(PhaseServingRuntimeConfig const& serving, LLMEngineConfig const& engine,
+    int32_t maxStableSlots, std::shared_ptr<PhaseRuntimeCostTracker> runtimeCostTracker)
+{
+    PhaseThreeCoordinatorConfig config;
+    config.policyMode = serving.policyMode;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.runtimeCostTracker = std::move(runtimeCostTracker);
+    config.enableGlobalEncoderPrefillAction = true;
+    config.maxEncodedInFlight
+        = serving.maxEncodedVisionRequests > 0 ? serving.maxEncodedVisionRequests : static_cast<size_t>(maxStableSlots);
+    config.maxEncodedBytes = serving.maxEncodedVisionBytes;
+    config.maxEncoderBatchSize = serving.maxEncoderBatchSize > 0
+        ? serving.maxEncoderBatchSize
+        : static_cast<size_t>(engine.maxSupportedPrefillBatchSize);
+    config.maxEncoderBatchSize = std::min(config.maxEncoderBatchSize, config.maxEncodedInFlight);
+    config.contextualPrefillBatchCapacity = engine.maxSupportedPrefillBatchSize;
+    config.contextualDecodeBatchCapacity = engine.maxSupportedDecodeBatchSize;
+    config.maxEncoderMediaItems = serving.maxEncoderMediaItems;
+    config.maxEncoderInputBytes = serving.maxEncoderInputBytes;
+    config.maxEncoderInputTokens = serving.maxEncoderInputTokens;
+    config.encoderBatchWaitUs = serving.encoderBatchWaitUs;
+    config.maxPrefillBatchSize
+        = static_cast<size_t>(engine.hasVisionPrefillProfile() ? engine.maxSupportedVisionPrefillBatchSize
+                                                               : engine.maxSupportedPrefillBatchSize);
+    config.maxPrefillBatchSize = std::min(config.maxPrefillBatchSize, config.maxEncodedInFlight);
+    config.maxPrefillBatchTokens = serving.maxPrefillBatchTokens > 0
+        ? static_cast<size_t>(serving.maxPrefillBatchTokens)
+        : static_cast<size_t>(engine.maxSupportedInputLength) * config.maxPrefillBatchSize;
+    config.prefillBatchWaitUs = serving.visionPrefillBatchWaitUs;
+    config.enableAdaptivePrefillAdmission = true;
+    config.enablePrefixBeforeVisionPrefill = serving.enableVisionPrefixPrefill;
+    config.enableAsyncEncoderPreparation = serving.enableAsyncEncoderPreparation;
+    config.visionTtftTargetUs = serving.visionTtftTargetUs;
     return config;
 }
 
@@ -163,10 +206,11 @@ class PhaseServingRuntime::Impl
 public:
     Impl(PhaseServingRuntimeConfig servingConfig, LLMEngineConfig const& engineConfig,
         std::unique_ptr<EngineExecutor> executor, SharedResources& resources, EmbeddingData const& embedding,
-        cudaStream_t setupStream)
+        cudaStream_t setupStream, std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer)
         : mServingConfig(std::move(servingConfig))
         , mEngineConfig(engineConfig)
         , mResources(resources)
+        , mVisionRunner(std::move(visionRunner))
         , mEmbeddingPreprocessor(embedding, engineConfig)
         , mSamplingSlots(std::max(engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedDecodeBatchSize))
     {
@@ -182,6 +226,12 @@ public:
 
         CUDA_CHECK(cudaStreamCreateWithFlags(&mPrefillStream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&mDecodeStream, cudaStreamNonBlocking));
+        if (mVisionRunner != nullptr)
+        {
+            ELLM_CHECK(tokenizer != nullptr, "Phase vision serving requires a tokenizer");
+            CUDA_CHECK(cudaStreamCreateWithFlags(&mEncoderStream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&mCopyStream, cudaStreamNonBlocking));
+        }
 
         IndependentEngineExecutorPairConfig pairConfig;
         pairConfig.setupStream = setupStream;
@@ -190,6 +240,10 @@ public:
         pairConfig.visionPrefillProfile = engineConfig.visionPrefillProfile;
         pairConfig.sharedExecutionContext = mServingConfig.sharedExecutionContext;
         mExecutors = IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
+        if (mVisionRunner != nullptr)
+        {
+            mVisionRunner->allocateContextMemory();
+        }
 
         mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(engineConfig,
             engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedInputLength, setupStream));
@@ -226,7 +280,25 @@ public:
         mPrefillCompactedLogits = Tensor({engineConfig.maxSupportedPrefillBatchSize, engineConfig.outputVocabSize},
             DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_serving_prefill_compacted_logits");
 
+        if (engineConfig.ropeConfig.type == RopeType::kMRope)
+        {
+            mTextMropeTemplate = Tensor({1, engineConfig.maxKVCacheCapacity, engineConfig.rotaryDim}, DeviceType::kGPU,
+                nvinfer1::DataType::kFLOAT, "phase_serving_text_mrope_template");
+            kernel::initializeTextOnlyMRopeCosSin(mTextMropeTemplate.dataPointer<float>(),
+                engineConfig.ropeConfig.rotaryTheta, engineConfig.rotaryDim, engineConfig.maxKVCacheCapacity, 1,
+                setupStream);
+            mPrefillMropeOwners.resize(static_cast<size_t>(engineConfig.maxSupportedPrefillBatchSize));
+            mDecodeMropeOwners.resize(static_cast<size_t>(engineConfig.maxSupportedDecodeBatchSize));
+            mPrefillMropeValid.resize(static_cast<size_t>(engineConfig.maxSupportedPrefillBatchSize));
+            mDecodeMropeValid.resize(static_cast<size_t>(engineConfig.maxSupportedDecodeBatchSize));
+        }
+
         PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, engineConfig);
+        if (schedulerConfig.maxExternalPrefillBatchSize <= 0)
+        {
+            schedulerConfig.maxExternalPrefillBatchSize = schedulerConfig.maxPrefillBatchSize;
+        }
+        std::shared_ptr<PhaseRuntimeCostTracker> runtimeCostTracker = schedulerConfig.runtimeCostTracker;
         schedulerConfig.globalMemoryHorizonSupplier = [this](
                                                           PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
             PhaseActionMemoryHorizon horizon;
@@ -254,6 +326,15 @@ public:
         IndependentPhaseServerConfig serverConfig = makeServerConfig(mServingConfig, engineConfig, maxStableSlots);
         mServer = std::make_unique<IndependentPhaseAsyncServer>(
             std::move(serverConfig), *mCoordinator, *mOwnership, std::move(adapter));
+        if (mVisionRunner != nullptr)
+        {
+            PhaseVisionStoragePolicy storagePolicy;
+            storagePolicy.splitMropeLease = engineConfig.ropeConfig.type == RopeType::kMRope;
+            mVisionAdapter = std::make_unique<PhaseVisionAdapter>(
+                *mVisionRunner, *tokenizer, engineConfig, mEncoderStream, storagePolicy, mCopyStream);
+            mThreePhase = std::make_unique<PhaseThreeCoordinator>(*mVisionAdapter, *mServer,
+                makeVisionConfig(mServingConfig, engineConfig, maxStableSlots, std::move(runtimeCostTracker)));
+        }
         CUDA_CHECK(cudaStreamSynchronize(setupStream));
     }
 
@@ -267,6 +348,16 @@ public:
         {
             static_cast<void>(cudaStreamSynchronize(mDecodeStream));
         }
+        if (mEncoderStream != nullptr)
+        {
+            static_cast<void>(cudaStreamSynchronize(mEncoderStream));
+        }
+        if (mCopyStream != nullptr)
+        {
+            static_cast<void>(cudaStreamSynchronize(mCopyStream));
+        }
+        mThreePhase.reset();
+        mVisionAdapter.reset();
         mServer.reset();
         mCoordinator.reset();
         mOwnership.reset();
@@ -280,6 +371,14 @@ public:
         if (mDecodeStream != nullptr)
         {
             static_cast<void>(cudaStreamDestroy(mDecodeStream));
+        }
+        if (mEncoderStream != nullptr)
+        {
+            static_cast<void>(cudaStreamDestroy(mEncoderStream));
+        }
+        if (mCopyStream != nullptr)
+        {
+            static_cast<void>(cudaStreamDestroy(mCopyStream));
         }
     }
 
@@ -320,8 +419,109 @@ public:
         }
         CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
             static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        mEmbeddingPreprocessor.embed(deviceIds, std::nullopt, std::nullopt, io, stream);
-        mEmbeddingPreprocessor.prepareDeepstack(deviceIds, {}, io, stream);
+
+        std::vector<Tensor> visionViews;
+        std::vector<Tensor> deepstackViews;
+        OptionalInputTensors visionSegments;
+        std::vector<OptionalInputTensors> deepstackSegments(static_cast<size_t>(mEngineConfig.numDeepstackFeatures));
+        size_t activeVisionRows{};
+        for (IndependentPhaseRequestView const& view : views)
+        {
+            if (view.visionPayload != nullptr)
+            {
+                ++activeVisionRows;
+            }
+        }
+        visionViews.reserve(activeVisionRows);
+        deepstackViews.reserve(activeVisionRows * static_cast<size_t>(mEngineConfig.numDeepstackFeatures));
+        visionSegments.reserve(activeVisionRows);
+        for (auto& segments : deepstackSegments)
+        {
+            segments.reserve(activeVisionRows);
+        }
+
+        auto makeFeatureView = [](Tensor& feature, int64_t rowOffset, int64_t rows, std::string const& name) {
+            Coords const shape = feature.getShape();
+            ELLM_CHECK(shape.getNumDims() == 2 && rowOffset >= 0 && rows > 0 && rowOffset + rows <= shape[0],
+                "Phase vision chunk is outside its request-owned feature buffer");
+            size_t const rowBytes = static_cast<size_t>(shape[1]) * utils::getTypeSize(feature.getDataType());
+            auto* const data = static_cast<std::byte*>(feature.rawPointer()) + rowOffset * rowBytes;
+            return Tensor(data, {rows, shape[1]}, DeviceType::kGPU, feature.getDataType(), name);
+        };
+        for (IndependentPhaseRequestView const& view : views)
+        {
+            if (view.visionPayload == nullptr || !prefill)
+            {
+                continue;
+            }
+            auto const chunkBegin = view.promptTokens->begin() + view.work.tokenOffset;
+            auto const chunkEnd = chunkBegin + view.work.tokenCount;
+            int64_t const imageOffset = std::count(view.promptTokens->begin(), chunkBegin, mEngineConfig.imageTokenId);
+            int64_t const imageRows = std::count(chunkBegin, chunkEnd, mEngineConfig.imageTokenId);
+            if (imageRows == 0)
+            {
+                continue;
+            }
+            PhaseVisionPayload& payload = *view.visionPayload;
+            visionViews.push_back(
+                makeFeatureView(payload.outputEmbedding, imageOffset, imageRows, "phase_serving_vision_segment"));
+            visionSegments.push_back(std::cref(visionViews.back()));
+            ELLM_CHECK(payload.deepstackFeatures.size() == deepstackSegments.size(),
+                "Phase vision request has the wrong deepstack feature count");
+            for (size_t index{}; index < payload.deepstackFeatures.size(); ++index)
+            {
+                deepstackViews.push_back(makeFeatureView(
+                    payload.deepstackFeatures[index], imageOffset, imageRows, "phase_serving_deepstack_segment"));
+                deepstackSegments[index].push_back(std::cref(deepstackViews.back()));
+            }
+        }
+
+        if (mEngineConfig.ropeConfig.type == RopeType::kMRope)
+        {
+            auto& owners = prefill ? mPrefillMropeOwners : mDecodeMropeOwners;
+            auto& validPositions = prefill ? mPrefillMropeValid : mDecodeMropeValid;
+            size_t const positionBytes
+                = static_cast<size_t>(mEngineConfig.rotaryDim) * utils::getTypeSize(nvinfer1::DataType::kFLOAT);
+            size_t const rowBytes = static_cast<size_t>(mEngineConfig.maxKVCacheCapacity) * positionBytes;
+            constexpr int32_t kCopyGranularity = 128;
+            for (size_t row{}; row < views.size(); ++row)
+            {
+                PhaseVisionPayload* const payload = views[row].visionPayload;
+                std::optional<uint64_t> const desiredOwner = payload != nullptr && !payload->mropeCosSin.isEmpty()
+                    ? std::optional<uint64_t>{views[row].requestId}
+                    : std::nullopt;
+                bool const ownerChanged = owners[row] != desiredOwner;
+                int32_t const requiredPositions = prefill ? views[row].work.tokenOffset + views[row].work.tokenCount
+                                                          : views[row].work.tokenCount + 1;
+                PhaseMropeStagingRange const range = phaseMropeStagingRange(ownerChanged, validPositions[row],
+                    requiredPositions, mEngineConfig.maxKVCacheCapacity, kCopyGranularity);
+                owners[row] = desiredOwner;
+                validPositions[row] = range.validPositions;
+                if (range.countPositions == 0)
+                {
+                    continue;
+                }
+                Tensor const& source = desiredOwner.has_value() ? payload->mropeCosSin : mTextMropeTemplate;
+                size_t const copyOffset = static_cast<size_t>(range.offsetPositions) * positionBytes;
+                size_t const copyBytes = static_cast<size_t>(range.countPositions) * positionBytes;
+                auto* const destination
+                    = static_cast<std::byte*>(io.mropeCosSin.rawPointer()) + row * rowBytes + copyOffset;
+                auto const* sourceBytes = static_cast<std::byte const*>(source.rawPointer()) + copyOffset;
+                CUDA_CHECK(cudaMemcpyAsync(destination, sourceBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
+            }
+            map.set(binding_names::kRopeCosSin, io.mropeCosSin);
+        }
+
+        if (!visionSegments.empty())
+        {
+            mEmbeddingPreprocessor.embedSegmentedVision(deviceIds, visionSegments, io, stream);
+            mEmbeddingPreprocessor.prepareSegmentedDeepstack(deviceIds, deepstackSegments, io, stream);
+        }
+        else
+        {
+            mEmbeddingPreprocessor.embed(deviceIds, std::nullopt, std::nullopt, io, stream);
+            mEmbeddingPreprocessor.prepareDeepstack(deviceIds, {}, io, stream);
+        }
         if (prefill)
         {
             for (int32_t index = 0; index < static_cast<int32_t>(io.deepstackEmbeds.size()); ++index)
@@ -383,7 +583,10 @@ public:
     SharedResources& mResources;
     cudaStream_t mPrefillStream{};
     cudaStream_t mDecodeStream{};
+    cudaStream_t mEncoderStream{};
+    cudaStream_t mCopyStream{};
     std::unique_ptr<IndependentEngineExecutorPair> mExecutors;
+    std::unique_ptr<MultimodalRunner> mVisionRunner;
     std::unique_ptr<PipelineIO> mPrefillIO;
     std::unique_ptr<PipelineIO> mDecodeIO;
     TensorMap mPrefillMap;
@@ -397,17 +600,25 @@ public:
     Tensor mPrefillSelectedIds;
     Tensor mDecodeSelectedIds;
     Tensor mPrefillCompactedLogits;
+    Tensor mTextMropeTemplate;
+    std::vector<std::optional<uint64_t>> mPrefillMropeOwners;
+    std::vector<std::optional<uint64_t>> mDecodeMropeOwners;
+    std::vector<int32_t> mPrefillMropeValid;
+    std::vector<int32_t> mDecodeMropeValid;
     PhaseSamplingSlotPool mSamplingSlots;
     std::unique_ptr<IndependentPhaseCoordinator> mCoordinator;
     std::unique_ptr<IndependentPhaseAsyncServer> mServer;
+    std::unique_ptr<PhaseVisionAdapter> mVisionAdapter;
+    std::unique_ptr<PhaseThreeCoordinator> mThreePhase;
 };
 
 std::unique_ptr<PhaseServingRuntime> PhaseServingRuntime::create(PhaseServingRuntimeConfig config,
     LLMEngineConfig const& engineConfig, std::unique_ptr<EngineExecutor> executor, SharedResources& resources,
-    EmbeddingData const& embedding, cudaStream_t setupStream)
+    EmbeddingData const& embedding, cudaStream_t setupStream, std::unique_ptr<MultimodalRunner> visionRunner,
+    tokenizer::Tokenizer const* tokenizer)
 {
-    return std::unique_ptr<PhaseServingRuntime>(new PhaseServingRuntime(std::make_unique<Impl>(
-        std::move(config), engineConfig, std::move(executor), resources, embedding, setupStream)));
+    return std::unique_ptr<PhaseServingRuntime>(new PhaseServingRuntime(std::make_unique<Impl>(std::move(config),
+        engineConfig, std::move(executor), resources, embedding, setupStream, std::move(visionRunner), tokenizer)));
 }
 
 PhaseServingRuntime::PhaseServingRuntime(std::unique_ptr<Impl> impl)
@@ -429,34 +640,53 @@ IndependentPhaseServerSubmission PhaseServingRuntime::submitOrQueue(
     return mImpl->mServer->submitOrQueue(requestId, std::move(promptTokens), maxOutputTokens, scheduling);
 }
 
+PhaseThreeSubmissionStatus PhaseServingRuntime::submitVision(
+    uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
+{
+    ELLM_CHECK(mImpl->mThreePhase != nullptr, "Phase vision serving is not enabled");
+    return mImpl->mThreePhase->submit(requestId, std::move(request), maxOutputTokens, scheduling);
+}
+
 bool PhaseServingRuntime::cancel(uint64_t requestId)
 {
-    return mImpl->mServer->cancel(requestId);
+    return mImpl->mThreePhase != nullptr ? mImpl->mThreePhase->cancel(requestId) : mImpl->mServer->cancel(requestId);
 }
 
 bool PhaseServingRuntime::poll()
 {
-    return mImpl->mServer->poll();
+    return mImpl->mThreePhase != nullptr ? mImpl->mThreePhase->poll() : mImpl->mServer->poll();
 }
 
 void PhaseServingRuntime::runUntilIdle(size_t maxPolls)
 {
-    mImpl->mServer->runUntilIdle(maxPolls);
+    if (mImpl->mThreePhase == nullptr)
+    {
+        mImpl->mServer->runUntilIdle(maxPolls);
+        return;
+    }
+    for (size_t pollCount{}; pollCount < maxPolls && !mImpl->mThreePhase->empty(); ++pollCount)
+    {
+        if (!mImpl->mThreePhase->poll())
+        {
+            std::this_thread::yield();
+        }
+    }
+    ELLM_CHECK(mImpl->mThreePhase->empty(), "Phase vision serving did not become idle within the poll limit");
 }
 
 std::optional<IndependentPhaseServerToken> PhaseServingRuntime::tryPopToken()
 {
-    return mImpl->mServer->tryPopToken();
+    return mImpl->mThreePhase != nullptr ? mImpl->mThreePhase->tryPopToken() : mImpl->mServer->tryPopToken();
 }
 
 std::optional<IndependentPhaseServerCompletion> PhaseServingRuntime::tryPopCompletion()
 {
-    return mImpl->mServer->tryPopCompletion();
+    return mImpl->mThreePhase != nullptr ? mImpl->mThreePhase->tryPopCompletion() : mImpl->mServer->tryPopCompletion();
 }
 
 bool PhaseServingRuntime::empty() const noexcept
 {
-    return mImpl->mServer->empty();
+    return mImpl->mThreePhase != nullptr ? mImpl->mThreePhase->empty() : mImpl->mServer->empty();
 }
 
 size_t PhaseServingRuntime::inFlightCount() const noexcept
@@ -467,6 +697,16 @@ size_t PhaseServingRuntime::inFlightCount() const noexcept
 size_t PhaseServingRuntime::pendingCount() const noexcept
 {
     return mImpl->mServer->pendingCount();
+}
+
+bool PhaseServingRuntime::visionEnabled() const noexcept
+{
+    return mImpl->mThreePhase != nullptr;
+}
+
+std::optional<PhaseThreeCoordinatorMetrics> PhaseServingRuntime::visionMetrics() const noexcept
+{
+    return mImpl->mThreePhase != nullptr ? std::optional{mImpl->mThreePhase->metrics()} : std::nullopt;
 }
 
 CUcontext PhaseServingRuntime::cudaContext() const noexcept
