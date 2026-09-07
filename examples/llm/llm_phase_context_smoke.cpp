@@ -2500,10 +2500,20 @@ int main(int argc, char** argv)
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
                 threePhaseConfig.contextualPrefillBatchCapacity = semanticSchedulerConfig.maxPrefillBatchSize;
                 threePhaseConfig.contextualDecodeBatchCapacity = semanticSchedulerConfig.maxDecodeBatchSize;
+                bool enableGlobalFormationAwareSelection{};
+                if (char const* value = std::getenv("TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE"))
+                {
+                    std::string const enabled(value);
+                    ELLM_CHECK(
+                        enabled == "0" || enabled == "1", "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE must be 0 or 1");
+                    enableGlobalFormationAwareSelection = enabled == "1";
+                }
                 threePhaseConfig.enableGlobalFormationAwareSelection
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
-                    && std::getenv("TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE") != nullptr
+                    && enableGlobalFormationAwareSelection
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_FORMATION_AWARE") == nullptr;
+                LOG_INFO("Phase transition policy: formation_aware=%s",
+                    threePhaseConfig.enableGlobalFormationAwareSelection ? "enabled" : "disabled");
                 threePhaseConfig.enableContextualSuccessorGuard
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD") != nullptr;

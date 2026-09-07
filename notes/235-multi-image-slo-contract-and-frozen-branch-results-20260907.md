@@ -152,18 +152,40 @@ correct fix:  같은 TPOT target을 모든 policy layer에 전달
 
 ### 4.2 SLO 통일 후
 
-| Policy | runs | token/s 중앙값 | 범위 | TTFT mean/p95 중앙 ms | TPOT mean/p95 중앙 ms | E2E mean/p95 중앙 ms |
+P21을 Scalar production, P22를 Scalar+Transition으로 의도했지만 benchmark가 false를 환경변수 부재가 아니라
+`TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE=0`으로 materialize했다. 당시 C++은 값이 아니라 존재 여부만 검사했으므로
+**P21과 P22 모두 실제로 H2 active였다**. 따라서 아래 결과는 policy A/B가 아니라 동일 H2-active policy의 두 반복
+block이다.
+
+| 실제 Policy | runs | token/s 중앙값 | 범위 | TTFT mean/p95 중앙 ms | TPOT mean/p95 중앙 ms | E2E mean/p95 중앙 ms |
 |---|---:|---:|---:|---:|---:|---:|
-| Scalar production, P21 | 5 | **323.84** | 292.61--324.52 | 259.06 / 285.15 | 7.46 / 8.62 | 490.81 / 493.55 |
-| Scalar+Transition, P22 | 5 | 318.98 | 203.05--324.68 | 258.05 / 293.72 | 7.88 / 9.32 | 494.38 / 501.35 |
+| H2 active replicate A, P21 | 5 | **323.84** | 292.61--324.52 | 259.06 / 285.15 | 7.46 / 8.62 | 490.81 / 493.55 |
+| H2 active replicate B, P22 | 5 | 318.98 | 203.05--324.68 | 258.05 / 293.72 | 7.88 / 9.32 | 494.38 / 501.35 |
 
-production Scalar는 catastrophic `203--244 tok/s` trajectory를 5/5에서 피했다. Scalar+Transition은 1/5에서
-다시 `203.05 tok/s`로 떨어졌다. 따라서 H2 authority는 계속 비활성으로 두고 physical/frozen replay 진단에만
-사용한다.
+두 block을 합친 H2 active 10회 중앙값은 `320.84 tok/s`이고 `<250 tok/s` catastrophic trajectory는 1/10,
+`<300 tok/s`는 2/10이었다. P21과 P22의 차이를 H2 효과로 해석해서는 안 된다.
 
-## 5. Full12 production gate
+### 4.3 Boolean contract 수정과 실제 H2-off 대조군
 
-P23의 12-workload 1회 결과를 사용하고, variance가 컸던 Poisson은 P24 3회 중앙값으로 대체했다. 이전 champion은
+`TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE`를 다른 explicit boolean option처럼 반드시 `0` 또는 `1`로 parse하도록
+수정했다. startup log도 실제 `formation_aware=enabled|disabled`를 남긴다. 수정 후 P27의 실제 H2-off 5회는 다음과
+같다.
+
+```text
+token/s = 242.21, 322.59, 320.72, 318.22, 203.84
+median  = 318.22
+<250    = 2/5
+<300    = 2/5
+```
+
+작은 표본에서는 H2 active가 median `+0.82%`이고 catastrophic 빈도도 `10%` 대 `40%`로 낮다. 이는 H2를 버려야
+한다는 이전 결론을 뒤집지만, 5-request trace의 분산이 크므로 causal promotion 증거로는 아직 부족하다. 현재 full12
+후보는 H2 active이며, production default를 결정하기 전 동일 binary의 paired full-telemetry 반복이 필요하다.
+
+## 5. Full12 H2-active gate
+
+P23과 P24도 위 boolean bug 때문에 실제 H2 active였다. P23의 12-workload 1회 결과를 사용하고, variance가 컸던
+Poisson은 P24 3회 중앙값으로 대체했다. 이전 champion은
 note 234의 workload별 최종/반복값이며 frozen vLLM은 request trace와 runtime contract가 변하지 않아 재실행하지
 않았다.
 
@@ -176,7 +198,7 @@ note 234의 workload별 최종/반복값이며 frozen vLLM은 request trace와 r
 | long-prefill | 1237.1 | +6.69% | +10.56% | 2036.8 / 2543.0 | 25.30 / 31.09 | 4187.8 / 5933.6 |
 | mixed | 1181.6 | +1.80% | +58.03% | 653.0 / 2059.5 | 37.52 / 56.21 | 2340.2 / 2466.7 |
 | multi-image | 320.4 | +1.54% | +34.83% | 248.0 / 290.8 | 7.87 / 9.29 | 492.1 / 498.8 |
-| poisson, 3x median | 1941.4 | -2.24% | +8.28% | 254.6 / 891.9 | 21.40 / 37.41 | 1608.4 / 2027.8 |
+| poisson, 5x median | 2033.2 | +2.39% | +13.41% | 229.4 / 771.8 | 20.77 / 37.06 | 1525.7 / 1970.6 |
 | short | 2503.9 | +2.56% | +25.99% | 86.2 / 177.0 | 13.37 / 26.10 | 327.5 / 406.6 |
 | text-heavy | 2117.1 | +2.49% | +29.37% | 375.0 / 937.4 | 21.65 / 34.91 | 1483.3 / 1590.7 |
 | vision-heavy | 734.7 | +4.88% | +27.62% | 1277.2 / 2964.6 | 49.05 / 77.95 | 3133.5 / 3316.8 |
@@ -184,14 +206,14 @@ note 234의 workload별 최종/반복값이며 frozen vLLM은 request trace와 r
 
 요약:
 
-- 이전 champion 대비 throughput geometric mean: **+1.90%**
+- 이전 champion 대비 throughput geometric mean: **+2.29%**
 - 이전 champion 대비 12/12가 `-3%` regression gate 통과, 10/12는 더 빠름
-- frozen vLLM 대비 throughput geometric mean: **+17.54%**
+- frozen vLLM 대비 throughput geometric mean: **+17.99%**
 - frozen vLLM throughput: **12/12 우세**
 - greedy token hash: 모든 measured repeat에서 동일
 - peak memory: `9495MiB` 이하
 
-P23은 single run이므로 paper confidence interval이 아니다. 다만 multi-image 5회와 Poisson 3회가 가장 큰 두
+P23은 single run이므로 paper confidence interval이 아니다. 다만 multi-image와 Poisson 각 5회가 가장 큰 두
 variance 위험을 보완한다.
 
 ### 5.1 48.8 req/s saturation 반복
@@ -213,6 +235,24 @@ mean/p95는 `-1.8%/-0.8%`, E2E mean/p95는 `-3.1%/-6.7%`다. Trace-derived는 ge
 P25는 ceiling/upper-bound로만 사용한다.
 
 모든 10회에서 generated token hash가 동일했고, peak memory median은 `9237MiB`였다.
+
+### 5.2 Poisson 5회와 SLO attribution
+
+P28은 corrected boolean contract에서 H2 active를 명시하고 generic VLM calibration만 사용했다.
+
+```text
+token/s = 2033.24, 2041.11, 1876.96, 2040.47, 1901.23
+mean    = 1978.60
+median  = 2033.24
+CV      = 4.16%
+95% t-CI = [1876.52, 2080.69]
+```
+
+이전 champion `1985.81 tok/s`보다 median `+2.39%`, frozen vLLM `1792.9 tok/s`보다 `+13.41%`다. 모든
+run의 token hash는 동일했다. 다만 joint SLO pass는 `82.81%, 85.94%, 79.69%, 85.94%, 79.69%`로 raw
+throughput보다 불안정하다. 실패 55개는 전부 vision request의 TTFT-only failure였으며 text request는
+240/240 모두 통과했다. 따라서 다음 Poisson 개선 목표는 더 많은 overlap이나 D batching이 아니라 E queue에서
+oldest vision request의 first-token critical path를 안정적으로 보호하는 것이다.
 
 ## 6. 검증
 
@@ -238,7 +278,7 @@ Python tests:
 
 ## 7. 최종 architecture 판단
 
-현재 production winner는 계속 `Contextual Scalar + deterministic feasibility/SLO selector`다.
+현재 full12 winner는 `Contextual Scalar + deterministic feasibility/SLO selector + bounded H2 transition`이다.
 
 ```text
 request DAG + E/P/D ready snapshot
@@ -261,12 +301,17 @@ exact CUDA execution registry    contextual Scalar RLS
                  SLO-safe global selector
                           |
                           v
+             deterministic bounded transition
+                 request DAG / next cohort
+                          |
+                          v
                     E/P/D dispatch
 ```
 
-Frozen completion-vector and H2 transition components는 production authority가 아니라 causal validation substrate다.
-더 복잡한 physical model이 반드시 더 좋은 policy를 만들지는 않는다. 이번 결과에서 가장 큰 이득은 model fidelity가
-아니라 policy layers가 동일한 SLO contract를 사용하게 한 데서 나왔다.
+Frozen completion-vector는 계속 causal validation substrate다. H2 transition은 full12 candidate에 포함됐지만
+multi-image에서의 독립 기여도는 아직 확정되지 않았다. 더 복잡한 physical model이 반드시 더 좋은 policy를 만들지는
+않는다. 이번 결과에서 가장 큰 확정 이득은 model fidelity가 아니라 policy layers가 동일한 SLO contract를 사용하게
+한 데서 나왔다.
 
 ## 8. 다음 계획
 
@@ -278,9 +323,10 @@ Frozen completion-vector and H2 transition components는 production authority가
 
 남은 순서:
 
-1. Poisson을 5회 이상으로 늘려 confidence interval을 확정한다.
-2. `Scalar+Transition`의 1/5 regression을 frozen branch replay로 재현하고 H2가 실제로 선택을 바꾼 경우만 causal하게
-   분석한다. production authority는 그 전까지 비활성이다.
+1. 동일 binary에서 H2 off/on multi-image를 각각 최소 10회 측정하고, full telemetry 반복에서 H2가 실제 action을
+   바꾼 decision만 frozen branch replay로 causal하게 분석한다.
+2. Poisson의 vision TTFT-only failure를 E-ready wait, encoder formation wait, E GPU service, E-complete-to-P-start로
+   분해하고 request-level slack guard가 어느 구간을 보호하지 못하는지 확인한다.
 3. 동일 HTTP contract의 최종 paper run에서는 Current와 vLLM을 모두 fresh 5회 실행하고 bootstrap confidence
    interval, joint-SLO goodput, memory를 함께 보고한다.
 4. 디스크 headroom 확보 후 selected multi-image run 하나만 full Nsight/lineage로 수집한다.
