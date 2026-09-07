@@ -954,11 +954,20 @@ void ExternalWeightManager::bindToContext(
 
 void ExternalWeightManager::registerTensorMapEntries(TensorMap& map)
 {
+    registerTensorMapEntries({&map});
+}
+
+void ExternalWeightManager::registerTensorMapEntries(std::initializer_list<TensorMap*> maps)
+{
     ELLM_CHECK(mValidated, "registerTensorMapEntries called before weight validation");
     ELLM_CHECK(!mRegistered, "registerTensorMapEntries called more than once");
-    for (auto& tensor : mWeights)
+    for (TensorMap* map : maps)
     {
-        map.set(tensor.getName(), tensor);
+        ELLM_CHECK(map != nullptr, "registerTensorMapEntries received a null tensor map");
+        for (auto& tensor : mWeights)
+        {
+            map->set(tensor.getName(), tensor);
+        }
     }
     mRegistered = true;
 }

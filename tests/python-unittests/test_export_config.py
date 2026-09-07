@@ -103,6 +103,7 @@ def _simulate_draft_dtype_write(draft_config):
 
 def test_packed_prefill_metadata_and_cli_are_wired():
     config_source = _load_config_source()
+    runtime_config_source = _load_source()
     with open(_EXPORT_CLI_PATH, "r", encoding="utf-8") as source_file:
         cli_source = source_file.read()
     assert re.search(r"packed_prefill:\s*bool\s*=\s*False", config_source)
@@ -111,6 +112,10 @@ def test_packed_prefill_metadata_and_cli_are_wired():
     assert '"--packed-prefill"' in cli_source
     assert '"--packed-prefill-max-chunk-tokens"' in cli_source
     assert "model.config.packed_prefill = packed_prefill" in cli_source
+    assert '"packed_prefill":' in runtime_config_source
+    assert "bool(config.packed_prefill)" in runtime_config_source
+    assert '"packed_prefill_max_chunk_tokens":' in runtime_config_source
+    assert "int(config.packed_prefill_max_chunk_tokens)" in runtime_config_source
 
 
 def test_packed_prefill_attention_attributes_are_wired_end_to_end():

@@ -60,6 +60,8 @@ public:
         ParallelConfig parallelConfig{};
         std::optional<SpecDecodeDraftingConfig> draftingConfig{};
         ContextCacheConfig contextCacheConfig{};
+        //! Construct directly into phase serving without allocating the legacy request-loop state.
+        std::optional<PhaseServingRuntimeConfig> phaseServingConfig{};
         std::string checkpointDir{};
         std::string draftCheckpointDir{};
         std::vector<int32_t> localRanks{};

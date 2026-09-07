@@ -19,6 +19,7 @@
 
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "runtime/config/llmEngineConfig.h"
@@ -240,23 +241,74 @@ public:
         pairConfig.visionPrefillProfile = engineConfig.visionPrefillProfile;
         pairConfig.sharedExecutionContext = mServingConfig.sharedExecutionContext;
         mExecutors = IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
+        int32_t decodeBatchCapacity = engineConfig.maxSupportedDecodeBatchSize;
+        size_t exclusiveEncoderInputTokenThreshold{};
+        bool serializeAllEncoderPrefill{};
+        bool serializeAllEncoderDecode{};
         if (mVisionRunner != nullptr)
         {
-            mVisionRunner->allocateContextMemory();
+            int32_t const profileCount = mVisionRunner->getOptimizationProfileCount();
+            ELLM_CHECK(profileCount > 0, "Phase vision serving requires at least one encoder profile");
+            size_t freeBytes{};
+            size_t totalBytes{};
+            CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+            LOG_INFO("Phase workspace requirements: prefill=%zu decode=%zu vision=%lld profiles=%d free=%zu total=%zu",
+                mExecutors->prefillContextMemory().getMemoryCapacity(),
+                mExecutors->decodeContextMemory().getMemoryCapacity(),
+                static_cast<long long>(mVisionRunner->getRequiredContextMemorySize()), profileCount, freeBytes,
+                totalBytes);
+            int64_t const prefillBytes = static_cast<int64_t>(mExecutors->prefillContextMemory().getMemoryCapacity());
+            int64_t const visionBytes = mVisionRunner->getRequiredContextMemorySize();
+            constexpr size_t kWORKSPACE_HEADROOM_BYTES = 96U * 1024U * 1024U;
+            size_t const prefillShareGrowth = static_cast<size_t>(std::max<int64_t>(0, visionBytes - prefillBytes));
+            bool const prefillShareFits
+                = freeBytes >= prefillShareGrowth && freeBytes - prefillShareGrowth >= kWORKSPACE_HEADROOM_BYTES;
+            if (!prefillShareFits)
+            {
+                TieredVisionContextMemoryInfo const info
+                    = mExecutors->configureSharedVisionDecodeContextMemory(*mVisionRunner);
+                serializeAllEncoderDecode = true;
+                constexpr int32_t kMEMORY_CONSTRAINED_DECODE_BATCH = 32;
+                decodeBatchCapacity = std::min(decodeBatchCapacity, kMEMORY_CONSTRAINED_DECODE_BATCH);
+                LOG_INFO("Phase workspace mode: shared E/D arena=%lld bytes; E/P overlap remains available",
+                    static_cast<long long>(info.arenaBytes));
+                LOG_INFO("Phase memory-constrained decode capacity: %d rows", decodeBatchCapacity);
+            }
+            else if (profileCount == 1)
+            {
+                TieredVisionContextMemoryInfo const info
+                    = mExecutors->configureSharedVisionContextMemory(*mVisionRunner, 0);
+                serializeAllEncoderPrefill = true;
+                LOG_INFO("Phase workspace mode: shared E/P arena=%lld bytes; E/D overlap remains available",
+                    static_cast<long long>(info.arenaBytes));
+            }
+            else
+            {
+                TieredVisionContextMemoryInfo const info
+                    = mExecutors->configureTieredVisionContextMemory(*mVisionRunner, 0, profileCount - 1);
+                exclusiveEncoderInputTokenThreshold
+                    = static_cast<size_t>(mVisionRunner->getInputTokenLimitForProfile(0));
+                LOG_INFO("Phase workspace mode: tiered E/P arena=%lld bytes, exclusive input threshold=%zu",
+                    static_cast<long long>(info.arenaBytes), exclusiveEncoderInputTokenThreshold);
+            }
         }
 
-        mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(engineConfig,
-            engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedInputLength, setupStream));
+        int32_t const prefillSequenceCapacity = engineConfig.packedPrefill
+            ? std::min(mServingConfig.maxPrefillChunkTokens, engineConfig.maxPackedPrefillChunkTokens)
+            : engineConfig.maxSupportedInputLength;
+        mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(
+            engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
         mDecodeIO = std::make_unique<PipelineIO>(
-            PipelineIO::createForLLMPhase(engineConfig, engineConfig.maxSupportedDecodeBatchSize, 1, setupStream));
+            PipelineIO::createForLLMPhase(engineConfig, decodeBatchCapacity, 1, setupStream));
         buildTensorMap(mPrefillMap, *mPrefillIO, resources, engineConfig, 0);
         buildTensorMap(mDecodeMap, *mDecodeIO, resources, engineConfig, 0);
-        resources.externalWeightManager->validateAgainstEngine(mExecutors->prefillExecutor(), "phase-base");
-        resources.externalWeightManager->registerTensorMapEntries(mPrefillMap);
-        resources.externalWeightManager->registerTensorMapEntries(mDecodeMap);
+        if (!resources.externalWeightManager->validated())
+        {
+            resources.externalWeightManager->validateAgainstEngine(mExecutors->prefillExecutor(), "phase-base");
+        }
+        resources.externalWeightManager->registerTensorMapEntries({&mPrefillMap, &mDecodeMap});
 
-        int32_t const maxPhaseBatch
-            = std::max(engineConfig.maxSupportedPrefillBatchSize, engineConfig.maxSupportedDecodeBatchSize);
+        int32_t const maxPhaseBatch = std::max(engineConfig.maxSupportedPrefillBatchSize, decodeBatchCapacity);
         int32_t const maxStableSlots
             = mServingConfig.maxStableSlots > 0 ? mServingConfig.maxStableSlots : engineConfig.maxSupportedBatchSize;
         ELLM_CHECK(maxStableSlots >= maxPhaseBatch, "Phase stable-slot capacity must cover the largest phase batch");
@@ -269,14 +321,14 @@ public:
             nvinfer1::DataType::kINT32, "phase_serving_host_prefill_ids");
         mDevicePrefillIds = Tensor({engineConfig.maxSupportedPrefillBatchSize, prefillTokenCapacity}, DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "phase_serving_prefill_ids");
-        mHostDecodeIds = Tensor({engineConfig.maxSupportedDecodeBatchSize, 1}, DeviceType::kCPU,
-            nvinfer1::DataType::kINT32, "phase_serving_host_decode_ids");
-        mDeviceDecodeIds = Tensor({engineConfig.maxSupportedDecodeBatchSize, 1}, DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "phase_serving_decode_ids");
+        mHostDecodeIds = Tensor(
+            {decodeBatchCapacity, 1}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_serving_host_decode_ids");
+        mDeviceDecodeIds = Tensor(
+            {decodeBatchCapacity, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "phase_serving_decode_ids");
         mPrefillSelectedIds = Tensor({engineConfig.maxSupportedPrefillBatchSize, 1}, DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "phase_serving_prefill_selected_ids");
-        mDecodeSelectedIds = Tensor({engineConfig.maxSupportedDecodeBatchSize, 1}, DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "phase_serving_decode_selected_ids");
+        mDecodeSelectedIds = Tensor({decodeBatchCapacity, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "phase_serving_decode_selected_ids");
         mPrefillCompactedLogits = Tensor({engineConfig.maxSupportedPrefillBatchSize, engineConfig.outputVocabSize},
             DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "phase_serving_prefill_compacted_logits");
 
@@ -288,12 +340,14 @@ public:
                 engineConfig.ropeConfig.rotaryTheta, engineConfig.rotaryDim, engineConfig.maxKVCacheCapacity, 1,
                 setupStream);
             mPrefillMropeOwners.resize(static_cast<size_t>(engineConfig.maxSupportedPrefillBatchSize));
-            mDecodeMropeOwners.resize(static_cast<size_t>(engineConfig.maxSupportedDecodeBatchSize));
+            mDecodeMropeOwners.resize(static_cast<size_t>(decodeBatchCapacity));
             mPrefillMropeValid.resize(static_cast<size_t>(engineConfig.maxSupportedPrefillBatchSize));
-            mDecodeMropeValid.resize(static_cast<size_t>(engineConfig.maxSupportedDecodeBatchSize));
+            mDecodeMropeValid.resize(static_cast<size_t>(decodeBatchCapacity));
         }
 
-        PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, engineConfig);
+        LLMEngineConfig phaseEngineConfig = engineConfig;
+        phaseEngineConfig.maxSupportedDecodeBatchSize = decodeBatchCapacity;
+        PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, phaseEngineConfig);
         if (schedulerConfig.maxExternalPrefillBatchSize <= 0)
         {
             schedulerConfig.maxExternalPrefillBatchSize = schedulerConfig.maxPrefillBatchSize;
@@ -308,7 +362,7 @@ public:
         };
         IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
-        mCoordinator = std::make_unique<IndependentPhaseCoordinator>(engineConfig, std::move(schedulerConfig),
+        mCoordinator = std::make_unique<IndependentPhaseCoordinator>(phaseEngineConfig, std::move(schedulerConfig),
             *mExecutors, *mOwnership, *mPrefillIO, *mDecodeIO, mPrefillMap, mDecodeMap, mPrefillStream, mDecodeStream,
             std::move(seedCallbacks));
         mCoordinator->setGraphCaptureEnabled(mServingConfig.enableCudaGraphs);
@@ -323,7 +377,7 @@ public:
         adapter.submitSampling
             = [this](std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream,
                   bool fromPrefill) { return submitSampling(views, io, stream, fromPrefill); };
-        IndependentPhaseServerConfig serverConfig = makeServerConfig(mServingConfig, engineConfig, maxStableSlots);
+        IndependentPhaseServerConfig serverConfig = makeServerConfig(mServingConfig, phaseEngineConfig, maxStableSlots);
         mServer = std::make_unique<IndependentPhaseAsyncServer>(
             std::move(serverConfig), *mCoordinator, *mOwnership, std::move(adapter));
         if (mVisionRunner != nullptr)
@@ -332,8 +386,12 @@ public:
             storagePolicy.splitMropeLease = engineConfig.ropeConfig.type == RopeType::kMRope;
             mVisionAdapter = std::make_unique<PhaseVisionAdapter>(
                 *mVisionRunner, *tokenizer, engineConfig, mEncoderStream, storagePolicy, mCopyStream);
-            mThreePhase = std::make_unique<PhaseThreeCoordinator>(*mVisionAdapter, *mServer,
-                makeVisionConfig(mServingConfig, engineConfig, maxStableSlots, std::move(runtimeCostTracker)));
+            PhaseThreeCoordinatorConfig visionConfig
+                = makeVisionConfig(mServingConfig, phaseEngineConfig, maxStableSlots, std::move(runtimeCostTracker));
+            visionConfig.exclusiveEncoderInputTokenThreshold = exclusiveEncoderInputTokenThreshold;
+            visionConfig.serializeAllEncoderPrefill = serializeAllEncoderPrefill;
+            visionConfig.serializeAllEncoderDecode = serializeAllEncoderDecode;
+            mThreePhase = std::make_unique<PhaseThreeCoordinator>(*mVisionAdapter, *mServer, std::move(visionConfig));
         }
         CUDA_CHECK(cudaStreamSynchronize(setupStream));
     }

@@ -449,6 +449,10 @@ def build_runtime_llm_config_dict(
                       or config.is_eagle3_draft or config.is_dflash_draft
                       or config.is_jetspec_draft or config.is_dspark_draft
                       or config.is_mtp_draft or config.gemma4_mtp_draft)),
+        "packed_prefill":
+        bool(config.packed_prefill),
+        "packed_prefill_max_chunk_tokens":
+        int(config.packed_prefill_max_chunk_tokens),
         "rms_norm_eps":
         float(config.rms_norm_eps),
     }

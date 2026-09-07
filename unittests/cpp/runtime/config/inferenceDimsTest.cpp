@@ -47,6 +47,7 @@ std::vector<int64_t InferenceDims::*> allReferenced()
 {
     return {
         &InferenceDims::batch,
+        &InferenceDims::tokenBatch,
         &InferenceDims::seqLen,
         &InferenceDims::kvLen,
         &InferenceDims::selectLen,
@@ -128,8 +129,8 @@ TEST(InferenceDimsTest, FirstInvalidMemberPartialSet)
     InferenceDims d{};
     d.batch = 4;
     auto const refs = allReferenced();
-    // First *invalid* is seqLen (next referenced member that's still zero).
-    EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::seqLen);
+    // First *invalid* is tokenBatch (next referenced member that's still zero).
+    EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::tokenBatch);
 }
 
 TEST(InferenceDimsTest, FirstInvalidMemberUnreferencedFieldZero)

@@ -102,6 +102,11 @@ public:
     //! either context uses this arena.
     TieredVisionContextMemoryInfo configureSharedVisionContextMemory(MultimodalRunner& vision, int32_t visionProfile);
 
+    //! Replace the independent decode workspace with one arena shared by all
+    //! vision profiles. E/D dispatch must be serialized while either context
+    //! uses this arena; E/P concurrency remains available.
+    TieredVisionContextMemoryInfo configureSharedVisionDecodeContextMemory(MultimodalRunner& vision);
+
     //! The CUDA context owning all three supplied streams.
     CUcontext cudaContext() const noexcept;
 

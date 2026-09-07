@@ -807,6 +807,8 @@ public:
     void setExternalDrainPreference(PhaseDrainPreference preference) noexcept;
     //! Temporarily exclude prefill dispatch while an external encoder owns overlapping context memory.
     void setPrefillDispatchBlocked(bool blocked) noexcept;
+    //! Temporarily exclude decode dispatch while an external encoder owns overlapping context memory.
+    void setDecodeDispatchBlocked(bool blocked) noexcept;
     //! Temporarily exclude every new P/D dispatch while an external phase crosses a latency deadline.
     void setDispatchBlocked(bool blocked) noexcept;
     //! Identify external vision-encoder contention for decode cost observation and selection.
@@ -919,6 +921,7 @@ private:
     size_t mDrainPreferenceDispatches{};
     size_t mConsecutiveDrainPreferenceDispatches{};
     bool mPrefillDispatchBlocked{};
+    bool mDecodeDispatchBlocked{};
     bool mDispatchBlocked{};
     bool mExternalEncoderActive{};
     size_t mPendingPrefillProducerRows{};

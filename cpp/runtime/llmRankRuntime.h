@@ -97,12 +97,14 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
         ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
-        std::string const& checkpointDir, std::string const& draftCheckpointDir);
+        std::string const& checkpointDir, std::string const& draftCheckpointDir,
+        std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig = std::nullopt);
 
     LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig);
+        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
+        std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig = std::nullopt);
 
     //! @brief Destructor
     ~LLMRankRuntime();
@@ -263,12 +265,14 @@ private:
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
         ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
-        std::string const& checkpointDir, std::string const& draftCheckpointDir);
+        std::string const& checkpointDir, std::string const& draftCheckpointDir,
+        std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig);
 
     void initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
         std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig);
+        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
+        std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the

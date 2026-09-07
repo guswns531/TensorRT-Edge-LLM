@@ -31,6 +31,7 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/multiDevice/ncclCollectiveBackend.h"
+#include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
@@ -44,14 +45,17 @@
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -104,7 +108,9 @@ enum LLMInferenceOptionId : int
     DART_PIVOT_IMAGE_TOKENS = 937,
     DART_PIVOT_TEXT_TOKENS = 938,
     VISUAL_PRUNE_ALGO = 939,
-    ENCODER_CACHE_BUDGET_BYTES = 940
+    ENCODER_CACHE_BUDGET_BYTES = 940,
+    PHASE_SERVING = 941,
+    PHASE_POLICY = 942
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -183,6 +189,8 @@ struct LLMInferenceArgs
     int32_t talkerPrefillThreshold{4}; //!< Start Talker prefill after this many Thinker assistant tokens
 
     int32_t tpSize{1};
+    bool phaseServing{false};
+    rt::PhasePolicyMode phasePolicy{rt::PhasePolicyMode::kContextualScalarTransition};
 };
 
 namespace
@@ -329,7 +337,7 @@ void printUsage(char const* programName)
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] "
-                 "[--tpSize=<number>]";
+                 "[--tpSize=<number>] [--phaseServing] [--phasePolicy=exact|scalar|scalar-transition]";
     std::cerr << " [--specDecode] [--specDraftTopK=<number>] [--specDraftStep=<number>] "
                  "[--specVerifySize=<number>] [--dflashBlockSize=<number>|--jetspecBlockSize=<number>] "
                  "[--dsparkScheduler=off|threshold|sps] "
@@ -352,6 +360,8 @@ void printUsage(char const* programName)
     std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
+    std::cerr << "  --phaseServing            Use continuous asynchronous E/P/D phase serving" << std::endl;
+    std::cerr << "  --phasePolicy             Phase selector: exact, scalar, or scalar-transition" << std::endl;
     std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
@@ -482,7 +492,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"dartPivotImageTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_IMAGE_TOKENS},
         {"dartPivotTextTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS},
         {"encoderCacheBudgetBytes", required_argument, 0, LLMInferenceOptionId::ENCODER_CACHE_BUDGET_BYTES},
-        {0, 0, 0, 0}};
+        {"phaseServing", no_argument, 0, LLMInferenceOptionId::PHASE_SERVING},
+        {"phasePolicy", required_argument, 0, LLMInferenceOptionId::PHASE_POLICY}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -802,6 +813,18 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::PHASE_SERVING: args.phaseServing = true; break;
+        case LLMInferenceOptionId::PHASE_POLICY:
+        {
+            std::optional<rt::PhasePolicyMode> const policy = rt::phasePolicyModeFromName(optarg);
+            if (!policy.has_value())
+            {
+                LOG_ERROR("Invalid phasePolicy value: %s (expected exact, scalar, or scalar-transition)", optarg);
+                return false;
+            }
+            args.phasePolicy = *policy;
+            break;
+        }
         default: return false;
         }
     }
@@ -852,6 +875,23 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (args.tpSize > 1)
     {
         LOG_INFO("Tensor parallel launch requested: tpSize=%d", args.tpSize);
+    }
+    if (args.phaseServing)
+    {
+        if (args.specDecodeArgs.enabled || args.contextCacheConfig.enabled || args.enableAudioOutput || args.tpSize > 1
+            || args.visualPrunerConfig.enabled)
+        {
+            LOG_ERROR(
+                "--phaseServing currently supports single-GPU vanilla text/VLM requests without context reuse "
+                "or audio output");
+            return false;
+        }
+        if (args.warmup > 0)
+        {
+            LOG_ERROR("--phaseServing uses online continuous admission; use a calibration trace instead of --warmup");
+            return false;
+        }
+        LOG_INFO("Asynchronous phase serving enabled with policy=%s", rt::phasePolicyModeName(args.phasePolicy));
     }
     if (args.specDecodeArgs.enabled)
     {
@@ -965,6 +1005,205 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
 
     return result;
 }
+
+namespace
+{
+
+double phasePercentile(std::vector<double> values, double percentile)
+{
+    if (values.empty())
+    {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    size_t const index = std::min(
+        values.size() - 1U, static_cast<size_t>(std::ceil(percentile * static_cast<double>(values.size()))) - 1U);
+    return values[index];
+}
+
+double phaseMean(std::vector<double> const& values)
+{
+    return values.empty() ? 0.0
+                          : std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+}
+
+int runPhaseServingInference(LLMInferenceArgs const& args, std::vector<rt::LLMGenerationRequest>& batchedRequests,
+    rt::LLMInferenceRuntime& runtime, MemoryMonitor& memoryMonitor, bool profilerEnabled)
+{
+    size_t logicalRequestCount{};
+    for (rt::LLMGenerationRequest const& batch : batchedRequests)
+    {
+        logicalRequestCount += batch.requests.size();
+    }
+
+    struct InputRecord
+    {
+        uint64_t requestId{};
+        std::vector<rt::Message> messages;
+    };
+    std::vector<InputRecord> inputs;
+    inputs.reserve(logicalRequestCount);
+
+    auto const benchmarkStart = std::chrono::steady_clock::now();
+    uint64_t nextRequestId{};
+    for (rt::LLMGenerationRequest& batch : batchedRequests)
+    {
+        for (size_t row{}; row < batch.requests.size(); ++row)
+        {
+            uint64_t const requestId = nextRequestId++;
+            rt::LLMGenerationRequest::Request& request = batch.requests[row];
+            inputs.push_back(InputRecord{requestId, request.messages});
+            int32_t const maxOutputTokens = static_cast<int32_t>(batch.maxGenerateLength);
+            if (!request.imageBuffers.empty())
+            {
+                rt::LLMGenerationRequest singleton;
+                singleton.temperature = batch.temperature;
+                singleton.topP = batch.topP;
+                singleton.topK = batch.topK;
+                singleton.maxGenerateLength = batch.maxGenerateLength;
+                singleton.diffusionMaxDenoisingSteps = batch.diffusionMaxDenoisingSteps;
+                singleton.loraWeightsName = batch.loraWeightsName;
+                singleton.saveSystemPromptKVCache = batch.saveSystemPromptKVCache;
+                singleton.applyChatTemplate = batch.applyChatTemplate;
+                singleton.addGenerationPrompt = batch.addGenerationPrompt;
+                singleton.enableThinking = batch.enableThinking;
+                singleton.disableSpecDecode = batch.disableSpecDecode;
+                singleton.numLogprobs = batch.numLogprobs;
+                singleton.generateAudio = batch.generateAudio;
+                singleton.acceptHiddenLayer = batch.acceptHiddenLayer;
+                singleton.onTokenGenerated = batch.onTokenGenerated;
+                singleton.contextCacheLookupPolicy = batch.contextCacheLookupPolicy;
+                singleton.contextCacheCommitPolicy = batch.contextCacheCommitPolicy;
+                singleton.contextCacheReplayTailLength = batch.contextCacheReplayTailLength;
+                singleton.recurrentCaptureInterval = batch.recurrentCaptureInterval;
+                singleton.requests.push_back(std::move(request));
+                if (!batch.preTokenizedInputIds.empty())
+                {
+                    singleton.preTokenizedInputIds.push_back(std::move(batch.preTokenizedInputIds.at(row)));
+                }
+                if (!batch.streamChannels.empty())
+                {
+                    singleton.streamChannels.push_back(std::move(batch.streamChannels.at(row)));
+                }
+                rt::PhaseThreeSubmissionStatus const status
+                    = runtime.submitPhaseVisionRequest(requestId, std::move(singleton), maxOutputTokens);
+                ELLM_CHECK(status != rt::PhaseThreeSubmissionStatus::kDuplicateRequest,
+                    "Phase vision request ID was duplicated");
+            }
+            else
+            {
+                rt::IndependentPhaseServerSubmission submission;
+                if (!batch.preTokenizedInputIds.empty())
+                {
+                    submission
+                        = runtime.submitPhaseTokens(requestId, batch.preTokenizedInputIds.at(row), maxOutputTokens);
+                }
+                else
+                {
+                    submission = runtime.submitPhaseRequest(requestId, request, maxOutputTokens,
+                        batch.applyChatTemplate, batch.addGenerationPrompt, batch.enableThinking);
+                }
+                ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted
+                        || submission.status == rt::IndependentPhaseServerStatus::kQueued
+                        || submission.status == rt::IndependentPhaseServerStatus::kCompleted,
+                    "Phase text request was rejected by continuous admission");
+            }
+        }
+    }
+
+    std::unordered_map<uint64_t, double> firstTokenMs;
+    std::unordered_map<uint64_t, rt::IndependentPhaseServerCompletion> completions;
+    constexpr size_t kMAX_POLLS = 50000000U;
+    size_t polls{};
+    while (!runtime.phaseServingEmpty() || completions.size() < logicalRequestCount)
+    {
+        bool const progressed = runtime.pollPhaseServing();
+        while (std::optional<rt::IndependentPhaseServerToken> token = runtime.tryPopPhaseToken())
+        {
+            firstTokenMs.try_emplace(token->requestId, token->elapsedMs);
+        }
+        while (std::optional<rt::IndependentPhaseServerCompletion> completion = runtime.tryPopPhaseCompletion())
+        {
+            completions.emplace(completion->requestId, std::move(*completion));
+        }
+        ELLM_CHECK(++polls < kMAX_POLLS, "Asynchronous phase serving exceeded its poll guard");
+        if (!progressed)
+        {
+            std::this_thread::yield();
+        }
+    }
+    auto const benchmarkEnd = std::chrono::steady_clock::now();
+
+    tokenizer::Tokenizer tokenizer;
+    ELLM_CHECK(tokenizer.loadFromHF(args.engineDir), "Failed to load tokenizer for phase output decoding");
+    nlohmann::json output;
+    output["input_file"] = args.inputFile;
+    output["mode"] = "phase-serving";
+    output["policy"] = rt::phasePolicyModeName(args.phasePolicy);
+    output["responses"] = nlohmann::json::array();
+
+    std::vector<double> ttftValues;
+    std::vector<double> tpotValues;
+    std::vector<double> e2eValues;
+    size_t totalOutputTokens{};
+    for (InputRecord const& input : inputs)
+    {
+        auto const completion = completions.find(input.requestId);
+        ELLM_CHECK(completion != completions.end(), "A phase request completed without a completion record");
+        std::vector<int32_t> const& tokens = completion->second.generatedTokens;
+        double const ttftMs = firstTokenMs.count(input.requestId) > 0U ? firstTokenMs.at(input.requestId)
+                                                                       : completion->second.latencyMs;
+        double const e2eMs = completion->second.latencyMs;
+        double const tpotMs = tokens.size() > 1U ? (e2eMs - ttftMs) / static_cast<double>(tokens.size() - 1U) : 0.0;
+        ttftValues.push_back(ttftMs);
+        tpotValues.push_back(tpotMs);
+        e2eValues.push_back(e2eMs);
+        totalOutputTokens += tokens.size();
+
+        nlohmann::json messages = nlohmann::json::array();
+        for (rt::Message const& message : input.messages)
+        {
+            nlohmann::json contents = nlohmann::json::array();
+            for (rt::Message::MessageContent const& content : message.contents)
+            {
+                contents.push_back({{"type", content.type}, {"text", content.type == "text" ? content.content : ""}});
+            }
+            messages.push_back({{"role", message.role}, {"content", std::move(contents)}});
+        }
+        output["responses"].push_back({{"request_idx", input.requestId}, {"messages", std::move(messages)},
+            {"output_text", tokenizer.decode(tokens, true)}, {"output_ids", tokens},
+            {"finish_reason", completion->second.stoppedByEos ? "end-of-sequence" : "length"},
+            {"prompt_tokens", completion->second.promptTokens}, {"output_tokens", tokens.size()}, {"ttft_ms", ttftMs},
+            {"tpot_ms", tpotMs}, {"e2e_ms", e2eMs}});
+    }
+
+    double const wallMs = std::chrono::duration<double, std::milli>(benchmarkEnd - benchmarkStart).count();
+    output["summary"] = {{"requests", logicalRequestCount}, {"output_tokens", totalOutputTokens}, {"wall_ms", wallMs},
+        {"request_throughput", wallMs > 0.0 ? static_cast<double>(logicalRequestCount) * 1000.0 / wallMs : 0.0},
+        {"token_throughput", wallMs > 0.0 ? static_cast<double>(totalOutputTokens) * 1000.0 / wallMs : 0.0},
+        {"ttft_mean_ms", phaseMean(ttftValues)}, {"ttft_p95_ms", phasePercentile(ttftValues, 0.95)},
+        {"tpot_mean_ms", phaseMean(tpotValues)}, {"tpot_p95_ms", phasePercentile(tpotValues, 0.95)},
+        {"e2e_mean_ms", phaseMean(e2eValues)}, {"e2e_p95_ms", phasePercentile(e2eValues, 0.95)}};
+
+    std::ofstream outputFile(args.outputFile);
+    ELLM_CHECK(outputFile.good(), "Failed to open phase-serving output file");
+    outputFile << std::setw(2) << output << std::endl;
+    if (args.dumpOutput)
+    {
+        LOG_INFO("%s", output.dump(2).c_str());
+    }
+    LOG_INFO("Phase serving complete: requests=%zu wall=%.3f ms req/s=%.3f tok/s=%.3f E2E mean/p95=%.3f/%.3f ms",
+        logicalRequestCount, wallMs, output["summary"]["request_throughput"].get<double>(),
+        output["summary"]["token_throughput"].get<double>(), phaseMean(e2eValues), phasePercentile(e2eValues, 0.95));
+
+    if (profilerEnabled)
+    {
+        memoryMonitor.stop();
+    }
+    return EXIT_SUCCESS;
+}
+
+} // namespace
 
 #if defined(EDGELLM_ENABLE_MULTI_DEVICE)
 namespace
@@ -1584,8 +1823,39 @@ int main(int argc, char* argv[])
         // Standard vanilla-only mode (no draft model)
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
-                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
+            if (args.phaseServing)
+            {
+                size_t logicalRequestCount{};
+                for (rt::LLMGenerationRequest const& batch : batchedRequests)
+                {
+                    logicalRequestCount += batch.requests.size();
+                }
+                rt::LLMInferenceRuntime::ParallelExecutionConfig runtimeConfig;
+                runtimeConfig.localRanks = {0};
+                runtimeConfig.localStreams = {stream};
+                runtimeConfig.ownsLocalStreams = false;
+                runtimeConfig.checkpointDir = args.checkpointDir;
+                rt::PhaseServingRuntimeConfig phaseConfig;
+                phaseConfig.policyMode = args.phasePolicy;
+                phaseConfig.maxPendingRequests = logicalRequestCount;
+                phaseConfig.maxEncodedVisionRequests = logicalRequestCount;
+                runtimeConfig.phaseServingConfig = phaseConfig;
+                bool const containsVision = std::any_of(
+                    batchedRequests.begin(), batchedRequests.end(), [](rt::LLMGenerationRequest const& batch) {
+                        return std::any_of(batch.requests.begin(), batch.requests.end(),
+                            [](rt::LLMGenerationRequest::Request const& request) {
+                                return !request.imageBuffers.empty();
+                            });
+                    });
+                std::string const& multimodalEngineDir = containsVision ? args.multimodalEngineDir : std::string{};
+                runtime = std::make_unique<rt::LLMInferenceRuntime>(
+                    args.engineDir, multimodalEngineDir, loraWeightsMap, std::move(runtimeConfig));
+            }
+            else
+            {
+                runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                    loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
+            }
         }
         catch (std::exception const& e)
         {
@@ -1593,6 +1863,25 @@ int main(int argc, char* argv[])
             cleanupAfterStreamCreate();
             return EXIT_FAILURE;
         }
+    }
+
+    if (args.phaseServing)
+    {
+        int result = EXIT_FAILURE;
+        try
+        {
+            result = runPhaseServingInference(args, batchedRequests, *runtime, memoryMonitor, profilerEnabled);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Asynchronous phase serving failed: %s", e.what());
+            if (profilerEnabled)
+            {
+                memoryMonitor.stop();
+            }
+        }
+        cleanupAfterStreamCreate();
+        return result;
     }
 
     if (args.visualPrunerConfig.enabled)

@@ -220,3 +220,15 @@ TEST(KvCacheManagerPagedPoolTest, NumPagesOverrideBelowMinimumActivePagesRejecte
     config.numPages = 1; // below the minimum active page count of 4
     EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception);
 }
+
+TEST(KvCacheManagerPagedPoolTest, ExplicitUndercommitAllocatesConfiguredPool)
+{
+    cudaStream_t stream{nullptr};
+
+    rt::KVCacheManager::Config config = makeHeteroConfig(/*maxBatch=*/2, /*maxSeq=*/200, 4, 64, 4, 64, DataType::kHALF);
+    config.numPages = 1;
+    config.allowPoolUndercommit = true;
+
+    rt::KVCacheManager mgr(config, stream);
+    EXPECT_EQ(mgr.numPages(), 1);
+}

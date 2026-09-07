@@ -97,6 +97,7 @@ void LLMInferenceRuntime::initializeCoordinator(std::string const& engineDir, st
     coordinatorConfig.parallelConfig = config.parallelConfig;
     coordinatorConfig.draftingConfig = config.draftingConfig;
     coordinatorConfig.contextCacheConfig = config.contextCacheConfig;
+    coordinatorConfig.phaseServingConfig = std::move(config.phaseServingConfig);
     coordinatorConfig.checkpointDir = std::move(config.checkpointDir);
     coordinatorConfig.draftCheckpointDir = std::move(config.draftCheckpointDir);
     coordinatorConfig.localRanks = std::move(config.localRanks);

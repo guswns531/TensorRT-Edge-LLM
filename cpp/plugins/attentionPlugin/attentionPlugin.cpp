@@ -452,7 +452,7 @@ bool hasConcretePagedKVContract(Dims const& qkv, Dims const& kvCacheInput, Dims 
     Dims const& kvPageTable, int32_t numKVHeads, int32_t headSize, bool enablePackedPrefill)
 {
     bool const validBatchContract
-        = enablePackedPrefill ? qkv.d[0] == 1 && kvPageTable.d[0] > 0 : kvPageTable.d[0] == qkv.d[0];
+        = kvPageTable.d[0] == qkv.d[0] || (enablePackedPrefill && qkv.d[0] == 1 && kvPageTable.d[0] > 0);
     return qkv.nbDims == 3 && qkv.d[0] > 0 && isPagedPoolShape(kvCacheInput, numKVHeads, headSize, false)
         && haveSameShape(kvCacheInput, kvCacheOutput) && kvPageTable.nbDims == 3 && validBatchContract
         && kvPageTable.d[1] == 2 && kvPageTable.d[2] > 0 && kvCacheInput.d[1] >= kvPageTable.d[2];

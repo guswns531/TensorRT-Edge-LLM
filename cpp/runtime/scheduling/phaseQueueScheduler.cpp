@@ -488,13 +488,18 @@ uint64_t PhaseQueueScheduler::globalSnapshotEpoch() const noexcept
 
 bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) const
 {
-    return !mDispatchBlocked && !(prefill && mPrefillDispatchBlocked)
+    return !mDispatchBlocked && !(prefill && mPrefillDispatchBlocked) && !(!prefill && mDecodeDispatchBlocked)
         && (!mConfig.eligibilityPolicy || mConfig.eligibilityPolicy(item, prefill));
 }
 
 void PhaseQueueScheduler::setPrefillDispatchBlocked(bool blocked) noexcept
 {
     mPrefillDispatchBlocked = blocked;
+}
+
+void PhaseQueueScheduler::setDecodeDispatchBlocked(bool blocked) noexcept
+{
+    mDecodeDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setDispatchBlocked(bool blocked) noexcept
@@ -872,10 +877,9 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     double const remainingDecodeUs
         = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
     double const allowedInterferenceUs = remainingDecodeUs * mConfig.decodeSlackSafetyFactor;
-    bool const prefillRecovery = mConfig.enablePrefillSloRecovery
-        && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
-    if (overlap && mConfig.enableTpotHardGuard
-        && mConsecutiveOverlapBatches >= mConfig.maxConsecutiveOverlapBatches)
+    bool const prefillRecovery
+        = mConfig.enablePrefillSloRecovery && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
+    if (overlap && mConfig.enableTpotHardGuard && mConsecutiveOverlapBatches >= mConfig.maxConsecutiveOverlapBatches)
     {
         return -1;
     }
@@ -885,7 +889,8 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         double const candidateInterferenceUs = static_cast<double>(candidate.decodeInterferenceMs) * 1000.0;
         bool const debtFeasible = mConfig.maxPredictedDecodeDebtUs == 0.0
             || mPredictedDecodeDebtUs + candidateInterferenceUs <= mConfig.maxPredictedDecodeDebtUs;
-        bool const feasible = (prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
+        bool const feasible
+            = (prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
             && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible);
         if (!feasible)
         {
@@ -2303,8 +2308,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     {
         decision = mGlobalScheduler.select(candidates);
     }
-    if (!mGlobalWarmupProbeMode
-        && mRuntimeCostTracker->contextualPdConfig().mode != PhaseContextualPdMode::kDisabled)
+    if (!mGlobalWarmupProbeMode && mRuntimeCostTracker->contextualPdConfig().mode != PhaseContextualPdMode::kDisabled)
     {
         auto const overlap = std::find_if(candidates.begin(), candidates.end(), [](auto const& candidate) {
             return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode && candidate.contextualPdFeatureValid;
@@ -2365,8 +2369,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     case PhaseGlobalActionKind::kPrefillDecode: kind = PhaseDispatchKind::kOverlap; break;
     default: break;
     }
-    bool const safeProbe
-        = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
+    bool const safeProbe = selected.calibrationProbe || (selected.safeProbeEligible && !selected.overlapCostKnown);
     if (safeProbe && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
         mLastGlobalSafeProbeSequence = mGlobalDecisionSequence;
@@ -3074,8 +3077,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     // dispatch boundary through mNextGlobalAction.
     bool const singleLocalPhase = (state.prefillQueued > 0U) != (state.decodeQueued > 0U);
     bool const workConservingSinglePhase = mConfig.elideVacuousGlobalDecisions
-        && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
-        && singleLocalPhase
+        && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && singleLocalPhase
         && (!mConfig.globalMemoryHorizonSupplier || mConfig.globalDispatchUsesPreReservedMemory)
         && !mGlobalWarmupProbeMode && !mNextGlobalAction.has_value();
     if (mNextGlobalAction.has_value())

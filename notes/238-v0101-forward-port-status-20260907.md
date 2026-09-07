@@ -1,5 +1,10 @@
 # v0.10.1 phase forward-port status
 
+> This compile-only checkpoint is superseded by
+> [239-v0101-forward-port-results-20260907.md](239-v0101-forward-port-results-20260907.md). The GPU became available
+> after this note was written; the later report records the completed export, build, inference, semantic VLM, and
+> 12-workload V0/V1/V2 validation.
+
 ## Scope
 
 This branch forward-ports the retained V0/V1/V2 phase-serving architecture onto the NVIDIA TensorRT Edge-LLM

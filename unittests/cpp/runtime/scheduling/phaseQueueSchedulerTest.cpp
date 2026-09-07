@@ -984,6 +984,31 @@ TEST(PhaseQueueSchedulerTest, ExternalArenaBlockExcludesOnlyPrefill)
     EXPECT_EQ(prefill.prefillBatch.front().requestId, 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, ExternalArenaBlockExcludesOnlyDecode)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 2;
+    config.maxDecodeBatchSize = 2;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 32});
+    scheduler.enqueueDecode({2, 128});
+
+    scheduler.setDecodeDispatchBlocked(true);
+    PhaseDispatchPlan prefillOnly = scheduler.next();
+    ASSERT_EQ(prefillOnly.kind, PhaseDispatchKind::kPrefill);
+    ASSERT_EQ(prefillOnly.prefillBatch.size(), 1U);
+    EXPECT_TRUE(prefillOnly.decodeBatch.empty());
+    scheduler.completePrefill(prefillOnly.prefillBatch.front(), 32);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    scheduler.setDecodeDispatchBlocked(false);
+    PhaseDispatchPlan decode = scheduler.next();
+    ASSERT_EQ(decode.kind, PhaseDispatchKind::kDecode);
+    ASSERT_EQ(decode.decodeBatch.size(), 2U);
+    EXPECT_EQ(decode.decodeBatch.front().requestId, 2U);
+    EXPECT_EQ(decode.decodeBatch.back().requestId, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, ExternalDeadlineBlockWaitsAtDispatchBoundary)
 {
     PhaseQueueScheduler scheduler;

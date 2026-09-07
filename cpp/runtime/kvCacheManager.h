@@ -61,6 +61,8 @@ public:
         //! (`maxBatchSize * ceil(maxSequenceLength / kTOKENS_PER_PAGE)`). A non-zero value must be at least
         //! that count; any extra pages are retained for cross-request reuse.
         int32_t numPages{0};
+        //! Allow a physical pool smaller than the maximum simultaneous full-length occupancy.
+        bool allowPoolUndercommit{false};
     };
     //! \endcond
 

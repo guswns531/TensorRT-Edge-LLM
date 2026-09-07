@@ -80,7 +80,11 @@ std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cud
 {
     auto table
         = std::make_unique<KVPageTable>(kv.getConfig().maxBatchSize, pagesPerSlot(kv.maxCapPadded()), kv.numPages());
-    table->setIdentity();
+    int64_t const identityPages = static_cast<int64_t>(kv.getConfig().maxBatchSize) * pagesPerSlot(kv.maxCapPadded());
+    if (identityPages <= kv.numPages())
+    {
+        table->setIdentity();
+    }
     table->upload(stream);
     return table;
 }
@@ -100,6 +104,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
         /*.numPages=*/cfg.kvPoolPages,
+        /*.allowPoolUndercommit=*/cfg.allowKVPoolUndercommit,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -208,6 +213,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.layerConfigs=*/bundle.base.kvLayerConfigs,
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
             /*.numPages=*/bundle.base.kvPoolPages,
+            /*.allowPoolUndercommit=*/bundle.base.allowKVPoolUndercommit,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -250,6 +256,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.layerConfigs=*/bundle.draft->kvLayerConfigs,
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
             /*.numPages=*/bundle.draft->kvPoolPages,
+            /*.allowPoolUndercommit=*/bundle.draft->allowKVPoolUndercommit,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,

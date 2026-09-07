@@ -2620,7 +2620,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     {
         candidates.push_back(*pd);
     }
-    bool const encoderExclusive = mConfig.serializeAllEncoderPrefill
+    bool const encoderPrefillExclusive = mConfig.serializeAllEncoderPrefill
         || (mConfig.exclusiveEncoderInputTokenThreshold > 0
             && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
     auto addEncoderOverlap = [&](PhaseGlobalActionKind kind, PhaseGlobalActionCandidate const& phase) {
@@ -2870,9 +2870,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 ? std::max(mActiveGlobalPdExecution->candidate.predictedMakespanUs,
                       mActiveGlobalPdExecution->candidate.predictedBlockingUs)
                 : 0.0;
-            double const requestedSkewFraction = residualAugmentation && incumbentReferenceUs > 0.0
-                ? residualElapsedUs / incumbentReferenceUs
-                : -1.0;
+            double const requestedSkewFraction
+                = residualAugmentation && incumbentReferenceUs > 0.0 ? residualElapsedUs / incumbentReferenceUs : -1.0;
             PhaseExecutionSet const contextualOutstanding = residualAugmentation
                 ? phase.key.kind == PhaseGlobalActionKind::kPrefill ? PhaseExecutionSet::kPrefill
                                                                     : PhaseExecutionSet::kDecode
@@ -2912,16 +2911,13 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         candidates.push_back(std::move(overlap));
     };
-    if (!encoderExclusive)
+    if (!encoderPrefillExclusive && prefillForEncoder.has_value())
     {
-        if (prefillForEncoder.has_value())
-        {
-            addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill, *prefillForEncoder);
-        }
-        if (decodeForEncoder.has_value())
-        {
-            addEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode, *decodeForEncoder);
-        }
+        addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill, *prefillForEncoder);
+    }
+    if (!mConfig.serializeAllEncoderDecode && decodeForEncoder.has_value())
+    {
+        addEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode, *decodeForEncoder);
     }
 
     std::vector<PhaseGlobalActionCandidate> unifiedCandidateFrontier = pdCandidateFrontier;
@@ -3074,17 +3070,17 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     if (mGlobalWarmupProbeMode && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive)
     {
-        auto const calibration = std::min_element(
-            candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
-                auto calibrationProgress = [&](auto const& candidate) {
-                    if (!candidate.calibrationProbe)
-                    {
-                        return std::numeric_limits<size_t>::max();
-                    }
-                    return mRuntimeCostTracker->overlapDiagnostic(candidate.key).sampleCount;
-                };
-                return calibrationProgress(left) < calibrationProgress(right);
-            });
+        auto const calibration
+            = std::min_element(candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
+                  auto calibrationProgress = [&](auto const& candidate) {
+                      if (!candidate.calibrationProbe)
+                      {
+                          return std::numeric_limits<size_t>::max();
+                      }
+                      return mRuntimeCostTracker->overlapDiagnostic(candidate.key).sampleCount;
+                  };
+                  return calibrationProgress(left) < calibrationProgress(right);
+              });
         if (calibration != candidates.end())
         {
             if (calibration->calibrationProbe)
@@ -3471,22 +3467,34 @@ bool PhaseThreeCoordinator::startNextEncoder()
             ? std::numeric_limits<size_t>::max()
             : candidateInputTokens + requestInputTokens;
     }
-    bool const exclusiveEncoder = mConfig.serializeAllEncoderPrefill
+    bool const exclusiveEncoderPrefill = mConfig.serializeAllEncoderPrefill
         || (mConfig.exclusiveEncoderInputTokenThreshold > 0
             && candidateInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
-    if (exclusiveEncoder)
+    bool const exclusiveEncoderDecode = mConfig.serializeAllEncoderDecode;
+    if (exclusiveEncoderPrefill || exclusiveEncoderDecode)
     {
         IndependentPhaseServerArbitrationSnapshot const snapshot = mServer.arbitrationSnapshot();
         bool const prefillInFlight = snapshot.busy
             && (snapshot.inFlightKind == PhaseDispatchKind::kPrefill
                 || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
-        if (prefillInFlight)
+        bool const decodeInFlight = snapshot.busy
+            && (snapshot.inFlightKind == PhaseDispatchKind::kDecode
+                || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
+        if ((exclusiveEncoderPrefill && prefillInFlight) || (exclusiveEncoderDecode && decodeInFlight))
         {
             ++mExclusiveEncoderPrefillDeferrals;
             return false;
         }
-        mServer.setPrefillDispatchBlocked(true);
-        mExclusiveEncoderInFlight = true;
+        if (exclusiveEncoderPrefill)
+        {
+            mServer.setPrefillDispatchBlocked(true);
+            mExclusiveEncoderPrefillInFlight = true;
+        }
+        if (exclusiveEncoderDecode)
+        {
+            mServer.setDecodeDispatchBlocked(true);
+            mExclusiveEncoderDecodeInFlight = true;
+        }
     }
 
     std::vector<PhaseVisionSubmission> submissions;
@@ -3568,10 +3576,15 @@ bool PhaseThreeCoordinator::startNextEncoder()
     catch (...)
     {
         mServer.setExternalEncoderActive(false);
-        if (mExclusiveEncoderInFlight)
+        if (mExclusiveEncoderPrefillInFlight)
         {
             mServer.setPrefillDispatchBlocked(false);
-            mExclusiveEncoderInFlight = false;
+            mExclusiveEncoderPrefillInFlight = false;
+        }
+        if (mExclusiveEncoderDecodeInFlight)
+        {
+            mServer.setDecodeDispatchBlocked(false);
+            mExclusiveEncoderDecodeInFlight = false;
         }
         throw;
     }
@@ -3583,7 +3596,7 @@ bool PhaseThreeCoordinator::startNextEncoder()
     mMaxEncoderInputBytes = std::max(mMaxEncoderInputBytes, encoderInputBytes);
     mLastEncoderInputTokens = encoderInputTokens;
     mMaxEncoderInputTokens = std::max(mMaxEncoderInputTokens, encoderInputTokens);
-    if (exclusiveEncoder)
+    if (exclusiveEncoderPrefill || exclusiveEncoderDecode)
     {
         ++mExclusiveEncoderBatches;
     }
@@ -3643,10 +3656,15 @@ bool PhaseThreeCoordinator::completeEncoderPreparation()
     catch (...)
     {
         mServer.setExternalEncoderActive(false);
-        if (mExclusiveEncoderInFlight)
+        if (mExclusiveEncoderPrefillInFlight)
         {
             mServer.setPrefillDispatchBlocked(false);
-            mExclusiveEncoderInFlight = false;
+            mExclusiveEncoderPrefillInFlight = false;
+        }
+        if (mExclusiveEncoderDecodeInFlight)
+        {
+            mServer.setDecodeDispatchBlocked(false);
+            mExclusiveEncoderDecodeInFlight = false;
         }
         throw;
     }
@@ -3690,12 +3708,17 @@ bool PhaseThreeCoordinator::completeEncoder()
         return false;
     }
     mServer.setExternalEncoderActive(false);
-    if (mExclusiveEncoderInFlight)
+    if (mExclusiveEncoderPrefillInFlight)
     {
         // ready() is driven by the encoder CUDA completion event, so the
         // overlapping arena is safe for the next prefill enqueue now.
         mServer.setPrefillDispatchBlocked(false);
-        mExclusiveEncoderInFlight = false;
+        mExclusiveEncoderPrefillInFlight = false;
+    }
+    if (mExclusiveEncoderDecodeInFlight)
+    {
+        mServer.setDecodeDispatchBlocked(false);
+        mExclusiveEncoderDecodeInFlight = false;
     }
     size_t const batchSize = mEncoding.size();
     for (PendingVisionRequest& encoding : mEncoding)
@@ -3869,6 +3892,12 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     std::vector<size_t> batchIndices = phaseVisionEncoderBatchIndices(inputs, capacityLimit,
         mConfig.maxEncoderMediaItems, mConfig.maxEncoderInputBytes, mConfig.maxEncoderInputTokens,
         mConfig.enableHomogeneousEncoderBatching, mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
+    bool const containsUnmeasuredPayload = std::any_of(batchIndices.begin(), batchIndices.end(),
+        [&](size_t index) { return mPending[index].estimatedPayloadBytes == 0U; });
+    if (mEstimatedEncodedBytes == 0U && containsUnmeasuredPayload && batchIndices.size() > 1U)
+    {
+        batchIndices.resize(1U);
+    }
     size_t batchSize = batchIndices.size();
     if (batchSize == 0)
     {

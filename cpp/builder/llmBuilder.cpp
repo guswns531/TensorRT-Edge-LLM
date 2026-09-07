@@ -345,6 +345,9 @@ bool LLMBuilder::build()
         return false;
     }
 
+    mBuilderConfig.profileLocalPackedPrefillChunkLimit
+        = hasInputBinding(*network, binding_names::kPackedPrefillChunkLimit);
+
     // Print network information
     LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
 

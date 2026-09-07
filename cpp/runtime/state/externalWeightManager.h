@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <initializer_list>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -68,6 +69,9 @@ public:
 
     void registerTensorMapEntries(TensorMap& map);
 
+    //! Publish the same immutable external weights to independent phase maps.
+    void registerTensorMapEntries(std::initializer_list<TensorMap*> maps);
+
     //! Validate against a raw engine and point its inputs at the loaded weights.
     //!
     //! Encoder runners drive TensorRT directly instead of through EngineExecutor
@@ -85,6 +89,11 @@ public:
     size_t size() const noexcept
     {
         return mWeights.size();
+    }
+
+    bool validated() const noexcept
+    {
+        return mValidated;
     }
 
 private:

@@ -788,24 +788,34 @@ int main(int argc, char** argv)
         {
             embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
         }
+        int32_t decodeBatchCapacity = config.maxSupportedDecodeBatchSize;
+        if (char const* value = std::getenv("TRT_EDGELLM_MAX_DECODE_BATCH"))
+        {
+            decodeBatchCapacity = std::min(decodeBatchCapacity, std::stoi(value));
+        }
+        ELLM_CHECK(decodeBatchCapacity > 0, "Phase decode capacity must be positive");
+        rt::LLMEngineConfig phaseConfig = config;
+        phaseConfig.maxSupportedDecodeBatchSize = decodeBatchCapacity;
+        int32_t const prefillSequenceCapacity = config.packedPrefill
+            ? std::min(config.maxPackedPrefillChunkTokens, config.maxSupportedInputLength)
+            : config.maxSupportedInputLength;
         auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(
-            config, config.maxSupportedPrefillBatchSize, config.maxSupportedInputLength, setupStream));
+            phaseConfig, config.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
         auto decodeIO = std::make_unique<rt::PipelineIO>(
-            rt::PipelineIO::createForLLMPhase(config, config.maxSupportedDecodeBatchSize, 1, setupStream));
+            rt::PipelineIO::createForLLMPhase(phaseConfig, decodeBatchCapacity, 1, setupStream));
         rt::TensorMap prefillMap;
         rt::TensorMap decodeMap;
-        rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
-        rt::buildTensorMap(decodeMap, *decodeIO, *resources, config, 0);
+        rt::buildTensorMap(prefillMap, *prefillIO, *resources, phaseConfig, 0);
+        rt::buildTensorMap(decodeMap, *decodeIO, *resources, phaseConfig, 0);
         resources->externalWeightManager->validateAgainstEngine(pair->prefillExecutor(), "base");
-        resources->externalWeightManager->registerTensorMapEntries(prefillMap);
-        resources->externalWeightManager->registerTensorMapEntries(decodeMap);
+        resources->externalWeightManager->registerTensorMapEntries({&prefillMap, &decodeMap});
 
         int32_t maxStableSlots = std::max(kDEFAULT_STABLE_SLOTS, config.maxSupportedBatchSize);
         if (char const* value = std::getenv("TRT_EDGELLM_MAX_STABLE_SLOTS"))
         {
             maxStableSlots = std::stoi(value);
         }
-        int32_t const maxPhaseBatch = std::max(config.maxSupportedPrefillBatchSize, config.maxSupportedDecodeBatchSize);
+        int32_t const maxPhaseBatch = std::max(config.maxSupportedPrefillBatchSize, decodeBatchCapacity);
         ELLM_CHECK(maxStableSlots >= maxPhaseBatch, "Stable slot capacity must cover the largest phase batch");
         rt::StableKVPageManager ownership(
             {maxStableSlots, maxPhaseBatch, config.kvPoolPages, config.maxKVCacheCapacity, 128});
@@ -848,7 +858,7 @@ int main(int argc, char** argv)
                 ownership.setLength(slot, 128);
             }
             rt::PhaseKVActiveView prefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "prefill");
-            rt::PhaseKVActiveView decodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "decode");
+            rt::PhaseKVActiveView decodeKV(decodeBatchCapacity, ownership, decodeMap, "decode");
             std::vector<int32_t> const prefillSlots = config.packedPrefill
                 ? std::vector<int32_t>{prefillSlot0, prefillSlot1}
                 : std::vector<int32_t>{prefillSlot0};
@@ -1059,7 +1069,7 @@ int main(int argc, char** argv)
             rt::IndependentPhaseCoordinatorCallbacks coordinatorCallbacks;
             coordinatorCallbacks.isDecodeFinished
                 = [&](rt::PhaseWorkItem const& item, int32_t) { return ++decodeSteps[item.requestId] >= 2; };
-            rt::IndependentPhaseCoordinator coordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
+            rt::IndependentPhaseCoordinator coordinator(phaseConfig, schedulerConfig, *pair, ownership, *prefillIO,
                 *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks));
 
             rt::PhaseSchedulingHints decodeHints;
@@ -1112,7 +1122,7 @@ int main(int argc, char** argv)
                 }
                 return finished;
             };
-            rt::IndependentPhaseCoordinator traceCoordinator(config, schedulerConfig, *pair, ownership, *prefillIO,
+            rt::IndependentPhaseCoordinator traceCoordinator(phaseConfig, schedulerConfig, *pair, ownership, *prefillIO,
                 *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
 
             auto const traceStart = std::chrono::steady_clock::now();
@@ -1228,14 +1238,14 @@ int main(int argc, char** argv)
             rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "semantic_phase_host_prefill_ids");
         rt::Tensor deviceSemanticPrefillIds({config.maxSupportedPrefillBatchSize, prefillTokenCapacity},
             rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "semantic_phase_prefill_ids");
-        rt::Tensor hostSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kCPU,
-            nvinfer1::DataType::kINT32, "semantic_phase_host_decode_ids");
-        rt::Tensor deviceSemanticDecodeIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "semantic_phase_decode_ids");
+        rt::Tensor hostSemanticDecodeIds({decodeBatchCapacity, 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32,
+            "semantic_phase_host_decode_ids");
+        rt::Tensor deviceSemanticDecodeIds(
+            {decodeBatchCapacity, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "semantic_phase_decode_ids");
         rt::Tensor prefillSelectedIds({config.maxSupportedPrefillBatchSize, 1}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "semantic_phase_prefill_selected_ids");
-        rt::Tensor decodeSelectedIds({config.maxSupportedDecodeBatchSize, 1}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "semantic_phase_decode_selected_ids");
+        rt::Tensor decodeSelectedIds({decodeBatchCapacity, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "semantic_phase_decode_selected_ids");
         rt::Tensor prefillCompactedLogits({config.maxSupportedPrefillBatchSize, config.outputVocabSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "semantic_phase_prefill_compacted_logits");
         SamplingSlotPool samplingSlotPool(maxPhaseBatch);
@@ -1261,11 +1271,10 @@ int main(int argc, char** argv)
         rt::Tensor textOnlyMropeTemplate;
         std::vector<std::optional<uint64_t>> prefillMropeOwners(
             static_cast<size_t>(config.maxSupportedPrefillBatchSize));
-        std::vector<std::optional<uint64_t>> decodeMropeOwners(static_cast<size_t>(config.maxSupportedDecodeBatchSize));
+        std::vector<std::optional<uint64_t>> decodeMropeOwners(static_cast<size_t>(decodeBatchCapacity));
         std::vector<int32_t> prefillMropeValid(
             static_cast<size_t>(config.maxSupportedPrefillBatchSize), config.maxKVCacheCapacity);
-        std::vector<int32_t> decodeMropeValid(
-            static_cast<size_t>(config.maxSupportedDecodeBatchSize), config.maxKVCacheCapacity);
+        std::vector<int32_t> decodeMropeValid(static_cast<size_t>(decodeBatchCapacity), config.maxKVCacheCapacity);
         if (config.ropeConfig.type == rt::RopeType::kMRope)
         {
             textOnlyMropeTemplate = rt::Tensor({1, config.maxKVCacheCapacity, config.rotaryDim}, rt::DeviceType::kGPU,
@@ -1626,7 +1635,7 @@ int main(int argc, char** argv)
                       return horizon;
                   };
         }
-        rt::IndependentPhaseCoordinator semanticCoordinator(config, semanticSchedulerConfig, *pair, ownership,
+        rt::IndependentPhaseCoordinator semanticCoordinator(phaseConfig, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
         if (std::getenv("TRT_EDGELLM_ENABLE_PERSISTENT_DECODE_SELECT") != nullptr)
         {
@@ -1686,6 +1695,7 @@ int main(int argc, char** argv)
             serverConfig.maxDecodeGraphs = static_cast<size_t>(std::stoul(value));
         }
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
+        serverConfig.allowChunkedVisionPrefill = config.packedPrefill;
         serverConfig.releaseVisionPrefillStorage = std::getenv("TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE") != nullptr;
         serverConfig.maxPendingRequests = 1024;
         serverConfig.enableGlobalWaitActions
@@ -1831,10 +1841,20 @@ int main(int argc, char** argv)
         }
         size_t tieredVisionExclusiveInputTokens{};
         bool serializeAllEncoderPrefill{};
+        bool serializeAllEncoderDecode{};
         auto configureVisionContextMemory = [&](rt::MultimodalRunner& runner) {
             int64_t const requiredBytes = runner.getRequiredContextMemorySize();
             LOG_INFO("Vision context workspace: required=%lld prefill_available=%zu bytes",
                 static_cast<long long>(requiredBytes), pair->prefillContextMemory().getMemoryCapacity());
+            if (std::getenv("TRT_EDGELLM_SHARED_VISION_DECODE_CONTEXT_MEMORY") != nullptr)
+            {
+                rt::TieredVisionContextMemoryInfo const info = pair->configureSharedVisionDecodeContextMemory(runner);
+                serializeAllEncoderDecode = true;
+                LOG_INFO("Shared E/D context arena: total=%lld decode=%lld vision=%lld serialize_all_encoder=yes",
+                    static_cast<long long>(info.arenaBytes), static_cast<long long>(info.prefillBytes),
+                    static_cast<long long>(info.largeVisionBytes));
+                return;
+            }
             if (std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr)
             {
                 int32_t const profileCount = runner.getOptimizationProfileCount();
@@ -1878,7 +1898,7 @@ int main(int argc, char** argv)
                     config.maxKVCacheCapacity, encoderStream, checkpointDir);
                 configureVisionContextMemory(*runner);
                 rt::PhaseVisionAdapter visionAdapter(
-                    *runner, tokenizer, config, encoderStream, visionStoragePolicy, copyStream);
+                    *runner, tokenizer, phaseConfig, encoderStream, visionStoragePolicy, copyStream);
                 rt::PhaseThreeCoordinator threePhase(visionAdapter, semanticServer);
                 if (activityTimeline != nullptr)
                 {
@@ -2200,14 +2220,8 @@ int main(int argc, char** argv)
             std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
             if (visionEngineDir != nullptr)
             {
-                bool const hasAtomicExternalPrefill = pair->hasExternalPrefillExecutor()
-                    && ((config.hasVisionPrefillProfile()
-                            && config.maxVisionPackedPrefillChunkTokens >= config.maxSupportedInputLength)
-                        || (!config.hasVisionPrefillProfile()
-                            && config.maxPackedPrefillChunkTokens >= config.maxSupportedInputLength));
-                ELLM_CHECK(!config.packedPrefill || hasAtomicExternalPrefill,
-                    "Three-phase packed vision requires a dedicated atomic external-prefill context covering "
-                    "maxInputLength");
+                ELLM_CHECK(!config.packedPrefill || pair->hasExternalPrefillExecutor(),
+                    "Three-phase packed vision requires a dedicated external-prefill context");
                 if (enablePhaseStreamPriorities)
                 {
                     CUDA_CHECK(cudaStreamCreateWithPriority(&ipcEncoderStream, cudaStreamNonBlocking, leastPriority));
@@ -2220,7 +2234,7 @@ int main(int argc, char** argv)
                     config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
                 configureVisionContextMemory(*ipcVisionRunner);
                 ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
-                    *ipcVisionRunner, tokenizer, config, ipcEncoderStream, visionStoragePolicy, copyStream);
+                    *ipcVisionRunner, tokenizer, phaseConfig, ipcEncoderStream, visionStoragePolicy, copyStream);
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_DEBUG_DIR"))
                 {
                     std::filesystem::path const debugDirectory(value);
@@ -2286,6 +2300,7 @@ int main(int argc, char** argv)
                 }
                 threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
                 threePhaseConfig.serializeAllEncoderPrefill = serializeAllEncoderPrefill;
+                threePhaseConfig.serializeAllEncoderDecode = serializeAllEncoderDecode;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
                 {
                     threePhaseConfig.exclusiveEncoderInputTokenThreshold = static_cast<size_t>(std::stoull(value));

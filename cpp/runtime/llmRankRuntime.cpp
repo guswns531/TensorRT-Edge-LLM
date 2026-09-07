@@ -179,19 +179,20 @@ LLMRankRuntime::LLMRankRuntime(std::string const& engineDir, std::string const& 
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    std::string const& draftCheckpointDir, std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig)
 {
     initializeFromEngineDir(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, mapping, tokenizer,
-        contextCacheConfig, checkpointDir, draftCheckpointDir);
+        contextCacheConfig, checkpointDir, draftCheckpointDir, phaseServingConfig);
 }
 
 LLMRankRuntime::LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir,
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
-    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig)
+    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
+    std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig)
 {
     initializeCommon(std::move(artifacts), engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream,
-        mapping, tokenizer, contextCacheConfig);
+        mapping, tokenizer, contextCacheConfig, phaseServingConfig);
 }
 
 LLMRankRuntime::~LLMRankRuntime()
@@ -207,7 +208,7 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    std::string const& draftCheckpointDir, std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig)
 {
     int32_t const tensorParallelSize = mapping.tensorParallelSize;
     int32_t const tensorParallelRank = mapping.tensorParallelRank;
@@ -321,13 +322,14 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     }
 
     initializeCommon(std::move(artifacts), engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream,
-        mapping, tokenizer, contextCacheConfig);
+        mapping, tokenizer, contextCacheConfig, phaseServingConfig);
 }
 
 void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
-    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig)
+    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
+    std::optional<PhaseServingRuntimeConfig> const& phaseServingConfig)
 {
     mMapping = mapping;
     mTokenizer = &tokenizer;
@@ -353,9 +355,45 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         contextCacheDeploymentProfile = validateContextCacheDeployment(mDeployment);
     }
 
-    ELLM_CHECK(mDeployment.base.isDiffusionBackbone || mDeployment.base.numDeepstackFeatures <= 0
-            || !multimodalEngineDir.empty(),
+    ELLM_CHECK(phaseServingConfig.has_value() || mDeployment.base.isDiffusionBackbone
+            || mDeployment.base.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
         "--multimodalEngineDir is required for VLM engine.");
+
+    if (phaseServingConfig.has_value())
+    {
+        ELLM_CHECK(!draftingConfig.has_value(), "Phase-only construction supports vanilla decoding only.");
+        ELLM_CHECK(!contextCacheConfig.enabled, "Phase-only construction cannot share the legacy context cache.");
+        mMaxRuntimeBatchSize = mDeployment.maxRuntimeBatchSize();
+        mSharedResources = SharedResources::createForLLM(mDeployment.base, loraWeightsMap, stream);
+        *mSharedResources->externalWeightManager = std::move(preparedWeights);
+
+        if (!multimodalEngineDir.empty())
+        {
+            auto loadVisionRunner = [&](std::filesystem::path const& directory) {
+                std::filesystem::path const enginePath = directory / "visual.engine";
+                if (!std::filesystem::exists(enginePath))
+                {
+                    return std::unique_ptr<MultimodalRunner>{};
+                }
+                int32_t const phaseEncoderBatchSize = phaseServingConfig->maxEncoderBatchSize > 0
+                    ? static_cast<int32_t>(phaseServingConfig->maxEncoderBatchSize)
+                    : mDeployment.base.maxSupportedPrefillBatchSize;
+                return MultimodalRunner::create(directory.string(), phaseEncoderBatchSize,
+                    mDeployment.base.maxKVCacheCapacity, stream, mCheckpointDir);
+            };
+            mVisionRunner = loadVisionRunner(std::filesystem::path(multimodalEngineDir) / "visual");
+            if (mVisionRunner == nullptr)
+            {
+                mVisionRunner = loadVisionRunner(multimodalEngineDir);
+            }
+        }
+        ELLM_CHECK(multimodalEngineDir.empty() || mVisionRunner != nullptr,
+            "Phase-only VLM construction could not load the requested visual engine.");
+        mPhaseServingRuntime = PhaseServingRuntime::create(*phaseServingConfig, mDeployment.base,
+            std::move(mBaseExecutor), *mSharedResources, mEmbedding, stream, std::move(mVisionRunner), mTokenizer);
+        LOG_INFO("Runtime initialized directly in asynchronous phase-serving mode.");
+        return;
+    }
 
     // -----------------------------------------------------------------------
     // 5. Set runtime batch size.
@@ -858,6 +896,8 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
 {
     ELLM_CHECK(mPhaseServingRuntime == nullptr,
         "handleRequest() is unavailable after the runtime switches to asynchronous phase serving.");
+    ELLM_CHECK(!mDeployment.base.allowKVPoolUndercommit,
+        "An undercommitted KV page pool requires asynchronous phase serving with stable page leases.");
     bool expected = false;
     if (!mHandleRequestInProgress.compare_exchange_strong(
             expected, true, std::memory_order_acquire, std::memory_order_relaxed))

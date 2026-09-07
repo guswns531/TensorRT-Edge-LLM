@@ -274,6 +274,34 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     return {arenaBytes, prefillBytes, visionBytes, visionBytes};
 }
 
+TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisionDecodeContextMemory(
+    MultimodalRunner& vision)
+{
+    ELLM_CHECK(!mConfig.sharedExecutionContext,
+        "Shared E/D context memory requires independent prefill and decode execution contexts");
+
+    int64_t const decodeBytes = mPrefillExecutor->getRequiredContextMemorySizeForProfile(mConfig.decodeProfile);
+    int64_t const visionBytes = vision.getRequiredContextMemorySize();
+    int64_t const arenaBytes = std::max(decodeBytes, visionBytes);
+
+    mDecodeContextMemory = Tensor{};
+    mTieredContextMemoryArena = Tensor{};
+    mTieredContextMemoryArena = Tensor({arenaBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::sharedVisionDecodeContextMemory");
+    void* const arenaBase = mTieredContextMemoryArena.rawPointer();
+    mDecodeContextMemory = Tensor(arenaBase, {decodeBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::sharedDecodeContextMemory");
+    Tensor visionMemory(arenaBase, {visionBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "IndependentEngineExecutorPair::sharedVisionContextMemory");
+
+    ELLM_CHECK(vision.setContextMemory(visionMemory), "Failed to assign the shared E/D vision workspace");
+    ELLM_CHECK(
+        mDecodeExecutor->setContextMemoryForProfile(mConfig.decodeProfile, mDecodeContextMemory, mConfig.setupStream),
+        "Failed to rebind decode to the shared E/D context arena");
+
+    return {arenaBytes, decodeBytes, visionBytes, visionBytes};
+}
+
 CUcontext IndependentEngineExecutorPair::cudaContext() const noexcept
 {
     return mCudaContext;

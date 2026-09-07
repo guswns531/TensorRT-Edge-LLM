@@ -805,6 +805,9 @@ LLMEngineConfig makeRecipeConfig(int32_t maxKV, bool mrope)
 {
     LLMEngineConfig cfg;
     cfg.maxKVCacheCapacity = maxKV;
+    cfg.maxSupportedBatchSize = 4;
+    cfg.maxSupportedPrefillBatchSize = 4;
+    cfg.maxSupportedDecodeBatchSize = 4;
     cfg.ropeConfig.type = mrope ? RopeType::kMRope : RopeType::kDefault;
     return cfg;
 }

@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/phase/policy/phaseFormationPlanner.h"
+#include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/phaseMemoryBroker.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
@@ -212,6 +212,8 @@ struct PhaseThreeCoordinatorConfig
     size_t exclusiveEncoderInputTokenThreshold{};
     //! Every encoder dispatch exclusively owns the shared E/P arena.
     bool serializeAllEncoderPrefill{};
+    //! Every encoder dispatch exclusively owns the shared E/D arena.
+    bool serializeAllEncoderDecode{};
 };
 
 struct PhaseThreeCoordinatorMetrics
@@ -776,7 +778,8 @@ private:
     std::chrono::steady_clock::time_point mEncoderPreparationStartedAt;
     size_t mExclusiveEncoderBatches{};
     size_t mExclusiveEncoderPrefillDeferrals{};
-    bool mExclusiveEncoderInFlight{};
+    bool mExclusiveEncoderPrefillInFlight{};
+    bool mExclusiveEncoderDecodeInFlight{};
     bool mEncoderSerializationGate{};
     bool mSerializedEncoderInFlight{};
     bool mEncoderSerializationYieldPending{};

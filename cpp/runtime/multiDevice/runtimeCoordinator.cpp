@@ -125,6 +125,12 @@ void RuntimeCoordinator::validateParallelPlan()
         "Tensor-parallel speculative decoding is not supported.");
     ELLM_CHECK(mWorldSize == 1 || !mConfig.contextCacheConfig.enabled,
         "Tensor-parallel context reuse is not supported in the current multi-device runtime.");
+    ELLM_CHECK(!mConfig.phaseServingConfig.has_value() || (mInlineSingleRank && mWorldSize == 1),
+        "Phase-only construction requires inline single-rank execution.");
+    ELLM_CHECK(!mConfig.phaseServingConfig.has_value() || !mConfig.draftingConfig.has_value(),
+        "Phase-only construction supports vanilla decoding only.");
+    ELLM_CHECK(!mConfig.phaseServingConfig.has_value() || !mConfig.contextCacheConfig.enabled,
+        "Phase-only construction cannot share the legacy context cache.");
     if (mWorldSize > 1)
     {
         for (ParallelBackendHandles const& backendHandles : mConfig.backendHandles)
@@ -999,11 +1005,11 @@ std::unique_ptr<LLMRankRuntime> RuntimeCoordinator::createRankRuntime(int32_t gl
         auto artifacts = std::move(mConfig.modelArtifacts);
         return std::make_unique<LLMRankRuntime>(std::move(*artifacts), mConfig.engineDir, mConfig.multimodalEngineDir,
             mConfig.loraWeightsMap, mConfig.draftingConfig, mStreams[globalRank], mapping, *mTokenizer,
-            mConfig.contextCacheConfig);
+            mConfig.contextCacheConfig, mConfig.phaseServingConfig);
     }
     return std::make_unique<LLMRankRuntime>(mConfig.engineDir, mConfig.multimodalEngineDir, mConfig.loraWeightsMap,
         mConfig.draftingConfig, mStreams[globalRank], mapping, *mTokenizer, mConfig.contextCacheConfig,
-        mConfig.checkpointDir, mConfig.draftCheckpointDir);
+        mConfig.checkpointDir, mConfig.draftCheckpointDir, mConfig.phaseServingConfig);
 }
 
 LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationRequest const& request) const

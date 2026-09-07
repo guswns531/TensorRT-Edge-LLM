@@ -918,8 +918,7 @@ bool IndependentPhaseAsyncServer::dispatchReady()
     {
         ++mDecodeRefillWaitCount;
     }
-    bool const profileFreeGlobal
-        = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive;
+    bool const profileFreeGlobal = mCoordinator.scheduler().globalSchedulerMode() == PhaseGlobalSchedulerMode::kActive;
     bool const waitForPrefillFormation = profileFreeGlobal ? false : shouldWaitForPrefillFormation();
     bool const phaseQueued
         = mCoordinator.scheduler().prefillQueueSize() > 0U || mCoordinator.scheduler().decodeQueueSize() > 0U;
@@ -1506,6 +1505,11 @@ void IndependentPhaseAsyncServer::setExternalDrainPreference(PhaseDrainPreferenc
 void IndependentPhaseAsyncServer::setPrefillDispatchBlocked(bool blocked) noexcept
 {
     mCoordinator.scheduler().setPrefillDispatchBlocked(blocked);
+}
+
+void IndependentPhaseAsyncServer::setDecodeDispatchBlocked(bool blocked) noexcept
+{
+    mCoordinator.scheduler().setDecodeDispatchBlocked(blocked);
 }
 
 void IndependentPhaseAsyncServer::setDispatchBlocked(bool blocked) noexcept
