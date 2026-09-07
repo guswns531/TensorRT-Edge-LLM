@@ -18,7 +18,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 
 #include "common/checkMacros.h"
-#include "multimodal/multimodalRunner.h"
+#include "multimodal/common/multimodalRunner.h"
 
 #include <algorithm>
 #include <cstddef>

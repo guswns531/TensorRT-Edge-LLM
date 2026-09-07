@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 
+#include <cstddef>
 #include <cstring>
 
 namespace trt_edgellm
@@ -65,6 +66,52 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
     {
         kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream);
     }
+}
+
+namespace
+{
+void materializeSegments(
+    OptionalInputTensors const& segments, Tensor& destination, char const* name, cudaStream_t stream)
+{
+    check::check(!segments.empty(), "Segmented embedding input cannot be empty");
+    int64_t hiddenSize{};
+    int64_t totalRows{};
+    for (Tensor const& segment : segments)
+    {
+        Coords const shape = segment.getShape();
+        check::check(
+            shape.getNumDims() == 2 && shape[0] > 0, "Segmented embedding inputs must be non-empty 2D tensors");
+        hiddenSize = hiddenSize == 0 ? shape[1] : hiddenSize;
+        check::check(shape[1] == hiddenSize, "Segmented embedding hidden dimensions must match");
+        check::check(segment.getDataType() == nvinfer1::DataType::kHALF, "Segmented embedding inputs must use FP16");
+        totalRows += shape[0];
+    }
+    Coords const destinationShape{totalRows, hiddenSize};
+    int64_t const requiredBytes = destinationShape.volume() * static_cast<int64_t>(sizeof(half));
+    if (destination.isEmpty() || destination.getMemoryCapacity() < requiredBytes)
+    {
+        destination = Tensor(destinationShape, DeviceType::kGPU, nvinfer1::DataType::kHALF, name);
+    }
+    else
+    {
+        check::check(destination.reshape(destinationShape), "Failed to reshape segmented embedding scratch");
+    }
+    auto* output = destination.dataPointer<uint8_t>();
+    size_t offset{};
+    for (Tensor const& segment : segments)
+    {
+        size_t const bytes = static_cast<size_t>(segment.getShape().volume()) * sizeof(half);
+        CUDA_CHECK(cudaMemcpyAsync(output + offset, segment.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+        offset += bytes;
+    }
+}
+} // namespace
+
+void EmbeddingPreprocessor::embedSegmentedVision(
+    Tensor const& tokenIds, OptionalInputTensors const& visionSegments, PipelineIO& io, cudaStream_t stream)
+{
+    materializeSegments(visionSegments, mSegmentedVisionScratch, "segmented_vision_scratch", stream);
+    embed(tokenIds, std::cref(mSegmentedVisionScratch), std::nullopt, io, stream);
 }
 
 OptionalInputTensors EmbeddingPreprocessor::assembleDeepstack(
@@ -127,6 +174,27 @@ void EmbeddingPreprocessor::prepareDeepstack(
         CUDA_CHECK(cudaMemsetAsync(
             io.deepstackEmbeds[idx].rawPointer(), 0, io.deepstackEmbeds[idx].getMemoryCapacity(), stream));
     }
+}
+
+void EmbeddingPreprocessor::prepareSegmentedDeepstack(Tensor const& tokenIds,
+    std::vector<OptionalInputTensors> const& featureSegments, PipelineIO& io, cudaStream_t stream)
+{
+    if (mConfig.numDeepstackFeatures == 0)
+    {
+        return;
+    }
+    check::check(featureSegments.size() == static_cast<size_t>(mConfig.numDeepstackFeatures),
+        "Segmented deepstack feature count does not match model configuration");
+    mSegmentedDeepstackScratch.resize(featureSegments.size());
+    OptionalInputTensors contiguousFeatures;
+    contiguousFeatures.reserve(featureSegments.size());
+    for (size_t index{}; index < featureSegments.size(); ++index)
+    {
+        materializeSegments(
+            featureSegments[index], mSegmentedDeepstackScratch[index], "segmented_deepstack_scratch", stream);
+        contiguousFeatures.push_back(std::cref(mSegmentedDeepstackScratch[index]));
+    }
+    prepareDeepstack(tokenIds, contiguousFeatures, io, stream);
 }
 
 } // namespace rt

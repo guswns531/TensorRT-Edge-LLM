@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "multimodal/multimodalRunner.h"
+#include "multimodal/common/multimodalRunner.h"
 #include "runtime/config/llmEngineConfig.h"
 
 #include <cuda_runtime_api.h>

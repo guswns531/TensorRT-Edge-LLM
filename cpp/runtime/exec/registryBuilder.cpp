@@ -39,9 +39,9 @@ constexpr int32_t kTokensPerPage = rt::kTOKENS_PER_PAGE;
 static int32_t computeNumPages(LLMEngineConfig const& cfg)
 {
     int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
-    ELLM_CHECK(cfg.kvPoolPages >= minimumActivePages && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
-        "KV pool page count (" + std::to_string(cfg.kvPoolPages) + ") is outside [" + std::to_string(minimumActivePages)
-            + ", " + std::to_string(rt::kMAX_KV_POOL_PAGES) + "].");
+    ELLM_CHECK((cfg.allowKVPoolUndercommit || cfg.kvPoolPages >= minimumActivePages) && cfg.kvPoolPages > 0
+            && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
+        "KV pool page count is outside the engine's configured paging contract.");
     return cfg.kvPoolPages;
 }
 
@@ -84,7 +84,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
 
     // inputs_embeds: [batch, seq_len, hiddenSize] HALF
     reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
-        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
+        {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
 
     if (cfg.isDiffusionBackbone)
     {
@@ -136,7 +136,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     {
         // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
         reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
-            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+            {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::selectLen)}});
     }
 
     // kvcache_start_index: [start_index_len] INT32. The engine's context profile
@@ -150,6 +150,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         {sym(&InferenceDims::startIndexLen)}});
 
     addKVPageTableSpec(reg, cfg);
+    if (cfg.profileLocalPackedPrefillChunkLimit)
+    {
+        reg.addTensor({binding_names::kPackedPrefillChunkLimit, TensorIO::kInput, nvinfer1::DataType::kINT8,
+            {sym(&InferenceDims::attnMaskSeqLen)}});
+    }
 
     if (cfg.useVisionBidirectionalAttention)
     {
@@ -268,9 +273,10 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         // deepstack_embeds_%d: [batch, seq_len, hiddenSize] HALF — one per feature.
         // DeepstackBinding swaps the backing tensor (real per-request buffer
         // vs. shared zero buffer) between prefill and non-prefill phases.
-        reg.addTensor({std::string(binding_names::kDeepstackEmbedsTemplate) + "_%d", TensorIO::kInput,
-            nvinfer1::DataType::kHALF, {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)},
-            /*perLayer=*/cfg.numDeepstackFeatures});
+        reg.addTensor(
+            {std::string(binding_names::kDeepstackEmbedsTemplate) + "_%d", TensorIO::kInput, nvinfer1::DataType::kHALF,
+                {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)},
+                /*perLayer=*/cfg.numDeepstackFeatures});
     }
 
     // ---------------------------------------------------------------

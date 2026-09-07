@@ -40,6 +40,14 @@ target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
 target_compile_options(llm_bench PRIVATE -Wno-psabi)
 add_cross_build_link_options(llm_bench)
 
+add_executable(llm_phase_context_smoke llm_phase_context_smoke.cpp)
+target_link_libraries(llm_phase_context_smoke PRIVATE commonLibraryExt
+                                                      edgellmCore)
+target_include_directories(
+  llm_phase_context_smoke PRIVATE ${COMMON_INCLUDE_DIRS}
+                                  ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(llm_phase_context_smoke)
+
 # All-reduce communication is registered through symbols resolved from the
 # dlopen'd plugin, instead of linking the plugin into this executable.
 # Build-time linking causes duplicate CUDA device-code modules between the

@@ -73,6 +73,12 @@ public:
     static std::unique_ptr<EngineExecutor> createForDraft(
         std::filesystem::path const& enginePath, DeploymentConfig const& bundle);
 
+    //! @brief Create an executor with a distinct execution context over the same immutable engine.
+    virtual std::unique_ptr<EngineExecutor> createSibling() const
+    {
+        return nullptr;
+    }
+
     EngineExecutor(EngineExecutor const&) = delete;
     EngineExecutor& operator=(EngineExecutor const&) = delete;
 
@@ -117,6 +123,13 @@ public:
      */
     virtual int64_t getRequiredContextMemorySize() const = 0;
 
+    //! @brief Query context memory for one optimization profile.
+    virtual int64_t getRequiredContextMemorySizeForProfile(int32_t profileIndex) const
+    {
+        static_cast<void>(profileIndex);
+        return getRequiredContextMemorySize();
+    }
+
     /*!
      * @brief Provide shared device memory for the execution context.
      *
@@ -124,6 +137,14 @@ public:
      * @return True on success
      */
     virtual bool setContextMemory(Tensor& sharedMem) = 0;
+
+    //! @brief Select a fixed profile and assign profile-sized context memory.
+    virtual bool setContextMemoryForProfile(int32_t profileIndex, Tensor& sharedMem, cudaStream_t stream)
+    {
+        static_cast<void>(profileIndex);
+        static_cast<void>(stream);
+        return setContextMemory(sharedMem);
+    }
 
     //! @brief Return the number of I/O tensors in the engine.
     virtual int32_t getNumIOTensors() const = 0;
@@ -151,9 +172,38 @@ public:
     //! @brief Access the underlying TRT engine for generic introspection.
     virtual nvinfer1::ICudaEngine const& getEngine() const noexcept = 0;
 
+    //! @brief Return the execution-context identity used for independence checks.
+    virtual nvinfer1::IExecutionContext const* getExecutionContextIdentity() const noexcept
+    {
+        return nullptr;
+    }
+
+    struct GraphCacheStats
+    {
+        size_t executeCalls{};
+        size_t hits{};
+        size_t misses{};
+        size_t captures{};
+        size_t evictions{};
+        size_t launchFailures{};
+        size_t entries{};
+    };
+
+    virtual GraphCacheStats graphCacheStats() const noexcept
+    {
+        return {};
+    }
+
+    virtual size_t trimGraphCache(size_t maxEntries) noexcept
+    {
+        static_cast<void>(maxEntries);
+        return 0;
+    }
+
     //! @brief Snapshot of binding addresses and shapes — used for graph-cache verification.
     struct BindingSnapshot
     {
+        int32_t profileIndex{-1};
         std::vector<std::pair<uintptr_t, nvinfer1::Dims>> bindings;
 
         bool operator==(BindingSnapshot const& rhs) const noexcept;

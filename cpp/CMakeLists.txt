@@ -168,6 +168,48 @@ file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE ACTION_CPP_SRCS "action/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
+
+set(PHASE_RUNTIME_CPP_SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/independentEngineExecutorPair.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/independentPhaseAsyncServer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/independentPhaseCoordinator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/packedPrefillActiveView.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseActivityTimeline.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseContinuousLoadGenerator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseContextualPdModel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseDispatchWorker.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseFormationPlanner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseGlobalScheduler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseIncrementalAction.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseKVActiveView.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseKernelGroupRecorder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseMemoryBroker.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phasePrefixReuseCache.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseQueueScheduler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseRuntimeCostTracker.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseThreeCoordinator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseVisionAdapter.cpp")
+set(STABLE_KV_PAGE_MANAGER_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/state/stableKVPageManager.cpp")
+
+list(REMOVE_ITEM RUNTIME_CPP_SRCS ${PHASE_RUNTIME_CPP_SRCS}
+     ${STABLE_KV_PAGE_MANAGER_SRC})
+list(FIND RUNTIME_CPP_SRCS
+     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/state/contextCache/blockHash.cpp"
+     PHASE_RUNTIME_INSERT_INDEX)
+if(PHASE_RUNTIME_INSERT_INDEX EQUAL -1)
+  message(FATAL_ERROR "Unable to locate the phase runtime archive anchor")
+endif()
+list(INSERT RUNTIME_CPP_SRCS ${PHASE_RUNTIME_INSERT_INDEX}
+     ${PHASE_RUNTIME_CPP_SRCS})
+
+list(FIND RUNTIME_CPP_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/streaming.cpp"
+     STABLE_KV_INSERT_INDEX)
+if(STABLE_KV_INSERT_INDEX EQUAL -1)
+  message(FATAL_ERROR "Unable to locate the stable KV archive anchor")
+endif()
+list(INSERT RUNTIME_CPP_SRCS ${STABLE_KV_INSERT_INDEX}
+     ${STABLE_KV_PAGE_MANAGER_SRC})
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
 
 # Enable relocatable device code for MoE Marlin kernels
@@ -220,7 +262,10 @@ if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
   target_compile_definitions(edgellmCore
                              PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
 endif()
-target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(
+  edgellmCore
+  PUBLIC ${CUDA_DRIVER_LINK_LIB}
+  PRIVATE ${CMAKE_DL_LIBS})
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 edgellm_apply_qnx_warning_suppressions(edgellmCore)

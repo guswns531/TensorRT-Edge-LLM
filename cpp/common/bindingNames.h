@@ -410,6 +410,7 @@ inline constexpr char const* kSpecVerifyPhaseMarker = "spec_verify_phase_marker"
  * override; 0 keeps the engine-carried calibrated default.
  */
 inline constexpr char const* kSkipSoftmaxScale = "skip_softmax_scale";
+inline constexpr char const* kPackedPrefillChunkLimit = "packed_prefill_chunk_limit";
 
 /*!
  * @brief DDTree parent node ids for hybrid DFlash base verification

@@ -139,6 +139,7 @@ edgellm_add_unit_test(
   cpp/runtime/config
   cpp/runtime/exec
   cpp/runtime/decoding
+  cpp/runtime/scheduling
   cpp/runtime/multiDevice)
 
 edgellm_add_unit_test(NAME unitTestRuntimeState DIRS cpp/runtime/state)

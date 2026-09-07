@@ -67,20 +67,23 @@ struct Gemma4MTPKVSharingEntry
 struct LLMEngineConfig
 {
     // --- Core model dimensions ---
-    int32_t hiddenSize{};                //!< Model hidden dimension
-    int32_t outputVocabSize{};           //!< Actual output vocab (reduced if vocab reduction active)
-    int32_t numAttentionLayers{};        //!< Number of attention layers needing KV cache
-    int32_t numKVHeads{};                //!< Number of key-value heads
-    int32_t headDim{};                   //!< Dimension of each attention head
-    int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
-    int32_t maxSupportedInputLength{};   //!< Maximum supported input length
-    int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
-    int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
-    int32_t kvPoolPages{};               //!< Exact physical K-page count serialized in KV binding shapes
-    int32_t rotaryDim{};                 //!< Rotary embedding dimension
-    int32_t numDecoderLayers{};          //!< Total decoder layers (attention + linear)
-    int32_t vocabSize{};                 //!< Full vocabulary size
-    int32_t reducedVocabSize{0};         //!< 0 = no vocab reduction
+    int32_t hiddenSize{};                   //!< Model hidden dimension
+    int32_t outputVocabSize{};              //!< Actual output vocab (reduced if vocab reduction active)
+    int32_t numAttentionLayers{};           //!< Number of attention layers needing KV cache
+    int32_t numKVHeads{};                   //!< Number of key-value heads
+    int32_t headDim{};                      //!< Dimension of each attention head
+    int32_t maxSupportedBatchSize{};        //!< Maximum supported batch size
+    int32_t maxSupportedPrefillBatchSize{}; //!< Maximum batch accepted by the prefill profile
+    int32_t maxSupportedDecodeBatchSize{};  //!< Maximum batch accepted by the decode profile
+    int32_t maxSupportedInputLength{};      //!< Maximum supported input length
+    int32_t maxKVCacheCapacity{};           //!< Maximum KV cache capacity (sequence length)
+    int64_t skipSoftmaxScaleOverride{0};    //!< skip-softmax scale-factor override (0 = disabled)
+    int32_t kvPoolPages{};                  //!< Exact physical K-page count serialized in KV binding shapes
+    bool allowKVPoolUndercommit{false};     //!< Page pool may be smaller than worst-case profile occupancy
+    int32_t rotaryDim{};                    //!< Rotary embedding dimension
+    int32_t numDecoderLayers{};             //!< Total decoder layers (attention + linear)
+    int32_t vocabSize{};                    //!< Full vocabulary size
+    int32_t reducedVocabSize{0};            //!< 0 = no vocab reduction
     int32_t diffusionCanvasLength{0};
     int32_t diffusionMaxDenoisingSteps{0};
     int32_t diffusionSelfConditioningSize{0};
@@ -92,10 +95,16 @@ struct LLMEngineConfig
     int32_t diffusionStabilityWindow{2};
 
     // --- Feature flags ---
-    bool isSpecDecodeBase{false};             //!< Base engine exposes speculative decoding verification bindings
-    bool isDiffusionBackbone{false};          //!< DiffusionGemma phase-aware transformer backbone engine
-    bool diffusionUnifiedConditioning{false}; //!< Backbone engine owns DiffusionGemma self-conditioning inputs
-    bool contextMaskSelectorEnabled{false};   //!< Engine exposes context_mask_selector binding
+    bool isSpecDecodeBase{false};                 //!< Base engine exposes speculative decoding verification bindings
+    bool isDiffusionBackbone{false};              //!< DiffusionGemma phase-aware transformer backbone engine
+    bool diffusionUnifiedConditioning{false};     //!< Backbone engine owns DiffusionGemma self-conditioning inputs
+    bool contextMaskSelectorEnabled{false};       //!< Engine exposes context_mask_selector binding
+    bool packedPrefill{false};                    //!< Pack logical prefill rows into one token carrier
+    int32_t maxPackedPrefillChunkTokens{};        //!< Maximum logical packed-prefill row length
+    int32_t maxSupportedVisionPrefillBatchSize{}; //!< Maximum rows accepted by the external-prefill profile
+    int32_t maxVisionPackedPrefillChunkTokens{};  //!< Maximum logical row length for external prefill
+    int32_t visionPrefillProfile{-1};             //!< Optional external-prefill TensorRT profile index
+    bool profileLocalPackedPrefillChunkLimit{};   //!< Engine carries the selected profile's packed chunk limit
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
@@ -249,6 +258,18 @@ struct LLMEngineConfig
     //! `context_mask_selector` as its attention-mask sentinel.
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
 
+    //! Packed text prefill dims. Tokens use a [1,totalTokens,*] carrier while
+    //! context lengths, page-table rows, and KV starts retain logicalBatch rows.
+    InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
+
+    //! Packed external-producer prefill dims, using the optional wider profile.
+    InferenceDims visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
+
+    bool hasVisionPrefillProfile() const noexcept
+    {
+        return visionPrefillProfile >= 0;
+    }
+
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).
     InferenceDims decodeDims(int64_t batch) const;
@@ -283,6 +304,10 @@ struct LLMEngineConfig
     //! even for MRope models — this matches the pre-migration behavior in
     //! both runtimes (reset is a binding placeholder, not an inference step).
     InferenceDims resetDims() const;
+
+private:
+    InferenceDims packedPrefillDimsWithLimits(
+        int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const;
 };
 
 //! Parse a `config.json` file (the same format used by the existing runtime)

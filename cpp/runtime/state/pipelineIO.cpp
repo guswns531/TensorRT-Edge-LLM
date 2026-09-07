@@ -321,6 +321,10 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
     {
         map.set(binding_names::kSkipSoftmaxScale, io.skipSoftmaxScale);
     }
+    if (!io.packedPrefillChunkLimit.isEmpty())
+    {
+        map.set(binding_names::kPackedPrefillChunkLimit, io.packedPrefillChunkLimit);
+    }
     if (!io.specTreeParentIds.isEmpty())
     {
         map.set(binding_names::kTreeParentIds, io.specTreeParentIds);
@@ -421,56 +425,74 @@ void buildTensorMapForGemma4MTPDraft(
 
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
 {
-    PipelineIO io;
-
     int32_t const maxSeqLen = cfg.isDiffusionBackbone ? std::max(cfg.diffusionCanvasLength, cfg.maxSupportedInputLength)
                                                       : cfg.maxSupportedInputLength;
-    allocateBasicIO(
-        io, cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize, cfg.outputVocabSize, nvinfer1::DataType::kHALF);
+    return createForLLMPhase(cfg, cfg.maxSupportedBatchSize, maxSeqLen, stream);
+}
+
+PipelineIO PipelineIO::createForLLMPhase(LLMEngineConfig const& cfg, int32_t maxSeqLen, cudaStream_t stream)
+{
+    return createForLLMPhase(cfg, cfg.maxSupportedBatchSize, maxSeqLen, stream);
+}
+
+PipelineIO PipelineIO::createForLLMPhase(
+    LLMEngineConfig const& cfg, int32_t maxBatchSize, int32_t maxSeqLen, cudaStream_t stream)
+{
+    PipelineIO io;
+
+    ELLM_CHECK(maxBatchSize > 0 && maxBatchSize <= cfg.maxSupportedBatchSize,
+        "PipelineIO phase batch size is outside the engine capacity");
+    ELLM_CHECK(maxSeqLen > 0 && maxSeqLen <= std::max(cfg.maxSupportedInputLength, cfg.diffusionCanvasLength),
+        "PipelineIO phase sequence length is outside the engine capacity");
+    allocateBasicIO(io, maxBatchSize, maxSeqLen, cfg.hiddenSize, cfg.outputVocabSize, nvinfer1::DataType::kHALF);
 
     if (cfg.isDiffusionBackbone)
     {
         int32_t const maxCanvasLen = cfg.diffusionCanvasLength;
-        io.outputLogits = Tensor({cfg.maxSupportedBatchSize, maxCanvasLen, cfg.outputVocabSize}, DeviceType::kGPU,
+        io.outputLogits = Tensor({maxBatchSize, maxCanvasLen, cfg.outputVocabSize}, DeviceType::kGPU,
             nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
-        io.selectTokenIndices = Tensor({cfg.maxSupportedBatchSize, maxCanvasLen}, DeviceType::kGPU,
-            nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
-        io.hostSelectTokenIndices = Tensor({cfg.maxSupportedBatchSize, maxCanvasLen}, DeviceType::kCPU,
-            nvinfer1::DataType::kINT64, "PipelineIO::hostSelectTokenIndices");
+        io.selectTokenIndices = Tensor({maxBatchSize, maxCanvasLen}, DeviceType::kGPU, nvinfer1::DataType::kINT64,
+            "PipelineIO::selectTokenIndices");
+        io.hostSelectTokenIndices = Tensor({maxBatchSize, maxCanvasLen}, DeviceType::kCPU, nvinfer1::DataType::kINT64,
+            "PipelineIO::hostSelectTokenIndices");
     }
 
     if (cfg.useVisionBidirectionalAttention)
     {
-        io.visionBlockIds = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength}, DeviceType::kGPU,
-            nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+        io.visionBlockIds = Tensor(
+            {maxBatchSize, maxSeqLen}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
     }
 
     if (hasDeepstackFeatures(cfg))
     {
-        allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength,
-            cfg.hiddenSize, nvinfer1::DataType::kHALF);
+        allocateDeepstackEmbeds(
+            io, cfg.numDeepstackFeatures, maxBatchSize, maxSeqLen, cfg.hiddenSize, nvinfer1::DataType::kHALF);
         LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]", cfg.numDeepstackFeatures,
-            cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize);
+            maxBatchSize, maxSeqLen, cfg.hiddenSize);
     }
 
     // Engine-output hidden states for the vanilla LLM path. Always allocated:
     // streaming consumers (Qwen3-Omni Talker) read it; if the engine emits
     // hidden_states but no consumer is set, the buffer is harmless write-target;
     // if the engine has no hidden_states output the binding is silently skipped.
-    io.outputHiddenStates = Tensor({cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize}, DeviceType::kGPU,
+    io.outputHiddenStates = Tensor({maxBatchSize, maxSeqLen, cfg.hiddenSize}, DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
 
     if (cfg.ropeConfig.type == RopeType::kMRope)
     {
-        allocateMRope(io, cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity, cfg.rotaryDim);
+        allocateMRope(io, maxBatchSize, cfg.maxKVCacheCapacity, cfg.rotaryDim);
         // Initialize MRoPE cache for all batch slots using text-only sequential positions.
         kernel::initializeTextOnlyMRopeCosSin(io.mropeCosSin.dataPointer<float>(), cfg.ropeConfig.rotaryTheta,
-            cfg.rotaryDim, cfg.maxKVCacheCapacity, cfg.maxSupportedBatchSize, stream);
+            cfg.rotaryDim, cfg.maxKVCacheCapacity, maxBatchSize, stream);
     }
 
     // Runtime skip-softmax override carrier (shape-only).
     io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
+    io.packedPrefillChunkLimit
+        = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::packedPrefillChunkLimit");
+    CUDA_CHECK(cudaMemsetAsync(
+        io.packedPrefillChunkLimit.rawPointer(), 0, io.packedPrefillChunkLimit.getMemoryCapacity(), stream));
 
     return io;
 }
@@ -566,6 +588,10 @@ PipelineIO PipelineIO::createForSpecDecode(
 
     io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
+    io.packedPrefillChunkLimit
+        = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::packedPrefillChunkLimit");
+    CUDA_CHECK(cudaMemsetAsync(
+        io.packedPrefillChunkLimit.rawPointer(), 0, io.packedPrefillChunkLimit.getMemoryCapacity(), stream));
 
     bool const useSpecTree
         = (isCachedBlockDraftMode(bundle.specDecodeMode()) || bundle.specDecodeMode() == SpecDecodeMode::kMTP)

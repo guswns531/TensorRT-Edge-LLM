@@ -556,6 +556,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{
         /*.batch=*/activeBatchSize,
+        /*.tokenBatch=*/activeBatchSize,
         /*.seqLen=*/proposalLen,
         /*.kvLen=*/draftKVCapacity,
         /*.selectLen=*/static_cast<int64_t>(maxDeltaLen),
@@ -1098,6 +1099,7 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
 
             InferenceDims const draftDims{
                 /*.batch=*/batchSize,
+                /*.tokenBatch=*/batchSize,
                 /*.seqLen=*/proposalLen,
                 /*.kvLen=*/draftKVCapacity,
                 /*.selectLen=*/static_cast<int64_t>(simDeltaLen),
@@ -1254,8 +1256,8 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     check::check(mDraftOutputLogits.reshape({activeBatchSize, proposalLen, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftHiddenStates.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
-    InferenceDims const draftDims{activeBatchSize, proposalLen, draftKVCapacity, prefillLen, proposalLen, 1,
-        static_cast<int64_t>(pmLen), 0, activeBatchSize, 0, 0};
+    InferenceDims const draftDims{activeBatchSize, activeBatchSize, proposalLen, draftKVCapacity, prefillLen,
+        proposalLen, 1, static_cast<int64_t>(pmLen), 0, activeBatchSize, 0, 0};
 
     cudaGetLastError();
     bool ok = mDraftExecutor->prepare(kPrefillProfile, draftDims, mDraftTensorMap, context.stream);

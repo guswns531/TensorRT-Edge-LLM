@@ -80,6 +80,12 @@ public:
      */
     int64_t getRequiredContextMemorySize() const;
 
+    int64_t getRequiredContextMemorySizeForProfile(int32_t profileIndex) const;
+
+    int32_t getOptimizationProfileCount() const noexcept;
+
+    int64_t getInputTokenLimitForProfile(int32_t profileIndex) const;
+
     /*!
      * @brief Set shared context memory for the execution context
      * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
@@ -88,6 +94,10 @@ public:
      * @note Handles both visual and audio engines
      */
     bool setContextMemory(rt::Tensor& sharedContextMemory);
+
+    bool setContextMemoryForProfile(int32_t profileIndex, rt::Tensor& sharedContextMemory, cudaStream_t stream);
+
+    void allocateContextMemory();
 
     /*!
      * @brief Create appropriate multimodal runner instance
@@ -149,6 +159,9 @@ public:
      */
     virtual bool infer(cudaStream_t stream) = 0;
 
+    //! Prepare profile-dependent execution state without enqueuing the encoder.
+    virtual bool prepareInference(cudaStream_t stream);
+
     //! @brief Get output embeddings from vision encoder
     //! @return Reference to output embedding tensor
     virtual rt::Tensor& getOutputEmbedding();
@@ -156,6 +169,15 @@ public:
     //! @brief Get deepstack features for Qwen3-VL models
     //! @return Optional deepstack features vector (raw features before embedding lookup)
     virtual rt::OptionalInputTensors getDeepstackFeatures();
+
+    //! Bind request-owned output storage for the next encoder inference when supported.
+    virtual bool bindExternalOutputStorage(
+        rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures);
+
+    //! Estimate encoder input and output token counts without launching CUDA work.
+    virtual int64_t estimateInputTokens(rt::LLMGenerationRequest const& request);
+    virtual int64_t estimateOutputTokens(rt::LLMGenerationRequest const& request);
+    virtual int64_t maxInputTokens() const noexcept;
 
     /*!
      * @brief Validate and fill configuration from file
@@ -218,6 +240,14 @@ protected:
     std::vector<int64_t> mLastMediaTokenLengths;                //!< Per-item token lengths from last preprocess
     //! Owns the encoder's externalized weights; the context points into them.
     std::unique_ptr<ExternalWeightManager> mExternalWeights;
+    struct ProfileContextMemory
+    {
+        void* pointer{};
+        int64_t capacity{};
+    };
+    std::vector<ProfileContextMemory> mProfileContextMemories;
+    int32_t mCurrentOptimizationProfile{};
+    rt::Tensor mOwnedContextMemory;
     bool mExternalWeightsLoaded{false}; //!< Guards the idempotent load
 };
 

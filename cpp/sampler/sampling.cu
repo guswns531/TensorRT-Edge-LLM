@@ -19,6 +19,7 @@
 #include "sampling.h"
 // clang-format on
 #include "common/checkMacros.h"
+#include "kernels/common/argmaxKernel.h"
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1301,6 +1302,38 @@ void selectArgmaxAndComputeEntropy(
     {
         argmaxEntropyKernel<float, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<float>(),
             topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows, vocabSize, temperature);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void selectArgmax(rt::Tensor const& input, rt::Tensor& topIndices, cudaStream_t stream)
+{
+    check::check(input.getDeviceType() == rt::DeviceType::kGPU && topIndices.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check((input.getDataType() == nvinfer1::DataType::kFLOAT || input.getDataType() == nvinfer1::DataType::kHALF)
+            && topIndices.getDataType() == nvinfer1::DataType::kINT32,
+        "Invalid tensor data types");
+
+    auto const inputShape = input.getShape();
+    auto const indexShape = topIndices.getShape();
+    check::check(inputShape.getNumDims() == 2 && indexShape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const rows = inputShape[0];
+    int32_t const vocabSize = inputShape[1];
+    check::check(indexShape[0] == rows && indexShape[1] == 1, "Top index tensor shape mismatch");
+    if (rows <= 0 || vocabSize <= 0)
+    {
+        return;
+    }
+
+    if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        kernel::invokeRowwiseArgmax(
+            input.dataPointer<half>(), rows, vocabSize, topIndices.dataPointer<int32_t>(), stream);
+    }
+    else
+    {
+        kernel::invokeRowwiseArgmax(
+            input.dataPointer<float>(), rows, vocabSize, topIndices.dataPointer<int32_t>(), stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

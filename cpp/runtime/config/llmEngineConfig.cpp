@@ -519,8 +519,11 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(configJson.contains("builder_config"), "parseEngineConfig: missing required 'builder_config' section");
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedBatchSize = getRequired<int32_t>(bc, "max_batch_size");
+    cfg.maxSupportedPrefillBatchSize = bc.value("max_prefill_batch_size", cfg.maxSupportedBatchSize);
+    cfg.maxSupportedDecodeBatchSize = bc.value("max_decode_batch_size", cfg.maxSupportedBatchSize);
     cfg.maxSupportedInputLength = getRequired<int32_t>(bc, "max_input_len");
     cfg.maxKVCacheCapacity = getRequired<int32_t>(bc, "max_kv_cache_capacity");
+    cfg.allowKVPoolUndercommit = bc.value("allow_kv_pool_undercommit", false);
     cfg.skipSoftmaxScaleOverride = configJson.value("skip_softmax_scale_override", int64_t{0});
 
     // RoPE configuration (top-level, derived from full config).
@@ -532,6 +535,12 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     requirePositive(cfg.headDim, "head_dim");
     requirePositive(cfg.hiddenSize, "hidden_size");
     requirePositive(cfg.maxSupportedBatchSize, "max_batch_size");
+    requirePositive(cfg.maxSupportedPrefillBatchSize, "max_prefill_batch_size");
+    requirePositive(cfg.maxSupportedDecodeBatchSize, "max_decode_batch_size");
+    ELLM_CHECK(cfg.maxSupportedPrefillBatchSize <= cfg.maxSupportedBatchSize,
+        "parseEngineConfig: max_prefill_batch_size cannot exceed max_batch_size");
+    ELLM_CHECK(cfg.maxSupportedDecodeBatchSize <= cfg.maxSupportedBatchSize,
+        "parseEngineConfig: max_decode_batch_size cannot exceed max_batch_size");
     requirePositive(cfg.maxSupportedInputLength, "max_input_len");
     requirePositive(cfg.maxKVCacheCapacity, "max_kv_cache_capacity");
     ELLM_CHECK(cfg.maxKVCacheCapacity <= kMAX_KV_CACHE_CAPACITY,
@@ -543,9 +552,11 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES,
         "parseEngineConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
             + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(kMAX_KV_POOL_PAGES) + ".");
-    ELLM_CHECK(serializedKvPoolPages >= minimumActivePages,
+    ELLM_CHECK(cfg.allowKVPoolUndercommit || serializedKvPoolPages >= minimumActivePages,
         "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
             + ") cannot be smaller than the minimum active pages (" + std::to_string(minimumActivePages) + ")");
+    ELLM_CHECK(!cfg.allowKVPoolUndercommit || serializedKvPoolPages > 0,
+        "parseEngineConfig: an undercommitted KV pool must contain at least one page");
     ELLM_CHECK(serializedKvPoolPages <= kMAX_KV_POOL_PAGES,
         "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
             + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(kMAX_KV_POOL_PAGES) + ")");
@@ -740,6 +751,19 @@ LLMEngineConfig parseEngineConfig(
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
     parseCoreFields(configJson, cfg);
+    cfg.packedPrefill = configJson.value("packed_prefill", false);
+    constexpr int32_t kDEFAULT_PACKED_PREFILL_CHUNK_TOKENS = 128;
+    int32_t const exportedPackedPrefillChunkTokens
+        = configJson.value("packed_prefill_max_chunk_tokens", kDEFAULT_PACKED_PREFILL_CHUNK_TOKENS);
+    auto const& packedBuilderConfig = configJson["builder_config"];
+    cfg.maxPackedPrefillChunkTokens = cfg.packedPrefill
+        ? packedBuilderConfig.value("max_prefill_chunk_tokens", exportedPackedPrefillChunkTokens)
+        : 0;
+    cfg.maxSupportedVisionPrefillBatchSize = packedBuilderConfig.value("max_vision_prefill_batch_size", 0);
+    cfg.maxVisionPackedPrefillChunkTokens = packedBuilderConfig.value("max_vision_prefill_chunk_tokens", 0);
+    cfg.visionPrefillProfile = packedBuilderConfig.value("vision_prefill_profile", -1);
+    cfg.profileLocalPackedPrefillChunkLimit
+        = packedBuilderConfig.value("profile_local_packed_prefill_chunk_limit", false);
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
@@ -851,6 +875,39 @@ LLMEngineConfig parseEngineConfig(
     // Populate per-layer type routing from canonical fields or scalar fallback.
     populateLayerTypes(configJson, cfg);
     parseDualRopeFields(configJson, cfg);
+    if (cfg.packedPrefill)
+    {
+        ELLM_CHECK(!cfg.isSpecDecodeBase && !cfg.isDiffusionBackbone,
+            "packed_prefill v1 supports vanilla autoregressive engines only.");
+        ELLM_CHECK(cfg.numLinearAttnLayers == 0, "packed_prefill v1 does not support recurrent layers.");
+        ELLM_CHECK(cfg.headDim == 128, "packed_prefill v1 requires attention head dimension 128.");
+        ELLM_CHECK(cfg.kvCacheDtype == nvinfer1::DataType::kHALF, "packed_prefill v1 requires FP16 KV cache.");
+        ELLM_CHECK(cfg.maxPackedPrefillChunkTokens > 0
+                && cfg.maxPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
+                && cfg.maxPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
+            "packed_prefill max chunk must be positive and no greater than the export and input limits.");
+        bool const hasVisionPrefillProfile = cfg.hasVisionPrefillProfile();
+        ELLM_CHECK(hasVisionPrefillProfile == (cfg.maxSupportedVisionPrefillBatchSize > 0)
+                && hasVisionPrefillProfile == (cfg.maxVisionPackedPrefillChunkTokens > 0),
+            "vision prefill profile metadata must be jointly enabled.");
+        if (hasVisionPrefillProfile)
+        {
+            ELLM_CHECK(cfg.maxSupportedVisionPrefillBatchSize <= cfg.maxSupportedBatchSize,
+                "vision prefill batch size exceeds max supported batch size.");
+            ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens
+                    && cfg.maxVisionPackedPrefillChunkTokens <= cfg.maxSupportedInputLength,
+                "vision prefill max chunk exceeds the export or input limit.");
+            ELLM_CHECK(cfg.maxVisionPackedPrefillChunkTokens == cfg.maxPackedPrefillChunkTokens
+                    || cfg.profileLocalPackedPrefillChunkLimit,
+                "Asymmetric packed-prefill profiles require the profile-local chunk-limit carrier.");
+        }
+    }
+    else
+    {
+        ELLM_CHECK(cfg.visionPrefillProfile < 0 && cfg.maxSupportedVisionPrefillBatchSize == 0
+                && cfg.maxVisionPackedPrefillChunkTokens == 0,
+            "vision prefill profile requires packed prefill.");
+    }
 
     // KV sharing donors: optional array of per-attention-layer donor indices.
     // Each entry is -1 (owns its own KV) or >= 0 (shares donor's KV cache).
@@ -998,10 +1055,16 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " outputVocabSize=" << cfg.outputVocabSize << " numDecoderLayers=" << cfg.numDecoderLayers
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
-       << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " kvPoolPages=" << cfg.kvPoolPages << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
-       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " maxPrefillBatch=" << cfg.maxSupportedPrefillBatchSize
+       << " maxDecodeBatch=" << cfg.maxSupportedDecodeBatchSize << " maxInputLen=" << cfg.maxSupportedInputLength
+       << " maxKVCapacity=" << cfg.maxKVCacheCapacity << " kvPoolPages=" << cfg.kvPoolPages
+       << " packedPrefill=" << cfg.packedPrefill << " maxPackedPrefillChunk=" << cfg.maxPackedPrefillChunkTokens
+       << " visionPrefillProfile=" << cfg.visionPrefillProfile
+       << " maxVisionPrefillBatch=" << cfg.maxSupportedVisionPrefillBatchSize
+       << " maxVisionPackedPrefillChunk=" << cfg.maxVisionPackedPrefillChunkTokens << " pleEnabled=" << cfg.pleEnabled
+       << " numPleInputs=" << cfg.numPleInputs << " pleHiddenSize=" << cfg.pleHiddenSize
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
@@ -1100,6 +1163,7 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     int64_t const kvLen = maxKVCacheCapacity;
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/seqLen,
         /*.kvLen=*/kvLen,
         /*.selectLen=*/1,
@@ -1113,10 +1177,55 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     };
 }
 
+InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const
+{
+    ELLM_CHECK(packedPrefill, "packedPrefillDims requires a packed-prefill engine");
+    int32_t const prefillBatchLimit
+        = maxSupportedPrefillBatchSize > 0 ? maxSupportedPrefillBatchSize : maxSupportedBatchSize;
+    return packedPrefillDimsWithLimits(
+        logicalBatch, totalTokens, maxRowTokens, prefillBatchLimit, maxPackedPrefillChunkTokens);
+}
+
+InferenceDims LLMEngineConfig::visionPackedPrefillDims(
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const
+{
+    ELLM_CHECK(hasVisionPrefillProfile(), "visionPackedPrefillDims requires an external-prefill profile");
+    return packedPrefillDimsWithLimits(
+        logicalBatch, totalTokens, maxRowTokens, maxSupportedVisionPrefillBatchSize, maxVisionPackedPrefillChunkTokens);
+}
+
+InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const
+{
+    ELLM_CHECK(logicalBatch > 0 && logicalBatch <= batchLimit, "packed prefill logical batch is out of range");
+    ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * chunkLimit,
+        "packed prefill token carrier exceeds the configured profile limit");
+    ELLM_CHECK(maxRowTokens > 0 && maxRowTokens <= chunkLimit && maxRowTokens <= totalTokens,
+        "packed prefill maximum row length is out of range");
+    return InferenceDims{
+        /*.batch=*/logicalBatch,
+        /*.tokenBatch=*/1,
+        /*.seqLen=*/totalTokens,
+        /*.kvLen=*/maxKVCacheCapacity,
+        /*.selectLen=*/logicalBatch,
+        /*.attnMaskSeqLen=*/chunkLimit,
+        /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? logicalBatch : 1,
+        /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
+        /*.startIndexLen=*/logicalBatch,
+        /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
+    };
+}
+
 InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
 {
+    int32_t const decodeBatchLimit
+        = maxSupportedDecodeBatchSize > 0 ? maxSupportedDecodeBatchSize : maxSupportedBatchSize;
+    ELLM_CHECK(batch > 0 && batch <= decodeBatchLimit, "decodeDims batch is out of range");
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/1,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/1,
@@ -1134,6 +1243,7 @@ InferenceDims LLMEngineConfig::denoiseDims(int64_t batch, int64_t canvasLen) con
 {
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/canvasLen,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/canvasLen,
@@ -1151,6 +1261,7 @@ InferenceDims LLMEngineConfig::diffusionCommitDims(int64_t batch, int64_t commit
 {
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/commitLen,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/commitLen,
@@ -1171,6 +1282,7 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
     // This is the only recipe where selectLen != 1.
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/verifySize,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/verifySize,
@@ -1193,6 +1305,7 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
     // [batch, draftTopK]).
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/proposalSize,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/draftTopK,
@@ -1214,6 +1327,7 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
     // acceptLen fans out to: seqLen, attnMaskSeqLen, and packedMaskLen.
     return InferenceDims{
         /*.batch=*/batch,
+        /*.tokenBatch=*/batch,
         /*.seqLen=*/acceptLen,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/1,
@@ -1556,6 +1670,7 @@ InferenceDims LLMEngineConfig::resetDims() const
     // real initial-prefill (which would need shape [0]).
     return InferenceDims{
         /*.batch=*/1,
+        /*.tokenBatch=*/1,
         /*.seqLen=*/1,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/1,

@@ -206,6 +206,9 @@ void topKLogitsToDenseProbabilities(rt::Tensor const& topKValues, rt::Tensor con
 void selectArgmaxAndComputeEntropy(
     rt::Tensor const& input, rt::Tensor& topIndices, rt::Tensor& entropy, float temperature, cudaStream_t stream);
 
+//! Greedy row-wise top-1 selection without softmax or entropy materialization.
+void selectArgmax(rt::Tensor const& input, rt::Tensor& topIndices, cudaStream_t stream);
+
 /*!
  * \brief Get workspace size required for top-K/top-P sampling (FP32 only).
  *

@@ -778,7 +778,16 @@ int main(int argc, char** argv)
 
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
-        rt::EmbeddingData embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
+        resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream, checkpointDir);
+        rt::EmbeddingData embedding;
+        if (auto table = resources->externalWeightManager->takeEmbedding())
+        {
+            embedding.table = std::move(*table);
+        }
+        else
+        {
+            embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
+        }
         auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(
             config, config.maxSupportedPrefillBatchSize, config.maxSupportedInputLength, setupStream));
         auto decodeIO = std::make_unique<rt::PipelineIO>(
@@ -787,8 +796,6 @@ int main(int argc, char** argv)
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, config, 0);
         rt::buildTensorMap(decodeMap, *decodeIO, *resources, config, 0);
-        resources->externalWeightManager->load(
-            engineDir, engineDir / "config.json", setupStream, checkpointDir, {}, &embedding.table);
         resources->externalWeightManager->validateAgainstEngine(pair->prefillExecutor(), "base");
         resources->externalWeightManager->registerTensorMapEntries(prefillMap);
         resources->externalWeightManager->registerTensorMapEntries(decodeMap);
@@ -1567,8 +1574,7 @@ int main(int argc, char** argv)
         if (char const* value = std::getenv("TRT_EDGELLM_PHASE_POLICY"))
         {
             std::optional<rt::PhasePolicyMode> const parsed = rt::phasePolicyModeFromName(value);
-            ELLM_CHECK(parsed.has_value(),
-                "TRT_EDGELLM_PHASE_POLICY must be exact, scalar, or scalar-transition");
+            ELLM_CHECK(parsed.has_value(), "TRT_EDGELLM_PHASE_POLICY must be exact, scalar, or scalar-transition");
             phasePolicyMode = *parsed;
         }
         rt::PhaseRuntimeCostTrackerConfig runtimeCostConfig;
@@ -3121,23 +3127,24 @@ int main(int argc, char** argv)
                         }
                         size_t contextualRequiredDirections{};
                         size_t contextualReadyDirections{};
-                        auto const contextualDirectionCalibration = [&](rt::PhaseContextualPairDirection direction,
-                                                                        size_t minimumObservations) {
-                            rt::PhaseContextualPdTelemetry const& telemetry
-                                = runtimeCostTracker->contextualDirectionTelemetry(direction);
-                            // Candidate generation may predict a residual or
-                            // reverse direction that never becomes a legal
-                            // dispatched action.  Such a direction remains on
-                            // scalar fallback and must not prevent a bounded
-                            // calibration epoch from terminating.
-                            bool const required = telemetry.observations > 0U;
-                            bool const ready = required && telemetry.observations >= minimumObservations;
-                            contextualRequiredDirections += required ? 1U : 0U;
-                            contextualReadyDirections += ready ? 1U : 0U;
-                            return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
-                                {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
-                                {"minimum_observations", minimumObservations}, {"required", required}, {"ready", ready}};
-                        };
+                        auto const contextualDirectionCalibration
+                            = [&](rt::PhaseContextualPairDirection direction, size_t minimumObservations) {
+                                  rt::PhaseContextualPdTelemetry const& telemetry
+                                      = runtimeCostTracker->contextualDirectionTelemetry(direction);
+                                  // Candidate generation may predict a residual or
+                                  // reverse direction that never becomes a legal
+                                  // dispatched action.  Such a direction remains on
+                                  // scalar fallback and must not prevent a bounded
+                                  // calibration epoch from terminating.
+                                  bool const required = telemetry.observations > 0U;
+                                  bool const ready = required && telemetry.observations >= minimumObservations;
+                                  contextualRequiredDirections += required ? 1U : 0U;
+                                  contextualReadyDirections += ready ? 1U : 0U;
+                                  return nlohmann::json{{"direction", rt::phaseContextualPairDirectionName(direction)},
+                                      {"predictions", telemetry.predictions}, {"observations", telemetry.observations},
+                                      {"minimum_observations", minimumObservations}, {"required", required},
+                                      {"ready", ready}};
+                              };
                         auto const contextualFamilyCalibration = [&](rt::PhaseContextualPairKind kind,
                                                                      rt::PhaseContextualPairDirection first,
                                                                      rt::PhaseContextualPairDirection second) {
@@ -3958,8 +3965,7 @@ int main(int argc, char** argv)
                             {"dispatch_signature", event.dispatchSignature},
                             {"kv_ownership_signature", event.kvOwnershipSignature},
                             {"scalar_policy_state_signature", event.scalarPolicyStateSignature},
-                            {"vision_lease_signature", event.visionLeaseSignature},
-                            {"action_id", event.actionId},
+                            {"vision_lease_signature", event.visionLeaseSignature}, {"action_id", event.actionId},
                             {"incremental_action_id", event.incrementalActionId},
                             {"requested_start_skew_percent", event.requestedStartSkewPercent},
                             {"requested_action_direction",
