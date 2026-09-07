@@ -24,6 +24,7 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
@@ -1681,120 +1682,46 @@ int main(int argc, char** argv)
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
         PhasePolicyWarmupMode const policyWarmupMode = phasePolicyWarmupMode();
+        rt::PhasePolicyMode phasePolicyMode{rt::PhasePolicyMode::kExact};
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_POLICY"))
+        {
+            std::optional<rt::PhasePolicyMode> const parsed = rt::phasePolicyModeFromName(value);
+            ELLM_CHECK(parsed.has_value(),
+                "TRT_EDGELLM_PHASE_POLICY must be exact, scalar, or scalar-transition");
+            phasePolicyMode = *parsed;
+        }
         rt::PhaseRuntimeCostTrackerConfig runtimeCostConfig;
+        runtimeCostConfig.policyMode = phasePolicyMode;
         runtimeCostConfig.action = semanticSchedulerConfig.globalCostModelConfig;
         runtimeCostConfig.decodeMinimumSamples = semanticSchedulerConfig.decodeComponentMinSamples;
         runtimeCostConfig.decodeWindowSize = semanticSchedulerConfig.decodeComponentWindow;
         runtimeCostConfig.decodeContextBucketTokens = semanticSchedulerConfig.runtimeDecodeContextBucketTokens;
-        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_PD"))
+        rt::PhaseContextualPdMode const contextualMode = rt::phasePolicyUsesContextualScalar(phasePolicyMode)
+            ? rt::PhaseContextualPdMode::kActive
+            : rt::PhaseContextualPdMode::kDisabled;
+        runtimeCostConfig.contextualPd.mode = contextualMode;
+        runtimeCostConfig.contextualEp.mode = contextualMode;
+        runtimeCostConfig.contextualEd.mode = contextualMode;
+        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_MIN_OBSERVATIONS"))
         {
-            std::string const mode(value);
-            ELLM_CHECK(mode == "disabled" || mode == "shadow" || mode == "active",
-                "TRT_EDGELLM_CONTEXTUAL_PD must be disabled, shadow, or active");
-            runtimeCostConfig.contextualPd.mode = mode == "active" ? rt::PhaseContextualPdMode::kActive
-                : mode == "shadow"                                 ? rt::PhaseContextualPdMode::kShadow
-                                                                   : rt::PhaseContextualPdMode::kDisabled;
+            size_t const minimumObservations = static_cast<size_t>(std::stoull(value));
+            runtimeCostConfig.contextualPd.minimumObservations = minimumObservations;
+            runtimeCostConfig.contextualEp.minimumObservations = minimumObservations;
+            runtimeCostConfig.contextualEd.minimumObservations = minimumObservations;
         }
-        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_PD_MIN_OBSERVATIONS"))
+        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_CONFIDENCE_BETA"))
         {
-            runtimeCostConfig.contextualPd.minimumObservations = static_cast<size_t>(std::stoull(value));
+            double const confidenceBeta = std::stod(value);
+            runtimeCostConfig.contextualPd.confidenceBeta = confidenceBeta;
+            runtimeCostConfig.contextualEp.confidenceBeta = confidenceBeta;
+            runtimeCostConfig.contextualEd.confidenceBeta = confidenceBeta;
         }
-        if (char const* value = std::getenv("TRT_EDGELLM_CONTEXTUAL_PD_CONFIDENCE_BETA"))
-        {
-            runtimeCostConfig.contextualPd.confidenceBeta = std::stod(value);
-        }
-        auto configureContextualEncoderPair = [](char const* modeVariable, char const* observationsVariable,
-                                                  char const* betaVariable, rt::PhaseContextualPdModelConfig& config) {
-            if (char const* value = std::getenv(modeVariable))
-            {
-                std::string const mode(value);
-                ELLM_CHECK(mode == "disabled" || mode == "shadow" || mode == "active",
-                    std::string(modeVariable) + " must be disabled, shadow, or active");
-                config.mode = mode == "active" ? rt::PhaseContextualPdMode::kActive
-                    : mode == "shadow"         ? rt::PhaseContextualPdMode::kShadow
-                                               : rt::PhaseContextualPdMode::kDisabled;
-            }
-            if (char const* value = std::getenv(observationsVariable))
-            {
-                config.minimumObservations = static_cast<size_t>(std::stoull(value));
-            }
-            if (char const* value = std::getenv(betaVariable))
-            {
-                config.confidenceBeta = std::stod(value);
-            }
-        };
-        configureContextualEncoderPair("TRT_EDGELLM_CONTEXTUAL_EP", "TRT_EDGELLM_CONTEXTUAL_EP_MIN_OBSERVATIONS",
-            "TRT_EDGELLM_CONTEXTUAL_EP_CONFIDENCE_BETA", runtimeCostConfig.contextualEp);
-        configureContextualEncoderPair("TRT_EDGELLM_CONTEXTUAL_ED", "TRT_EDGELLM_CONTEXTUAL_ED_MIN_OBSERVATIONS",
-            "TRT_EDGELLM_CONTEXTUAL_ED_CONFIDENCE_BETA", runtimeCostConfig.contextualEd);
         if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly)
         {
             runtimeCostConfig.contextualPd.mode = rt::PhaseContextualPdMode::kDisabled;
             runtimeCostConfig.contextualEp.mode = rt::PhaseContextualPdMode::kDisabled;
             runtimeCostConfig.contextualEd.mode = rt::PhaseContextualPdMode::kDisabled;
         }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL"))
-        {
-            std::string const enabled(value);
-            ELLM_CHECK(enabled == "0" || enabled == "1", "TRT_EDGELLM_COMPLETION_CONFORMAL must be 0 or 1");
-            runtimeCostConfig.completionCalibration.enabled = enabled == "1";
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE"))
-        {
-            std::string const active(value);
-            ELLM_CHECK(active == "0" || active == "1", "TRT_EDGELLM_COMPLETION_CONFORMAL_ACTIVE must be 0 or 1");
-            runtimeCostConfig.completionCalibration.active = active == "1";
-            ELLM_CHECK(
-                !runtimeCostConfig.completionCalibration.active || runtimeCostConfig.completionCalibration.enabled,
-                "Active completion conformal authority requires TRT_EDGELLM_COMPLETION_CONFORMAL=1");
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_MIN_OBSERVATIONS"))
-        {
-            runtimeCostConfig.completionCalibration.minimumObservations = static_cast<size_t>(std::stoull(value));
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_WINDOW"))
-        {
-            runtimeCostConfig.completionCalibration.windowSize = static_cast<size_t>(std::stoull(value));
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_CONFORMAL_TARGET"))
-        {
-            runtimeCostConfig.completionCalibration.targetCoverage = std::stod(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_COVERAGE_TOLERANCE"))
-        {
-            runtimeCostConfig.completionCalibration.authorityCoverageTolerance = std::stod(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_MIN_OBSERVATIONS"))
-        {
-            runtimeCostConfig.completionCalibration.authorityMinimumObservations
-                = static_cast<size_t>(std::stoull(value));
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_DEMOTION_TOLERANCE"))
-        {
-            runtimeCostConfig.completionCalibration.authorityDemotionCoverageTolerance = std::stod(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_MAX_FALSE_SAFE_RATE"))
-        {
-            runtimeCostConfig.completionCalibration.authorityMaximumFalseSafeRate = std::stod(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_COMPLETION_AUTHORITY_BLEND_WEIGHT"))
-        {
-            runtimeCostConfig.completionCalibration.authorityBlendWeight = std::stod(value);
-        }
-        auto completionAblation = [](char const* variable, bool& setting) {
-            if (char const* value = std::getenv(variable))
-            {
-                std::string const enabled(value);
-                ELLM_CHECK(enabled == "0" || enabled == "1", std::string(variable) + " must be 0 or 1");
-                setting = enabled == "1";
-            }
-        };
-        completionAblation("TRT_EDGELLM_COMPLETION_AUTHORITY_USES_UNCERTAINTY",
-            runtimeCostConfig.completionCalibration.authorityUsesUncertainty);
-        completionAblation("TRT_EDGELLM_COMPLETION_USE_RESIDUAL_FEATURES",
-            runtimeCostConfig.completionCalibration.useResidualFeatures);
-        completionAblation("TRT_EDGELLM_COMPLETION_AUTHORITY_PREDICTS_INCUMBENT",
-            runtimeCostConfig.completionCalibration.authorityPredictsIncumbent);
         auto runtimeCostTracker = std::make_shared<rt::PhaseRuntimeCostTracker>(runtimeCostConfig);
         semanticSchedulerConfig.runtimeCostTracker = runtimeCostTracker;
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
@@ -2500,23 +2427,12 @@ int main(int argc, char** argv)
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
                 threePhaseConfig.contextualPrefillBatchCapacity = semanticSchedulerConfig.maxPrefillBatchSize;
                 threePhaseConfig.contextualDecodeBatchCapacity = semanticSchedulerConfig.maxDecodeBatchSize;
-                bool enableGlobalFormationAwareSelection{};
-                if (char const* value = std::getenv("TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE"))
-                {
-                    std::string const enabled(value);
-                    ELLM_CHECK(
-                        enabled == "0" || enabled == "1", "TRT_EDGELLM_ENABLE_GLOBAL_FORMATION_AWARE must be 0 or 1");
-                    enableGlobalFormationAwareSelection = enabled == "1";
-                }
                 threePhaseConfig.enableGlobalFormationAwareSelection
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
-                    && enableGlobalFormationAwareSelection
-                    && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_FORMATION_AWARE") == nullptr;
-                LOG_INFO("Phase transition policy: formation_aware=%s",
+                    && rt::phasePolicyUsesTransition(phasePolicyMode);
+                threePhaseConfig.policyMode = phasePolicyMode;
+                LOG_INFO("Phase policy: mode=%s formation_aware=%s", rt::phasePolicyModeName(phasePolicyMode),
                     threePhaseConfig.enableGlobalFormationAwareSelection ? "enabled" : "disabled");
-                threePhaseConfig.enableContextualSuccessorGuard
-                    = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
-                    && std::getenv("TRT_EDGELLM_CONTEXTUAL_SUCCESSOR_GUARD") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_FORMATION_REALIZED_DISPATCHES"))
                 {
                     threePhaseConfig.globalFormationRealizedDispatches = static_cast<size_t>(std::stoull(value));

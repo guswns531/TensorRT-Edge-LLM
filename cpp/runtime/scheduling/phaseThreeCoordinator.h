@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/phase/policy/phaseFormationPlanner.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/phaseCudaDirectionalGate.h"
@@ -94,6 +95,7 @@ PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
 
 struct PhaseThreeCoordinatorConfig
 {
+    PhasePolicyMode policyMode{PhasePolicyMode::kExact};
     PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
     PhaseGlobalSchedulerConfig globalSchedulerConfig{};
     PhaseGlobalCostModelConfig globalCostModelConfig{};

@@ -19,6 +19,7 @@
 
 #include "runtime/phase/policy/phaseContextualPdModel.h"
 #include "runtime/phase/policy/phaseGlobalCostModel.h"
+#include "runtime/phase/policy/phasePolicyMode.h"
 
 #include <array>
 #include <cstddef>
@@ -34,6 +35,7 @@ namespace trt_edgellm::rt
 //! Configuration for bounded, process-local CUDA timing observations.
 struct PhaseRuntimeCostTrackerConfig
 {
+    PhasePolicyMode policyMode{PhasePolicyMode::kExact};
     PhaseGlobalCostModelConfig action;
     size_t actionMinimumSamples{4U};
     size_t decodeMinimumSamples{8U};
