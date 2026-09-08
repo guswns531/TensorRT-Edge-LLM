@@ -369,18 +369,22 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
+
+    // Packed FP16 prefill and XQA decode do not consume the dense split-K/V carrier below.
+    // The compact packed carrier has physical batch one and requires only Q/output boundary scratch.
+    if (enablePackedPrefill)
+    {
+        workspaceSize
+            = accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
+        return accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
+    }
+
     workspaceSize = accumulateWorkspaceSize(
         workspaceSize, rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
 
     // Roped Q is written to a scratch tensor (always needed).
     workspaceSize
         = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize, seqLen, numQHeads, headSize}, DataType::kHALF);
-    if (enablePackedPrefill)
-    {
-        workspaceSize = accumulateWorkspaceSize(
-            workspaceSize, rt::Coords{batchSize, seqLen, numQHeads, headSize}, DataType::kHALF);
-    }
-
     // Scratch K/V remain necessary for dense FP8 FMHA-v2 normal prefill; allocate unconditionally.
     workspaceSize
         = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize, seqLen, numKVHeads, headSize}, DataType::kHALF);
