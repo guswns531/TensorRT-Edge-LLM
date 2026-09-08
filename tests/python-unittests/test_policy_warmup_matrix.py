@@ -112,26 +112,34 @@ def test_prepare_generic_command_repeats_only_until_convergence(
     generic = tmp_path / "generic.json"
     _trace(measured, False)
     generic.write_text(json.dumps({
-        "requests": [{"messages": [{"content": "one"}]},
-                     {"messages": [{"content": "two"}]}]
-    }), encoding="utf-8")
+        "requests": [{
+            "messages": [{
+                "content": "one"
+            }]
+        }, {
+            "messages": [{
+                "content": "two"
+            }]
+        }]
+    }),
+                       encoding="utf-8")
     command = [
         "python3", "bench.py", "--trace",
         str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
         "run", "--rm", "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
     ]
 
-    result = MATRIX.prepare_command(
-        {"command": command},
-        "generic",
-        tmp_path / "out",
-        1,
-        generic,
-        generic,
-        generic_calibration_max_rounds=3)
+    result = MATRIX.prepare_command({"command": command},
+                                    "generic",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    generic_calibration_max_rounds=3)
 
     assert result[result.index("--warmup-requests") + 1] == "6"
-    assert result[result.index("--phase-calibration-round-requests") + 1] == "2"
+    assert result[result.index("--phase-calibration-round-requests") +
+                  1] == "2"
     assert result[result.index("--phase-calibration-min-requests") + 1] == "2"
 
 
@@ -198,7 +206,32 @@ def test_prepare_replaces_backend_engine(tmp_path: Path) -> None:
     assert result[binary + 2] == "/workspace/model"
 
 
-def test_prepare_v0_exact_uses_canonical_policy_setting(tmp_path: Path) -> None:
+def test_prepare_drops_requested_backend_environment(tmp_path: Path) -> None:
+    measured = tmp_path / "measured.json"
+    generic = tmp_path / "generic.json"
+    _trace(measured, False)
+    _trace(generic, False)
+    command = [
+        "python3", "bench.py", "--trace",
+        str(measured), "--output-dir", "old", "--repeats", "1", "--", "docker",
+        "run", "--rm", "-e", "KEEP=1", "-e", "DROP=1",
+        "nvcr.io/nvidia/tensorrt:26.06-py3", "binary"
+    ]
+
+    result = MATRIX.prepare_command({"command": command},
+                                    "zero_start",
+                                    tmp_path / "out",
+                                    1,
+                                    generic,
+                                    generic,
+                                    dropped_backend_environment=("DROP", ))
+
+    assert "KEEP=1" in result
+    assert "DROP=1" not in result
+
+
+def test_prepare_v0_exact_uses_canonical_policy_setting(
+        tmp_path: Path) -> None:
     measured = tmp_path / "measured.json"
     generic = tmp_path / "generic.json"
     _trace(measured, False)
@@ -255,7 +288,8 @@ def test_prepare_v2_scalar_transition_uses_canonical_policy_setting(
     assert environments["TRT_EDGELLM_PHASE_POLICY"] == "scalar-transition"
 
 
-def test_prepare_v1_scalar_uses_canonical_policy_setting(tmp_path: Path) -> None:
+def test_prepare_v1_scalar_uses_canonical_policy_setting(
+        tmp_path: Path) -> None:
     measured = tmp_path / "measured.json"
     generic = tmp_path / "generic.json"
     _trace(measured, False)

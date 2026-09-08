@@ -245,10 +245,10 @@ size    3,081,676,788 bytes
 SHA256  50493717b98f2c3b7dcbac4bb41b5bc395bd70ecfa5f9c5f577bdd20de49dad1
 ```
 
-## 8. Remaining evaluation
+## 8. Policy evaluation
 
-The engine/runtime regression is resolved. The next experiment is a same-engine
-V0/V1/V2 12-workload replay to isolate scheduler policy from this repaired
-mechanism. Frozen vLLM results remain reusable because the requests, model,
-precision, memory limit, and vLLM configuration have not changed. Those policy
-results should not be mixed into the engine promotion claim above.
+The same-engine independent E/P/D V0/V1/V2 12-workload replay and selected
+three-run confirmations are complete. See
+`241-v0101-independent-v0-v1-v2-gate-20260908.md`. The memory and local
+v0.10.1 text-engine regression is resolved, V1 is the aggregate policy
+candidate, and the remaining performance gap is concentrated in the VLM path.

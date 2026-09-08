@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Compare policy variants from matching phase HTTP workload matrices."""
 
 import argparse
 import csv
 import json
 import pathlib
-
 
 METRICS = (
     "achieved_req_s_median",
@@ -29,10 +39,17 @@ def parse_args() -> argparse.Namespace:
         "--variant",
         action="append",
         required=True,
-        help="Variant assignment NAME=RESULT_ROOT; the first variant is the baseline.",
+        help=
+        "Variant assignment NAME=RESULT_ROOT; the first variant is the baseline.",
     )
     parser.add_argument("--output-json", type=pathlib.Path, required=True)
     parser.add_argument("--output-csv", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--allow-token-trace-mismatch",
+        action="store_true",
+        help=
+        "Record token-trace fidelity per row instead of rejecting mismatched variants.",
+    )
     return parser.parse_args()
 
 
@@ -52,11 +69,13 @@ def load_variant(name: str, root: pathlib.Path) -> dict[str, dict]:
         with path.open(encoding="utf-8") as stream:
             results[workload] = json.load(stream)
     if not results:
-        raise RuntimeError(f"no HTTP workload results found for {name} under {root}")
+        raise RuntimeError(
+            f"no HTTP workload results found for {name} under {root}")
     return results
 
 
-def relative_percent(value: float, baseline: float, lower_is_better: bool) -> float:
+def relative_percent(value: float, baseline: float,
+                     lower_is_better: bool) -> float:
     if baseline == 0.0:
         return 0.0
     direction = -1.0 if lower_is_better else 1.0
@@ -71,7 +90,8 @@ def main() -> int:
     workloads = sorted(loaded[baseline_name])
     for name, results in loaded.items():
         if sorted(results) != workloads:
-            raise RuntimeError(f"workload set for {name} differs from {baseline_name}")
+            raise RuntimeError(
+                f"workload set for {name} differs from {baseline_name}")
 
     rows = []
     for workload in workloads:
@@ -79,27 +99,38 @@ def main() -> int:
         baseline_hash = baseline["token_trace_sha256_per_run"]
         for name, _ in variants:
             result = loaded[name][workload]
-            if result["token_trace_sha256_per_run"] != baseline_hash:
-                raise RuntimeError(f"token trace differs for {workload}: {baseline_name} vs {name}")
+            token_trace_matches_baseline = result[
+                "token_trace_sha256_per_run"] == baseline_hash
+            if not token_trace_matches_baseline and not args.allow_token_trace_mismatch:
+                raise RuntimeError(
+                    f"token trace differs for {workload}: {baseline_name} vs {name}"
+                )
             row = {
                 "workload": workload,
                 "variant": name,
                 "requests": result["requests_per_run"],
                 "token_trace_sha256": result["token_trace_sha256_per_run"][0],
+                "token_trace_matches_baseline": token_trace_matches_baseline,
             }
             for metric in METRICS:
                 value = float(result[metric])
                 row[metric] = value
                 if name != baseline_name:
                     row[f"{metric}_relative_percent"] = relative_percent(
-                        value, float(baseline[metric]), metric.endswith("_ms") or "memory" in metric
-                    )
+                        value, float(baseline[metric]),
+                        metric.endswith("_ms") or "memory" in metric)
             rows.append(row)
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     with args.output_json.open("w", encoding="utf-8") as stream:
-        json.dump({"baseline": baseline_name, "variants": [name for name, _ in variants], "rows": rows}, stream,
-                  indent=2)
+        json.dump(
+            {
+                "baseline": baseline_name,
+                "variants": [name for name, _ in variants],
+                "rows": rows
+            },
+            stream,
+            indent=2)
         stream.write("\n")
     fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with args.output_csv.open("w", encoding="utf-8", newline="") as stream:

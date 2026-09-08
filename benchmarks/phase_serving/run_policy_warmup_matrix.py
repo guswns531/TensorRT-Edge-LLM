@@ -97,7 +97,8 @@ def _set_backend_environment(command: list[str], name: str,
 def _drop_backend_environment(command: list[str], name: str) -> None:
     index = 0
     while index + 1 < len(command):
-        if command[index] == "-e" and command[index + 1].split("=", 1)[0] == name:
+        if command[index] == "-e" and command[index + 1].split("=",
+                                                               1)[0] == name:
             del command[index:index + 2]
             continue
         index += 1
@@ -162,20 +163,23 @@ def _is_vision_trace(path: Path) -> bool:
         if isinstance(part, dict))
 
 
-def prepare_command(entry: dict[str, Any],
-                    mode: str,
-                    output_dir: Path,
-                    repeats: int,
-                    generic_text: Path,
-                    generic_vlm: Path,
-                    backend_build_root: str = "",
-                    backend_engine_dir: str = "",
-                    policy_variant: str = "v2_scalar_transition",
-                    backend_environment: tuple[str, ...] = (),
-                    client_max_in_flight: int = 0,
-                    capture_phase_telemetry: bool = False,
-                    trace_override: str = "",
-                    generic_calibration_max_rounds: int = 1) -> list[str]:
+def prepare_command(
+    entry: dict[str, Any],
+    mode: str,
+    output_dir: Path,
+    repeats: int,
+    generic_text: Path,
+    generic_vlm: Path,
+    backend_build_root: str = "",
+    backend_engine_dir: str = "",
+    policy_variant: str = "v2_scalar_transition",
+    backend_environment: tuple[str, ...] = (),
+    client_max_in_flight: int = 0,
+    capture_phase_telemetry: bool = False,
+    trace_override: str = "",
+    generic_calibration_max_rounds: int = 1,
+    dropped_backend_environment: tuple[str, ...] = ()
+) -> list[str]:
     if policy_variant not in POLICY_VARIANTS:
         raise ValueError(f"unknown policy variant: {policy_variant}")
     command = list(entry["command"])
@@ -198,6 +202,8 @@ def prepare_command(entry: dict[str, Any],
     _replace_backend_build(command, backend_build_root)
     _replace_backend_engine(command, backend_engine_dir)
     for name in DEPRECATED_POLICY_ENVIRONMENT:
+        _drop_backend_environment(command, name)
+    for name in dropped_backend_environment:
         _drop_backend_environment(command, name)
     for name, value in POLICY_VARIANTS[policy_variant].items():
         _set_backend_environment(command, name, value)
@@ -273,6 +279,11 @@ def main() -> int:
         action="append",
         default=[],
         help="override one backend NAME=VALUE assignment; may be repeated")
+    parser.add_argument(
+        "--drop-backend-env",
+        action="append",
+        default=[],
+        help="remove one backend environment variable; may be repeated")
     args = parser.parse_args()
     modes = tuple(value for value in args.modes.split(",") if value)
     if not modes or any(mode not in MODES for mode in modes):
@@ -281,11 +292,12 @@ def main() -> int:
             or args.generic_calibration_max_rounds <= 0):
         parser.error(
             "repeats and generic-calibration-max-rounds must be positive; "
-            "client-max-in-flight cannot be negative"
-        )
+            "client-max-in-flight cannot be negative")
     if any("=" not in assignment or not assignment.split("=", 1)[0]
            for assignment in args.backend_env):
         parser.error("backend-env values must use NAME=VALUE")
+    if any(not name or "=" in name for name in args.drop_backend_env):
+        parser.error("drop-backend-env values must be environment names")
     selected_cases = {value for value in args.cases.split(",") if value}
     entries = json.loads(args.base_commands.read_text(encoding="utf-8"))
     if selected_cases:
@@ -300,13 +312,21 @@ def main() -> int:
             case = str(entry["case"])
             output = args.output_dir / mode / case / str(entry["variant"])
             command = prepare_command(
-                entry, mode, output, args.repeats, args.generic_text,
-                args.generic_vlm, args.backend_build_root,
-                args.backend_engine_dir, args.policy_variant,
-                tuple(args.backend_env), args.client_max_in_flight,
+                entry,
+                mode,
+                output,
+                args.repeats,
+                args.generic_text,
+                args.generic_vlm,
+                args.backend_build_root,
+                args.backend_engine_dir,
+                args.policy_variant,
+                tuple(args.backend_env),
+                args.client_max_in_flight,
                 args.capture_phase_telemetry,
                 str(args.trace_override) if args.trace_override else "",
-                args.generic_calibration_max_rounds)
+                args.generic_calibration_max_rounds,
+                dropped_backend_environment=tuple(args.drop_backend_env))
             commands.append({
                 "mode": mode,
                 "policy_variant": args.policy_variant,
