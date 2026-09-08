@@ -471,3 +471,11 @@ Retained corrected results:
 .local/results/v0101-forward-port/no-vp-v010-contract-v0-v1-v2.{json,csv}
 .local/results/v0101-forward-port/no-vp-v010-contract-full12-v1-r3
 ```
+
+## Follow-up: atomic P1024 execution restored
+
+See [note 243](243-v0101-atomic-vision-recovery-final-20260908.md) for the subsequent full-suite measurements.
+The earlier dedicated-profile comparison did not restore atomic external prefill: chunked vision prefill remained
+enabled in the IPC adapter. It therefore does not establish that a dedicated vision profile is intrinsically slower.
+The follow-up separates this execution-contract change from the unchanged KV allocation and records the remaining
+performance and exact-output gate failures explicitly.
