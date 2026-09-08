@@ -3269,6 +3269,16 @@ int main(int argc, char** argv)
                                 activityTimeline->reset(setupStream);
                             }
                             emitRecord("PHASE_EPOCH\t", {{"epoch", measurementEpoch}, {"kind", "measurement"}});
+                            auto const prefillGraphStats = semanticCoordinator.prefillGraphCacheStats();
+                            auto const decodeGraphStats = semanticCoordinator.decodeGraphCacheStats();
+                            LOG_INFO(
+                                "Phase CUDA graph measurement start: prefill entries=%zu hits=%zu misses=%zu "
+                                "captures=%zu evictions=%zu; decode entries=%zu hits=%zu misses=%zu captures=%zu "
+                                "evictions=%zu",
+                                prefillGraphStats.entries, prefillGraphStats.hits, prefillGraphStats.misses,
+                                prefillGraphStats.captures, prefillGraphStats.evictions, decodeGraphStats.entries,
+                                decodeGraphStats.hits, decodeGraphStats.misses, decodeGraphStats.captures,
+                                decodeGraphStats.evictions);
                         }
                         char const* calibrationAction = input.kind == PhaseIpcKind::kCalibrationBegin ? "begin"
                             : input.kind == PhaseIpcKind::kCalibrationEnd                             ? "end"
