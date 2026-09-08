@@ -11,8 +11,10 @@ vision prefill reuse the P128 profile in chunks and its existing prefill arena.
 
 The recovered engine:
 
-- lowers ready memory from 9,281 MiB to 9,061 MiB and observed VLM peak memory
-  from 9,325--9,333 MiB to 9,097--9,113 MiB;
+- lowers ready memory from 9,281 MiB to 9,061 MiB; under the initial
+  capacity-four diagnostic, observed VLM peak memory falls from
+  9,325--9,333 MiB to 9,097--9,113 MiB, while the restored-capacity final
+  matrix peaks at 9,113--9,229 MiB depending on workload;
 - improves V1 throughput by `+5.13%` geometric mean over the previous v0.10.1
   engine and wins 10/12 traces;
 - improves the most affected V1 traces by `+17.79%` on mixed, `+10.93%` on
@@ -23,11 +25,15 @@ The recovered engine:
   mean over V0 with 10/12 throughput wins. V2 is `-0.44%` versus V0 and is not
   promoted.
 
-This recovers the intended independent E/P/D memory frontier, but it does not
-yet recover the old v0.10.0 VLM throughput. The three-run v0.10.1 V1 result is
-`-21.19%` geometric mean versus the old v0.10.0 V1 table and `-9.74%` versus the frozen
-vLLM table. The remaining gap is concentrated in VLM-containing traces rather
-than the KV pool or the pure-text executor topology.
+This recovers the intended independent E/P/D memory frontier. The first
+three-run result below still used a restrictive encoded-vision capacity of four
+and was therefore not a fair comparison with the old v0.10.0 champion. Restoring
+the workload-independent v0.10.0 ownership frontier (`16` normal, up to `80`
+when its existing age/TPOT guard allows growth) improves V1 by another `+12.65%`
+geometric mean over that restricted run. The corrected three-run V1 result is
+`-11.22%` geometric mean versus the old v0.10.0 table and `+1.68%` versus the
+frozen vLLM table, with 7/12 vLLM wins. The remaining old-version gap is not a
+KV-pool regression.
 
 ## 2. Engine contract
 
@@ -190,11 +196,14 @@ engine tactic/profile change changes the action costs even when the scheduler
 source is unchanged. The result also demonstrates why the policy gate must be
 rerun after rebuilding an engine.
 
-## 7. V1 three-run promotion result
+## 7. Restrictive-capacity diagnostic
 
-Each workload was repeated three times after generic calibration. Throughput
-and tail columns are medians; mean-latency columns are the median of run means.
-Values are milliseconds except token throughput and memory.
+Each workload was repeated three times after generic calibration, but this run
+fixed both normal and throughput encoded-vision capacity at four. It is retained
+as a controlled diagnostic of ownership/admission pressure, not as the final
+promotion result. Throughput and tail columns are medians; mean-latency columns
+are the median of run means. Values are milliseconds except token throughput
+and memory.
 
 | workload | tok/s | TTFT mean/p95 | TPOT mean/p95 | E2E mean/p95 | peak MiB | vs frozen vLLM |
 |---|---:|---:|---:|---:|---:|---:|
@@ -212,10 +221,9 @@ Values are milliseconds except token throughput and memory.
 | multi-image | 193.5 | 323.5 / 552.9 | 9.95 / 11.47 | 631.9 / 786.3 | 9,097 | -20.88% |
 
 The repeated run preserves deterministic captured tokens within every trace.
-It wins 4/12 token-throughput rows versus the frozen vLLM table and confirms
-that the remaining deficit is VLM-path specific. The one-run policy gate is
-still the correct V0/V1/V2 causal comparison; this table is the higher-confidence
-absolute V1 promotion result.
+It wins 4/12 token-throughput rows versus the frozen vLLM table. Section 14
+shows that most of this apparent VLM deficit came from the capacity-four test
+contract rather than v0.10.1 execution itself.
 
 ## 8. Historical comparison
 
@@ -342,3 +350,124 @@ Next work is ordered by the remaining measured gap:
 3. rerun vLLM only after the runtime or workload contract changes materially;
 4. retain P128 and profile-free V0/V1/V2 evaluation until a controlled result
    proves that another engine shape has better cross-workload SLO goodput.
+
+## 14. Encoded-vision capacity confound and recovery
+
+The old v0.10.0 champion and the initial v0.10.1 promotion run did not have the
+same downstream ownership frontier:
+
+```text
+old v0.10.0 champion
+  normal encoded capacity       16 requests
+  guarded throughput capacity   80 requests
+  generic calibration           v7 text / v7 VLM small-D traces
+
+initial v0.10.1 P128 result
+  normal encoded capacity        4 requests
+  guarded throughput capacity    4 requests
+  generic calibration           earlier text / VLM traces
+```
+
+The capacity is not a workload label and does not directly force a batch size.
+It bounds how many request-owned encoder results may wait for or execute through
+P/D. The existing age, TPOT-pressure, byte, and stable-page guards still decide
+when the larger frontier is safe. Setting both limits to four removed the queue
+state needed to form useful E and external-P cohorts.
+
+Restoring the old workload-independent contract on the recovered P128 engine
+produced these one-run V0/V1/V2 results:
+
+| workload | V0 tok/s | V1 tok/s | V2 tok/s | V1 vs V0 | V2 vs V0 |
+|---|---:|---:|---:|---:|---:|
+| short | 2,370.1 | 2,323.6 | 2,309.6 | -1.96% | -2.55% |
+| balanced | 4,279.5 | 4,139.5 | 4,099.9 | -3.27% | -4.20% |
+| decode-heavy | 4,957.0 | 4,998.5 | 4,680.7 | +0.84% | -5.58% |
+| long-prefill | 1,044.1 | 1,171.8 | 1,174.6 | +12.23% | +12.50% |
+| bimodal | 1,800.8 | 1,818.4 | 1,789.8 | +0.98% | -0.61% |
+| text-heavy | 1,731.1 | 1,873.7 | 1,727.6 | +8.24% | -0.20% |
+| mixed | 936.5 | 1,042.0 | 1,067.1 | +11.27% | +13.95% |
+| poisson | 1,656.4 | 1,802.2 | 1,683.4 | +8.80% | +1.63% |
+| vision-heavy | 622.7 | 563.7 | 629.8 | -9.48% | +1.14% |
+| wave-drain | 95.1 | 96.2 | 95.5 | +1.19% | +0.42% |
+| late-vision | 2,438.8 | 2,390.6 | 2,358.0 | -1.98% | -3.31% |
+| multi-image | 219.5 | 262.6 | 219.1 | +19.64% | -0.19% |
+
+Aggregate token throughput is `+3.58%` for V1 and `+0.92%` for V2 relative
+to V0. V1 wins 8/12 rows and remains the promoted production policy. V2 wins
+5/12 and remains a research-only transition variant. This gate uses one run per
+cell and is the causal same-binary/same-engine policy comparison.
+
+## 15. Corrected V1 three-run promotion result
+
+The final V1 matrix uses the restored capacity/calibration contract. All values
+are medians across three runs except that the mean columns are the median of run
+means. Historical v0.10.0 and frozen vLLM values retain the same request, model,
+precision, and output-length contract but are not fresh confidence-interval
+runs.
+
+| workload | tok/s | TTFT mean/p95 | TPOT mean/p95 | E2E mean/p95 | peak MiB | vs v0.10.0 | vs vLLM | hash stable |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| short | 2,325.2 | 110.4 / 192.8 | 12.89 / 23.36 | 357.1 / 438.8 | 9,061 | -6.20% | +17.23% | yes |
+| balanced | 4,137.4 | 71.1 / 179.3 | 13.42 / 15.22 | 1,209.9 / 1,905.3 | 9,061 | -7.13% | -4.22% | yes |
+| decode-heavy | 4,950.9 | 72.7 / 195.2 | 11.27 / 12.01 | 2,981.1 / 4,589.9 | 9,061 | -6.92% | +1.99% | yes |
+| long-prefill | 1,181.4 | 2,135.4 / 2,712.6 | 26.48 / 32.22 | 4,381.9 / 6,246.5 | 9,061 | -3.20% | +5.40% | yes |
+| bimodal | 1,815.5 | 2,037.3 / 4,221.6 | 18.81 / 26.73 | 4,660.2 / 9,677.9 | 9,061 | -5.25% | -2.83% | yes |
+| text-heavy | 1,728.9 | 332.8 / 1,198.4 | 29.95 / 45.43 | 1,861.8 / 1,939.6 | 9,173 | -18.90% | +5.76% | no |
+| mixed | 996.9 | 782.9 / 2,305.6 | 36.32 / 52.97 | 2,526.7 / 2,838.8 | 9,229 | -15.88% | +8.18% | no |
+| poisson | 1,781.9 | 244.2 / 964.3 | 23.89 / 41.06 | 1,794.9 / 2,260.8 | 9,193 | -13.74% | -1.01% | yes |
+| vision-heavy | 578.0 | 1,544.0 / 3,747.8 | 37.85 / 55.82 | 2,983.9 / 4,184.1 | 9,185 | -15.98% | -0.21% | no |
+| wave-drain | 96.0 | 291.3 / 447.9 | 9.91 / 13.65 | 613.3 / 663.3 | 9,121 | -2.07% | +0.18% | yes |
+| late-vision | 2,407.0 | 156.0 / 578.5 | 9.78 / 9.83 | 1,553.7 / 1,916.1 | 9,141 | -5.69% | +2.03% | yes |
+| multi-image | 220.4 | 389.1 / 499.4 | 9.52 / 12.25 | 684.0 / 721.9 | 9,113 | -29.37% | -9.85% | yes |
+
+The corrected V1 matrix is `+12.65%` geometric mean over the restrictive
+capacity-four matrix. It is `+1.68%` geometric mean versus frozen vLLM with
+7/12 wins, but remains `-11.22%` versus the old v0.10.0 V1 table. The old
+version gap is largest in multi-image, text-heavy, mixed, and vision-heavy.
+
+Text-heavy, mixed, and vision-heavy do not preserve the exact greedy token hash
+across all three repeats. This is a numerical/order determinism failure, not a
+request-count or completion failure: every run emits the requested number of
+tokens. It blocks an exact-fidelity production promotion for those VLM traces
+and must be debugged separately from performance.
+
+## 16. Final architecture and remaining work
+
+```text
+one CUDA context
+  E TensorRT context / E stream
+      -> request-owned visual payload lease
+      -> encoded-ready queue (normal 16, guarded frontier up to 80)
+  P text context + external-P sibling / P stream
+      -> one shared P128 context-memory arena
+      -> fixed 128-token chunks, stable indexed-paged KV lease
+  D TensorRT context / D stream
+      -> D64 dynamic cohorts, sampling completion back to ready queue
+  Copy stream
+      -> pinned/async staging and explicit CUDA-event dependencies
+
+Global V0/V1/V2 mechanism
+  feasibility -> request SLO safety -> measured action value -> dispatch
+```
+
+The next work is no longer another broad capacity or KV redesign:
+
+1. restore canonical VLM row/request ordering until the three failing traces
+   have repeat-stable greedy hashes;
+2. compare old/new E dispatch count, E input-token mass, external-P dispatch
+   count, and P/D GPU service on multi-image and vision-heavy;
+3. isolate whether the remaining 11.22% old-version gap is encoder export,
+   external-embedding placement, or runtime realization;
+4. repeat only the affected V1 traces after each controlled mechanism change;
+5. rerun the frozen vLLM baseline only if model, requests, precision, memory
+   budget, or server contract changes.
+
+Retained corrected results:
+
+```text
+.local/results/v0101-forward-port/no-vp-v010-contract-full12-v0
+.local/results/v0101-forward-port/no-vp-v010-contract-v1
+.local/results/v0101-forward-port/no-vp-v010-contract-full12-v2
+.local/results/v0101-forward-port/no-vp-v010-contract-v0-v1-v2.{json,csv}
+.local/results/v0101-forward-port/no-vp-v010-contract-full12-v1-r3
+```
