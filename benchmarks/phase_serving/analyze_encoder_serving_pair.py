@@ -117,6 +117,10 @@ def analyze(path):
     return dict(
         source=str(path),
         phases=summary,
+        actions_with_ready_decode=dict(
+            collections.Counter(e['action_kind'] for e in events
+                                if e['event_kind'] == 'decision'
+                                and e['ready']['decode_rows'] > 0)),
         decode_snapshot_notice_to_next_enqueue_ms=distribution(host_gaps),
         decode_gpu_end_to_next_start_ms=distribution(gpu_gaps),
         encoder_covered_decode_gap_ms=distribution(e_covered),
@@ -129,6 +133,130 @@ def analyze(path):
          ))
 
 
+def analyze_ready_path(path):
+    """Join producer tickets to the next request-local decode start in one host clock."""
+    timeline = []
+    epochs = 0
+    for line in path.read_text().splitlines():
+        kind, separator, value = line.partition('\t')
+        if not separator:
+            continue
+        if kind == 'PHASE_EPOCH' and json.loads(
+                value)['kind'] == 'measurement':
+            timeline = []
+            epochs += 1
+        elif kind == 'PHASE_TIMELINE':
+            timeline.append(json.loads(value))
+    if epochs != 1 or not timeline:
+        raise ValueError(
+            'Expected one measurement epoch with request timeline')
+    tickets = collections.defaultdict(dict)
+    starts = collections.defaultdict(list)
+    for event in timeline:
+        request = event['request_index']
+        stage = event['stage']
+        if stage == 'decode_start':
+            starts[request].append(event)
+        if 'sampling_' in stage or stage.endswith(
+                'token_committed') or stage == 'decode_ready':
+            key = (request, event['dispatch_index'])
+            if stage in tickets[key]:
+                raise ValueError('Duplicate ticket stage')
+            tickets[key][stage] = event['timestamp_us']
+    for events in starts.values():
+        events.sort(key=lambda event: event['timestamp_us'])
+    rows = []
+    for (request,
+         ticket), stages in sorted(tickets.items(),
+                                   key=lambda item: min(item[1].values())):
+        prefix = 'prefill' if 'prefill_sampling_submit' in stages else 'decode'
+        names = [
+            prefix + '_sampling_submit', prefix + '_sampling_ready',
+            prefix + '_sampling_collected', prefix + '_token_committed'
+        ]
+        if any(name not in stages for name in names):
+            raise ValueError('Incomplete sampling ticket')
+        values = [stages[name] for name in names]
+        if values != sorted(values):
+            raise ValueError('Nonmonotonic producer timestamps')
+        row = dict(request=request,
+                   ticket=ticket,
+                   producer=prefix,
+                   submit_to_handling_ms=(values[1] - values[0]) / 1000,
+                   handling_to_collect_ms=(values[2] - values[1]) / 1000,
+                   collect_to_commit_ms=(values[3] - values[2]) / 1000)
+        if 'decode_ready' in stages:
+            ready = stages['decode_ready']
+            if ready < values[-1]:
+                raise ValueError('Ready precedes token commit')
+            candidates = starts[request]
+            if not candidates or candidates[0]['timestamp_us'] < ready:
+                raise ValueError('Missing or unmatched decode start')
+            start = candidates.pop(0)
+            row.update(
+                commit_to_ready_ms=(ready - values[-1]) / 1000,
+                ready_to_decode_start_ms=(start['timestamp_us'] - ready) /
+                1000,
+                ready_host_us=ready,
+                decode_start_host_us=start['timestamp_us'],
+                next_decode_dispatch=start['dispatch_index'],
+                next_decode_batch=start['batch_size'])
+        rows.append(row)
+    if any(starts.values()):
+        raise ValueError('Decode starts without producer readiness')
+    phase_starts = {}
+    phase_intervals = collections.defaultdict(list)
+    for event in sorted(timeline, key=lambda value: value['timestamp_us']):
+        phase, _, suffix = event['stage'].partition('_')
+        if phase not in ('encoder', 'prefill',
+                         'decode') or suffix not in ('start', 'done'):
+            continue
+        key = (phase, event['request_index'], event['dispatch_index'])
+        if suffix == 'start':
+            phase_starts[key] = event['timestamp_us']
+        elif key in phase_starts:
+            phase_intervals[phase].append(
+                (phase_starts.pop(key), event['timestamp_us']))
+    for row in rows:
+        if 'ready_host_us' not in row:
+            continue
+        start, end = row['ready_host_us'], row['decode_start_host_us']
+        for phase, intervals in phase_intervals.items():
+            row[phase + '_host_span_while_ready_ms'] = covered_duration(
+                start, end, intervals) / 1000
+        all_intervals = [
+            interval for intervals in phase_intervals.values()
+            for interval in intervals
+        ]
+        row['uncovered_host_span_while_ready_ms'] = (
+            end - start - covered_duration(start, end, all_intervals)) / 1000
+    fields = [
+        'submit_to_handling_ms', 'handling_to_collect_ms',
+        'collect_to_commit_ms', 'commit_to_ready_ms',
+        'ready_to_decode_start_ms', 'encoder_host_span_while_ready_ms',
+        'prefill_host_span_while_ready_ms', 'decode_host_span_while_ready_ms',
+        'uncovered_host_span_while_ready_ms'
+    ]
+    summaries = {}
+    for producer in ['all', 'prefill', 'decode']:
+        selected = [
+            row for row in rows
+            if producer == 'all' or row['producer'] == producer
+        ]
+        summaries[producer] = {
+            field:
+            distribution([row[field] for row in selected if field in row])
+            for field in fields
+        }
+    return dict(
+        rows=rows,
+        summaries=summaries,
+        caveat=
+        ('Sampling-ready denotes CPU ticket handling after readiness detection, not GPU completion. '
+         'Phase host-span coverage is not GPU utilization and phase spans may overlap.'
+         ))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--events',
@@ -136,10 +264,14 @@ def main():
                         action='append',
                         required=True)
     parser.add_argument('--output', type=pathlib.Path, required=True)
+    parser.add_argument('--request-timeline', action='store_true')
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
     result = [analyze(path) for path in args.events]
+    if args.request_timeline:
+        for path, item in zip(args.events, result):
+            item['ready_path'] = analyze_ready_path(path)
     with args.output.open('x') as output:
         json.dump(result, output, indent=2)
 
