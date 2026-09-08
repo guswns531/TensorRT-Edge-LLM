@@ -64,6 +64,16 @@ struct PhaseGlobalSchedulerConfig
     double deadlineGuardUs{};
 };
 
+//! Evaluation of one actual selector input, not a preview-frontier candidate.
+struct PhaseGlobalCandidateAudit
+{
+    uint64_t candidateId{};
+    bool hardFeasible{};
+    double predictedViolationUs{};
+    bool frontierEligible{};
+    bool dominated{};
+};
+
 //! Profile-free selector shared by text and multimodal request DAGs.
 //!
 //! Mechanism components generate a small candidate frontier. This selector
@@ -74,7 +84,8 @@ class PhaseGlobalScheduler
 public:
     explicit PhaseGlobalScheduler(PhaseGlobalSchedulerConfig config = {});
 
-    PhaseGlobalDecision select(std::vector<PhaseGlobalActionCandidate> const& candidates) const;
+    PhaseGlobalDecision select(std::vector<PhaseGlobalActionCandidate> const& candidates,
+        std::vector<PhaseGlobalCandidateAudit>* audit = nullptr) const;
 
 private:
     PhaseGlobalSchedulerConfig mConfig;

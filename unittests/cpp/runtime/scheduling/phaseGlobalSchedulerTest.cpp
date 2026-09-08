@@ -46,6 +46,66 @@ TEST(PhaseGlobalSchedulerTest, RejectsBrokenMechanismInvariants)
     EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kNoHardFeasibleCandidate);
 }
 
+TEST(PhaseGlobalSchedulerTest, AuditReportsActualInputsWithoutChangingDecision)
+{
+    PhaseGlobalScheduler scheduler({11U, 20.0});
+    auto safe = candidate(PhaseGlobalActionKind::kDecode, 100.0, 100.0, 1000.0);
+    auto late = candidate(PhaseGlobalActionKind::kEncoder, 500.0, 500.0, 100.0);
+    auto invalid = safe;
+    safe.candidateId = 1U;
+    late.candidateId = 2U;
+    invalid.candidateId = 3U;
+    invalid.contextSafe = false;
+    std::vector<PhaseGlobalActionCandidate> inputs{safe, late, invalid};
+    std::vector<PhaseGlobalCandidateAudit> audit;
+    auto const reference = scheduler.select(inputs);
+    auto const measured = scheduler.select(inputs, &audit);
+    ASSERT_EQ(audit.size(), inputs.size());
+    EXPECT_EQ(measured.selectedIndex, reference.selectedIndex);
+    EXPECT_EQ(measured.reason, reference.reason);
+    EXPECT_EQ(measured.predictedViolationUs, reference.predictedViolationUs);
+    EXPECT_EQ(audit[0].candidateId, 1U);
+    EXPECT_TRUE(audit[0].frontierEligible);
+    EXPECT_DOUBLE_EQ(audit[0].predictedViolationUs, 0.0);
+    EXPECT_DOUBLE_EQ(audit[1].predictedViolationUs, 420.0);
+    EXPECT_FALSE(audit[1].frontierEligible);
+    EXPECT_FALSE(audit[2].hardFeasible);
+    EXPECT_FALSE(audit[2].frontierEligible);
+    scheduler.select({}, &audit);
+    EXPECT_TRUE(audit.empty());
+}
+
+TEST(PhaseGlobalSchedulerTest, AuditUsesProtectedCompletionUncertainty)
+{
+    PhaseGlobalScheduler scheduler({11U, 20.0});
+    auto input = candidate(PhaseGlobalActionKind::kDecode, 100.0, 100.0, 10000.0);
+    input.protectedCompletions.push_back({100.0, 150.0, 30.0, PhaseProtectedKind::kDecode});
+    std::vector<PhaseGlobalCandidateAudit> audit;
+    auto const decision = scheduler.select({input}, &audit);
+    ASSERT_EQ(audit.size(), 1U);
+    EXPECT_DOUBLE_EQ(audit[0].predictedViolationUs, 100.0);
+    EXPECT_DOUBLE_EQ(decision.predictedViolationUs, audit[0].predictedViolationUs);
+}
+
+TEST(PhaseGlobalSchedulerTest, FinalProtectionCanInvalidateSameIdPreview)
+{
+    PhaseGlobalScheduler scheduler;
+    auto preview = candidate(PhaseGlobalActionKind::kDecode, 100.0, 100.0, 1000.0);
+    preview.candidateId = 7U;
+    auto finalInput = preview;
+    finalInput.protectedCompletions.push_back({1000.0, 100.0, 0.0, PhaseProtectedKind::kDecode});
+    finalInput.protectedCompletions.push_back({200.0, 800.0, 50.0, PhaseProtectedKind::kEncoder});
+    std::vector<PhaseGlobalCandidateAudit> previewAudit;
+    std::vector<PhaseGlobalCandidateAudit> finalAudit;
+    scheduler.select({preview}, &previewAudit);
+    scheduler.select({finalInput}, &finalAudit);
+    ASSERT_EQ(previewAudit.size(), 1U);
+    ASSERT_EQ(finalAudit.size(), 1U);
+    EXPECT_EQ(previewAudit[0].candidateId, finalAudit[0].candidateId);
+    EXPECT_DOUBLE_EQ(previewAudit[0].predictedViolationUs, 0.0);
+    EXPECT_DOUBLE_EQ(finalAudit[0].predictedViolationUs, 650.0);
+}
+
 TEST(PhaseGlobalSchedulerTest, ContextualDecisionCostCanGeneralizeAnUnknownOverlap)
 {
     PhaseGlobalScheduler scheduler;

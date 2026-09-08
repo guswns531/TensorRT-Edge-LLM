@@ -1021,9 +1021,15 @@ PhaseGlobalScheduler::PhaseGlobalScheduler(PhaseGlobalSchedulerConfig config)
     ELLM_CHECK(mConfig.deadlineGuardUs >= 0.0, "Global phase deadline guard must be non-negative");
 }
 
-PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCandidate> const& candidates) const
+PhaseGlobalDecision PhaseGlobalScheduler::select(
+    std::vector<PhaseGlobalActionCandidate> const& candidates, std::vector<PhaseGlobalCandidateAudit>* audit) const
 {
     ELLM_CHECK(candidates.size() <= mConfig.maxCandidates, "Global phase candidate limit exceeded");
+    if (audit != nullptr)
+    {
+        audit->clear();
+        audit->resize(candidates.size());
+    }
     PhaseGlobalDecision decision;
     decision.inputCandidates = candidates.size();
     if (candidates.empty())
@@ -1034,7 +1040,14 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
     std::vector<size_t> feasible;
     for (size_t index{}; index < candidates.size(); ++index)
     {
-        if (hardFeasible(candidates[index]))
+        bool const feasibleInput = hardFeasible(candidates[index]);
+        if (audit != nullptr)
+        {
+            PhaseGlobalActionCandidate const& candidate = candidates[index];
+            (*audit)[index] = {candidate.candidateId != 0U ? candidate.candidateId : phaseGlobalCandidateId(candidate),
+                feasibleInput, predictedViolationUs(candidate, mConfig.deadlineGuardUs), false, false};
+        }
+        if (feasibleInput)
         {
             feasible.push_back(index);
         }
@@ -1079,6 +1092,10 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
     std::vector<size_t> pruned;
     for (size_t const right : frontier)
     {
+        if (audit != nullptr)
+        {
+            (*audit)[right].frontierEligible = true;
+        }
         bool dominated{};
         for (size_t const left : frontier)
         {
@@ -1090,6 +1107,10 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(std::vector<PhaseGlobalActionCa
         }
         if (dominated)
         {
+            if (audit != nullptr)
+            {
+                (*audit)[right].dominated = true;
+            }
             ++decision.dominatedCandidates;
         }
         else
