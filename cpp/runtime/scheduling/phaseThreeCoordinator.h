@@ -112,6 +112,8 @@ struct PhaseThreeCoordinatorConfig
     std::vector<PhaseEncoderDecodeBatchCost> globalEncoderDecodeCosts;
     //! Keep the initial bounded action space at E/P/D, E+D, P+D, and WAIT.
     bool enableGlobalEncoderPrefillAction{};
+    //! Retain one standalone P and D alternative at the final E/P/D selector.
+    bool enableGlobalPdFrontier{};
     //! Number of actual dispatches attributed after an H=2/myopic selection
     //! change. The selected action is the first dispatch in the horizon.
     size_t globalFormationRealizedDispatches{4U};

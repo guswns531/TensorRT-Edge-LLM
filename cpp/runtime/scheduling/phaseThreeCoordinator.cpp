@@ -2625,6 +2625,22 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     {
         candidates.push_back(*pd);
     }
+    if (mConfig.enableGlobalPdFrontier && !residualAugmentation && !mGlobalWarmupProbeMode)
+    {
+        for (PhaseGlobalActionKind const kind : {PhaseGlobalActionKind::kPrefill, PhaseGlobalActionKind::kDecode})
+        {
+            auto alternative = frontierCandidate(kind);
+            if (!alternative.has_value() || (pd.has_value() && alternative->candidateId == pd->candidateId))
+            {
+                continue;
+            }
+            alternative->protectedCompletions.push_back(
+                {encoderSlackUs, alternative->predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
+                    alternative->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs,
+                    PhaseProtectedKind::kEncoder});
+            candidates.push_back(std::move(*alternative));
+        }
+    }
     bool const encoderPrefillExclusive = mConfig.serializeAllEncoderPrefill
         || (mConfig.exclusiveEncoderInputTokenThreshold > 0
             && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
