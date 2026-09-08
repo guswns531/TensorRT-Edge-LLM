@@ -17,6 +17,7 @@ import importlib.util
 import json
 import pathlib
 
+import jsonschema
 import pytest
 
 SPEC = importlib.util.spec_from_file_location(
@@ -25,6 +26,31 @@ SPEC = importlib.util.spec_from_file_location(
     'benchmarks/phase_serving/analyze_selector_audit.py')
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+def test_schema_distinguishes_uncomputed_preview_from_actual_audit():
+    path = pathlib.Path(__file__).parents[
+        2] / 'benchmarks/phase_serving/manifests/phase_event_schema_v1.json'
+    schema = json.loads(path.read_text())
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.validate(
+        None,
+        schema['$defs']['candidate']['properties']['max_slo_violation_us'])
+    for name in [
+            'policy_decision_sequence', 'kv_ownership_signature',
+            'vision_lease_signature'
+    ]:
+        jsonschema.validate(0, schema['properties'][name])
+    audit_schema = schema['$defs']['selectorAudit']
+    jsonschema.validate(None, audit_schema)
+    audit = dict(inputs=[],
+                 selected_action_id=None,
+                 reason='no_candidate',
+                 selected_violation_us=0)
+    jsonschema.validate(audit, audit_schema)
+    audit['reason'] = 'invented_reason'
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(audit, audit_schema)
 
 
 def test_actual_inputs_override_preview_evidence(tmp_path):

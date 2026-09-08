@@ -12,6 +12,12 @@
     "host_monotonic_ns"
   ],
   "properties": {
+    "selector_audit": {
+      "$ref": "#/$defs/selectorAudit"
+    },
+    "pd_selector_audit": {
+      "$ref": "#/$defs/selectorAudit"
+    },
     "schema_version": {
       "const": 1
     },
@@ -39,9 +45,9 @@
       "minimum": 1
     },
     "policy_decision_sequence": {
-      "description": "Monotonic policy invocation sequence within one serving process.",
+      "description": "Enclosing E/P/D policy counter; zero before the first enclosing selection, including P/D-only dispatches.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 0
     },
     "snapshot_id": {
       "type": "integer",
@@ -63,9 +69,9 @@
       "minimum": 1
     },
     "kv_ownership_signature": {
-      "description": "Cross-run identity of request-to-slot/page leases, generation, and committed KV length.",
+      "description": "Cross-run identity of request-to-slot/page leases, generation, and committed KV length. Zero means the lightweight mode did not collect this hash.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 0
     },
     "scalar_policy_state_signature": {
       "description": "Cross-run identity of scalar cost and deadline inputs over the exact candidate frontier.",
@@ -73,9 +79,9 @@
       "minimum": 1
     },
     "vision_lease_signature": {
-      "description": "Cross-run identity of active and pending vision payload lifetimes.",
+      "description": "Cross-run identity of active and pending vision payload lifetimes. Zero means the lightweight mode did not collect this hash.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 0
     },
     "scalar_formation": {
       "$ref": "#/$defs/model_formation"
@@ -383,6 +389,34 @@
     }
   ],
   "$defs": {
+    "selectorAudit": {
+      "type": ["object", "null"],
+      "required": ["inputs", "selected_action_id", "reason", "selected_violation_us"],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["action_id", "action_kind", "hard_feasible", "max_slo_violation_us", "violation_mask", "frontier_eligible", "dominated"],
+            "properties": {
+              "action_id": {"type": "integer", "minimum": 0},
+              "action_kind": {"type": "string"},
+              "hard_feasible": {"type": "boolean"},
+              "max_slo_violation_us": {"type": "number", "minimum": 0},
+              "violation_mask": {"type": "integer", "minimum": 0},
+              "frontier_eligible": {"type": "boolean"},
+              "dominated": {"type": "boolean"}
+            }
+          }
+        },
+        "selected_action_id": {"type": ["integer", "null"], "minimum": 0},
+        "reason": {
+          "enum": ["no_candidate", "no_hard_feasible_candidate", "deadline_safe_efficiency", "bounded_exploration", "minimum_violation", "all_late_efficiency_recovery"]
+        },
+        "selected_violation_us": {"type": "number", "minimum": 0},
+        "post_select_override": {"type": "boolean"}
+      }
+    },
     "executionPhase": {
       "enum": [
         "encoder",
@@ -588,7 +622,8 @@
           }
         },
         "max_slo_violation_us": {
-          "type": "number",
+          "description": "Null when the preview snapshot has not evaluated deadline safety; actual evaluations are in selector_audit.",
+          "type": ["number", "null"],
           "minimum": 0
         },
         "scalar_decision_cost_known": {

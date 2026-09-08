@@ -63,6 +63,9 @@ vision activation 문제와 구분해야 한다. 다만 이 관찰만으로 hier
 
 ## 아직 남은 연결 및 실험
 
+후속 구현·실험은 [note254](254-selector-stage-attribution-and-regression-20260908.md)에 기록했다.
+아래 항목은 이 문서 작성 시점의 계획이며, HTTP 감사 연결은 후속 커밋 `a7480e6`에서 완료했다.
+
 감사 API는 아직 HTTP telemetry에 연결하지 않았다. 따라서 이번 변경만으로 note252의
 실제 요청별 선택 이유가 밝혀진 것은 아니다.
 
