@@ -1519,7 +1519,7 @@ PhaseDispatchPlan PhaseQueueScheduler::previewMechanismPlan(PhaseDispatchKind ki
 
 std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::selectGlobalQueueAction(
     PhaseQueueSnapshot const& state, bool allowPrefill, bool allowDecode, bool allowOverlap,
-    std::optional<PhaseDispatchKind> requiredKind)
+    std::optional<PhaseDispatchKind> requiredKind, PhaseGlobalSelectionAudit* audit)
 {
     if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kDisabled)
     {
@@ -2306,7 +2306,11 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     }
     else
     {
-        decision = mGlobalScheduler.select(candidates);
+        decision = mGlobalScheduler.select(candidates, audit != nullptr ? &audit->inputs : nullptr);
+    }
+    if (audit != nullptr)
+    {
+        audit->decision = decision;
     }
     if (!mGlobalWarmupProbeMode && mRuntimeCostTracker->contextualPdConfig().mode != PhaseContextualPdMode::kDisabled)
     {
@@ -2641,10 +2645,15 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
     }
 }
 
-std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalAction()
+std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalAction(PhaseGlobalSelectionAudit* audit)
 {
+    if (audit != nullptr)
+    {
+        *audit = {};
+    }
     PhaseQueueSnapshot const state = snapshot();
-    std::optional<GlobalQueueSelection> const selection = selectGlobalQueueAction(state, true, true, true);
+    std::optional<GlobalQueueSelection> const selection
+        = selectGlobalQueueAction(state, true, true, true, std::nullopt, audit);
     mLastGlobalPreviewCandidates
         = selection.has_value() ? selection->candidateFrontier : std::vector<PhaseGlobalActionCandidate>{};
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;

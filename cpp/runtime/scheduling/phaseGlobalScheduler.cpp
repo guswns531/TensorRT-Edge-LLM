@@ -1045,7 +1045,8 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
         {
             PhaseGlobalActionCandidate const& candidate = candidates[index];
             (*audit)[index] = {candidate.candidateId != 0U ? candidate.candidateId : phaseGlobalCandidateId(candidate),
-                feasibleInput, predictedViolationUs(candidate, mConfig.deadlineGuardUs), false, false};
+                feasibleInput, predictedViolationUs(candidate, mConfig.deadlineGuardUs), false, false,
+                candidate.key.kind, predictedViolationMask(candidate, mConfig.deadlineGuardUs)};
         }
         if (feasibleInput)
         {

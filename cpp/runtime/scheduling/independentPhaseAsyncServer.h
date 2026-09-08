@@ -396,7 +396,7 @@ public:
     bool pollCompletions();
     //! Select and enqueue at most one ready P/D action.
     bool dispatchReady();
-    std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    std::optional<PhaseGlobalActionCandidate> previewGlobalAction(PhaseGlobalSelectionAudit* audit = nullptr);
     std::vector<PhaseGlobalActionCandidate> const& lastGlobalPreviewCandidates() const noexcept;
     std::optional<PhaseGlobalActionCandidate> previewGlobalPrefillAction();
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();

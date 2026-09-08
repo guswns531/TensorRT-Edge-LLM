@@ -1445,13 +1445,18 @@ PhaseInFlightSnapshot PhaseThreeCoordinator::unifiedInFlightSnapshot(
 }
 
 void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate const& candidate,
-    PhaseGlobalDispatchPlan const& plan, std::vector<PhaseGlobalActionCandidate> const* candidateFrontier)
+    PhaseGlobalDispatchPlan const& plan, std::vector<PhaseGlobalActionCandidate> const* candidateFrontier,
+    PhaseGlobalSelectionAudit const* selectorAudit)
 {
     if (!mUnifiedEventCallback)
     {
         return;
     }
     PhaseUnifiedEvent event;
+    if (selectorAudit != nullptr)
+    {
+        event.selectorAudit = std::make_shared<PhaseGlobalSelectionAudit>(*selectorAudit);
+    }
     event.kind = PhaseUnifiedEventKind::kDecision;
     event.decisionId = plan.snapshotEpoch;
     event.policyDecisionSequence = mGlobalDecisionSequence;
@@ -1959,8 +1964,8 @@ void PhaseThreeCoordinator::refreshGlobalExecutionLease()
     }
 }
 
-PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(
-    PhaseGlobalActionCandidate const& candidate, std::vector<PhaseGlobalActionCandidate> const* candidateFrontier)
+PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate,
+    std::vector<PhaseGlobalActionCandidate> const* candidateFrontier, PhaseGlobalSelectionAudit const* selectorAudit)
 {
     ELLM_CHECK(!mGlobalExecutionLease.has_value(), "A global execution lease is already active");
     PhaseExecutionSet const outstandingBefore = observedGlobalExecution();
@@ -1980,7 +1985,7 @@ PhaseGlobalDispatchPlan PhaseThreeCoordinator::beginGlobalExecutionLease(
     }
     ELLM_CHECK(plan.incrementalAction.legal(), "A dispatch lease violates incremental action legality");
     mGlobalExecutionLease = plan;
-    recordUnifiedDecision(candidate, plan, candidateFrontier);
+    recordUnifiedDecision(candidate, plan, candidateFrontier, selectorAudit);
     return plan;
 }
 
@@ -2360,6 +2365,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     double residualElapsedUs{};
     std::optional<PhaseGlobalActionCandidate> pd;
+    PhaseGlobalSelectionAudit pdAudit;
     std::vector<PhaseGlobalActionCandidate> pdCandidateFrontier;
     std::optional<PhaseGlobalActionCandidate> prefillForEncoder;
     std::optional<PhaseGlobalActionCandidate> decodeForEncoder;
@@ -2380,7 +2386,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     else if (serverState.prefillQueued > 0U || serverState.decodeQueued > 0U)
     {
-        pd = mServer.previewGlobalAction();
+        pd = mServer.previewGlobalAction(mUnifiedEventCallback ? &pdAudit : nullptr);
         pdCandidateFrontier = mServer.lastGlobalPreviewCandidates();
     }
     auto const frontierCandidate = [&](PhaseGlobalActionKind kind) -> std::optional<PhaseGlobalActionCandidate> {
@@ -2440,7 +2446,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             std::vector<PhaseGlobalActionCandidate> const* candidateFrontier
                 = pdCandidateFrontier.empty() ? nullptr : &pdCandidateFrontier;
             recordGlobalDecisionCost(decisionStart);
-            PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(*pd, candidateFrontier);
+            PhaseGlobalDispatchPlan const executionPlan
+                = beginGlobalExecutionLease(*pd, candidateFrontier, pdAudit.inputs.empty() ? nullptr : &pdAudit);
             PhaseGlobalActionCandidate launched = *pd;
             auto const launchedAt = std::chrono::steady_clock::now();
             bool const started
@@ -3031,7 +3038,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     ++mGlobalDecisionSequence;
-    PhaseGlobalDecision const decision = mGlobalScheduler.select(candidates);
+    PhaseGlobalSelectionAudit selectorAudit;
+    PhaseGlobalDecision const decision
+        = mGlobalScheduler.select(candidates, mUnifiedEventCallback ? &selectorAudit.inputs : nullptr);
+    selectorAudit.decision = decision;
+    selectorAudit.pdInputs = std::move(pdAudit.inputs);
+    selectorAudit.pdDecision = pdAudit.decision;
     std::optional<size_t> const h2SelectedIndex
         = formationSelectionActive ? decision.selectedIndex : formationOracle.selectedAction;
     if (formationEvaluated && h2SelectedIndex.has_value())
@@ -3225,7 +3237,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             = phaseGlobalAugmentedDispatchPlan(kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalPlanSequence,
                 kTHREE_PHASE_PLAN_NAMESPACE | ++mGlobalSnapshotEpoch, *mGlobalExecutionLease, selected, startSkew);
         ELLM_CHECK(augmented.has_value(), "Residual lease augmentation does not match the active phase rows");
-        recordUnifiedDecision(selected, *augmented, &unifiedCandidateFrontier);
+        recordUnifiedDecision(selected, *augmented, &unifiedCandidateFrontier, &selectorAudit);
         if (!preparedEncoderReady)
         {
             mGlobalEncoderBatchIndices = encoderBatchIndices;
@@ -3269,7 +3281,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     if (selected.key.kind == PhaseGlobalActionKind::kEncoder)
     {
-        static_cast<void>(beginGlobalExecutionLease(selected, &unifiedCandidateFrontier));
+        static_cast<void>(beginGlobalExecutionLease(selected, &unifiedCandidateFrontier, &selectorAudit));
         if (!preparedEncoderReady)
         {
             mGlobalEncoderBatchIndices = encoderBatchIndices;
@@ -3292,7 +3304,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         std::optional<PhaseGlobalActionCandidate>& phase
             = selected.key.kind == PhaseGlobalActionKind::kEncoderPrefill ? prefillForEncoder : decodeForEncoder;
         ELLM_CHECK(phase.has_value(), "Selected encoder overlap has no matching phase action");
-        PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(selected, &unifiedCandidateFrontier);
+        PhaseGlobalDispatchPlan const executionPlan
+            = beginGlobalExecutionLease(selected, &unifiedCandidateFrontier, &selectorAudit);
         if (!preparedEncoderReady)
         {
             mGlobalEncoderBatchIndices = encoderBatchIndices;
@@ -3336,7 +3349,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         return true;
     }
     ++mGlobalPdSelections;
-    PhaseGlobalDispatchPlan const executionPlan = beginGlobalExecutionLease(selected, &unifiedCandidateFrontier);
+    PhaseGlobalDispatchPlan const executionPlan
+        = beginGlobalExecutionLease(selected, &unifiedCandidateFrontier, &selectorAudit);
     PhaseGlobalActionCandidate launched = selected;
     auto const launchedAt = std::chrono::steady_clock::now();
     bool const started

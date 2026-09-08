@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <tuple>
@@ -360,15 +361,18 @@ struct PhaseUnifiedCandidateSnapshot
     std::vector<uint64_t> requestIds;
     double predictedCompletionUs{};
     double uncertaintyUs{};
-    double predictedSloViolationUs{};
+    double predictedSloViolationUs{std::numeric_limits<double>::quiet_NaN()};
     bool scalarDecisionCostKnown{};
     bool contextualScalarAuthorityApplied{};
     double scalarDecisionMakespanUs{};
     std::vector<PhaseProtectedCompletion> scalarProtectedCompletions;
 };
 
+struct PhaseGlobalSelectionAudit;
+
 struct PhaseUnifiedEvent
 {
+    std::shared_ptr<PhaseGlobalSelectionAudit const> selectorAudit;
     uint32_t schemaVersion{kPHASE_UNIFIED_EVENT_SCHEMA_VERSION};
     PhaseUnifiedEventKind kind{PhaseUnifiedEventKind::kDecision};
     uint64_t eventId{};

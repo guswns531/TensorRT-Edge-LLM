@@ -608,7 +608,8 @@ private:
     PhaseExecutionSet observedGlobalExecution() const noexcept;
     void refreshGlobalExecutionLease();
     PhaseGlobalDispatchPlan beginGlobalExecutionLease(PhaseGlobalActionCandidate const& candidate,
-        std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr);
+        std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr,
+        PhaseGlobalSelectionAudit const* selectorAudit = nullptr);
     void validateGlobalExecutionLaunch();
     void abandonGlobalExecutionLease() noexcept;
     void emitCompletedFormationEpisodes();
@@ -632,7 +633,8 @@ private:
     void observeServerCompletion(uint64_t requestId);
     PhaseInFlightSnapshot unifiedInFlightSnapshot(uint64_t hostSnapshotNs = 0U, bool includeRequestIds = true) const;
     void recordUnifiedDecision(PhaseGlobalActionCandidate const& candidate, PhaseGlobalDispatchPlan const& plan,
-        std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr);
+        std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr,
+        PhaseGlobalSelectionAudit const* selectorAudit = nullptr);
     void observeUnifiedInFlightTransitions();
     void emitUnifiedEvent(PhaseUnifiedEvent event);
     void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,

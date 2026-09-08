@@ -765,7 +765,7 @@ public:
         return mConfig.globalDecodeTpotTargetUs;
     }
     //! Preview the best current P/D action without removing queue entries.
-    std::optional<PhaseGlobalActionCandidate> previewGlobalAction();
+    std::optional<PhaseGlobalActionCandidate> previewGlobalAction(PhaseGlobalSelectionAudit* audit = nullptr);
     //! Return the complete immutable P/D frontier captured by the preceding
     //! previewGlobalAction() call. This is telemetry/evaluation evidence only;
     //! the selected action remains owned by the existing queue policy.
@@ -855,7 +855,7 @@ private:
 
     std::optional<GlobalQueueSelection> selectGlobalQueueAction(PhaseQueueSnapshot const& snapshot,
         bool allowPrefill = true, bool allowDecode = true, bool allowOverlap = true,
-        std::optional<PhaseDispatchKind> requiredKind = std::nullopt);
+        std::optional<PhaseDispatchKind> requiredKind = std::nullopt, PhaseGlobalSelectionAudit* audit = nullptr);
     PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
     PhaseDispatchKind legacyQueueDecision(PhaseQueueSnapshot const& snapshot) const;
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;

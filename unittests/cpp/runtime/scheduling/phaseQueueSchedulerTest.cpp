@@ -379,9 +379,13 @@ TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
     scheduler.enqueuePrefill({1, 128});
     scheduler.enqueueDecode({2, 128});
 
-    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+    PhaseGlobalSelectionAudit audit;
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction(&audit);
 
     ASSERT_TRUE(candidate.has_value());
+    ASSERT_TRUE(audit.decision.selectedIndex.has_value());
+    EXPECT_EQ(audit.inputs.at(*audit.decision.selectedIndex).candidateId, candidate->candidateId);
+    EXPECT_EQ(audit.inputs.size(), scheduler.lastGlobalPreviewCandidates().size());
     EXPECT_TRUE(candidate->key.kind == PhaseGlobalActionKind::kPrefill
         || candidate->key.kind == PhaseGlobalActionKind::kDecode);
     EXPECT_NEAR(candidate->predictedHorizonUs, 3280.0, 1.0e-3);

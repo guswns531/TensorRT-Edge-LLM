@@ -999,13 +999,18 @@ bool IndependentPhaseAsyncServer::tryAugmentReadyAction()
     return started;
 }
 
-std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalAction()
+std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalAction(
+    PhaseGlobalSelectionAudit* audit)
 {
+    if (audit != nullptr)
+    {
+        *audit = {};
+    }
     if (mCoordinator.busy())
     {
         return std::nullopt;
     }
-    return mCoordinator.scheduler().previewGlobalAction();
+    return mCoordinator.scheduler().previewGlobalAction(audit);
 }
 
 std::vector<PhaseGlobalActionCandidate> const& IndependentPhaseAsyncServer::lastGlobalPreviewCandidates() const noexcept

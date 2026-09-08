@@ -72,6 +72,17 @@ struct PhaseGlobalCandidateAudit
     double predictedViolationUs{};
     bool frontierEligible{};
     bool dominated{};
+    PhaseGlobalActionKind kind{PhaseGlobalActionKind::kNone};
+    uint32_t violationMask{};
+};
+
+//! Captured at selection; a later dispatch override is not this decision.
+struct PhaseGlobalSelectionAudit
+{
+    std::vector<PhaseGlobalCandidateAudit> inputs;
+    PhaseGlobalDecision decision;
+    std::vector<PhaseGlobalCandidateAudit> pdInputs;
+    PhaseGlobalDecision pdDecision;
 };
 
 //! Profile-free selector shared by text and multimodal request DAGs.

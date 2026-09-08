@@ -2122,11 +2122,13 @@ int main(int argc, char** argv)
                 ? std::getenv("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL")
                 : "full";
             ELLM_CHECK(phaseTelemetryLevel == "full" || phaseTelemetryLevel == "research"
-                    || phaseTelemetryLevel == "counterfactual" || phaseTelemetryLevel == "dispatch",
-                "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL must be full, research, counterfactual, or dispatch");
-            bool const emitPhaseRequestTimeline = emitPhaseMetrics && phaseTelemetryLevel == "full";
-            bool const emitFullUnifiedSnapshots
-                = phaseTelemetryLevel != "research" && phaseTelemetryLevel != "dispatch";
+                    || phaseTelemetryLevel == "counterfactual" || phaseTelemetryLevel == "dispatch"
+                    || phaseTelemetryLevel == "audit",
+                "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL must be full, research, counterfactual, dispatch, or audit");
+            bool const emitPhaseRequestTimeline
+                = emitPhaseMetrics && (phaseTelemetryLevel == "full" || phaseTelemetryLevel == "audit");
+            bool const emitFullUnifiedSnapshots = phaseTelemetryLevel != "research" && phaseTelemetryLevel != "dispatch"
+                && phaseTelemetryLevel != "audit";
             bool const collectPhaseDispatchMetrics
                 = emitPhaseMetrics && (phaseTelemetryLevel == "full" || phaseTelemetryLevel == "dispatch");
             std::string const schedulerRunId = std::getenv("TRT_EDGELLM_PHASE_RUN_ID") != nullptr
@@ -4095,6 +4097,41 @@ int main(int argc, char** argv)
                         {"run_id", schedulerRunId}, {"host_monotonic_ns", event.hostMonotonicNs}};
                     if (event.kind == rt::PhaseUnifiedEventKind::kDecision)
                     {
+                        record["selector_audit"] = nullptr;
+                        if (event.selectorAudit != nullptr)
+                        {
+                            auto const& audit = *event.selectorAudit;
+                            auto auditJson = [](auto const& evaluations, auto const& decision) {
+                                nlohmann::json inputs = nlohmann::json::array();
+                                for (auto const& input : evaluations)
+                                {
+                                    inputs.push_back({{"action_id", input.candidateId},
+                                        {"action_kind", rt::phaseGlobalActionKindName(input.kind)},
+                                        {"hard_feasible", input.hardFeasible},
+                                        {"max_slo_violation_us", input.predictedViolationUs},
+                                        {"violation_mask", input.violationMask},
+                                        {"frontier_eligible", input.frontierEligible}, {"dominated", input.dominated}});
+                                }
+                                constexpr char const* reasons[]{"no_candidate", "no_hard_feasible_candidate",
+                                    "deadline_safe_efficiency", "bounded_exploration", "minimum_violation",
+                                    "all_late_efficiency_recovery"};
+                                nlohmann::json selectedId = nullptr;
+                                if (decision.selectedIndex.has_value())
+                                {
+                                    selectedId = evaluations.at(*decision.selectedIndex).candidateId;
+                                }
+                                return nlohmann::json{{"inputs", std::move(inputs)}, {"selected_action_id", selectedId},
+                                    {"reason", reasons[static_cast<size_t>(decision.reason)]},
+                                    {"selected_violation_us", decision.predictedViolationUs}};
+                            };
+                            record["selector_audit"] = auditJson(audit.inputs, audit.decision);
+                            record["selector_audit"]["post_select_override"]
+                                = record["selector_audit"]["selected_action_id"]
+                                != nlohmann::json(event.selectedActionId);
+                            record["pd_selector_audit"] = audit.pdInputs.empty()
+                                ? nlohmann::json(nullptr)
+                                : auditJson(audit.pdInputs, audit.pdDecision);
+                        }
                         nlohmann::json inflight = nlohmann::json::array();
                         for (rt::PhaseInFlightWorkSnapshot const& work : event.inFlight.work)
                         {
