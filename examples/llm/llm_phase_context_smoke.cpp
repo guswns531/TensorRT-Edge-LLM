@@ -1278,6 +1278,8 @@ int main(int argc, char** argv)
         char const* const diagnosticLogitDir = std::getenv("TRT_EDGELLM_DIAGNOSTIC_LOGIT_DIR");
         uint64_t diagnosticRequestId{};
         bool diagnosticMeasurement{};
+        bool diagnosticVisionDumped{};
+        bool const diagnosticInputs = std::getenv("TRT_EDGELLM_DIAGNOSTIC_VISION_INPUTS") != nullptr;
         if (diagnosticLogitDir != nullptr)
         {
             char const* const request = std::getenv("TRT_EDGELLM_DIAGNOSTIC_REQUEST_ID");
@@ -1346,6 +1348,54 @@ int main(int argc, char** argv)
                     {
                         visionViews.push_back(&view);
                     }
+                }
+            }
+            if (diagnosticInputs && diagnosticLogitDir != nullptr && diagnosticMeasurement && !diagnosticVisionDumped)
+            {
+                for (auto const* view : visionViews)
+                {
+                    if (view->requestId != diagnosticRequestId)
+                    {
+                        continue;
+                    }
+                    auto dump = [&](rt::Tensor const& tensor, std::string const& label) {
+                        size_t const bytes = tensor.getShape().volume() * rt::utils::getTypeSize(tensor.getDataType());
+                        rt::Tensor host({static_cast<int64_t>(bytes)}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT8,
+                            "diagnostic_vision_payload");
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            host.rawPointer(), tensor.rawPointer(), bytes, cudaMemcpyDeviceToHost, stream));
+                        // Diagnostic-only host read; the request still owns the source payload.
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        auto const path = std::filesystem::path(diagnosticLogitDir)
+                            / ("request-" + std::to_string(view->requestId) + "-" + label + ".fp16");
+                        ELLM_CHECK(tensor.getDataType() == nvinfer1::DataType::kHALF,
+                            "Vision diagnostic requires FP16 payloads");
+                        std::ofstream file(path, std::ios::binary);
+                        file.write(static_cast<char const*>(host.rawPointer()), static_cast<std::streamsize>(bytes));
+                        ELLM_CHECK(file.good(), "Cannot write vision diagnostic payload");
+                    };
+                    if (char const* replay = std::getenv("TRT_EDGELLM_DIAGNOSTIC_REPLAY_VISION_EMBEDDING"))
+                    {
+                        rt::Tensor& embedding = view->visionPayload->outputEmbedding;
+                        size_t const bytes
+                            = embedding.getShape().volume() * rt::utils::getTypeSize(embedding.getDataType());
+                        ELLM_CHECK(std::filesystem::file_size(replay) == bytes, "Diagnostic replay size mismatch");
+                        rt::Tensor host({static_cast<int64_t>(bytes)}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT8,
+                            "diagnostic_vision_replay");
+                        std::ifstream file(replay, std::ios::binary);
+                        file.read(static_cast<char*>(host.rawPointer()), static_cast<std::streamsize>(bytes));
+                        ELLM_CHECK(file.good(), "Cannot read diagnostic vision replay");
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            embedding.rawPointer(), host.rawPointer(), bytes, cudaMemcpyHostToDevice, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                    }
+                    dump(view->visionPayload->outputEmbedding, "encoder-embedding");
+                    for (size_t index{}; index < view->visionPayload->deepstackFeatures.size(); ++index)
+                    {
+                        dump(view->visionPayload->deepstackFeatures[index],
+                            "encoder-deepstack-" + std::to_string(index));
+                    }
+                    diagnosticVisionDumped = true;
                 }
             }
             auto makeFeatureView = [&](rt::Tensor& feature, int64_t imageOffset, int64_t imageTokens,
@@ -3331,6 +3381,7 @@ int main(int argc, char** argv)
                             }
                             ++measurementEpoch;
                             diagnosticMeasurement = diagnosticLogitDir != nullptr;
+                            diagnosticVisionDumped = false;
                             if (ipcThreePhase != nullptr)
                             {
                                 ipcThreePhase->resetGlobalDecisionCostTelemetry();
