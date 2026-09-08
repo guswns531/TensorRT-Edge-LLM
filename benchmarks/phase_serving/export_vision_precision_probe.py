@@ -25,6 +25,40 @@ import shutil
 import onnx
 
 
+def restore_exact_merger_gelu(model):
+    """Match checkpoint merger GELU without changing the vision block MLPs."""
+    nodes = list(model.graph.node)
+    targets = []
+    for index, node in enumerate(nodes):
+        if node.op_type != 'Gemm' or len(node.input) < 2:
+            continue
+        weight = node.input[1]
+        if not (weight.startswith('merger.')
+                or weight.startswith('deepstack_merger_list.')):
+            continue
+        if not weight.endswith('.linear_fc1.weight'):
+            continue
+        if index + 2 >= len(nodes):
+            raise ValueError('Incomplete merger')
+        activation, output = nodes[index + 1:index + 3]
+        if (activation.op_type != 'Gelu'
+                or list(activation.input) != [node.output[0]]
+                or output.op_type != 'Gemm' or len(output.input) < 2
+                or output.input[0] != activation.output[0] or output.input[1]
+                != weight.replace('.linear_fc1.', '.linear_fc2.')):
+            raise ValueError('Unsupported merger GELU topology')
+        targets.append(activation)
+    if not targets:
+        raise ValueError('No merger GELU nodes')
+    for node in targets:
+        retained = [a for a in node.attribute if a.name != 'approximate']
+        del node.attribute[:]
+        node.attribute.extend(retained)
+        node.attribute.append(onnx.helper.make_attribute(
+            'approximate', 'none'))
+    return len(targets)
+
+
 def upcast_final_merger(model):
     """Keep the public FP16 output while computing the two merger GEMMs in FP32."""
     nodes = list(model.graph.node)
@@ -128,6 +162,7 @@ def main():
     parser.add_argument('--output-dir', type=pathlib.Path, required=True)
     parser.add_argument('--merger-fp32', action='store_true')
     parser.add_argument('--externalize-norms', action='store_true')
+    parser.add_argument('--exact-merger-gelu', action='store_true')
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     path = args.onnx_dir / 'model.onnx'
@@ -136,6 +171,8 @@ def main():
     count = externalize(model, config, args.externalize_norms)
     onnx.external_data_helper.load_external_data_for_model(
         model, str(args.onnx_dir))
+    exact_mergers = restore_exact_merger_gelu(
+        model) if args.exact_merger_gelu else 0
     if args.merger_fp32:
         upcast_final_merger(model)
     onnx.checker.check_model(model)
@@ -152,6 +189,7 @@ def main():
                 'checkpoint_config': str(args.checkpoint_config.resolve()),
                 'merger_fp32': args.merger_fp32,
                 'externalize_norms': args.externalize_norms,
+                'exact_merger_gelu_count': exact_mergers,
                 'external_weight_count': count,
                 'experimental_only': True,
             },

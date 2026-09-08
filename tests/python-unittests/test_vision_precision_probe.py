@@ -27,6 +27,30 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_exact_mergers_preserve_mlp_activation():
+    nodes = []
+    for index, prefix in enumerate(
+        ['blocks.0.mlp', 'deepstack_merger_list.0', 'merger']):
+        hidden, activated = f'h{index}', f'g{index}'
+        nodes.extend([
+            onnx.helper.make_node('Gemm', ['x', prefix + '.linear_fc1.weight'],
+                                  [hidden]),
+            onnx.helper.make_node('Gelu', [hidden], [activated],
+                                  approximate='tanh'),
+            onnx.helper.make_node('Gemm',
+                                  [activated, prefix + '.linear_fc2.weight'],
+                                  [f'y{index}'])
+        ])
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(nodes, 'mergers', [], []))
+    assert MODULE.restore_exact_merger_gelu(model) == 2
+    assert [n.attribute[0].s for n in model.graph.node
+            if n.op_type == 'Gelu'] == [b'tanh', b'none', b'none']
+    model.graph.node[-2].input[0] = 'wrong'
+    with pytest.raises(ValueError, match='topology'):
+        MODULE.restore_exact_merger_gelu(model)
+
+
 def test_merger_interface_and_casts():
     inputs = [
         'x', 'merger.linear_fc1.weight', 'b1', 'merger.linear_fc2.weight', 'b2'
