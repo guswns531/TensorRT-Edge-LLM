@@ -1703,7 +1703,7 @@ int main(int argc, char** argv)
             serverConfig.maxDecodeGraphs = static_cast<size_t>(std::stoul(value));
         }
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
-        serverConfig.allowChunkedVisionPrefill = config.packedPrefill;
+        serverConfig.allowChunkedVisionPrefill = config.packedPrefill && !config.hasVisionPrefillProfile();
         serverConfig.releaseVisionPrefillStorage = std::getenv("TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE") != nullptr;
         serverConfig.maxPendingRequests = 1024;
         serverConfig.enableGlobalWaitActions

@@ -2186,12 +2186,9 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     overlap.overlapCostProfitable = overlapProfitable;
     overlap.safeProbeEligible = safeProbe;
     PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
-    bool const externalPrefillLineage
-        = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
     bool const producerCriticalPath = phaseContextualPdProducerCriticalPath(
-        !mPending.empty() || !mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid(),
-        externalPrefillLineage);
-    if (contextualMode != PhaseContextualPdMode::kDisabled && !externalPrefillLineage)
+        !mPending.empty() || !mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid(), false);
+    if (contextualMode != PhaseContextualPdMode::kDisabled)
     {
         PhaseContextualPdInput contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
             protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
