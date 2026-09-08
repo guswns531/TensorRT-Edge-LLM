@@ -707,6 +707,7 @@ int main(int argc, char** argv)
     std::filesystem::path const engineDir{argv[1]};
     std::string const checkpointDir = argc == kMAX_ARGUMENTS ? argv[2] : "";
     rt::LLMEngineConfig const config = rt::parseEngineConfig(engineDir / "config.json");
+    char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
 
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
@@ -742,7 +743,8 @@ int main(int argc, char** argv)
         rt::IndependentEngineExecutorPairConfig pairConfig;
         pairConfig.visionPrefillProfile = config.visionPrefillProfile;
         pairConfig.dedicatedExternalPrefillContext
-            = std::getenv("TRT_EDGELLM_DEDICATED_EXTERNAL_PREFILL_CONTEXT") != nullptr;
+            = std::getenv("TRT_EDGELLM_DEDICATED_EXTERNAL_PREFILL_CONTEXT") != nullptr
+            || (visionEngineDir != nullptr && config.packedPrefill && config.visionPrefillProfile < 0);
         pairConfig.setupStream = setupStream;
         pairConfig.prefillStream = prefillStream;
         pairConfig.decodeStream = decodeStream;
@@ -1832,7 +1834,6 @@ int main(int argc, char** argv)
         }
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
-        char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
         char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
         char const* encoderCalibrationImage = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE");
         int32_t visionRunnerBatchSize = config.maxSupportedBatchSize;

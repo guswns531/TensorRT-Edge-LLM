@@ -240,6 +240,8 @@ public:
         pairConfig.decodeStream = mDecodeStream;
         pairConfig.visionPrefillProfile = engineConfig.visionPrefillProfile;
         pairConfig.sharedExecutionContext = mServingConfig.sharedExecutionContext;
+        pairConfig.dedicatedExternalPrefillContext
+            = mVisionRunner != nullptr && engineConfig.packedPrefill && engineConfig.visionPrefillProfile < 0;
         mExecutors = IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
         int32_t decodeBatchCapacity = engineConfig.maxSupportedDecodeBatchSize;
         size_t exclusiveEncoderInputTokenThreshold{};

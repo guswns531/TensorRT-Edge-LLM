@@ -159,6 +159,10 @@ public:
     bool bindExternalOutputStorage(
         rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
 
+    int64_t estimateInputTokens(rt::LLMGenerationRequest const& request) override;
+    int64_t estimateOutputTokens(rt::LLMGenerationRequest const& request) override;
+    int64_t maxInputTokens() const noexcept override;
+
     //! \brief Get MRoPE rope deltas for each batch from the last preprocess/infer run.
     //! \return Vector of length (batch size): delta = maxMropePositionId + 1 - inputIdSize per batch; empty if not yet
     //! set.

@@ -245,6 +245,10 @@ size    3,081,676,788 bytes
 SHA256  50493717b98f2c3b7dcbac4bb41b5bc395bd70ecfa5f9c5f577bdd20de49dad1
 ```
 
+This plan was superseded by the shared-P128 engine documented in note 242 and
+was removed from `.local` after that engine passed the 12-workload gate. The
+hash and retained raw measurements above remain the reproducibility identity.
+
 ## 8. Policy evaluation
 
 The same-engine independent E/P/D V0/V1/V2 12-workload replay and selected

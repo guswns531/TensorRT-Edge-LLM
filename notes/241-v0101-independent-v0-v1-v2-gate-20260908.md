@@ -50,6 +50,10 @@ size    3,081,676,788 bytes
 SHA256  50493717b98f2c3b7dcbac4bb41b5bc395bd70ecfa5f9c5f577bdd20de49dad1
 ```
 
+This dedicated-P1024 plan was superseded by the shared-P128 engine in note 242
+and removed after the replacement passed the same 12-workload gate. The raw
+results and engine hash remain retained as the reproducibility record.
+
 Raw retained results:
 
 ```text

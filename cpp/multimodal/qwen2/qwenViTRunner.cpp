@@ -308,6 +308,33 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     return true;
 }
 
+int64_t QwenViTRunner::estimateInputTokens(rt::LLMGenerationRequest const& request)
+{
+    int64_t totalTokens{};
+    for (auto const& logicalRequest : request.requests)
+    {
+        for (auto const& image : logicalRequest.imageBuffers)
+        {
+            bool const isVideo = image.frames > 1;
+            auto const [height, width] = getResizedImageSize(image.frames, isVideo, image.height, image.width);
+            int64_t const gridT = (image.frames + mConfig.temporalPatchSize - 1) / mConfig.temporalPatchSize;
+            totalTokens += gridT * (height / mConfig.patchSize) * (width / mConfig.patchSize);
+        }
+    }
+    return totalTokens;
+}
+
+int64_t QwenViTRunner::estimateOutputTokens(rt::LLMGenerationRequest const& request)
+{
+    int64_t const inputTokens = estimateInputTokens(request);
+    return inputTokens / (mConfig.mergeSize * mConfig.mergeSize);
+}
+
+int64_t QwenViTRunner::maxInputTokens() const noexcept
+{
+    return mConfig.maxHW;
+}
+
 std::tuple<int64_t, int64_t> QwenViTRunner::computeVisionSpans(
     rt::imageUtils::ImageData const& image, int64_t patchBase, std::vector<VisionSpan>& spans)
 {
