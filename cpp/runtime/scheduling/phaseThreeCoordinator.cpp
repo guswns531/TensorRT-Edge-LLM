@@ -2952,7 +2952,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
     }
 
-    PhaseGlobalDecision const myopicDecision = mGlobalScheduler.select(candidates);
+    PhaseGlobalSelectionAudit selectorAudit;
+    PhaseGlobalDecision const myopicDecision
+        = mGlobalScheduler.select(candidates, mUnifiedEventCallback ? &selectorAudit.inputs : nullptr);
     mLastGlobalFormationPredictedRows = 0U;
     mLastGlobalFormationHorizonUs = 0.0;
     mLastGlobalFormationCostGapUs = 0.0;
@@ -3054,9 +3056,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     ++mGlobalDecisionSequence;
-    PhaseGlobalSelectionAudit selectorAudit;
-    PhaseGlobalDecision const decision
-        = mGlobalScheduler.select(candidates, mUnifiedEventCallback ? &selectorAudit.inputs : nullptr);
+    PhaseGlobalDecision const decision = formationEvaluated
+        ? mGlobalScheduler.select(candidates, mUnifiedEventCallback ? &selectorAudit.inputs : nullptr)
+        : myopicDecision;
     selectorAudit.decision = decision;
     selectorAudit.pdInputs = std::move(pdAudit.inputs);
     selectorAudit.pdDecision = pdAudit.decision;

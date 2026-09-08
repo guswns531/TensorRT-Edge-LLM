@@ -386,6 +386,11 @@ TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
     ASSERT_TRUE(audit.decision.selectedIndex.has_value());
     EXPECT_EQ(audit.inputs.at(*audit.decision.selectedIndex).candidateId, candidate->candidateId);
     EXPECT_EQ(audit.inputs.size(), scheduler.lastGlobalPreviewCandidates().size());
+    auto const& retained = scheduler.lastGlobalPreviewCandidates().at(*audit.decision.selectedIndex);
+    EXPECT_EQ(retained.candidateId, candidate->candidateId);
+    EXPECT_EQ(retained.primaryRequestIds, candidate->primaryRequestIds);
+    EXPECT_EQ(retained.primaryStableSlotIds, candidate->primaryStableSlotIds);
+    EXPECT_FALSE(retained.requestIds.empty());
     EXPECT_TRUE(candidate->key.kind == PhaseGlobalActionKind::kPrefill
         || candidate->key.kind == PhaseGlobalActionKind::kDecode);
     EXPECT_NEAR(candidate->predictedHorizonUs, 3280.0, 1.0e-3);

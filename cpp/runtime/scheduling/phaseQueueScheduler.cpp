@@ -2345,7 +2345,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         ++mTelemetry.globalNoFeasibleDecisionCount;
         return std::nullopt;
     }
-    PhaseGlobalActionCandidate const selected = candidates[*decision.selectedIndex];
+    PhaseGlobalActionCandidate const& selected = candidates[*decision.selectedIndex];
     if (prefillFormation.has_value() && selected.key.kind == PhaseGlobalActionKind::kDecode)
     {
         ++mTelemetry.globalPrefillFormationDecodeSelectionCount;
@@ -2652,11 +2652,12 @@ std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalActi
         *audit = {};
     }
     PhaseQueueSnapshot const state = snapshot();
-    std::optional<GlobalQueueSelection> const selection
+    std::optional<GlobalQueueSelection> selection
         = selectGlobalQueueAction(state, true, true, true, std::nullopt, audit);
     mLastGlobalPreviewCandidates
-        = selection.has_value() ? selection->candidateFrontier : std::vector<PhaseGlobalActionCandidate>{};
-    return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
+        = selection.has_value() ? std::move(selection->candidateFrontier) : std::vector<PhaseGlobalActionCandidate>{};
+    return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(std::move(selection->candidate))
+                                 : std::nullopt;
 }
 
 std::vector<PhaseGlobalActionCandidate> const& PhaseQueueScheduler::lastGlobalPreviewCandidates() const noexcept
