@@ -2,6 +2,12 @@
 
 Date: 2026-09-08. Development branch: `codex/v0101-phase-forward-port`.
 
+**Comparison-contract follow-up:** [note 244](244-v010-v0101-detailed-regression-audit-20260908.md)
+audits the raw artifacts. Frozen vLLM uses client max-in-flight 80 versus phase HTTP 64 in four text workloads;
+the comparison is not equal-admission. Both old/current full12 phase runs have zero P/D graph captures/hits.
+The recorded TTFT/E2E exclude client concurrency wait; note 244 adds arrival-relative metrics and request-level
+cross-engine token comparisons. These qualifications supersede any broader same-contract interpretation below.
+
 ## 결론과 상태
 
 이번 수정은 새 scheduler가 아니라 forward-port에서 달라진 실행 경로 두 곳을 복원한다. 전용 vision-P profile이 있는 엔진에서는 external prefill을 atomic하게 처리하고, residual P+D 경로에서 external lineage만으로 Scalar 평가를 제외하지 않는다. KV allocator/pool/precision은 변경하지 않았다.
