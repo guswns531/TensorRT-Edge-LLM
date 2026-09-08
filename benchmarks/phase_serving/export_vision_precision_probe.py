@@ -19,14 +19,15 @@ import ast
 import copy
 import hashlib
 import json
+import math
 import pathlib
 import shutil
 
 import onnx
 
 
-def restore_exact_merger_gelu(model):
-    """Match checkpoint merger GELU without changing the vision block MLPs."""
+def merger_gelu_nodes(model):
+    """Validate and locate the checkpoint merger activation chains."""
     nodes = list(model.graph.node)
     targets = []
     for index, node in enumerate(nodes):
@@ -50,12 +51,69 @@ def restore_exact_merger_gelu(model):
         targets.append(activation)
     if not targets:
         raise ValueError('No merger GELU nodes')
+    return targets
+
+
+def restore_exact_merger_gelu(model):
+    """Match checkpoint merger GELU without changing the vision block MLPs."""
+    targets = merger_gelu_nodes(model)
     for node in targets:
         retained = [a for a in node.attribute if a.name != 'approximate']
         del node.attribute[:]
         node.attribute.extend(retained)
         node.attribute.append(onnx.helper.make_attribute(
             'approximate', 'none'))
+    return len(targets)
+
+
+def decompose_merger_gelu(model):
+    """Use the direct builder's FP32 erf arithmetic with FP16 merger boundaries."""
+    targets = {node.output[0] for node in merger_gelu_nodes(model)}
+    used = {
+        name
+        for node in model.graph.node
+        for name in (*node.input, *node.output)
+    }
+    used.update(tensor.name for tensor in model.graph.initializer)
+    rewritten = []
+    for node in model.graph.node:
+        if node.op_type != 'Gelu' or node.output[0] not in targets:
+            rewritten.append(node)
+            continue
+        prefix = node.output[0] + '_exact_erf_'
+        names = {
+            key: prefix + key
+            for key in ('x32', 'sqrt2', 'one', 'half', 'scaled', 'erf', 'sum',
+                        'factor', 'result')
+        }
+        if used.intersection(names.values()):
+            raise ValueError('Merger erf tensor name collision')
+        used.update(names.values())
+        for key, value in [('sqrt2', math.sqrt(2.0)), ('one', 1.0),
+                           ('half', 0.5)]:
+            model.graph.initializer.append(
+                onnx.helper.make_tensor(names[key], onnx.TensorProto.FLOAT,
+                                        [1, 1], [value]))
+        rewritten.append(
+            onnx.helper.make_node('Cast', [node.input[0]], [names['x32']],
+                                  name=names['x32'],
+                                  to=onnx.TensorProto.FLOAT))
+        for op, inputs, output in [('Div', ['x32', 'sqrt2'], 'scaled'),
+                                   ('Erf', ['scaled'], 'erf'),
+                                   ('Add', ['one', 'erf'], 'sum'),
+                                   ('Mul', ['sum', 'half'], 'factor'),
+                                   ('Mul', ['x32', 'factor'], 'result')]:
+            rewritten.append(
+                onnx.helper.make_node(op, [names[key] for key in inputs],
+                                      [names[output]],
+                                      name=names[output]))
+        rewritten.append(
+            onnx.helper.make_node('Cast', [names['result']],
+                                  list(node.output),
+                                  name=prefix + 'fp16',
+                                  to=onnx.TensorProto.FLOAT16))
+    del model.graph.node[:]
+    model.graph.node.extend(rewritten)
     return len(targets)
 
 
@@ -163,7 +221,10 @@ def main():
     parser.add_argument('--merger-fp32', action='store_true')
     parser.add_argument('--externalize-norms', action='store_true')
     parser.add_argument('--exact-merger-gelu', action='store_true')
+    parser.add_argument('--merger-erf-fp32', action='store_true')
     args = parser.parse_args()
+    if args.merger_erf_fp32 and args.merger_fp32:
+        parser.error('--merger-erf-fp32 requires FP16 GEMM boundaries')
     args.output_dir.mkdir(parents=True, exist_ok=False)
     path = args.onnx_dir / 'model.onnx'
     model = onnx.load(path, load_external_data=False)
@@ -175,6 +236,7 @@ def main():
         model) if args.exact_merger_gelu else 0
     if args.merger_fp32:
         upcast_final_merger(model)
+    erf_mergers = decompose_merger_gelu(model) if args.merger_erf_fp32 else 0
     onnx.checker.check_model(model)
     onnx.save(model, args.output_dir / 'model.onnx')
     (args.output_dir / 'config.json').write_text(json.dumps(config, indent=2))
@@ -190,6 +252,7 @@ def main():
                 'merger_fp32': args.merger_fp32,
                 'externalize_norms': args.externalize_norms,
                 'exact_merger_gelu_count': exact_mergers,
+                'erf_fp32_merger_count': erf_mergers,
                 'external_weight_count': count,
                 'experimental_only': True,
             },

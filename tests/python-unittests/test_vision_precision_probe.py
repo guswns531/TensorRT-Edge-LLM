@@ -16,7 +16,9 @@
 import importlib.util
 from pathlib import Path
 
+import numpy as np
 import onnx
+import onnx.reference
 import pytest
 
 SPEC = importlib.util.spec_from_file_location(
@@ -25,6 +27,50 @@ SPEC = importlib.util.spec_from_file_location(
     'benchmarks/phase_serving/export_vision_precision_probe.py')
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+def test_erf_merger_reference_and_fp16_interface():
+    tensors = [
+        onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT16,
+                                           [2, 2]) for name in
+        ['x', 'merger.linear_fc1.weight', 'merger.linear_fc2.weight']
+    ]
+    nodes = [
+        onnx.helper.make_node('Gemm', ['x', 'merger.linear_fc1.weight'],
+                              ['h']),
+        onnx.helper.make_node('Gelu', ['h'], ['g'], approximate='tanh'),
+        onnx.helper.make_node('Gemm', ['g', 'merger.linear_fc2.weight'],
+                              ['output'])
+    ]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(nodes, 'erf', tensors, [
+            onnx.helper.make_tensor_value_info(
+                'output', onnx.TensorProto.FLOAT16, [2, 2])
+        ]),
+        opset_imports=[onnx.helper.make_opsetid('', 20)])
+    assert MODULE.decompose_merger_gelu(model) == 1
+    onnx.checker.check_model(model)
+    inferred = onnx.shape_inference.infer_shapes(model, check_type=True)
+    types = {
+        value.name: value.type.tensor_type.elem_type
+        for value in inferred.graph.value_info
+    }
+    assert types['g'] == onnx.TensorProto.FLOAT16
+    assert types['g_exact_erf_result'] == onnx.TensorProto.FLOAT
+    x = np.array([[-2.0, -0.7], [0.4, 1.9]], dtype=np.float16)
+    actual = onnx.reference.ReferenceEvaluator(model).run(
+        None, {
+            'x': x,
+            'merger.linear_fc1.weight': np.eye(2, dtype=np.float16),
+            'merger.linear_fc2.weight': np.eye(2, dtype=np.float16)
+        })[0]
+    reference = np.array([[
+        float(v) * 0.5 *
+        (1.0 + MODULE.math.erf(float(v) / MODULE.math.sqrt(2.0))) for v in row
+    ] for row in x],
+                         dtype=np.float16)
+    np.testing.assert_array_equal(actual, reference)
+    assert sum(node.op_type == 'Erf' for node in model.graph.node) == 1
 
 
 def test_exact_mergers_preserve_mlp_activation():
