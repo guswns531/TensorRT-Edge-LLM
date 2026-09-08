@@ -1114,6 +1114,7 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.memoryDrainPreferenceTransitions = mServer.drainPreferenceTransitionCount();
     result.memoryDrainPreferenceAppliedDispatches = mServer.drainPreferenceAppliedDispatchCount();
     result.exclusiveEncoderBatches = mExclusiveEncoderBatches;
+    result.unknownPayloadBootstrapSelections = mUnknownPayloadBootstrapSelections;
     result.exclusiveEncoderPrefillDeferrals = mExclusiveEncoderPrefillDeferrals;
     result.globalDecisions = mGlobalDecisions;
     result.globalEncoderSelections = mGlobalEncoderSelections;
@@ -3893,6 +3894,7 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
         [&](size_t index) { return mPending[index].estimatedPayloadBytes == 0U; });
     if (mEstimatedEncodedBytes == 0U && containsUnmeasuredPayload && batchIndices.size() > 1U)
     {
+        ++mUnknownPayloadBootstrapSelections;
         batchIndices.resize(1U);
     }
     size_t batchSize = batchIndices.size();

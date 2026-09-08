@@ -24,8 +24,11 @@
 #include "common/trtUtils.h"
 #include "runtime/exec/registryBuilder.h"
 #include <algorithm>
+#include <cstdlib>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
 
 namespace trt_edgellm
 {
@@ -140,6 +143,9 @@ private:
     std::unordered_map<size_t, CapturedGraph> mGraphs;
     GraphCacheStats mGraphCacheStats;
     uint64_t mGraphUseSequence{};
+    bool const mTraceGraphBindings{std::getenv("TRT_EDGELLM_TRACE_GRAPH_BINDINGS") != nullptr};
+    std::unordered_set<size_t> mTracedGraphBindings;
+    void traceGraphBindings(size_t hash, bool captured);
 
     //! Hash the current binding addresses and shapes into a single key.
     size_t computeBindingHash() const;
@@ -355,6 +361,10 @@ bool TrtEngineExecutor::execute(cudaStream_t stream)
     }
 
     ++mGraphCacheStats.misses;
+    if (mTraceGraphBindings)
+    {
+        traceGraphBindings(hash, false);
+    }
     return mContext->enqueueV3(stream);
 }
 
@@ -399,6 +409,10 @@ bool TrtEngineExecutor::captureGraph(cudaStream_t stream)
     cg.lastUsed = ++mGraphUseSequence;
     mGraphs[hash] = cg;
     ++mGraphCacheStats.captures;
+    if (mTraceGraphBindings)
+    {
+        traceGraphBindings(hash, true);
+    }
 
     LOG_INFO("captured graph (hash=0x%zx)", hash);
     return true;
@@ -540,6 +554,30 @@ bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) con
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+void TrtEngineExecutor::traceGraphBindings(size_t hash, bool captured)
+{
+    constexpr size_t kMAX_TRACES{128};
+    if (!captured && (mTracedGraphBindings.size() >= kMAX_TRACES || !mTracedGraphBindings.insert(hash).second))
+    {
+        return;
+    }
+    BindingSnapshot const snapshot = snapshotBindings();
+    std::ostringstream fields;
+    for (size_t index{}; index < snapshot.bindings.size(); ++index)
+    {
+        auto const& binding = snapshot.bindings[index];
+        fields << ' ' << mEngineState->engine->getIOTensorName(static_cast<int32_t>(index)) << '@' << binding.first
+               << '[';
+        for (int32_t dimension{}; dimension < binding.second.nbDims; ++dimension)
+        {
+            fields << (dimension == 0 ? "" : ",") << binding.second.d[dimension];
+        }
+        fields << ']';
+    }
+    LOG_INFO("Graph bindings: context=%p captured=%d profile=%d hash=%zu%s", static_cast<void*>(mContext.get()),
+        captured ? 1 : 0, snapshot.profileIndex, hash, fields.str().c_str());
+}
 
 size_t TrtEngineExecutor::computeBindingHash() const
 {

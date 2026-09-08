@@ -292,6 +292,7 @@ struct PhaseThreeCoordinatorMetrics
     size_t memoryDrainPreferenceTransitions{};
     size_t memoryDrainPreferenceAppliedDispatches{};
     size_t exclusiveEncoderBatches{};
+    size_t unknownPayloadBootstrapSelections{};
     size_t exclusiveEncoderPrefillDeferrals{};
     size_t globalDecisions{};
     size_t globalEncoderSelections{};
@@ -777,6 +778,7 @@ private:
     double mMaxEncoderPreparationUs{};
     std::chrono::steady_clock::time_point mEncoderPreparationStartedAt;
     size_t mExclusiveEncoderBatches{};
+    size_t mUnknownPayloadBootstrapSelections{};
     size_t mExclusiveEncoderPrefillDeferrals{};
     bool mExclusiveEncoderPrefillInFlight{};
     bool mExclusiveEncoderDecodeInFlight{};

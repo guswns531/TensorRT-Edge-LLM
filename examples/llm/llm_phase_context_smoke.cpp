@@ -379,9 +379,14 @@ class SamplingSlotPool
 public:
     struct Slot
     {
-        explicit Slot(int32_t maxRows)
+        explicit Slot(int32_t maxRows, int32_t diagnosticVocab = 0)
             : hostIds({maxRows}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "phase_sampling_host_ids")
         {
+            if (diagnosticVocab > 0)
+            {
+                diagnosticLogits = std::make_unique<rt::Tensor>(rt::Coords{diagnosticVocab}, rt::DeviceType::kCPU,
+                    nvinfer1::DataType::kFLOAT, "phase_diagnostic_logits");
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
         }
 
@@ -394,13 +399,20 @@ public:
         }
 
         rt::Tensor hostIds;
+        std::unique_ptr<rt::Tensor> diagnosticLogits;
         cudaEvent_t ready{};
         bool busy{};
     };
 
-    explicit SamplingSlotPool(int32_t maxRows)
+    explicit SamplingSlotPool(int32_t maxRows, int32_t diagnosticVocab = 0)
         : mMaxRows(maxRows)
+        , mDiagnosticVocab(diagnosticVocab)
     {
+        if (diagnosticVocab > 0)
+        {
+            mSlots.push_back(std::make_unique<Slot>(mMaxRows, mDiagnosticVocab));
+            mSlots.push_back(std::make_unique<Slot>(mMaxRows, mDiagnosticVocab));
+        }
     }
 
     Slot& acquire()
@@ -414,7 +426,7 @@ public:
                 return *slot;
             }
         }
-        mSlots.push_back(std::make_unique<Slot>(mMaxRows));
+        mSlots.push_back(std::make_unique<Slot>(mMaxRows, mDiagnosticVocab));
         mSlots.back()->busy = true;
         return *mSlots.back();
     }
@@ -436,6 +448,7 @@ public:
 
 private:
     int32_t mMaxRows{};
+    int32_t mDiagnosticVocab{};
     std::vector<std::unique_ptr<Slot>> mSlots;
     size_t mReuseCount{};
 };
@@ -815,6 +828,12 @@ int main(int argc, char** argv)
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, phaseConfig, 0);
         rt::buildTensorMap(decodeMap, *decodeIO, *resources, phaseConfig, 0);
+        // The shared zero binding covers decode rows, not packed prefill tokens.
+        for (size_t index{}; index < prefillIO->deepstackEmbeds.size(); ++index)
+        {
+            prefillMap.set(binding_names::formatDeepstackEmbedsName(static_cast<int32_t>(index)),
+                prefillIO->deepstackEmbeds[index]);
+        }
         resources->externalWeightManager->validateAgainstEngine(pair->prefillExecutor(), "base");
         resources->externalWeightManager->registerTensorMapEntries({&prefillMap, &decodeMap});
 
@@ -1256,7 +1275,17 @@ int main(int argc, char** argv)
             "semantic_phase_decode_selected_ids");
         rt::Tensor prefillCompactedLogits({config.maxSupportedPrefillBatchSize, config.outputVocabSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "semantic_phase_prefill_compacted_logits");
-        SamplingSlotPool samplingSlotPool(maxPhaseBatch);
+        char const* const diagnosticLogitDir = std::getenv("TRT_EDGELLM_DIAGNOSTIC_LOGIT_DIR");
+        uint64_t diagnosticRequestId{};
+        bool diagnosticMeasurement{};
+        if (diagnosticLogitDir != nullptr)
+        {
+            char const* const request = std::getenv("TRT_EDGELLM_DIAGNOSTIC_REQUEST_ID");
+            ELLM_CHECK(request != nullptr, "Logit diagnostics require one explicit request ID");
+            diagnosticRequestId = std::stoull(request);
+            std::filesystem::create_directories(diagnosticLogitDir);
+        }
+        SamplingSlotPool samplingSlotPool(maxPhaseBatch, diagnosticLogitDir != nullptr ? config.outputVocabSize : 0);
         std::vector<uint64_t> lastDecodeSampleRequestIds;
         size_t tokenH2DOperations{};
         size_t tokenH2DBytes{};
@@ -1550,6 +1579,31 @@ int main(int argc, char** argv)
                 samplingLogits = &prefillCompactedLogits;
             }
             selectArgmax(*samplingLogits, selectedIds, stream);
+            std::optional<nlohmann::json> diagnosticMetadata;
+            if (diagnosticLogitDir != nullptr && diagnosticMeasurement)
+            {
+                for (size_t row{}; row < views.size(); ++row)
+                {
+                    auto const& view = views[row];
+                    if (view.requestId != diagnosticRequestId || view.generatedTokens->size() >= 64U)
+                    {
+                        continue;
+                    }
+                    size_t const bytes = static_cast<size_t>(config.outputVocabSize) * sizeof(float);
+                    auto const* source = static_cast<std::byte const*>(samplingLogits->rawPointer());
+                    CUDA_CHECK(cudaMemcpyAsync(slot.diagnosticLogits->rawPointer(), source + row * bytes, bytes,
+                        cudaMemcpyDeviceToHost, stream));
+                    std::vector<uint64_t> members;
+                    for (auto const& member : views)
+                    {
+                        members.push_back(member.requestId);
+                    }
+                    diagnosticMetadata
+                        = {{"request_id", view.requestId}, {"step", view.generatedTokens->size()}, {"prefill", prefill},
+                            {"phase_row", view.phaseBatchRow}, {"sample_row", row}, {"batch_members", members},
+                            {"prefix", *view.generatedTokens}, {"vocab", config.outputVocabSize}};
+                }
+            }
             CUDA_CHECK(cudaMemcpyAsync(slot.hostIds.rawPointer(), selectedIds.rawPointer(),
                 static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaEventRecord(slot.ready, stream));
@@ -1564,8 +1618,22 @@ int main(int argc, char** argv)
             {
                 lastDecodeSampleRequestIds = ticket->requestIds;
             }
-            ticket->collect = [&slot, batchSize]() {
+            ticket->collect = [&slot, batchSize, diagnosticMetadata, diagnosticLogitDir]() {
                 int32_t const* selected = slot.hostIds.dataPointer<int32_t>();
+                if (diagnosticMetadata.has_value())
+                {
+                    auto metadata = *diagnosticMetadata;
+                    metadata["selected_token"] = selected[metadata.at("sample_row").get<size_t>()];
+                    std::filesystem::path const base = std::filesystem::path(diagnosticLogitDir)
+                        / ("request-" + std::to_string(metadata.at("request_id").get<uint64_t>()) + "-step-"
+                            + std::to_string(metadata.at("step").get<size_t>()));
+                    std::ofstream data(base.string() + ".fp32", std::ios::binary);
+                    data.write(static_cast<char const*>(slot.diagnosticLogits->rawPointer()),
+                        static_cast<std::streamsize>(metadata.at("vocab").get<int32_t>()) * sizeof(float));
+                    std::ofstream description(base.string() + ".json");
+                    description << metadata.dump();
+                    ELLM_CHECK(data.good() && description.good(), "Cannot write diagnostic logits");
+                }
                 return std::vector<int32_t>(selected, selected + batchSize);
             };
             ticket->release = [&samplingSlotPool, &slot]() { samplingSlotPool.release(slot); };
@@ -2004,11 +2072,13 @@ int main(int argc, char** argv)
                 ? std::getenv("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL")
                 : "full";
             ELLM_CHECK(phaseTelemetryLevel == "full" || phaseTelemetryLevel == "research"
-                    || phaseTelemetryLevel == "counterfactual",
-                "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL must be full, research, or counterfactual");
+                    || phaseTelemetryLevel == "counterfactual" || phaseTelemetryLevel == "dispatch",
+                "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL must be full, research, counterfactual, or dispatch");
             bool const emitPhaseRequestTimeline = emitPhaseMetrics && phaseTelemetryLevel == "full";
-            bool const emitFullUnifiedSnapshots = phaseTelemetryLevel != "research";
-            bool const collectPhaseDispatchMetrics = emitPhaseMetrics && phaseTelemetryLevel == "full";
+            bool const emitFullUnifiedSnapshots
+                = phaseTelemetryLevel != "research" && phaseTelemetryLevel != "dispatch";
+            bool const collectPhaseDispatchMetrics
+                = emitPhaseMetrics && (phaseTelemetryLevel == "full" || phaseTelemetryLevel == "dispatch");
             std::string const schedulerRunId = std::getenv("TRT_EDGELLM_PHASE_RUN_ID") != nullptr
                 ? std::getenv("TRT_EDGELLM_PHASE_RUN_ID")
                 : "phase-ipc";
@@ -3117,6 +3187,13 @@ int main(int argc, char** argv)
                             ++ingestedLines;
                             continue;
                         }
+                        if (serverConfig.enableCudaGraphs
+                            && std::getenv("TRT_EDGELLM_CAPTURE_CALIBRATION_GRAPHS") != nullptr
+                            && input.kind != PhaseIpcKind::kCalibrationStatus)
+                        {
+                            semanticCoordinator.setGraphCaptureEnabled(
+                                active || std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") != nullptr);
+                        }
                         rt::PhaseThreeCoordinatorMetrics const calibrationMetrics
                             = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                         rt::PhaseSchedulerTelemetry const calibrationQueueMetrics
@@ -3253,6 +3330,7 @@ int main(int argc, char** argv)
                                 semanticCoordinator.scheduler().resetPolicyPosterior();
                             }
                             ++measurementEpoch;
+                            diagnosticMeasurement = diagnosticLogitDir != nullptr;
                             if (ipcThreePhase != nullptr)
                             {
                                 ipcThreePhase->resetGlobalDecisionCostTelemetry();
@@ -3404,6 +3482,20 @@ int main(int argc, char** argv)
                 {
                     madeProgress = true;
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
+                    if (phaseTelemetryLevel == "dispatch")
+                    {
+                        nlohmann::json const event{{"dispatch_index", metrics.dispatchIndex},
+                            {"measurement_epoch", measurementEpoch}, {"kind", static_cast<int32_t>(metrics.kind)},
+                            {"prefill_batch", metrics.prefillBatchSize}, {"decode_batch", metrics.decodeBatchSize},
+                            {"prefill_tokens", metrics.prefillTokens}, {"prefill_gpu_ms", metrics.prefillGpuMs},
+                            {"decode_gpu_ms", metrics.decodeGpuMs}, {"makespan_gpu_ms", metrics.makespanGpuMs},
+                            {"host_scheduler_decision_us", metrics.hostSchedulerDecisionUs},
+                            {"host_dispatch_start_us", static_cast<double>(metrics.hostDispatchStartNs) / 1000.0},
+                            {"host_submission_end_us", static_cast<double>(metrics.hostSubmissionEndNs) / 1000.0},
+                            {"host_completion_us", static_cast<double>(metrics.hostCompletionNs) / 1000.0}};
+                        serializedRecords.push_back("PHASE_METRIC\t" + event.dump());
+                        continue;
+                    }
                     auto const prefillGraphs = semanticCoordinator.prefillGraphCacheStats();
                     auto const decodeGraphs = semanticCoordinator.decodeGraphCacheStats();
                     rt::PhaseThreeCoordinatorMetrics const visionMetrics
@@ -3758,6 +3850,8 @@ int main(int argc, char** argv)
                         {"vision_encoder_preparation_ms", visionMetrics.lastEncoderPreparationUs / 1000.0},
                         {"vision_encoder_preparation_max_ms", visionMetrics.maxEncoderPreparationUs / 1000.0},
                         {"vision_encoder_exclusive_batches", visionMetrics.exclusiveEncoderBatches},
+                        {"vision_unknown_payload_bootstrap_selections",
+                            visionMetrics.unknownPayloadBootstrapSelections},
                         {"vision_encoder_exclusive_prefill_deferrals", visionMetrics.exclusiveEncoderPrefillDeferrals},
                         {"vision_global_decisions", visionMetrics.globalDecisions},
                         {"vision_global_encoder_selections", visionMetrics.globalEncoderSelections},
@@ -4299,6 +4393,8 @@ int main(int argc, char** argv)
             if (ipcThreePhase != nullptr)
             {
                 rt::PhaseThreeCoordinatorMetrics const visionMetrics = ipcThreePhase->metrics();
+                LOG_INFO(
+                    "Phase unknown-payload bootstrap selections: %zu", visionMetrics.unknownPayloadBootstrapSelections);
                 rt::PhaseSchedulerTelemetry const& schedulerMetrics = semanticCoordinator.scheduler().telemetry();
                 LOG_INFO("Phase global scheduler decision cost: samples=%zu mean=%.3f us p95=%.3f us max=%.3f us",
                     visionMetrics.globalHostDecisionSamples, visionMetrics.globalHostDecisionMeanUs,
