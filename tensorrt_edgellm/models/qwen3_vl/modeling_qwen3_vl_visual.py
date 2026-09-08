@@ -351,7 +351,7 @@ class Qwen3VLPatchMerger(nn.Module):
         else:
             # Norm first, then reshape
             x = self.norm(x).view(-1, self.merged_size)
-        return self.linear_fc2(F.gelu(self.linear_fc1(x), approximate="tanh"))
+        return self.linear_fc2(F.gelu(self.linear_fc1(x), approximate="none"))
 
 
 class Qwen3VLVisualModel(nn.Module):
