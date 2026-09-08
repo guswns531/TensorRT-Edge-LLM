@@ -281,6 +281,41 @@ TEST_F(EmbeddingLookupTest, StandardEmbeddingLookupAccuracy)
     }
 }
 
+TEST_F(EmbeddingLookupTest, TransposedEmbeddingLookupAccuracy)
+{
+    int64_t constexpr batchSize = 2;
+    int64_t constexpr seqLen = 5;
+    int32_t constexpr vocabSize = 17;
+    int64_t constexpr hiddenSize = 128;
+
+    std::vector<int32_t> inputIds(batchSize * seqLen);
+    uniformIntInitialization<int32_t>(inputIds, 0, vocabSize - 1);
+
+    std::vector<half> embeddingTable(vocabSize * hiddenSize);
+    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
+    std::vector<half> transposedTable(embeddingTable.size());
+    for (int64_t token = 0; token < vocabSize; ++token)
+    {
+        for (int64_t hidden = 0; hidden < hiddenSize; ++hidden)
+        {
+            transposedTable[hidden * vocabSize + token] = embeddingTable[token * hiddenSize + hidden];
+        }
+    }
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor embeddingTableTensor(
+        {hiddenSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "embedding_transposed");
+    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(embeddingTableTensor, transposedTable);
+    kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, std::nullopt, outputTensor, stream);
+
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
+    auto const cpuResult = embeddingLookupRef(inputIds, embeddingTable, batchSize, seqLen, vocabSize, hiddenSize);
+    EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Transposed Embedding Lookup Accuracy Test"));
+}
+
 #if SUPPORTS_FP8
 // Test FP8 embedding lookup accuracy with various configurations
 TEST_F(EmbeddingLookupTest, FP8EmbeddingLookupAccuracy)

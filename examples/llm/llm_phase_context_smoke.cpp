@@ -778,13 +778,19 @@ int main(int argc, char** argv)
 
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
-        resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream, checkpointDir);
         rt::EmbeddingData embedding;
+        bool const reuseTiedEmbedding = rt::ExternalWeightManager::requiresTiedEmbedding(engineDir / "config.json");
+        if (reuseTiedEmbedding)
+        {
+            embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
+        }
+        resources->externalWeightManager->load(engineDir, engineDir / "config.json", setupStream, checkpointDir, {}, {},
+            {}, reuseTiedEmbedding ? &embedding.table : nullptr);
         if (auto table = resources->externalWeightManager->takeEmbedding())
         {
             embedding.table = std::move(*table);
         }
-        else
+        else if (!reuseTiedEmbedding)
         {
             embedding = rt::loadEmbeddingTable(engineDir / "embedding.safetensors", setupStream);
         }

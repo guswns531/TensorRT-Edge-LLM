@@ -766,6 +766,7 @@ int main(int argc, char** argv)
     rt::Tensor diffusionPrevSelfConditioningEmbeds;
     rt::Tensor diffusionNextSelfConditioningEmbeds;
     rt::Tensor diffusionSelfConditioningTemperature;
+    std::optional<rt::EmbeddingData> tiedEmbedding;
 
     // Visual mode uses MultimodalRunner (unchanged from legacy)
     std::unique_ptr<rt::MultimodalRunner> visualRunner;
@@ -1104,7 +1105,12 @@ int main(int argc, char** argv)
 
             // --- Load externalized model weights ---
             std::filesystem::path const& activeConfigPath = useDraftEngine ? *draftConfigPath : baseConfigPath;
-            resources->externalWeightManager->load(dir, activeConfigPath, stream, args.checkpointDir);
+            if (rt::ExternalWeightManager::requiresTiedEmbedding(activeConfigPath))
+            {
+                tiedEmbedding.emplace(rt::loadEmbeddingTable(dir / "embedding.safetensors", stream));
+            }
+            resources->externalWeightManager->load(dir, activeConfigPath, stream, args.checkpointDir, {}, {}, {},
+                tiedEmbedding.has_value() ? &tiedEmbedding->table : nullptr);
             resources->externalWeightManager->validateAgainstEngine(*executor, useDraftEngine ? "draft" : "base");
             resources->externalWeightManager->registerTensorMapEntries(tensorMap);
 

@@ -1005,6 +1005,7 @@ def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
                             fp8_embedding: bool = False,
+                            transpose_embedding: bool = False,
                             reduced_vocab_dir: str = "",
                             config_filename: str = "config.json",
                             write_shared_artifacts: bool = True) -> None:
@@ -1122,9 +1123,13 @@ def write_runtime_artifacts(model: "CausalLM",
                 logger.info("Wrote FP8 embedding.safetensors (%s)",
                             list(weight.shape))
             else:
-                save_file({"embedding": weight}, embedding_path)
-                logger.info("Wrote embedding.safetensors (%s)",
-                            list(weight.shape))
+                tensor_name = ("embedding_transposed"
+                               if transpose_embedding else "embedding")
+                if transpose_embedding:
+                    weight = weight.transpose(0, 1).contiguous()
+                save_file({tensor_name: weight}, embedding_path)
+                logger.info("Wrote %s in embedding.safetensors (%s)",
+                            tensor_name, list(weight.shape))
         else:
             logger.warning(
                 "embed_tokens not found; skipping embedding.safetensors")

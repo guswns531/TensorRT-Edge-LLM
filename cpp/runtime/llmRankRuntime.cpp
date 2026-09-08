@@ -234,12 +234,18 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
         = tensorParallelSize > 1 ? std::optional<int32_t>{tensorParallelRank} : std::nullopt;
     std::optional<int32_t> const weightTpSize
         = tensorParallelSize > 1 ? std::optional<int32_t>{tensorParallelSize} : std::nullopt;
-    artifacts.weights.load(engineRoot, baseConfigPath, stream, artifacts.checkpointDir, {}, weightTpRank, weightTpSize);
+    bool const reuseTiedEmbedding = ExternalWeightManager::requiresTiedEmbedding(baseConfigPath);
+    if (reuseTiedEmbedding)
+    {
+        artifacts.embedding = loadEmbeddingTable(engineRoot / "embedding.safetensors", stream);
+    }
+    artifacts.weights.load(engineRoot, baseConfigPath, stream, artifacts.checkpointDir, {}, weightTpRank, weightTpSize,
+        reuseTiedEmbedding ? &artifacts.embedding.table : nullptr);
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
         artifacts.embedding.table = std::move(*embedding);
     }
-    else
+    else if (!reuseTiedEmbedding)
     {
         artifacts.embedding = loadEmbeddingTable(engineRoot / "embedding.safetensors", stream);
     }

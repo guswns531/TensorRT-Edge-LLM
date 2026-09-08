@@ -54,6 +54,7 @@ using Json = nlohmann::json;
 constexpr size_t kWeightAlignment = 256;
 constexpr size_t kPackedNvfp4ArenaAlignment = 2U << 20;
 constexpr char const* kStorageAliasField = "storage_alias_of";
+constexpr char const* kTiedEmbeddingSource = "embedding";
 constexpr char const* kRegisterPluginWeightSymbol = "edgellmRegisterFusedNvfp4WeightResource";
 constexpr char const* kUnregisterPluginWeightSymbol = "edgellmUnregisterFusedNvfp4WeightResource";
 using RegisterPluginWeightFn = bool (*)(int32_t, int32_t, void const*, void const*, int32_t, int32_t, int32_t);
@@ -372,13 +373,29 @@ std::vector<CheckpointReader::TensorLocation> checkpointLocations(Json const& bi
 }
 
 void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, Json const& config,
-    std::vector<Tensor>& weights, cudaStream_t stream)
+    std::vector<Tensor>& weights, cudaStream_t stream, Tensor* tiedEmbedding)
 {
     Json const files = config.value("external_weight_files", Json::array());
     ELLM_CHECK(files.is_array(), "external_weight_files must be an array in " + configPath.string());
 
     for (auto const& entry : files)
     {
+        if (entry.is_object() && entry.value("source", "") == kTiedEmbeddingSource)
+        {
+            ELLM_CHECK(tiedEmbedding != nullptr,
+                "External tied LM-head requires the runtime embedding tensor: " + configPath.string());
+            ELLM_CHECK(entry.contains("tensors") && entry["tensors"].is_array() && !entry["tensors"].empty(),
+                "Tied embedding external-weight entry requires a non-empty tensors array");
+            ELLM_CHECK(tiedEmbedding->getDeviceType() == DeviceType::kGPU,
+                "Tied LM-head embedding tensor must reside on the GPU");
+            for (Json const& tensorName : entry["tensors"])
+            {
+                ELLM_CHECK(tensorName.is_string(), "Tied embedding tensor names must be strings");
+                weights.emplace_back(tiedEmbedding->rawPointer(), tiedEmbedding->getShape(),
+                    tiedEmbedding->getDeviceType(), tiedEmbedding->getDataType(), tensorName.get<std::string>());
+            }
+            continue;
+        }
         ELLM_CHECK(entry.is_object() && entry.contains("file") && entry["file"].is_string(),
             "Malformed external weight entry in " + configPath.string());
         std::filesystem::path const path = engineDir / entry["file"].get<std::string>();
@@ -468,7 +485,8 @@ void ExternalWeightManager::releasePluginResources() noexcept
 
 void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath,
     cudaStream_t stream, std::filesystem::path const& componentCheckpointDir,
-    std::filesystem::path const& targetCheckpointDir, std::optional<int32_t> tpRank, std::optional<int32_t> tpSize)
+    std::filesystem::path const& targetCheckpointDir, std::optional<int32_t> tpRank, std::optional<int32_t> tpSize,
+    Tensor* tiedEmbedding)
 {
     NVTX_SCOPED_RANGE(nvtx_model_weight_preparation, "MODEL_WEIGHT_PREPARATION", nvtx_colors::YELLOW);
     ELLM_CHECK(!mLoaded, "ExternalWeightManager::load called more than once");
@@ -513,7 +531,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
     size_t peakRegisteredSourceBytes = 0;
     if (bindings.empty())
     {
-        loadSidecars(engineDir, configPath, config, mWeights, stream);
+        loadSidecars(engineDir, configPath, config, mWeights, stream, tiedEmbedding);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     else
@@ -898,6 +916,15 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 static_cast<long long>(transformTime.count()));
         }
     }
+}
+
+bool ExternalWeightManager::requiresTiedEmbedding(std::filesystem::path const& configPath)
+{
+    Json const config = readConfig(configPath);
+    Json const files = config.value("external_weight_files", Json::array());
+    ELLM_CHECK(files.is_array(), "external_weight_files must be an array in " + configPath.string());
+    return std::any_of(files.begin(), files.end(),
+        [](Json const& entry) { return entry.is_object() && entry.value("source", "") == kTiedEmbeddingSource; });
 }
 
 std::optional<Tensor> ExternalWeightManager::takeEmbedding()

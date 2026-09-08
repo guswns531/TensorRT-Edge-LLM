@@ -652,13 +652,23 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
 
     // Find tensors by name
     rt::Tensor* embeddingPtr = nullptr;
+    bool transposedEmbedding = false;
     rt::Tensor* scalesPtr = nullptr;
 
     for (auto& tensor : tensors)
     {
         if (tensor.getName() == "embedding")
         {
+            ELLM_CHECK(embeddingPtr == nullptr,
+                "Embedding file cannot contain both 'embedding' and 'embedding_transposed' tensors");
             embeddingPtr = &tensor;
+        }
+        else if (tensor.getName() == "embedding_transposed")
+        {
+            ELLM_CHECK(embeddingPtr == nullptr,
+                "Embedding file cannot contain both 'embedding' and 'embedding_transposed' tensors");
+            embeddingPtr = &tensor;
+            transposedEmbedding = true;
         }
         else if (tensor.getName() == "embedding_scale")
         {
@@ -667,19 +677,21 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
     }
 
     ELLM_CHECK(embeddingPtr != nullptr,
-        format::fmtstr("Embedding file missing 'embedding' tensor: %s", embeddingPath.string().c_str()));
+        format::fmtstr(
+            "Embedding file missing 'embedding' or 'embedding_transposed' tensor: %s", embeddingPath.string().c_str()));
 
     ELLM_CHECK(embeddingPtr->getShape().getNumDims() == 2,
         format::fmtstr("Embedding tensor must be 2D, got %d dimensions", embeddingPtr->getShape().getNumDims()));
 
-    int64_t vocabSize = embeddingPtr->getShape()[0];
-    int64_t hiddenSize = embeddingPtr->getShape()[1];
+    int64_t vocabSize = embeddingPtr->getShape()[transposedEmbedding ? 1 : 0];
+    int64_t hiddenSize = embeddingPtr->getShape()[transposedEmbedding ? 0 : 1];
 
     EmbeddingData result;
 
     // Detect FP8 vs FP16 by checking dtype
     if (embeddingPtr->getDataType() == nvinfer1::DataType::kFP8)
     {
+        ELLM_CHECK(!transposedEmbedding, "FP8 transposed embeddings are not supported");
         // FP8 format - requires scales
         ELLM_CHECK(scalesPtr != nullptr,
             format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
@@ -712,7 +724,8 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
     else
     {
         // FP16 format
-        LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
+        LOG_INFO("Loaded FP16 embedding: [%ld, %ld] layout=%s", vocabSize, hiddenSize,
+            transposedEmbedding ? "hidden_vocab" : "vocab_hidden");
 
         result.table = std::move(*embeddingPtr);
     }

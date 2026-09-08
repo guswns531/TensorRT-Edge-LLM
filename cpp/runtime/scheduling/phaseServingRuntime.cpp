@@ -259,11 +259,20 @@ public:
                 totalBytes);
             int64_t const prefillBytes = static_cast<int64_t>(mExecutors->prefillContextMemory().getMemoryCapacity());
             int64_t const visionBytes = mVisionRunner->getRequiredContextMemorySize();
+            ELLM_CHECK(visionBytes > 0, "TensorRT returned an empty vision workspace for phase execution");
             constexpr size_t kWORKSPACE_HEADROOM_BYTES = 96U * 1024U * 1024U;
+            size_t const independentVisionBytes = static_cast<size_t>(visionBytes);
+            bool const independentVisionFits = freeBytes >= independentVisionBytes
+                && freeBytes - independentVisionBytes >= kWORKSPACE_HEADROOM_BYTES;
             size_t const prefillShareGrowth = static_cast<size_t>(std::max<int64_t>(0, visionBytes - prefillBytes));
             bool const prefillShareFits
                 = freeBytes >= prefillShareGrowth && freeBytes - prefillShareGrowth >= kWORKSPACE_HEADROOM_BYTES;
-            if (!prefillShareFits)
+            if (independentVisionFits)
+            {
+                mVisionRunner->allocateContextMemory();
+                LOG_INFO("Phase workspace mode: independent E/P/D arenas; all pairwise overlap remains available");
+            }
+            else if (!prefillShareFits)
             {
                 TieredVisionContextMemoryInfo const info
                     = mExecutors->configureSharedVisionDecodeContextMemory(*mVisionRunner);

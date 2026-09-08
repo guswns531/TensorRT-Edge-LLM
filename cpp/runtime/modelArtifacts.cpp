@@ -170,12 +170,18 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
         = draftingConfig.has_value() ? engineDir / "base_config.json" : engineDir / "config.json";
 
     // Finish checkpoint reads and weight conversion before any engine can run.
-    artifacts.weights.load(engineDir, baseConfigPath, stream, artifacts.checkpointDir);
+    bool const reuseTiedEmbedding = ExternalWeightManager::requiresTiedEmbedding(baseConfigPath);
+    if (reuseTiedEmbedding)
+    {
+        artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", stream);
+    }
+    artifacts.weights.load(engineDir, baseConfigPath, stream, artifacts.checkpointDir, {}, {}, {},
+        reuseTiedEmbedding ? &artifacts.embedding.table : nullptr);
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
         artifacts.embedding.table = std::move(*embedding);
     }
-    else
+    else if (!reuseTiedEmbedding)
     {
         artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", stream);
     }
