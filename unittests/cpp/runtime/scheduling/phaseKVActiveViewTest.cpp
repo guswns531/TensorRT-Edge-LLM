@@ -22,7 +22,92 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 using namespace trt_edgellm;
+
+TEST(PhaseKVActiveViewTest, IsolatedMetadataCostBenchmark)
+{
+    if (std::getenv("TRT_EDGELLM_KV_METADATA_BENCH") == nullptr)
+    {
+        GTEST_SKIP() << "Opt-in metadata benchmark";
+    }
+    cudaStream_t stream{};
+    cudaEvent_t start{}, stop{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    for (int32_t const batch : {1, 8, 32, 64})
+    {
+        for (bool const persistent : {false, true})
+        {
+            for (bool const churn : {false, true})
+            {
+                rt::StableKVPageManager ownership({80, 64, 256, 2048, 128});
+                std::vector<int32_t> slots;
+                for (int32_t row{}; row < batch; ++row)
+                {
+                    int32_t const slot = ownership.reserve();
+                    ownership.ensureCapacity(slot, 256);
+                    ownership.setLength(slot, 256);
+                    slots.push_back(slot);
+                }
+                rt::TensorMap map;
+                rt::Tensor lengths({64}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "bench_lengths");
+                rt::KVPageTable table(64, 16, 256);
+                map.set(binding_names::kKVCacheStartIndex, lengths);
+                map.set(binding_names::kKVPageTable, table.kernelView());
+                rt::PhaseKVActiveView view(64, ownership, map, "metadata_bench");
+                view.setPersistentPageBindingsEnabled(persistent);
+                std::vector<double> hostUs, leaseUs, gpuUs;
+                for (int32_t step{}; step < 1100; ++step)
+                {
+                    auto const leaseStart = std::chrono::steady_clock::now();
+                    if (churn)
+                    {
+                        ownership.release(slots.front());
+                        slots.front() = ownership.reserve();
+                        ownership.ensureCapacity(slots.front(), 256);
+                        ownership.setLength(slots.front(), 256);
+                        std::rotate(slots.begin(), slots.begin() + 1, slots.end());
+                    }
+                    auto const hostStart = std::chrono::steady_clock::now();
+                    CUDA_CHECK(cudaEventRecord(start, stream));
+                    view.prepare(slots, stream);
+                    CUDA_CHECK(cudaEventRecord(stop, stream));
+                    auto const hostStop = std::chrono::steady_clock::now();
+                    CUDA_CHECK(cudaEventSynchronize(stop));
+                    float elapsed{};
+                    CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+                    view.complete();
+                    if (step >= 100)
+                    {
+                        hostUs.push_back(std::chrono::duration<double, std::micro>(hostStop - hostStart).count());
+                        leaseUs.push_back(std::chrono::duration<double, std::micro>(hostStart - leaseStart).count());
+                        gpuUs.push_back(elapsed * 1000.0);
+                    }
+                }
+                std::sort(hostUs.begin(), hostUs.end());
+                std::sort(leaseUs.begin(), leaseUs.end());
+                std::sort(gpuUs.begin(), gpuUs.end());
+                auto const& stats = view.pageTableUploadStats();
+                std::printf(
+                    "KV_BENCH batch=%d persistent=%d churn=%d host_median_us=%.3f host_p95_us=%.3f "
+                    "lease_median_us=%.3f lease_p95_us=%.3f event_median_us=%.3f event_p95_us=%.3f "
+                    "table_bytes=%zu host_waits=%zu\n",
+                    batch, persistent, churn, hostUs[500], hostUs[949], leaseUs[500], leaseUs[949], gpuUs[500],
+                    gpuUs[949], stats.copyBytes, stats.hostWaits);
+                EXPECT_EQ(ownership.availablePages(), 256 - batch * 2);
+            }
+        }
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
 
 TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPages)
 {

@@ -16,6 +16,7 @@
  */
 
 #include "runtime/phase/mechanism/phaseIncrementalAction.h"
+#include "runtime/scheduling/phaseThreeCoordinator.h"
 
 #include <gtest/gtest.h>
 
@@ -25,6 +26,22 @@ namespace trt_edgellm::rt
 {
 namespace
 {
+
+TEST(PhasePairEligibilityTest, LegacyScopeDoesNotRelaxWorkspaceSafety)
+{
+    PhaseThreeCoordinatorConfig config;
+    EXPECT_TRUE(config.contextualResidualEligible(true));
+    EXPECT_TRUE(config.encoderDecodeEligible(true));
+    config.preserveLegacyPairEligibility = true;
+    EXPECT_FALSE(config.contextualResidualEligible(true));
+    EXPECT_TRUE(config.contextualResidualEligible(false));
+    EXPECT_FALSE(config.encoderDecodeEligible(true));
+    EXPECT_TRUE(config.encoderDecodeEligible(false));
+    config.serializeAllEncoderDecode = true;
+    EXPECT_FALSE(config.encoderDecodeEligible(false));
+    config.preserveLegacyPairEligibility = false;
+    EXPECT_FALSE(config.encoderDecodeEligible(false));
+}
 
 std::vector<PhaseIncrementalReadyAction> readyMask()
 {

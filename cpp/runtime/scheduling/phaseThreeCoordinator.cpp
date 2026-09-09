@@ -2192,9 +2192,13 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     overlap.overlapCostProfitable = overlapProfitable;
     overlap.safeProbeEligible = safeProbe;
     PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
+    bool const externalPrefillLineage
+        = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
+    bool const contextualEligible = mConfig.contextualResidualEligible(externalPrefillLineage);
     bool const producerCriticalPath = phaseContextualPdProducerCriticalPath(
-        !mPending.empty() || !mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid(), false);
-    if (contextualMode != PhaseContextualPdMode::kDisabled)
+        !mPending.empty() || !mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid(),
+        mConfig.preserveLegacyPairEligibility && externalPrefillLineage);
+    if (contextualMode != PhaseContextualPdMode::kDisabled && contextualEligible)
     {
         PhaseContextualPdInput contextualInput{prefill.predictedMakespanUs, decode.predictedMakespanUs,
             protectedSlackUs, prefill.key.primaryBatchSize, decode.key.primaryBatchSize, prefill.key.chunkLength,
@@ -2936,7 +2940,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     {
         addEncoderOverlap(PhaseGlobalActionKind::kEncoderPrefill, *prefillForEncoder);
     }
-    if (!mConfig.serializeAllEncoderDecode && decodeForEncoder.has_value())
+    if (mConfig.encoderDecodeEligible(encoderPrefillExclusive) && decodeForEncoder.has_value())
     {
         addEncoderOverlap(PhaseGlobalActionKind::kEncoderDecode, *decodeForEncoder);
     }

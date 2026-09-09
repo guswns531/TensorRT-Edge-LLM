@@ -114,6 +114,18 @@ struct PhaseThreeCoordinatorConfig
     bool enableGlobalEncoderPrefillAction{};
     //! Retain one standalone P and D alternative at the final E/P/D selector.
     bool enableGlobalPdFrontier{};
+    //! Restrict residual external-prefill authority and couple E/P and E/D candidate eligibility.
+    bool preserveLegacyPairEligibility{};
+
+    bool contextualResidualEligible(bool externalPrefill) const noexcept
+    {
+        return !preserveLegacyPairEligibility || !externalPrefill;
+    }
+
+    bool encoderDecodeEligible(bool encoderPrefillExclusive) const noexcept
+    {
+        return !serializeAllEncoderDecode && (!preserveLegacyPairEligibility || !encoderPrefillExclusive);
+    }
     //! Number of actual dispatches attributed after an H=2/myopic selection
     //! change. The selected action is the first dispatch in the horizon.
     size_t globalFormationRealizedDispatches{4U};

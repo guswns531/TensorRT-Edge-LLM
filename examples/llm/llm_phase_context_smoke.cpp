@@ -2409,6 +2409,8 @@ int main(int argc, char** argv)
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
                 threePhaseConfig.enableGlobalPdFrontier = std::getenv("TRT_EDGELLM_GLOBAL_PD_FRONTIER") != nullptr;
+                threePhaseConfig.preserveLegacyPairEligibility
+                    = std::getenv("TRT_EDGELLM_LEGACY_PAIR_ELIGIBILITY") != nullptr;
                 threePhaseConfig.enableGlobalEncoderPrefillAction
                     = semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive
                     && std::getenv("TRT_EDGELLM_DISABLE_GLOBAL_ENCODER_PREFILL_ACTION") == nullptr;
