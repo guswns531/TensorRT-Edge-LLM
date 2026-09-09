@@ -1954,6 +1954,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     }
     bool const preserveExpiredDecode
         = mConfig.preserveExpiredDecodeCandidate && state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0;
+    if (audit != nullptr)
+    {
+        bool const guardApplies = prefillDeadlineExpired && allowDecode && decode.has_value();
+        audit->decodeGuard = PhaseDecodeGuardAudit{prefillDeadlineExpired,
+            state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0, guardApplies && preserveExpiredDecode,
+            guardApplies && !preserveExpiredDecode};
+    }
     if (allowDecode && decode.has_value() && (!prefillDeadlineExpired || preserveExpiredDecode))
     {
         PhaseGlobalActionCandidate candidate;

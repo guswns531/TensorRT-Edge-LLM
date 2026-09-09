@@ -265,11 +265,18 @@ def main():
                         required=True)
     parser.add_argument('--output', type=pathlib.Path, required=True)
     parser.add_argument('--request-timeline', action='store_true')
+    parser.add_argument(
+        '--host-ready-only',
+        action='store_true',
+        help=
+        'Analyze the host ready path without requiring GPU epoch timestamps')
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
-    result = [analyze(path) for path in args.events]
-    if args.request_timeline:
+    result = ([dict(source=str(path))
+               for path in args.events] if args.host_ready_only else
+              [analyze(path) for path in args.events])
+    if args.request_timeline or args.host_ready_only:
         for path, item in zip(args.events, result):
             item['ready_path'] = analyze_ready_path(path)
     with args.output.open('x') as output:

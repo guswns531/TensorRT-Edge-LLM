@@ -24,6 +24,7 @@ import pathlib
 def analyze(path):
     """Return decision counts and non-D choices in one measurement epoch."""
     decisions = []
+    dispatches = collections.defaultdict(set)
     epochs = 0
     for line in path.read_text().splitlines():
         prefix, separator, value = line.partition('\t')
@@ -32,17 +33,61 @@ def analyze(path):
         if prefix == 'PHASE_EPOCH' and json.loads(
                 value)['kind'] == 'measurement':
             decisions.clear()
+            dispatches.clear()
             epochs += 1
         elif prefix == 'PHASE_SCHEDULER_EVENT':
             event = json.loads(value)
             if event['event_kind'] == 'decision':
                 decisions.append(event)
+            elif event['event_kind'] == 'dispatch':
+                dispatches[event['decision_id']].add(event['action_kind'])
     if epochs != 1:
         raise ValueError('Expected one explicit measurement epoch')
     counts = collections.Counter()
     rows = []
+    restored_rows = []
     for event in decisions:
         counts['decisions'] += 1
+        guard = event.get('decode_guard_audit')
+        if guard is not None:
+            counts['guard_audited'] += 1
+            counts['both_deadlines_expired'] += int(
+                guard['prefill_expired'] and guard['decode_expired'])
+            counts['guard_suppressed'] += int(guard['candidate_suppressed'])
+            if guard['candidate_restored']:
+                counts['guard_restored'] += 1
+                local = event.get('pd_selector_audit') or event.get(
+                    'selector_audit')
+                if local is None:
+                    raise ValueError(
+                        'Restored candidate lacks local selection audit')
+                decode_inputs = [
+                    row for row in local['inputs']
+                    if row['action_kind'] == 'decode'
+                ]
+                if len(decode_inputs) != 1:
+                    raise ValueError(
+                        'Restored D must occur once in local inputs')
+                local_selected = decode_inputs[0]['action_id'] == local[
+                    'selected_action_id']
+                counts['restored_local_d_selected'] += int(local_selected)
+                counts['restored_local_d_lost'] += int(not local_selected)
+                counts['restored_final_' + event['action_kind']] += 1
+                realized = dispatches[event['decision_id']]
+                counts['restored_without_dispatch'] += int(not realized)
+                for kind in realized:
+                    counts['restored_dispatch_' + kind] += 1
+                restored_rows.append(
+                    dict(decision_id=event['decision_id'],
+                         final_action=event['action_kind'],
+                         dispatch_kinds=sorted(realized),
+                         local_selector=local,
+                         final_selector=event.get('selector_audit')))
+                counts['restored_local_d_then_non_d'] += int(
+                    local_selected and event['action_kind']
+                    not in ('decode', 'prefill_decode', 'encoder_decode'))
+        else:
+            counts['guard_unavailable'] += 1
         audit = event.get('selector_audit')
         if audit is None:
             counts['unavailable'] += 1
@@ -100,7 +145,10 @@ def analyze(path):
                  decode_candidate=classification,
                  selector=audit,
                  pd_selector=pd_audit))
-    return dict(source=str(path), counts=dict(counts), non_decode_rows=rows)
+    return dict(source=str(path),
+                counts=dict(counts),
+                non_decode_rows=rows,
+                restored_rows=restored_rows)
 
 
 def main():

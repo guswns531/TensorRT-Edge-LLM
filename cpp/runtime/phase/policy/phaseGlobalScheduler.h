@@ -76,6 +76,15 @@ struct PhaseGlobalCandidateAudit
     uint32_t violationMask{};
 };
 
+//! Local queue guard outcome before global candidate ranking.
+struct PhaseDecodeGuardAudit
+{
+    bool prefillExpired{};
+    bool decodeExpired{};
+    bool candidateRestored{};
+    bool candidateSuppressed{};
+};
+
 //! Captured at selection; a later dispatch override is not this decision.
 struct PhaseGlobalSelectionAudit
 {
@@ -83,6 +92,8 @@ struct PhaseGlobalSelectionAudit
     PhaseGlobalDecision decision;
     std::vector<PhaseGlobalCandidateAudit> pdInputs;
     PhaseGlobalDecision pdDecision;
+    std::optional<PhaseDecodeGuardAudit> decodeGuard;
+    std::optional<PhaseDecodeGuardAudit> pdDecodeGuard;
 };
 
 //! Profile-free selector shared by text and multimodal request DAGs.

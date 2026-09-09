@@ -3066,6 +3066,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     selectorAudit.decision = decision;
     selectorAudit.pdInputs = std::move(pdAudit.inputs);
     selectorAudit.pdDecision = pdAudit.decision;
+    selectorAudit.pdDecodeGuard = pdAudit.decodeGuard;
     std::optional<size_t> const h2SelectedIndex
         = formationSelectionActive ? decision.selectedIndex : formationOracle.selectedAction;
     if (formationEvaluated && h2SelectedIndex.has_value())

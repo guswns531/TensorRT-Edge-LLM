@@ -4134,6 +4134,15 @@ int main(int argc, char** argv)
                             record["pd_selector_audit"] = audit.pdInputs.empty()
                                 ? nlohmann::json(nullptr)
                                 : auditJson(audit.pdInputs, audit.pdDecision);
+                            auto const& guard
+                                = audit.pdDecodeGuard.has_value() ? audit.pdDecodeGuard : audit.decodeGuard;
+                            if (guard.has_value())
+                            {
+                                record["decode_guard_audit"] = {{"prefill_expired", guard->prefillExpired},
+                                    {"decode_expired", guard->decodeExpired},
+                                    {"candidate_restored", guard->candidateRestored},
+                                    {"candidate_suppressed", guard->candidateSuppressed}};
+                            }
                         }
                         nlohmann::json inflight = nlohmann::json::array();
                         for (rt::PhaseInFlightWorkSnapshot const& work : event.inFlight.work)

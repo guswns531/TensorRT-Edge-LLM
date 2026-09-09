@@ -35,9 +35,60 @@ REPLAY = load_tool("replay_retained_policy_commands")
 DISTRIBUTIONS = load_tool("report_request_distributions")
 OUTPUTS = load_tool("compare_engine_outputs")
 DISPATCH = load_tool("summarize_compact_dispatch")
+SELECTOR = load_tool("analyze_selector_audit")
 
 
 class ReplayContractTest(unittest.TestCase):
+
+    def test_restored_decode_selection_is_not_final_dispatch(self):
+        candidate = dict(action_id=1,
+                         action_kind='decode',
+                         hard_feasible=True,
+                         max_slo_violation_us=1)
+        encoder = dict(action_id=2,
+                       action_kind='encoder',
+                       hard_feasible=True,
+                       max_slo_violation_us=2)
+        event = dict(event_kind='decision',
+                     decision_id=1,
+                     action_kind='encoder',
+                     ready=dict(decode_rows=1),
+                     decode_guard_audit=dict(prefill_expired=True,
+                                             decode_expired=True,
+                                             candidate_restored=True,
+                                             candidate_suppressed=False),
+                     pd_selector_audit=dict(inputs=[candidate],
+                                            selected_action_id=1,
+                                            reason='minimum_violation'),
+                     selector_audit=dict(inputs=[encoder],
+                                         selected_action_id=2,
+                                         reason='minimum_violation',
+                                         post_select_override=False))
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'events.jsonl'
+            path.write_text('PHASE_EPOCH\t{"kind":"measurement"}\n' +
+                            'PHASE_SCHEDULER_EVENT\t' + json.dumps(event) +
+                            '\n')
+            counts = SELECTOR.analyze(path)['counts']
+            self.assertEqual(counts['guard_restored'], 1)
+            self.assertEqual(counts['restored_local_d_selected'], 1)
+            self.assertEqual(counts['restored_local_d_then_non_d'], 1)
+            self.assertEqual(counts['restored_final_encoder'], 1)
+            self.assertEqual(counts['restored_without_dispatch'], 1)
+            with path.open('a') as output:
+                output.write('PHASE_SCHEDULER_EVENT\t' + json.dumps(
+                    dict(event_kind='dispatch',
+                         decision_id=1,
+                         action_kind='encoder')) + '\n')
+            counts = SELECTOR.analyze(path)['counts']
+            self.assertEqual(counts['restored_without_dispatch'], 0)
+            self.assertEqual(counts['restored_dispatch_encoder'], 1)
+            event['pd_selector_audit']['inputs'] = []
+            path.write_text('PHASE_EPOCH\t{"kind":"measurement"}\n' +
+                            'PHASE_SCHEDULER_EVENT\t' + json.dumps(event) +
+                            '\n')
+            with self.assertRaises(ValueError):
+                SELECTOR.analyze(path)
 
     def test_dispatch_epoch_is_required(self):
         with tempfile.TemporaryDirectory() as directory:

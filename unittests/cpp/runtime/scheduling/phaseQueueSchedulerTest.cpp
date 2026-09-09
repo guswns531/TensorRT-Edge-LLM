@@ -717,6 +717,21 @@ TEST(PhaseQueueSchedulerTest, ExpiredDecodeCandidateRequiresOptInAndBothExpiredD
 
             EXPECT_EQ(scheduler.queueSnapshot().decodeMinTpotSlackUs <= 0.0, decodeExpired);
             EXPECT_EQ(scheduler.previewGlobalDecodeAction().has_value(), enabled && decodeExpired);
+            PhaseGlobalSelectionAudit audit;
+            PhaseQueueScheduler control = scheduler;
+            auto const audited = scheduler.previewGlobalAction(&audit);
+            auto const unaudited = control.previewGlobalAction();
+            ASSERT_TRUE(audit.decodeGuard.has_value());
+            EXPECT_TRUE(audit.decodeGuard->prefillExpired);
+            EXPECT_EQ(audit.decodeGuard->decodeExpired, decodeExpired);
+            EXPECT_EQ(audit.decodeGuard->candidateRestored, enabled && decodeExpired);
+            EXPECT_EQ(audit.decodeGuard->candidateSuppressed, !(enabled && decodeExpired));
+            ASSERT_EQ(audited.has_value(), unaudited.has_value());
+            if (audited.has_value())
+            {
+                EXPECT_EQ(audited->key.kind, unaudited->key.kind);
+                EXPECT_EQ(audited->requestIds, unaudited->requestIds);
+            }
             EXPECT_EQ(scheduler.queueSnapshot().prefillQueued, 1U);
             EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 1U);
         }
