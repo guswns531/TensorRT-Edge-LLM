@@ -4109,6 +4109,17 @@ int main(int argc, char** argv)
                             {"selected_decode_violation_us", formation.selectedDecodeViolationUs},
                             {"selected_protected_violation_us", formation.selectedProtectedViolationUs}};
                     };
+                    auto const serviceStateJson = [](rt::PhaseServiceState const& service) {
+                        return nlohmann::json{{"request_id", service.requestId},
+                            {"ready_wait_us", service.readyWaitUs}, {"service_age_quanta", service.serviceAgeQuanta},
+                            {"reference_us", service.reference.serviceUs},
+                            {"reference_source", rt::phaseServiceReferenceSourceName(service.reference.source)},
+                            {"service_epoch", service.reference.epoch}, {"reference_valid", service.reference.valid},
+                            {"has_explicit_slo", service.hasExplicitSlo},
+                            {"absolute_slack_us", std::isfinite(service.absoluteSlackUs)
+                                    ? nlohmann::json(service.absoluteSlackUs)
+                                    : nlohmann::json(nullptr)}};
+                    };
                     nlohmann::json record{{"schema_version", event.schemaVersion},
                         {"event_kind", rt::phaseUnifiedEventKindName(event.kind)}, {"event_id", event.eventId},
                         {"run_id", schedulerRunId}, {"host_monotonic_ns", event.hostMonotonicNs}};
@@ -4276,6 +4287,8 @@ int main(int argc, char** argv)
                             {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
                             {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
                             {"ready", workJson(event.ready)}, {"selected_cohort", workJson(event.cohort)},
+                            {"prefill_service", serviceStateJson(event.prefillService)},
+                            {"decode_service", serviceStateJson(event.decodeService)},
                             {"service_clocks",
                                 [&event] {
                                     nlohmann::json clocks = nlohmann::json::array();

@@ -291,9 +291,84 @@ bool PhaseQueueScheduler::cancel(uint64_t requestId)
         check::check(mQueuedSince.erase(requestId) == 1, "Cancelled request has no queue timestamp");
         mPrefillCohortIds.erase(requestId);
         mDecodeCohortIds.erase(requestId);
+        mPrefillServiceEpochs.erase(requestId);
+        mDecodeServiceEpochs.erase(requestId);
     }
     return erased;
 }
+
+PhaseServiceReference PhaseQueueScheduler::makePrefillServiceReference(PhaseWorkItem const& item)
+{
+    int32_t const chunkTokens = std::max(1, dispatchedPrefillTokens(item));
+    if (std::optional<float> const measured
+        = measuredPrefillP95(1, chunkTokens, item.tokenOffset, item.prefillClass, chunkTokens))
+    {
+        return {std::max(1.0, static_cast<double>(*measured) * 1000.0),
+            PhaseServiceReferenceSource::kRuntimeCovering, mNextServiceEpoch++, true};
+    }
+
+    std::optional<float> staticP95;
+    for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
+    {
+        bool const classMatches
+            = cost.prefillClass == PhasePrefillClass::kAny || cost.prefillClass == item.prefillClass;
+        if (cost.batchSize < 1 || cost.chunkLength < chunkTokens || cost.maxPastKVLength < item.tokenOffset
+            || !classMatches || cost.p95GpuMs <= 0.0F)
+        {
+            continue;
+        }
+        staticP95 = staticP95.has_value() ? std::min(*staticP95, cost.p95GpuMs) : cost.p95GpuMs;
+    }
+    if (staticP95.has_value())
+    {
+        return {std::max(1.0, static_cast<double>(*staticP95) * 1000.0),
+            PhaseServiceReferenceSource::kStaticProfile, mNextServiceEpoch++, true};
+    }
+    double const coldUs
+        = std::max(1.0, static_cast<double>(mConfig.globalColdPrefillMsPerToken) * 1000.0 * chunkTokens);
+    return {coldUs, PhaseServiceReferenceSource::kColdFallback, mNextServiceEpoch++, true};
+}
+
+PhaseServiceReference PhaseQueueScheduler::makeDecodeServiceReference(PhaseWorkItem const& item)
+{
+    if (std::optional<float> const measured = measuredDecodeP95(1, item.tokenCount))
+    {
+        return {std::max(1.0, static_cast<double>(*measured) * 1000.0),
+            PhaseServiceReferenceSource::kRuntimeCovering, mNextServiceEpoch++, true};
+    }
+
+    std::optional<float> staticP95;
+    for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
+    {
+        if (cost.batchSize < 1 || cost.maxContextLength < item.tokenCount || cost.p95GpuMs <= 0.0F)
+        {
+            continue;
+        }
+        staticP95 = staticP95.has_value() ? std::min(*staticP95, cost.p95GpuMs) : cost.p95GpuMs;
+    }
+    if (staticP95.has_value())
+    {
+        return {std::max(1.0, static_cast<double>(*staticP95) * 1000.0),
+            PhaseServiceReferenceSource::kStaticProfile, mNextServiceEpoch++, true};
+    }
+    double const coldUs = std::max(1.0, static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0);
+    return {coldUs, PhaseServiceReferenceSource::kColdFallback, mNextServiceEpoch++, true};
+}
+
+void PhaseQueueScheduler::resetPrefillServiceEpoch(PhaseWorkItem const& item)
+{
+    PhaseServiceReference const reference = makePrefillServiceReference(item);
+    mPrefillServiceEpochs[item.requestId] = {std::chrono::steady_clock::now(), reference};
+    mDecodeServiceEpochs.erase(item.requestId);
+}
+
+void PhaseQueueScheduler::resetDecodeServiceEpoch(PhaseWorkItem const& item)
+{
+    PhaseServiceReference const reference = makeDecodeServiceReference(item);
+    mDecodeServiceEpochs[item.requestId] = {std::chrono::steady_clock::now(), reference};
+    mPrefillServiceEpochs.erase(item.requestId);
+}
+
 void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
 {
     if (item.scheduling.submittedAt == std::chrono::steady_clock::time_point{})
@@ -302,6 +377,7 @@ void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
     }
     mPrefillQueue.push_back(item);
     mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
+    resetPrefillServiceEpoch(item);
 }
 
 void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
@@ -312,6 +388,7 @@ void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
     }
     mDecodeQueue.push_back(item);
     mQueuedSince[item.requestId] = std::chrono::steady_clock::now();
+    resetDecodeServiceEpoch(item);
 }
 
 PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
@@ -419,6 +496,27 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
                 = std::chrono::duration<double, std::micro>(now - item.scheduling.submittedAt).count();
             double const sloAgeUs = prefill ? requestAgeUs : itemWaitUs;
             maxSloPressure = std::max(maxSloPressure, sloAgeUs / target);
+            auto const& serviceEpochs = prefill ? mPrefillServiceEpochs : mDecodeServiceEpochs;
+            auto const serviceEpoch = serviceEpochs.find(item.requestId);
+            check::check(serviceEpoch != serviceEpochs.end(), "Queued request has no service epoch");
+            double const serviceWaitUs
+                = std::chrono::duration<double, std::micro>(now - serviceEpoch->second.startedAt).count();
+            double const serviceAgeQuanta
+                = serviceWaitUs / std::max(1.0, serviceEpoch->second.reference.serviceUs);
+            PhaseServiceState& service = prefill ? result.prefillService : result.decodeService;
+            if (!service.reference.valid || serviceAgeQuanta > service.serviceAgeQuanta)
+            {
+                service.requestId = item.requestId;
+                service.readyWaitUs = serviceWaitUs;
+                service.serviceAgeQuanta = serviceAgeQuanta;
+                service.reference = serviceEpoch->second.reference;
+                service.hasExplicitSlo
+                    = requestTarget > 0.0 || (!prefill && mConfig.globalDecodeTpotTargetExplicit);
+                double const explicitTarget = requestTarget > 0.0 ? requestTarget : mConfig.globalDecodeTpotTargetUs;
+                service.absoluteSlackUs = service.hasExplicitSlo
+                    ? explicitTarget - (prefill ? requestAgeUs : itemWaitUs)
+                    : std::numeric_limits<double>::infinity();
+            }
             if (prefill)
             {
                 result.prefillOldestRequestAgeUs = std::max(result.prefillOldestRequestAgeUs, requestAgeUs);
@@ -1959,6 +2057,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         completion.elapsedServiceUs = state.prefillOldestRequestAgeUs;
         completion.hasExplicitSlo = state.prefillMinimumSlackHasExplicitSlo;
         completion.absoluteSlackUs = state.prefillMinimumAbsoluteSlackUs;
+        if (state.prefillService.requestId == completion.requestId)
+        {
+            completion.referenceUs = state.prefillService.reference.serviceUs;
+            completion.referenceSource = state.prefillService.reference.source;
+            completion.elapsedServiceUs = state.prefillService.readyWaitUs;
+            completion.serviceEpoch = state.prefillService.reference.epoch;
+        }
         return completion;
     };
     auto protect = [&](PhaseGlobalActionCandidate& candidate, int32_t advancedPrefillTokens, Prediction const& action) {
@@ -1978,6 +2083,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 decode->referenceSource, state.decodeOldestWaitUs};
             protectedDecode.hasExplicitSlo = state.decodeMinimumSlackHasExplicitSlo;
             protectedDecode.absoluteSlackUs = state.decodeMinimumAbsoluteSlackUs;
+            if (state.decodeService.requestId == protectedDecode.requestId)
+            {
+                protectedDecode.referenceUs = state.decodeService.reference.serviceUs;
+                protectedDecode.referenceSource = state.decodeService.reference.source;
+                protectedDecode.elapsedServiceUs = state.decodeService.readyWaitUs;
+                protectedDecode.serviceEpoch = state.decodeService.reference.epoch;
+            }
             candidate.protectedCompletions.push_back(protectedDecode);
         }
     };
@@ -2309,6 +2421,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             decode->referenceSource, state.decodeOldestWaitUs};
         protectedDecode.hasExplicitSlo = state.decodeMinimumSlackHasExplicitSlo;
         protectedDecode.absoluteSlackUs = state.decodeMinimumAbsoluteSlackUs;
+        if (state.decodeService.requestId == protectedDecode.requestId)
+        {
+            protectedDecode.referenceUs = state.decodeService.reference.serviceUs;
+            protectedDecode.referenceSource = state.decodeService.reference.source;
+            protectedDecode.elapsedServiceUs = state.decodeService.readyWaitUs;
+            protectedDecode.serviceEpoch = state.decodeService.reference.epoch;
+        }
         candidate.protectedCompletions.push_back(protectedDecode);
         if (decodeFormation.has_value())
         {
@@ -3908,6 +4027,7 @@ void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingK
         check::check(nextOffset == item.promptTokenCount, "A request cannot finish before its final prefill chunk");
         check::check(mActiveRequestIds.erase(item.requestId) == 1, "Finished prefill request is not active");
         mPrefillCohortIds.erase(item.requestId);
+        mPrefillServiceEpochs.erase(item.requestId);
         return;
     }
 
@@ -3932,6 +4052,7 @@ void PhaseQueueScheduler::completeDecode(PhaseWorkItem item, int32_t resultingKV
     {
         check::check(mActiveRequestIds.erase(item.requestId) == 1, "Finished decode request is not active");
         mDecodeCohortIds.erase(item.requestId);
+        mDecodeServiceEpochs.erase(item.requestId);
         return;
     }
     item.tokenCount = resultingKVLength;

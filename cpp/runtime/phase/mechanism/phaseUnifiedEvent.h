@@ -410,6 +410,8 @@ struct PhaseUnifiedEvent
     PhaseExecutionSet plannedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet observedOutstanding{PhaseExecutionSet::kNone};
     PhaseUnifiedWork ready;
+    PhaseServiceState prefillService;
+    PhaseServiceState decodeService;
     //! Canonical ready lineages. Transient timestamps and process-local
     //! execution IDs are deliberately excluded from the replay signature.
     std::vector<uint64_t> readyEncoderRequestIds;

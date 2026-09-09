@@ -1799,6 +1799,8 @@ IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrati
     result.prefillCandidateTokens = queue.prefillCandidateTokens;
     result.decodeQueued = queue.decodeQueued;
     result.decodeCandidateTokens = queue.decodeCandidateTokens;
+    result.prefillService = queue.prefillService;
+    result.decodeService = queue.decodeService;
     result.pagePoolAllocatedBundles = queue.pagePoolAllocatedBundles;
     result.pageReservationGuaranteedBundles = queue.pageReservationGuaranteedBundles;
     if (includeReadyDetails)

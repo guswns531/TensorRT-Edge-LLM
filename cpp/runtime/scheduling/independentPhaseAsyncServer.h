@@ -316,6 +316,8 @@ struct IndependentPhaseServerArbitrationSnapshot
     double prefillOldestRequestAgeUs{};
     double prefillMinTtftSlackUs{};
     double decodeOldestWaitUs{};
+    PhaseServiceState prefillService;
+    PhaseServiceState decodeService;
     double oldestTextWithoutTokenAgeUs{};
     double recentDecodeTpotP95Us{};
     float recentDecodeTpotPressure{};

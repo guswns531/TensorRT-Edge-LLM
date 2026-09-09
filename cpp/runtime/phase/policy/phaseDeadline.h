@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseServiceState.h"
+
 #include <cstdint>
 #include <limits>
 
@@ -30,35 +32,6 @@ enum class PhaseProtectedKind
     kPrefill,
     kDecode,
 };
-
-//! Origin of the immutable isolated-service denominator used by diagnostic
-//! request-age normalization. Queue residence, SLO targets, and selected
-//! overlap timings are deliberately not valid sources.
-enum class PhaseServiceReferenceSource
-{
-    kUnknown,
-    kRuntimeExact,
-    kRuntimeInterpolated,
-    kRuntimeCovering,
-    kStaticProfile,
-    kColdFallback,
-    kDerivedIsolated,
-};
-
-inline char const* phaseServiceReferenceSourceName(PhaseServiceReferenceSource source) noexcept
-{
-    switch (source)
-    {
-    case PhaseServiceReferenceSource::kUnknown: return "unknown";
-    case PhaseServiceReferenceSource::kRuntimeExact: return "runtime_exact";
-    case PhaseServiceReferenceSource::kRuntimeInterpolated: return "runtime_interpolated";
-    case PhaseServiceReferenceSource::kRuntimeCovering: return "runtime_covering";
-    case PhaseServiceReferenceSource::kStaticProfile: return "static_profile";
-    case PhaseServiceReferenceSource::kColdFallback: return "cold_fallback";
-    case PhaseServiceReferenceSource::kDerivedIsolated: return "derived_isolated";
-    }
-    return "unknown";
-}
 
 inline char const* phaseProtectedKindName(PhaseProtectedKind kind) noexcept
 {

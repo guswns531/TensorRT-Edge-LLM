@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseServiceState.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -75,6 +77,8 @@ struct PhaseQueueSnapshot
     uint64_t decodeMinimumSlackRequestId{};
     double prefillMaxSloPressure{};
     double decodeMaxSloPressure{};
+    PhaseServiceState prefillService;
+    PhaseServiceState decodeService;
     int32_t prefillHighestPriority{};
     int32_t decodeHighestPriority{};
     //! Current resource state supplied by the serving facade. Zero denotes a

@@ -1494,6 +1494,8 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.ready.prefillTokens = server.prefillCandidateTokens;
     event.ready.decodeRows = static_cast<int32_t>(server.decodeQueued);
     event.ready.decodeContextTokens = server.decodeCandidateTokens;
+    event.prefillService = server.prefillService;
+    event.decodeService = server.decodeService;
     if (mUnifiedDetailedDecisionSnapshots)
     {
         event.serviceClocks = server.serviceClocks;

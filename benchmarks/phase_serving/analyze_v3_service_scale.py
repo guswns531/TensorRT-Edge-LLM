@@ -49,17 +49,27 @@ def _summary(values):
 
 def _protected_services(event):
     unique = {}
+    for kind in FIXED_SCALE_US:
+        state = event.get(f'{kind}_service', {})
+        if state.get('reference_valid'):
+            service = {
+                'kind': kind,
+                'request_id': state.get('request_id'),
+                'reference_us': state.get('reference_us'),
+                'reference_source': state.get('reference_source'),
+                'elapsed_service_us': state.get('ready_wait_us'),
+                'has_explicit_slo': state.get('has_explicit_slo'),
+                'absolute_slack_us': state.get('absolute_slack_us'),
+                'service_epoch': state.get('service_epoch'),
+                'service_age_quanta': state.get('service_age_quanta'),
+            }
+            unique[(kind, service['request_id'], service['service_epoch'])] = service
     for candidate in event.get('mechanism_candidates', []):
         services = candidate.get('protected_services', [])
         for service in services:
             key = (service.get('kind'), service.get('request_id'),
-                   service.get('reference_us'),
-                   service.get('reference_source'),
-                   service.get('elapsed_service_us'),
-                   service.get('has_explicit_slo'),
-                   service.get('absolute_slack_us'),
                    service.get('service_epoch'))
-            unique[key] = service
+            unique.setdefault(key, service)
     return unique.values()
 
 

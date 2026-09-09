@@ -2361,6 +2361,52 @@ TEST(PhaseQueueSchedulerTest, SnapshotSeparatesExplicitSloFromInternalQueueTarge
     EXPECT_TRUE(std::isfinite(decode.decodeMinimumAbsoluteSlackUs));
 }
 
+TEST(PhaseQueueSchedulerTest, ServiceReferenceIsFrozenUntilRealPrefillProgress)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 32;
+    config.globalColdPrefillMsPerToken = 0.02F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64});
+
+    PhaseQueueSnapshot const first = scheduler.queueSnapshot();
+    ASSERT_TRUE(first.prefillService.reference.valid);
+    EXPECT_EQ(first.prefillService.requestId, 1U);
+    EXPECT_EQ(first.prefillService.reference.source, PhaseServiceReferenceSource::kColdFallback);
+    EXPECT_NEAR(first.prefillService.reference.serviceUs, 640.0, 1.0e-3);
+    PhaseDispatchMetrics unrelated;
+    unrelated.kind = PhaseDispatchKind::kDecode;
+    unrelated.decodeBatchSize = 1;
+    unrelated.decodeGpuMs = 1.0F;
+    scheduler.observeMetrics(unrelated);
+    PhaseQueueSnapshot const repeated = scheduler.queueSnapshot();
+    EXPECT_EQ(repeated.prefillService.reference.epoch, first.prefillService.reference.epoch);
+    EXPECT_DOUBLE_EQ(repeated.prefillService.reference.serviceUs, first.prefillService.reference.serviceUs);
+    EXPECT_GE(repeated.prefillService.serviceAgeQuanta, first.prefillService.serviceAgeQuanta);
+
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    scheduler.completePrefill(plan.prefillBatch.front(), 32, false);
+    PhaseQueueSnapshot const next = scheduler.queueSnapshot();
+    EXPECT_GT(next.prefillService.reference.epoch, first.prefillService.reference.epoch);
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceEpochResetsAcrossDecodeCommitCancelAndRequestReuse)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueueDecode({7, 128});
+    uint64_t const firstEpoch = scheduler.queueSnapshot().decodeService.reference.epoch;
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.decodeBatch.size(), 1U);
+    scheduler.completeDecode(plan.decodeBatch.front(), 129, false);
+    uint64_t const committedEpoch = scheduler.queueSnapshot().decodeService.reference.epoch;
+    EXPECT_GT(committedEpoch, firstEpoch);
+    EXPECT_TRUE(scheduler.cancel(7U));
+
+    scheduler.enqueueDecode({7, 64});
+    EXPECT_GT(scheduler.queueSnapshot().decodeService.reference.epoch, committedEpoch);
+}
+
 TEST(PhaseQueueSchedulerTest, PagePressurePrefersDecodeWithoutOverridingAnExpiredPrefill)
 {
     PhaseQueueSchedulerConfig config;

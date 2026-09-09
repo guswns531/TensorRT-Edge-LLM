@@ -849,6 +849,12 @@ public:
     void setGlobalWarmupProbeMode(bool active);
 
 private:
+    struct ServiceEpochRecord
+    {
+        std::chrono::steady_clock::time_point startedAt;
+        PhaseServiceReference reference;
+    };
+
     struct GlobalQueueSelection
     {
         PhaseDispatchKind kind{PhaseDispatchKind::kNone};
@@ -899,6 +905,10 @@ private:
         PhaseGlobalActionCandidate const& candidate, bool primary, bool chunkPrefill, PhaseDispatchPlan& plan);
     void enqueueKnownPrefill(PhaseWorkItem item);
     void enqueueKnownDecode(PhaseWorkItem item);
+    PhaseServiceReference makePrefillServiceReference(PhaseWorkItem const& item);
+    PhaseServiceReference makeDecodeServiceReference(PhaseWorkItem const& item);
+    void resetPrefillServiceEpoch(PhaseWorkItem const& item);
+    void resetDecodeServiceEpoch(PhaseWorkItem const& item);
 
     PhaseQueueSchedulerConfig mConfig;
     PhaseGlobalScheduler mGlobalScheduler;
@@ -908,6 +918,9 @@ private:
     std::unordered_set<uint64_t> mActiveRequestIds;
     std::unordered_set<uint64_t> mInFlightRequestIds;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> mQueuedSince;
+    std::unordered_map<uint64_t, ServiceEpochRecord> mPrefillServiceEpochs;
+    std::unordered_map<uint64_t, ServiceEpochRecord> mDecodeServiceEpochs;
+    uint64_t mNextServiceEpoch{1U};
     PhaseSchedulerTelemetry mTelemetry;
     using RecentDecodeTpot = std::deque<double>;
     //! Mechanism previews only read recent histories through the shared tracker.
