@@ -122,6 +122,7 @@ def main():
                         choices=("exact", "scalar", "scalar-transition"),
                         default=["exact", "scalar", "scalar-transition"])
     parser.add_argument("--vision-engine-dir")
+    parser.add_argument("--text-engine-dir")
     parser.add_argument("--service-normalized-authority", action="store_true")
     parser.add_argument(
         "--respect-eos",
@@ -253,6 +254,16 @@ def main():
                     )
                 command[vision[
                     0]] = "TRT_EDGELLM_VISION_ENGINE_DIR=" + args.vision_engine_dir
+            if args.text_engine_dir:
+                executable = [
+                    i for i, value in enumerate(command)
+                    if value.endswith("/examples/llm/llm_phase_context_smoke")
+                ]
+                if len(executable) != 1 or executable[0] + 1 >= len(command):
+                    raise ValueError(
+                        "Expected one text engine argument after the phase runtime executable"
+                    )
+                command[executable[0] + 1] = args.text_engine_dir
             planned.append({
                 "policy": policy,
                 "case": case,
