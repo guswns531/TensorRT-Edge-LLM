@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <set>
 
@@ -2328,6 +2329,36 @@ TEST(PhaseQueueSchedulerTest, MaterializesReadyRowsOnlyForDetailedSnapshots)
     EXPECT_EQ(detailed.prefillTokenCounts, std::vector<int32_t>{64});
     EXPECT_EQ(detailed.decodeRequestIds, std::vector<uint64_t>{2U});
     EXPECT_EQ(detailed.decodeContextLengths, std::vector<int32_t>{128});
+}
+
+TEST(PhaseQueueSchedulerTest, SnapshotSeparatesExplicitSloFromInternalQueueTargets)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalDecodeTpotTargetUs = 80000.0;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 64});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseQueueSnapshot const inherited = scheduler.queueSnapshot();
+    EXPECT_FALSE(inherited.prefillMinimumSlackHasExplicitSlo);
+    EXPECT_TRUE(std::isinf(inherited.prefillMinimumAbsoluteSlackUs));
+    EXPECT_FALSE(inherited.decodeMinimumSlackHasExplicitSlo);
+    EXPECT_TRUE(std::isinf(inherited.decodeMinimumAbsoluteSlackUs));
+
+    PhaseSchedulingHints explicitPrefill;
+    explicitPrefill.ttftTargetUs = 90000.0;
+    PhaseQueueScheduler explicitPrefillScheduler(config);
+    explicitPrefillScheduler.enqueuePrefill({3, 64, 0, 0, 64, true, explicitPrefill});
+    PhaseQueueSnapshot const prefill = explicitPrefillScheduler.queueSnapshot();
+    EXPECT_TRUE(prefill.prefillMinimumSlackHasExplicitSlo);
+    EXPECT_TRUE(std::isfinite(prefill.prefillMinimumAbsoluteSlackUs));
+
+    config.globalDecodeTpotTargetExplicit = true;
+    PhaseQueueScheduler explicitDecodeScheduler(config);
+    explicitDecodeScheduler.enqueueDecode({4, 128});
+    PhaseQueueSnapshot const decode = explicitDecodeScheduler.queueSnapshot();
+    EXPECT_TRUE(decode.decodeMinimumSlackHasExplicitSlo);
+    EXPECT_TRUE(std::isfinite(decode.decodeMinimumAbsoluteSlackUs));
 }
 
 TEST(PhaseQueueSchedulerTest, PagePressurePrefersDecodeWithoutOverridingAnExpiredPrefill)

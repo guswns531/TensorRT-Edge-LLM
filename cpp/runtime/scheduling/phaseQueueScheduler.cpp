@@ -431,6 +431,10 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
                     result.prefillMinTtftSlackUs = slackUs;
                     result.prefillMinimumSlackRequestId = item.requestId;
                     result.prefillCriticalPathRemainingTokens = item.tokenCount;
+                    result.prefillMinimumSlackHasExplicitSlo = requestTarget > 0.0;
+                    result.prefillMinimumAbsoluteSlackUs = requestTarget > 0.0
+                        ? requestTarget - requestAgeUs
+                        : std::numeric_limits<double>::infinity();
                 }
             }
             else
@@ -444,6 +448,11 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
                 {
                     result.decodeMinTpotSlackUs = slackUs;
                     result.decodeMinimumSlackRequestId = item.requestId;
+                    result.decodeMinimumSlackHasExplicitSlo
+                        = requestTarget > 0.0 || mConfig.globalDecodeTpotTargetExplicit;
+                    result.decodeMinimumAbsoluteSlackUs = result.decodeMinimumSlackHasExplicitSlo
+                        ? tpotTarget - itemWaitUs
+                        : std::numeric_limits<double>::infinity();
                 }
             }
             highestPriority = std::max(highestPriority, item.scheduling.priority);
@@ -1948,6 +1957,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 * static_cast<double>(canonicalTurns));
         completion.referenceSource = prefill->referenceSource;
         completion.elapsedServiceUs = state.prefillOldestRequestAgeUs;
+        completion.hasExplicitSlo = state.prefillMinimumSlackHasExplicitSlo;
+        completion.absoluteSlackUs = state.prefillMinimumAbsoluteSlackUs;
         return completion;
     };
     auto protect = [&](PhaseGlobalActionCandidate& candidate, int32_t advancedPrefillTokens, Prediction const& action) {
@@ -1961,10 +1972,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 || candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode;
             double const completion = action.makespanUs + (advancesDecode ? 0.0 : decode->makespanUs);
             double const uncertainty = action.uncertaintyUs + (advancesDecode ? 0.0 : decode->uncertaintyUs);
-            candidate.protectedCompletions.push_back(
-                {decodeSlack, completion, uncertainty, PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
-                    std::max(1.0, decode->referenceWorkUs / static_cast<double>(std::max(1, decodeRows))),
-                    decode->referenceSource, state.decodeOldestWaitUs});
+            PhaseProtectedCompletion protectedDecode{decodeSlack, completion, uncertainty,
+                PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
+                std::max(1.0, decode->referenceWorkUs / static_cast<double>(std::max(1, decodeRows))),
+                decode->referenceSource, state.decodeOldestWaitUs};
+            protectedDecode.hasExplicitSlo = state.decodeMinimumSlackHasExplicitSlo;
+            protectedDecode.absoluteSlackUs = state.decodeMinimumAbsoluteSlackUs;
+            candidate.protectedCompletions.push_back(protectedDecode);
         }
     };
     auto makeDecodeCandidate = [&]() {
@@ -2289,8 +2303,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlapDecodeCompletionUs = static_cast<double>(*decodeP95) * 1000.0;
             overlapDecodeUncertaintyUs = 0.0;
         }
-        candidate.protectedCompletions.push_back(
-            {decodeSlack, overlapDecodeCompletionUs, overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode});
+        PhaseProtectedCompletion protectedDecode{decodeSlack, overlapDecodeCompletionUs,
+            overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
+            std::max(1.0, decode->referenceWorkUs / static_cast<double>(std::max(1, decodeRows))),
+            decode->referenceSource, state.decodeOldestWaitUs};
+        protectedDecode.hasExplicitSlo = state.decodeMinimumSlackHasExplicitSlo;
+        protectedDecode.absoluteSlackUs = state.decodeMinimumAbsoluteSlackUs;
+        candidate.protectedCompletions.push_back(protectedDecode);
         if (decodeFormation.has_value())
         {
             double const currentActionUs

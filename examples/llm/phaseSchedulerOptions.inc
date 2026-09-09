@@ -38,11 +38,13 @@
         if (char const* value = std::getenv("TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS"))
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value) * 1000.0;
+            semanticSchedulerConfig.globalDecodeTpotTargetExplicit = true;
             decodeTpotTargetSource = "vision_decode_tpot_target_ms";
         }
         else if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US"))
         {
             semanticSchedulerConfig.globalDecodeTpotTargetUs = std::stod(value);
+            semanticSchedulerConfig.globalDecodeTpotTargetExplicit = true;
             decodeTpotTargetSource = "global_decode_tpot_target_us";
         }
         LOG_INFO("Phase request SLO contract: decode_tpot_fallback_us=%.3f source=%s request_override=enabled",

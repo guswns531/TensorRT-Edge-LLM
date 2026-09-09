@@ -91,6 +91,14 @@ struct PhaseProtectedCompletion
     //! First-token service uses request submission; decode uses the previous
     //! token commit. It is intentionally independent of an explicit SLO.
     double elapsedServiceUs{};
+    //! Whether this milestone has a user or composition-root absolute SLO.
+    //! The legacy slackUs field may still contain a policy fallback.
+    bool hasExplicitSlo{};
+    //! Absolute request slack only. Infinite means that no external SLO was
+    //! supplied for this milestone.
+    double absoluteSlackUs{std::numeric_limits<double>::infinity()};
+    //! Immutable service-reference generation. Zero is the pre-V3 contract.
+    uint64_t serviceEpoch{};
 };
 
 } // namespace trt_edgellm::rt

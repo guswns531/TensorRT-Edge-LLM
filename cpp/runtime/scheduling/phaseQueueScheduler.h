@@ -588,6 +588,9 @@ struct PhaseQueueSchedulerConfig
     //! Default next-token deadline for bounded WAIT/refill decisions when a
     //! request does not carry an explicit TPOT target.
     double globalDecodeTpotTargetUs{20000.0};
+    //! True when globalDecodeTpotTargetUs is an external composition-root SLO
+    //! rather than the legacy built-in fallback.
+    bool globalDecodeTpotTargetExplicit{};
     float maxPredictedOverlapPrefillMs{30.0F};
     float minObservedOverlapRatio{0.05F};
     //! At or above this page-pool pressure, prefer draining decode work when

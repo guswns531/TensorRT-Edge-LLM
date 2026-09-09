@@ -4188,6 +4188,11 @@ int main(int argc, char** argv)
                                         {"uncertainty_us", completion.uncertaintyUs},
                                         {"reference_us", completion.referenceUs},
                                         {"elapsed_service_us", completion.elapsedServiceUs},
+                                        {"has_explicit_slo", completion.hasExplicitSlo},
+                                        {"absolute_slack_us", std::isfinite(completion.absoluteSlackUs)
+                                                ? nlohmann::json(completion.absoluteSlackUs)
+                                                : nlohmann::json(nullptr)},
+                                        {"service_epoch", completion.serviceEpoch},
                                         {"reference_source",
                                             rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
                                 }
@@ -4231,6 +4236,11 @@ int main(int argc, char** argv)
                                         {"uncertainty_us", completion.uncertaintyUs},
                                         {"reference_us", completion.referenceUs},
                                         {"elapsed_service_us", completion.elapsedServiceUs},
+                                        {"has_explicit_slo", completion.hasExplicitSlo},
+                                        {"absolute_slack_us", std::isfinite(completion.absoluteSlackUs)
+                                                ? nlohmann::json(completion.absoluteSlackUs)
+                                                : nlohmann::json(nullptr)},
+                                        {"service_epoch", completion.serviceEpoch},
                                         {"reference_source",
                                             rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
                                 }

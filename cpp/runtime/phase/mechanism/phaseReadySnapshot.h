@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace trt_edgellm::rt
@@ -59,6 +60,8 @@ struct PhaseQueueSnapshot
     double prefillOldestWaitUs{};
     double prefillOldestRequestAgeUs{};
     double prefillMinTtftSlackUs{};
+    bool prefillMinimumSlackHasExplicitSlo{};
+    double prefillMinimumAbsoluteSlackUs{std::numeric_limits<double>::infinity()};
     //! Request and remaining prompt path owning the minimum first-token slack.
     uint64_t prefillMinimumSlackRequestId{};
     int32_t prefillCriticalPathRemainingTokens{};
@@ -66,6 +69,8 @@ struct PhaseQueueSnapshot
     //! Minimum remaining next-token slack. Request SLOs override the global
     //! fallback used only by WAIT/refill action selection.
     double decodeMinTpotSlackUs{};
+    bool decodeMinimumSlackHasExplicitSlo{};
+    double decodeMinimumAbsoluteSlackUs{std::numeric_limits<double>::infinity()};
     //! Stable tie-broken request owning decodeMinTpotSlackUs.
     uint64_t decodeMinimumSlackRequestId{};
     double prefillMaxSloPressure{};

@@ -213,6 +213,28 @@ TEST(PhaseUnifiedEventTest, StrictSnapshotSignatureIncludesOwnershipAndExactCand
     EXPECT_NE(phaseUnifiedStrictSnapshotSignature(left), phaseUnifiedStrictSnapshotSignature(right));
 }
 
+TEST(PhaseUnifiedEventTest, ScalarPolicySignatureIgnoresServiceTelemetry)
+{
+    PhaseUnifiedEvent left;
+    PhaseUnifiedCandidateSnapshot candidate;
+    candidate.actionId = 1U;
+    candidate.scalarDecisionCostKnown = true;
+    candidate.scalarDecisionMakespanUs = 100.0;
+    PhaseProtectedCompletion completion;
+    completion.kind = PhaseProtectedKind::kDecode;
+    completion.slackUs = 200.0;
+    completion.predictedCompletionUs = 80.0;
+    completion.uncertaintyUs = 5.0;
+    candidate.scalarProtectedCompletions.push_back(completion);
+    left.candidates.push_back(candidate);
+
+    PhaseUnifiedEvent right = left;
+    right.candidates.front().scalarProtectedCompletions.front().hasExplicitSlo = true;
+    right.candidates.front().scalarProtectedCompletions.front().absoluteSlackUs = 123.0;
+    right.candidates.front().scalarProtectedCompletions.front().serviceEpoch = 7U;
+    EXPECT_EQ(phaseUnifiedScalarPolicyStateSignature(left), phaseUnifiedScalarPolicyStateSignature(right));
+}
+
 TEST(PhaseUnifiedEventTest, DispatchSignatureSeparatesBranchesFromOneStrictSnapshot)
 {
     PhaseUnifiedEvent left;

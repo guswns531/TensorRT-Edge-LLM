@@ -2531,6 +2531,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     double encoderSlackUs{std::numeric_limits<double>::infinity()};
     double encoderServiceLagUs{};
     uint64_t encoderProtectedRequestId{};
+    bool encoderHasExplicitSlo{};
+    double encoderAbsoluteSlackUs{std::numeric_limits<double>::infinity()};
     auto const now = std::chrono::steady_clock::now();
     for (size_t const index : encoderBatchIndices)
     {
@@ -2548,6 +2550,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         {
             encoderSlackUs = slackUs;
             encoderProtectedRequestId = request.requestId;
+            encoderHasExplicitSlo = targetUs > 0.0;
+            encoderAbsoluteSlackUs = encoderHasExplicitSlo ? slackUs : std::numeric_limits<double>::infinity();
         }
         encoderServiceLagUs = std::max(encoderServiceLagUs, ageUs);
     }
@@ -2655,6 +2659,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                 + visionPrefillMakespanUs),
         PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
+    encoder.protectedCompletions.back().hasExplicitSlo = encoderHasExplicitSlo;
+    encoder.protectedCompletions.back().absoluteSlackUs = encoderAbsoluteSlackUs;
     PhaseMemoryBrokerConfig const& memoryConfig = mMemoryBroker.config();
     size_t const committedKVBytes = memoryConfig.bytesPerKVPage > 0U
         ? saturatedMultiply(static_cast<size_t>(memoryConfig.committedKVPages), memoryConfig.bytesPerKVPage)
@@ -2681,6 +2687,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                     encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                         + visionPrefillMakespanUs),
                 PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
+        pd->protectedCompletions.back().hasExplicitSlo = encoderHasExplicitSlo;
+        pd->protectedCompletions.back().absoluteSlackUs = encoderAbsoluteSlackUs;
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -2709,6 +2717,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                             + visionPrefillMakespanUs),
                     PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
+            alternative->protectedCompletions.back().hasExplicitSlo = encoderHasExplicitSlo;
+            alternative->protectedCompletions.back().absoluteSlackUs = encoderAbsoluteSlackUs;
             candidates.push_back(std::move(*alternative));
         }
     }
@@ -2946,6 +2956,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                     + visionPrefillMakespanUs),
             PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
+        overlap.protectedCompletions.back().hasExplicitSlo = encoderHasExplicitSlo;
+        overlap.protectedCompletions.back().absoluteSlackUs = encoderAbsoluteSlackUs;
         for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
             completion.predictedCompletionUs = residualAugmentation ? phaseOverlapCompletionUs : overlapMakespanUs;
@@ -3047,6 +3059,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                             + visionPrefillMakespanUs),
                     PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
+            mechanism.protectedCompletions.back().hasExplicitSlo = encoderHasExplicitSlo;
+            mechanism.protectedCompletions.back().absoluteSlackUs = encoderAbsoluteSlackUs;
         }
     }
     for (PhaseGlobalActionCandidate candidate : candidates)

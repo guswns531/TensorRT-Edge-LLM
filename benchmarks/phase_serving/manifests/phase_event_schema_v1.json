@@ -497,6 +497,39 @@
         "uncertainty_us": {
           "type": "number",
           "minimum": 0
+        },
+        "request_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reference_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "elapsed_service_us": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reference_source": {
+          "enum": [
+            "unknown",
+            "runtime_exact",
+            "runtime_interpolated",
+            "runtime_covering",
+            "static_profile",
+            "cold_fallback",
+            "derived_isolated"
+          ]
+        },
+        "has_explicit_slo": {
+          "type": "boolean"
+        },
+        "absolute_slack_us": {
+          "type": ["number", "null"]
+        },
+        "service_epoch": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false
