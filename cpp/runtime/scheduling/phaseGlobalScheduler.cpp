@@ -148,6 +148,25 @@ uint32_t predictedViolationMask(PhaseGlobalActionCandidate const& candidate, dou
     return mask;
 }
 
+double additionalViolationUs(PhaseGlobalActionCandidate const& candidate, double deadlineGuardUs) noexcept
+{
+    auto additional = [deadlineGuardUs](double slackUs, double completionUs) {
+        return std::isfinite(slackUs) ? std::max(0.0, completionUs + deadlineGuardUs - std::max(0.0, slackUs)) : 0.0;
+    };
+    if (candidate.protectedCompletions.empty())
+    {
+        return additional(candidate.minimumProtectedSlackUs, robustCompletionUs(candidate));
+    }
+    double result{};
+    for (auto const& completion : candidate.protectedCompletions)
+    {
+        result = std::max(result,
+            additional(completion.slackUs,
+                std::max(0.0, completion.predictedCompletionUs) + std::max(0.0, completion.uncertaintyUs)));
+    }
+    return result;
+}
+
 double serviceCompression(PhaseGlobalActionCandidate const& candidate) noexcept
 {
     double const makespan = std::max(selectionHorizonUs(candidate), std::numeric_limits<double>::epsilon());
@@ -1046,7 +1065,9 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
             PhaseGlobalActionCandidate const& candidate = candidates[index];
             (*audit)[index] = {candidate.candidateId != 0U ? candidate.candidateId : phaseGlobalCandidateId(candidate),
                 feasibleInput, predictedViolationUs(candidate, mConfig.deadlineGuardUs), false, false,
-                candidate.key.kind, predictedViolationMask(candidate, mConfig.deadlineGuardUs)};
+                candidate.key.kind, predictedViolationMask(candidate, mConfig.deadlineGuardUs),
+                additionalViolationUs(candidate, mConfig.deadlineGuardUs), serviceCompression(candidate),
+                selectionHorizonUs(candidate), candidate.key.primaryBatchSize, candidate.key.secondaryBatchSize};
         }
         if (feasibleInput)
         {

@@ -4113,6 +4113,11 @@ int main(int argc, char** argv)
                                         {"hard_feasible", input.hardFeasible},
                                         {"max_slo_violation_us", input.predictedViolationUs},
                                         {"violation_mask", input.violationMask},
+                                        {"additional_violation_us", input.additionalViolationUs},
+                                        {"service_compression", input.serviceCompression},
+                                        {"selection_horizon_us", input.selectionHorizonUs},
+                                        {"primary_batch", input.primaryBatchSize},
+                                        {"secondary_batch", input.secondaryBatchSize},
                                         {"frontier_eligible", input.frontierEligible}, {"dominated", input.dominated}});
                                 }
                                 constexpr char const* reasons[]{"no_candidate", "no_hard_feasible_candidate",

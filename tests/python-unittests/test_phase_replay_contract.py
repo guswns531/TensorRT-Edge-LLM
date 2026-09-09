@@ -36,9 +36,37 @@ DISTRIBUTIONS = load_tool("report_request_distributions")
 OUTPUTS = load_tool("compare_engine_outputs")
 DISPATCH = load_tool("summarize_compact_dispatch")
 SELECTOR = load_tool("analyze_selector_audit")
+SHADOW = load_tool("analyze_all_late_shadow")
 
 
 class ReplayContractTest(unittest.TestCase):
+
+    def test_all_late_shadow_uses_only_the_actual_eligible_frontier(self):
+        actual = dict(action_id=1,
+                      hard_feasible=True,
+                      frontier_eligible=True,
+                      dominated=False,
+                      additional_violation_us=200.0,
+                      service_compression=1.2,
+                      selection_horizon_us=200.0)
+        lower_delay = dict(actual,
+                           action_id=2,
+                           additional_violation_us=100.0,
+                           service_compression=1.0)
+        pruned = dict(lower_delay,
+                      action_id=3,
+                      additional_violation_us=0.0,
+                      dominated=True)
+        audit = dict(inputs=[actual, lower_delay, pruned],
+                     selected_action_id=1)
+        result = SHADOW.compare(audit)
+        self.assertEqual(result['shadow']['action_id'], 2)
+        self.assertEqual(result['predicted_added_delay_saved_us'], 100.0)
+        self.assertAlmostEqual(result['compression_delta'], -0.2)
+        self.assertEqual(audit['selected_action_id'], 1)
+        lower_delay['additional_violation_us'] = float('nan')
+        with self.assertRaises(ValueError):
+            SHADOW.compare(audit)
 
     def test_restored_decode_selection_is_not_final_dispatch(self):
         candidate = dict(action_id=1,

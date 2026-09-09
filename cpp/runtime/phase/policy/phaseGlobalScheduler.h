@@ -74,6 +74,11 @@ struct PhaseGlobalCandidateAudit
     bool dominated{};
     PhaseGlobalActionKind kind{PhaseGlobalActionKind::kNone};
     uint32_t violationMask{};
+    double additionalViolationUs{};
+    double serviceCompression{};
+    double selectionHorizonUs{};
+    int32_t primaryBatchSize{};
+    int32_t secondaryBatchSize{};
 };
 
 //! Local queue guard outcome before global candidate ranking.

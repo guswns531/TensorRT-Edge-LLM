@@ -87,6 +87,26 @@ TEST(PhaseGlobalSchedulerTest, AuditUsesProtectedCompletionUncertainty)
     EXPECT_DOUBLE_EQ(decision.predictedViolationUs, audit[0].predictedViolationUs);
 }
 
+TEST(PhaseGlobalSchedulerTest, AdditionalViolationAuditExcludesExistingLateness)
+{
+    PhaseGlobalScheduler scheduler({11U, 20.0});
+    auto input = candidate(PhaseGlobalActionKind::kDecode, 100.0, 100.0, -1000.0);
+    input.key.primaryBatchSize = 8;
+    std::vector<PhaseGlobalCandidateAudit> audit;
+    scheduler.select({input}, &audit);
+    EXPECT_DOUBLE_EQ(audit[0].predictedViolationUs, 1120.0);
+    EXPECT_DOUBLE_EQ(audit[0].additionalViolationUs, 120.0);
+    EXPECT_DOUBLE_EQ(audit[0].serviceCompression, 1.0);
+    EXPECT_EQ(audit[0].primaryBatchSize, 8);
+    input.protectedCompletions
+        = {{-1000.0, 150.0, 30.0, PhaseProtectedKind::kDecode}, {100.0, 250.0, 0.0, PhaseProtectedKind::kPrefill}};
+    auto const plain = scheduler.select({input});
+    auto const measured = scheduler.select({input}, &audit);
+    EXPECT_EQ(plain.selectedIndex, measured.selectedIndex);
+    EXPECT_DOUBLE_EQ(audit[0].predictedViolationUs, 1200.0);
+    EXPECT_DOUBLE_EQ(audit[0].additionalViolationUs, 200.0);
+}
+
 TEST(PhaseGlobalSchedulerTest, FinalProtectionCanInvalidateSameIdPreview)
 {
     PhaseGlobalScheduler scheduler;
