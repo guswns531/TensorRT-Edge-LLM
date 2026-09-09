@@ -1712,6 +1712,10 @@ int main(int argc, char** argv)
             ELLM_CHECK(parsed.has_value(), "TRT_EDGELLM_PHASE_POLICY must be exact, scalar, or scalar-transition");
             phasePolicyMode = *parsed;
         }
+        bool const enableServiceNormalizedAuthority = rt::phasePolicyUsesTransition(phasePolicyMode)
+            && std::getenv("TRT_EDGELLM_SERVICE_NORMALIZED_AUTHORITY") != nullptr;
+        semanticSchedulerConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
+            = enableServiceNormalizedAuthority;
         rt::PhaseRuntimeCostTrackerConfig runtimeCostConfig;
         runtimeCostConfig.policyMode = phasePolicyMode;
         runtimeCostConfig.action = semanticSchedulerConfig.globalCostModelConfig;
@@ -2407,6 +2411,8 @@ int main(int argc, char** argv)
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
+                threePhaseConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
+                    = enableServiceNormalizedAuthority;
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
                 threePhaseConfig.enableGlobalPdFrontier = std::getenv("TRT_EDGELLM_GLOBAL_PD_FRONTIER") != nullptr;
                 threePhaseConfig.preserveLegacyPairEligibility
@@ -4138,7 +4144,9 @@ int main(int argc, char** argv)
                                 }
                                 return nlohmann::json{{"inputs", std::move(inputs)}, {"selected_action_id", selectedId},
                                     {"reason", reasons[static_cast<size_t>(decision.reason)]},
-                                    {"selected_violation_us", decision.predictedViolationUs}};
+                                    {"selected_violation_us", decision.predictedViolationUs},
+                                    {"service_normalized_authority", decision.serviceNormalizedAuthorityApplied},
+                                    {"max_normalized_service_age", decision.maxNormalizedServiceAge}};
                             };
                             record["selector_audit"] = auditJson(audit.inputs, audit.decision);
                             record["selector_audit"]["post_select_override"]
@@ -4179,6 +4187,7 @@ int main(int argc, char** argv)
                                         {"predicted_completion_us", completion.predictedCompletionUs},
                                         {"uncertainty_us", completion.uncertaintyUs},
                                         {"reference_us", completion.referenceUs},
+                                        {"elapsed_service_us", completion.elapsedServiceUs},
                                         {"reference_source",
                                             rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
                                 }
@@ -4221,6 +4230,7 @@ int main(int argc, char** argv)
                                         {"predicted_completion_us", completion.predictedCompletionUs},
                                         {"uncertainty_us", completion.uncertaintyUs},
                                         {"reference_us", completion.referenceUs},
+                                        {"elapsed_service_us", completion.elapsedServiceUs},
                                         {"reference_source",
                                             rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
                                 }

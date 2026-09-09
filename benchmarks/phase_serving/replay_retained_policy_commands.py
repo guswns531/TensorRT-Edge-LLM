@@ -81,6 +81,28 @@ def enable_eos_termination(command):
     return result
 
 
+def remap_runtime_build(command, build_cache):
+    """Use the validated Release build without changing the retained workload."""
+    mounts = [value for value in command if value.endswith(":/workspace")]
+    if len(mounts) != 1:
+        raise ValueError("Expected one writable /workspace mount")
+    host_root = pathlib.Path(mounts[0].rsplit(":", 1)[0]).resolve()
+    build_root = build_cache.parent.resolve()
+    try:
+        relative = build_root.relative_to(host_root)
+    except ValueError as error:
+        raise ValueError("Build cache must be below the /workspace mount") from error
+    executable = [
+        value for value in command
+        if value.endswith("/examples/llm/llm_phase_context_smoke")
+    ]
+    if len(executable) != 1:
+        raise ValueError("Expected one phase runtime executable")
+    old_root = str(pathlib.PurePosixPath(executable[0]).parents[2])
+    new_root = str(pathlib.PurePosixPath("/workspace") / relative)
+    return [value.replace(old_root, new_root) for value in command]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commands", type=pathlib.Path, required=True)
@@ -100,6 +122,7 @@ def main():
                         choices=("exact", "scalar", "scalar-transition"),
                         default=["exact", "scalar", "scalar-transition"])
     parser.add_argument("--vision-engine-dir")
+    parser.add_argument("--service-normalized-authority", action="store_true")
     parser.add_argument(
         "--respect-eos",
         action="store_true",
@@ -156,7 +179,7 @@ def main():
     planned = []
     for policy in args.policies:
         for case in args.cases:
-            command = list(selected[case]["command"])
+            command = remap_runtime_build(list(selected[case]["command"]), args.build_cache)
             if args.respect_eos:
                 command = enable_eos_termination(command)
             for option in ("--trace", "--generic-warmup-trace"):
@@ -165,7 +188,12 @@ def main():
                     command[index] = str(documents[pathlib.Path(
                         command[index])][0])
             client_index = command.index("--client-script") + 1
-            client_implementation = command[client_index]
+            client_implementation = selected[case].get("environment", {}).get(
+                "PHASE_TRACE_CLIENT_IMPL", command[client_index])
+            if not pathlib.Path(client_implementation).is_file():
+                raise FileNotFoundError(
+                    "Retained HTTP client implementation is missing: "
+                    f"{client_implementation}")
             command[client_index] = str(
                 pathlib.Path(__file__).resolve().with_name(
                     "guarded_trace_client.py"))
@@ -200,6 +228,11 @@ def main():
                 image = command.index("nvcr.io/nvidia/tensorrt:26.06-py3")
                 command[image:image] = [
                     "-e", "TRT_EDGELLM_PRESERVE_EXPIRED_DECODE_CANDIDATE=1"
+                ]
+            if args.service_normalized_authority:
+                image = command.index("nvcr.io/nvidia/tensorrt:26.06-py3")
+                command[image:image] = [
+                    "-e", "TRT_EDGELLM_SERVICE_NORMALIZED_AUTHORITY=1"
                 ]
             matches = [
                 i for i, value in enumerate(command)

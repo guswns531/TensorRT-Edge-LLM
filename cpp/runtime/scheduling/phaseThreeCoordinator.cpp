@@ -2654,7 +2654,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         std::max(1.0,
             encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                 + visionPrefillMakespanUs),
-        PhaseServiceReferenceSource::kDerivedIsolated});
+        PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
     PhaseMemoryBrokerConfig const& memoryConfig = mMemoryBroker.config();
     size_t const committedKVBytes = memoryConfig.bytesPerKVPage > 0U
         ? saturatedMultiply(static_cast<size_t>(memoryConfig.committedKVPages), memoryConfig.bytesPerKVPage)
@@ -2680,7 +2680,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 std::max(1.0,
                     encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                         + visionPrefillMakespanUs),
-                PhaseServiceReferenceSource::kDerivedIsolated});
+                PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -2708,7 +2708,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                     std::max(1.0,
                         encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                             + visionPrefillMakespanUs),
-                    PhaseServiceReferenceSource::kDerivedIsolated});
+                    PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
             candidates.push_back(std::move(*alternative));
         }
     }
@@ -2945,7 +2945,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             std::max(1.0,
                 encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                     + visionPrefillMakespanUs),
-            PhaseServiceReferenceSource::kDerivedIsolated});
+            PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
         for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
             completion.predictedCompletionUs = residualAugmentation ? phaseOverlapCompletionUs : overlapMakespanUs;
@@ -3046,7 +3046,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                     std::max(1.0,
                         encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
                             + visionPrefillMakespanUs),
-                    PhaseServiceReferenceSource::kDerivedIsolated});
+                    PhaseServiceReferenceSource::kDerivedIsolated, encoderServiceLagUs});
         }
     }
     for (PhaseGlobalActionCandidate candidate : candidates)

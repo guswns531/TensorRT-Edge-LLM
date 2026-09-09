@@ -217,6 +217,33 @@ class ReplayContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             REPLAY.enable_eos_termination(["TRT_EDGELLM_IGNORE_EOS=1"])
 
+    def test_runtime_build_remap_preserves_the_workload_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            build = root / "canonical"
+            build.mkdir()
+            cache = build / "CMakeCache.txt"
+            cache.touch()
+            command = [
+                "docker", "-v", f"{root}:/workspace",
+                "EDGELLM_PLUGIN_PATH=/workspace/old/lib.so",
+                "LD_LIBRARY_PATH=/workspace/old/examples/llm:/opt/tensorrt/lib",
+                "image", "/workspace/old/examples/llm/llm_phase_context_smoke",
+                "/workspace/engine",
+            ]
+
+            changed = REPLAY.remap_runtime_build(command, cache)
+
+            self.assertIn(
+                "EDGELLM_PLUGIN_PATH=/workspace/canonical/lib.so", changed)
+            self.assertIn(
+                "LD_LIBRARY_PATH=/workspace/canonical/examples/llm:/opt/tensorrt/lib",
+                changed)
+            self.assertIn(
+                "/workspace/canonical/examples/llm/llm_phase_context_smoke",
+                changed)
+            self.assertEqual(command[-1], changed[-1])
+
     def test_latency_statistics(self):
         mean, p95 = DISTRIBUTIONS.latency_statistics([1.0, 2.0, 3.0])
         self.assertEqual(mean, 2.0)

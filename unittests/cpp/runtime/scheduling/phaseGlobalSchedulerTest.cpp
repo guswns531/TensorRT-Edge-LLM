@@ -175,6 +175,42 @@ TEST(PhaseGlobalSchedulerTest, ContextualDecisionCostCannotBypassExactDeadlinePr
     EXPECT_EQ(*decision.selectedIndex, 0U);
 }
 
+TEST(PhaseGlobalSchedulerTest, ServiceNormalizationRequiresOneCanonicalRequestFrontier)
+{
+    PhaseGlobalScheduler scheduler({11U, 0.0, true});
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 3000.0, 1000.0, 10000.0);
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 2000.0, 800.0, 10000.0);
+    prefill.protectedCompletions = {
+        {10000.0, 1000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0, PhaseServiceReferenceSource::kRuntimeExact,
+            4000.0},
+        {10000.0, 1800.0, 0.0, PhaseProtectedKind::kDecode, 9U, 500.0, PhaseServiceReferenceSource::kRuntimeExact,
+            1000.0},
+    };
+    decode.protectedCompletions = {
+        {10000.0, 800.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0, PhaseServiceReferenceSource::kRuntimeExact,
+            4000.0},
+        {10000.0, 800.0, 0.0, PhaseProtectedKind::kDecode, 9U, 500.0, PhaseServiceReferenceSource::kRuntimeExact,
+            1000.0},
+    };
+
+    PhaseGlobalDecision const decision = scheduler.select({prefill, decode});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_TRUE(decision.serviceNormalizedAuthorityApplied);
+    EXPECT_DOUBLE_EQ(decision.maxNormalizedServiceAge, 4.8);
+
+    decode.protectedCompletions.back().predictedCompletionUs = 2800.0;
+    PhaseGlobalDecision const tradeoff = scheduler.select({prefill, decode});
+    ASSERT_TRUE(tradeoff.selectedIndex.has_value());
+    EXPECT_EQ(*tradeoff.selectedIndex, 0U);
+    EXPECT_FALSE(tradeoff.serviceNormalizedAuthorityApplied);
+
+    decode.protectedCompletions.pop_back();
+    PhaseGlobalDecision const incomplete = scheduler.select({prefill, decode});
+    EXPECT_FALSE(incomplete.serviceNormalizedAuthorityApplied);
+}
+
 TEST(PhaseGlobalSchedulerTest, SelectsBoundedUnknownProbeInsideTheSingleSelector)
 {
     PhaseGlobalScheduler scheduler;

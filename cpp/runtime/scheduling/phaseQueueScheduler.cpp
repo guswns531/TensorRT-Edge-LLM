@@ -1947,6 +1947,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             prefill->referenceWorkUs / static_cast<double>(std::max(1, prefillRows))
                 * static_cast<double>(canonicalTurns));
         completion.referenceSource = prefill->referenceSource;
+        completion.elapsedServiceUs = state.prefillOldestRequestAgeUs;
         return completion;
     };
     auto protect = [&](PhaseGlobalActionCandidate& candidate, int32_t advancedPrefillTokens, Prediction const& action) {
@@ -1963,7 +1964,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             candidate.protectedCompletions.push_back(
                 {decodeSlack, completion, uncertainty, PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
                     std::max(1.0, decode->referenceWorkUs / static_cast<double>(std::max(1, decodeRows))),
-                    decode->referenceSource});
+                    decode->referenceSource, state.decodeOldestWaitUs});
         }
     };
     auto makeDecodeCandidate = [&]() {

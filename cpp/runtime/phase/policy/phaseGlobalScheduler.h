@@ -56,12 +56,17 @@ struct PhaseGlobalDecision
     double predictedViolationUs{};
     double serviceCompression{};
     size_t hardPeakManagedBytes{};
+    bool serviceNormalizedAuthorityApplied{};
+    double maxNormalizedServiceAge{};
 };
 
 struct PhaseGlobalSchedulerConfig
 {
     size_t maxCandidates{11U};
     double deadlineGuardUs{};
+    //! Rank otherwise-safe candidates by request-local service age only when
+    //! every frontier member covers the same canonical request references.
+    bool enableServiceNormalizedAuthority{};
 };
 
 //! Evaluation of one actual selector input, not a preview-frontier candidate.

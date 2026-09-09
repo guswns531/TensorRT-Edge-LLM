@@ -194,6 +194,94 @@ bool isSlackConstrained(double pressure) noexcept
     return pressure >= kPROTECTED_SLACK_PRESSURE_THRESHOLD;
 }
 
+struct ServiceNormalizedScore
+{
+    double maximum{};
+    double mean{};
+    std::map<uint64_t, double> requestAges;
+};
+
+bool validServiceReference(PhaseProtectedCompletion const& completion) noexcept
+{
+    return completion.requestId != 0U && std::isfinite(completion.referenceUs) && completion.referenceUs > 0.0
+        && std::isfinite(completion.elapsedServiceUs) && completion.elapsedServiceUs >= 0.0
+        && completion.referenceSource != PhaseServiceReferenceSource::kUnknown
+        && completion.referenceSource != PhaseServiceReferenceSource::kColdFallback;
+}
+
+std::optional<std::vector<ServiceNormalizedScore>> serviceNormalizedScores(
+    std::vector<PhaseGlobalActionCandidate> const& candidates, std::vector<size_t> const& frontier)
+{
+    if (frontier.empty())
+    {
+        return std::nullopt;
+    }
+    using Reference = std::tuple<double, PhaseServiceReferenceSource, double>;
+    std::map<uint64_t, Reference> canonical;
+    std::vector<ServiceNormalizedScore> scores;
+    scores.reserve(frontier.size());
+    for (size_t const index : frontier)
+    {
+        std::map<uint64_t, Reference> references;
+        ServiceNormalizedScore score;
+        for (PhaseProtectedCompletion const& completion : candidates[index].protectedCompletions)
+        {
+            if (!validServiceReference(completion)
+                || !references
+                    .emplace(completion.requestId,
+                        Reference{completion.referenceUs, completion.referenceSource, completion.elapsedServiceUs})
+                    .second)
+            {
+                return std::nullopt;
+            }
+            double const robustAge = (completion.elapsedServiceUs + std::max(0.0, completion.predictedCompletionUs)
+                                         + std::max(0.0, completion.uncertaintyUs))
+                / completion.referenceUs;
+            if (!std::isfinite(robustAge))
+            {
+                return std::nullopt;
+            }
+            score.maximum = std::max(score.maximum, robustAge);
+            score.mean += robustAge;
+            score.requestAges.emplace(completion.requestId, robustAge);
+        }
+        if (references.empty())
+        {
+            return std::nullopt;
+        }
+        if (canonical.empty())
+        {
+            canonical = references;
+        }
+        else if (canonical != references)
+        {
+            return std::nullopt;
+        }
+        score.mean /= static_cast<double>(references.size());
+        scores.push_back(score);
+    }
+    return scores;
+}
+
+bool serviceDominates(ServiceNormalizedScore const& left, ServiceNormalizedScore const& right) noexcept
+{
+    if (left.requestAges.size() != right.requestAges.size())
+    {
+        return false;
+    }
+    bool strictlyBetter{};
+    for (auto const& [requestId, leftAge] : left.requestAges)
+    {
+        auto const found = right.requestAges.find(requestId);
+        if (found == right.requestAges.end() || leftAge > found->second)
+        {
+            return false;
+        }
+        strictlyBetter = strictlyBetter || leftAge < found->second;
+    }
+    return strictlyBetter;
+}
+
 bool hardFeasible(PhaseGlobalActionCandidate const& candidate) noexcept
 {
     if (!candidate.dependencySafe || !candidate.contextSafe || !candidate.shapeSafe)
@@ -1234,6 +1322,43 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
             || (!safe.empty() && betterSafe(index, selected)))
         {
             selected = index;
+        }
+    }
+    if (mConfig.enableServiceNormalizedAuthority && exploration.empty() && !safe.empty() && pruned.size() > 1U)
+    {
+        std::optional<std::vector<ServiceNormalizedScore>> const normalized
+            = serviceNormalizedScores(candidates, pruned);
+        if (normalized.has_value())
+        {
+            size_t selectedOffset
+                = static_cast<size_t>(std::distance(pruned.begin(), std::find(pruned.begin(), pruned.end(), selected)));
+            for (size_t offset{}; offset < pruned.size(); ++offset)
+            {
+                if (!serviceDominates((*normalized)[offset], (*normalized)[selectedOffset]))
+                {
+                    continue;
+                }
+                size_t const left = pruned[offset];
+                size_t const right = pruned[selectedOffset];
+                ServiceNormalizedScore const& lhs = (*normalized)[offset];
+                ServiceNormalizedScore const& rhs = (*normalized)[selectedOffset];
+                uint64_t const lhsId = candidates[left].candidateId != 0U ? candidates[left].candidateId
+                                                                          : phaseGlobalCandidateId(candidates[left]);
+                uint64_t const rhsId = candidates[right].candidateId != 0U ? candidates[right].candidateId
+                                                                           : phaseGlobalCandidateId(candidates[right]);
+                if (std::tuple{lhs.maximum, lhs.mean, selectionHorizonUs(candidates[left]), lhsId}
+                    < std::tuple{rhs.maximum, rhs.mean, selectionHorizonUs(candidates[right]), rhsId})
+                {
+                    selectedOffset = offset;
+                }
+            }
+            size_t const normalizedSelection = pruned[selectedOffset];
+            if (normalizedSelection != selected)
+            {
+                selected = normalizedSelection;
+                decision.serviceNormalizedAuthorityApplied = true;
+                decision.maxNormalizedServiceAge = (*normalized)[selectedOffset].maximum;
+            }
         }
     }
     PhaseGlobalActionCandidate const& candidate = candidates[selected];

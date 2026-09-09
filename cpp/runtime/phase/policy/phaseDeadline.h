@@ -87,6 +87,10 @@ struct PhaseProtectedCompletion
     //! Snapshot-fixed isolated service cost for this request's milestone.
     double referenceUs{};
     PhaseServiceReferenceSource referenceSource{PhaseServiceReferenceSource::kUnknown};
+    //! Time already spent waiting for this milestone at the decision boundary.
+    //! First-token service uses request submission; decode uses the previous
+    //! token commit. It is intentionally independent of an explicit SLO.
+    double elapsedServiceUs{};
 };
 
 } // namespace trt_edgellm::rt
