@@ -119,7 +119,8 @@ def main():
                         metavar="OLD=NEW")
     parser.add_argument("--policies",
                         nargs="+",
-                        choices=("exact", "scalar", "scalar-transition"),
+                        choices=("exact", "scalar", "scalar-transition",
+                                 "service-scaled-transition"),
                         default=["exact", "scalar", "scalar-transition"])
     parser.add_argument("--vision-engine-dir")
     parser.add_argument("--text-engine-dir")

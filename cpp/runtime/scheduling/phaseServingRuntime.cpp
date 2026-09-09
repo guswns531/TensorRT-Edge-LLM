@@ -103,6 +103,7 @@ private:
 PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& serving, LLMEngineConfig const& engine)
 {
     PhaseQueueSchedulerConfig config;
+    config.policyMode = serving.policyMode;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     config.maxPrefillBatchSize = engine.maxSupportedPrefillBatchSize;
     config.maxExternalPrefillBatchSize = engine.maxSupportedVisionPrefillBatchSize;

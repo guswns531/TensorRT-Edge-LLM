@@ -878,6 +878,8 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     }
     mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, estimatedPayloadBytes,
         geometry, prefixSubmitted});
+    mEncoderServiceEpochs.emplace(
+        requestId, EncoderServiceEpochRecord{arrival, makeEncoderServiceReference(inputTokens)});
     recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
     bool const started = mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kActive
         && !mConfig.enableEncoderDispatchArbitration && startNextEncoder();
@@ -898,6 +900,7 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
             ELLM_CHECK(mServer.cancel(requestId), "Deferred vision prefix could not be cancelled");
         }
         mPending.erase(pending);
+        mEncoderServiceEpochs.erase(requestId);
         mRequestIds.erase(requestId);
         eraseTpotTarget(requestId);
         return true;
@@ -935,6 +938,64 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         }
     }
     return cancelled;
+}
+
+PhaseServiceReference PhaseThreeCoordinator::makeEncoderServiceReference(size_t inputTokens)
+{
+    constexpr size_t kEncoderTokenBucket = 1024U;
+    int32_t const contextBucket
+        = static_cast<int32_t>((inputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
+    PhaseGlobalActionKey const key{PhaseGlobalActionKind::kEncoder, 1, 0, 0, contextBucket, 0};
+    if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(key))
+    {
+        return {std::max(1.0, static_cast<double>(online->referenceWorkMedianMs) * 1000.0),
+            PhaseServiceReferenceSource::kRuntimeExact, mNextEncoderServiceEpoch++, true};
+    }
+
+    PhaseVisionEncoderBatchCost const* selected{};
+    for (PhaseVisionEncoderBatchCost const& cost : mConfig.encoderBatchCosts)
+    {
+        if (cost.batchSize != 1U || cost.maxInputTokens < inputTokens
+            || (selected != nullptr && selected->maxInputTokens <= cost.maxInputTokens))
+        {
+            continue;
+        }
+        selected = &cost;
+    }
+    if (selected != nullptr)
+    {
+        return {std::max(1.0, static_cast<double>(selected->p95GpuMs) * 1000.0),
+            PhaseServiceReferenceSource::kStaticProfile, mNextEncoderServiceEpoch++, true};
+    }
+    return {std::max(1.0, mConfig.encoderDispatchInitialCostUs), PhaseServiceReferenceSource::kColdFallback,
+        mNextEncoderServiceEpoch++, true};
+}
+
+PhaseServiceState PhaseThreeCoordinator::encoderServiceState() const
+{
+    PhaseServiceState result;
+    auto const now = std::chrono::steady_clock::now();
+    for (PendingVisionRequest const& request : mPending)
+    {
+        auto const epoch = mEncoderServiceEpochs.find(request.requestId);
+        ELLM_CHECK(epoch != mEncoderServiceEpochs.end(), "Pending encoder request has no service epoch");
+        double const readyWaitUs = std::chrono::duration<double, std::micro>(now - epoch->second.startedAt).count();
+        double const age = readyWaitUs / std::max(1.0, epoch->second.reference.serviceUs);
+        if (result.reference.valid && age <= result.serviceAgeQuanta)
+        {
+            continue;
+        }
+        result.requestId = request.requestId;
+        result.readyWaitUs = readyWaitUs;
+        result.serviceAgeQuanta = age;
+        result.reference = epoch->second.reference;
+        result.hasExplicitSlo = request.scheduling.ttftTargetUs > 0.0;
+        result.absoluteSlackUs = result.hasExplicitSlo
+            ? request.scheduling.ttftTargetUs
+                - std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count()
+            : std::numeric_limits<double>::infinity();
+    }
+    return result;
 }
 
 bool PhaseThreeCoordinator::poll()
@@ -1494,6 +1555,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.ready.prefillTokens = server.prefillCandidateTokens;
     event.ready.decodeRows = static_cast<int32_t>(server.decodeQueued);
     event.ready.decodeContextTokens = server.decodeCandidateTokens;
+    event.encoderService = encoderServiceState();
     event.prefillService = server.prefillService;
     event.decodeService = server.decodeService;
     if (mUnifiedDetailedDecisionSnapshots)
@@ -3679,6 +3741,8 @@ bool PhaseThreeCoordinator::startNextEncoder()
         size_t const pendingIndex = batchIndices[selectedIndex] - selectedIndex;
         PendingVisionRequest pending = std::move(mPending[pendingIndex]);
         mPending.erase(mPending.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
+        ELLM_CHECK(mEncoderServiceEpochs.erase(pending.requestId) == 1U,
+            "Dispatched encoder request has no service epoch");
         size_t const requestInputBytes = mediaInputBytes(pending);
         encoderInputBytes = requestInputBytes > std::numeric_limits<size_t>::max() - encoderInputBytes
             ? std::numeric_limits<size_t>::max()

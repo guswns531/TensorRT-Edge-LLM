@@ -1709,9 +1709,11 @@ int main(int argc, char** argv)
         if (char const* value = std::getenv("TRT_EDGELLM_PHASE_POLICY"))
         {
             std::optional<rt::PhasePolicyMode> const parsed = rt::phasePolicyModeFromName(value);
-            ELLM_CHECK(parsed.has_value(), "TRT_EDGELLM_PHASE_POLICY must be exact, scalar, or scalar-transition");
+            ELLM_CHECK(parsed.has_value(),
+                "TRT_EDGELLM_PHASE_POLICY must be exact, scalar, scalar-transition, or service-scaled-transition");
             phasePolicyMode = *parsed;
         }
+        semanticSchedulerConfig.policyMode = phasePolicyMode;
         bool const enableServiceNormalizedAuthority = rt::phasePolicyUsesTransition(phasePolicyMode)
             && std::getenv("TRT_EDGELLM_SERVICE_NORMALIZED_AUTHORITY") != nullptr;
         semanticSchedulerConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
@@ -4287,6 +4289,7 @@ int main(int argc, char** argv)
                             {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
                             {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
                             {"ready", workJson(event.ready)}, {"selected_cohort", workJson(event.cohort)},
+                            {"encoder_service", serviceStateJson(event.encoderService)},
                             {"prefill_service", serviceStateJson(event.prefillService)},
                             {"decode_service", serviceStateJson(event.decodeService)},
                             {"service_clocks",

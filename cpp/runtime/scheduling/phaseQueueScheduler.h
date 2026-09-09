@@ -181,6 +181,7 @@ struct PhaseDispatchMetrics
     int32_t decodeContextTokens{};
     double prefillQueueWaitUs{};
     double decodeQueueWaitUs{};
+    double decodeServiceReferenceUs{};
     float prefillGpuMs{};
     float decodeGpuMs{};
     //! Component completion relative to the current H1 dispatch/augmentation
@@ -392,6 +393,7 @@ struct PhaseOverlapBatchCost
 
 struct PhaseQueueSchedulerConfig
 {
+    PhasePolicyMode policyMode{PhasePolicyMode::kExact};
     //! Profile-free P/D action selection. Shadow mode observes the same queue
     //! state without changing legacy dispatch; active mode owns the decision.
     PhaseGlobalSchedulerMode globalSchedulerMode{PhaseGlobalSchedulerMode::kDisabled};
@@ -654,6 +656,7 @@ struct PhaseDispatchPlan
     //! Oldest selected row's host queue residence before dispatch.
     double prefillQueueWaitUs{};
     double decodeQueueWaitUs{};
+    double decodeServiceReferenceUs{};
     float predictedPrefillGpuMs{};
     float predictedDecodeSlowdownMs{};
     double predictedDecodeDebtUs{};
@@ -923,8 +926,10 @@ private:
     uint64_t mNextServiceEpoch{1U};
     PhaseSchedulerTelemetry mTelemetry;
     using RecentDecodeTpot = std::deque<double>;
+    using RecentDecodeServiceAge = std::deque<double>;
     //! Mechanism previews only read recent histories through the shared tracker.
     std::shared_ptr<RecentDecodeTpot> mRecentDecodeTpotUs;
+    std::shared_ptr<RecentDecodeServiceAge> mRecentDecodeServiceAges;
     bool mDecodeComponentObservationActive{};
     bool mLatencySafeFallback{};
     int32_t mConsecutiveDecodeBatches{};

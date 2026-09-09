@@ -30,6 +30,17 @@ def test_reports_service_scale_and_pseudo_expiration(tmp_path):
         'event_kind': 'decision',
         'host_monotonic_ns': 2_000_000,
         'action_kind': 'prefill',
+        'encoder_service': {
+            'request_id': 3,
+            'reference_us': 20_000.0,
+            'reference_source': 'static_profile',
+            'ready_wait_us': 10_000.0,
+            'reference_valid': True,
+            'has_explicit_slo': True,
+            'absolute_slack_us': 400_000.0,
+            'service_epoch': 1,
+            'service_age_quanta': 0.5,
+        },
         'ready': {
             'decode_rows': 4
         },
@@ -73,6 +84,7 @@ def test_reports_service_scale_and_pseudo_expiration(tmp_path):
     assert result['counts']['prefill_pseudo_expired'] == 1
     assert result['counts']['decode_candidate_suppressed'] == 1
     assert result['counts']['prefill_service_age_over_one'] == 1
+    assert result['service_age_quanta']['encoder']['p50'] == 0.5
     assert result['fixed_scale_to_service_ratio']['prefill']['p50'] == 0.5
     assert result['fixed_scale_to_service_ratio']['decode']['p50'] == 0.25
     assert result['p_only_streak']['maximum'] == 1

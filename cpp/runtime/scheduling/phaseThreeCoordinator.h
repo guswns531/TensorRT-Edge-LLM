@@ -616,7 +616,15 @@ private:
         bool prefixSubmitted{};
     };
 
+    struct EncoderServiceEpochRecord
+    {
+        std::chrono::steady_clock::time_point startedAt;
+        PhaseServiceReference reference;
+    };
+
     bool startNextEncoder();
+    PhaseServiceReference makeEncoderServiceReference(size_t inputTokens);
+    PhaseServiceState encoderServiceState() const;
     bool dispatchGlobalAction();
     bool dispatchGlobalPrefillDecodeResidual(IndependentPhaseServerArbitrationSnapshot const& serverState);
     PhaseExecutionSet observedGlobalExecution() const noexcept;
@@ -665,6 +673,8 @@ private:
     std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
     PhaseMemoryBroker mMemoryBroker;
     std::deque<PendingVisionRequest> mPending;
+    std::unordered_map<uint64_t, EncoderServiceEpochRecord> mEncoderServiceEpochs;
+    uint64_t mNextEncoderServiceEpoch{1U};
     std::vector<PendingVisionRequest> mEncoding;
     std::future<std::shared_ptr<PhaseVisionPreparedBatch>> mEncoderPreparation;
     //! A CPU/preprocess-complete batch awaiting an E/P/D scheduling decision.

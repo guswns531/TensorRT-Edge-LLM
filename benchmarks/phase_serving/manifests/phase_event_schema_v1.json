@@ -177,6 +177,9 @@
     "ready": {
       "$ref": "#/$defs/work"
     },
+    "encoder_service": {
+      "$ref": "#/$defs/serviceState"
+    },
     "prefill_service": {
       "$ref": "#/$defs/serviceState"
     },

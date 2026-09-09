@@ -337,14 +337,19 @@ TEST(PhasePolicyModeTest, ParsesOnlyCanonicalProductionVariants)
     EXPECT_EQ(phasePolicyModeFromName("exact"), PhasePolicyMode::kExact);
     EXPECT_EQ(phasePolicyModeFromName("scalar"), PhasePolicyMode::kContextualScalar);
     EXPECT_EQ(phasePolicyModeFromName("scalar-transition"), PhasePolicyMode::kContextualScalarTransition);
+    EXPECT_EQ(phasePolicyModeFromName("service-scaled-transition"), PhasePolicyMode::kServiceScaledTransition);
     EXPECT_FALSE(phasePolicyModeFromName("completion").has_value());
     EXPECT_FALSE(phasePolicyModeFromName("selective").has_value());
 
     EXPECT_FALSE(phasePolicyUsesContextualScalar(PhasePolicyMode::kExact));
     EXPECT_TRUE(phasePolicyUsesContextualScalar(PhasePolicyMode::kContextualScalar));
     EXPECT_TRUE(phasePolicyUsesContextualScalar(PhasePolicyMode::kContextualScalarTransition));
+    EXPECT_TRUE(phasePolicyUsesContextualScalar(PhasePolicyMode::kServiceScaledTransition));
     EXPECT_FALSE(phasePolicyUsesTransition(PhasePolicyMode::kContextualScalar));
     EXPECT_TRUE(phasePolicyUsesTransition(PhasePolicyMode::kContextualScalarTransition));
+    EXPECT_TRUE(phasePolicyUsesTransition(PhasePolicyMode::kServiceScaledTransition));
+    EXPECT_FALSE(phasePolicyUsesServiceScale(PhasePolicyMode::kContextualScalarTransition));
+    EXPECT_TRUE(phasePolicyUsesServiceScale(PhasePolicyMode::kServiceScaledTransition));
 }
 
 TEST(PhasePolicyModeTest, ExactModeCannotAccidentallyEnableContextualAuthority)

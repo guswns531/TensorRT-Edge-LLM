@@ -337,7 +337,8 @@ void printUsage(char const* programName)
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] "
-                 "[--tpSize=<number>] [--phaseServing] [--phasePolicy=exact|scalar|scalar-transition]";
+                 "[--tpSize=<number>] [--phaseServing] "
+                 "[--phasePolicy=exact|scalar|scalar-transition|service-scaled-transition]";
     std::cerr << " [--specDecode] [--specDraftTopK=<number>] [--specDraftStep=<number>] "
                  "[--specVerifySize=<number>] [--dflashBlockSize=<number>|--jetspecBlockSize=<number>] "
                  "[--dsparkScheduler=off|threshold|sps] "
@@ -361,7 +362,9 @@ void printUsage(char const* programName)
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
     std::cerr << "  --phaseServing            Use continuous asynchronous E/P/D phase serving" << std::endl;
-    std::cerr << "  --phasePolicy             Phase selector: exact, scalar, or scalar-transition" << std::endl;
+    std::cerr << "  --phasePolicy             Phase selector: exact, scalar, scalar-transition, or "
+                 "service-scaled-transition"
+              << std::endl;
     std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
@@ -819,7 +822,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             std::optional<rt::PhasePolicyMode> const policy = rt::phasePolicyModeFromName(optarg);
             if (!policy.has_value())
             {
-                LOG_ERROR("Invalid phasePolicy value: %s (expected exact, scalar, or scalar-transition)", optarg);
+                LOG_ERROR("Invalid phasePolicy value: %s "
+                          "(expected exact, scalar, scalar-transition, or service-scaled-transition)",
+                    optarg);
                 return false;
             }
             args.phasePolicy = *policy;

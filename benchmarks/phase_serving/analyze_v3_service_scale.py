@@ -49,7 +49,7 @@ def _summary(values):
 
 def _protected_services(event):
     unique = {}
-    for kind in FIXED_SCALE_US:
+    for kind in ('encoder', 'prefill', 'decode'):
         state = event.get(f'{kind}_service', {})
         if state.get('reference_valid'):
             service = {
@@ -137,11 +137,13 @@ def analyze(path):
             reference = service.get('reference_us')
             elapsed = service.get('elapsed_service_us')
             source = service.get('reference_source', 'unknown')
-            if kind not in FIXED_SCALE_US or reference is None or elapsed is None or reference <= 0:
+            if kind not in ('encoder', 'prefill', 'decode') or reference is None or elapsed is None or reference <= 0:
                 continue
             source_counts[f'{kind}:{source}'] += 1
-            fixed_to_service[kind].append(FIXED_SCALE_US[kind] / reference)
             service_ages[kind].append(elapsed / reference)
+            if kind in FIXED_SCALE_US:
+                fixed_to_service[kind].append(FIXED_SCALE_US[kind] /
+                                              reference)
             explicit = bool(service.get('has_explicit_slo', False))
             counts[f'{kind}_explicit_slo'] += int(explicit)
             counts[f'{kind}_no_explicit_slo'] += int(not explicit)

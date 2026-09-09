@@ -410,6 +410,7 @@ struct PhaseUnifiedEvent
     PhaseExecutionSet plannedOutstanding{PhaseExecutionSet::kNone};
     PhaseExecutionSet observedOutstanding{PhaseExecutionSet::kNone};
     PhaseUnifiedWork ready;
+    PhaseServiceState encoderService;
     PhaseServiceState prefillService;
     PhaseServiceState decodeService;
     //! Canonical ready lineages. Transient timestamps and process-local

@@ -65,6 +65,7 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
                     return trackerConfig;
                 }()))
     , mRecentDecodeTpotUs(std::make_shared<RecentDecodeTpot>())
+    , mRecentDecodeServiceAges(std::make_shared<RecentDecodeServiceAge>())
     , mDecodeComponentObservationActive(mConfig.enableDecodeComponentObservation)
 {
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
@@ -488,14 +489,8 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
             check::check(timestamp != mQueuedSince.end(), "Queued request has no residence timestamp");
             double const itemWaitUs = std::chrono::duration<double, std::micro>(now - timestamp->second).count();
             waitUs = std::max(waitUs, itemWaitUs);
-            double const requestTarget = prefill ? item.scheduling.ttftTargetUs : item.scheduling.tpotTargetUs;
-            double const target = requestTarget > 0.0
-                ? requestTarget
-                : (prefill ? mConfig.prefillQueueWaitTargetUs : mConfig.decodeQueueWaitTargetUs);
             double const requestAgeUs
                 = std::chrono::duration<double, std::micro>(now - item.scheduling.submittedAt).count();
-            double const sloAgeUs = prefill ? requestAgeUs : itemWaitUs;
-            maxSloPressure = std::max(maxSloPressure, sloAgeUs / target);
             auto const& serviceEpochs = prefill ? mPrefillServiceEpochs : mDecodeServiceEpochs;
             auto const serviceEpoch = serviceEpochs.find(item.requestId);
             check::check(serviceEpoch != serviceEpochs.end(), "Queued request has no service epoch");
@@ -503,6 +498,14 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
                 = std::chrono::duration<double, std::micro>(now - serviceEpoch->second.startedAt).count();
             double const serviceAgeQuanta
                 = serviceWaitUs / std::max(1.0, serviceEpoch->second.reference.serviceUs);
+            double const requestTarget = prefill ? item.scheduling.ttftTargetUs : item.scheduling.tpotTargetUs;
+            double const target = requestTarget > 0.0
+                ? requestTarget
+                : (prefill ? mConfig.prefillQueueWaitTargetUs : mConfig.decodeQueueWaitTargetUs);
+            double const sloAgeUs = prefill ? requestAgeUs : itemWaitUs;
+            double const internalPressure
+                = phasePolicyUsesServiceScale(mConfig.policyMode) ? serviceAgeQuanta : sloAgeUs / target;
+            maxSloPressure = std::max(maxSloPressure, internalPressure);
             PhaseServiceState& service = prefill ? result.prefillService : result.decodeService;
             if (!service.reference.valid || serviceAgeQuanta > service.serviceAgeQuanta)
             {
@@ -520,6 +523,11 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
             if (prefill)
             {
                 result.prefillOldestRequestAgeUs = std::max(result.prefillOldestRequestAgeUs, requestAgeUs);
+                if (phasePolicyUsesServiceScale(mConfig.policyMode) && requestTarget <= 0.0)
+                {
+                    highestPriority = std::max(highestPriority, item.scheduling.priority);
+                    continue;
+                }
                 double const slackUs = target - requestAgeUs;
                 if (slackUs < result.prefillMinTtftSlackUs
                     || (slackUs == result.prefillMinTtftSlackUs
@@ -538,6 +546,12 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
             else
             {
                 double const tpotTarget = requestTarget > 0.0 ? requestTarget : mConfig.globalDecodeTpotTargetUs;
+                if (phasePolicyUsesServiceScale(mConfig.policyMode) && requestTarget <= 0.0
+                    && !mConfig.globalDecodeTpotTargetExplicit)
+                {
+                    highestPriority = std::max(highestPriority, item.scheduling.priority);
+                    continue;
+                }
                 double const slackUs = tpotTarget - itemWaitUs;
                 if (slackUs < result.decodeMinTpotSlackUs
                     || (slackUs == result.decodeMinTpotSlackUs
@@ -561,6 +575,31 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
         mPrefillQueue, true, result.prefillOldestWaitUs, result.prefillMaxSloPressure, result.prefillHighestPriority);
     summarizeQueue(
         mDecodeQueue, false, result.decodeOldestWaitUs, result.decodeMaxSloPressure, result.decodeHighestPriority);
+    bool const missingPrefillDeadline
+        = result.prefillMinTtftSlackUs == std::numeric_limits<double>::max();
+    if (phasePolicyUsesServiceScale(mConfig.policyMode) && missingPrefillDeadline
+        && result.prefillService.reference.valid)
+    {
+        result.prefillMinTtftSlackUs = std::numeric_limits<double>::infinity();
+        result.prefillMinimumSlackRequestId = result.prefillService.requestId;
+        auto const item = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(), [&](PhaseWorkItem const& row) {
+            return row.requestId == result.prefillService.requestId;
+        });
+        if (item != mPrefillQueue.end())
+        {
+            result.prefillCriticalPathRemainingTokens = item->tokenCount;
+        }
+        result.prefillMinimumSlackHasExplicitSlo = false;
+        result.prefillMinimumAbsoluteSlackUs = std::numeric_limits<double>::infinity();
+    }
+    bool const missingDecodeDeadline = result.decodeMinTpotSlackUs == std::numeric_limits<double>::max();
+    if (phasePolicyUsesServiceScale(mConfig.policyMode) && missingDecodeDeadline && result.decodeService.reference.valid)
+    {
+        result.decodeMinTpotSlackUs = std::numeric_limits<double>::infinity();
+        result.decodeMinimumSlackRequestId = result.decodeService.requestId;
+        result.decodeMinimumSlackHasExplicitSlo = false;
+        result.decodeMinimumAbsoluteSlackUs = std::numeric_limits<double>::infinity();
+    }
     if (result.prefillQueued == 0)
     {
         result.prefillMinTtftSlackUs = 0.0;
@@ -989,8 +1028,11 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         return overlap && mConfig.enableTpotHardGuard && mConfig.requireDirectOverlapCost ? -1 : 0;
     }
 
-    double const remainingDecodeUs
-        = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
+    double const decodeServiceTargetUs = phasePolicyUsesServiceScale(mConfig.policyMode)
+            && state.decodeService.reference.valid
+        ? state.decodeService.reference.serviceUs
+        : mConfig.decodeQueueWaitTargetUs;
+    double const remainingDecodeUs = std::max(0.0, decodeServiceTargetUs * (1.0 - state.decodeMaxSloPressure));
     double const allowedInterferenceUs = remainingDecodeUs * mConfig.decodeSlackSafetyFactor;
     bool const prefillRecovery
         = mConfig.enablePrefillSloRecovery && state.prefillMaxSloPressure >= 1.0 && state.decodeMaxSloPressure < 1.0;
@@ -1076,11 +1118,30 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         {
             return priorityRank(lhs) > priorityRank(rhs);
         }
+        bool const lhsExplicit = lhs.scheduling.ttftTargetUs > 0.0;
+        bool const rhsExplicit = rhs.scheduling.ttftTargetUs > 0.0;
+        if (phasePolicyUsesServiceScale(mConfig.policyMode) && lhsExplicit != rhsExplicit)
+        {
+            return lhsExplicit;
+        }
         double const lhsSlack = ttftSlack(lhs);
         double const rhsSlack = ttftSlack(rhs);
-        if (lhsSlack != rhsSlack)
+        if ((!phasePolicyUsesServiceScale(mConfig.policyMode) || lhsExplicit) && lhsSlack != rhsSlack)
         {
             return lhsSlack < rhsSlack;
+        }
+        if (phasePolicyUsesServiceScale(mConfig.policyMode) && !lhsExplicit)
+        {
+            ServiceEpochRecord const& lhsEpoch = mPrefillServiceEpochs.at(lhs.requestId);
+            ServiceEpochRecord const& rhsEpoch = mPrefillServiceEpochs.at(rhs.requestId);
+            double const lhsAge = std::chrono::duration<double, std::micro>(now - lhsEpoch.startedAt).count()
+                / std::max(1.0, lhsEpoch.reference.serviceUs);
+            double const rhsAge = std::chrono::duration<double, std::micro>(now - rhsEpoch.startedAt).count()
+                / std::max(1.0, rhsEpoch.reference.serviceUs);
+            if (lhsAge != rhsAge)
+            {
+                return lhsAge > rhsAge;
+            }
         }
         auto const lhsQueued = mQueuedSince.at(lhs.requestId);
         auto const rhsQueued = mQueuedSince.at(rhs.requestId);
@@ -1666,8 +1727,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         return (std::max(0, tokens) + contextBucketTokens - 1) / contextBucketTokens;
     };
 
-    bool const prefillDeadlineExpired
-        = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U && state.prefillMinTtftSlackUs <= 0.0;
+    bool const prefillDeadlineExpired = mConfig.enablePrefillTtftHardGuard && state.prefillQueued > 0U
+        && state.prefillMinTtftSlackUs <= 0.0
+        && (!phasePolicyUsesServiceScale(mConfig.policyMode) || state.prefillMinimumSlackHasExplicitSlo);
     PhaseDispatchPlan const prefillPlan
         = state.prefillQueued > 0U ? previewMechanismPlan(PhaseDispatchKind::kPrefill) : PhaseDispatchPlan{};
     int32_t const prefillRows = static_cast<int32_t>(prefillPlan.prefillBatch.size());
@@ -2129,8 +2191,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         protect(candidate, protectedPrefillAdvance(prefillPlan.prefillBatch), *prefill);
         candidates.push_back(std::move(candidate));
     }
-    bool const preserveExpiredDecode
-        = mConfig.preserveExpiredDecodeCandidate && state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0;
+    bool const preserveExpiredDecode = phasePolicyUsesServiceScale(mConfig.policyMode)
+        || (mConfig.preserveExpiredDecodeCandidate && state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0);
     if (audit != nullptr)
     {
         bool const guardApplies = prefillDeadlineExpired && allowDecode && decode.has_value();
@@ -3402,6 +3464,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.adaptiveChunkObservedTpotPressure = mTelemetry.recentDecodeTpotPressure;
     plan.adaptiveChunkCombinedPressure = plan.adaptiveChunkDecodeQueuePressure * plan.adaptiveChunkObservedTpotPressure;
     plan.latencySafeFallback = mLatencySafeFallback;
+    plan.decodeServiceReferenceUs
+        = state.decodeService.reference.valid ? state.decodeService.reference.serviceUs : 0.0;
     plan.overlapEvaluatedByCost = kind == PhaseDispatchKind::kOverlap && mConfig.enableCostAwareOverlapAdmission
         && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
     plan.externalEncoderActive = mExternalEncoderActive;
@@ -3899,11 +3963,15 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
               return estimatedDrainCostMs(lhs) < estimatedDrainCostMs(rhs);
           });
     float const minimumDrainCostMs = estimatedDrainCostMs(*minimumDrainCandidate);
+    double const decodeServiceTargetUs = phasePolicyUsesServiceScale(mConfig.policyMode)
+            && state.decodeService.reference.valid
+        ? state.decodeService.reference.serviceUs
+        : mConfig.decodeQueueWaitTargetUs;
     bool const deadlineInfeasibleAtIdle
-        = static_cast<double>(minimumDrainCostMs) * 1000.0 > mConfig.decodeQueueWaitTargetUs;
+        = static_cast<double>(minimumDrainCostMs) * 1000.0 > decodeServiceTargetUs;
     bool const urgent
         = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold || deadlineInfeasibleAtIdle;
-    double const remainingUs = std::max(0.0, mConfig.decodeQueueWaitTargetUs * (1.0 - state.decodeMaxSloPressure));
+    double const remainingUs = std::max(0.0, decodeServiceTargetUs * (1.0 - state.decodeMaxSloPressure));
     Candidate const* selected{};
     for (Candidate const& candidate : candidates)
     {
@@ -4161,9 +4229,21 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         }
         double const sampleUs = metrics.decodeQueueWaitUs + static_cast<double>(metrics.decodeGpuMs) * 1000.0;
         mRecentDecodeTpotUs->push_back(sampleUs);
+        if (!mRecentDecodeServiceAges.unique())
+        {
+            mRecentDecodeServiceAges = std::make_shared<RecentDecodeServiceAge>(*mRecentDecodeServiceAges);
+        }
+        if (metrics.decodeServiceReferenceUs > 0.0)
+        {
+            mRecentDecodeServiceAges->push_back(sampleUs / metrics.decodeServiceReferenceUs);
+        }
         if (mRecentDecodeTpotUs->size() > mConfig.tpotHysteresisWindow)
         {
             mRecentDecodeTpotUs->pop_front();
+        }
+        while (mRecentDecodeServiceAges->size() > mConfig.tpotHysteresisWindow)
+        {
+            mRecentDecodeServiceAges->pop_front();
         }
         ++mTelemetry.decodeTpotSampleCount;
         if (mRecentDecodeTpotUs->size() >= mConfig.minTpotHysteresisSamples)
@@ -4172,8 +4252,20 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             std::sort(ordered.begin(), ordered.end());
             size_t const p95Index = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(ordered.size()))) - 1;
             mTelemetry.recentDecodeTpotP95Us = ordered[p95Index];
-            mTelemetry.recentDecodeTpotPressure
-                = static_cast<float>(mTelemetry.recentDecodeTpotP95Us / mConfig.decodeQueueWaitTargetUs);
+            if (phasePolicyUsesServiceScale(mConfig.policyMode) && !mRecentDecodeServiceAges->empty())
+            {
+                std::vector<double> serviceAges(
+                    mRecentDecodeServiceAges->begin(), mRecentDecodeServiceAges->end());
+                std::sort(serviceAges.begin(), serviceAges.end());
+                size_t const serviceP95Index
+                    = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(serviceAges.size()))) - 1;
+                mTelemetry.recentDecodeTpotPressure = static_cast<float>(serviceAges[serviceP95Index]);
+            }
+            else
+            {
+                mTelemetry.recentDecodeTpotPressure
+                    = static_cast<float>(mTelemetry.recentDecodeTpotP95Us / mConfig.decodeQueueWaitTargetUs);
+            }
             if (mConfig.enableTpotHysteresis)
             {
                 bool const previousFallback = mLatencySafeFallback;
@@ -4290,6 +4382,7 @@ void PhaseQueueScheduler::resetSchedulingHistory()
         "Scheduling history can only be reset while the scheduler is idle");
     mTelemetry = {};
     mRecentDecodeTpotUs = std::make_shared<RecentDecodeTpot>();
+    mRecentDecodeServiceAges = std::make_shared<RecentDecodeServiceAge>();
     mLatencySafeFallback = false;
     mConsecutiveDecodeBatches = 0;
     mConsecutiveOverlapBatches = 0;

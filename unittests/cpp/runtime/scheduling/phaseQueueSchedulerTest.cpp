@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <set>
+#include <thread>
 
 namespace trt_edgellm
 {
@@ -2342,8 +2343,10 @@ TEST(PhaseQueueSchedulerTest, SnapshotSeparatesExplicitSloFromInternalQueueTarge
     PhaseQueueSnapshot const inherited = scheduler.queueSnapshot();
     EXPECT_FALSE(inherited.prefillMinimumSlackHasExplicitSlo);
     EXPECT_TRUE(std::isinf(inherited.prefillMinimumAbsoluteSlackUs));
+    EXPECT_TRUE(std::isfinite(inherited.prefillMinTtftSlackUs));
     EXPECT_FALSE(inherited.decodeMinimumSlackHasExplicitSlo);
     EXPECT_TRUE(std::isinf(inherited.decodeMinimumAbsoluteSlackUs));
+    EXPECT_TRUE(std::isfinite(inherited.decodeMinTpotSlackUs));
 
     PhaseSchedulingHints explicitPrefill;
     explicitPrefill.ttftTargetUs = 90000.0;
@@ -2359,6 +2362,96 @@ TEST(PhaseQueueSchedulerTest, SnapshotSeparatesExplicitSloFromInternalQueueTarge
     PhaseQueueSnapshot const decode = explicitDecodeScheduler.queueSnapshot();
     EXPECT_TRUE(decode.decodeMinimumSlackHasExplicitSlo);
     EXPECT_TRUE(std::isfinite(decode.decodeMinimumAbsoluteSlackUs));
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledModeDoesNotCreateImplicitDeadlines)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.prefillQueueWaitTargetUs = 1.0;
+    config.decodeQueueWaitTargetUs = 1.0;
+    config.globalDecodeTpotTargetUs = 1.0;
+    config.globalColdPrefillMsPerToken = 0.001F;
+    config.globalColdDecodeMs = 0.001F;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 1});
+    scheduler.enqueueDecode({2, 128});
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    PhaseQueueSnapshot const state = scheduler.queueSnapshot();
+
+    EXPECT_TRUE(std::isinf(state.prefillMinTtftSlackUs));
+    EXPECT_TRUE(std::isinf(state.decodeMinTpotSlackUs));
+    EXPECT_FALSE(state.prefillMinimumSlackHasExplicitSlo);
+    EXPECT_FALSE(state.decodeMinimumSlackHasExplicitSlo);
+    EXPECT_GT(state.prefillMaxSloPressure, 1.0);
+    EXPECT_GT(state.decodeMaxSloPressure, 1.0);
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledModeKeepsExplicitDeadlinesAbsolute)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.globalDecodeTpotTargetUs = 80000.0;
+    config.globalDecodeTpotTargetExplicit = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints prefill;
+    prefill.ttftTargetUs = 500000.0;
+    scheduler.enqueuePrefill({1, 64, 0, 0, 64, true, prefill});
+    scheduler.enqueueDecode({2, 128});
+
+    PhaseQueueSnapshot const state = scheduler.queueSnapshot();
+
+    EXPECT_TRUE(state.prefillMinimumSlackHasExplicitSlo);
+    EXPECT_TRUE(state.decodeMinimumSlackHasExplicitSlo);
+    EXPECT_TRUE(std::isfinite(state.prefillMinTtftSlackUs));
+    EXPECT_TRUE(std::isfinite(state.decodeMinTpotSlackUs));
+    EXPECT_TRUE(std::isfinite(state.prefillMinimumAbsoluteSlackUs));
+    EXPECT_TRUE(std::isfinite(state.decodeMinimumAbsoluteSlackUs));
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledModePreservesStandaloneDecodeCandidate)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enablePrefillTtftHardGuard = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints expired;
+    expired.submittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    expired.ttftTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, expired});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseGlobalSelectionAudit audit;
+    scheduler.previewGlobalAction(&audit);
+
+    ASSERT_TRUE(audit.decodeGuard.has_value());
+    EXPECT_TRUE(audit.decodeGuard->prefillExpired);
+    EXPECT_TRUE(audit.decodeGuard->candidateRestored);
+    EXPECT_FALSE(audit.decodeGuard->candidateSuppressed);
+    EXPECT_TRUE(scheduler.previewGlobalDecodeAction().has_value());
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledRecentDecodePressureUsesFrozenReference)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.enableDecodeTpotTelemetry = true;
+    config.tpotHysteresisWindow = 2;
+    config.minTpotHysteresisSamples = 2;
+    config.decodeQueueWaitTargetUs = 2000.0;
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kDecode;
+    metrics.decodeBatchSize = 4;
+    metrics.decodeGpuMs = 4.0F;
+    metrics.decodeServiceReferenceUs = 8000.0;
+    scheduler.observeMetrics(metrics);
+    scheduler.observeMetrics(metrics);
+
+    EXPECT_FLOAT_EQ(scheduler.telemetry().recentDecodeTpotPressure, 0.5F);
 }
 
 TEST(PhaseQueueSchedulerTest, ServiceReferenceIsFrozenUntilRealPrefillProgress)

@@ -393,6 +393,7 @@ bool PhaseDispatchWorker::dispatchNext()
     }
     mCurrentMetrics.prefillQueueWaitUs = mInFlight.prefillQueueWaitUs;
     mCurrentMetrics.decodeQueueWaitUs = mInFlight.decodeQueueWaitUs;
+    mCurrentMetrics.decodeServiceReferenceUs = mInFlight.decodeServiceReferenceUs;
     if (mCallbacks.onDispatch)
     {
         mCallbacks.onDispatch(mCurrentMetrics);
@@ -550,6 +551,10 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
     mInFlight.concurrentPrefillActive = true;
     mInFlight.prefillQueueWaitUs = std::max(mInFlight.prefillQueueWaitUs, additional.prefillQueueWaitUs);
     mInFlight.decodeQueueWaitUs = std::max(mInFlight.decodeQueueWaitUs, additional.decodeQueueWaitUs);
+    if (additional.decodeServiceReferenceUs > 0.0)
+    {
+        mInFlight.decodeServiceReferenceUs = additional.decodeServiceReferenceUs;
+    }
     if (!additional.prefillBatch.empty())
     {
         mInFlight.predictedPrefillGpuMs = additional.predictedPrefillGpuMs;
@@ -635,6 +640,7 @@ void PhaseDispatchWorker::mergeAugmentedMetrics(PhaseDispatchPlan const& additio
             = std::max(mCurrentMetrics.plannedDecodeMaxContextLength, item.tokenCount);
     }
     mCurrentMetrics.decodeTokens = mCurrentMetrics.decodeBatchSize;
+    mCurrentMetrics.decodeServiceReferenceUs = mInFlight.decodeServiceReferenceUs;
     mCurrentMetrics.concurrentPrefillActive = true;
     mCurrentMetrics.globalDecisionEvaluated = true;
     mCurrentMetrics.globalDecisionApplied = true;

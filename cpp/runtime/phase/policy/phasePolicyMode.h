@@ -30,6 +30,7 @@ enum class PhasePolicyMode
     kExact,
     kContextualScalar,
     kContextualScalarTransition,
+    kServiceScaledTransition,
 };
 
 inline char const* phasePolicyModeName(PhasePolicyMode mode) noexcept
@@ -39,6 +40,7 @@ inline char const* phasePolicyModeName(PhasePolicyMode mode) noexcept
     case PhasePolicyMode::kExact: return "exact";
     case PhasePolicyMode::kContextualScalar: return "scalar";
     case PhasePolicyMode::kContextualScalarTransition: return "scalar-transition";
+    case PhasePolicyMode::kServiceScaledTransition: return "service-scaled-transition";
     }
     return "unknown";
 }
@@ -57,6 +59,10 @@ inline std::optional<PhasePolicyMode> phasePolicyModeFromName(std::string_view n
     {
         return PhasePolicyMode::kContextualScalarTransition;
     }
+    if (name == "service-scaled-transition")
+    {
+        return PhasePolicyMode::kServiceScaledTransition;
+    }
     return std::nullopt;
 }
 
@@ -67,7 +73,12 @@ inline bool phasePolicyUsesContextualScalar(PhasePolicyMode mode) noexcept
 
 inline bool phasePolicyUsesTransition(PhasePolicyMode mode) noexcept
 {
-    return mode == PhasePolicyMode::kContextualScalarTransition;
+    return mode == PhasePolicyMode::kContextualScalarTransition || mode == PhasePolicyMode::kServiceScaledTransition;
+}
+
+inline bool phasePolicyUsesServiceScale(PhasePolicyMode mode) noexcept
+{
+    return mode == PhasePolicyMode::kServiceScaledTransition;
 }
 
 } // namespace trt_edgellm::rt
