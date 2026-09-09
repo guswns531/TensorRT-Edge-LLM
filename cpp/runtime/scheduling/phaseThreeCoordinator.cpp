@@ -332,6 +332,19 @@ PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
     return result;
 }
 
+bool phaseNoSloServiceRecoveryDue(PhaseServiceState const& service) noexcept
+{
+    constexpr double kSERVICE_RECOVERY_AGE_QUANTA = 1.0;
+    return service.reference.valid && !service.hasExplicitSlo
+        && service.serviceAgeQuanta >= kSERVICE_RECOVERY_AGE_QUANTA;
+}
+
+size_t phaseVisionSafeThroughputCapacity(
+    size_t baseCapacity, size_t throughputCapacity, size_t maxEncodedBytes) noexcept
+{
+    return maxEncodedBytes > 0U ? throughputCapacity : baseCapacity;
+}
+
 PhaseSchedulingHints phaseVisionSchedulingHints(
     PhaseSchedulingHints scheduling, double defaultTtftTargetUs, std::chrono::steady_clock::time_point now)
 {
@@ -674,7 +687,11 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     : mVision(vision)
     , mServer(server)
     , mConfig(config)
-    , mGlobalScheduler(mConfig.globalSchedulerConfig)
+    , mGlobalScheduler([&] {
+        PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
+        global.enableServiceRecovery = phasePolicyUsesServiceScale(mConfig.policyMode);
+        return global;
+    }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
               ? mConfig.runtimeCostTracker
               : std::make_shared<PhaseRuntimeCostTracker>([&] {
@@ -686,6 +703,12 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mMemoryBroker(mConfig.memoryBroker)
     , mGlobalFormationRealizedTracker({mConfig.globalFormationRealizedDispatches, 8U})
 {
+    if (phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.visionTtftTargetExplicit)
+    {
+        mConfig.visionTtftTargetUs = 0.0;
+    }
+    mConfig.throughputMaxEncodedInFlight = phaseVisionSafeThroughputCapacity(
+        mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight, mConfig.maxEncodedBytes);
     ELLM_CHECK(mConfig.maxEncodedInFlight > 0, "Three-phase encoded request capacity must be positive");
     ELLM_CHECK(
         mConfig.throughputMaxEncodedInFlight == 0 || mConfig.throughputMaxEncodedInFlight >= mConfig.maxEncodedInFlight,
@@ -943,8 +966,7 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
 PhaseServiceReference PhaseThreeCoordinator::makeEncoderServiceReference(size_t inputTokens)
 {
     constexpr size_t kEncoderTokenBucket = 1024U;
-    int32_t const contextBucket
-        = static_cast<int32_t>((inputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
+    int32_t const contextBucket = static_cast<int32_t>((inputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
     PhaseGlobalActionKey const key{PhaseGlobalActionKind::kEncoder, 1, 0, 0, contextBucket, 0};
     if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(key))
     {
@@ -990,10 +1012,9 @@ PhaseServiceState PhaseThreeCoordinator::encoderServiceState() const
         result.serviceAgeQuanta = age;
         result.reference = epoch->second.reference;
         result.hasExplicitSlo = request.scheduling.ttftTargetUs > 0.0;
-        result.absoluteSlackUs = result.hasExplicitSlo
-            ? request.scheduling.ttftTargetUs
+        result.absoluteSlackUs = result.hasExplicitSlo ? request.scheduling.ttftTargetUs
                 - std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count()
-            : std::numeric_limits<double>::infinity();
+                                                       : std::numeric_limits<double>::infinity();
     }
     return result;
 }
@@ -2764,10 +2785,19 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     {
         candidates.push_back(*pd);
     }
-    if (mConfig.enableGlobalPdFrontier && !residualAugmentation && !mGlobalWarmupProbeMode)
+    auto const serviceRecoveryDue = [&](PhaseGlobalActionKind kind) {
+        PhaseServiceState const& service
+            = kind == PhaseGlobalActionKind::kPrefill ? serverState.prefillService : serverState.decodeService;
+        return phasePolicyUsesServiceScale(mConfig.policyMode) && phaseNoSloServiceRecoveryDue(service);
+    };
+    if (!residualAugmentation && !mGlobalWarmupProbeMode)
     {
         for (PhaseGlobalActionKind const kind : {PhaseGlobalActionKind::kPrefill, PhaseGlobalActionKind::kDecode})
         {
+            if (!mConfig.enableGlobalPdFrontier && !serviceRecoveryDue(kind))
+            {
+                continue;
+            }
             auto alternative = frontierCandidate(kind);
             if (!alternative.has_value() || (pd.has_value() && alternative->candidateId == pd->candidateId))
             {
@@ -2810,7 +2840,10 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         double phaseOverlapCompletionUs{};
         double phaseOverlapCompletionUncertaintyUs{};
         bool residualDerivedFromFullCost{};
+        PhaseServiceReferenceSource overlapCostSource{PhaseServiceReferenceSource::kDerivedIsolated};
         std::optional<PhaseGlobalCostEstimate> online = mRuntimeCostTracker->estimate(overlapKey);
+        overlapCostSource
+            = online.has_value() ? PhaseServiceReferenceSource::kRuntimeExact : overlapCostSource;
         if (!online.has_value() && residualAugmentation)
         {
             PhaseGlobalActionKey fullKey = overlapKey;
@@ -2818,6 +2851,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             fullKey.residualAnchor = PhaseGlobalResidualAnchor::kNone;
             online = mRuntimeCostTracker->estimate(fullKey);
             residualDerivedFromFullCost = online.has_value();
+            overlapCostSource
+                = online.has_value() ? PhaseServiceReferenceSource::kRuntimeExact : overlapCostSource;
         }
         if (online.has_value())
         {
@@ -2848,6 +2883,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
                         overlapUncertaintyUs = 0.0;
                         overlapKnown = true;
+                        overlapCostSource = PhaseServiceReferenceSource::kStaticProfile;
                     }
                 }
             }
@@ -2865,6 +2901,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                         overlapMakespanUs = static_cast<double>(cost.makespanP95GpuMs) * 1000.0;
                         overlapUncertaintyUs = 0.0;
                         overlapKnown = true;
+                        overlapCostSource = PhaseServiceReferenceSource::kStaticProfile;
                     }
                 }
             }
@@ -3002,7 +3039,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.uncertaintyUs = overlapUncertaintyUs;
         overlap.referenceWorkUs = encoderReferenceUs + phase.referenceWorkUs;
         overlap.predictedCostSource
-            = overlapKnown ? PhaseServiceReferenceSource::kRuntimeExact : PhaseServiceReferenceSource::kDerivedIsolated;
+            = overlapKnown ? overlapCostSource : PhaseServiceReferenceSource::kDerivedIsolated;
         overlap.referenceCostSource = PhaseServiceReferenceSource::kDerivedIsolated;
         overlap.requestServiceLagUs = std::max(encoderServiceLagUs, phase.requestServiceLagUs);
         overlap.memory = encoder.memory;
@@ -3741,8 +3778,8 @@ bool PhaseThreeCoordinator::startNextEncoder()
         size_t const pendingIndex = batchIndices[selectedIndex] - selectedIndex;
         PendingVisionRequest pending = std::move(mPending[pendingIndex]);
         mPending.erase(mPending.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
-        ELLM_CHECK(mEncoderServiceEpochs.erase(pending.requestId) == 1U,
-            "Dispatched encoder request has no service epoch");
+        ELLM_CHECK(
+            mEncoderServiceEpochs.erase(pending.requestId) == 1U, "Dispatched encoder request has no service epoch");
         size_t const requestInputBytes = mediaInputBytes(pending);
         encoderInputBytes = requestInputBytes > std::numeric_limits<size_t>::max() - encoderInputBytes
             ? std::numeric_limits<size_t>::max()

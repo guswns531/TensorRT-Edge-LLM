@@ -2549,6 +2549,7 @@ int main(int argc, char** argv)
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_TTFT_TARGET_MS"))
                 {
                     threePhaseConfig.visionTtftTargetUs = std::stod(value) * 1000.0;
+                    threePhaseConfig.visionTtftTargetExplicit = true;
                 }
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_LOOKAHEAD_ESCALATION_RATIO"))
                 {
@@ -4112,15 +4113,15 @@ int main(int argc, char** argv)
                             {"selected_protected_violation_us", formation.selectedProtectedViolationUs}};
                     };
                     auto const serviceStateJson = [](rt::PhaseServiceState const& service) {
-                        return nlohmann::json{{"request_id", service.requestId},
-                            {"ready_wait_us", service.readyWaitUs}, {"service_age_quanta", service.serviceAgeQuanta},
+                        return nlohmann::json{{"request_id", service.requestId}, {"ready_wait_us", service.readyWaitUs},
+                            {"service_age_quanta", service.serviceAgeQuanta},
                             {"reference_us", service.reference.serviceUs},
                             {"reference_source", rt::phaseServiceReferenceSourceName(service.reference.source)},
                             {"service_epoch", service.reference.epoch}, {"reference_valid", service.reference.valid},
                             {"has_explicit_slo", service.hasExplicitSlo},
-                            {"absolute_slack_us", std::isfinite(service.absoluteSlackUs)
-                                    ? nlohmann::json(service.absoluteSlackUs)
-                                    : nlohmann::json(nullptr)}};
+                            {"absolute_slack_us",
+                                std::isfinite(service.absoluteSlackUs) ? nlohmann::json(service.absoluteSlackUs)
+                                                                       : nlohmann::json(nullptr)}};
                     };
                     nlohmann::json record{{"schema_version", event.schemaVersion},
                         {"event_kind", rt::phaseUnifiedEventKindName(event.kind)}, {"event_id", event.eventId},
@@ -4159,6 +4160,8 @@ int main(int argc, char** argv)
                                     {"reason", reasons[static_cast<size_t>(decision.reason)]},
                                     {"selected_violation_us", decision.predictedViolationUs},
                                     {"service_normalized_authority", decision.serviceNormalizedAuthorityApplied},
+                                    {"service_recovery_applied", decision.serviceRecoveryApplied},
+                                    {"service_recovery_candidates", decision.serviceRecoveryCandidates},
                                     {"max_normalized_service_age", decision.maxNormalizedServiceAge}};
                             };
                             record["selector_audit"] = auditJson(audit.inputs, audit.decision);
@@ -4202,7 +4205,8 @@ int main(int argc, char** argv)
                                         {"reference_us", completion.referenceUs},
                                         {"elapsed_service_us", completion.elapsedServiceUs},
                                         {"has_explicit_slo", completion.hasExplicitSlo},
-                                        {"absolute_slack_us", std::isfinite(completion.absoluteSlackUs)
+                                        {"absolute_slack_us",
+                                            std::isfinite(completion.absoluteSlackUs)
                                                 ? nlohmann::json(completion.absoluteSlackUs)
                                                 : nlohmann::json(nullptr)},
                                         {"service_epoch", completion.serviceEpoch},
@@ -4250,7 +4254,8 @@ int main(int argc, char** argv)
                                         {"reference_us", completion.referenceUs},
                                         {"elapsed_service_us", completion.elapsedServiceUs},
                                         {"has_explicit_slo", completion.hasExplicitSlo},
-                                        {"absolute_slack_us", std::isfinite(completion.absoluteSlackUs)
+                                        {"absolute_slack_us",
+                                            std::isfinite(completion.absoluteSlackUs)
                                                 ? nlohmann::json(completion.absoluteSlackUs)
                                                 : nlohmann::json(nullptr)},
                                         {"service_epoch", completion.serviceEpoch},

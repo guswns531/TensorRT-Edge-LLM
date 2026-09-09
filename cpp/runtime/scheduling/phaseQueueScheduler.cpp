@@ -53,7 +53,11 @@ char const* phaseDrainPreferenceName(PhaseDrainPreference preference) noexcept
 
 PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
-    , mGlobalScheduler(mConfig.globalSchedulerConfig)
+    , mGlobalScheduler([&] {
+        PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
+        global.enableServiceRecovery = phasePolicyUsesServiceScale(mConfig.policyMode);
+        return global;
+    }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
               ? mConfig.runtimeCostTracker
               : std::make_shared<PhaseRuntimeCostTracker>([&] {
@@ -301,11 +305,42 @@ bool PhaseQueueScheduler::cancel(uint64_t requestId)
 PhaseServiceReference PhaseQueueScheduler::makePrefillServiceReference(PhaseWorkItem const& item)
 {
     int32_t const chunkTokens = std::max(1, dispatchedPrefillTokens(item));
+    int32_t const remainingTurns = std::max(1, (item.tokenCount + chunkTokens - 1) / chunkTokens);
     if (std::optional<float> const measured
         = measuredPrefillP95(1, chunkTokens, item.tokenOffset, item.prefillClass, chunkTokens))
     {
-        return {std::max(1.0, static_cast<double>(*measured) * 1000.0),
+        return {std::max(1.0, static_cast<double>(*measured) * 1000.0 * remainingTurns),
             PhaseServiceReferenceSource::kRuntimeCovering, mNextServiceEpoch++, true};
+    }
+    if (phasePolicyUsesServiceScale(mConfig.policyMode))
+    {
+        int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
+        int32_t const contextBucket = (item.tokenOffset + contextBucketTokens - 1) / contextBucketTokens;
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, 1, 0, chunkTokens, contextBucket, 0};
+        key.primaryWorkClass = static_cast<int32_t>(item.prefillClass);
+        key.executionVariant = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, chunkTokens)
+                                                               : PhaseExecutionVariant::kEager;
+        std::optional<PhaseGlobalCostEstimate> covering;
+        for (PhaseExecutionVariant const variant : {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
+        {
+            key.executionVariant = variant;
+            std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->estimateCoveringPrimary(key);
+            if (estimate.has_value()
+                && (!covering.has_value()
+                    || std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs)
+                        > std::max(covering->makespanP95Ms,
+                            covering->makespanMedianMs + covering->uncertaintyMs)))
+            {
+                covering = estimate;
+            }
+        }
+        if (covering.has_value())
+        {
+            double const robustMs
+                = std::max(covering->makespanP95Ms, covering->makespanMedianMs + covering->uncertaintyMs);
+            return {std::max(1.0, robustMs * 1000.0 * remainingTurns),
+                PhaseServiceReferenceSource::kRuntimeCovering, mNextServiceEpoch++, true};
+        }
     }
 
     std::optional<float> staticP95;
@@ -322,20 +357,47 @@ PhaseServiceReference PhaseQueueScheduler::makePrefillServiceReference(PhaseWork
     }
     if (staticP95.has_value())
     {
-        return {std::max(1.0, static_cast<double>(*staticP95) * 1000.0),
+        return {std::max(1.0, static_cast<double>(*staticP95) * 1000.0 * remainingTurns),
             PhaseServiceReferenceSource::kStaticProfile, mNextServiceEpoch++, true};
     }
     double const coldUs
         = std::max(1.0, static_cast<double>(mConfig.globalColdPrefillMsPerToken) * 1000.0 * chunkTokens);
-    return {coldUs, PhaseServiceReferenceSource::kColdFallback, mNextServiceEpoch++, true};
+    return {coldUs * remainingTurns, PhaseServiceReferenceSource::kColdFallback, mNextServiceEpoch++, true};
 }
 
 PhaseServiceReference PhaseQueueScheduler::makeDecodeServiceReference(PhaseWorkItem const& item)
 {
     if (std::optional<float> const measured = measuredDecodeP95(1, item.tokenCount))
     {
-        return {std::max(1.0, static_cast<double>(*measured) * 1000.0),
-            PhaseServiceReferenceSource::kRuntimeCovering, mNextServiceEpoch++, true};
+        return {std::max(1.0, static_cast<double>(*measured) * 1000.0), PhaseServiceReferenceSource::kRuntimeCovering,
+            mNextServiceEpoch++, true};
+    }
+    if (phasePolicyUsesServiceScale(mConfig.policyMode))
+    {
+        int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
+        int32_t const contextBucket = (item.tokenCount + contextBucketTokens - 1) / contextBucketTokens;
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, 1, 0, 1, contextBucket, 0};
+        std::optional<PhaseGlobalCostEstimate> covering;
+        for (PhaseExecutionVariant const variant : {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
+        {
+            key.executionVariant = variant;
+            std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->estimateCoveringPrimary(key);
+            if (estimate.has_value()
+                && (!covering.has_value()
+                    || std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs)
+                        > std::max(covering->makespanP95Ms,
+                            covering->makespanMedianMs + covering->uncertaintyMs)))
+            {
+                covering = estimate;
+            }
+        }
+        if (covering.has_value())
+        {
+            double const robustMs
+                = std::max(covering->makespanP95Ms, covering->makespanMedianMs + covering->uncertaintyMs);
+            return {std::max(1.0, robustMs * 1000.0), PhaseServiceReferenceSource::kRuntimeCovering,
+                mNextServiceEpoch++, true};
+        }
     }
 
     std::optional<float> staticP95;
@@ -349,8 +411,8 @@ PhaseServiceReference PhaseQueueScheduler::makeDecodeServiceReference(PhaseWorkI
     }
     if (staticP95.has_value())
     {
-        return {std::max(1.0, static_cast<double>(*staticP95) * 1000.0),
-            PhaseServiceReferenceSource::kStaticProfile, mNextServiceEpoch++, true};
+        return {std::max(1.0, static_cast<double>(*staticP95) * 1000.0), PhaseServiceReferenceSource::kStaticProfile,
+            mNextServiceEpoch++, true};
     }
     double const coldUs = std::max(1.0, static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0);
     return {coldUs, PhaseServiceReferenceSource::kColdFallback, mNextServiceEpoch++, true};
@@ -496,8 +558,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
             check::check(serviceEpoch != serviceEpochs.end(), "Queued request has no service epoch");
             double const serviceWaitUs
                 = std::chrono::duration<double, std::micro>(now - serviceEpoch->second.startedAt).count();
-            double const serviceAgeQuanta
-                = serviceWaitUs / std::max(1.0, serviceEpoch->second.reference.serviceUs);
+            double const serviceAgeQuanta = serviceWaitUs / std::max(1.0, serviceEpoch->second.reference.serviceUs);
             double const requestTarget = prefill ? item.scheduling.ttftTargetUs : item.scheduling.tpotTargetUs;
             double const target = requestTarget > 0.0
                 ? requestTarget
@@ -513,8 +574,7 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
                 service.readyWaitUs = serviceWaitUs;
                 service.serviceAgeQuanta = serviceAgeQuanta;
                 service.reference = serviceEpoch->second.reference;
-                service.hasExplicitSlo
-                    = requestTarget > 0.0 || (!prefill && mConfig.globalDecodeTpotTargetExplicit);
+                service.hasExplicitSlo = requestTarget > 0.0 || (!prefill && mConfig.globalDecodeTpotTargetExplicit);
                 double const explicitTarget = requestTarget > 0.0 ? requestTarget : mConfig.globalDecodeTpotTargetUs;
                 service.absoluteSlackUs = service.hasExplicitSlo
                     ? explicitTarget - (prefill ? requestAgeUs : itemWaitUs)
@@ -538,9 +598,8 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
                     result.prefillMinimumSlackRequestId = item.requestId;
                     result.prefillCriticalPathRemainingTokens = item.tokenCount;
                     result.prefillMinimumSlackHasExplicitSlo = requestTarget > 0.0;
-                    result.prefillMinimumAbsoluteSlackUs = requestTarget > 0.0
-                        ? requestTarget - requestAgeUs
-                        : std::numeric_limits<double>::infinity();
+                    result.prefillMinimumAbsoluteSlackUs
+                        = requestTarget > 0.0 ? requestTarget - requestAgeUs : std::numeric_limits<double>::infinity();
                 }
             }
             else
@@ -575,16 +634,14 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
         mPrefillQueue, true, result.prefillOldestWaitUs, result.prefillMaxSloPressure, result.prefillHighestPriority);
     summarizeQueue(
         mDecodeQueue, false, result.decodeOldestWaitUs, result.decodeMaxSloPressure, result.decodeHighestPriority);
-    bool const missingPrefillDeadline
-        = result.prefillMinTtftSlackUs == std::numeric_limits<double>::max();
+    bool const missingPrefillDeadline = result.prefillMinTtftSlackUs == std::numeric_limits<double>::max();
     if (phasePolicyUsesServiceScale(mConfig.policyMode) && missingPrefillDeadline
         && result.prefillService.reference.valid)
     {
         result.prefillMinTtftSlackUs = std::numeric_limits<double>::infinity();
         result.prefillMinimumSlackRequestId = result.prefillService.requestId;
-        auto const item = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(), [&](PhaseWorkItem const& row) {
-            return row.requestId == result.prefillService.requestId;
-        });
+        auto const item = std::find_if(mPrefillQueue.begin(), mPrefillQueue.end(),
+            [&](PhaseWorkItem const& row) { return row.requestId == result.prefillService.requestId; });
         if (item != mPrefillQueue.end())
         {
             result.prefillCriticalPathRemainingTokens = item->tokenCount;
@@ -593,7 +650,8 @@ PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
         result.prefillMinimumAbsoluteSlackUs = std::numeric_limits<double>::infinity();
     }
     bool const missingDecodeDeadline = result.decodeMinTpotSlackUs == std::numeric_limits<double>::max();
-    if (phasePolicyUsesServiceScale(mConfig.policyMode) && missingDecodeDeadline && result.decodeService.reference.valid)
+    if (phasePolicyUsesServiceScale(mConfig.policyMode) && missingDecodeDeadline
+        && result.decodeService.reference.valid)
     {
         result.decodeMinTpotSlackUs = std::numeric_limits<double>::infinity();
         result.decodeMinimumSlackRequestId = result.decodeService.requestId;
@@ -1028,8 +1086,8 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         return overlap && mConfig.enableTpotHardGuard && mConfig.requireDirectOverlapCost ? -1 : 0;
     }
 
-    double const decodeServiceTargetUs = phasePolicyUsesServiceScale(mConfig.policyMode)
-            && state.decodeService.reference.valid
+    double const decodeServiceTargetUs
+        = phasePolicyUsesServiceScale(mConfig.policyMode) && state.decodeService.reference.valid
         ? state.decodeService.reference.serviceUs
         : mConfig.decodeQueueWaitTargetUs;
     double const remainingDecodeUs = std::max(0.0, decodeServiceTargetUs * (1.0 - state.decodeMaxSloPressure));
@@ -2139,8 +2197,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 || candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode;
             double const completion = action.makespanUs + (advancesDecode ? 0.0 : decode->makespanUs);
             double const uncertainty = action.uncertaintyUs + (advancesDecode ? 0.0 : decode->uncertaintyUs);
-            PhaseProtectedCompletion protectedDecode{decodeSlack, completion, uncertainty,
-                PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
+            PhaseProtectedCompletion protectedDecode{decodeSlack, completion, uncertainty, PhaseProtectedKind::kDecode,
+                state.decodeMinimumSlackRequestId,
                 std::max(1.0, decode->referenceWorkUs / static_cast<double>(std::max(1, decodeRows))),
                 decode->referenceSource, state.decodeOldestWaitUs};
             protectedDecode.hasExplicitSlo = state.decodeMinimumSlackHasExplicitSlo;
@@ -2477,8 +2535,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlapDecodeCompletionUs = static_cast<double>(*decodeP95) * 1000.0;
             overlapDecodeUncertaintyUs = 0.0;
         }
-        PhaseProtectedCompletion protectedDecode{decodeSlack, overlapDecodeCompletionUs,
-            overlapDecodeUncertaintyUs, PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
+        PhaseProtectedCompletion protectedDecode{decodeSlack, overlapDecodeCompletionUs, overlapDecodeUncertaintyUs,
+            PhaseProtectedKind::kDecode, state.decodeMinimumSlackRequestId,
             std::max(1.0, decode->referenceWorkUs / static_cast<double>(std::max(1, decodeRows))),
             decode->referenceSource, state.decodeOldestWaitUs};
         protectedDecode.hasExplicitSlo = state.decodeMinimumSlackHasExplicitSlo;
@@ -3464,8 +3522,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.adaptiveChunkObservedTpotPressure = mTelemetry.recentDecodeTpotPressure;
     plan.adaptiveChunkCombinedPressure = plan.adaptiveChunkDecodeQueuePressure * plan.adaptiveChunkObservedTpotPressure;
     plan.latencySafeFallback = mLatencySafeFallback;
-    plan.decodeServiceReferenceUs
-        = state.decodeService.reference.valid ? state.decodeService.reference.serviceUs : 0.0;
+    plan.decodeServiceReferenceUs = state.decodeService.reference.valid ? state.decodeService.reference.serviceUs : 0.0;
     plan.overlapEvaluatedByCost = kind == PhaseDispatchKind::kOverlap && mConfig.enableCostAwareOverlapAdmission
         && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
     plan.externalEncoderActive = mExternalEncoderActive;
@@ -3963,12 +4020,11 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
               return estimatedDrainCostMs(lhs) < estimatedDrainCostMs(rhs);
           });
     float const minimumDrainCostMs = estimatedDrainCostMs(*minimumDrainCandidate);
-    double const decodeServiceTargetUs = phasePolicyUsesServiceScale(mConfig.policyMode)
-            && state.decodeService.reference.valid
+    double const decodeServiceTargetUs
+        = phasePolicyUsesServiceScale(mConfig.policyMode) && state.decodeService.reference.valid
         ? state.decodeService.reference.serviceUs
         : mConfig.decodeQueueWaitTargetUs;
-    bool const deadlineInfeasibleAtIdle
-        = static_cast<double>(minimumDrainCostMs) * 1000.0 > decodeServiceTargetUs;
+    bool const deadlineInfeasibleAtIdle = static_cast<double>(minimumDrainCostMs) * 1000.0 > decodeServiceTargetUs;
     bool const urgent
         = state.decodeMaxSloPressure >= mConfig.decodeRecoveryPressureThreshold || deadlineInfeasibleAtIdle;
     double const remainingUs = std::max(0.0, decodeServiceTargetUs * (1.0 - state.decodeMaxSloPressure));
@@ -4254,8 +4310,7 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             mTelemetry.recentDecodeTpotP95Us = ordered[p95Index];
             if (phasePolicyUsesServiceScale(mConfig.policyMode) && !mRecentDecodeServiceAges->empty())
             {
-                std::vector<double> serviceAges(
-                    mRecentDecodeServiceAges->begin(), mRecentDecodeServiceAges->end());
+                std::vector<double> serviceAges(mRecentDecodeServiceAges->begin(), mRecentDecodeServiceAges->end());
                 std::sort(serviceAges.begin(), serviceAges.end());
                 size_t const serviceP95Index
                     = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(serviceAges.size()))) - 1;

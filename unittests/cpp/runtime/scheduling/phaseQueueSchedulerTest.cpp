@@ -2454,7 +2454,7 @@ TEST(PhaseQueueSchedulerTest, ServiceScaledRecentDecodePressureUsesFrozenReferen
     EXPECT_FLOAT_EQ(scheduler.telemetry().recentDecodeTpotPressure, 0.5F);
 }
 
-TEST(PhaseQueueSchedulerTest, ServiceReferenceIsFrozenUntilRealPrefillProgress)
+TEST(PhaseQueueSchedulerTest, PrefillServiceReferenceTracksRemainingMilestoneWork)
 {
     PhaseQueueSchedulerConfig config;
     config.maxPrefillChunkTokens = 32;
@@ -2466,7 +2466,7 @@ TEST(PhaseQueueSchedulerTest, ServiceReferenceIsFrozenUntilRealPrefillProgress)
     ASSERT_TRUE(first.prefillService.reference.valid);
     EXPECT_EQ(first.prefillService.requestId, 1U);
     EXPECT_EQ(first.prefillService.reference.source, PhaseServiceReferenceSource::kColdFallback);
-    EXPECT_NEAR(first.prefillService.reference.serviceUs, 640.0, 1.0e-3);
+    EXPECT_NEAR(first.prefillService.reference.serviceUs, 1280.0, 1.0e-3);
     PhaseDispatchMetrics unrelated;
     unrelated.kind = PhaseDispatchKind::kDecode;
     unrelated.decodeBatchSize = 1;
@@ -2482,6 +2482,61 @@ TEST(PhaseQueueSchedulerTest, ServiceReferenceIsFrozenUntilRealPrefillProgress)
     scheduler.completePrefill(plan.prefillBatch.front(), 32, false);
     PhaseQueueSnapshot const next = scheduler.queueSnapshot();
     EXPECT_GT(next.prefillService.reference.epoch, first.prefillService.reference.epoch);
+    EXPECT_NEAR(next.prefillService.reference.serviceUs, 640.0, 1.0e-3);
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledPrefillUsesCoveringRuntimeCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kPrefill;
+    metrics.prefillClass = PhasePrefillClass::kText;
+    metrics.prefillBatchSize = 8;
+    metrics.prefillTokens = 1024;
+    metrics.prefillPaddedTokens = 1024;
+    metrics.prefillGpuMs = 8.0F;
+    metrics.makespanGpuMs = 8.0F;
+    for (int32_t sample = 0; sample < 4; ++sample)
+    {
+        scheduler.observeMetrics(metrics);
+    }
+
+    PhaseWorkItem item{1, 64};
+    item.prefillClass = PhasePrefillClass::kText;
+    scheduler.enqueuePrefill(item);
+    PhaseQueueSnapshot const state = scheduler.queueSnapshot();
+
+    EXPECT_EQ(state.prefillService.reference.source, PhaseServiceReferenceSource::kRuntimeCovering);
+    EXPECT_GE(state.prefillService.reference.serviceUs, 8000.0);
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledDecodeUsesCoveringRuntimeCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kDecode;
+    metrics.decodeBatchSize = 32;
+    metrics.decodeContextTokens = 4096;
+    metrics.plannedDecodeMaxContextLength = 256;
+    metrics.decodeGpuMs = 8.0F;
+    metrics.makespanGpuMs = 8.0F;
+    for (int32_t sample = 0; sample < 4; ++sample)
+    {
+        scheduler.observeMetrics(metrics);
+    }
+
+    scheduler.enqueueDecode({1, 128});
+    PhaseQueueSnapshot const state = scheduler.queueSnapshot();
+
+    EXPECT_EQ(state.decodeService.reference.source, PhaseServiceReferenceSource::kRuntimeCovering);
+    EXPECT_GE(state.decodeService.reference.serviceUs, 8000.0);
 }
 
 TEST(PhaseQueueSchedulerTest, ServiceEpochResetsAcrossDecodeCommitCancelAndRequestReuse)
@@ -3920,6 +3975,31 @@ TEST(PhaseThreeCoordinatorPolicyTest, CountsPerRequestVisionEmbeddingRows)
 {
     std::vector<std::vector<int32_t>> const tokenIds{{1, 7, 7, 2}, {7, 3}, {4, 5}};
     EXPECT_EQ(phaseVisionEmbeddingRows(tokenIds, 7), (std::vector<int64_t>{2, 1, 0}));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, RecoversNoSloPhaseAfterOneServiceQuantum)
+{
+    PhaseServiceState service;
+    service.reference = {1000.0, PhaseServiceReferenceSource::kRuntimeExact, 1U, true};
+    service.serviceAgeQuanta = 0.999;
+    EXPECT_FALSE(phaseNoSloServiceRecoveryDue(service));
+
+    service.serviceAgeQuanta = 1.0;
+    EXPECT_TRUE(phaseNoSloServiceRecoveryDue(service));
+
+    service.hasExplicitSlo = true;
+    service.serviceAgeQuanta = 10.0;
+    EXPECT_FALSE(phaseNoSloServiceRecoveryDue(service));
+
+    service.hasExplicitSlo = false;
+    service.reference.valid = false;
+    EXPECT_FALSE(phaseNoSloServiceRecoveryDue(service));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, RequiresByteContractForExpandedVisionOwnership)
+{
+    EXPECT_EQ(phaseVisionSafeThroughputCapacity(16U, 80U, 0U), 16U);
+    EXPECT_EQ(phaseVisionSafeThroughputCapacity(16U, 80U, 512U * 1024U * 1024U), 80U);
 }
 
 TEST(PhaseThreeCoordinatorPolicyTest, StagesOnlyNewMropePrefix)

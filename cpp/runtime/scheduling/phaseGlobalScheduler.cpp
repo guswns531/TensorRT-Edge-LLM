@@ -196,6 +196,7 @@ bool isSlackConstrained(double pressure) noexcept
 
 struct ServiceNormalizedScore
 {
+    double currentMaximum{};
     double maximum{};
     double mean{};
     std::map<uint64_t, double> requestAges;
@@ -209,8 +210,21 @@ bool validServiceReference(PhaseProtectedCompletion const& completion) noexcept
         && completion.referenceSource != PhaseServiceReferenceSource::kColdFallback;
 }
 
+bool hasOverdueNoSloService(PhaseGlobalActionCandidate const& candidate) noexcept
+{
+    return std::any_of(candidate.protectedCompletions.begin(), candidate.protectedCompletions.end(),
+        [](PhaseProtectedCompletion const& completion) {
+            bool const validRecoveryReference = completion.requestId != 0U && std::isfinite(completion.referenceUs)
+                && completion.referenceUs > 0.0 && std::isfinite(completion.elapsedServiceUs)
+                && completion.elapsedServiceUs >= completion.referenceUs
+                && completion.referenceSource != PhaseServiceReferenceSource::kUnknown;
+            return !completion.hasExplicitSlo && validRecoveryReference;
+        });
+}
+
 std::optional<std::vector<ServiceNormalizedScore>> serviceNormalizedScores(
-    std::vector<PhaseGlobalActionCandidate> const& candidates, std::vector<size_t> const& frontier)
+    std::vector<PhaseGlobalActionCandidate> const& candidates, std::vector<size_t> const& frontier,
+    bool noSloOnly = false, bool allowColdReference = false)
 {
     if (frontier.empty())
     {
@@ -226,7 +240,12 @@ std::optional<std::vector<ServiceNormalizedScore>> serviceNormalizedScores(
         ServiceNormalizedScore score;
         for (PhaseProtectedCompletion const& completion : candidates[index].protectedCompletions)
         {
-            if (!validServiceReference(completion)
+            bool const validReference = validServiceReference(completion)
+                || (allowColdReference && completion.requestId != 0U && std::isfinite(completion.referenceUs)
+                    && completion.referenceUs > 0.0 && std::isfinite(completion.elapsedServiceUs)
+                    && completion.elapsedServiceUs >= 0.0
+                    && completion.referenceSource == PhaseServiceReferenceSource::kColdFallback);
+            if ((noSloOnly && completion.hasExplicitSlo) || !validReference
                 || !references
                     .emplace(completion.requestId,
                         Reference{completion.referenceUs, completion.referenceSource, completion.elapsedServiceUs})
@@ -241,6 +260,7 @@ std::optional<std::vector<ServiceNormalizedScore>> serviceNormalizedScores(
             {
                 return std::nullopt;
             }
+            score.currentMaximum = std::max(score.currentMaximum, completion.elapsedServiceUs / completion.referenceUs);
             score.maximum = std::max(score.maximum, robustAge);
             score.mean += robustAge;
             score.requestAges.emplace(completion.requestId, robustAge);
@@ -1184,21 +1204,55 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
     // guard. Prefer one such bounded probe here so exploration cannot become
     // a post-selection policy override.
     std::vector<size_t> exploration;
-    for (size_t const index : feasible)
+    bool const overdueNoSloService = mConfig.enableServiceRecovery
+        && std::any_of(feasible.begin(), feasible.end(),
+            [&](size_t index) { return hasOverdueNoSloService(candidates[index]); });
+    if (!overdueNoSloService)
     {
-        PhaseGlobalActionCandidate const& candidate = candidates[index];
-        bool const unknownProbe
-            = candidate.safeProbeEligible && !candidate.overlapCostKnown && !candidate.decisionCostKnown;
-        // Candidate generation has already applied the process-local probe
-        // interval and either the robust slack guard or the all-late recovery
-        // guard. Keep this exploration inside the selector so there is one
-        // policy authority even when every candidate currently violates SLO.
-        if (unknownProbe)
+        for (size_t const index : feasible)
         {
-            exploration.push_back(index);
+            PhaseGlobalActionCandidate const& candidate = candidates[index];
+            bool const unknownProbe
+                = candidate.safeProbeEligible && !candidate.overlapCostKnown && !candidate.decisionCostKnown;
+            // Candidate generation has already applied the process-local probe
+            // interval and either the robust slack guard or the all-late recovery
+            // guard. Keep this exploration inside the selector so there is one
+            // policy authority even when every candidate currently violates SLO.
+            if (unknownProbe)
+            {
+                exploration.push_back(index);
+            }
         }
     }
     std::vector<size_t> frontier = !exploration.empty() ? exploration : safe.empty() ? feasible : safe;
+    std::map<size_t, double> recoveryProjectedAges;
+    if (mConfig.enableServiceRecovery && exploration.empty() && !safe.empty() && frontier.size() > 1U)
+    {
+        std::optional<std::vector<ServiceNormalizedScore>> const normalized
+            = serviceNormalizedScores(candidates, frontier, true, true);
+        if (normalized.has_value() && (*normalized)[0].currentMaximum >= 1.0)
+        {
+            double minimumProjected = std::numeric_limits<double>::infinity();
+            for (ServiceNormalizedScore const& score : *normalized)
+            {
+                minimumProjected = std::min(minimumProjected, score.maximum);
+            }
+            constexpr double kSERVICE_RECOVERY_BAND_QUANTA = 1.0;
+            std::vector<size_t> recovery;
+            for (size_t offset{}; offset < frontier.size(); ++offset)
+            {
+                if ((*normalized)[offset].maximum <= minimumProjected + kSERVICE_RECOVERY_BAND_QUANTA)
+                {
+                    recovery.push_back(frontier[offset]);
+                    recoveryProjectedAges.emplace(frontier[offset], (*normalized)[offset].maximum);
+                }
+            }
+            ELLM_CHECK(!recovery.empty(), "Service recovery removed every safe phase action");
+            decision.serviceRecoveryApplied = recovery.size() != frontier.size();
+            decision.serviceRecoveryCandidates = recovery.size();
+            frontier = std::move(recovery);
+        }
+    }
     std::vector<size_t> pruned;
     for (size_t const right : frontier)
     {
@@ -1362,6 +1416,11 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
         }
     }
     PhaseGlobalActionCandidate const& candidate = candidates[selected];
+    auto const recoveryAge = recoveryProjectedAges.find(selected);
+    if (recoveryAge != recoveryProjectedAges.end())
+    {
+        decision.maxNormalizedServiceAge = recoveryAge->second;
+    }
     decision.selectedIndex = selected;
     decision.reason = !exploration.empty() ? PhaseGlobalDecisionReason::kBoundedExploration
         : allLateSameProtectedSet          ? PhaseGlobalDecisionReason::kAllLateEfficiencyRecovery

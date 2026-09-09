@@ -217,6 +217,19 @@ class ReplayContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             REPLAY.enable_eos_termination(["TRT_EDGELLM_IGNORE_EOS=1"])
 
+    def test_no_slo_contract_removes_only_composition_targets(self):
+        command = [
+            "docker", "run", "-e", "TRT_EDGELLM_VISION_TTFT_TARGET_MS=500", "-e",
+            "TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS=80", "-e", "KEEP=1", "image"
+        ]
+
+        changed = REPLAY.remove_explicit_slo_contract(command)
+
+        self.assertEqual(changed, ["docker", "run", "-e", "KEEP=1", "image"])
+        with self.assertRaises(ValueError):
+            REPLAY.remove_explicit_slo_contract(
+                ["TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US=80000"])
+
     def test_runtime_build_remap_preserves_the_workload_command(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

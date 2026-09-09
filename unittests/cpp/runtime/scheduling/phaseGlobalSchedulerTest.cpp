@@ -211,6 +211,84 @@ TEST(PhaseGlobalSchedulerTest, ServiceNormalizationRequiresOneCanonicalRequestFr
     EXPECT_FALSE(incomplete.serviceNormalizedAuthorityApplied);
 }
 
+TEST(PhaseGlobalSchedulerTest, ServiceRecoveryProtectsOverdueNoSloWorkWithinSafeFrontier)
+{
+    PhaseGlobalSchedulerConfig config;
+    config.enableServiceRecovery = true;
+    PhaseGlobalScheduler scheduler(config);
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 2000.0, 1000.0, 10000.0);
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 4000.0, 1000.0, 10000.0);
+    prefill.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 1000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 3000.0},
+        {10000.0, 2000.0, 0.0, PhaseProtectedKind::kDecode, 9U, 1000.0, PhaseServiceReferenceSource::kRuntimeExact,
+            0.0},
+    };
+    decode.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 3000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 3000.0},
+        {10000.0, 1000.0, 0.0, PhaseProtectedKind::kDecode, 9U, 1000.0, PhaseServiceReferenceSource::kRuntimeExact,
+            0.0},
+    };
+
+    PhaseGlobalDecision const decision = scheduler.select({prefill, decode});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+    EXPECT_TRUE(decision.serviceRecoveryApplied);
+    EXPECT_EQ(decision.serviceRecoveryCandidates, 1U);
+    EXPECT_DOUBLE_EQ(decision.maxNormalizedServiceAge, 4.0);
+}
+
+TEST(PhaseGlobalSchedulerTest, ServiceRecoveryKeepsEfficiencyWithinOneQuantumBand)
+{
+    PhaseGlobalSchedulerConfig config;
+    config.enableServiceRecovery = true;
+    PhaseGlobalScheduler scheduler(config);
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 2000.0, 1000.0, 10000.0);
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 4000.0, 1000.0, 10000.0);
+    prefill.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 1000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 10000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 10000.0},
+    };
+    decode.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 1500.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 10000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 10000.0},
+    };
+
+    PhaseGlobalDecision const decision = scheduler.select({prefill, decode});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_FALSE(decision.serviceRecoveryApplied);
+    EXPECT_EQ(decision.serviceRecoveryCandidates, 2U);
+}
+
+TEST(PhaseGlobalSchedulerTest, ServiceRecoveryDoesNotReplaceExplicitDeadlineSafety)
+{
+    PhaseGlobalSchedulerConfig config;
+    config.enableServiceRecovery = true;
+    PhaseGlobalScheduler scheduler(config);
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 4000.0, 2000.0, 10000.0);
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 2000.0, 1000.0, 10000.0);
+    prefill.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 2000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 3000.0},
+        {1000.0, 2000.0, 0.0, PhaseProtectedKind::kDecode, 9U, 1000.0, PhaseServiceReferenceSource::kRuntimeExact, 0.0},
+    };
+    decode.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 4000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 3000.0},
+        {1000.0, 1000.0, 0.0, PhaseProtectedKind::kDecode, 9U, 1000.0, PhaseServiceReferenceSource::kRuntimeExact, 0.0},
+    };
+
+    PhaseGlobalDecision const decision = scheduler.select({prefill, decode});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 1U);
+    EXPECT_FALSE(decision.serviceRecoveryApplied);
+}
+
 TEST(PhaseGlobalSchedulerTest, SelectsBoundedUnknownProbeInsideTheSingleSelector)
 {
     PhaseGlobalScheduler scheduler;
@@ -225,6 +303,32 @@ TEST(PhaseGlobalSchedulerTest, SelectsBoundedUnknownProbeInsideTheSingleSelector
     ASSERT_TRUE(decision.selectedIndex.has_value());
     EXPECT_EQ(*decision.selectedIndex, 1U);
     EXPECT_EQ(decision.reason, PhaseGlobalDecisionReason::kBoundedExploration);
+}
+
+TEST(PhaseGlobalSchedulerTest, OverdueNoSloServiceSuppressesUnknownOverlapExploration)
+{
+    PhaseGlobalSchedulerConfig config;
+    config.enableServiceRecovery = true;
+    PhaseGlobalScheduler scheduler(config);
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, 10000.0);
+    decode.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 1000.0, 0.0, PhaseProtectedKind::kDecode, 9U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 2000.0},
+    };
+    auto probe = candidate(PhaseGlobalActionKind::kEncoderPrefill, 5000.0, 500.0, 10000.0);
+    probe.safeProbeEligible = true;
+    probe.overlapCostKnown = false;
+    probe.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 3000.0, 0.0, PhaseProtectedKind::kDecode, 9U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 2000.0},
+    };
+
+    PhaseGlobalDecision const decision = scheduler.select({decode, probe});
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+    EXPECT_NE(decision.reason, PhaseGlobalDecisionReason::kBoundedExploration);
+    EXPECT_TRUE(decision.serviceRecoveryApplied);
 }
 
 TEST(PhaseGlobalSchedulerTest, UsesOnlyExplicitlyEligibleProbeWhenEveryActionIsLate)

@@ -57,6 +57,8 @@ struct PhaseGlobalDecision
     double serviceCompression{};
     size_t hardPeakManagedBytes{};
     bool serviceNormalizedAuthorityApplied{};
+    bool serviceRecoveryApplied{};
+    size_t serviceRecoveryCandidates{};
     double maxNormalizedServiceAge{};
 };
 
@@ -67,6 +69,9 @@ struct PhaseGlobalSchedulerConfig
     //! Rank otherwise-safe candidates by request-local service age only when
     //! every frontier member covers the same canonical request references.
     bool enableServiceNormalizedAuthority{};
+    //! Bound no-SLO starvation in immutable service-cost units before applying
+    //! the ordinary transition/efficiency ranking.
+    bool enableServiceRecovery{};
 };
 
 //! Evaluation of one actual selector input, not a preview-frontier candidate.

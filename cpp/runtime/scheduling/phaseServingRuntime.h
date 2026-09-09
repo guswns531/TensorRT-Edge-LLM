@@ -63,6 +63,7 @@ struct PhaseServingRuntimeConfig
     double encoderBatchWaitUs{};
     double visionPrefillBatchWaitUs{};
     double visionTtftTargetUs{2500000.0};
+    bool visionTtftTargetExplicit{};
     bool enableBatchedVisionPrefill{true};
     bool enableChunkedVisionPrefill{true};
     bool enableVisionPrefixPrefill{true};

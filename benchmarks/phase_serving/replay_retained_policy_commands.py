@@ -81,6 +81,25 @@ def enable_eos_termination(command):
     return result
 
 
+def remove_explicit_slo_contract(command):
+    """Remove composition-root SLOs while preserving all scheduling mechanisms."""
+    result = list(command)
+    prefixes = (
+        "TRT_EDGELLM_VISION_TTFT_TARGET_MS=",
+        "TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS=",
+        "TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US=",
+    )
+    matches = [
+        i for i, value in enumerate(result)
+        if any(value.startswith(prefix) for prefix in prefixes)
+    ]
+    for index in reversed(matches):
+        if index == 0 or result[index - 1] != "-e":
+            raise ValueError("Expected a Docker -e before the SLO assignment")
+        del result[index - 1:index + 1]
+    return result
+
+
 def remap_runtime_build(command, build_cache):
     """Use the validated Release build without changing the retained workload."""
     mounts = [value for value in command if value.endswith(":/workspace")]
@@ -131,6 +150,10 @@ def main():
         help=
         "Separate correctness contract; not comparable to fixed-output throughput"
     )
+    parser.add_argument(
+        "--no-explicit-slo",
+        action="store_true",
+        help="Remove composition-root TTFT/TPOT targets from the replay")
     parser.add_argument(
         "--phase-telemetry",
         "--dispatch-telemetry",
@@ -184,6 +207,8 @@ def main():
             command = remap_runtime_build(list(selected[case]["command"]), args.build_cache)
             if args.respect_eos:
                 command = enable_eos_termination(command)
+            if args.no_explicit_slo:
+                command = remove_explicit_slo_contract(command)
             for option in ("--trace", "--generic-warmup-trace"):
                 if option in command:
                     index = command.index(option) + 1

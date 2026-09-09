@@ -67,6 +67,13 @@ struct PhaseVisionEncoderBatchChoice
 std::vector<size_t> phaseEncoderCalibrationBatchSizes(
     size_t maxEncoderBatchSize, std::vector<size_t> requestedBatchSizes = {});
 
+//! A phase without an external SLO regains a standalone candidate after one measured service quantum.
+bool phaseNoSloServiceRecoveryDue(PhaseServiceState const& service) noexcept;
+
+//! Do not expand persistent vision ownership without a byte-level feasibility contract.
+size_t phaseVisionSafeThroughputCapacity(
+    size_t baseCapacity, size_t throughputCapacity, size_t maxEncodedBytes) noexcept;
+
 //! Direct E+D overlap point used until enough online observations exist.
 struct PhaseEncoderDecodeBatchCost
 {
@@ -131,7 +138,7 @@ struct PhaseThreeCoordinatorConfig
     size_t globalFormationRealizedDispatches{4U};
     //! Bound request-owned GPU vision payloads waiting in or running through the LLM phases.
     size_t maxEncodedInFlight{2U};
-    //! Optional larger downstream capacity enabled only by the vision-age/decode-TPOT guard.
+    //! Optional larger downstream capacity enabled only with a byte-level ownership budget.
     size_t throughputMaxEncodedInFlight{};
     //! Optional byte budget for downstream request-owned vision payloads. Zero disables the byte gate.
     size_t maxEncodedBytes{};
@@ -186,6 +193,8 @@ struct PhaseThreeCoordinatorConfig
     double prefillReadyBytePressureRatio{0.8};
     //! Default end-to-end image TTFT SLO, including encoder queue and execution. Zero inherits the LLM default.
     double visionTtftTargetUs{2500000.0};
+    //! Distinguish an external contract from the legacy built-in fallback.
+    bool visionTtftTargetExplicit{};
     //! Escalate lookahead after this fraction of the oldest vision request's TTFT target. Zero disables age escalation.
     double lookaheadEscalationRatio{0.4};
     //! Contract encoded capacity at or above this normalized decode TPOT pressure. Zero disables contraction.
