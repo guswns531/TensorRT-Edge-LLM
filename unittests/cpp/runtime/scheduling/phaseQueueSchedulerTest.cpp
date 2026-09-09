@@ -726,6 +726,20 @@ TEST(PhaseQueueSchedulerTest, ExpiredDecodeCandidateRequiresOptInAndBothExpiredD
             EXPECT_EQ(audit.decodeGuard->decodeExpired, decodeExpired);
             EXPECT_EQ(audit.decodeGuard->candidateRestored, enabled && decodeExpired);
             EXPECT_EQ(audit.decodeGuard->candidateSuppressed, !(enabled && decodeExpired));
+            auto const mechanismDecode = std::find_if(audit.mechanismInputs.begin(), audit.mechanismInputs.end(),
+                [](PhaseGlobalActionCandidate const& candidate) {
+                    return candidate.key.kind == PhaseGlobalActionKind::kDecode;
+                });
+            ASSERT_NE(mechanismDecode, audit.mechanismInputs.end());
+            EXPECT_EQ(mechanismDecode->requestIds, std::vector<uint64_t>({2U}));
+            EXPECT_FALSE(mechanismDecode->contextualScalarAuthorityApplied);
+            auto const decodeProtection = std::find_if(mechanismDecode->protectedCompletions.begin(),
+                mechanismDecode->protectedCompletions.end(), [](PhaseProtectedCompletion const& completion) {
+                    return completion.kind == PhaseProtectedKind::kDecode;
+                });
+            ASSERT_NE(decodeProtection, mechanismDecode->protectedCompletions.end());
+            EXPECT_EQ(decodeProtection->requestId, 2U);
+            EXPECT_GT(decodeProtection->referenceUs, 0.0);
             ASSERT_EQ(audited.has_value(), unaudited.has_value());
             if (audited.has_value())
             {

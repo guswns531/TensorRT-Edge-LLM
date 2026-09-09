@@ -24,6 +24,16 @@ namespace trt_edgellm::rt
 namespace
 {
 
+TEST(PhaseUnifiedEventTest, ServiceClockPreservesUnknownAndHostEpoch)
+{
+    EXPECT_EQ(phaseServiceHostNs({}), 0U);
+    auto const timestamp = std::chrono::steady_clock::time_point{std::chrono::nanoseconds{1234567}};
+    EXPECT_EQ(phaseServiceHostNs(timestamp), 1234567U);
+    PhaseServiceClock const clock{42U, phaseServiceHostNs(timestamp), 0U};
+    EXPECT_EQ(clock.requestId, 42U);
+    EXPECT_EQ(clock.lastTokenCommittedHostNs, 0U);
+}
+
 TEST(PhaseUnifiedEventTest, ReportsStableSchemaAndNames)
 {
     EXPECT_EQ(kPHASE_UNIFIED_EVENT_SCHEMA_VERSION, 1U);

@@ -1496,10 +1496,24 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.ready.decodeContextTokens = server.decodeCandidateTokens;
     if (mUnifiedDetailedDecisionSnapshots)
     {
+        event.serviceClocks = server.serviceClocks;
+        auto appendServiceClock = [&](uint64_t requestId, PhaseSchedulingHints const& hints) {
+            auto const existing = std::find_if(event.serviceClocks.begin(), event.serviceClocks.end(),
+                [requestId](PhaseServiceClock const& clock) { return clock.requestId == requestId; });
+            if (existing == event.serviceClocks.end())
+            {
+                event.serviceClocks.push_back({requestId, phaseServiceHostNs(hints.submittedAt), 0U});
+            }
+        };
         event.readyEncoderRequestIds.reserve(mPending.size());
         for (PendingVisionRequest const& request : mPending)
         {
             event.readyEncoderRequestIds.push_back(request.requestId);
+            appendServiceClock(request.requestId, request.scheduling);
+        }
+        for (PendingVisionRequest const& request : mEncoding)
+        {
+            appendServiceClock(request.requestId, request.scheduling);
         }
         event.readyPrefillRequestIds = server.prefillRequestIds;
         event.readyPrefillTokenCounts = server.prefillTokenCounts;
@@ -1508,6 +1522,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         for (ReadyPrefillRequest const& request : mReadyPrefill)
         {
             event.readyPrefillRequestIds.push_back(request.requestId);
+            appendServiceClock(request.requestId, request.scheduling);
             event.readyPrefillTokenCounts.push_back(static_cast<int32_t>(request.promptTokens.size()));
         }
         event.readyDecodeRequestIds = server.decodeRequestIds;
@@ -1522,12 +1537,25 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
         PhaseUnifiedCandidateSnapshot snapshot;
         snapshot.actionId = source.candidateId;
         snapshot.key = source.key;
-        snapshot.legal = source.dependencySafe && source.contextSafe && source.shapeSafe;
+        size_t committedBytes = source.memory.managedBytes;
+        if (source.memory.immediateReclaimObserved)
+        {
+            committedBytes = committedBytes > source.memory.immediateReclaimBytes
+                ? committedBytes - source.memory.immediateReclaimBytes
+                : 0U;
+        }
+        size_t const peakBytes = saturatedAdd(
+            saturatedAdd(committedBytes, source.memory.allocateBytes), source.memory.guaranteedGrowthBytes);
+        bool const memorySafe = source.memory.budgetBytes == 0U || peakBytes <= source.memory.budgetBytes;
+        bool const waitSafe = source.key.kind != PhaseGlobalActionKind::kWait || source.concreteWaitEvent;
+        snapshot.legal = source.dependencySafe && source.contextSafe && source.shapeSafe && memorySafe && waitSafe;
         snapshot.requestIds = source.requestIds;
         snapshot.predictedCompletionUs = source.predictedHorizonUs > 0.0 ? source.predictedHorizonUs
             : source.predictedMakespanUs > 0.0                           ? source.predictedMakespanUs
                                                                          : source.predictedBlockingUs;
         snapshot.uncertaintyUs = source.uncertaintyUs;
+        snapshot.predictedCostSource = source.predictedCostSource;
+        snapshot.referenceCostSource = source.referenceCostSource;
         snapshot.scalarDecisionCostKnown = source.decisionCostKnown;
         snapshot.contextualScalarAuthorityApplied = source.contextualScalarAuthorityApplied;
         snapshot.scalarDecisionMakespanUs = source.decisionMakespanUs;
@@ -1544,6 +1572,16 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     else if (mUnifiedDetailedDecisionSnapshots)
     {
         appendCandidate(candidate);
+    }
+    if (mUnifiedDetailedDecisionSnapshots && selectorAudit != nullptr)
+    {
+        std::vector<PhaseUnifiedCandidateSnapshot> activeCandidates = std::move(event.candidates);
+        for (PhaseGlobalActionCandidate const& mechanismCandidate : selectorAudit->mechanismInputs)
+        {
+            appendCandidate(mechanismCandidate);
+        }
+        event.mechanismCandidates = std::move(event.candidates);
+        event.candidates = std::move(activeCandidates);
     }
     if (candidateFrontier != nullptr)
     {
@@ -2492,6 +2530,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     size_t encoderPayloadBytes{};
     double encoderSlackUs{std::numeric_limits<double>::infinity()};
     double encoderServiceLagUs{};
+    uint64_t encoderProtectedRequestId{};
     auto const now = std::chrono::steady_clock::now();
     for (size_t const index : encoderBatchIndices)
     {
@@ -2502,8 +2541,14 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         double const ageUs = std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count();
         double const targetUs
             = request.scheduling.ttftTargetUs > 0.0 ? request.scheduling.ttftTargetUs : mConfig.visionTtftTargetUs;
-        encoderSlackUs
-            = std::min(encoderSlackUs, targetUs > 0.0 ? targetUs - ageUs : std::numeric_limits<double>::infinity());
+        double const slackUs = targetUs > 0.0 ? targetUs - ageUs : std::numeric_limits<double>::infinity();
+        if (slackUs < encoderSlackUs
+            || (slackUs == encoderSlackUs
+                && (encoderProtectedRequestId == 0U || request.requestId < encoderProtectedRequestId)))
+        {
+            encoderSlackUs = slackUs;
+            encoderProtectedRequestId = request.requestId;
+        }
         encoderServiceLagUs = std::max(encoderServiceLagUs, ageUs);
     }
     struct EncoderCostPrediction
@@ -2512,6 +2557,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         double makespanUs{};
         double uncertaintyUs{};
         double referenceUs{};
+        PhaseServiceReferenceSource costSource{PhaseServiceReferenceSource::kColdFallback};
+        PhaseServiceReferenceSource referenceSource{PhaseServiceReferenceSource::kColdFallback};
     };
     constexpr size_t kEncoderTokenBucket = 1024U;
     auto const predictEncoderCost = [&](size_t batchSize, size_t inputTokens) {
@@ -2528,6 +2575,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             prediction.makespanUs = static_cast<double>(online->makespanMedianMs) * 1000.0;
             prediction.uncertaintyUs = static_cast<double>(online->uncertaintyMs) * 1000.0;
             prediction.referenceUs = static_cast<double>(online->referenceWorkMedianMs) * 1000.0;
+            prediction.costSource = PhaseServiceReferenceSource::kRuntimeExact;
+            prediction.referenceSource = PhaseServiceReferenceSource::kRuntimeExact;
             return prediction;
         }
 
@@ -2557,6 +2606,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             prediction.referenceUs = singleton != nullptr
                 ? static_cast<double>(singleton->p95GpuMs) * 1000.0 * batchSize
                 : prediction.makespanUs;
+            prediction.costSource = PhaseServiceReferenceSource::kStaticProfile;
+            prediction.referenceSource = singleton != nullptr ? PhaseServiceReferenceSource::kStaticProfile
+                                                              : PhaseServiceReferenceSource::kDerivedIsolated;
         }
         return prediction;
     };
@@ -2594,9 +2646,15 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     encoder.predictedMakespanUs = encoderMakespanUs;
     encoder.uncertaintyUs = encoderUncertaintyUs;
     encoder.referenceWorkUs = encoderReferenceUs;
+    encoder.predictedCostSource = encoderPrediction.costSource;
+    encoder.referenceCostSource = encoderPrediction.referenceSource;
     encoder.requestServiceLagUs = encoderServiceLagUs;
     encoder.protectedCompletions.push_back({encoderSlackUs, encoderMakespanUs + visionPrefillMakespanUs,
-        encoderUncertaintyUs + visionPrefillUncertaintyUs, PhaseProtectedKind::kEncoder});
+        encoderUncertaintyUs + visionPrefillUncertaintyUs, PhaseProtectedKind::kEncoder, encoderProtectedRequestId,
+        std::max(1.0,
+            encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
+                + visionPrefillMakespanUs),
+        PhaseServiceReferenceSource::kDerivedIsolated});
     PhaseMemoryBrokerConfig const& memoryConfig = mMemoryBroker.config();
     size_t const committedKVBytes = memoryConfig.bytesPerKVPage > 0U
         ? saturatedMultiply(static_cast<size_t>(memoryConfig.committedKVPages), memoryConfig.bytesPerKVPage)
@@ -2617,7 +2675,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         pd->protectedCompletions.push_back(
             {encoderSlackUs, pd->predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
-                pd->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs, PhaseProtectedKind::kEncoder});
+                pd->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs, PhaseProtectedKind::kEncoder,
+                encoderProtectedRequestId,
+                std::max(1.0,
+                    encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
+                        + visionPrefillMakespanUs),
+                PhaseServiceReferenceSource::kDerivedIsolated});
     }
 
     std::vector<PhaseGlobalActionCandidate> candidates;
@@ -2641,7 +2704,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             alternative->protectedCompletions.push_back(
                 {encoderSlackUs, alternative->predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
                     alternative->uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs,
-                    PhaseProtectedKind::kEncoder});
+                    PhaseProtectedKind::kEncoder, encoderProtectedRequestId,
+                    std::max(1.0,
+                        encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
+                            + visionPrefillMakespanUs),
+                    PhaseServiceReferenceSource::kDerivedIsolated});
             candidates.push_back(std::move(*alternative));
         }
     }
@@ -2860,6 +2927,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.predictedMakespanUs = overlapMakespanUs;
         overlap.uncertaintyUs = overlapUncertaintyUs;
         overlap.referenceWorkUs = encoderReferenceUs + phase.referenceWorkUs;
+        overlap.predictedCostSource
+            = overlapKnown ? PhaseServiceReferenceSource::kRuntimeExact : PhaseServiceReferenceSource::kDerivedIsolated;
+        overlap.referenceCostSource = PhaseServiceReferenceSource::kDerivedIsolated;
         overlap.requestServiceLagUs = std::max(encoderServiceLagUs, phase.requestServiceLagUs);
         overlap.memory = encoder.memory;
         overlap.memory.allocateBytes = saturatedAdd(overlap.memory.allocateBytes, phase.memory.allocateBytes);
@@ -2871,7 +2941,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.secondaryStableSlotIds = phase.primaryStableSlotIds;
         phaseGlobalFinalizeCandidate(overlap);
         overlap.protectedCompletions.push_back({encoderSlackUs, overlapMakespanUs + visionPrefillMakespanUs,
-            overlapUncertaintyUs + visionPrefillUncertaintyUs, PhaseProtectedKind::kEncoder});
+            overlapUncertaintyUs + visionPrefillUncertaintyUs, PhaseProtectedKind::kEncoder, encoderProtectedRequestId,
+            std::max(1.0,
+                encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
+                    + visionPrefillMakespanUs),
+            PhaseServiceReferenceSource::kDerivedIsolated});
         for (PhaseProtectedCompletion completion : phase.protectedCompletions)
         {
             completion.predictedCompletionUs = residualAugmentation ? phaseOverlapCompletionUs : overlapMakespanUs;
@@ -2957,6 +3031,38 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     PhaseGlobalSelectionAudit selectorAudit;
+    selectorAudit.mechanismInputs = pdAudit.mechanismInputs;
+    for (PhaseGlobalActionCandidate& mechanism : selectorAudit.mechanismInputs)
+    {
+        bool const protectsEncoder = std::any_of(mechanism.protectedCompletions.begin(),
+            mechanism.protectedCompletions.end(),
+            [](PhaseProtectedCompletion const& completion) { return completion.kind == PhaseProtectedKind::kEncoder; });
+        if (!protectsEncoder && encoderProtectedRequestId != 0U)
+        {
+            mechanism.protectedCompletions.push_back(
+                {encoderSlackUs, mechanism.predictedMakespanUs + encoderMakespanUs + visionPrefillMakespanUs,
+                    mechanism.uncertaintyUs + encoderUncertaintyUs + visionPrefillUncertaintyUs,
+                    PhaseProtectedKind::kEncoder, encoderProtectedRequestId,
+                    std::max(1.0,
+                        encoderReferenceUs / static_cast<double>(std::max<size_t>(1U, encoderBatchIndices.size()))
+                            + visionPrefillMakespanUs),
+                    PhaseServiceReferenceSource::kDerivedIsolated});
+        }
+    }
+    for (PhaseGlobalActionCandidate candidate : candidates)
+    {
+        phaseRestoreNonContextualPolicy(candidate);
+        auto const present = std::find_if(selectorAudit.mechanismInputs.begin(), selectorAudit.mechanismInputs.end(),
+            [&](PhaseGlobalActionCandidate const& existing) { return existing.candidateId == candidate.candidateId; });
+        if (present == selectorAudit.mechanismInputs.end())
+        {
+            selectorAudit.mechanismInputs.push_back(std::move(candidate));
+        }
+        else
+        {
+            *present = std::move(candidate);
+        }
+    }
     PhaseGlobalDecision const myopicDecision
         = mGlobalScheduler.select(candidates, mUnifiedEventCallback ? &selectorAudit.inputs : nullptr);
     mLastGlobalFormationPredictedRows = 0U;

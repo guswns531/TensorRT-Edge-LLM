@@ -1824,6 +1824,11 @@ IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrati
         for (uint64_t const requestId : activeRequestIds)
         {
             RequestState const& request = mRequests.at(requestId);
+            auto const submitted = request.scheduling.submittedAt == std::chrono::steady_clock::time_point{}
+                ? request.submittedAt
+                : request.scheduling.submittedAt;
+            result.serviceClocks.push_back(
+                {requestId, phaseServiceHostNs(submitted), phaseServiceHostNs(request.lastTokenCommittedAt)});
             addStateHash(result.kvOwnershipSignature, requestId);
             addStateHash(result.kvOwnershipSignature, static_cast<uint64_t>(request.kvSlotId));
             if (request.kvSlotId >= 0 && mOwnership.leased(request.kvSlotId))
@@ -2362,6 +2367,7 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         }
         RequestState& state = it->second;
         state.generatedTokens.push_back(tokens[index]);
+        state.lastTokenCommittedAt = std::chrono::steady_clock::now();
         recordTimeline(requestId,
             ticket->fromPrefill ? PhaseTimelineStage::kPrefillTokenCommitted
                                 : PhaseTimelineStage::kDecodeTokenCommitted,

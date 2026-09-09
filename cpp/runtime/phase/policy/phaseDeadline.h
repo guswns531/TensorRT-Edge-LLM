@@ -16,6 +16,8 @@
  */
 
 #pragma once
+
+#include <cstdint>
 #include <limits>
 
 namespace trt_edgellm::rt
@@ -28,6 +30,35 @@ enum class PhaseProtectedKind
     kPrefill,
     kDecode,
 };
+
+//! Origin of the immutable isolated-service denominator used by diagnostic
+//! request-age normalization. Queue residence, SLO targets, and selected
+//! overlap timings are deliberately not valid sources.
+enum class PhaseServiceReferenceSource
+{
+    kUnknown,
+    kRuntimeExact,
+    kRuntimeInterpolated,
+    kRuntimeCovering,
+    kStaticProfile,
+    kColdFallback,
+    kDerivedIsolated,
+};
+
+inline char const* phaseServiceReferenceSourceName(PhaseServiceReferenceSource source) noexcept
+{
+    switch (source)
+    {
+    case PhaseServiceReferenceSource::kUnknown: return "unknown";
+    case PhaseServiceReferenceSource::kRuntimeExact: return "runtime_exact";
+    case PhaseServiceReferenceSource::kRuntimeInterpolated: return "runtime_interpolated";
+    case PhaseServiceReferenceSource::kRuntimeCovering: return "runtime_covering";
+    case PhaseServiceReferenceSource::kStaticProfile: return "static_profile";
+    case PhaseServiceReferenceSource::kColdFallback: return "cold_fallback";
+    case PhaseServiceReferenceSource::kDerivedIsolated: return "derived_isolated";
+    }
+    return "unknown";
+}
 
 inline char const* phaseProtectedKindName(PhaseProtectedKind kind) noexcept
 {
@@ -50,6 +81,12 @@ struct PhaseProtectedCompletion
     double predictedCompletionUs{};
     double uncertaintyUs{};
     PhaseProtectedKind kind{PhaseProtectedKind::kUnknown};
+    //! Zero means the older aggregate-only contract. Nonzero identities make
+    //! the estimate suitable for request-local shadow evaluation.
+    uint64_t requestId{};
+    //! Snapshot-fixed isolated service cost for this request's milestone.
+    double referenceUs{};
+    PhaseServiceReferenceSource referenceSource{PhaseServiceReferenceSource::kUnknown};
 };
 
 } // namespace trt_edgellm::rt

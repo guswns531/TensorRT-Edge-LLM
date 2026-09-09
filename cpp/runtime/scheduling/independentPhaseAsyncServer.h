@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseServiceClock.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phasePrefixReuseCache.h"
 
@@ -290,6 +291,7 @@ struct IndependentPhaseServerSubmission
 //! Read-only LLM state used by an upstream encoder dispatch arbiter.
 struct IndependentPhaseServerArbitrationSnapshot
 {
+    std::vector<PhaseServiceClock> serviceClocks;
     bool busy{};
     PhaseDispatchKind inFlightKind{PhaseDispatchKind::kNone};
     PhasePrefillClass inFlightPrefillClass{PhasePrefillClass::kAny};
@@ -501,6 +503,7 @@ private:
         int32_t kvSlotId{-1};
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
+        std::chrono::steady_clock::time_point lastTokenCommittedAt;
         std::shared_ptr<PhaseVisionPayload> visionPayload;
         int32_t baseReservedPages{};
         int32_t fullReservedPages{};

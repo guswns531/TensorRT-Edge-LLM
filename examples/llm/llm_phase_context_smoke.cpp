@@ -2864,12 +2864,16 @@ int main(int argc, char** argv)
                     ipcThreePhase->setEncoderBatchMetricCallback([&](rt::PhaseVisionEncoderBatchMetric const& metric) {
                         encoderBatchMetrics.push_back(metric);
                     });
-                    ipcThreePhase->setFormationEpisodeCallback([&](rt::PhaseFormationRealizedEpisode const& episode) {
-                        formationEpisodes.push_back(episode);
-                    });
-                    ipcThreePhase->setUnifiedEventCallback(
-                        [&](rt::PhaseUnifiedEvent const& event) { unifiedSchedulerEvents.push_back(event); },
-                        emitFullUnifiedSnapshots);
+                    if (phaseTelemetryLevel != "dispatch")
+                    {
+                        ipcThreePhase->setFormationEpisodeCallback(
+                            [&](rt::PhaseFormationRealizedEpisode const& episode) {
+                                formationEpisodes.push_back(episode);
+                            });
+                        ipcThreePhase->setUnifiedEventCallback(
+                            [&](rt::PhaseUnifiedEvent const& event) { unifiedSchedulerEvents.push_back(event); },
+                            emitFullUnifiedSnapshots);
+                    }
                 }
             }
             bool const asyncRequestAdapter = std::getenv("TRT_EDGELLM_IPC_ASYNC_REQUEST_ADAPTER") != nullptr;
@@ -3534,7 +3538,11 @@ int main(int argc, char** argv)
                 {
                     emittedMetrics = semanticCoordinator.metrics().size();
                 }
-                while (collectPhaseDispatchMetrics && emittedMetrics < semanticCoordinator.metrics().size())
+                // Compact records retain execution timestamps; defer JSON work until the serving batch drains.
+                bool const deferCompactMetrics = collectPhaseDispatchMetrics && phaseTelemetryLevel == "dispatch"
+                    && !(ipcThreePhase != nullptr ? ipcThreePhase->empty() : semanticServer.empty());
+                while (collectPhaseDispatchMetrics && !deferCompactMetrics
+                    && emittedMetrics < semanticCoordinator.metrics().size())
                 {
                     madeProgress = true;
                     rt::PhaseDispatchMetrics const& metrics = semanticCoordinator.metrics()[emittedMetrics++];
@@ -4167,9 +4175,12 @@ int main(int argc, char** argv)
                                 for (rt::PhaseProtectedCompletion const& completion : completions)
                                 {
                                     result.push_back({{"kind", rt::phaseProtectedKindName(completion.kind)},
-                                        {"slack_us", completion.slackUs},
+                                        {"request_id", completion.requestId}, {"slack_us", completion.slackUs},
                                         {"predicted_completion_us", completion.predictedCompletionUs},
-                                        {"uncertainty_us", completion.uncertaintyUs}});
+                                        {"uncertainty_us", completion.uncertaintyUs},
+                                        {"reference_us", completion.referenceUs},
+                                        {"reference_source",
+                                            rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
                                 }
                                 return result;
                             };
@@ -4187,12 +4198,46 @@ int main(int argc, char** argv)
                                 {"legal", candidate.legal}, {"request_ids", candidate.requestIds},
                                 {"predicted_completion_us", nlohmann::json::array({candidate.predictedCompletionUs})},
                                 {"uncertainty_us", nlohmann::json::array({candidate.uncertaintyUs})},
+                                {"predicted_cost_source",
+                                    rt::phaseServiceReferenceSourceName(candidate.predictedCostSource)},
+                                {"reference_cost_source",
+                                    rt::phaseServiceReferenceSourceName(candidate.referenceCostSource)},
                                 {"max_slo_violation_us", candidate.predictedSloViolationUs},
                                 {"scalar_decision_cost_known", candidate.scalarDecisionCostKnown},
                                 {"contextual_scalar_authority_applied", candidate.contextualScalarAuthorityApplied},
                                 {"scalar_decision_makespan_us", candidate.scalarDecisionMakespanUs},
                                 {"scalar_protected_completions",
                                     protectedCompletions(candidate.scalarProtectedCompletions)}});
+                        }
+                        nlohmann::json mechanismCandidates = nlohmann::json::array();
+                        for (rt::PhaseUnifiedCandidateSnapshot const& candidate : event.mechanismCandidates)
+                        {
+                            auto protectedCompletions = [](auto const& completions) {
+                                nlohmann::json result = nlohmann::json::array();
+                                for (rt::PhaseProtectedCompletion const& completion : completions)
+                                {
+                                    result.push_back({{"kind", rt::phaseProtectedKindName(completion.kind)},
+                                        {"request_id", completion.requestId}, {"slack_us", completion.slackUs},
+                                        {"predicted_completion_us", completion.predictedCompletionUs},
+                                        {"uncertainty_us", completion.uncertaintyUs},
+                                        {"reference_us", completion.referenceUs},
+                                        {"reference_source",
+                                            rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
+                                }
+                                return result;
+                            };
+                            mechanismCandidates.push_back({{"action_id", candidate.actionId},
+                                {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
+                                {"primary_batch_size", candidate.key.primaryBatchSize},
+                                {"secondary_batch_size", candidate.key.secondaryBatchSize}, {"legal", candidate.legal},
+                                {"request_ids", candidate.requestIds},
+                                {"predicted_completion_us", candidate.predictedCompletionUs},
+                                {"uncertainty_us", candidate.uncertaintyUs},
+                                {"predicted_cost_source",
+                                    rt::phaseServiceReferenceSourceName(candidate.predictedCostSource)},
+                                {"reference_cost_source",
+                                    rt::phaseServiceReferenceSourceName(candidate.referenceCostSource)},
+                                {"protected_services", protectedCompletions(candidate.scalarProtectedCompletions)}});
                         }
                         record.update({{"decision_id", event.decisionId},
                             {"policy_decision_sequence", event.policyDecisionSequence},
@@ -4211,6 +4256,17 @@ int main(int argc, char** argv)
                             {"outstanding_before_mask", static_cast<uint8_t>(event.outstandingBefore)},
                             {"planned_outstanding_mask", static_cast<uint8_t>(event.plannedOutstanding)},
                             {"ready", workJson(event.ready)}, {"selected_cohort", workJson(event.cohort)},
+                            {"service_clocks",
+                                [&event] {
+                                    nlohmann::json clocks = nlohmann::json::array();
+                                    for (auto const& clock : event.serviceClocks)
+                                    {
+                                        clocks.push_back({{"request_id", clock.requestId},
+                                            {"submitted_host_ns", clock.submittedHostNs},
+                                            {"last_token_committed_host_ns", clock.lastTokenCommittedHostNs}});
+                                    }
+                                    return clocks;
+                                }()},
                             {"ready_encoder_request_ids", event.readyEncoderRequestIds},
                             {"ready_prefill_request_ids", event.readyPrefillRequestIds},
                             {"ready_prefill_token_counts", event.readyPrefillTokenCounts},
@@ -4220,6 +4276,7 @@ int main(int argc, char** argv)
                             {"page_reservation_guaranteed_bundles", event.pageReservationGuaranteedBundles},
                             {"vision_payload_bytes", event.visionPayloadBytes}, {"request_ids", event.requestIds},
                             {"inflight", std::move(inflight)}, {"candidates", std::move(candidates)},
+                            {"mechanism_candidates", std::move(mechanismCandidates)},
                             {"selected_action_id", event.selectedActionId},
                             {"scalar_h1_selected_action_id", event.scalarSelectedActionId},
                             {"non_contextual_selected_action_id", event.nonContextualSelectedActionId},

@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseServiceClock.h"
+
 #include "runtime/phase/policy/phaseDeadline.h"
 #include "runtime/phase/policy/phaseGlobalCostModel.h"
 
@@ -361,6 +363,8 @@ struct PhaseUnifiedCandidateSnapshot
     std::vector<uint64_t> requestIds;
     double predictedCompletionUs{};
     double uncertaintyUs{};
+    PhaseServiceReferenceSource predictedCostSource{PhaseServiceReferenceSource::kUnknown};
+    PhaseServiceReferenceSource referenceCostSource{PhaseServiceReferenceSource::kUnknown};
     double predictedSloViolationUs{std::numeric_limits<double>::quiet_NaN()};
     bool scalarDecisionCostKnown{};
     bool contextualScalarAuthorityApplied{};
@@ -372,6 +376,9 @@ struct PhaseGlobalSelectionAudit;
 
 struct PhaseUnifiedEvent
 {
+    std::vector<PhaseServiceClock> serviceClocks;
+    //! Policy-neutral frontier retained before deadline/profitability pruning.
+    std::vector<PhaseUnifiedCandidateSnapshot> mechanismCandidates;
     std::shared_ptr<PhaseGlobalSelectionAudit const> selectorAudit;
     uint32_t schemaVersion{kPHASE_UNIFIED_EVENT_SCHEMA_VERSION};
     PhaseUnifiedEventKind kind{PhaseUnifiedEventKind::kDecision};

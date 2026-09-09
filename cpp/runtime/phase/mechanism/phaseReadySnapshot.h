@@ -66,6 +66,8 @@ struct PhaseQueueSnapshot
     //! Minimum remaining next-token slack. Request SLOs override the global
     //! fallback used only by WAIT/refill action selection.
     double decodeMinTpotSlackUs{};
+    //! Stable tie-broken request owning decodeMinTpotSlackUs.
+    uint64_t decodeMinimumSlackRequestId{};
     double prefillMaxSloPressure{};
     double decodeMaxSloPressure{};
     int32_t prefillHighestPriority{};

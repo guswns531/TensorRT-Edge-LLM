@@ -93,6 +93,9 @@ struct PhaseDecodeGuardAudit
 //! Captured at selection; a later dispatch override is not this decision.
 struct PhaseGlobalSelectionAudit
 {
+    //! Immutable candidates admitted by dependency/context/shape mechanism
+    //! before deadline/profitability pruning. Diagnostic only.
+    std::vector<PhaseGlobalActionCandidate> mechanismInputs;
     std::vector<PhaseGlobalCandidateAudit> inputs;
     PhaseGlobalDecision decision;
     std::vector<PhaseGlobalCandidateAudit> pdInputs;

@@ -92,6 +92,7 @@ struct PhaseGlobalActionCandidate
     double uncertaintyUs{};
     //! GPU makespan of this action only. Zero falls back to predictedBlockingUs.
     double predictedMakespanUs{};
+    PhaseServiceReferenceSource predictedCostSource{PhaseServiceReferenceSource::kUnknown};
     //! Low-dimensional policy estimate used only to rank already-safe actions.
     //! Exact CUDA costs and protected completion bounds remain authoritative
     //! for feasibility and deadline checks. This separation lets contextual
@@ -110,6 +111,7 @@ struct PhaseGlobalActionCandidate
     double predictedHorizonUs{};
     std::vector<PhaseProtectedCompletion> protectedCompletions;
     double referenceWorkUs{};
+    PhaseServiceReferenceSource referenceCostSource{PhaseServiceReferenceSource::kUnknown};
     //! Reference work covered by predictedHorizonUs. Zero falls back to
     //! referenceWorkUs and therefore preserves ordinary one-action selection.
     double horizonReferenceWorkUs{};
