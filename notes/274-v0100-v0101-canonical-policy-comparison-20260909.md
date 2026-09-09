@@ -1,5 +1,9 @@
 # 274. v0.10.0 and v0.10.1 canonical policy comparison
 
+> This initial four-workload comparison is superseded for aggregate conclusions
+> by the canonical 12-workload result in
+> `notes/275-v0100-v0101-canonical-full12-20260909.md`.
+
 ## Outcome
 
 The retained v0.10.0 V0/V1/V2 runtime was rerun against the same text engine,
@@ -228,4 +232,3 @@ caused by shrinking the KV pool.
   completion order, WAIT placement, cohort sequence, and host submission gaps.
 - Investigate the shared V0/V1 multi-image cold outlier before changing policy.
   A workload-specific warm-up or batch-size exception is not an acceptable fix.
-
