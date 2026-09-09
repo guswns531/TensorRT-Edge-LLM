@@ -87,6 +87,8 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--cases", nargs="+", required=True)
     parser.add_argument("--legacy-pair-eligibility", action="store_true")
+    parser.add_argument("--preserve-expired-decode-candidate",
+                        action="store_true")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--build-cache", type=pathlib.Path, required=True)
     parser.add_argument("--asset-remap",
@@ -192,6 +194,11 @@ def main():
                 image = command.index("nvcr.io/nvidia/tensorrt:26.06-py3")
                 command[image:image] = [
                     "-e", "TRT_EDGELLM_LEGACY_PAIR_ELIGIBILITY=1"
+                ]
+            if args.preserve_expired_decode_candidate:
+                image = command.index("nvcr.io/nvidia/tensorrt:26.06-py3")
+                command[image:image] = [
+                    "-e", "TRT_EDGELLM_PRESERVE_EXPIRED_DECODE_CANDIDATE=1"
                 ]
             matches = [
                 i for i, value in enumerate(command)

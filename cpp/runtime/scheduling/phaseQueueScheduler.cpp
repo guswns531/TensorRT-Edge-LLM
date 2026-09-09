@@ -1952,7 +1952,9 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         protect(candidate, protectedPrefillAdvance(prefillPlan.prefillBatch), *prefill);
         candidates.push_back(std::move(candidate));
     }
-    if (allowDecode && decode.has_value() && !prefillDeadlineExpired)
+    bool const preserveExpiredDecode
+        = mConfig.preserveExpiredDecodeCandidate && state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0;
+    if (allowDecode && decode.has_value() && (!prefillDeadlineExpired || preserveExpiredDecode))
     {
         PhaseGlobalActionCandidate candidate;
         candidate.key = decodeKey;

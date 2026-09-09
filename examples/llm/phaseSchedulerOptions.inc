@@ -104,6 +104,8 @@
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
         semanticSchedulerConfig.enablePrefillTtftHardGuard
             = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;
+        semanticSchedulerConfig.preserveExpiredDecodeCandidate
+            = std::getenv("TRT_EDGELLM_PRESERVE_EXPIRED_DECODE_CANDIDATE") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_GLOBAL_SAFE_PROBE_SLACK_MULTIPLIER"))
         {
             semanticSchedulerConfig.globalSafeProbeSlackMultiplier = std::stof(value);

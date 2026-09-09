@@ -696,6 +696,50 @@ TEST(PhaseQueueSchedulerTest, GlobalExpiredTtftSuppressesDecodeOnlyPreview)
     EXPECT_FALSE(scheduler.previewGlobalDecodeAction().has_value());
 }
 
+TEST(PhaseQueueSchedulerTest, ExpiredDecodeCandidateRequiresOptInAndBothExpiredDeadlines)
+{
+    for (bool const enabled : {false, true})
+    {
+        for (bool const decodeExpired : {false, true})
+        {
+            PhaseQueueSchedulerConfig config;
+            config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+            config.enablePrefillTtftHardGuard = true;
+            config.preserveExpiredDecodeCandidate = enabled;
+            PhaseQueueScheduler scheduler(config);
+            PhaseSchedulingHints prefill;
+            prefill.submittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+            prefill.ttftTargetUs = 1.0;
+            PhaseSchedulingHints decode;
+            decode.tpotTargetUs = decodeExpired ? 1.0e-9 : 1.0e12;
+            scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, prefill});
+            scheduler.enqueueDecode({2, 128, 1, 0, 0, true, decode});
+
+            EXPECT_EQ(scheduler.queueSnapshot().decodeMinTpotSlackUs <= 0.0, decodeExpired);
+            EXPECT_EQ(scheduler.previewGlobalDecodeAction().has_value(), enabled && decodeExpired);
+            EXPECT_EQ(scheduler.queueSnapshot().prefillQueued, 1U);
+            EXPECT_EQ(scheduler.queueSnapshot().decodeQueued, 1U);
+        }
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, ExpiredDecodeCandidateDoesNotOverrideLegacyHardGuard)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableMetricsPolicy = true;
+    config.enablePrefillTtftHardGuard = true;
+    config.preserveExpiredDecodeCandidate = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints prefill;
+    prefill.submittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    prefill.ttftTargetUs = 1.0;
+    PhaseSchedulingHints decode;
+    decode.tpotTargetUs = 1.0e-9;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, prefill});
+    scheduler.enqueueDecode({2, 128, 1, 0, 0, true, decode});
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kPrefill);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalSelectionProtectsDecodeTpotInsteadOfFormationWait)
 {
     PhaseQueueSchedulerConfig config;

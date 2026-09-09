@@ -574,6 +574,8 @@ struct PhaseQueueSchedulerConfig
     //! Dispatch expired prefill work before decode even when decode queue pressure is numerically larger.
     //! This is useful when a request TTFT target is an end-to-end hard bound while the decode target is a soft goal.
     bool enablePrefillTtftHardGuard{};
+    //! Keep standalone D eligible for global SLO comparison when both P and D deadlines have expired.
+    bool preserveExpiredDecodeCandidate{};
     //! Skip policy candidate construction when exactly one local phase is
     //! runnable and memory safety is either local or guaranteed by a
     //! pre-reserved ownership contract. The mechanism batch and online
