@@ -24,6 +24,37 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
   explaining the same local pattern. Do not add change narration that compares against previous code, such as
   "replaces X" or "now uses Y"; that belongs in the commit message or PR description.
 
+## Local Research Workflow
+
+- The repository root on `codex/v0101-phase-forward-port` is the only active development worktree. New features,
+  fixes, tests, scripts, and notes belong there unless the user explicitly requests a backport.
+- `.local/worktrees/v0100-reference` on `codex/v010-phase-forward-port` is the frozen modified-v0.10.0 reference.
+  `.local/worktrees/upstream-v0101` is the detached clean-v0.10.1 baseline, and
+  `.local/worktrees/upstream-v091` is the detached historical v0.9.1 baseline. Comparison worktrees are read-only.
+- Treat source worktrees and generated artifacts as different retention classes. Everything under
+  `.local/worktrees/` is protected from artifact cleanup. Keep modified lineages committed and pushed; never leave
+  the only copy of a source change as untracked work under `.local/`.
+- V0/V1/V2 name policy variants inside one version. A v0.10.0-versus-v0.10.1 comparison is a version-port
+  comparison and must record both commits, binaries, engines, and runtime contracts separately.
+- Use the root `.local/` as the shared artifact store. Do not create nested `.local/` directories in linked
+  worktrees. New data belongs under `artifacts/`, `baselines/`, `builds/`, `results/`, `cache/`, `scratch/`, or
+  `registry/`; `.local/current/` contains stable pointers to the active model, ONNX, engines, build, baseline, and
+  result root.
+- Result states are `scratch`, `diagnostic`, `validation`, and `citable`. Every retained campaign must have a
+  manifest with its command/config, source commit and dirty state, binary and engine identity, workload, repeat
+  count, summary paths, and note references. Keep raw traces only when a documented conclusion depends on them.
+- Cleanup is reference- and state-driven, not age-driven. Never delete `current`, `validation`, `citable`, models,
+  engines, or source worktrees without an explicit allowlist and a `notes/` reference audit. Cleanup tools must
+  default to dry-run.
+- Do not move a Git worktree with plain `mv`; use `git worktree move/add/remove`. Do not move a CMake build tree;
+  regenerate it at the canonical path and delete the old tree only after validation.
+- Put reproducible scripts in `benchmarks/` or `scripts/`, and numbered conclusions in `notes/NNN-topic-YYYYMMDD.md`.
+- Use `.local/results/` as the index of retained experiments and `.local/scratch/` for disposable runs.
+- Compare V0/V1/V2 with the same binary, engine, requests, calibration, and memory limits. Reuse a frozen vLLM result
+  when that contract is unchanged; rerun vLLM when it changes.
+- Container writes to `.local/` must use the host UID/GID whenever possible. Never commit models, engines, tokens,
+  or `.local/` data.
+
 ## Common Commands
 
 | Task | Command |
