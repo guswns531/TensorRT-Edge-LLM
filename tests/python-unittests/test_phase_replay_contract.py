@@ -37,9 +37,74 @@ OUTPUTS = load_tool("compare_engine_outputs")
 DISPATCH = load_tool("summarize_compact_dispatch")
 SELECTOR = load_tool("analyze_selector_audit")
 SHADOW = load_tool("analyze_all_late_shadow")
+BRANCH = load_tool("inspect_branch_replay")
 
 
 class ReplayContractTest(unittest.TestCase):
+
+    def test_branch_metadata_does_not_accept_zero_ownership(self):
+        event = dict(ready=dict(prefill_rows=2, decode_rows=48), candidates=[])
+        errors = BRANCH.metadata_errors(event)
+        self.assertIn('missing_kv_ownership_signature', errors)
+        self.assertIn('incomplete_prefill_rows', errors)
+        self.assertIn('incomplete_decode_rows', errors)
+        self.assertIn('missing_candidate_snapshots', errors)
+
+    def test_branch_metadata_requires_request_aligned_lengths(self):
+        event = dict(ready=dict(prefill_rows=1, decode_rows=1),
+                     candidates=[dict(action_id=1)],
+                     kv_ownership_signature=1,
+                     vision_lease_signature=1,
+                     strict_snapshot_signature=1,
+                     scalar_policy_state_signature=1,
+                     ready_prefill_request_ids=[1],
+                     ready_prefill_token_counts=[128],
+                     ready_decode_request_ids=[2],
+                     ready_decode_context_lengths=[512])
+        self.assertEqual(BRANCH.metadata_errors(event), [])
+        event['ready_decode_context_lengths'] = []
+        self.assertIn('incomplete_decode_rows', BRANCH.metadata_errors(event))
+
+    def test_complete_branch_metadata_is_not_a_physical_checkpoint(self):
+        single = dict(action_id=1,
+                      action_kind='prefill',
+                      primary_batch=1,
+                      secondary_batch=0,
+                      hard_feasible=True,
+                      frontier_eligible=True,
+                      dominated=False)
+        pair = dict(single,
+                    action_id=2,
+                    action_kind='prefill_decode',
+                    secondary_batch=1)
+        event = dict(event_kind='decision',
+                     decision_id=1,
+                     action_kind='prefill',
+                     ready=dict(prefill_rows=1, decode_rows=1),
+                     kv_ownership_signature=1,
+                     vision_lease_signature=1,
+                     strict_snapshot_signature=1,
+                     scalar_policy_state_signature=1,
+                     ready_prefill_request_ids=[1],
+                     ready_prefill_token_counts=[128],
+                     ready_decode_request_ids=[2],
+                     ready_decode_context_lengths=[512],
+                     candidates=[
+                         dict(action_id=1, request_ids=[1]),
+                         dict(action_id=2, request_ids=[1, 2])
+                     ],
+                     selector_audit=dict(inputs=[single, pair]))
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'events.jsonl'
+            path.write_text('PHASE_EPOCH\t{"kind":"measurement"}\n' +
+                            'PHASE_SCHEDULER_EVENT\t' + json.dumps(event) +
+                            '\n')
+            result = BRANCH.inspect(path, 1, 1)['matches'][0]
+            self.assertEqual(result['errors'], [])
+            self.assertTrue(result['metadata_fingerprint'])
+            self.assertFalse(result['runtime_replay_ready'])
+            self.assertEqual(BRANCH.inspect(path, 1, 2)['matches'], [])
+            self.assertEqual(len(BRANCH.inspect(path, 1, None)['matches']), 1)
 
     def test_all_late_shadow_uses_only_the_actual_eligible_frontier(self):
         actual = dict(action_id=1,

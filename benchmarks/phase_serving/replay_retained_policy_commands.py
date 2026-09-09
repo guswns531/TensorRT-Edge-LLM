@@ -115,7 +115,7 @@ def main():
         "Diagnostic-only per-dispatch output; changes instrumentation overhead"
     )
     parser.add_argument("--telemetry-level",
-                        choices=("dispatch", "audit"),
+                        choices=("dispatch", "audit", "full"),
                         default="dispatch")
     args = parser.parse_args()
     if "CMAKE_BUILD_TYPE:STRING=Release" not in args.build_cache.read_text(
