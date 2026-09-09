@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import hashlib
+import importlib.util
+import json
+import pathlib
+import tempfile
+import unittest
+
+
+def load_tool(name):
+    path = pathlib.Path(
+        __file__).parents[2] / "benchmarks/phase_serving" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+GUARD = load_tool("guarded_trace_client")
+REPLAY = load_tool("replay_retained_policy_commands")
+DISTRIBUTIONS = load_tool("report_request_distributions")
+OUTPUTS = load_tool("compare_engine_outputs")
+DISPATCH = load_tool("summarize_compact_dispatch")
+
+
+class ReplayContractTest(unittest.TestCase):
+
+    def test_dispatch_epoch_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "dispatch.jsonl"
+            path.write_text('PHASE_METRIC\t{}\n')
+            with self.assertRaises(ValueError):
+                DISPATCH.analyze(path)
+
+    def test_negative_host_intervals_are_preserved(self):
+        result = DISPATCH.stats([-1.0, 2.0])
+        self.assertEqual(result["negative_count"], 1)
+        self.assertEqual(result["mean"], 0.5)
+
+    def test_eos_identity_does_not_hide_strict_difference(self):
+        result = OUTPUTS.compare({"a": [1, 9, 2]}, {"a": [1, 9, 3]}, {9})
+        self.assertEqual(result["full_equal"], 0)
+        self.assertEqual(result["through_eos_equal"], 1)
+        result = OUTPUTS.compare({"a": [1, 9]}, {"a": [2, 9]}, {9})
+        self.assertEqual(result["through_eos_equal"], 0)
+        with self.assertRaises(ValueError):
+            OUTPUTS.compare({"a": [1]}, {"b": [1]}, {9})
+
+    def test_eos_contract_removes_both_overrides(self):
+        command = [
+            "client", "--ignore-eos", "--", "docker", "-e",
+            "TRT_EDGELLM_IGNORE_EOS=1", "-e", "KEEP=1", "image"
+        ]
+        changed = REPLAY.enable_eos_termination(command)
+        self.assertEqual(changed,
+                         ["client", "--", "docker", "-e", "KEEP=1", "image"])
+        self.assertIn("--ignore-eos", command)
+        self.assertEqual(REPLAY.enable_eos_termination(changed), changed)
+        with self.assertRaises(ValueError):
+            REPLAY.enable_eos_termination(["TRT_EDGELLM_IGNORE_EOS=1"])
+
+    def test_latency_statistics(self):
+        mean, p95 = DISTRIBUTIONS.latency_statistics([1.0, 2.0, 3.0])
+        self.assertEqual(mean, 2.0)
+        self.assertAlmostEqual(p95, 2.9)
+        for values in ([], [float("nan")], [float("inf")]):
+            with self.assertRaises(ValueError):
+                DISTRIBUTIONS.latency_statistics(values)
+
+    def test_successful_batch(self):
+        GUARD.validate_rows([{"http_status": 200, "error": ""}], 1)
+
+    def test_http_failure(self):
+        with self.assertRaises(RuntimeError):
+            GUARD.validate_rows([{"http_status": 500, "error": "failed"}], 1)
+
+    def test_stream_failure(self):
+        with self.assertRaises(RuntimeError):
+            GUARD.validate_rows([{
+                "http_status": 200,
+                "error": "SSE error"
+            }], 1)
+
+    def test_missing_response(self):
+        with self.assertRaises(RuntimeError):
+            GUARD.validate_rows([], 1)
+
+    def test_asset_remap_and_missing_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            old = root / "old"
+            new = root / "new"
+            new.mkdir()
+            asset = new / "image.bin"
+            asset.write_bytes(b"unchanged fixture")
+            trace = root / "trace.json"
+            content = {
+                "requests": [{
+                    "messages": [{
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {
+                                "url": (old / "image.bin").as_uri()
+                            }
+                        }]
+                    }]
+                }]
+            }
+            trace.write_text(json.dumps(content))
+            commands = [{"command": ["--trace", str(trace)]}]
+            with self.assertRaises(FileNotFoundError):
+                REPLAY.materialize_inputs(commands, root / "output", [])
+            documents, assets = REPLAY.materialize_inputs(
+                commands, root / "output", [(str(old), str(new))])
+            self.assertEqual(assets[str(asset)],
+                             hashlib.sha256(asset.read_bytes()).hexdigest())
+            rewritten = documents[trace][1]["requests"][0]["messages"][0][
+                "content"][0]["image_url"]["url"]
+            self.assertEqual(rewritten, asset.as_uri())
+            self.assertEqual(json.loads(trace.read_text()), content)
+            self.assertFalse((root / "output").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,5 +1,11 @@
 # v0.10 → v0.10.1: 실행 계약·지연·정책·수치 차이 재감사
 
+> 후속 검증 주의(2026-09-09): note259에서 old Release/current 미최적화 build 차이,
+> note261에서 삭제된 VLM calibration 이미지 경로와 warmup 실패 미검증을 발견했다.
+> 아래 원시 수치는 보존하지만 공정한 버전/정책 인과 효과로 인용하기 전 각 run의 실제
+> build flags와 warmup 성공을 확인해야 한다. 모든 과거 run이 동일 문제였다고 소급 단정하지는 않는다.
+> Old/frozen vLLM 자체의 수치를 이 문제만으로 무효화하는 것도 아니다.
+
 Date: 2026-09-08. Current source: `77c7662` (runtime changes `4099f76`). Compared source tree: root `codex/v010-phase-forward-port`, `f4eb53e`. **새 GPU 실험이나 코드 변경 없이** 보관된 request CSV, aggregate, command manifest, measurement events 및 Git diff를 분석했다.
 
 ## 1. 요약과 이전 표현의 정정
