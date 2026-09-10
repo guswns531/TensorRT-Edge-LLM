@@ -264,6 +264,32 @@ TEST(PhaseGlobalSchedulerTest, ServiceRecoveryKeepsEfficiencyWithinOneQuantumBan
     EXPECT_EQ(decision.serviceRecoveryCandidates, 2U);
 }
 
+TEST(PhaseGlobalSchedulerTest, ServiceRecoveryUsesConfiguredAgeAndBand)
+{
+    PhaseGlobalSchedulerConfig config;
+    config.enableServiceRecovery = true;
+    config.serviceRecoveryAgeQuanta = 2.0;
+    config.serviceRecoveryBandQuanta = 0.0;
+    PhaseGlobalScheduler scheduler(config);
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 2000.0, 1000.0, 10000.0);
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 4000.0, 1000.0, 10000.0);
+    prefill.protectedCompletions = {
+        {std::numeric_limits<double>::infinity(), 1000.0, 0.0, PhaseProtectedKind::kPrefill, 7U, 1000.0,
+            PhaseServiceReferenceSource::kRuntimeExact, 1500.0},
+    };
+    decode.protectedCompletions = prefill.protectedCompletions;
+
+    PhaseGlobalDecision const beforeThreshold = scheduler.select({prefill, decode});
+    EXPECT_FALSE(beforeThreshold.serviceRecoveryApplied);
+
+    prefill.protectedCompletions.front().elapsedServiceUs = 3000.0;
+    decode.protectedCompletions.front().elapsedServiceUs = 3000.0;
+    decode.protectedCompletions.front().predictedCompletionUs = 2000.0;
+    PhaseGlobalDecision const afterThreshold = scheduler.select({prefill, decode});
+    EXPECT_TRUE(afterThreshold.serviceRecoveryApplied);
+    EXPECT_EQ(afterThreshold.serviceRecoveryCandidates, 1U);
+}
+
 TEST(PhaseGlobalSchedulerTest, ServiceRecoveryDoesNotReplaceExplicitDeadlineSafety)
 {
     PhaseGlobalSchedulerConfig config;

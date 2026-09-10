@@ -67,8 +67,8 @@ struct PhaseVisionEncoderBatchChoice
 std::vector<size_t> phaseEncoderCalibrationBatchSizes(
     size_t maxEncoderBatchSize, std::vector<size_t> requestedBatchSizes = {});
 
-//! A phase without an external SLO regains a standalone candidate after one measured service quantum.
-bool phaseNoSloServiceRecoveryDue(PhaseServiceState const& service) noexcept;
+//! A phase without an external SLO regains a standalone candidate after the configured measured service age.
+bool phaseNoSloServiceRecoveryDue(PhaseServiceState const& service, double ageQuanta = 1.0) noexcept;
 
 //! Do not expand persistent vision ownership without a byte-level feasibility contract.
 size_t phaseVisionSafeThroughputCapacity(

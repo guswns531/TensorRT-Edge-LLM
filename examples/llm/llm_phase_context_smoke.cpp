@@ -1718,6 +1718,18 @@ int main(int argc, char** argv)
             && std::getenv("TRT_EDGELLM_SERVICE_NORMALIZED_AUTHORITY") != nullptr;
         semanticSchedulerConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
             = enableServiceNormalizedAuthority;
+        semanticSchedulerConfig.globalSchedulerConfig.disableServiceRecovery
+            = std::getenv("TRT_EDGELLM_DISABLE_SERVICE_RECOVERY") != nullptr;
+        semanticSchedulerConfig.globalSchedulerConfig.suppressUnknownExplorationWhenServiceOverdue
+            = std::getenv("TRT_EDGELLM_ALLOW_OVERDUE_EXPLORATION") == nullptr;
+        if (char const* value = std::getenv("TRT_EDGELLM_SERVICE_RECOVERY_AGE_QUANTA"))
+        {
+            semanticSchedulerConfig.globalSchedulerConfig.serviceRecoveryAgeQuanta = std::stod(value);
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_SERVICE_RECOVERY_BAND_QUANTA"))
+        {
+            semanticSchedulerConfig.globalSchedulerConfig.serviceRecoveryBandQuanta = std::stod(value);
+        }
         rt::PhaseRuntimeCostTrackerConfig runtimeCostConfig;
         runtimeCostConfig.policyMode = phasePolicyMode;
         runtimeCostConfig.action = semanticSchedulerConfig.globalCostModelConfig;
@@ -2413,8 +2425,7 @@ int main(int argc, char** argv)
                 }
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
-                threePhaseConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
-                    = enableServiceNormalizedAuthority;
+                threePhaseConfig.globalSchedulerConfig = semanticSchedulerConfig.globalSchedulerConfig;
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
                 threePhaseConfig.enableGlobalPdFrontier = std::getenv("TRT_EDGELLM_GLOBAL_PD_FRONTIER") != nullptr;
                 threePhaseConfig.preserveLegacyPairEligibility

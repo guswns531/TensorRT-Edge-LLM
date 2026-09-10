@@ -210,13 +210,13 @@ bool validServiceReference(PhaseProtectedCompletion const& completion) noexcept
         && completion.referenceSource != PhaseServiceReferenceSource::kColdFallback;
 }
 
-bool hasOverdueNoSloService(PhaseGlobalActionCandidate const& candidate) noexcept
+bool hasOverdueNoSloService(PhaseGlobalActionCandidate const& candidate, double ageQuanta) noexcept
 {
     return std::any_of(candidate.protectedCompletions.begin(), candidate.protectedCompletions.end(),
-        [](PhaseProtectedCompletion const& completion) {
+        [ageQuanta](PhaseProtectedCompletion const& completion) {
             bool const validRecoveryReference = completion.requestId != 0U && std::isfinite(completion.referenceUs)
                 && completion.referenceUs > 0.0 && std::isfinite(completion.elapsedServiceUs)
-                && completion.elapsedServiceUs >= completion.referenceUs
+                && completion.elapsedServiceUs >= ageQuanta * completion.referenceUs
                 && completion.referenceSource != PhaseServiceReferenceSource::kUnknown;
             return !completion.hasExplicitSlo && validRecoveryReference;
         });
@@ -1146,6 +1146,10 @@ PhaseGlobalScheduler::PhaseGlobalScheduler(PhaseGlobalSchedulerConfig config)
 {
     ELLM_CHECK(mConfig.maxCandidates > 0U, "Global phase candidate limit must be positive");
     ELLM_CHECK(mConfig.deadlineGuardUs >= 0.0, "Global phase deadline guard must be non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.serviceRecoveryAgeQuanta) && mConfig.serviceRecoveryAgeQuanta >= 0.0,
+        "Service recovery age must be finite and non-negative");
+    ELLM_CHECK(std::isfinite(mConfig.serviceRecoveryBandQuanta) && mConfig.serviceRecoveryBandQuanta >= 0.0,
+        "Service recovery band must be finite and non-negative");
 }
 
 PhaseGlobalDecision PhaseGlobalScheduler::select(
@@ -1205,8 +1209,9 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
     // a post-selection policy override.
     std::vector<size_t> exploration;
     bool const overdueNoSloService = mConfig.enableServiceRecovery
+        && mConfig.suppressUnknownExplorationWhenServiceOverdue
         && std::any_of(feasible.begin(), feasible.end(),
-            [&](size_t index) { return hasOverdueNoSloService(candidates[index]); });
+            [&](size_t index) { return hasOverdueNoSloService(candidates[index], mConfig.serviceRecoveryAgeQuanta); });
     if (!overdueNoSloService)
     {
         for (size_t const index : feasible)
@@ -1230,18 +1235,17 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
     {
         std::optional<std::vector<ServiceNormalizedScore>> const normalized
             = serviceNormalizedScores(candidates, frontier, true, true);
-        if (normalized.has_value() && (*normalized)[0].currentMaximum >= 1.0)
+        if (normalized.has_value() && (*normalized)[0].currentMaximum >= mConfig.serviceRecoveryAgeQuanta)
         {
             double minimumProjected = std::numeric_limits<double>::infinity();
             for (ServiceNormalizedScore const& score : *normalized)
             {
                 minimumProjected = std::min(minimumProjected, score.maximum);
             }
-            constexpr double kSERVICE_RECOVERY_BAND_QUANTA = 1.0;
             std::vector<size_t> recovery;
             for (size_t offset{}; offset < frontier.size(); ++offset)
             {
-                if ((*normalized)[offset].maximum <= minimumProjected + kSERVICE_RECOVERY_BAND_QUANTA)
+                if ((*normalized)[offset].maximum <= minimumProjected + mConfig.serviceRecoveryBandQuanta)
                 {
                     recovery.push_back(frontier[offset]);
                     recoveryProjectedAges.emplace(frontier[offset], (*normalized)[offset].maximum);

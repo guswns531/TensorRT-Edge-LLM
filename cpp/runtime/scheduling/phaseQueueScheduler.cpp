@@ -55,7 +55,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mGlobalScheduler([&] {
         PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
-        global.enableServiceRecovery = phasePolicyUsesServiceScale(mConfig.policyMode);
+        global.enableServiceRecovery
+            = phasePolicyUsesServiceScale(mConfig.policyMode) && !global.disableServiceRecovery;
         return global;
     }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
@@ -321,15 +322,15 @@ PhaseServiceReference PhaseQueueScheduler::makePrefillServiceReference(PhaseWork
         key.executionVariant = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, chunkTokens)
                                                                : PhaseExecutionVariant::kEager;
         std::optional<PhaseGlobalCostEstimate> covering;
-        for (PhaseExecutionVariant const variant : {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
+        for (PhaseExecutionVariant const variant :
+            {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
         {
             key.executionVariant = variant;
             std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->estimateCoveringPrimary(key);
             if (estimate.has_value()
                 && (!covering.has_value()
                     || std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs)
-                        > std::max(covering->makespanP95Ms,
-                            covering->makespanMedianMs + covering->uncertaintyMs)))
+                        > std::max(covering->makespanP95Ms, covering->makespanMedianMs + covering->uncertaintyMs)))
             {
                 covering = estimate;
             }
@@ -338,8 +339,8 @@ PhaseServiceReference PhaseQueueScheduler::makePrefillServiceReference(PhaseWork
         {
             double const robustMs
                 = std::max(covering->makespanP95Ms, covering->makespanMedianMs + covering->uncertaintyMs);
-            return {std::max(1.0, robustMs * 1000.0 * remainingTurns),
-                PhaseServiceReferenceSource::kRuntimeCovering, mNextServiceEpoch++, true};
+            return {std::max(1.0, robustMs * 1000.0 * remainingTurns), PhaseServiceReferenceSource::kRuntimeCovering,
+                mNextServiceEpoch++, true};
         }
     }
 
@@ -378,15 +379,15 @@ PhaseServiceReference PhaseQueueScheduler::makeDecodeServiceReference(PhaseWorkI
         int32_t const contextBucket = (item.tokenCount + contextBucketTokens - 1) / contextBucketTokens;
         PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, 1, 0, 1, contextBucket, 0};
         std::optional<PhaseGlobalCostEstimate> covering;
-        for (PhaseExecutionVariant const variant : {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
+        for (PhaseExecutionVariant const variant :
+            {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
         {
             key.executionVariant = variant;
             std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->estimateCoveringPrimary(key);
             if (estimate.has_value()
                 && (!covering.has_value()
                     || std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs)
-                        > std::max(covering->makespanP95Ms,
-                            covering->makespanMedianMs + covering->uncertaintyMs)))
+                        > std::max(covering->makespanP95Ms, covering->makespanMedianMs + covering->uncertaintyMs)))
             {
                 covering = estimate;
             }
@@ -2249,7 +2250,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         protect(candidate, protectedPrefillAdvance(prefillPlan.prefillBatch), *prefill);
         candidates.push_back(std::move(candidate));
     }
-    bool const preserveExpiredDecode = phasePolicyUsesServiceScale(mConfig.policyMode)
+    bool const preserveExpiredDecode
+        = (phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.globalSchedulerConfig.disableServiceRecovery)
         || (mConfig.preserveExpiredDecodeCandidate && state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0);
     if (audit != nullptr)
     {

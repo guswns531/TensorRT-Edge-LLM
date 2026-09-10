@@ -219,8 +219,9 @@ class ReplayContractTest(unittest.TestCase):
 
     def test_no_slo_contract_removes_only_composition_targets(self):
         command = [
-            "docker", "run", "-e", "TRT_EDGELLM_VISION_TTFT_TARGET_MS=500", "-e",
-            "TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS=80", "-e", "KEEP=1", "image"
+            "docker", "run", "-e", "TRT_EDGELLM_VISION_TTFT_TARGET_MS=500",
+            "-e", "TRT_EDGELLM_VISION_DECODE_TPOT_TARGET_MS=80", "-e",
+            "KEEP=1", "image"
         ]
 
         changed = REPLAY.remove_explicit_slo_contract(command)
@@ -238,17 +239,20 @@ class ReplayContractTest(unittest.TestCase):
             cache = build / "CMakeCache.txt"
             cache.touch()
             command = [
-                "docker", "-v", f"{root}:/workspace",
+                "docker",
+                "-v",
+                f"{root}:/workspace",
                 "EDGELLM_PLUGIN_PATH=/workspace/old/lib.so",
                 "LD_LIBRARY_PATH=/workspace/old/examples/llm:/opt/tensorrt/lib",
-                "image", "/workspace/old/examples/llm/llm_phase_context_smoke",
+                "image",
+                "/workspace/old/examples/llm/llm_phase_context_smoke",
                 "/workspace/engine",
             ]
 
             changed = REPLAY.remap_runtime_build(command, cache)
 
-            self.assertIn(
-                "EDGELLM_PLUGIN_PATH=/workspace/canonical/lib.so", changed)
+            self.assertIn("EDGELLM_PLUGIN_PATH=/workspace/canonical/lib.so",
+                          changed)
             self.assertIn(
                 "LD_LIBRARY_PATH=/workspace/canonical/examples/llm:/opt/tensorrt/lib",
                 changed)
@@ -256,6 +260,22 @@ class ReplayContractTest(unittest.TestCase):
                 "/workspace/canonical/examples/llm/llm_phase_context_smoke",
                 changed)
             self.assertEqual(command[-1], changed[-1])
+
+    def test_runtime_environment_is_scoped_and_replaces_existing_value(self):
+        command = [
+            "docker", "run", "-e", "TRT_EDGELLM_TEST_VALUE=old",
+            "nvcr.io/nvidia/tensorrt:26.06-py3", "runtime"
+        ]
+
+        changed = REPLAY.inject_runtime_environment(
+            command, ["TRT_EDGELLM_TEST_VALUE=new", "TRT_EDGELLM_OTHER=1"])
+
+        self.assertEqual(changed.count("TRT_EDGELLM_TEST_VALUE=new"), 1)
+        self.assertNotIn("TRT_EDGELLM_TEST_VALUE=old", changed)
+        self.assertLess(changed.index("TRT_EDGELLM_OTHER=1"),
+                        changed.index("nvcr.io/nvidia/tensorrt:26.06-py3"))
+        with self.assertRaises(ValueError):
+            REPLAY.inject_runtime_environment(command, ["OTHER=1"])
 
     def test_latency_statistics(self):
         mean, p95 = DISTRIBUTIONS.latency_statistics([1.0, 2.0, 3.0])

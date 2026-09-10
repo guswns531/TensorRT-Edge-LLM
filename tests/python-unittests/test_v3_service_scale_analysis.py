@@ -17,19 +17,22 @@ import importlib.util
 import json
 from pathlib import Path
 
-
 SCRIPT = (Path(__file__).parents[2] / 'benchmarks' / 'phase_serving' /
           'analyze_v3_service_scale.py')
-SPEC = importlib.util.spec_from_file_location('analyze_v3_service_scale', SCRIPT)
+SPEC = importlib.util.spec_from_file_location('analyze_v3_service_scale',
+                                              SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
 def test_reports_service_scale_and_pseudo_expiration(tmp_path):
     event = {
-        'event_kind': 'decision',
-        'host_monotonic_ns': 2_000_000,
-        'action_kind': 'prefill',
+        'event_kind':
+        'decision',
+        'host_monotonic_ns':
+        2_000_000,
+        'action_kind':
+        'prefill',
         'encoder_service': {
             'request_id': 3,
             'reference_us': 20_000.0,
@@ -47,6 +50,11 @@ def test_reports_service_scale_and_pseudo_expiration(tmp_path):
         'decode_guard_audit': {
             'candidate_suppressed': True,
             'candidate_restored': False,
+        },
+        'selector_audit': {
+            'service_recovery_applied': True,
+            'service_recovery_candidates': 2,
+            'max_normalized_service_age': 1.25,
         },
         'mechanism_candidates': [{
             'protected_services': [{
@@ -84,6 +92,10 @@ def test_reports_service_scale_and_pseudo_expiration(tmp_path):
     assert result['counts']['prefill_pseudo_expired'] == 1
     assert result['counts']['decode_candidate_suppressed'] == 1
     assert result['counts']['prefill_service_age_over_one'] == 1
+    assert result['counts']['service_recovery_applied'] == 1
+    assert result['counts']['service_recovery_retained_candidates'] == 2
+    assert result['counts']['service_recovery_eligible_decisions'] == 1
+    assert result['service_recovery_rate'] == 1.0
     assert result['service_age_quanta']['encoder']['p50'] == 0.5
     assert result['fixed_scale_to_service_ratio']['prefill']['p50'] == 0.5
     assert result['fixed_scale_to_service_ratio']['decode']['p50'] == 0.25

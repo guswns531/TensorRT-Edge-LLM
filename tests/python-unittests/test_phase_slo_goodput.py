@@ -15,6 +15,9 @@
 
 import csv
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 GOODPUT_PATH = Path(__file__).parents[
@@ -129,3 +132,45 @@ def test_slo_goodput_attributes_joint_failures(tmp_path):
 
     assert result["passed_requests"] == 0
     assert result["failure_reasons"] == {"ttft+tpot+e2e": 1}
+
+
+def test_slo_surface_writes_every_threshold_pair(tmp_path):
+    requests = tmp_path / "requests.csv"
+    output_json = tmp_path / "surface.json"
+    output_csv = tmp_path / "surface.csv"
+    fieldnames = [
+        "request_class", "scheduled_arrival_us", "first_token_us",
+        "completed_us", "output_tokens", "http_status", "error", "ttft_ms",
+        "tpot_ms", "e2e_ms"
+    ]
+    with requests.open("w", newline="", encoding="utf-8") as destination:
+        writer = csv.DictWriter(destination, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({
+            "request_class": "text",
+            "scheduled_arrival_us": 0,
+            "first_token_us": 100_000,
+            "completed_us": 1_000_000,
+            "output_tokens": 32,
+            "http_status": 200,
+            "error": "",
+            "ttft_ms": 100,
+            "tpot_ms": 20,
+            "e2e_ms": 1000,
+        })
+
+    surface_path = Path(__file__).parents[
+        2] / "benchmarks" / "phase_serving" / "analyze_slo_surface.py"
+    subprocess.run([
+        sys.executable,
+        str(surface_path), "--run", f"test={requests}", "--ttft-ms", "50",
+        "150", "--tpot-ms", "10", "30", "--output-json",
+        str(output_json), "--output-csv",
+        str(output_csv)
+    ],
+                   check=True)
+
+    artifact = json.loads(output_json.read_text())
+    assert len(artifact["run_points"]) == 4
+    assert len(artifact["surface"]) == 4
+    assert sum(row["passed_requests"] for row in artifact["surface"]) == 1

@@ -3986,6 +3986,7 @@ TEST(PhaseThreeCoordinatorPolicyTest, RecoversNoSloPhaseAfterOneServiceQuantum)
 
     service.serviceAgeQuanta = 1.0;
     EXPECT_TRUE(phaseNoSloServiceRecoveryDue(service));
+    EXPECT_FALSE(phaseNoSloServiceRecoveryDue(service, 2.0));
 
     service.hasExplicitSlo = true;
     service.serviceAgeQuanta = 10.0;

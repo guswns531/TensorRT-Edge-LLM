@@ -22,7 +22,6 @@ import math
 import pathlib
 import statistics
 
-
 FIXED_SCALE_US = {
     'prefill': 5000.0,
     'decode': 2000.0,
@@ -63,7 +62,8 @@ def _protected_services(event):
                 'service_epoch': state.get('service_epoch'),
                 'service_age_quanta': state.get('service_age_quanta'),
             }
-            unique[(kind, service['request_id'], service['service_epoch'])] = service
+            unique[(kind, service['request_id'],
+                    service['service_epoch'])] = service
     for candidate in event.get('mechanism_candidates', []):
         services = candidate.get('protected_services', [])
         for service in services:
@@ -81,7 +81,8 @@ def analyze(path):
         prefix, separator, value = line.partition('\t')
         if not separator:
             continue
-        if prefix == 'PHASE_EPOCH' and json.loads(value)['kind'] == 'measurement':
+        if prefix == 'PHASE_EPOCH' and json.loads(
+                value)['kind'] == 'measurement':
             decisions.clear()
             measurement_epochs += 1
         elif prefix == 'PHASE_SCHEDULER_EVENT':
@@ -108,7 +109,8 @@ def analyze(path):
         previous_ns = host_ns
         ready_decode = event.get('ready', {}).get('decode_rows', 0) > 0
         action = event.get('action_kind')
-        serves_decode = action in ('decode', 'prefill_decode', 'encoder_decode')
+        serves_decode = action in ('decode', 'prefill_decode',
+                                   'encoder_decode')
         if ready_decode and not serves_decode:
             counts['decode_ready_non_decode'] += 1
             if non_decode_start_ns is None:
@@ -120,7 +122,8 @@ def analyze(path):
                 current_p_streak = 0
         else:
             if non_decode_start_ns is not None and host_ns is not None:
-                non_decode_durations_ms.append((host_ns - non_decode_start_ns) / 1.0e6)
+                non_decode_durations_ms.append(
+                    (host_ns - non_decode_start_ns) / 1.0e6)
                 non_decode_start_ns = None
             if current_p_streak:
                 p_only_streaks.append(current_p_streak)
@@ -129,25 +132,40 @@ def analyze(path):
         guard = event.get('decode_guard_audit')
         if guard is not None:
             counts['decode_guard_audited'] += 1
-            counts['decode_candidate_suppressed'] += int(guard['candidate_suppressed'])
-            counts['decode_candidate_restored'] += int(guard['candidate_restored'])
+            counts['decode_candidate_suppressed'] += int(
+                guard['candidate_suppressed'])
+            counts['decode_candidate_restored'] += int(
+                guard['candidate_restored'])
+
+        selector = event.get('selector_audit', {})
+        if selector:
+            recovery_applied = bool(
+                selector.get('service_recovery_applied', False))
+            counts['service_recovery_applied'] += int(recovery_applied)
+            if recovery_applied:
+                counts['service_recovery_retained_candidates'] += int(
+                    selector.get('service_recovery_candidates', 0))
+            counts['service_recovery_eligible_decisions'] += int(
+                float(selector.get('max_normalized_service_age', 0.0)) >= 1.0)
 
         for service in _protected_services(event):
             kind = service.get('kind')
             reference = service.get('reference_us')
             elapsed = service.get('elapsed_service_us')
             source = service.get('reference_source', 'unknown')
-            if kind not in ('encoder', 'prefill', 'decode') or reference is None or elapsed is None or reference <= 0:
+            if kind not in (
+                    'encoder', 'prefill', 'decode'
+            ) or reference is None or elapsed is None or reference <= 0:
                 continue
             source_counts[f'{kind}:{source}'] += 1
             service_ages[kind].append(elapsed / reference)
             if kind in FIXED_SCALE_US:
-                fixed_to_service[kind].append(FIXED_SCALE_US[kind] /
-                                              reference)
+                fixed_to_service[kind].append(FIXED_SCALE_US[kind] / reference)
             explicit = bool(service.get('has_explicit_slo', False))
             counts[f'{kind}_explicit_slo'] += int(explicit)
             counts[f'{kind}_no_explicit_slo'] += int(not explicit)
-            counts[f'{kind}_service_age_over_one'] += int(elapsed / reference >= 1.0)
+            counts[f'{kind}_service_age_over_one'] += int(elapsed /
+                                                          reference >= 1.0)
             legacy_slack = service.get('slack_us')
             if kind == 'prefill' and not explicit and legacy_slack is not None and legacy_slack <= 0:
                 counts['prefill_pseudo_expired'] += 1
@@ -155,22 +173,26 @@ def analyze(path):
     if current_p_streak:
         p_only_streaks.append(current_p_streak)
     if non_decode_start_ns is not None and previous_ns is not None:
-        non_decode_durations_ms.append((previous_ns - non_decode_start_ns) / 1.0e6)
+        non_decode_durations_ms.append(
+            (previous_ns - non_decode_start_ns) / 1.0e6)
 
-    return dict(source=str(path),
-                counts=dict(sorted(counts.items())),
-                reference_sources=dict(sorted(source_counts.items())),
-                service_age_quanta={
-                    kind: _summary(values)
-                    for kind, values in sorted(service_ages.items())
-                },
-                fixed_scale_to_service_ratio={
-                    kind: _summary(values)
-                    for kind, values in sorted(fixed_to_service.items())
-                },
-                p_only_streak=_summary(p_only_streaks),
-                decode_ready_non_decode_duration_ms=_summary(
-                    non_decode_durations_ms))
+    return dict(
+        source=str(path),
+        counts=dict(sorted(counts.items())),
+        service_recovery_rate=(counts['service_recovery_applied'] /
+                               counts['decisions']
+                               if counts['decisions'] else 0.0),
+        reference_sources=dict(sorted(source_counts.items())),
+        service_age_quanta={
+            kind: _summary(values)
+            for kind, values in sorted(service_ages.items())
+        },
+        fixed_scale_to_service_ratio={
+            kind: _summary(values)
+            for kind, values in sorted(fixed_to_service.items())
+        },
+        p_only_streak=_summary(p_only_streaks),
+        decode_ready_non_decode_duration_ms=_summary(non_decode_durations_ms))
 
 
 def main():

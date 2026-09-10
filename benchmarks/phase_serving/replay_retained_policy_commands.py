@@ -90,8 +90,8 @@ def remove_explicit_slo_contract(command):
         "TRT_EDGELLM_GLOBAL_DECODE_TPOT_TARGET_US=",
     )
     matches = [
-        i for i, value in enumerate(result)
-        if any(value.startswith(prefix) for prefix in prefixes)
+        i for i, value in enumerate(result) if any(
+            value.startswith(prefix) for prefix in prefixes)
     ]
     for index in reversed(matches):
         if index == 0 or result[index - 1] != "-e":
@@ -110,7 +110,8 @@ def remap_runtime_build(command, build_cache):
     try:
         relative = build_root.relative_to(host_root)
     except ValueError as error:
-        raise ValueError("Build cache must be below the /workspace mount") from error
+        raise ValueError(
+            "Build cache must be below the /workspace mount") from error
     executable = [
         value for value in command
         if value.endswith("/examples/llm/llm_phase_context_smoke")
@@ -120,6 +121,29 @@ def remap_runtime_build(command, build_cache):
     old_root = str(pathlib.PurePosixPath(executable[0]).parents[2])
     new_root = str(pathlib.PurePosixPath("/workspace") / relative)
     return [value.replace(old_root, new_root) for value in command]
+
+
+def inject_runtime_environment(command, assignments):
+    """Inject validated runtime-only ablation settings into a Docker command."""
+    result = list(command)
+    image = result.index("nvcr.io/nvidia/tensorrt:26.06-py3")
+    for assignment in assignments:
+        name, separator, value = assignment.partition("=")
+        if not separator or not name.startswith("TRT_EDGELLM_") or not value:
+            raise ValueError(
+                "Runtime environment must use TRT_EDGELLM_NAME=VALUE")
+        matches = [
+            index for index, item in enumerate(result)
+            if item.startswith(name + "=")
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"Duplicate runtime environment setting: {name}")
+        if matches:
+            result[matches[0]] = assignment
+            continue
+        result[image:image] = ["-e", assignment]
+        image += 2
+    return result
 
 
 def main():
@@ -144,6 +168,12 @@ def main():
     parser.add_argument("--vision-engine-dir")
     parser.add_argument("--text-engine-dir")
     parser.add_argument("--service-normalized-authority", action="store_true")
+    parser.add_argument(
+        "--runtime-env",
+        action="append",
+        default=[],
+        metavar="TRT_EDGELLM_NAME=VALUE",
+        help="Runtime-only diagnostic or ablation setting; may be repeated")
     parser.add_argument(
         "--respect-eos",
         action="store_true",
@@ -204,11 +234,13 @@ def main():
     planned = []
     for policy in args.policies:
         for case in args.cases:
-            command = remap_runtime_build(list(selected[case]["command"]), args.build_cache)
+            command = remap_runtime_build(list(selected[case]["command"]),
+                                          args.build_cache)
             if args.respect_eos:
                 command = enable_eos_termination(command)
             if args.no_explicit_slo:
                 command = remove_explicit_slo_contract(command)
+            command = inject_runtime_environment(command, args.runtime_env)
             for option in ("--trace", "--generic-warmup-trace"):
                 if option in command:
                     index = command.index(option) + 1

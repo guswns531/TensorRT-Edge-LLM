@@ -332,11 +332,9 @@ PhaseVisionEncoderBatchChoice phaseVisionSelectEncoderBatch(
     return result;
 }
 
-bool phaseNoSloServiceRecoveryDue(PhaseServiceState const& service) noexcept
+bool phaseNoSloServiceRecoveryDue(PhaseServiceState const& service, double ageQuanta) noexcept
 {
-    constexpr double kSERVICE_RECOVERY_AGE_QUANTA = 1.0;
-    return service.reference.valid && !service.hasExplicitSlo
-        && service.serviceAgeQuanta >= kSERVICE_RECOVERY_AGE_QUANTA;
+    return service.reference.valid && !service.hasExplicitSlo && service.serviceAgeQuanta >= ageQuanta;
 }
 
 size_t phaseVisionSafeThroughputCapacity(
@@ -689,7 +687,8 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mConfig(config)
     , mGlobalScheduler([&] {
         PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
-        global.enableServiceRecovery = phasePolicyUsesServiceScale(mConfig.policyMode);
+        global.enableServiceRecovery
+            = phasePolicyUsesServiceScale(mConfig.policyMode) && !global.disableServiceRecovery;
         return global;
     }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
@@ -2788,7 +2787,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     auto const serviceRecoveryDue = [&](PhaseGlobalActionKind kind) {
         PhaseServiceState const& service
             = kind == PhaseGlobalActionKind::kPrefill ? serverState.prefillService : serverState.decodeService;
-        return phasePolicyUsesServiceScale(mConfig.policyMode) && phaseNoSloServiceRecoveryDue(service);
+        return phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.globalSchedulerConfig.disableServiceRecovery
+            && phaseNoSloServiceRecoveryDue(service, mConfig.globalSchedulerConfig.serviceRecoveryAgeQuanta);
     };
     if (!residualAugmentation && !mGlobalWarmupProbeMode)
     {
@@ -2842,8 +2842,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         bool residualDerivedFromFullCost{};
         PhaseServiceReferenceSource overlapCostSource{PhaseServiceReferenceSource::kDerivedIsolated};
         std::optional<PhaseGlobalCostEstimate> online = mRuntimeCostTracker->estimate(overlapKey);
-        overlapCostSource
-            = online.has_value() ? PhaseServiceReferenceSource::kRuntimeExact : overlapCostSource;
+        overlapCostSource = online.has_value() ? PhaseServiceReferenceSource::kRuntimeExact : overlapCostSource;
         if (!online.has_value() && residualAugmentation)
         {
             PhaseGlobalActionKey fullKey = overlapKey;
@@ -2851,8 +2850,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             fullKey.residualAnchor = PhaseGlobalResidualAnchor::kNone;
             online = mRuntimeCostTracker->estimate(fullKey);
             residualDerivedFromFullCost = online.has_value();
-            overlapCostSource
-                = online.has_value() ? PhaseServiceReferenceSource::kRuntimeExact : overlapCostSource;
+            overlapCostSource = online.has_value() ? PhaseServiceReferenceSource::kRuntimeExact : overlapCostSource;
         }
         if (online.has_value())
         {
@@ -3038,8 +3036,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         overlap.predictedMakespanUs = overlapMakespanUs;
         overlap.uncertaintyUs = overlapUncertaintyUs;
         overlap.referenceWorkUs = encoderReferenceUs + phase.referenceWorkUs;
-        overlap.predictedCostSource
-            = overlapKnown ? overlapCostSource : PhaseServiceReferenceSource::kDerivedIsolated;
+        overlap.predictedCostSource = overlapKnown ? overlapCostSource : PhaseServiceReferenceSource::kDerivedIsolated;
         overlap.referenceCostSource = PhaseServiceReferenceSource::kDerivedIsolated;
         overlap.requestServiceLagUs = std::max(encoderServiceLagUs, phase.requestServiceLagUs);
         overlap.memory = encoder.memory;

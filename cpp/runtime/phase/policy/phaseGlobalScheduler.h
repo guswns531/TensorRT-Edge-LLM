@@ -72,6 +72,10 @@ struct PhaseGlobalSchedulerConfig
     //! Bound no-SLO starvation in immutable service-cost units before applying
     //! the ordinary transition/efficiency ranking.
     bool enableServiceRecovery{};
+    bool disableServiceRecovery{};
+    bool suppressUnknownExplorationWhenServiceOverdue{true};
+    double serviceRecoveryAgeQuanta{1.0};
+    double serviceRecoveryBandQuanta{1.0};
 };
 
 //! Evaluation of one actual selector input, not a preview-frontier candidate.

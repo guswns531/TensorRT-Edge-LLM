@@ -78,15 +78,46 @@ def main():
     parser.add_argument('--commands', type=pathlib.Path, required=True)
     parser.add_argument('--output-dir', type=pathlib.Path, required=True)
     parser.add_argument('--ready-timeout', type=float, default=600)
+    parser.add_argument(
+        '--repeats',
+        type=int,
+        default=1,
+        help='start a fresh server for every independent case repetition')
+    parser.add_argument(
+        '--continue-on-error',
+        action='store_true',
+        help='retain a failed run and continue with the remaining matrix')
     args = parser.parse_args()
+    if args.repeats <= 0:
+        parser.error('repeats must be positive')
     for case in json.loads(args.commands.read_text()):
         if not re.fullmatch('[a-zA-Z0-9_-]+', case['name']):
             raise ValueError('Invalid case directory name')
         if case['server'][:2] != ['docker', 'run'] or '--rm' in case['server']:
             raise ValueError(
                 'Server must use docker run without --rm to retain exit logs')
-        run_case(case, args.output_dir / case['name'], args.ready_timeout)
-        print('Completed ' + case['name'], flush=True)
+        for repeat in range(1, args.repeats + 1):
+            destination = args.output_dir / case['name']
+            if args.repeats > 1:
+                destination /= f'run-{repeat:03d}'
+            try:
+                run_case(case, destination, args.ready_timeout)
+                print(f"Completed {case['name']} run {repeat}/{args.repeats}",
+                      flush=True)
+            except Exception as error:
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / 'failure.json').write_text(
+                    json.dumps(
+                        {
+                            'type': type(error).__name__,
+                            'message': str(error),
+                        },
+                        indent=2) + '\n')
+                print(
+                    f"Failed {case['name']} run {repeat}/{args.repeats}: {error}",
+                    flush=True)
+                if not args.continue_on_error:
+                    raise
 
 
 if __name__ == '__main__':
