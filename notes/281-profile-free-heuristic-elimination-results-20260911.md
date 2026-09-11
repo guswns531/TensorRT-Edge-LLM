@@ -34,11 +34,13 @@ The three-repeat canonical full-12 campaign is under:
 
 ```text
 .local/results/v0101-forward-port/heuristic-elimination-20260911/
-  v3-profile-free-canonical-full12-3x/
+  v3-profile-free-clean-full12-3x/
 ```
 
 All 36 measured runs completed, no run OOMed, and every workload produced a
 deterministic fixed-output token trace across its three repetitions.
+The campaign manifest records source commit `ae36f65`, a clean worktree, and
+runtime executable SHA-256 `6f1b066a...e6ddefd`.
 
 ## 1. Implementation
 
@@ -213,24 +215,28 @@ Positive means the simplified canonical is better.
 
 | Workload | token/s | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| short | -0.04% | +0.36% | -0.16% | -0.22% | -0.58% | -0.01% | -0.01% |
-| balanced | +0.79% | -6.49% | -2.08% | +1.24% | +1.05% | +0.86% | +2.20% |
-| decode-heavy | -1.31% | -0.16% | -3.81% | -1.10% | -1.24% | -1.48% | -1.28% |
-| long-prefill | -0.15% | +0.18% | -1.06% | +0.57% | +2.40% | -0.06% | +0.09% |
-| bimodal | -0.94% | +0.61% | +1.53% | -1.90% | -9.86% | -0.21% | +1.08% |
-| text-heavy | +1.61% | -4.46% | -2.53% | +3.79% | +6.99% | +1.19% | +1.59% |
-| mixed | +0.21% | +2.43% | +0.89% | -0.82% | +0.38% | +0.07% | +0.34% |
-| vision-heavy | -0.15% | +2.72% | +2.89% | -7.60% | +0.19% | -2.56% | -0.07% |
-| poisson | +1.84% | +7.48% | +4.35% | +0.91% | +1.67% | +2.41% | +1.53% |
-| wave-drain | +0.01% | -0.13% | +0.11% | +0.24% | +0.12% | +0.03% | +0.04% |
-| multi-image | -0.83% | +0.11% | -1.04% | -0.35% | -0.15% | -0.34% | -0.92% |
-| late-vision | -0.08% | +1.25% | +0.33% | -0.21% | +0.07% | -0.03% | -0.03% |
-| geometric mean | **+0.08%** | **+0.38%** | **-0.02%** | **-0.42%** | **+0.15%** | **-0.00%** | **+0.38%** |
+| short | -0.74% | -1.79% | -1.34% | -0.38% | +11.66% | -1.93% | -0.90% |
+| balanced | +0.34% | -4.58% | -2.90% | +0.71% | +0.96% | +0.27% | +1.59% |
+| decode-heavy | -0.16% | +4.99% | -1.58% | +0.03% | -0.37% | -0.19% | +0.29% |
+| long-prefill | -0.12% | -0.77% | -2.03% | +1.37% | +2.06% | +0.07% | +1.14% |
+| bimodal | -0.43% | -1.62% | +3.58% | +1.38% | +7.18% | -0.95% | +1.27% |
+| text-heavy | -0.78% | -9.00% | +1.87% | +2.78% | +2.30% | -0.78% | -0.64% |
+| mixed | -0.83% | +2.38% | -1.05% | -1.75% | +1.04% | -0.44% | -0.75% |
+| vision-heavy | -0.95% | -1.56% | -1.64% | -6.00% | +1.92% | -1.37% | -1.15% |
+| poisson | +2.74% | +8.84% | +5.16% | +0.58% | +0.55% | +3.75% | +3.01% |
+| wave-drain | -0.00% | -0.14% | -0.01% | -0.09% | -4.44% | -0.11% | -0.02% |
+| multi-image | +0.79% | +0.06% | +1.08% | -0.19% | +2.68% | +0.46% | +0.75% |
+| late-vision | +0.42% | +1.39% | +0.51% | +0.19% | +0.11% | +0.34% | +0.40% |
+| geometric mean | **+0.02%** | **-0.06%** | **+0.17%** | **-0.09%** | **+2.21%** | **-0.06%** | **+0.42%** |
 
 The aggregate is performance-neutral. Large single-metric exchanges in
 balanced, bimodal, text-heavy, vision-heavy, and poisson show why citable
 evaluation must retain all request metrics and three repeats rather than report
 only token throughput.
+
+The clean campaign also reproduced the pre-commit validation campaign within
+-0.06% token/s and +0.04% E2E-p95 geometric mean. The clean manifest, rather
+than the dirty validation manifest, is the retained citable result.
 
 ## 8. Canonical V3 versus frozen equal-contract vLLM
 
@@ -240,22 +246,22 @@ canonical V3 is better.
 
 | Workload | token/s | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| short | +15.20% | +48.61% | +23.67% | +6.69% | +19.11% | +20.75% | +16.04% |
-| balanced | -0.11% | +42.16% | +36.34% | -5.14% | -6.82% | +0.12% | -2.22% |
-| decode-heavy | +1.89% | +42.29% | +47.12% | -0.14% | -1.23% | +1.56% | -0.10% |
-| long-prefill | +19.81% | -1.96% | +10.12% | +32.05% | +31.37% | +17.92% | +20.47% |
-| bimodal | +4.61% | -21.81% | -59.13% | +25.42% | +31.92% | +8.72% | +0.26% |
-| text-heavy | +56.80% | +61.91% | +44.86% | -27.45% | +12.70% | +20.00% | +34.52% |
-| mixed | +20.13% | +9.86% | +9.59% | +39.17% | +51.64% | +26.75% | +17.71% |
-| vision-heavy | +13.41% | +13.73% | +7.74% | +56.90% | +68.11% | +36.93% | +13.00% |
-| poisson | +11.28% | +44.30% | +21.15% | +7.87% | +15.90% | +14.82% | +12.43% |
-| wave-drain | +1.94% | -9.24% | +24.96% | +36.74% | +48.72% | +18.48% | +18.72% |
-| multi-image | +21.47% | -9.08% | +19.18% | +35.82% | +41.49% | +17.46% | +17.50% |
-| late-vision | +14.62% | +46.77% | +46.36% | +11.96% | +11.74% | +16.90% | +12.81% |
-| geometric mean | **+14.27%** | **+27.16%** | **+23.01%** | **+21.50%** | **+30.71%** | **+17.27%** | **+14.01%** |
+| short | +14.40% | +47.50% | +22.77% | +6.54% | +28.95% | +19.23% | +15.30% |
+| balanced | -0.56% | +43.20% | +35.83% | -5.71% | -6.92% | -0.48% | -2.86% |
+| decode-heavy | +3.08% | +45.25% | +48.25% | +0.98% | -0.37% | +2.80% | +1.45% |
+| long-prefill | +19.84% | -2.93% | +9.26% | +32.60% | +31.13% | +18.03% | +21.31% |
+| bimodal | +5.14% | -24.55% | -55.81% | +27.82% | +42.48% | +8.05% | +0.46% |
+| text-heavy | +53.12% | +60.26% | +47.23% | -28.78% | +8.30% | +18.41% | +33.04% |
+| mixed | +18.87% | +9.81% | +7.82% | +38.61% | +51.96% | +26.38% | +16.81% |
+| vision-heavy | +12.50% | +9.93% | +3.43% | +57.54% | +68.66% | +37.66% | +12.06% |
+| poisson | +12.25% | +45.12% | +21.82% | +7.56% | +14.94% | +15.99% | +13.75% |
+| wave-drain | +1.92% | -9.25% | +24.88% | +36.53% | +46.38% | +18.37% | +18.67% |
+| multi-image | +23.44% | -9.13% | +20.88% | +35.92% | +43.14% | +18.12% | +18.87% |
+| late-vision | +15.20% | +46.85% | +46.45% | +12.32% | +11.77% | +17.21% | +13.18% |
+| geometric mean | **+14.20%** | **+26.84%** | **+23.16%** | **+21.75%** | **+32.14%** | **+17.22%** | **+14.04%** |
 
 Canonical V3 wins token throughput in 11/12 workloads, TTFT p95 in 11/12,
-TPOT p95 in 10/12, E2E mean in 12/12, and E2E p95 in 10/12. It is not a
+TPOT p95 in 10/12, E2E mean in 11/12, and E2E p95 in 11/12. It is not a
 pointwise latency dominator: balanced/decode-heavy TPOT and bimodal TTFT remain
 the clearest gaps.
 
