@@ -212,13 +212,14 @@ Completed:
   required a CUDA device and reported `no CUDA-capable device is detected`;
 - pre-commit checks passed for every modified source/test file.
 
-GPU execution is currently blocked because the loaded NVIDIA driver has no
-`/dev/nvidia*` device nodes. Creating host device nodes requires explicit
-system-level approval, so no new performance result is claimed in this note.
+The initial host-side GPU check was blocked because `/dev/nvidia*` was absent.
+GPU access was subsequently restored through the configured NVIDIA container
+runtime. The causal GPU validation and its promotion decision are recorded in
+`283-preparation-separation-gpu-validation-20260911.md`.
 
-## 9. Remaining gates
+## 9. Original GPU gate sequence
 
-Execute in this order once the GPU device is available:
+The GPU campaign subsequently executed this sequence:
 
 1. compatibility mode, three repeats on mixed and vision-heavy;
 2. preparation timing/resource characterization for E1/E2/E4;
@@ -228,7 +229,8 @@ Execute in this order once the GPU device is available:
 5. inspect E/P/D/Copy activity masks and Nsight preparation interference;
 6. promote only if token identity holds and no VLM6 latency metric regresses
    beyond the established gate;
-7. implement detached Qwen/Cosmos prepared-input leases and late packing;
+7. implement detached Qwen/Cosmos prepared-input leases and late packing only
+   if the preceding mechanism gates justify the new ownership boundary;
 8. reproduce compatibility again on the new lease architecture;
 9. replace arrival EWMA, 25 ms wait, and arbiter with prepared-state and
    known-event decisions;
