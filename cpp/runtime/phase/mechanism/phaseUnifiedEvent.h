@@ -73,6 +73,28 @@ enum class PhaseInFlightStatus : uint8_t
     kCompletionReady,
 };
 
+enum class PhasePreparationStage : uint8_t
+{
+    kIdle,
+    kQueued,
+    kRunning,
+    kPrepared,
+    kFailed,
+};
+
+inline char const* phasePreparationStageName(PhasePreparationStage stage) noexcept
+{
+    switch (stage)
+    {
+    case PhasePreparationStage::kIdle: return "idle";
+    case PhasePreparationStage::kQueued: return "queued";
+    case PhasePreparationStage::kRunning: return "running";
+    case PhasePreparationStage::kPrepared: return "prepared";
+    case PhasePreparationStage::kFailed: return "failed";
+    }
+    return "unknown";
+}
+
 //! Distinguish an idle-boundary pair launch from adding work to a live context.
 enum class PhaseUnifiedDispatchMode : uint8_t
 {
@@ -342,6 +364,19 @@ struct PhaseInFlightSnapshot
     std::vector<PhaseInFlightWorkSnapshot> work;
 };
 
+//! Observable preparation state kept outside the E/P/D execution mask.
+struct PhasePreparationSnapshot
+{
+    PhasePreparationStage stage{PhasePreparationStage::kIdle};
+    std::vector<uint64_t> requestIds;
+    uint64_t startHostNs{};
+    uint64_t endHostNs{};
+    bool usesHostThread{};
+    bool mayUseCopyEngine{};
+    bool usesEncoderStream{};
+    bool holdsDeviceMemory{};
+};
+
 //! Predictor-independent summary of one immutable transition replay. Min/max
 //! rows preserve uncertainty envelopes without choosing an arbitrary physical
 //! completion order in telemetry.
@@ -440,6 +475,7 @@ struct PhaseUnifiedEvent
     PhaseUnifiedWork cohort;
     std::vector<uint64_t> requestIds;
     PhaseInFlightSnapshot inFlight;
+    PhasePreparationSnapshot preparation;
     std::vector<PhaseUnifiedCandidateSnapshot> candidates;
     uint64_t selectedActionId{};
     //! H=1 contextual-scalar selector result over this exact frontier.

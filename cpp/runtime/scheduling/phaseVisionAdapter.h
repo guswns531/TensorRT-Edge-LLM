@@ -91,8 +91,15 @@ struct PhaseVisionPayload
     Tensor mropeCosSin;
     std::shared_ptr<PhaseVisionBatchStorage> storageOwner;
     std::shared_ptr<PhaseVisionMropeStorage> mropeStorageOwner;
+    //! GPU-stream envelope from the first preparation event through prepared-state publication.
+    float preparationGpuMs{};
+    //! GPU time from encoder submission through retained output readiness.
+    float encoderExecutionGpuMs{};
+    //! End-to-end GPU-stream envelope retained for compatibility and diagnostics.
     float encoderGpuMs{};
     cudaEvent_t startEvent{};
+    cudaEvent_t preparationReadyEvent{};
+    cudaEvent_t encoderStartEvent{};
     cudaEvent_t readyEvent{};
 };
 

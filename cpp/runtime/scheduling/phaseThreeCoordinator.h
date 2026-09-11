@@ -29,7 +29,6 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <future>
 #include <memory>
 #include <optional>
 #include <set>
@@ -39,6 +38,8 @@
 
 namespace trt_edgellm::rt
 {
+
+class PhaseEncoderPreparationWorker;
 
 enum class PhaseThreeSubmissionStatus
 {
@@ -211,6 +212,10 @@ struct PhaseThreeCoordinatorConfig
     bool enableEncoderDispatchArbitration{};
     //! Run vision preprocessing on a worker while the coordinator continues polling prefill and decode.
     bool enableAsyncEncoderPreparation{};
+    //! Permit independent P/D dispatch while encoder preprocessing is active.
+    bool allowPdDispatchDuringEncoderPreparation{};
+    //! Exclude the already-completed preparation envelope from E action learning.
+    bool separateEncoderPreparationCost{};
     //! Initial encoder cost used before the first CUDA-event sample is available.
     double encoderDispatchInitialCostUs{50000.0};
     //! Margin added to the latest encoder cost when protecting text TTFT.
@@ -250,6 +255,9 @@ struct PhaseThreeCoordinatorMetrics
     size_t downstreamEncodedBytes{};
     size_t prefillStorageReleases{};
     size_t prefillStorageReleasedBytes{};
+    size_t visionPrefixPlans{};
+    size_t visionPrefixSubmissions{};
+    size_t visionPrefixThresholdSuppressions{};
     size_t encoderStarts{};
     size_t encoderCompletions{};
     size_t encoderBatches{};
@@ -264,6 +272,10 @@ struct PhaseThreeCoordinatorMetrics
     double maxEncoderQueueWaitUs{};
     float lastEncoderGpuMs{};
     float maxEncoderGpuMs{};
+    float lastEncoderPreparationGpuMs{};
+    float maxEncoderPreparationGpuMs{};
+    float lastEncoderExecutionGpuMs{};
+    float maxEncoderExecutionGpuMs{};
     size_t prefillAdmissionBatches{};
     size_t lastPrefillAdmissionBatchSize{};
     size_t maxPrefillAdmissionBatchSize{};
@@ -303,6 +315,10 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderPreparationCompletions{};
     double lastEncoderPreparationUs{};
     double maxEncoderPreparationUs{};
+    size_t encoderPreparationPdBlockPeriods{};
+    size_t encoderPreparationPdBlockPolls{};
+    double encoderPreparationPdBlockedUs{};
+    double maxEncoderPreparationPdBlockedUs{};
     size_t memoryBrokerDecisions{};
     size_t memoryBrokerEncoderReductions{};
     size_t memoryBrokerBackpressure{};
@@ -444,6 +460,8 @@ struct PhaseVisionEncoderBatchMetric
     size_t batchSize{};
     size_t inputBytes{};
     size_t inputTokens{};
+    float preparationGpuMs{};
+    float executionGpuMs{};
     float gpuMs{};
 };
 
@@ -529,6 +547,14 @@ bool phaseVisionShouldAccumulateEncoderCredits(size_t admittedBatchSize, size_t 
 bool phaseVisionShouldWaitForGlobalEncoderArrival(double predictedWaitUs, double oldestSlackUs,
     double robustFutureCriticalPathUs, double dispatchNowHorizonUs, double waitHorizonUs) noexcept;
 
+//! Whether batch-coupled encoder preparation would suppress otherwise runnable P/D work.
+bool phaseEncoderPreparationBlocksPd(bool preparationActive, bool allowConcurrentPd, bool serverBusy,
+    size_t prefillQueued, size_t decodeQueued) noexcept;
+
+//! Select the measured interval that belongs to the E action under the active preparation contract.
+float phaseEncoderActionGpuMs(
+    bool asyncPreparation, bool separatePreparationCost, float pipelineGpuMs, float executionGpuMs) noexcept;
+
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
     size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept;
@@ -566,6 +592,7 @@ class PhaseThreeCoordinator
 public:
     PhaseThreeCoordinator(
         PhaseVisionAdapter& vision, IndependentPhaseAsyncServer& server, PhaseThreeCoordinatorConfig config = {});
+    ~PhaseThreeCoordinator() noexcept;
 
     PhaseThreeSubmissionStatus submit(uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens,
         PhaseSchedulingHints scheduling = {});
@@ -648,6 +675,10 @@ private:
     void recordGlobalDecisionCost(std::chrono::steady_clock::time_point startedAt) noexcept;
     bool completeEncoder();
     bool completeEncoderPreparation();
+    bool encoderPreparationActive() const noexcept;
+    float lastEncoderActionGpuMs() const noexcept;
+    PhasePreparationSnapshot encoderPreparationSnapshot() const;
+    void observeEncoderPreparationPdBlock(bool blocked) noexcept;
     bool submitPreparedEncoder();
     void markUnifiedEncoderSubmitted();
     bool dispatchReadyPrefill();
@@ -685,7 +716,7 @@ private:
     std::unordered_map<uint64_t, EncoderServiceEpochRecord> mEncoderServiceEpochs;
     uint64_t mNextEncoderServiceEpoch{1U};
     std::vector<PendingVisionRequest> mEncoding;
-    std::future<std::shared_ptr<PhaseVisionPreparedBatch>> mEncoderPreparation;
+    std::unique_ptr<PhaseEncoderPreparationWorker> mEncoderPreparationWorker;
     //! A CPU/preprocess-complete batch awaiting an E/P/D scheduling decision.
     std::shared_ptr<PhaseVisionPreparedBatch> mPreparedEncoder;
     std::deque<ReadyPrefillRequest> mReadyPrefill;
@@ -743,6 +774,9 @@ private:
     std::function<void(PhaseVisionEncoderBatchMetric const&)> mEncoderBatchMetricCallback;
     std::function<void(PhaseFormationRealizedEpisode const&)> mFormationEpisodeCallback;
     size_t mEstimatedEncodedBytes{};
+    size_t mVisionPrefixPlans{};
+    size_t mVisionPrefixSubmissions{};
+    size_t mVisionPrefixThresholdSuppressions{};
     size_t mEncoderStarts{};
     size_t mEncoderCompletions{};
     size_t mEncoderBatches{};
@@ -756,6 +790,10 @@ private:
     double mMaxEncoderQueueWaitUs{};
     float mLastEncoderGpuMs{};
     float mMaxEncoderGpuMs{};
+    float mLastEncoderPreparationGpuMs{};
+    float mMaxEncoderPreparationGpuMs{};
+    float mLastEncoderExecutionGpuMs{};
+    float mMaxEncoderExecutionGpuMs{};
     bool mEncoderGpuSubmitted{};
     uint64_t mEncoderDispatchHostNs{};
     uint64_t mEncoderPrepareStartHostNs{};
@@ -812,6 +850,11 @@ private:
     double mLastEncoderPreparationUs{};
     double mMaxEncoderPreparationUs{};
     std::chrono::steady_clock::time_point mEncoderPreparationStartedAt;
+    size_t mEncoderPreparationPdBlockPeriods{};
+    size_t mEncoderPreparationPdBlockPolls{};
+    double mEncoderPreparationPdBlockedUs{};
+    double mMaxEncoderPreparationPdBlockedUs{};
+    std::optional<std::chrono::steady_clock::time_point> mEncoderPreparationPdBlockStartedAt;
     size_t mExclusiveEncoderBatches{};
     size_t mUnknownPayloadBootstrapSelections{};
     size_t mExclusiveEncoderPrefillDeferrals{};

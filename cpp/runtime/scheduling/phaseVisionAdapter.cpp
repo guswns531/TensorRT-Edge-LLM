@@ -113,6 +113,14 @@ PhaseVisionPayload::~PhaseVisionPayload() noexcept
     {
         static_cast<void>(cudaEventDestroy(readyEvent));
     }
+    if (preparationReadyEvent != nullptr)
+    {
+        static_cast<void>(cudaEventDestroy(preparationReadyEvent));
+    }
+    if (encoderStartEvent != nullptr)
+    {
+        static_cast<void>(cudaEventDestroy(encoderStartEvent));
+    }
 }
 
 size_t PhaseVisionPayload::byteSize() const noexcept
@@ -374,6 +382,8 @@ std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vecto
         {
             auto payload = std::make_unique<PhaseVisionPayload>();
             CUDA_CHECK(cudaEventCreate(&payload->startEvent));
+            CUDA_CHECK(cudaEventCreate(&payload->preparationReadyEvent));
+            CUDA_CHECK(cudaEventCreate(&payload->encoderStartEvent));
             CUDA_CHECK(cudaEventCreate(&payload->readyEvent));
             CUDA_CHECK(cudaEventRecord(payload->startEvent, mStream));
             prepared->payloads.push_back(std::move(payload));
@@ -427,6 +437,10 @@ std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vecto
             resizeTensor(
                 prepared->storage->deepstackFeatures[index], deepstackSpecs[index], "phase_vision_batch_deepstack");
         }
+        for (std::unique_ptr<PhaseVisionPayload> const& payload : prepared->payloads)
+        {
+            CUDA_CHECK(cudaEventRecord(payload->preparationReadyEvent, mStream));
+        }
     }
     catch (...)
     {
@@ -466,6 +480,10 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
         bool inferenceSucceeded{};
         uint64_t const correlationId = prepared->submissions.front().requestId;
         CUDA_CHECK(cudaEventRecord(mEncoderStartEvent, mStream));
+        for (std::unique_ptr<PhaseVisionPayload> const& payload : prepared->payloads)
+        {
+            CUDA_CHECK(cudaEventRecord(payload->encoderStartEvent, mStream));
+        }
         recordActivity(PhaseActivityKind::kEncoder, "encoder_engine", correlationId, mStream,
             [&] { inferenceSucceeded = mRunner.infer(mStream); });
         ELLM_CHECK(inferenceSucceeded, "Phase vision inference failed");
@@ -585,6 +603,10 @@ std::unique_ptr<PhaseVisionPayload> PhaseVisionAdapter::take(uint64_t requestId)
     auto it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Unknown phase vision request");
     ELLM_CHECK(ready(requestId), "Phase vision request is not complete");
+    CUDA_CHECK(
+        cudaEventElapsedTime(&it->second->preparationGpuMs, it->second->startEvent, it->second->preparationReadyEvent));
+    CUDA_CHECK(cudaEventElapsedTime(
+        &it->second->encoderExecutionGpuMs, it->second->encoderStartEvent, it->second->readyEvent));
     CUDA_CHECK(cudaEventElapsedTime(&it->second->encoderGpuMs, it->second->startEvent, it->second->readyEvent));
     std::unique_ptr<PhaseVisionPayload> result = std::move(it->second);
     mRequests.erase(it);

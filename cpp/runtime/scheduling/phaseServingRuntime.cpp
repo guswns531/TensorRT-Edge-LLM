@@ -197,6 +197,8 @@ PhaseThreeCoordinatorConfig makeVisionConfig(PhaseServingRuntimeConfig const& se
     config.enableAdaptivePrefillAdmission = true;
     config.enablePrefixBeforeVisionPrefill = serving.enableVisionPrefixPrefill;
     config.enableAsyncEncoderPreparation = serving.enableAsyncEncoderPreparation;
+    config.allowPdDispatchDuringEncoderPreparation = serving.allowPdDispatchDuringEncoderPreparation;
+    config.separateEncoderPreparationCost = serving.separateEncoderPreparationCost;
     config.visionTtftTargetUs = serving.visionTtftTargetUs;
     config.visionTtftTargetExplicit = serving.visionTtftTargetExplicit;
     return config;

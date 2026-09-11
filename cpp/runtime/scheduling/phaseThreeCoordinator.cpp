@@ -25,9 +25,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -233,6 +237,145 @@ PhaseModelFormationSnapshot modelFormationSnapshot(
 }
 
 } // namespace
+
+class PhaseEncoderPreparationWorker
+{
+public:
+    PhaseEncoderPreparationWorker(PhaseVisionAdapter& vision, CUcontext cudaContext)
+        : mVision(vision)
+        , mCudaContext(cudaContext)
+        , mThread(&PhaseEncoderPreparationWorker::run, this)
+    {
+    }
+
+    ~PhaseEncoderPreparationWorker() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mStop = true;
+        }
+        mCondition.notify_one();
+        if (mThread.joinable())
+        {
+            mThread.join();
+        }
+    }
+
+    PhaseEncoderPreparationWorker(PhaseEncoderPreparationWorker const&) = delete;
+    PhaseEncoderPreparationWorker& operator=(PhaseEncoderPreparationWorker const&) = delete;
+
+    bool submit(std::vector<PhaseVisionSubmission> submissions)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mStop || mTask.has_value() || mRunning || mComplete)
+        {
+            return false;
+        }
+        mTask = std::move(submissions);
+        mCondition.notify_one();
+        return true;
+    }
+
+    bool active() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mTask.has_value() || mRunning || mComplete;
+    }
+
+    bool ready() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mComplete;
+    }
+
+    PhasePreparationStage stage() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mTask.has_value())
+        {
+            return PhasePreparationStage::kQueued;
+        }
+        if (mRunning)
+        {
+            return PhasePreparationStage::kRunning;
+        }
+        if (mComplete)
+        {
+            return mError == nullptr ? PhasePreparationStage::kPrepared : PhasePreparationStage::kFailed;
+        }
+        return PhasePreparationStage::kIdle;
+    }
+
+    std::shared_ptr<PhaseVisionPreparedBatch> take()
+    {
+        std::shared_ptr<PhaseVisionPreparedBatch> result;
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            ELLM_CHECK(mComplete, "Encoder preparation result is not ready");
+            result = std::move(mResult);
+            error = std::move(mError);
+            mComplete = false;
+        }
+        if (error != nullptr)
+        {
+            std::rethrow_exception(error);
+        }
+        return result;
+    }
+
+private:
+    void run() noexcept
+    {
+        while (true)
+        {
+            std::optional<std::vector<PhaseVisionSubmission>> task;
+            {
+                std::unique_lock<std::mutex> lock(mMutex);
+                mCondition.wait(lock, [&] { return mStop || mTask.has_value(); });
+                if (mStop && !mTask.has_value())
+                {
+                    return;
+                }
+                task = std::move(mTask);
+                mTask.reset();
+                mRunning = true;
+            }
+
+            std::shared_ptr<PhaseVisionPreparedBatch> result;
+            std::exception_ptr error;
+            try
+            {
+                ScopedCudaContext context(mCudaContext);
+                result = mVision.prepare(std::move(*task));
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                mResult = std::move(result);
+                mError = std::move(error);
+                mRunning = false;
+                mComplete = true;
+            }
+        }
+    }
+
+    PhaseVisionAdapter& mVision;
+    CUcontext mCudaContext{};
+    mutable std::mutex mMutex;
+    std::condition_variable mCondition;
+    std::optional<std::vector<PhaseVisionSubmission>> mTask;
+    std::shared_ptr<PhaseVisionPreparedBatch> mResult;
+    std::exception_ptr mError;
+    bool mRunning{};
+    bool mComplete{};
+    bool mStop{};
+    std::thread mThread;
+};
 
 std::vector<size_t> phaseEncoderCalibrationBatchSizes(
     size_t maxEncoderBatchSize, std::vector<size_t> requestedBatchSizes)
@@ -647,6 +790,18 @@ bool phaseVisionEncoderSerializationDue(
     return oldestVisionAgeUs + predictedEncoderCostUs >= visionTtftTargetUs * deadlineRatio;
 }
 
+bool phaseEncoderPreparationBlocksPd(
+    bool preparationActive, bool allowConcurrentPd, bool serverBusy, size_t prefillQueued, size_t decodeQueued) noexcept
+{
+    return preparationActive && !allowConcurrentPd && !serverBusy && (prefillQueued > 0U || decodeQueued > 0U);
+}
+
+float phaseEncoderActionGpuMs(
+    bool asyncPreparation, bool separatePreparationCost, float pipelineGpuMs, float executionGpuMs) noexcept
+{
+    return asyncPreparation && separatePreparationCost && executionGpuMs > 0.0F ? executionGpuMs : pipelineGpuMs;
+}
+
 PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
     double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
     double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
@@ -687,8 +842,7 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mConfig(config)
     , mGlobalScheduler([&] {
         PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
-        global.enableServiceRecovery
-            = phasePolicyUsesServiceScale(mConfig.policyMode) && global.enableServiceRecovery;
+        global.enableServiceRecovery = phasePolicyUsesServiceScale(mConfig.policyMode) && global.enableServiceRecovery;
         return global;
     }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
@@ -736,6 +890,10 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     }
     ELLM_CHECK(mConfig.maxEncoderBatchSize <= mConfig.maxEncodedInFlight,
         "Three-phase encoder batch size cannot exceed downstream encoded capacity");
+    ELLM_CHECK(!mConfig.allowPdDispatchDuringEncoderPreparation || mConfig.enableAsyncEncoderPreparation,
+        "P/D dispatch during encoder preparation requires asynchronous preparation");
+    ELLM_CHECK(!mConfig.separateEncoderPreparationCost || mConfig.enableAsyncEncoderPreparation,
+        "Separating encoder preparation cost requires asynchronous preparation");
     size_t const runnerInputTokens = mVision.maxInputTokens();
     if (mConfig.maxEncoderInputTokens == 0)
     {
@@ -855,7 +1013,13 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         ? std::max(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight)
         : mConfig.maxEncodedInFlight;
     mMaxEffectiveEncodedCapacity = mEffectiveEncodedCapacity;
+    if (mConfig.enableAsyncEncoderPreparation)
+    {
+        mEncoderPreparationWorker = std::make_unique<PhaseEncoderPreparationWorker>(mVision, mVision.cudaContext());
+    }
 }
+
+PhaseThreeCoordinator::~PhaseThreeCoordinator() noexcept = default;
 
 PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
@@ -892,11 +1056,17 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     {
         if (auto plan = mVision.makePrefixPlan(request); plan.has_value())
         {
+            ++mVisionPrefixPlans;
             if (plan->prefixTokens.size() >= mConfig.minPrefixBeforeVisionTokens)
             {
                 IndependentPhaseServerSubmission const prefix = mServer.submitVisionPrefix(requestId,
                     std::move(plan->prefixTokens), plan->estimatedFinalPromptTokens, maxOutputTokens, scheduling);
                 prefixSubmitted = prefix.status == IndependentPhaseServerStatus::kAdmitted;
+                mVisionPrefixSubmissions += prefixSubmitted ? 1U : 0U;
+            }
+            else
+            {
+                ++mVisionPrefixThresholdSuppressions;
             }
         }
     }
@@ -1024,7 +1194,7 @@ bool PhaseThreeCoordinator::poll()
 {
     bool const pdOnlyFastPath = mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kDisabled
         && mRequestIds.empty() && mPending.empty() && mEncoding.empty() && mReadyPrefill.empty()
-        && mDownstreamRequestBytes.empty() && !mVision.busy() && !mEncoderPreparation.valid()
+        && mDownstreamRequestBytes.empty() && !mVision.busy() && !encoderPreparationActive()
         && mPreparedEncoder == nullptr && !mGlobalExecutionLease.has_value()
         && !mPendingGlobalOverlapObservation.has_value() && !phasePolicyUsesTransition(mConfig.policyMode)
         && !mUnifiedEventCallback && !mFormationEpisodeCallback;
@@ -1086,7 +1256,7 @@ bool PhaseThreeCoordinator::poll()
     if (globalScheduling)
     {
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && mConfig.enableAsyncEncoderPreparation
-            && mEncoding.empty() && !mEncoderPreparation.valid() && mPreparedEncoder == nullptr && !mPending.empty()
+            && mEncoding.empty() && !encoderPreparationActive() && mPreparedEncoder == nullptr && !mPending.empty()
             && !mVision.busy())
         {
             // Preparation is a mechanism stage, not an E execution action.
@@ -1101,7 +1271,7 @@ bool PhaseThreeCoordinator::poll()
     {
         progressed = startNextEncoder() || progressed;
     }
-    if (!mEncoderPreparation.valid() && mPreparedEncoder == nullptr)
+    if (!encoderPreparationActive() && mPreparedEncoder == nullptr)
     {
         mVision.reclaimIdleStorage();
     }
@@ -1133,6 +1303,9 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.downstreamEncodedBytes = mReadyPrefillBytes + mServer.visionPayloadBytes();
     result.prefillStorageReleases = mServer.visionPrefillReleaseCount();
     result.prefillStorageReleasedBytes = mServer.visionPrefillReleasedBytes();
+    result.visionPrefixPlans = mVisionPrefixPlans;
+    result.visionPrefixSubmissions = mVisionPrefixSubmissions;
+    result.visionPrefixThresholdSuppressions = mVisionPrefixThresholdSuppressions;
     result.encoderStarts = mEncoderStarts;
     result.encoderCompletions = mEncoderCompletions;
     result.encoderBatches = mEncoderBatches;
@@ -1146,6 +1319,10 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.maxEncoderQueueWaitUs = mMaxEncoderQueueWaitUs;
     result.lastEncoderGpuMs = mLastEncoderGpuMs;
     result.maxEncoderGpuMs = mMaxEncoderGpuMs;
+    result.lastEncoderPreparationGpuMs = mLastEncoderPreparationGpuMs;
+    result.maxEncoderPreparationGpuMs = mMaxEncoderPreparationGpuMs;
+    result.lastEncoderExecutionGpuMs = mLastEncoderExecutionGpuMs;
+    result.maxEncoderExecutionGpuMs = mMaxEncoderExecutionGpuMs;
     result.prefillAdmissionBatches = mPrefillAdmissionBatches;
     result.lastPrefillAdmissionBatchSize = mLastPrefillAdmissionBatchSize;
     result.maxPrefillAdmissionBatchSize = mMaxPrefillAdmissionBatchSize;
@@ -1185,6 +1362,17 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderPreparationCompletions = mEncoderPreparationCompletions;
     result.lastEncoderPreparationUs = mLastEncoderPreparationUs;
     result.maxEncoderPreparationUs = mMaxEncoderPreparationUs;
+    result.encoderPreparationPdBlockPeriods = mEncoderPreparationPdBlockPeriods;
+    result.encoderPreparationPdBlockPolls = mEncoderPreparationPdBlockPolls;
+    double activePreparationBlockUs{};
+    if (mEncoderPreparationPdBlockStartedAt.has_value())
+    {
+        activePreparationBlockUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - *mEncoderPreparationPdBlockStartedAt)
+                                       .count();
+    }
+    result.encoderPreparationPdBlockedUs = mEncoderPreparationPdBlockedUs + activePreparationBlockUs;
+    result.maxEncoderPreparationPdBlockedUs = std::max(mMaxEncoderPreparationPdBlockedUs, activePreparationBlockUs);
     result.memoryBrokerDecisions = mMemoryBrokerDecisions;
     result.memoryBrokerEncoderReductions = mMemoryBrokerEncoderReductions;
     result.memoryBrokerBackpressure = mMemoryBrokerBackpressure;
@@ -1554,6 +1742,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.cohort = unifiedCandidateWork(candidate);
     event.requestIds = candidate.requestIds;
     event.inFlight = unifiedInFlightSnapshot(0U, mUnifiedDetailedDecisionSnapshots);
+    event.preparation = encoderPreparationSnapshot();
     // The dispatch plan is the mechanism authority for this transition. A
     // residual P/D augmentation may be recorded after enqueue has returned
     // but before the server's next arbitration snapshot exposes the incumbent
@@ -1819,7 +2008,7 @@ void PhaseThreeCoordinator::observeUnifiedInFlightTransitions()
         }
         if (prior.phase == PhaseUnifiedPhase::kEncoder)
         {
-            completion.gpuDurationUs = static_cast<double>(mLastEncoderGpuMs) * 1000.0;
+            completion.gpuDurationUs = static_cast<double>(lastEncoderActionGpuMs()) * 1000.0;
         }
         else if (std::optional<PhaseDispatchMetrics> const& metrics = mServer.schedulerTelemetry().lastDispatch;
             metrics.has_value() && (metrics->globalPlanId == prior.planId || metrics->dispatchIndex == prior.planId))
@@ -2164,7 +2353,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
 {
     if (mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kActive || !mGlobalExecutionLease.has_value()
         || !mActiveGlobalPdExecution.has_value() || !serverState.busy || !mPending.empty() || !mEncoding.empty()
-        || mVision.busy() || mEncoderPreparation.valid())
+        || mVision.busy() || encoderPreparationActive())
     {
         return false;
     }
@@ -2320,7 +2509,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         = prefill.key.primaryWorkClass == static_cast<int32_t>(PhasePrefillClass::kExternal);
     bool const contextualEligible = mConfig.contextualResidualEligible(externalPrefillLineage);
     bool const producerCriticalPath = phaseContextualPdProducerCriticalPath(
-        !mPending.empty() || !mEncoding.empty() || mVision.busy() || mEncoderPreparation.valid(),
+        !mPending.empty() || !mEncoding.empty() || mVision.busy() || encoderPreparationActive(),
         mConfig.preserveLegacyPairEligibility && externalPrefillLineage);
     if (contextualMode != PhaseContextualPdMode::kDisabled && contextualEligible)
     {
@@ -2461,6 +2650,11 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     refreshGlobalExecutionLease();
     IndependentPhaseServerArbitrationSnapshot const serverState = mServer.arbitrationSnapshot();
+    bool const preparationActive = encoderPreparationActive();
+    bool const preparationWouldBlockPd
+        = phaseEncoderPreparationBlocksPd(preparationActive, mConfig.allowPdDispatchDuringEncoderPreparation,
+            serverState.busy, serverState.prefillQueued, serverState.decodeQueued);
+    observeEncoderPreparationPdBlock(preparationWouldBlockPd);
     if (dispatchGlobalPrefillDecodeResidual(serverState))
     {
         return true;
@@ -2469,7 +2663,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     bool const residualAugmentation = mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
         && mGlobalExecutionLease.has_value() && mActiveGlobalPdExecution.has_value() && serverState.busy
         && (preparedEncoderReady || (!mPending.empty() && mEncoding.empty())) && !mVision.busy()
-        && !mEncoderPreparation.valid()
+        && !encoderPreparationActive()
         && (mActiveGlobalPdExecution->candidate.key.kind == PhaseGlobalActionKind::kPrefill
             || mActiveGlobalPdExecution->candidate.key.kind == PhaseGlobalActionKind::kDecode);
     if (mGlobalExecutionLease.has_value() && !residualAugmentation)
@@ -2486,7 +2680,9 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         return false;
     }
 
-    if ((!mEncoding.empty() && !preparedEncoderReady) || mVision.busy() || mEncoderPreparation.valid())
+    bool const unpreparedEncoder = !mEncoding.empty() && !preparedEncoderReady;
+    if (mVision.busy()
+        || ((!mConfig.allowPdDispatchDuringEncoderPreparation) && (unpreparedEncoder || preparationActive)))
     {
         return false;
     }
@@ -2656,8 +2852,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
             = static_cast<int32_t>((inputTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
         EncoderCostPrediction prediction{
             {PhaseGlobalActionKind::kEncoder, static_cast<int32_t>(batchSize), 0, 0, contextBucket, 0},
-            mLastEncoderGpuMs > 0.0F ? static_cast<double>(mLastEncoderGpuMs) * 1000.0
-                                     : mConfig.encoderDispatchInitialCostUs,
+            lastEncoderActionGpuMs() > 0.0F ? static_cast<double>(lastEncoderActionGpuMs()) * 1000.0
+                                            : mConfig.encoderDispatchInitialCostUs,
             static_cast<double>(mConfig.globalCostModelConfig.coldStartUncertaintyMs) * 1000.0, 0.0};
         prediction.referenceUs = prediction.makespanUs;
         if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(prediction.key))
@@ -3809,14 +4005,11 @@ bool PhaseThreeCoordinator::startNextEncoder()
         mEncoderDispatchHostNs = 0U;
         if (mConfig.enableAsyncEncoderPreparation)
         {
-            ELLM_CHECK(!mEncoderPreparation.valid(), "An async encoder preparation is already active");
-            CUcontext const cudaContext = mVision.cudaContext();
+            ELLM_CHECK(mEncoderPreparationWorker != nullptr, "Encoder preparation worker is not initialized");
+            ELLM_CHECK(!mEncoderPreparationWorker->active(), "An async encoder preparation is already active");
             mEncoderPreparationStartedAt = std::chrono::steady_clock::now();
-            mEncoderPreparation
-                = std::async(std::launch::async, [this, cudaContext, submissions = std::move(submissions)]() mutable {
-                      ScopedCudaContext context(cudaContext);
-                      return mVision.prepare(std::move(submissions));
-                  });
+            ELLM_CHECK(mEncoderPreparationWorker->submit(std::move(submissions)),
+                "Failed to submit an asynchronous encoder preparation batch");
             ++mEncoderPreparationStarts;
         }
         else
@@ -3881,17 +4074,17 @@ void PhaseThreeCoordinator::markUnifiedEncoderSubmitted()
 
 bool PhaseThreeCoordinator::completeEncoderPreparation()
 {
-    if (!mEncoderPreparation.valid())
+    if (!encoderPreparationActive())
     {
         return true;
     }
-    if (mEncoderPreparation.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    if (!mEncoderPreparationWorker->ready())
     {
         return false;
     }
     try
     {
-        std::shared_ptr<PhaseVisionPreparedBatch> prepared = mEncoderPreparation.get();
+        std::shared_ptr<PhaseVisionPreparedBatch> prepared = mEncoderPreparationWorker->take();
         mEncoderPrepareEndHostNs = phaseTimelineNowNs();
         mLastEncoderPreparationUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mEncoderPreparationStartedAt)
@@ -3926,6 +4119,71 @@ bool PhaseThreeCoordinator::completeEncoderPreparation()
         throw;
     }
     return true;
+}
+
+bool PhaseThreeCoordinator::encoderPreparationActive() const noexcept
+{
+    return mEncoderPreparationWorker != nullptr && mEncoderPreparationWorker->active();
+}
+
+float PhaseThreeCoordinator::lastEncoderActionGpuMs() const noexcept
+{
+    return phaseEncoderActionGpuMs(mConfig.enableAsyncEncoderPreparation, mConfig.separateEncoderPreparationCost,
+        mLastEncoderGpuMs, mLastEncoderExecutionGpuMs);
+}
+
+PhasePreparationSnapshot PhaseThreeCoordinator::encoderPreparationSnapshot() const
+{
+    PhasePreparationSnapshot result;
+    if (mPreparedEncoder != nullptr)
+    {
+        result.stage = PhasePreparationStage::kPrepared;
+    }
+    else if (mEncoderPreparationWorker != nullptr)
+    {
+        result.stage = mEncoderPreparationWorker->stage();
+    }
+    if (result.stage == PhasePreparationStage::kIdle)
+    {
+        return result;
+    }
+    result.requestIds.reserve(mEncoding.size());
+    for (PendingVisionRequest const& request : mEncoding)
+    {
+        result.requestIds.push_back(request.requestId);
+    }
+    result.startHostNs = mEncoderPrepareStartHostNs;
+    result.endHostNs = mEncoderPrepareEndHostNs;
+    result.usesHostThread
+        = result.stage == PhasePreparationStage::kQueued || result.stage == PhasePreparationStage::kRunning;
+    result.mayUseCopyEngine = result.usesHostThread;
+    result.usesEncoderStream = result.usesHostThread;
+    result.holdsDeviceMemory = true;
+    return result;
+}
+
+void PhaseThreeCoordinator::observeEncoderPreparationPdBlock(bool blocked) noexcept
+{
+    auto const now = std::chrono::steady_clock::now();
+    if (blocked)
+    {
+        ++mEncoderPreparationPdBlockPolls;
+        if (!mEncoderPreparationPdBlockStartedAt.has_value())
+        {
+            mEncoderPreparationPdBlockStartedAt = now;
+            ++mEncoderPreparationPdBlockPeriods;
+        }
+        return;
+    }
+    if (!mEncoderPreparationPdBlockStartedAt.has_value())
+    {
+        return;
+    }
+    double const blockedUs
+        = std::chrono::duration<double, std::micro>(now - *mEncoderPreparationPdBlockStartedAt).count();
+    mEncoderPreparationPdBlockedUs += blockedUs;
+    mMaxEncoderPreparationPdBlockedUs = std::max(mMaxEncoderPreparationPdBlockedUs, blockedUs);
+    mEncoderPreparationPdBlockStartedAt.reset();
 }
 
 bool PhaseThreeCoordinator::submitPreparedEncoder()
@@ -3986,6 +4244,10 @@ bool PhaseThreeCoordinator::completeEncoder()
         ++mEncoderCompletions;
         mLastEncoderGpuMs = encoded->encoderGpuMs;
         mMaxEncoderGpuMs = std::max(mMaxEncoderGpuMs, mLastEncoderGpuMs);
+        mLastEncoderPreparationGpuMs = encoded->preparationGpuMs;
+        mMaxEncoderPreparationGpuMs = std::max(mMaxEncoderPreparationGpuMs, mLastEncoderPreparationGpuMs);
+        mLastEncoderExecutionGpuMs = encoded->encoderExecutionGpuMs;
+        mMaxEncoderExecutionGpuMs = std::max(mMaxEncoderExecutionGpuMs, mLastEncoderExecutionGpuMs);
         if (mCancelRequested.erase(requestId) > 0)
         {
             if (encoding.prefixSubmitted)
@@ -4013,19 +4275,20 @@ bool PhaseThreeCoordinator::completeEncoder()
     }
     if (mEncoderBatchMetricCallback)
     {
-        mEncoderBatchMetricCallback(
-            {mEncoderBatches, batchSize, mLastEncoderInputBytes, mLastEncoderInputTokens, mLastEncoderGpuMs});
+        mEncoderBatchMetricCallback({mEncoderBatches, batchSize, mLastEncoderInputBytes, mLastEncoderInputTokens,
+            mLastEncoderPreparationGpuMs, mLastEncoderExecutionGpuMs, mLastEncoderGpuMs});
     }
-    if (mInFlightGlobalEncoderKey.has_value() && mLastEncoderGpuMs > 0.0F && mInFlightGlobalEncoderReferenceMs > 0.0)
+    float const encoderActionGpuMs = lastEncoderActionGpuMs();
+    if (mInFlightGlobalEncoderKey.has_value() && encoderActionGpuMs > 0.0F && mInFlightGlobalEncoderReferenceMs > 0.0)
     {
         mRuntimeCostTracker->observe(
-            *mInFlightGlobalEncoderKey, {static_cast<float>(mInFlightGlobalEncoderReferenceMs), mLastEncoderGpuMs});
+            *mInFlightGlobalEncoderKey, {static_cast<float>(mInFlightGlobalEncoderReferenceMs), encoderActionGpuMs});
     }
     mInFlightGlobalEncoderKey.reset();
     mInFlightGlobalEncoderReferenceMs = 0.0;
     if (mPendingGlobalOverlapObservation.has_value())
     {
-        mPendingGlobalOverlapObservation->encoderGpuMs = mLastEncoderGpuMs;
+        mPendingGlobalOverlapObservation->encoderGpuMs = encoderActionGpuMs;
     }
     mEncoding.clear();
     mEncoderGpuSubmitted = false;

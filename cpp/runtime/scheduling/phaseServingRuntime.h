@@ -68,6 +68,8 @@ struct PhaseServingRuntimeConfig
     bool enableChunkedVisionPrefill{true};
     bool enableVisionPrefixPrefill{true};
     bool enableAsyncEncoderPreparation{true};
+    bool allowPdDispatchDuringEncoderPreparation{};
+    bool separateEncoderPreparationCost{};
     bool releaseVisionPrefillStorage{true};
 };
 

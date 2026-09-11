@@ -43,6 +43,7 @@ TEST(PhaseUnifiedEventTest, ReportsStableSchemaAndNames)
     EXPECT_STREQ(phaseUnifiedPhaseName(PhaseUnifiedPhase::kEncoder), "encoder");
     EXPECT_STREQ(phaseUnifiedPhaseName(PhaseUnifiedPhase::kPrefill), "prefill");
     EXPECT_STREQ(phaseUnifiedPhaseName(PhaseUnifiedPhase::kDecode), "decode");
+    EXPECT_STREQ(phasePreparationStageName(PhasePreparationStage::kPrepared), "prepared");
     EXPECT_STREQ(phaseProtectedKindName(PhaseProtectedKind::kEncoder), "encoder");
     EXPECT_STREQ(phaseProtectedKindName(PhaseProtectedKind::kPrefill), "prefill");
     EXPECT_STREQ(phaseProtectedKindName(PhaseProtectedKind::kDecode), "decode");

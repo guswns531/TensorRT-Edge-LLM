@@ -4000,6 +4000,24 @@ TEST(PhaseThreeCoordinatorPolicyTest, CountsPerRequestVisionEmbeddingRows)
     EXPECT_EQ(phaseVisionEmbeddingRows(tokenIds, 7), (std::vector<int64_t>{2, 1, 0}));
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, EncoderPreparationBlocksOnlyRunnablePdWorkInCompatibilityMode)
+{
+    EXPECT_TRUE(phaseEncoderPreparationBlocksPd(true, false, false, 1U, 0U));
+    EXPECT_TRUE(phaseEncoderPreparationBlocksPd(true, false, false, 0U, 1U));
+    EXPECT_FALSE(phaseEncoderPreparationBlocksPd(true, true, false, 1U, 1U));
+    EXPECT_FALSE(phaseEncoderPreparationBlocksPd(false, false, false, 1U, 1U));
+    EXPECT_FALSE(phaseEncoderPreparationBlocksPd(true, false, true, 1U, 1U));
+    EXPECT_FALSE(phaseEncoderPreparationBlocksPd(true, false, false, 0U, 0U));
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, SeparatesPreparedEncoderExecutionCostOnlyWhenEnabled)
+{
+    EXPECT_FLOAT_EQ(phaseEncoderActionGpuMs(true, true, 40.0F, 12.0F), 12.0F);
+    EXPECT_FLOAT_EQ(phaseEncoderActionGpuMs(true, false, 40.0F, 12.0F), 40.0F);
+    EXPECT_FLOAT_EQ(phaseEncoderActionGpuMs(false, true, 40.0F, 12.0F), 40.0F);
+    EXPECT_FLOAT_EQ(phaseEncoderActionGpuMs(true, true, 40.0F, 0.0F), 40.0F);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, RecoversNoSloPhaseAfterOneServiceQuantum)
 {
     PhaseServiceState service;

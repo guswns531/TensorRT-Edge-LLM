@@ -2597,6 +2597,10 @@ int main(int argc, char** argv)
                     = std::getenv("TRT_EDGELLM_VISION_ENCODER_ARBITER") != nullptr;
                 threePhaseConfig.enableAsyncEncoderPreparation
                     = std::getenv("TRT_EDGELLM_VISION_ASYNC_PREPARATION") != nullptr;
+                threePhaseConfig.allowPdDispatchDuringEncoderPreparation
+                    = std::getenv("TRT_EDGELLM_VISION_PREPARATION_PD_DISPATCH") != nullptr;
+                threePhaseConfig.separateEncoderPreparationCost
+                    = std::getenv("TRT_EDGELLM_VISION_SEPARATE_PREPARATION_COST") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_INITIAL_COST_US"))
                 {
                     threePhaseConfig.encoderDispatchInitialCostUs = std::stod(value);
@@ -3901,6 +3905,9 @@ int main(int argc, char** argv)
                         {"vision_decode_tpot_pressure", visionMetrics.decodeTpotPressure},
                         {"vision_prefill_storage_releases", visionMetrics.prefillStorageReleases},
                         {"vision_prefill_storage_released_bytes", visionMetrics.prefillStorageReleasedBytes},
+                        {"vision_prefix_plans", visionMetrics.visionPrefixPlans},
+                        {"vision_prefix_submissions", visionMetrics.visionPrefixSubmissions},
+                        {"vision_prefix_threshold_suppressions", visionMetrics.visionPrefixThresholdSuppressions},
                         {"vision_encoder_starts", visionMetrics.encoderStarts},
                         {"vision_encoder_completions", visionMetrics.encoderCompletions},
                         {"vision_encoder_batches", visionMetrics.encoderBatches},
@@ -3915,6 +3922,10 @@ int main(int argc, char** argv)
                         {"vision_encoder_queue_wait_max_ms", visionMetrics.maxEncoderQueueWaitUs / 1000.0},
                         {"vision_encoder_gpu_ms", visionMetrics.lastEncoderGpuMs},
                         {"vision_encoder_gpu_max_ms", visionMetrics.maxEncoderGpuMs},
+                        {"vision_encoder_preparation_gpu_ms", visionMetrics.lastEncoderPreparationGpuMs},
+                        {"vision_encoder_preparation_gpu_max_ms", visionMetrics.maxEncoderPreparationGpuMs},
+                        {"vision_encoder_execution_gpu_ms", visionMetrics.lastEncoderExecutionGpuMs},
+                        {"vision_encoder_execution_gpu_max_ms", visionMetrics.maxEncoderExecutionGpuMs},
                         {"vision_encoder_dispatch_deferrals", visionMetrics.encoderDispatchDeferrals},
                         {"vision_encoder_text_guard_deferrals", visionMetrics.encoderTextGuardDeferrals},
                         {"vision_encoder_prefill_guard_deferrals", visionMetrics.encoderPrefillGuardDeferrals},
@@ -3934,6 +3945,12 @@ int main(int argc, char** argv)
                         {"vision_encoder_preparation_completions", visionMetrics.encoderPreparationCompletions},
                         {"vision_encoder_preparation_ms", visionMetrics.lastEncoderPreparationUs / 1000.0},
                         {"vision_encoder_preparation_max_ms", visionMetrics.maxEncoderPreparationUs / 1000.0},
+                        {"vision_encoder_preparation_pd_block_periods", visionMetrics.encoderPreparationPdBlockPeriods},
+                        {"vision_encoder_preparation_pd_block_polls", visionMetrics.encoderPreparationPdBlockPolls},
+                        {"vision_encoder_preparation_pd_blocked_ms",
+                            visionMetrics.encoderPreparationPdBlockedUs / 1000.0},
+                        {"vision_encoder_preparation_pd_blocked_max_ms",
+                            visionMetrics.maxEncoderPreparationPdBlockedUs / 1000.0},
                         {"vision_encoder_exclusive_batches", visionMetrics.exclusiveEncoderBatches},
                         {"vision_unknown_payload_bootstrap_selections",
                             visionMetrics.unknownPayloadBootstrapSelections},
@@ -4330,6 +4347,15 @@ int main(int argc, char** argv)
                             {"vision_payload_bytes", event.visionPayloadBytes}, {"request_ids", event.requestIds},
                             {"inflight", std::move(inflight)}, {"candidates", std::move(candidates)},
                             {"mechanism_candidates", std::move(mechanismCandidates)},
+                            {"preparation",
+                                {{"stage", rt::phasePreparationStageName(event.preparation.stage)},
+                                    {"request_ids", event.preparation.requestIds},
+                                    {"start_host_ns", event.preparation.startHostNs},
+                                    {"end_host_ns", event.preparation.endHostNs},
+                                    {"uses_host_thread", event.preparation.usesHostThread},
+                                    {"may_use_copy_engine", event.preparation.mayUseCopyEngine},
+                                    {"uses_encoder_stream", event.preparation.usesEncoderStream},
+                                    {"holds_device_memory", event.preparation.holdsDeviceMemory}}},
                             {"selected_action_id", event.selectedActionId},
                             {"scalar_h1_selected_action_id", event.scalarSelectedActionId},
                             {"non_contextual_selected_action_id", event.nonContextualSelectedActionId},
@@ -4440,7 +4466,8 @@ int main(int argc, char** argv)
                     encoderBatchMetrics.pop_front();
                     nlohmann::json const metricEvent{{"batch_index", metric.batchIndex},
                         {"batch_size", metric.batchSize}, {"input_bytes", metric.inputBytes},
-                        {"input_tokens", metric.inputTokens}, {"gpu_ms", metric.gpuMs}};
+                        {"input_tokens", metric.inputTokens}, {"preparation_gpu_ms", metric.preparationGpuMs},
+                        {"execution_gpu_ms", metric.executionGpuMs}, {"gpu_ms", metric.gpuMs}};
                     serializedRecords.push_back("PHASE_ENCODER_METRIC\t" + metricEvent.dump());
                 }
                 while (emitPhaseMetrics && !formationEpisodes.empty())
@@ -4639,13 +4666,16 @@ int main(int argc, char** argv)
                     "available_kv_pages=%d "
                     "prefill_releases=%zu prefill_released_bytes=%zu "
                     "queue_wait_last=%.3f ms queue_wait_max=%.3f ms encoder_gpu_last=%.3f ms encoder_gpu_max=%.3f ms "
+                    "preparation_gpu_last=%.3f ms preparation_gpu_max=%.3f ms "
+                    "execution_gpu_last=%.3f ms execution_gpu_max=%.3f ms "
                     "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
                     "capacity_contractions=%zu capacity_dwell_blocks=%zu "
                     "encoder_arrival_wait_periods=%zu encoder_arrival_wait_expirations=%zu "
                     "encoder_arrival_wait_last=%.3f ms "
                     "decode_tpot_pressure=%.3f async_preparations=%zu/%zu preparation_last=%.3f ms "
-                    "preparation_max=%.3f ms exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
+                    "preparation_max=%.3f ms preparation_pd_blocks=%zu/%zu preparation_pd_blocked=%.3f ms "
+                    "preparation_pd_blocked_max=%.3f ms exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
                     visionMetrics.lastEncoderBatchSize, visionMetrics.maxEncoderBatchSize,
                     visionMetrics.lastEncoderInputBytes, visionMetrics.maxEncoderInputBytes,
@@ -4662,15 +4692,19 @@ int main(int argc, char** argv)
                     visionMetrics.prefillStorageReleases, visionMetrics.prefillStorageReleasedBytes,
                     visionMetrics.lastEncoderQueueWaitUs / 1000.0, visionMetrics.maxEncoderQueueWaitUs / 1000.0,
                     visionMetrics.lastEncoderGpuMs, visionMetrics.maxEncoderGpuMs,
+                    visionMetrics.lastEncoderPreparationGpuMs, visionMetrics.maxEncoderPreparationGpuMs,
+                    visionMetrics.lastEncoderExecutionGpuMs, visionMetrics.maxEncoderExecutionGpuMs,
                     visionMetrics.lastPrefillReadyQueueWaitUs / 1000.0,
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
                     visionMetrics.encodedCapacityContractions, visionMetrics.encodedCapacityDwellBlocks,
                     visionMetrics.globalEncoderArrivalWaitPeriods, visionMetrics.globalEncoderArrivalWaitExpirations,
-                    visionMetrics.lastGlobalEncoderArrivalWaitUs / 1000.0,
-                    visionMetrics.decodeTpotPressure, visionMetrics.encoderPreparationStarts,
-                    visionMetrics.encoderPreparationCompletions, visionMetrics.lastEncoderPreparationUs / 1000.0,
-                    visionMetrics.maxEncoderPreparationUs / 1000.0, visionMetrics.exclusiveEncoderBatches,
+                    visionMetrics.lastGlobalEncoderArrivalWaitUs / 1000.0, visionMetrics.decodeTpotPressure,
+                    visionMetrics.encoderPreparationStarts, visionMetrics.encoderPreparationCompletions,
+                    visionMetrics.lastEncoderPreparationUs / 1000.0, visionMetrics.maxEncoderPreparationUs / 1000.0,
+                    visionMetrics.encoderPreparationPdBlockPeriods, visionMetrics.encoderPreparationPdBlockPolls,
+                    visionMetrics.encoderPreparationPdBlockedUs / 1000.0,
+                    visionMetrics.maxEncoderPreparationPdBlockedUs / 1000.0, visionMetrics.exclusiveEncoderBatches,
                     visionMetrics.exclusiveEncoderPrefillDeferrals);
                 rt::PhaseVisionMemoryStats const& memoryStats = ipcVisionAdapter->memoryStats();
                 LOG_INFO(
