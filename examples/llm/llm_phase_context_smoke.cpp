@@ -1718,8 +1718,9 @@ int main(int argc, char** argv)
             && std::getenv("TRT_EDGELLM_SERVICE_NORMALIZED_AUTHORITY") != nullptr;
         semanticSchedulerConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
             = enableServiceNormalizedAuthority;
-        semanticSchedulerConfig.globalSchedulerConfig.disableServiceRecovery
-            = std::getenv("TRT_EDGELLM_DISABLE_SERVICE_RECOVERY") != nullptr;
+        semanticSchedulerConfig.globalSchedulerConfig.enableServiceRecovery
+            = std::getenv("TRT_EDGELLM_ENABLE_SERVICE_RECOVERY") != nullptr
+            && std::getenv("TRT_EDGELLM_DISABLE_SERVICE_RECOVERY") == nullptr;
         semanticSchedulerConfig.globalSchedulerConfig.suppressUnknownExplorationWhenServiceOverdue
             = std::getenv("TRT_EDGELLM_ALLOW_OVERDUE_EXPLORATION") == nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_SERVICE_RECOVERY_AGE_QUANTA"))
@@ -4641,6 +4642,8 @@ int main(int argc, char** argv)
                     "prefill_ready_wait_last=%.3f ms prefill_ready_wait_max=%.3f ms "
                     "encoded_capacity=%zu encoded_capacity_max=%zu lookahead_escalations=%zu "
                     "capacity_contractions=%zu capacity_dwell_blocks=%zu "
+                    "encoder_arrival_wait_periods=%zu encoder_arrival_wait_expirations=%zu "
+                    "encoder_arrival_wait_last=%.3f ms "
                     "decode_tpot_pressure=%.3f async_preparations=%zu/%zu preparation_last=%.3f ms "
                     "preparation_max=%.3f ms exclusive_batches=%zu exclusive_prefill_deferrals=%zu",
                     visionMetrics.encoderStarts, visionMetrics.encoderCompletions, visionMetrics.encoderBatches,
@@ -4663,6 +4666,8 @@ int main(int argc, char** argv)
                     visionMetrics.maxPrefillReadyQueueWaitUs / 1000.0, visionMetrics.effectiveEncodedCapacity,
                     visionMetrics.maxEffectiveEncodedCapacity, visionMetrics.lookaheadEscalations,
                     visionMetrics.encodedCapacityContractions, visionMetrics.encodedCapacityDwellBlocks,
+                    visionMetrics.globalEncoderArrivalWaitPeriods, visionMetrics.globalEncoderArrivalWaitExpirations,
+                    visionMetrics.lastGlobalEncoderArrivalWaitUs / 1000.0,
                     visionMetrics.decodeTpotPressure, visionMetrics.encoderPreparationStarts,
                     visionMetrics.encoderPreparationCompletions, visionMetrics.lastEncoderPreparationUs / 1000.0,
                     visionMetrics.maxEncoderPreparationUs / 1000.0, visionMetrics.exclusiveEncoderBatches,

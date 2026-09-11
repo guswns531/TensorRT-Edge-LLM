@@ -56,7 +56,7 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     , mGlobalScheduler([&] {
         PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
         global.enableServiceRecovery
-            = phasePolicyUsesServiceScale(mConfig.policyMode) && !global.disableServiceRecovery;
+            = phasePolicyUsesServiceScale(mConfig.policyMode) && global.enableServiceRecovery;
         return global;
     }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
@@ -2251,7 +2251,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         candidates.push_back(std::move(candidate));
     }
     bool const preserveExpiredDecode
-        = (phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.globalSchedulerConfig.disableServiceRecovery)
+        = (phasePolicyUsesServiceScale(mConfig.policyMode) && mConfig.globalSchedulerConfig.enableServiceRecovery)
         || (mConfig.preserveExpiredDecodeCandidate && state.decodeQueued > 0U && state.decodeMinTpotSlackUs <= 0.0);
     if (audit != nullptr)
     {

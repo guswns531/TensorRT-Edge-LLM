@@ -688,7 +688,7 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mGlobalScheduler([&] {
         PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
         global.enableServiceRecovery
-            = phasePolicyUsesServiceScale(mConfig.policyMode) && !global.disableServiceRecovery;
+            = phasePolicyUsesServiceScale(mConfig.policyMode) && global.enableServiceRecovery;
         return global;
     }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
@@ -851,7 +851,9 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
             return horizon;
         });
     }
-    mEffectiveEncodedCapacity = mConfig.maxEncodedInFlight;
+    mEffectiveEncodedCapacity = phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.visionTtftTargetExplicit
+        ? std::max(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight)
+        : mConfig.maxEncodedInFlight;
     mMaxEffectiveEncodedCapacity = mEffectiveEncodedCapacity;
 }
 
@@ -2787,7 +2789,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     auto const serviceRecoveryDue = [&](PhaseGlobalActionKind kind) {
         PhaseServiceState const& service
             = kind == PhaseGlobalActionKind::kPrefill ? serverState.prefillService : serverState.decodeService;
-        return phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.globalSchedulerConfig.disableServiceRecovery
+        return phasePolicyUsesServiceScale(mConfig.policyMode) && mConfig.globalSchedulerConfig.enableServiceRecovery
             && phaseNoSloServiceRecoveryDue(service, mConfig.globalSchedulerConfig.serviceRecoveryAgeQuanta);
     };
     if (!residualAugmentation && !mGlobalWarmupProbeMode)
@@ -4520,6 +4522,19 @@ float PhaseThreeCoordinator::decodeTpotPressure() const noexcept
 
 void PhaseThreeCoordinator::refreshEffectiveEncodedCapacity() noexcept
 {
+    auto const hasExplicitVisionTtft = [](auto const& requests) {
+        return std::any_of(requests.begin(), requests.end(),
+            [](auto const& request) { return request.scheduling.ttftTargetUs > 0.0; });
+    };
+    bool const explicitRequestContract = !mTpotTargets.empty() || hasExplicitVisionTtft(mPending)
+        || hasExplicitVisionTtft(mEncoding) || hasExplicitVisionTtft(mReadyPrefill);
+    if (phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.visionTtftTargetExplicit
+        && !explicitRequestContract)
+    {
+        mEffectiveEncodedCapacity = std::max(mConfig.maxEncodedInFlight, mConfig.throughputMaxEncodedInFlight);
+        mMaxEffectiveEncodedCapacity = std::max(mMaxEffectiveEncodedCapacity, mEffectiveEncodedCapacity);
+        return;
+    }
     double oldestVisionAgeUs{};
     double visionTtftTargetUs = mConfig.visionTtftTargetUs;
     if (!mPending.empty())

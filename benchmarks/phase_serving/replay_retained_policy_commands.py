@@ -24,6 +24,15 @@ import subprocess
 import urllib.parse
 
 
+def file_sha256(path):
+    """Return the content identity of one retained campaign input."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def materialize_inputs(commands, output, remaps):
     """Validate local media and preserve explicit path repairs with asset hashes."""
     documents, assets = {}, {}
@@ -146,6 +155,53 @@ def inject_runtime_environment(command, assignments):
     return result
 
 
+def remove_runtime_environment(command, names):
+    """Remove explicit runtime settings from a copied retained command."""
+    result = list(command)
+    for name in names:
+        if not name.startswith("TRT_EDGELLM_") or "=" in name:
+            raise ValueError(
+                "Dropped runtime environment must be a TRT_EDGELLM_NAME")
+        matches = [
+            index for index, item in enumerate(result)
+            if item.startswith(name + "=")
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"Duplicate runtime environment setting: {name}")
+        if not matches:
+            continue
+        index = matches[0]
+        if index == 0 or result[index - 1] != "-e":
+            raise ValueError(f"Expected a Docker -e before {name}")
+        del result[index - 1:index + 1]
+    return result
+
+
+def enable_automatic_calibration(command, max_cycles):
+    """Use complete generic-program cycles as convergence observations."""
+    result = list(command)
+    required = ("--warmup-requests", "--generic-warmup-trace",
+                "--phase-calibration-round-requests",
+                "--phase-calibration-min-requests")
+    if any(option not in result for option in required):
+        raise ValueError(
+            "Automatic calibration requires a generic trace and calibration options"
+        )
+    if max_cycles < 1:
+        raise ValueError("Automatic calibration needs a positive cycle cap")
+    trace = pathlib.Path(result[result.index("--generic-warmup-trace") + 1])
+    requests = json.loads(trace.read_bytes()).get("requests", [])
+    if not requests:
+        raise ValueError("Generic calibration trace contains no requests")
+    cycle_requests = len(requests)
+    result[result.index("--warmup-requests") + 1] = str(cycle_requests *
+                                                         max_cycles)
+    result[result.index("--phase-calibration-round-requests") + 1] = str(
+        cycle_requests)
+    result[result.index("--phase-calibration-min-requests") + 1] = "0"
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commands", type=pathlib.Path, required=True)
@@ -175,6 +231,12 @@ def main():
         metavar="TRT_EDGELLM_NAME=VALUE",
         help="Runtime-only diagnostic or ablation setting; may be repeated")
     parser.add_argument(
+        "--drop-runtime-env",
+        action="append",
+        default=[],
+        metavar="TRT_EDGELLM_NAME",
+        help="Remove a retained runtime setting; may be repeated")
+    parser.add_argument(
         "--respect-eos",
         action="store_true",
         help=
@@ -184,6 +246,24 @@ def main():
         "--no-explicit-slo",
         action="store_true",
         help="Remove composition-root TTFT/TPOT targets from the replay")
+    parser.add_argument(
+        "--automatic-calibration",
+        action="store_true",
+        help=
+        "Check runtime convergence after each complete generic calibration cycle"
+    )
+    parser.add_argument(
+        "--calibration-max-cycles",
+        type=int,
+        default=3,
+        help="Safety cap for automatic generic calibration (default: 3)")
+    parser.add_argument(
+        "--calibration-stable-rounds",
+        type=int,
+        default=1,
+        help=
+        "Consecutive converged coverage cycles required before serving (default: 1)"
+    )
     parser.add_argument(
         "--phase-telemetry",
         "--dispatch-telemetry",
@@ -197,6 +277,11 @@ def main():
                                  "full"),
                         default="dispatch")
     args = parser.parse_args()
+    if args.calibration_stable_rounds <= 0:
+        raise ValueError("Calibration stable rounds must be positive")
+    if args.automatic_calibration and args.calibration_stable_rounds > args.calibration_max_cycles:
+        raise ValueError(
+            "Calibration stable rounds cannot exceed the cycle safety cap")
     if "CMAKE_BUILD_TYPE:STRING=Release" not in args.build_cache.read_text(
     ).splitlines():
         raise ValueError("Performance comparison requires a Release build")
@@ -240,6 +325,11 @@ def main():
                 command = enable_eos_termination(command)
             if args.no_explicit_slo:
                 command = remove_explicit_slo_contract(command)
+            if args.automatic_calibration:
+                command = enable_automatic_calibration(
+                    command, args.calibration_max_cycles)
+            command = remove_runtime_environment(command,
+                                                 args.drop_runtime_env)
             command = inject_runtime_environment(command, args.runtime_env)
             for option in ("--trace", "--generic-warmup-trace"):
                 if option in command:
@@ -327,11 +417,49 @@ def main():
                 "case": case,
                 "command": command,
                 "environment": {
-                    "PHASE_TRACE_CLIENT_IMPL": client_implementation
+                    "PHASE_TRACE_CLIENT_IMPL": client_implementation,
+                    **({
+                        "PHASE_CALIBRATION_STABLE_ROUNDS":
+                        str(args.calibration_stable_rounds)
+                    } if args.automatic_calibration else {})
                 }
             })
     (args.output /
      "commands.json").write_text(json.dumps(planned, indent=2) + "\n")
+    repository = pathlib.Path(__file__).resolve().parents[2]
+    executable = args.build_cache.parent / "examples/llm/llm_phase_context_smoke"
+    source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+    source_dirty = bool(
+        subprocess.check_output(["git", "status", "--porcelain"],
+                                cwd=repository,
+                                text=True).strip())
+    (args.output / "campaign-manifest.json").write_text(
+        json.dumps(
+            {
+                "source_commit": source_commit,
+                "source_dirty": source_dirty,
+                "base_commands": str(args.commands.resolve()),
+                "base_commands_sha256": file_sha256(args.commands),
+                "build_cache": str(args.build_cache.resolve()),
+                "build_cache_sha256": file_sha256(args.build_cache),
+                "runtime_executable": str(executable.resolve()),
+                "runtime_executable_sha256": file_sha256(executable),
+                "policies": args.policies,
+                "cases": args.cases,
+                "repeats": args.repeats,
+                "no_explicit_slo": args.no_explicit_slo,
+                "automatic_calibration": args.automatic_calibration,
+                "calibration_max_cycles": args.calibration_max_cycles,
+                "calibration_stable_rounds": args.calibration_stable_rounds,
+                "runtime_environment_added": args.runtime_env,
+                "runtime_environment_removed": args.drop_runtime_env,
+                "dispatch_telemetry": args.dispatch_telemetry,
+                "telemetry_level": args.telemetry_level,
+                "input_contract": "input-contract.json",
+                "commands": "commands.json",
+            },
+            indent=2) + "\n")
     for index, record in enumerate(planned):
         print(
             f"[{index + 1}/{len(planned)}] {record['policy']} {record['case']}",

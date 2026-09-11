@@ -2410,7 +2410,31 @@ TEST(PhaseQueueSchedulerTest, ServiceScaledModeKeepsExplicitDeadlinesAbsolute)
     EXPECT_TRUE(std::isfinite(state.decodeMinimumAbsoluteSlackUs));
 }
 
-TEST(PhaseQueueSchedulerTest, ServiceScaledModePreservesStandaloneDecodeCandidate)
+TEST(PhaseQueueSchedulerTest, ExplicitServiceRecoveryPreservesStandaloneDecodeCandidate)
+{
+    PhaseQueueSchedulerConfig config;
+    config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSchedulerConfig.enableServiceRecovery = true;
+    config.enablePrefillTtftHardGuard = true;
+    PhaseQueueScheduler scheduler(config);
+    PhaseSchedulingHints expired;
+    expired.submittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    expired.ttftTargetUs = 1.0;
+    scheduler.enqueuePrefill({1, 32, 0, 0, 32, true, expired});
+    scheduler.enqueueDecode({2, 128, 1});
+
+    PhaseGlobalSelectionAudit audit;
+    scheduler.previewGlobalAction(&audit);
+
+    ASSERT_TRUE(audit.decodeGuard.has_value());
+    EXPECT_TRUE(audit.decodeGuard->prefillExpired);
+    EXPECT_TRUE(audit.decodeGuard->candidateRestored);
+    EXPECT_FALSE(audit.decodeGuard->candidateSuppressed);
+    EXPECT_TRUE(scheduler.previewGlobalDecodeAction().has_value());
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceScaledModeDoesNotEnableRecoveryImplicitly)
 {
     PhaseQueueSchedulerConfig config;
     config.policyMode = PhasePolicyMode::kServiceScaledTransition;
@@ -2428,9 +2452,8 @@ TEST(PhaseQueueSchedulerTest, ServiceScaledModePreservesStandaloneDecodeCandidat
 
     ASSERT_TRUE(audit.decodeGuard.has_value());
     EXPECT_TRUE(audit.decodeGuard->prefillExpired);
-    EXPECT_TRUE(audit.decodeGuard->candidateRestored);
-    EXPECT_FALSE(audit.decodeGuard->candidateSuppressed);
-    EXPECT_TRUE(scheduler.previewGlobalDecodeAction().has_value());
+    EXPECT_FALSE(audit.decodeGuard->candidateRestored);
+    EXPECT_TRUE(audit.decodeGuard->candidateSuppressed);
 }
 
 TEST(PhaseQueueSchedulerTest, ServiceScaledRecentDecodePressureUsesFrozenReference)

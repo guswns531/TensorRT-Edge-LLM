@@ -277,6 +277,53 @@ class ReplayContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             REPLAY.inject_runtime_environment(command, ["OTHER=1"])
 
+    def test_runtime_environment_can_be_removed_from_retained_command(self):
+        command = [
+            "docker", "run", "-e", "TRT_EDGELLM_LEGACY_PAIR_ELIGIBILITY=1",
+            "-e", "KEEP=1", "image"
+        ]
+
+        changed = REPLAY.remove_runtime_environment(
+            command, ["TRT_EDGELLM_LEGACY_PAIR_ELIGIBILITY"])
+
+        self.assertEqual(changed,
+                         ["docker", "run", "-e", "KEEP=1", "image"])
+        self.assertEqual(
+            REPLAY.remove_runtime_environment(changed,
+                                              ["TRT_EDGELLM_MISSING"]),
+            changed)
+        with self.assertRaises(ValueError):
+            REPLAY.remove_runtime_environment(command, ["KEEP"])
+
+    def test_automatic_calibration_uses_complete_coverage_cycles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = pathlib.Path(directory) / "generic.json"
+            trace.write_text(json.dumps({"requests": [{}, {}, {}]}))
+            command = [
+                "client", "--warmup-requests", "319",
+                "--generic-warmup-trace", str(trace),
+                "--phase-calibration-round-requests", "319",
+                "--phase-calibration-min-requests", "319", "--", "docker"
+            ]
+
+            changed = REPLAY.enable_automatic_calibration(command, 3)
+
+            self.assertEqual(
+                changed[changed.index("--warmup-requests") + 1], "9")
+            self.assertEqual(
+                changed[changed.index("--phase-calibration-round-requests") +
+                        1], "3")
+            self.assertEqual(
+                changed[changed.index("--phase-calibration-min-requests") + 1],
+                "0")
+            self.assertEqual(command[command.index("--warmup-requests") + 1],
+                             "319")
+            one_cycle = REPLAY.enable_automatic_calibration(command, 1)
+            self.assertEqual(
+                one_cycle[one_cycle.index("--warmup-requests") + 1], "3")
+            with self.assertRaises(ValueError):
+                REPLAY.enable_automatic_calibration(command, 0)
+
     def test_latency_statistics(self):
         mean, p95 = DISTRIBUTIONS.latency_statistics([1.0, 2.0, 3.0])
         self.assertEqual(mean, 2.0)
@@ -291,6 +338,45 @@ class ReplayContractTest(unittest.TestCase):
     def test_http_failure(self):
         with self.assertRaises(RuntimeError):
             GUARD.validate_rows([{"http_status": 500, "error": "failed"}], 1)
+
+    def test_calibration_signature_ignores_sample_count(self):
+        first = {
+            "calibration_cost_keys": [{
+                "action": "prefill_decode",
+                "primary_batch_size": 2,
+                "secondary_batch_size": 32,
+                "chunk_length": 128,
+                "primary_context_bucket": 1,
+                "secondary_context_bucket": 2,
+                "execution_variant": "plain",
+                "residual_anchor": "none",
+                "status": "eligible",
+                "sample_count": 4,
+                "required": True,
+            }],
+            "contextual_policy_calibration": {
+                "prefill_decode": {
+                    "directions": [{
+                        "direction": "prefill_to_decode",
+                        "observations": 4,
+                        "required": True,
+                        "ready": True,
+                    }]
+                }
+            },
+            "contextual_policy_calibration_converged": True,
+        }
+        second = json.loads(json.dumps(first))
+        second["calibration_cost_keys"][0]["sample_count"] = 8
+        second["contextual_policy_calibration"]["prefill_decode"][
+            "directions"][0]["observations"] = 8
+
+        self.assertEqual(GUARD.calibration_signature(first),
+                         GUARD.calibration_signature(second))
+        second["calibration_cost_keys"][0]["status"] = "unprofitable"
+        second["contextual_policy_calibration_converged"] = False
+        self.assertNotEqual(GUARD.calibration_signature(first),
+                            GUARD.calibration_signature(second))
 
     def test_stream_failure(self):
         with self.assertRaises(RuntimeError):
