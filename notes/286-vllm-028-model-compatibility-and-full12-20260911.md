@@ -106,9 +106,10 @@ allocator fragmentation.
 
 Restarting with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` preserved every serving parameter and completed
 all 36 measured runs in one long-lived server. After the campaign, vLLM occupied 9,576 MiB and the GPU had 290 MiB
-free. The current runtime's retained mixed V3 peak was 9,268 MiB with 972 MiB headroom, although those values come
-from different memory instrumentation and should be treated as an approximate residency comparison rather than an
-exact allocator A/B.
+free. The canonical Cosmos V3 runtime allocated 9,399 MiB after text-engine initialization, and its retained mixed-VLM
+campaign had a 9,629 MiB median peak, leaving about 611 MiB against the nominal 10,240 MiB device capacity. These
+values come from different memory instrumentation and should be treated as an approximate residency comparison rather
+than an exact allocator A/B.
 
 This result does not justify reducing vLLM's KV pool to make it pass. Instead, the equal-capacity result is retained
 with the allocator setting disclosed. It also reinforces the current architecture's benefit: stable ownership and
