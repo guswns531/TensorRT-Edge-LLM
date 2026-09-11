@@ -268,7 +268,8 @@ success, generated-token count, and semantic output inspection in this campaign.
 | Direct corrected matrix | `.local/results/gemma4-e2b-awq-soft280-20260911` |
 | HTTP cold-policy matrix | `.local/results/gemma4-e2b-awq-soft280-http-20260911/matrix` |
 | HTTP warmup-matched matrix | `.local/results/gemma4-e2b-awq-soft280-http-20260911/trace-derived-matrix` |
-| Frozen vLLM results | `.local/results/gemma4-e2b-awq-vllm028-equal-http-20260911` |
+| Initial eager vLLM results | `.local/results/gemma4-e2b-awq-vllm028-equal-http-20260911` |
+| Optimized vLLM results | `.local/results/gemma4-e2b-awq-vllm028-graph-eager-20260911` |
 
 Engine identities:
 
@@ -288,5 +289,5 @@ Visual engine  f09bbd50a34f7ee4b4bc6070ff531075c720a3811f69976d9de4e3b0ba1b5b6f
    binding strategy; the E4 visual-only profile is not useful.
 5. Implement d256/d512 packed/chunked prefill before claiming parity with the earlier Cosmos P8/D64 scheduler
    frontier. Gemma currently exercises dense P2/D4 and is a model-port validation, not the 12-workload replacement.
-6. Re-run vLLM only if the execution contract changes, such as a compiled path that fits, a different quantization,
-   or a matched active-sequence/admission experiment. Reuse the frozen result otherwise.
+6. Use note 289's decoder-CUDA-Graph vLLM result for subsequent unchanged-trace comparisons. The all-eager result in
+   this note is an historical control rather than the optimized vLLM baseline.
