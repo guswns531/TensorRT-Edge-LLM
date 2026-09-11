@@ -29,6 +29,7 @@
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
+#include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
@@ -420,6 +421,17 @@ public:
             visionConfig.serializeAllEncoderPrefill = serializeAllEncoderPrefill;
             visionConfig.serializeAllEncoderDecode = serializeAllEncoderDecode;
             mThreePhase = std::make_unique<PhaseThreeCoordinator>(*mVisionAdapter, *mServer, std::move(visionConfig));
+        }
+        if (mServingConfig.activityTimeline != nullptr)
+        {
+            if (mThreePhase != nullptr)
+            {
+                mThreePhase->setActivityTimeline(mServingConfig.activityTimeline.get());
+            }
+            else
+            {
+                mServer->setActivityTimeline(mServingConfig.activityTimeline.get());
+            }
         }
         CUDA_CHECK(cudaStreamSynchronize(setupStream));
     }

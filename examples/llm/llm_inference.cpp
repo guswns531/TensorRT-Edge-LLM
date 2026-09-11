@@ -33,6 +33,7 @@
 #include "runtime/multiDevice/ncclCollectiveBackend.h"
 #include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
+#include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
@@ -1183,12 +1184,21 @@ int runPhaseServingInference(LLMInferenceArgs const& args, std::vector<rt::LLMGe
     }
 
     double const wallMs = std::chrono::duration<double, std::milli>(benchmarkEnd - benchmarkStart).count();
+    if (profilerEnabled)
+    {
+        memoryMonitor.stop();
+    }
     output["summary"] = {{"requests", logicalRequestCount}, {"output_tokens", totalOutputTokens}, {"wall_ms", wallMs},
         {"request_throughput", wallMs > 0.0 ? static_cast<double>(logicalRequestCount) * 1000.0 / wallMs : 0.0},
         {"token_throughput", wallMs > 0.0 ? static_cast<double>(totalOutputTokens) * 1000.0 / wallMs : 0.0},
         {"ttft_mean_ms", phaseMean(ttftValues)}, {"ttft_p95_ms", phasePercentile(ttftValues, 0.95)},
         {"tpot_mean_ms", phaseMean(tpotValues)}, {"tpot_p95_ms", phasePercentile(tpotValues, 0.95)},
         {"e2e_mean_ms", phaseMean(e2eValues)}, {"e2e_p95_ms", phasePercentile(e2eValues, 0.95)}};
+    if (profilerEnabled)
+    {
+        output["summary"]["peak_gpu_memory_bytes"] = memoryMonitor.getPeakGpuMemory();
+        output["summary"]["peak_cpu_memory_bytes"] = memoryMonitor.getPeakCpuMemory();
+    }
 
     std::ofstream outputFile(args.outputFile);
     ELLM_CHECK(outputFile.good(), "Failed to open phase-serving output file");
@@ -1201,10 +1211,6 @@ int runPhaseServingInference(LLMInferenceArgs const& args, std::vector<rt::LLMGe
         logicalRequestCount, wallMs, output["summary"]["request_throughput"].get<double>(),
         output["summary"]["token_throughput"].get<double>(), phaseMean(e2eValues), phasePercentile(e2eValues, 0.95));
 
-    if (profilerEnabled)
-    {
-        memoryMonitor.stop();
-    }
     return EXIT_SUCCESS;
 }
 
@@ -1791,6 +1797,16 @@ int main(int argc, char* argv[])
     std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    std::shared_ptr<rt::PhaseActivityTimelineRecorder> phaseActivityTimeline;
+    std::filesystem::path phaseActivityPrefix;
+    if (args.phaseServing)
+    {
+        if (char const* value = std::getenv("TRT_EDGELLM_PHASE_ACTIVITY_PREFIX"))
+        {
+            phaseActivityPrefix = value;
+            phaseActivityTimeline = std::make_shared<rt::PhaseActivityTimelineRecorder>(stream);
+        }
+    }
     auto cleanupAfterStreamCreate = [&]() {
         runtime.reset();
         CUDA_CHECK(cudaStreamDestroy(stream));
@@ -1844,6 +1860,7 @@ int main(int argc, char* argv[])
                 phaseConfig.policyMode = args.phasePolicy;
                 phaseConfig.maxPendingRequests = logicalRequestCount;
                 phaseConfig.maxEncodedVisionRequests = logicalRequestCount;
+                phaseConfig.activityTimeline = phaseActivityTimeline;
                 runtimeConfig.phaseServingConfig = phaseConfig;
                 bool const containsVision = std::any_of(
                     batchedRequests.begin(), batchedRequests.end(), [](rt::LLMGenerationRequest const& batch) {
@@ -1876,6 +1893,11 @@ int main(int argc, char* argv[])
         try
         {
             result = runPhaseServingInference(args, batchedRequests, *runtime, memoryMonitor, profilerEnabled);
+            if (result == EXIT_SUCCESS && phaseActivityTimeline != nullptr)
+            {
+                phaseActivityTimeline->drain();
+                phaseActivityTimeline->writeCsv(phaseActivityPrefix);
+            }
         }
         catch (std::exception const& e)
         {

@@ -37,6 +37,7 @@ namespace trt_edgellm::rt
 
 class EngineExecutor;
 class MultimodalRunner;
+class PhaseActivityTimelineRecorder;
 struct EmbeddingData;
 struct LLMEngineConfig;
 struct SharedResources;
@@ -71,6 +72,7 @@ struct PhaseServingRuntimeConfig
     bool allowPdDispatchDuringEncoderPreparation{};
     bool separateEncoderPreparationCost{};
     bool releaseVisionPrefillStorage{true};
+    std::shared_ptr<PhaseActivityTimelineRecorder> activityTimeline;
 };
 
 //! Single-rank asynchronous text serving over independent prefill/decode contexts.
