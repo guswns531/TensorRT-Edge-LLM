@@ -9,10 +9,15 @@ checkpoint, and a fresh 12-workload performance campaign was run with the retain
 execute under one contract.
 
 vLLM 0.28.0 fixes the Gemma 4 architecture failure seen in vLLM 0.27.1. It resolves the heterogeneous d256/d512
-attention layers and selects Triton attention on the RTX 3080. The retained `Chunity/gemma-4-E2B-it-AWQ-4bit`
-checkpoint still cannot be used for a fair performance comparison: its AutoRound mixed-precision projection layout
-is incompatible with vLLM's fused QKV loader. This is a different, later failure than the old global-`head_dim`
-failure.
+attention layers and selects Triton attention on the RTX 3080. A later audit corrected the initial conclusion about
+the retained `Chunity/gemma-4-E2B-it-AWQ-4bit` checkpoint: its weights are usable by vLLM. The fused-QKV validator
+was treating K/V shards that are structurally absent in Gemma 4's 20 KV-sharing layers as unquantized shards.
+
+A metadata-only compatibility view adds those 40 absent K/V module names to `modules_to_not_convert`; it does not
+modify or duplicate the checkpoint weights. With that view, vLLM 0.28 passes both text-only and one-image eager
+inference. The normal compiled path remains unsuitable on this RTX 3080 because Inductor autotuning requests an
+additional 4.38 GiB allocation after loading about 6.58 GiB of model state. This is a compile-workspace limit, not
+a checkpoint-format failure.
 
 The fair performance control therefore remains `nvidia/Cosmos-Reason2-2B` in FP16. A fresh vLLM 0.28.0 server ran
 all 12 retained request traces three times each with the same model, FP16 KV cache, 2,048-token context, 3.5 GiB KV
@@ -25,19 +30,34 @@ beats vLLM on E2E p95 in 11 of 12, while four TTFT-sensitive VLM traces still ex
 | Runtime/checkpoint | Result | Failure boundary |
 |---|---|---|
 | vLLM 0.27.1 + Chunity Gemma AWQ | Fail | Architecture conversion accesses ambiguous global `head_dim` |
-| vLLM 0.28.0 + Chunity Gemma AWQ | Fail | Architecture succeeds; fused QKV requires every shard to use one precision |
+| vLLM 0.28.0 + Chunity Gemma AWQ, original metadata | Fail | Architecture succeeds; absent shared-KV K/V shards are misclassified by fused-QKV validation |
+| vLLM 0.28.0 + Chunity Gemma AWQ, compatibility view | Pass | Text-only and one-image eager inference; weights unchanged |
 | TensorRT-Edge-LLM v0.10.1 current + Chunity Gemma AWQ | Pass | Separate projection loading accepts the checkpoint; export → build → inference passes |
 | vLLM 0.28.0 + Cosmos FP16 | Pass | Full 12-workload HTTP campaign completes |
 
-The vLLM 0.28 model loader reports both Gemma attention dimensions and explicitly forces `TRITON_ATTN` because
-SM86 does not provide the heterogeneous-head FlashAttention-4 path. During weight construction it then rejects
-layer 15 `qkv_proj`: only some fused shards are quantized. The Chunity checkpoint skips quantization selectively
-inside attention projections, whereas vLLM's fused QKV representation requires a common precision. Changing vLLM
-alone is therefore insufficient for this particular checkpoint.
+The checkpoint audit found three distinct layer groups. Layers 0-3, 5-8, and 10-13 contain quantized Q/K/V/O
+projections. Layers 4, 9, and 14 intentionally keep all four attention projections in floating point and list them
+in `modules_to_not_convert`. Layers 15-34 list floating-point Q/O projections, while K/V projections are absent
+because `num_kv_shared_layers=20` reuses earlier KV state. vLLM's AWQ fused-QKV validation counted those absent
+K/V names as present-unquantized shards and rejected layer 15.
 
-A future same-Gemma performance comparison needs one common checkpoint whose Q, K, and V projections use a uniform
-quantization contract, followed by the complete TensorRT-Edge-LLM export → build → inference validation. Comparing
-different Gemma quantizers would otherwise mix runtime performance with weight format and calibration differences.
+The compatibility view adds exactly the absent layer-15-through-34 K/V names to the existing exclusion list. All
+safetensors are hard-linked byte-for-byte from the original artifact. This is consistent with the general absent
+fused-shard failure reported in vLLM issue #53992 and addressed for the GPTQ loader by pull request #53996; the
+local AWQ checkpoint still needs the config-level representation because its quantization exclusions come from
+model metadata.
+
+The following diagnostics now pass:
+
+| Mode | Contract | Result | Warm median HTTP E2E | GPU process memory |
+|---|---|---|---:|---:|
+| Text-only eager | 2,048 context, BS4, 1.84 GiB KV | 3/3 deterministic 32-token generations | 1,087.9 ms | 9,104 MiB |
+| One-image eager | 2,048 context, BS1, 512 MiB KV | 3/3 `The animal shown is a red panda.` | 350.4 ms | 8,148 MiB |
+| Compiled | 1,024-token range, 512 MiB KV, combo benchmark off | OOM during an additional 4.38 GiB allocation | N/A | N/A |
+| Compiled-minimal | 128-token range, BS1, 256 MiB KV, all exposed autotune flags off | Same 4.38 GiB allocation OOM | N/A | N/A |
+
+The text output is an exact character prefix of the retained TensorRT-Edge-LLM 64-token output for the same prompt.
+This is encouraging but is not yet the stronger input-ID-level, equal-generation-contract identity gate.
 
 ## Fair Cosmos contract
 
@@ -121,6 +141,9 @@ lifetime pattern.
 | Artifact | Path |
 |---|---|
 | Gemma compatibility manifest | `.local/results/gemma4-e2b-awq-vllm028-20260911/manifest.json` |
+| Text eager smoke | `.local/results/gemma4-e2b-awq-vllm028-20260911/text-eager-smoke.json` |
+| One-image eager smoke | `.local/results/gemma4-e2b-awq-vllm028-20260911/vlm-eager-smoke.json` |
+| Metadata compatibility view | `.local/artifacts/models/gemma-4-e2b-it-awq-vllm028-compat/manifest.json` |
 | vLLM 0.28 full-12 manifest | `.local/results/v0101-forward-port/vllm-028-cosmos-fresh-20260911/manifest.json` |
 | Compact V3 comparison | `.local/results/v0101-forward-port/vllm-028-cosmos-fresh-20260911/vllm-028-v3-summary.csv` |
 | Per-workload vLLM aggregates | `.local/results/v0101-forward-port/vllm-028-cosmos-fresh-20260911/*-expandable/aggregate.json` |
@@ -128,13 +151,19 @@ lifetime pattern.
 
 ## Next steps
 
-1. Keep Cosmos as the cross-runtime performance control until a uniform-QKV Gemma checkpoint passes both complete
-   pipelines. Do not compare different Gemma quantizers as a runtime result.
-2. Select one uniform W4A16 Gemma candidate, audit every fused QKV group before downloading/building, and retain
-   only one checkpoint because current disk headroom cannot safely hold two complete Gemma engine lineages.
-3. Address Current's bimodal and vision-wave TTFT regressions using observable ready-state and service-scale signals,
+1. Keep this checkpoint and avoid a second Gemma download or requantization: the same weights now execute in both
+   runtimes. Promote the metadata transformation from scratch into a reproducible compatibility tool only if it is
+   needed for the retained benchmark workflow.
+2. Establish an equal input-ID, chat-template, output-length, eager/graph, KV-capacity, and image-preprocessing
+   contract before publishing a same-Gemma runtime comparison. Eager vLLM is currently a functionality baseline,
+   not a fair peak-performance baseline.
+3. Treat vLLM's compiled path as unsupported on this 10GB card for this checkpoint unless the generated Inductor
+   autotune block itself is changed. Disabling combo-kernel benchmarking and all exposed max-autotune flags, reducing
+   the compile range from 1,024 to 128 tokens, reducing BS4 to BS1, and reducing KV from 512 MiB to 256 MiB all
+   retained the same 4.38 GiB allocation failure. Further serving-contract reductions are not informative.
+4. Address Current's bimodal and vision-wave TTFT regressions using observable ready-state and service-scale signals,
    without workload names or fixed SLO constants.
-4. Add the vLLM allocator contract to future VLM manifests. A default-allocator OOM is not comparable with a
+5. Add the vLLM allocator contract to future VLM manifests. A default-allocator OOM is not comparable with a
    preallocated TensorRT runtime unless both usable KV capacity and allocator policy are disclosed.
-5. Repeat selected short, balanced, text-heavy, vision-heavy, and wave/drain points five times before promoting the
+6. Repeat selected short, balanced, text-heavy, vision-heavy, and wave/drain points five times before promoting the
    numbers to citable status.
