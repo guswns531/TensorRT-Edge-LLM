@@ -84,7 +84,7 @@ class PhaseServingRuntime
 public:
     static std::unique_ptr<PhaseServingRuntime> create(PhaseServingRuntimeConfig config,
         LLMEngineConfig const& engineConfig, std::unique_ptr<EngineExecutor> executor, SharedResources& resources,
-        EmbeddingData const& embedding, cudaStream_t setupStream,
+        EmbeddingData const& embedding, std::shared_ptr<Tensor const> pleTable, cudaStream_t setupStream,
         std::unique_ptr<MultimodalRunner> visionRunner = nullptr, tokenizer::Tokenizer const* tokenizer = nullptr);
 
     ~PhaseServingRuntime() noexcept;

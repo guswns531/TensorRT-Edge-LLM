@@ -26,6 +26,7 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/phase/cost/phaseRuntimeCostTracker.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
@@ -211,7 +212,8 @@ class PhaseServingRuntime::Impl
 public:
     Impl(PhaseServingRuntimeConfig servingConfig, LLMEngineConfig const& engineConfig,
         std::unique_ptr<EngineExecutor> executor, SharedResources& resources, EmbeddingData const& embedding,
-        cudaStream_t setupStream, std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer)
+        std::shared_ptr<Tensor const> pleTable, cudaStream_t setupStream,
+        std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer)
         : mServingConfig(std::move(servingConfig))
         , mEngineConfig(engineConfig)
         , mResources(resources)
@@ -225,7 +227,8 @@ public:
         ELLM_CHECK(!engineConfig.isSpecDecodeBase && !engineConfig.isDiffusionBackbone,
             "Phase serving supports vanilla autoregressive engines only");
         ELLM_CHECK(engineConfig.numLinearAttnLayers == 0, "Phase serving does not yet support recurrent layers");
-        ELLM_CHECK(!engineConfig.pleEnabled, "Phase serving does not yet support PLE inputs");
+        ELLM_CHECK(engineConfig.pleEnabled == (pleTable != nullptr),
+            "Phase serving Gemma4 PLE configuration and checkpoint table disagree");
         ELLM_CHECK(engineConfig.maxSupportedLoraRank == 0, "Phase serving does not yet support LoRA switching");
         ELLM_CHECK(mServingConfig.maxPrefillChunkTokens > 0, "Phase serving prefill chunk must be positive");
 
@@ -244,8 +247,7 @@ public:
         pairConfig.decodeStream = mDecodeStream;
         pairConfig.visionPrefillProfile = engineConfig.visionPrefillProfile;
         pairConfig.sharedExecutionContext = mServingConfig.sharedExecutionContext;
-        pairConfig.dedicatedExternalPrefillContext
-            = mVisionRunner != nullptr && engineConfig.packedPrefill && engineConfig.visionPrefillProfile < 0;
+        pairConfig.dedicatedExternalPrefillContext = mVisionRunner != nullptr && engineConfig.visionPrefillProfile < 0;
         mExecutors = IndependentEngineExecutorPair::create(std::move(executor), pairConfig);
         int32_t decodeBatchCapacity = engineConfig.maxSupportedDecodeBatchSize;
         size_t exclusiveEncoderInputTokenThreshold{};
@@ -317,6 +319,17 @@ public:
             PipelineIO::createForLLMPhase(engineConfig, decodeBatchCapacity, 1, setupStream));
         buildTensorMap(mPrefillMap, *mPrefillIO, resources, engineConfig, 0);
         buildTensorMap(mDecodeMap, *mDecodeIO, resources, engineConfig, 0);
+        if (engineConfig.pleEnabled)
+        {
+            int32_t const plePrefillBatch = engineConfig.packedPrefill ? 1 : engineConfig.maxSupportedPrefillBatchSize;
+            int32_t const plePrefillSequence = engineConfig.packedPrefill
+                ? engineConfig.maxSupportedPrefillBatchSize * prefillSequenceCapacity
+                : prefillSequenceCapacity;
+            mPrefillPle = std::make_unique<Gemma4EmbeddingPreprocessor>(
+                engineConfig, plePrefillBatch, plePrefillSequence, mPrefillMap, pleTable);
+            mDecodePle = std::make_unique<Gemma4EmbeddingPreprocessor>(
+                engineConfig, decodeBatchCapacity, 1, mDecodeMap, std::move(pleTable));
+        }
         if (!resources.externalWeightManager->validated())
         {
             resources.externalWeightManager->validateAgainstEngine(mExecutors->prefillExecutor(), "phase-base");
@@ -492,6 +505,11 @@ public:
         }
         CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
             static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        Gemma4EmbeddingPreprocessor* const ple = prefill ? mPrefillPle.get() : mDecodePle.get();
+        if (ple != nullptr)
+        {
+            ple->embed(deviceIds, stream);
+        }
 
         std::vector<Tensor> visionViews;
         std::vector<Tensor> deepstackViews;
@@ -662,6 +680,8 @@ public:
     std::unique_ptr<MultimodalRunner> mVisionRunner;
     std::unique_ptr<PipelineIO> mPrefillIO;
     std::unique_ptr<PipelineIO> mDecodeIO;
+    std::unique_ptr<Gemma4EmbeddingPreprocessor> mPrefillPle;
+    std::unique_ptr<Gemma4EmbeddingPreprocessor> mDecodePle;
     TensorMap mPrefillMap;
     TensorMap mDecodeMap;
     std::unique_ptr<StableKVPageManager> mOwnership;
@@ -687,11 +707,12 @@ public:
 
 std::unique_ptr<PhaseServingRuntime> PhaseServingRuntime::create(PhaseServingRuntimeConfig config,
     LLMEngineConfig const& engineConfig, std::unique_ptr<EngineExecutor> executor, SharedResources& resources,
-    EmbeddingData const& embedding, cudaStream_t setupStream, std::unique_ptr<MultimodalRunner> visionRunner,
-    tokenizer::Tokenizer const* tokenizer)
+    EmbeddingData const& embedding, std::shared_ptr<Tensor const> pleTable, cudaStream_t setupStream,
+    std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer)
 {
-    return std::unique_ptr<PhaseServingRuntime>(new PhaseServingRuntime(std::make_unique<Impl>(std::move(config),
-        engineConfig, std::move(executor), resources, embedding, setupStream, std::move(visionRunner), tokenizer)));
+    return std::unique_ptr<PhaseServingRuntime>(
+        new PhaseServingRuntime(std::make_unique<Impl>(std::move(config), engineConfig, std::move(executor), resources,
+            embedding, std::move(pleTable), setupStream, std::move(visionRunner), tokenizer)));
 }
 
 PhaseServingRuntime::PhaseServingRuntime(std::unique_ptr<Impl> impl)

@@ -29,42 +29,63 @@ namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+
+std::shared_ptr<Tensor const> loadPleTable(
+    std::filesystem::path const& engineDir, cudaStream_t stream, std::optional<Tensor> checkpointTable)
+{
+    if (checkpointTable.has_value())
+    {
+        return std::make_shared<Tensor>(std::move(*checkpointTable));
+    }
+
+    std::filesystem::path const plePath = engineDir / binding_names::kPleEmbeddingFileName;
+    std::vector<Tensor> pleTensors;
+    ELLM_CHECK(safetensors::loadSafetensors(plePath, pleTensors, stream),
+        "Failed to load " + std::string(binding_names::kPleEmbeddingFileName)
+            + " from model directory: " + engineDir.string());
+    ELLM_CHECK(pleTensors.size() == 1, "ple_embedding.safetensors must contain exactly one tensor named weight");
+    ELLM_CHECK(pleTensors[0].getName() == "weight", "ple_embedding.safetensors tensor must be named weight");
+    return std::make_shared<Tensor>(std::move(pleTensors[0]));
+}
+
+} // namespace
+
+std::shared_ptr<Tensor const> Gemma4EmbeddingPreprocessor::loadTable(
+    std::filesystem::path const& engineDir, cudaStream_t stream)
+{
+    return loadPleTable(engineDir, stream, std::nullopt);
+}
 
 Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path const& engineDir,
     LLMEngineConfig const& config, int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream,
     std::optional<Tensor> checkpointTable)
+    : Gemma4EmbeddingPreprocessor(
+          config, maxBatchSize, maxSeqLen, tensorMap, loadPleTable(engineDir, stream, std::move(checkpointTable)))
+{
+}
+
+Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(LLMEngineConfig const& config, int32_t maxBatchSize,
+    int32_t maxSeqLen, TensorMap& tensorMap, std::shared_ptr<Tensor const> checkpointTable)
     : mConfig(config)
+    , mPleTable(std::move(checkpointTable))
 {
     ELLM_CHECK(mConfig.pleEnabled, "Gemma4EmbeddingPreprocessor constructed while PLE is disabled");
     ELLM_CHECK(maxBatchSize > 0, "Gemma4EmbeddingPreprocessor requires positive max batch size");
     ELLM_CHECK(maxSeqLen > 0, "Gemma4EmbeddingPreprocessor requires positive max sequence length");
+    ELLM_CHECK(mPleTable != nullptr && !mPleTable->isEmpty(), "Gemma4 PLE table is unavailable");
 
-    if (checkpointTable.has_value())
-    {
-        mPleTable = std::move(*checkpointTable);
-    }
-    else
-    {
-        std::filesystem::path const plePath = engineDir / binding_names::kPleEmbeddingFileName;
-        std::vector<Tensor> pleTensors;
-        ELLM_CHECK(safetensors::loadSafetensors(plePath, pleTensors, stream),
-            "Failed to load " + std::string(binding_names::kPleEmbeddingFileName)
-                + " from model directory: " + engineDir.string());
-        ELLM_CHECK(pleTensors.size() == 1, "ple_embedding.safetensors must contain exactly one tensor named weight");
-        ELLM_CHECK(pleTensors[0].getName() == "weight", "ple_embedding.safetensors tensor must be named weight");
-        mPleTable = std::move(pleTensors[0]);
-    }
-
-    auto const pleShape = mPleTable.getShape();
+    auto const pleShape = mPleTable->getShape();
     ELLM_CHECK(pleShape.getNumDims() == 2, "PLE table must be 2D [vocab, num_layers * hidden]");
     ELLM_CHECK(pleShape[1] == static_cast<int64_t>(mConfig.numPleInputs) * mConfig.pleHiddenSize,
         "PLE table second dimension must equal num_ple_inputs * ple_hidden_size");
     ELLM_CHECK(
-        mPleTable.getDataType() == nvinfer1::DataType::kHALF || mPleTable.getDataType() == nvinfer1::DataType::kBF16,
+        mPleTable->getDataType() == nvinfer1::DataType::kHALF || mPleTable->getDataType() == nvinfer1::DataType::kBF16,
         "PLE table must be FP16 or BF16");
 
     mPleOutputBuffer = Tensor({mConfig.numPleInputs, maxBatchSize, maxSeqLen, mConfig.pleHiddenSize}, DeviceType::kGPU,
-        mPleTable.getDataType(), "Gemma4EmbeddingPreprocessor::mPleOutputBuffer");
+        mPleTable->getDataType(), "Gemma4EmbeddingPreprocessor::mPleOutputBuffer");
 
     mPleOutputViews.reserve(mConfig.numPleInputs);
     for (int32_t idx = 0; idx < mConfig.numPleInputs; ++idx)
@@ -74,7 +95,7 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
     }
 
     LOG_INFO("Initialized Gemma4 PLE preprocessor: table=%s outputBuffer=%s numPleInputs=%d pleHiddenSize=%d",
-        mPleTable.getShape().formatString().c_str(), mPleOutputBuffer.getShape().formatString().c_str(),
+        mPleTable->getShape().formatString().c_str(), mPleOutputBuffer.getShape().formatString().c_str(),
         mConfig.numPleInputs, mConfig.pleHiddenSize);
 }
 
@@ -88,11 +109,11 @@ Tensor Gemma4EmbeddingPreprocessor::makeOutputViewForLayer(int32_t layerIdx, int
     ELLM_CHECK(seqLen <= outputShape[2], "Gemma4 PLE sequence length exceeds buffer capacity");
 
     int64_t const layerOutputCapacityBytes = outputShape[1] * outputShape[2] * mConfig.pleHiddenSize
-        * static_cast<int64_t>(utils::getTypeSize(mPleTable.getDataType()));
+        * static_cast<int64_t>(utils::getTypeSize(mPleTable->getDataType()));
     void* const layerOutputPtr
         = static_cast<void*>(static_cast<char*>(mPleOutputBuffer.rawPointer()) + layerIdx * layerOutputCapacityBytes);
     return Tensor(layerOutputPtr, Coords{batchSize, seqLen, mConfig.pleHiddenSize}, DeviceType::kGPU,
-        mPleTable.getDataType(), binding_names::formatPleTokenEmbedsName(layerIdx));
+        mPleTable->getDataType(), binding_names::formatPleTokenEmbedsName(layerIdx));
 }
 
 void Gemma4EmbeddingPreprocessor::reshapeOutputs(int64_t batchSize, int64_t seqLen)
@@ -108,7 +129,7 @@ void Gemma4EmbeddingPreprocessor::embed(Tensor const& tokenIds, cudaStream_t str
     auto const tokenShape = tokenIds.getShape();
     ELLM_CHECK(tokenShape.getNumDims() == 2, "Gemma4 PLE token IDs must be [batch, seq_len]");
     reshapeOutputs(tokenShape[0], tokenShape[1]);
-    kernel::gemma4PleGather(tokenIds, mPleTable, mPleOutputBuffer, mConfig.numPleInputs, mConfig.pleHiddenSize,
+    kernel::gemma4PleGather(tokenIds, *mPleTable, mPleOutputBuffer, mConfig.numPleInputs, mConfig.pleHiddenSize,
         mConfig.imageTokenId, mConfig.audioTokenId, stream);
 }
 

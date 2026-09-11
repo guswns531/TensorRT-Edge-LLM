@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -40,9 +41,14 @@ namespace rt
 class Gemma4EmbeddingPreprocessor
 {
 public:
+    static std::shared_ptr<Tensor const> loadTable(std::filesystem::path const& engineDir, cudaStream_t stream);
+
     Gemma4EmbeddingPreprocessor(std::filesystem::path const& engineDir, LLMEngineConfig const& config,
         int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream,
         std::optional<Tensor> checkpointTable = std::nullopt);
+
+    Gemma4EmbeddingPreprocessor(LLMEngineConfig const& config, int32_t maxBatchSize, int32_t maxSeqLen,
+        TensorMap& tensorMap, std::shared_ptr<Tensor const> checkpointTable);
 
     //! Gather PLE tensors for the current token-id tensor shape.
     void embed(Tensor const& tokenIds, cudaStream_t stream);
@@ -50,9 +56,14 @@ public:
     //! Reshape already-bound output tensors for a CUDA-graph capture shape.
     void reshapeOutputs(int64_t batchSize, int64_t seqLen);
 
+    std::shared_ptr<Tensor const> shareTable() const noexcept
+    {
+        return mPleTable;
+    }
+
 private:
     LLMEngineConfig mConfig{};
-    Tensor mPleTable{};
+    std::shared_ptr<Tensor const> mPleTable;
     Tensor mPleOutputBuffer{}; //!< Unified owned backing buffer for all PLE layer outputs.
     //! Non-owned tensor views into mPleOutputBuffer. TensorMap stores pointers to these stable objects.
     std::vector<Tensor> mPleOutputViews{};

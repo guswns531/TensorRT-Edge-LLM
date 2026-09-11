@@ -395,8 +395,18 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         }
         ELLM_CHECK(multimodalEngineDir.empty() || mVisionRunner != nullptr,
             "Phase-only VLM construction could not load the requested visual engine.");
-        mPhaseServingRuntime = PhaseServingRuntime::create(*phaseServingConfig, mDeployment.base,
-            std::move(mBaseExecutor), *mSharedResources, mEmbedding, stream, std::move(mVisionRunner), mTokenizer);
+        std::shared_ptr<Tensor const> phasePleTable;
+        if (pleEmbedding.has_value())
+        {
+            phasePleTable = std::make_shared<Tensor>(std::move(*pleEmbedding));
+        }
+        else if (mDeployment.base.pleEnabled)
+        {
+            phasePleTable = Gemma4EmbeddingPreprocessor::loadTable(engineDir, stream);
+        }
+        mPhaseServingRuntime
+            = PhaseServingRuntime::create(*phaseServingConfig, mDeployment.base, std::move(mBaseExecutor),
+                *mSharedResources, mEmbedding, std::move(phasePleTable), stream, std::move(mVisionRunner), mTokenizer);
         LOG_INFO("Runtime initialized directly in asynchronous phase-serving mode.");
         return;
     }
@@ -1742,8 +1752,9 @@ void LLMRankRuntime::enablePhaseServing(PhaseServingRuntimeConfig const& config,
     mDecoderRegistry.reset();
     mDecodingRuntimeContext.reset();
     auto executor = std::move(mBaseExecutor);
+    std::shared_ptr<Tensor const> phasePleTable = mGemma4Ple != nullptr ? mGemma4Ple->shareTable() : nullptr;
     mPhaseServingRuntime = PhaseServingRuntime::create(config, mDeployment.base, std::move(executor), *mSharedResources,
-        mEmbedding, setupStream, std::move(mVisionRunner), mTokenizer);
+        mEmbedding, std::move(phasePleTable), setupStream, std::move(mVisionRunner), mTokenizer);
 
     mDeepstack.reset();
     mGemma4Ple.reset();
