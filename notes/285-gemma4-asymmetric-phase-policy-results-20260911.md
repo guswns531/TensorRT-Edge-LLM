@@ -20,7 +20,8 @@ The main result is workload-dependent but not workload-labelled policy behavior:
 - All 12 measured outputs per workload, across four policies and three repeats, are exact string matches.
 
 This is a validation campaign for a new model and a small engine, not a replacement for the retained 12-workload
-Cosmos campaign. A same-model vLLM comparison and larger Gemma profiles remain future work.
+Cosmos campaign. A same-model vLLM load check was attempted, but vLLM 0.27.1 rejects Gemma 4's heterogeneous
+per-layer head dimensions before loading weights. Larger Gemma profiles remain future work.
 
 ## Artifact contract
 
@@ -150,6 +151,20 @@ new memory plan. The KV pool is not the dominant new cost: increasing from 16 to
 stable owners, while the PLE table, embedding, model weights, TensorRT engine state, and three phase workspaces
 dominate residency.
 
+## vLLM compatibility control
+
+The retained `vllm/vllm-openai:v0.27.1` image was started with the same local checkpoint, FP16 activation dtype,
+2,048-token context, four maximum sequences, and 90% GPU-memory utilization. It failed before model-weight loading:
+
+```text
+AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute and may vary across layers
+```
+
+vLLM's model-architecture converter accesses one global `head_dim`; Gemma 4 exposes heterogeneous d256/d512 layer
+configuration. TensorRT-Edge-LLM's engine config and attention path already carry 35 per-layer KV/head descriptors.
+Consequently, there is no honest same-checkpoint vLLM number for this campaign. Substituting another model,
+quantization, or homogeneous-head configuration would change the contract and is intentionally not reported.
+
 ## Validation
 
 - LLM engine build: pass.
@@ -158,6 +173,7 @@ dominate residency.
 - Policy output identity: 12/12 for text and 12/12 for mixed.
 - Opt-in E/P/D/Copy activity CSV generation: pass.
 - Phase-serving peak-memory JSON fields: pass.
+- vLLM 0.27.1 same-checkpoint load: unsupported heterogeneous `head_dim` contract.
 - `unitTestRuntime`: 649 passed, 2 skipped.
 
 ## Interpretation and next steps
@@ -170,11 +186,10 @@ Next steps, in order:
 
 1. Add a text-tail protection that is derived from observed service scale rather than a Gemma-specific constant,
    then rerun these exact two traces.
-2. Run a same-checkpoint vLLM serving check. If the installed vLLM cannot load Gemma 4 AWQ, record the unsupported
-   contract rather than substituting a different model or quantization.
+2. Recheck a future vLLM release only after its model-architecture converter supports heterogeneous per-layer
+   `head_dim`; do not patch the config to pretend Gemma 4 is homogeneous.
 3. Build a controlled E1/E2 plus P2/D4 opportunity trace and measure requested versus realized overlap.
 4. Expand the request count and output length while keeping the four-slot engine fixed, so steady-state D4 rather
    than startup dominates.
 5. Only after the 972 MiB budget is rebalanced, test P4/D8 or more KV pages. Packed prefill remains unavailable until
    the d256/d512 Gemma attention path is implemented.
-
