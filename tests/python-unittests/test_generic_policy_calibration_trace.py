@@ -47,3 +47,22 @@ def test_generic_trace_is_fixed_and_optionally_covers_vision() -> None:
             part.get("type") == "image_url"
             for part in request["messages"][0]["content"])
         for request in vision_requests) == [1, 1, 1, 1, 1, 1, 1]
+
+
+def test_generic_trace_respects_engine_batch_capabilities() -> None:
+    trace = GENERIC_TRACE.build_trace("file:///image.png",
+                                      cycles=4,
+                                      cycle_interval_us=120_000,
+                                      max_prefill_batch=2,
+                                      max_decode_batch=4,
+                                      max_encoder_batch=2,
+                                      prefill_tokens=768)
+
+    classes = [request["request_class"] for request in trace["requests"]]
+    assert classes.count("generic_resident_decode") == 8
+    assert classes.count("generic_prefill") == 12
+    assert classes.count("generic_vision") == 12
+    prefill = [request for request in trace["requests"]
+               if request["request_class"] == "generic_prefill"]
+    assert all(len(request["messages"][0]["content"]) < 7680
+               for request in prefill)

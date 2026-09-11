@@ -61,14 +61,31 @@ def _vision_request(image_url: str, output_tokens: int, arrival_us: int,
     }
 
 
-def build_trace(image_url: str | None, cycles: int,
-                cycle_interval_us: int) -> dict[str, Any]:
+def _coverage_rows(limit: int, legacy_rows: tuple[int, ...]) -> tuple[int, ...]:
+    if limit <= 0:
+        raise ValueError("phase batch capacities must be positive")
+    values = [value for value in legacy_rows if value <= limit]
+    values.append(limit)
+    return tuple(dict.fromkeys(values))
+
+
+def build_trace(image_url: str | None,
+                cycles: int,
+                cycle_interval_us: int,
+                max_prefill_batch: int = 8,
+                max_decode_batch: int = 64,
+                max_encoder_batch: int = 4,
+                prefill_tokens: int = 1024) -> dict[str, Any]:
     """Return a fixed action-coverage trace independent of measured traffic."""
     requests: list[dict[str, Any]] = []
     # Cover both latency-oriented refill cohorts and throughput-oriented
     # cohorts without deriving the sequence from a measured workload. Keep D8
     # first so a one-cycle smoke trace retains its established request count.
-    decode_rows = (8, 1, 2, 4, 16, 32, 64)
+    if prefill_tokens <= 0:
+        raise ValueError("prefill tokens must be positive")
+    decode_rows = _coverage_rows(max_decode_batch, (8, 1, 2, 4, 16, 32, 64))
+    prefill_rows = _coverage_rows(max_prefill_batch, (1, 4, 8))
+    encoder_rows = _coverage_rows(max_encoder_batch, (1, 2, 4))
     phase_offsets = (
         {
             "decode": 0,
@@ -102,13 +119,13 @@ def build_trace(image_url: str | None, cycles: int,
             for _ in range(decode_rows[cycle % len(decode_rows)]))
         # Rotate phase order across cycles so both incumbent directions are
         # observable without replaying the workload under measurement.
-        for wave, rows in enumerate((1, 4, 8)):
+        for wave, rows in enumerate(prefill_rows):
             requests.extend(
-                _text_request(1024, 8, base + offsets["prefill"] +
+                _text_request(prefill_tokens, 8, base + offsets["prefill"] +
                               wave * 5_000, "generic_prefill")
                 for _ in range(rows))
         if image_url is not None:
-            for wave, rows in enumerate((1, 2, 4)):
+            for wave, rows in enumerate(encoder_rows):
                 requests.extend(
                     _vision_request(image_url, 16, base + offsets["encoder"] +
                                     wave * 8_000, "generic_vision")
@@ -129,10 +146,17 @@ def main() -> int:
     parser.add_argument("--image-url")
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--cycle-interval-us", type=int, default=1_000_000)
+    parser.add_argument("--max-prefill-batch", type=int, default=8)
+    parser.add_argument("--max-decode-batch", type=int, default=64)
+    parser.add_argument("--max-encoder-batch", type=int, default=4)
+    parser.add_argument("--prefill-tokens", type=int, default=1024)
     args = parser.parse_args()
     if args.cycles <= 0 or args.cycle_interval_us <= 0:
         parser.error("cycles and cycle interval must be positive")
-    trace = build_trace(args.image_url, args.cycles, args.cycle_interval_us)
+    trace = build_trace(args.image_url, args.cycles,
+                        args.cycle_interval_us, args.max_prefill_batch,
+                        args.max_decode_batch, args.max_encoder_batch,
+                        args.prefill_tokens)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(trace, indent=2) + "\n",
                            encoding="utf-8")
