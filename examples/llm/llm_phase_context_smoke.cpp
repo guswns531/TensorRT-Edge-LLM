@@ -26,6 +26,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/phase/policy/phasePolicyMode.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseAsyncServer.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
@@ -757,7 +758,7 @@ int main(int argc, char** argv)
         pairConfig.visionPrefillProfile = config.visionPrefillProfile;
         pairConfig.dedicatedExternalPrefillContext
             = std::getenv("TRT_EDGELLM_DEDICATED_EXTERNAL_PREFILL_CONTEXT") != nullptr
-            || (visionEngineDir != nullptr && config.packedPrefill && config.visionPrefillProfile < 0);
+            || (visionEngineDir != nullptr && config.visionPrefillProfile < 0);
         pairConfig.setupStream = setupStream;
         pairConfig.prefillStream = prefillStream;
         pairConfig.decodeStream = decodeStream;
@@ -828,6 +829,21 @@ int main(int argc, char** argv)
         rt::TensorMap decodeMap;
         rt::buildTensorMap(prefillMap, *prefillIO, *resources, phaseConfig, 0);
         rt::buildTensorMap(decodeMap, *decodeIO, *resources, phaseConfig, 0);
+        std::unique_ptr<rt::Gemma4EmbeddingPreprocessor> prefillPle;
+        std::unique_ptr<rt::Gemma4EmbeddingPreprocessor> decodePle;
+        if (config.pleEnabled)
+        {
+            std::shared_ptr<rt::Tensor const> pleTable
+                = rt::Gemma4EmbeddingPreprocessor::loadTable(engineDir, setupStream);
+            int32_t const plePrefillBatch = config.packedPrefill ? 1 : config.maxSupportedPrefillBatchSize;
+            int32_t const plePrefillSequence = config.packedPrefill
+                ? config.maxSupportedPrefillBatchSize * prefillSequenceCapacity
+                : prefillSequenceCapacity;
+            prefillPle = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
+                config, plePrefillBatch, plePrefillSequence, prefillMap, pleTable);
+            decodePle = std::make_unique<rt::Gemma4EmbeddingPreprocessor>(
+                config, decodeBatchCapacity, 1, decodeMap, std::move(pleTable));
+        }
         // The shared zero binding covers decode rows, not packed prefill tokens.
         for (size_t index{}; index < prefillIO->deepstackEmbeds.size(); ++index)
         {
@@ -903,6 +919,19 @@ int main(int argc, char** argv)
                 prefillIO->inputsEmbeds.rawPointer(), 0, prefillIO->inputsEmbeds.getMemoryCapacity(), prefillStream));
             CUDA_CHECK(cudaMemsetAsync(
                 decodeIO->inputsEmbeds.rawPointer(), 0, decodeIO->inputsEmbeds.getMemoryCapacity(), decodeStream));
+            if (prefillPle != nullptr)
+            {
+                rt::Tensor prefillPleIds(
+                    {1, prefillTotalTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "prefill_ple_ids");
+                rt::Tensor decodePleIds({controlledDecodeBatchSize, 1}, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kINT32, "decode_ple_ids");
+                CUDA_CHECK(cudaMemsetAsync(
+                    prefillPleIds.rawPointer(), 0, prefillPleIds.getMemoryCapacity(), prefillStream));
+                CUDA_CHECK(
+                    cudaMemsetAsync(decodePleIds.rawPointer(), 0, decodePleIds.getMemoryCapacity(), decodeStream));
+                prefillPle->embed(prefillPleIds, prefillStream);
+                decodePle->embed(decodePleIds, decodeStream);
+            }
             for (rt::Tensor& deepstack : prefillIO->deepstackEmbeds)
             {
                 CUDA_CHECK(cudaMemsetAsync(deepstack.rawPointer(), 0, deepstack.getMemoryCapacity(), prefillStream));
@@ -1593,6 +1622,11 @@ int main(int argc, char** argv)
             {
                 embeddingPreprocessor.embed(*stagedIds, visionEmbedding, std::nullopt, io, stream);
                 embeddingPreprocessor.prepareDeepstack(*stagedIds, deepstackFeatures, io, stream);
+            }
+            rt::Gemma4EmbeddingPreprocessor* const ple = prefill ? prefillPle.get() : decodePle.get();
+            if (ple != nullptr)
+            {
+                ple->embed(*stagedIds, stream);
             }
             if (prefill)
             {

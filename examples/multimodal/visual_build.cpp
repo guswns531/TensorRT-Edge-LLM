@@ -24,6 +24,7 @@
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <string>
 
 using namespace trt_edgellm;
@@ -50,6 +51,7 @@ struct ViTBuildArgs
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
     int64_t maxImageTokensPerImage{512};
+    bool maxImageTokensPerImageExplicit{false};
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
 };
 
@@ -69,7 +71,9 @@ void printUsage(char const* programName)
     std::cerr << "  --debug              Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --minImageTokens     Minimum image tokens. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens     Maximum image tokens. Default = 1024" << std::endl;
-    std::cerr << "  --maxImageTokensPerImage     Maximum image tokens per image. Default = 512" << std::endl;
+    std::cerr << "  --maxImageTokensPerImage     Maximum image tokens per image. Default = 512; Gemma4 uses the "
+                 "model default when omitted"
+              << std::endl;
     std::cerr << "  --profilingDetailed  Enable detailed profiling verbosity to include ONNX op names. "
                  "Use for DLSim analysis."
               << std::endl;
@@ -131,6 +135,7 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
             if (optarg)
             {
                 args.maxImageTokensPerImage = std::stoi(optarg);
+                args.maxImageTokensPerImageExplicit = true;
             }
             break;
         case VLMBuildOptionId::PROFILING_DETAILED: args.profilingDetailed = true; break;
@@ -171,6 +176,20 @@ int main(int argc, char** argv)
     {
         LOG_ERROR("config.json not found in onnx directory: %s", args.onnxDir.c_str());
         return EXIT_FAILURE;
+    }
+
+    if (!args.maxImageTokensPerImageExplicit)
+    {
+        nlohmann::json modelConfig;
+        configFile >> modelConfig;
+        if (modelConfig.value("model_type", std::string{}) == "gemma4_vision"
+            && modelConfig.contains("vision_config") && modelConfig["vision_config"].is_object())
+        {
+            auto const& visionConfig = modelConfig["vision_config"];
+            args.maxImageTokensPerImage
+                = visionConfig.value("default_output_length", args.maxImageTokensPerImage);
+            LOG_INFO("Using Gemma4 model default maxImageTokensPerImage=%ld", args.maxImageTokensPerImage);
+        }
     }
     configFile.close();
 
