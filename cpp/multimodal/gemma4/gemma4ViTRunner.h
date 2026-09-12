@@ -69,6 +69,12 @@ public:
 
     bool allocateBuffer(cudaStream_t stream) override;
 
+    MultimodalOutputSpec getOutputEmbeddingSpec() const override;
+    bool releaseInternalOutputStorage() override;
+
+    bool bindExternalOutputStorage(
+        rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
+
 private:
     struct ImageGrid
     {
@@ -110,6 +116,7 @@ private:
     rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
     rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
     rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
+    Coords mOutputEmbeddingShape{};      //!< Active output shape when request-owned storage is bound
 
     bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 instead of ViTAttentionPlugin
     bool mHasMaxSeqLenCarrier{false}; //!< Whether the visual engine has max_seqlen_carrier binding

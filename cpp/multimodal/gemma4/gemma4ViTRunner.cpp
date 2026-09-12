@@ -246,6 +246,7 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
 
     mOutputEmbedding = rt::Tensor({mConfig.maxImageTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "Gemma4ViTRunner::mOutputEmbedding");
+    mOutputEmbeddingShape = mOutputEmbedding.getShape();
     setTensorAddressStatus
         &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
 
@@ -374,7 +375,11 @@ void Gemma4ViTRunner::imagePreprocessTokenLengthsOnly(
 
     if (totalSoftTokens > 0)
     {
-        check::check(mOutputEmbedding.reshape({totalSoftTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+        mOutputEmbeddingShape = {totalSoftTokens, mConfig.outHiddenSize};
+        if (!mOutputEmbedding.isEmpty())
+        {
+            check::check(mOutputEmbedding.reshape(mOutputEmbeddingShape), "Tensor reshape failed");
+        }
     }
 }
 
@@ -435,7 +440,11 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     check::check(mPixelPositionIdsHost.reshape({totalPatches, 2}), "Tensor reshape failed");
     check::check(mRotaryPosEmb.reshape({totalPatches, mConfig.rotaryPosEmbDim}), "Tensor reshape failed");
     check::check(mCuSeqlens.reshape({cuSeqlensSize}), "Tensor reshape failed");
-    check::check(mOutputEmbedding.reshape({totalSoftTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    mOutputEmbeddingShape = {totalSoftTokens, mConfig.outHiddenSize};
+    if (!mOutputEmbedding.isEmpty())
+    {
+        check::check(mOutputEmbedding.reshape(mOutputEmbeddingShape), "Tensor reshape failed");
+    }
     check::check(mPoolingWeights.reshape({totalSoftTokens, totalPatches}), "Tensor reshape failed");
     if (mHasMaxSeqLenCarrier)
     {
@@ -645,6 +654,34 @@ bool Gemma4ViTRunner::infer(cudaStream_t stream) noexcept
     }
 
     return true;
+}
+
+MultimodalOutputSpec Gemma4ViTRunner::getOutputEmbeddingSpec() const
+{
+    ELLM_CHECK(mOutputEmbeddingShape.getNumDims() > 0, "Gemma4 vision output shape is not available");
+    return {mOutputEmbeddingShape, nvinfer1::DataType::kHALF};
+}
+
+bool Gemma4ViTRunner::releaseInternalOutputStorage()
+{
+    mOutputEmbedding = rt::Tensor{};
+    return true;
+}
+
+bool Gemma4ViTRunner::bindExternalOutputStorage(
+    rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures)
+{
+    check::check(
+        outputEmbedding.getDeviceType() == rt::DeviceType::kGPU, "External vision output storage must be a GPU tensor");
+    check::check(outputEmbedding.getDataType() == nvinfer1::DataType::kHALF,
+        "External vision output storage has the wrong data type");
+    check::check(
+        outputEmbedding.getShape() == mOutputEmbeddingShape, "External vision output storage has the wrong shape");
+    if (!deepstackFeatures.empty())
+    {
+        return false;
+    }
+    return mVisualContext->setTensorAddress(binding_names::kVisualOutput, outputEmbedding.rawPointer());
 }
 
 } // namespace rt
