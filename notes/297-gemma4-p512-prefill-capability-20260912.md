@@ -122,6 +122,27 @@ Compared with the P128/P128 control, P512/P512 changes:
 The P256 point is not a useful compromise on this trace. It is 8.77% slower
 than P128 and regresses most request-level latency metrics.
 
+## Frozen vLLM capacity control
+
+The request traces and vLLM serving contract are unchanged, so this campaign
+reuses the selected seq24/KV480/P4096/sparse-graph vLLM result instead of
+rerunning it. This is a contextual comparison rather than a P512 policy
+ablation because vLLM does not expose the same TensorRT profile contract.
+
+| Workload | Runtime | Tok/s | TTFT mean/p95 (ms) | TPOT mean/p95 (ms) | E2E mean/p95 (ms) | Peak MiB |
+|---|---|---:|---:|---:|---:|---:|
+| long-prefill | P512 Exact | 496.79 | 1,817.27 / 2,620.59 | 21.29 / 23.92 | 3,594.57 / 5,218.96 | 9,245 |
+| long-prefill | vLLM | 500.26 | 543.92 / 1,442.01 | 36.37 / 44.60 | 3,554.56 / 5,866.97 | 8,841 |
+| multi-image | P512 Exact | 234.09 | 896.26 / 1,719.99 | 11.50 / 16.79 | 1,220.87 / 1,981.50 | 9,735 |
+| multi-image | vLLM | 381.34 | 188.86 / 227.16 | 29.70 / 35.54 | 1,109.61 / 1,300.30 | 8,843 |
+
+P512 nearly reaches vLLM long-prefill throughput (-0.69%), has 41.47% lower
+mean TPOT, and has 11.05% lower E2E p95, but its TTFT remains much higher. On
+multi-image it remains 38.61% behind vLLM throughput and has substantially
+higher TTFT and tail E2E despite much lower TPOT. Wider text prefill therefore
+addresses the long-prefill throughput gap but does not solve the vision
+first-token critical path.
+
 ## Correctness and memory-copy observations
 
 Every retained run generated the complete requested token count. Multi-image
