@@ -997,6 +997,68 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
     }
 }
 
+void TestRopeQOnlyPackedToDense(int32_t headDim, int32_t rotaryDim)
+{
+    cudaStream_t stream{nullptr};
+    int32_t constexpr batchSize = 3;
+    int32_t constexpr numQHeads = 2;
+    int32_t constexpr denseSeqLen = 5;
+    int32_t constexpr totalTokens = 10;
+    int32_t constexpr maxPosition = 32;
+    std::vector<int32_t> const cuQSeqLens{0, 3, 8, 10};
+    std::vector<int32_t> const kvEndLens{7, 20, 2};
+
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, maxPosition, rotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, rotaryDim, maxPosition, stream);
+
+    std::vector<half> packedInput(static_cast<size_t>(totalTokens) * numQHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    std::vector<half> reference(static_cast<size_t>(batchSize) * denseSeqLen * numQHeads * headDim, __float2half(0.0F));
+    for (int32_t batch{}; batch < batchSize; ++batch)
+    {
+        int32_t const rowLen = cuQSeqLens[batch + 1] - cuQSeqLens[batch];
+        int32_t const positionBegin = kvEndLens[batch] - rowLen;
+        for (int32_t row{}; row < rowLen; ++row)
+        {
+            size_t const packedOffset = static_cast<size_t>(cuQSeqLens[batch] + row) * numQHeads * headDim;
+            std::vector<half> token(
+                packedInput.begin() + packedOffset, packedInput.begin() + packedOffset + numQHeads * headDim);
+            std::vector<half> const roped
+                = ropeRef(token, numQHeads, headDim, rotaryDim, positionBegin + row, 1.0F, 10000.0F, true);
+            size_t const denseOffset = (static_cast<size_t>(batch) * denseSeqLen + row) * numQHeads * headDim;
+            std::copy(roped.begin(), roped.end(), reference.begin() + denseOffset);
+        }
+    }
+
+    rt::Tensor packedQ({1, totalTokens, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor denseQ({batchSize, denseSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kvEndLensTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(packedQ, packedInput);
+    copyHostToDevice(denseQ, std::vector<half>(reference.size(), __float2half(0.0F)));
+    copyHostToDevice(kvEndLensTensor, kvEndLens);
+    copyHostToDevice(cuQSeqLensTensor, cuQSeqLens);
+
+    launchApplyRopeQOnlyPackedToDense(cosSinCacheTensor, kvEndLensTensor, packedQ, denseQ, cuQSeqLensTensor, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<half> const output = copyDeviceToHost<half>(denseQ);
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t index{}; index < output.size(); ++index)
+    {
+        ASSERT_TRUE(isclose(output[index], reference[index], 1e-3, 1e-3)) << "Mismatch at element " << index;
+    }
+}
+
+TEST(RopeQOnlyPackedToDense, Gemma4HeadDimensionsAndRaggedRows)
+{
+    TestRopeQOnlyPackedToDense(256, 64);
+    TestRopeQOnlyPackedToDense(512, 128);
+}
+
 TEST(RopePackedFusedNorm, Accuracy)
 {
     // Power-of-2 lane count baseline (headDim=128 -> 16 lanes, no ghosts); odd seq len for

@@ -429,6 +429,8 @@ class AttentionPluginRunner:
                  enable_kv_shared: int = 0,
                  enable_context_mask_selector: bool = False,
                  enable_vision_block_attention: bool = False,
+                 enable_packed_prefill: bool = False,
+                 packed_prefill_max_chunk_tokens: int = 128,
                  expect_unsupported: bool = False,
                  shuffle_pages: bool = False):
         self.p = p
@@ -439,6 +441,8 @@ class AttentionPluginRunner:
         self.attention_scale = attention_scale
         self.kv_shared = enable_kv_shared
         self.context_mask_selector = enable_context_mask_selector
+        self.packed_prefill = enable_packed_prefill
+        self.packed_prefill_max_chunk_tokens = packed_prefill_max_chunk_tokens
         self.expect_unsupported = expect_unsupported
         # shuffle_pages: give each slot non-contiguous physical pages so the
         # page table stops being identity -- proves the kernel follows it.
@@ -474,9 +478,16 @@ class AttentionPluginRunner:
         # Channel width is fixed by the mode: Q-only (q_hidden) for shared-KV
         # engines, the full packed width otherwise.
         qkv_c = qh if self.kv_shared else p.qkv_hidden_size
+        qkv_profile = ((1, 1, qkv_c), (1, p.batch_size * p.seq_len, qkv_c),
+                       (1, mb * ms,
+                        qkv_c)) if self.packed_prefill else ((1, 1, qkv_c),
+                                                             (p.batch_size,
+                                                              p.seq_len,
+                                                              qkv_c), (mb, ms,
+                                                                       qkv_c))
         profiles = {
             "qkv":
-            ((1, 1, qkv_c), (p.batch_size, p.seq_len, qkv_c), (mb, ms, qkv_c)),
+            qkv_profile,
             "kv_cache": (pool_shape, pool_shape, pool_shape),
             "context_lengths": ((1, ), (p.batch_size, ), (mb, )),
             "rope_cos_sin": ((1, mpe, D), (1, mpe, D), (1, mpe, D)),
@@ -536,6 +547,9 @@ class AttentionPluginRunner:
             pf_int32("enable_context_mask_selector",
                      int(self.context_mask_selector)),
             pf_int32("enable_fp8_kv_cache", int(p.enable_fp8_kv_cache)),
+            pf_int32("enable_packed_prefill", int(self.packed_prefill)),
+            pf_int32("packed_prefill_max_chunk_tokens",
+                     self.packed_prefill_max_chunk_tokens),
             pf_int32("sliding_window_size", p.sliding_window_size),
         ]
         if p.enable_fp8_kv_cache:
@@ -2656,6 +2670,71 @@ def _assert_cache_untouched(name: str, before: "torch.Tensor",
 # supported. FP16 head 512 runs native-paged common FMHA on SM100/101/110 and
 # native-paged FMHA-v2 on the remaining CuTe DSL targets. Nsight route
 # validation separately excludes the gather fallback.
+@pytest.mark.parametrize("head_size,sliding_window", [
+    pytest.param(256, 1024, id="gemma4-sliding-d256"),
+    pytest.param(512, -1, id="gemma4-global-d512"),
+])
+def test_gemma4_packed_prefill_owned_and_shared_kv(head_size, sliding_window):
+    """Packed logical rows match dense Gemma4 own-KV and donor-KV paths."""
+    cfg = dict(BASE)
+    cfg.update(head_size=head_size,
+               num_q_heads=8,
+               num_kv_heads=1,
+               sliding_window_size=sliding_window,
+               kv_cache_capacity=128,
+               max_batch_size=4,
+               max_seq_len=16,
+               max_position_embeddings=128)
+    p = AttentionParams(batch_size=3, seq_len=8, is_prefill=True, **cfg)
+    gen = torch.Generator().manual_seed(2380 + head_size)
+    _, _, rope = _make_rope(p, gen)
+    qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV).to(torch.float16)
+    contexts = torch.full((p.batch_size, ),
+                          p.seq_len,
+                          dtype=torch.int32,
+                          device=DEV)
+    starts = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    _, _, dense_kv = _empty_caches(p)
+    _, _, packed_kv = _empty_caches(p)
+    dense = AttentionPluginRunner(p)
+    packed = AttentionPluginRunner(p,
+                                   enable_packed_prefill=True,
+                                   packed_prefill_max_chunk_tokens=16)
+    dense_out, dense_kv = dense.run(qkv.clone(),
+                                    dense_kv,
+                                    contexts,
+                                    rope,
+                                    starts,
+                                    input_shapes={"kv_cache_indices": (0, )})
+    packed_out, packed_kv = packed.run(qkv.reshape(1, -1, p.qkv_hidden_size),
+                                       packed_kv, contexts, rope, starts)
+    assert_close("gemma4-packed-owned-output", dense_out,
+                 packed_out.reshape_as(dense_out))
+    assert_close("gemma4-packed-owned-cache", dense_kv, packed_kv)
+
+    q_only = torch.randn((p.batch_size, p.seq_len, p.q_hidden),
+                         generator=gen,
+                         dtype=torch.float32).to(DEV).to(torch.float16)
+    dense_shared = AttentionPluginRunner(p, enable_kv_shared=1)
+    packed_shared = AttentionPluginRunner(p,
+                                          enable_kv_shared=1,
+                                          enable_packed_prefill=True,
+                                          packed_prefill_max_chunk_tokens=16)
+    dense_before = dense_kv.clone()
+    packed_before = packed_kv.clone()
+    dense_shared_out, dense_kv = dense_shared.run(q_only.clone(), dense_kv,
+                                                  contexts, rope, starts)
+    packed_shared_out, packed_kv = packed_shared.run(
+        q_only.reshape(1, -1, p.q_hidden), packed_kv, contexts, rope, starts)
+    assert_close("gemma4-packed-shared-output", dense_shared_out,
+                 packed_shared_out.reshape_as(dense_shared_out))
+    _assert_cache_untouched("gemma4-packed-dense-shared", dense_before,
+                            dense_kv)
+    _assert_cache_untouched("gemma4-packed-shared", packed_before, packed_kv)
+
+
 @pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [
     pytest.param(128, 8, 4, -1, id="head128_q8_kv4"),
     pytest.param(256, 16, 8, -1, id="head256_q16_kv8"),

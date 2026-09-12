@@ -1131,6 +1131,80 @@ void launchApplyRopeQOnly(
         totalNumTokens, numQHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
 }
 
+template <typename T>
+__global__ void applyRopeQOnlyPackedToDenseKernel(T const* __restrict__ packedQ, T* __restrict__ denseQ,
+    float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
+    int32_t const* __restrict__ cuQSeqLens, int32_t totalNumTokens, int32_t logicalBatchSize, int32_t denseSeqLen,
+    uint32_t numQHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
+{
+    uint32_t const tokenIdx = blockIdx.x * blockDim.y + threadIdx.y;
+    if (tokenIdx >= static_cast<uint32_t>(totalNumTokens))
+    {
+        return;
+    }
+
+    int32_t batchIdx{};
+    while (batchIdx + 1 < logicalBatchSize && tokenIdx >= static_cast<uint32_t>(cuQSeqLens[batchIdx + 1]))
+    {
+        ++batchIdx;
+    }
+    int32_t const row = static_cast<int32_t>(tokenIdx) - cuQSeqLens[batchIdx];
+    int32_t const rowLen = cuQSeqLens[batchIdx + 1] - cuQSeqLens[batchIdx];
+    int32_t const position = kvCacheEndLens[batchIdx] - rowLen + row;
+
+    uint32_t const sinOffset = rotaryDim / 2;
+    uint32_t const cosOffset = (threadIdx.x * DVec<float>::vec_size) % (rotaryDim / 2);
+    int32_t const ropeBatch = cosSinCacheBatchSize == 1 ? 0 : batchIdx;
+    int64_t const ropeOffset = static_cast<int64_t>(ropeBatch) * cosSinCacheSeqLen * rotaryDim + position * rotaryDim;
+    DVec<float> cosVec;
+    DVec<float> sinVec;
+    cosVec.load(cosSinCache + ropeOffset + cosOffset);
+    sinVec.load(cosSinCache + ropeOffset + cosOffset + sinOffset);
+
+    uint32_t const head = blockIdx.y;
+    int64_t const packedOffset = (static_cast<int64_t>(tokenIdx) * numQHead + head) * headDim;
+    int64_t const denseOffset = ((static_cast<int64_t>(batchIdx) * denseSeqLen + row) * numQHead + head) * headDim;
+    DVec<T> qRoped = vecApplyRopeNonInterleave(packedQ + packedOffset, cosVec, sinVec, rotaryDim);
+    qRoped.store(denseQ + denseOffset + DVec<T>::vec_size * threadIdx.x);
+}
+
+void launchApplyRopeQOnlyPackedToDense(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
+    rt::Tensor const& packedQ, rt::Tensor& denseQ, rt::Tensor const& cuQSeqLens, cudaStream_t stream)
+{
+    constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
+    constexpr uint32_t kTHREADS_PER_CTA = 128;
+    check::check(
+        packedQ.getDataType() == nvinfer1::DataType::kHALF && denseQ.getDataType() == nvinfer1::DataType::kHALF,
+        "Packed and dense Q tensors must be FP16.");
+    check::check(packedQ.getShape().getNumDims() == 4 && packedQ.getShape()[0] == 1
+            && denseQ.getShape().getNumDims() == 4 && packedQ.getShape()[2] == denseQ.getShape()[2]
+            && packedQ.getShape()[3] == denseQ.getShape()[3],
+        "Packed and dense Q tensor shapes are incompatible.");
+    int32_t const logicalBatchSize = static_cast<int32_t>(denseQ.getShape()[0]);
+    check::check(cuQSeqLens.getDataType() == nvinfer1::DataType::kINT32 && cuQSeqLens.getShape().getNumDims() == 1
+            && cuQSeqLens.getShape()[0] == logicalBatchSize + 1,
+        "Packed Q cumulative sequence lengths must have shape [logicalBatch+1].");
+    check::check(kvCacheEndLens.getDataType() == nvinfer1::DataType::kINT32
+            && kvCacheEndLens.getShape().getNumDims() == 1 && kvCacheEndLens.getShape()[0] == logicalBatchSize,
+        "Packed Q KV end lengths must have shape [logicalBatch].");
+
+    int32_t const totalNumTokens = static_cast<int32_t>(packedQ.getShape()[1]);
+    uint32_t const numQHeads = static_cast<uint32_t>(packedQ.getShape()[2]);
+    uint32_t const headDim = static_cast<uint32_t>(packedQ.getShape()[3]);
+    uint32_t const rotaryDim = static_cast<uint32_t>(cosSinCache.getShape()[2]);
+    uint32_t const tokensPerCTA = kTHREADS_PER_CTA * kVEC_SIZE / headDim;
+    check::check(tokensPerCTA > 0 && headDim % kVEC_SIZE == 0,
+        "Packed Q head dimension is incompatible with the vectorized RoPE kernel.");
+
+    dim3 const grid((totalNumTokens + tokensPerCTA - 1) / tokensPerCTA, numQHeads);
+    dim3 const block(headDim / kVEC_SIZE, tokensPerCTA);
+    applyRopeQOnlyPackedToDenseKernel<half><<<grid, block, 0, stream>>>(packedQ.dataPointer<half>(),
+        denseQ.dataPointer<half>(), cosSinCache.dataPointer<float>(), kvCacheEndLens.dataPointer<int32_t>(),
+        cuQSeqLens.dataPointer<int32_t>(), totalNumTokens, logicalBatchSize, static_cast<int32_t>(denseQ.getShape()[1]),
+        numQHeads, headDim, rotaryDim, static_cast<int32_t>(cosSinCache.getShape()[0]),
+        static_cast<int32_t>(cosSinCache.getShape()[1]));
+}
+
 // =============================================================================
 // Q-only RoPE kernel for shared-KV layers with tree decoding (per-token position IDs)
 // =============================================================================

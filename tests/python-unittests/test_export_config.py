@@ -50,6 +50,9 @@ _ATTENTION_TRANSLATION_PATH = os.path.normpath(
 _ATTENTION_SCHEMA_PATH = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "onnx",
                  "onnx_custom_schemas.py"))
+_GEMMA4_TEXT_MODEL_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "models", "gemma4",
+                 "modeling_gemma4_text.py"))
 
 
 def _load_source():
@@ -125,6 +128,15 @@ def test_packed_prefill_attention_attributes_are_wired_end_to_end():
             source = source_file.read()
         assert "enable_packed_prefill" in source
         assert "packed_prefill_max_chunk_tokens" in source
+
+
+def test_gemma4_packed_prefill_contract_is_wired_end_to_end():
+    with open(_GEMMA4_TEXT_MODEL_PATH, "r", encoding="utf-8") as source_file:
+        source = source_file.read()
+    assert "packed_prefill_chunk_limit=packed_prefill_chunk_limit" in source
+    assert '"enable_packed_prefill": int(self.enable_packed_prefill)' in source
+    assert 'input_names = input_names + ["packed_prefill_chunk_limit"]' in source
+    assert "packed_prefill=config.packed_prefill" in source
 
 
 # ---------------------------------------------------------------------------

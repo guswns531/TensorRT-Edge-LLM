@@ -880,7 +880,11 @@ LLMEngineConfig parseEngineConfig(
         ELLM_CHECK(!cfg.isSpecDecodeBase && !cfg.isDiffusionBackbone,
             "packed_prefill v1 supports vanilla autoregressive engines only.");
         ELLM_CHECK(cfg.numLinearAttnLayers == 0, "packed_prefill v1 does not support recurrent layers.");
-        ELLM_CHECK(cfg.headDim == 128, "packed_prefill v1 requires attention head dimension 128.");
+        ELLM_CHECK(std::all_of(cfg.kvLayerConfigs.begin(), cfg.kvLayerConfigs.end(),
+                       [](KVLayerConfig const& layer) {
+                           return layer.headDim == 128 || layer.headDim == 256 || layer.headDim == 512;
+                       }),
+            "packed_prefill requires every attention layer head dimension to be 128, 256, or 512.");
         ELLM_CHECK(cfg.kvCacheDtype == nvinfer1::DataType::kHALF, "packed_prefill v1 requires FP16 KV cache.");
         ELLM_CHECK(cfg.maxPackedPrefillChunkTokens > 0
                 && cfg.maxPackedPrefillChunkTokens <= exportedPackedPrefillChunkTokens

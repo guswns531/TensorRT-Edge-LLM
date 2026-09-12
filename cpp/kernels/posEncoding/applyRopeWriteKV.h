@@ -124,6 +124,13 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 void launchApplyRopeQOnly(
     rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream);
 
+//! Apply RoPE to `[1, totalTokens, Hq, D]` Q and scatter logical rows into dense Q.
+//!
+//! `cuQSeqLens` maps the packed token carrier to `denseQ` shaped
+//! `[logicalBatch, maxRowTokens, Hq, D]`. The caller must zero dense padding.
+void launchApplyRopeQOnlyPackedToDense(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
+    rt::Tensor const& packedQ, rt::Tensor& denseQ, rt::Tensor const& cuQSeqLens, cudaStream_t stream);
+
 //! @brief Launch kernel to apply RoPE to Q only, using per-token position IDs (tree decoding).
 //!
 //! For shared-KV layers during tree/speculative decoding, each candidate token has its own

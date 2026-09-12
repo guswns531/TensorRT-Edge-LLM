@@ -575,12 +575,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
-    ELLM_CHECK(!mEnablePackedPrefill || (!mEnableTreeAttention && !mEnableVisionBlockAttention && !mEnableKVShared),
-        "Packed prefill v1 requires owned KV and is mutually exclusive with tree and vision-block attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || (!mEnableTreeAttention && !mEnableVisionBlockAttention),
+        "Packed prefill is mutually exclusive with tree and vision-block attention.");
     ELLM_CHECK(!mEnablePackedPrefill || !mEnableFp8KVCache, "Packed prefill v1 requires an FP16 KV cache.");
-    ELLM_CHECK(!mEnablePackedPrefill || mHeadSize == 128, "Packed prefill v1 supports head size 128 only.");
-    ELLM_CHECK(!mEnablePackedPrefill || mSlidingWindowSize <= 0,
-        "Packed prefill v1 does not support sliding-window attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || (mHeadSize == 128 || mHeadSize == 256 || mHeadSize == 512),
+        "Packed prefill supports head sizes 128, 256, and 512.");
     ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
         "Packed prefill maximum chunk length must be positive.");
     ELLM_CHECK(!mEnableProfileLocalPackedPrefill || mEnablePackedPrefill,
@@ -684,12 +683,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
 
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
-    ELLM_CHECK(!mEnablePackedPrefill || (!mEnableTreeAttention && !mEnableVisionBlockAttention && !mEnableKVShared),
-        "Packed prefill v1 requires owned KV and is mutually exclusive with tree and vision-block attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || (!mEnableTreeAttention && !mEnableVisionBlockAttention),
+        "Packed prefill is mutually exclusive with tree and vision-block attention.");
     ELLM_CHECK(!mEnablePackedPrefill || !mEnableFp8KVCache, "Packed prefill v1 requires an FP16 KV cache.");
-    ELLM_CHECK(!mEnablePackedPrefill || mHeadSize == 128, "Packed prefill v1 supports head size 128 only.");
-    ELLM_CHECK(!mEnablePackedPrefill || mSlidingWindowSize <= 0,
-        "Packed prefill v1 does not support sliding-window attention.");
+    ELLM_CHECK(!mEnablePackedPrefill || (mHeadSize == 128 || mHeadSize == 256 || mHeadSize == 512),
+        "Packed prefill supports head sizes 128, 256, and 512.");
     ELLM_CHECK(!mEnablePackedPrefill || mPackedPrefillMaxChunkTokens > 0,
         "Packed prefill maximum chunk length must be positive.");
     ELLM_CHECK(!mEnableProfileLocalPackedPrefill || mEnablePackedPrefill,
@@ -1356,7 +1354,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     int32_t const combinedHeads = sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads);
 
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
-    bool const packedPrefill = mEnablePackedPrefill && physicalBatchSize == 1 && runtimeSeqLen > 1 && !sharedKV;
+    bool const packedPrefill = mEnablePackedPrefill && physicalBatchSize == 1 && runtimeSeqLen > 1;
     int32_t const runtimeBatchSize
         = packedPrefill ? static_cast<int32_t>(contextLengthInputDesc.dims.d[0]) : physicalBatchSize;
     int32_t packedPrefillChunkLimit = mPackedPrefillMaxChunkTokens;
@@ -1785,15 +1783,33 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         // --- Shared KV prefill: Q gets RoPE, K/V read from donor layer's cache ---
         if (sharedKV)
         {
-            // Shared-KV: RoPE Q in-place only; the donor layer's cache is already populated.
-            qInputTensor = aliasPackedAsQInput();
-            if (useExplicitPositionIds)
+            int32_t const denseSeqLen
+                = packedPrefill ? std::min(runtimeSeqLen, packedPrefillChunkLimit) : runtimeSeqLen;
+            rt::Tensor denseAttentionOutput;
+            void* fmhaOutput = attentionOutputTensor.rawPointer();
+            if (packedPrefill)
             {
-                kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                qInputTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, denseSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                denseAttentionOutput = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, denseSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                CUDA_CHECK(cudaMemsetAsync(qInputTensor.rawPointer(), 0, qInputTensor.getMemoryCapacity(), stream));
+                kernel::launchApplyRopeQOnlyPackedToDense(
+                    ropeCosSinTensor, kvCacheEndIdxsTensor, packedQKVTensor, qInputTensor, cuQSeqLensTensor, stream);
+                fmhaOutput = denseAttentionOutput.rawPointer();
             }
             else
             {
-                kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+                qInputTensor = aliasPackedAsQInput();
+                if (useExplicitPositionIds)
+                {
+                    kernel::launchApplyRopeQOnlyTreeDecoding(
+                        ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                }
+                else
+                {
+                    kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+                }
             }
 
             // Run FMHA reading from the donor's KV cache (bound to this layer's KV cache input).
@@ -1810,11 +1826,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     ? cuKVSeqLensTensor.dataPointer<int32_t>()
                     : paddedCuKVSeqLensTensor.dataPointer<int32_t>();
                 CuteDslFMHARunner runner(
-                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, denseSeqLen, kvCacheCapacity);
                 if (!runner.runPaged(qInputTensor.dataPointer<half>(), // Q  [b, s_q, h_q, d]
-                        kvCacheTensor.rawPointer(),                // paged KV pool [2, numPages, 128, h_k, d] (donor)
-                        pageTable,                                 // page table [b, 2, maxPagesPerSeq]
-                        attentionOutputTensor.dataPointer<half>(), // O  [b, s_q, h_q, d]
+                        kvCacheTensor.rawPointer(), // paged KV pool [2, numPages, 128, h_k, d] (donor)
+                        pageTable,                  // page table [b, 2, maxPagesPerSeq]
+                        fmhaOutput,                 // O  [b, s_q, h_q, d]
                         fmhaCuKVSeqLens, 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
                         kvCacheTensor.getDataType(), stream, mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F,
                         kScale, vScale, !usePaddingContextMask, skipSoftmaxThresholdLog2))
@@ -1837,9 +1853,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         runtimeBatchSize, runtimeSeqLen, kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize);
                     // Non-padding shared-KV prefill routes to native-paged FMHA-v2.
                     CuteDslFMHAV2Runner runner(
-                        mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                        mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, denseSeqLen, kvCacheCapacity);
                     if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
-                            attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
+                            fmhaOutput, cuQSeqLensTensor.dataPointer<int32_t>(),
                             cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq,
                             rt::kTOKENS_PER_PAGE, stream, mAttentionScale, slidingWindow))
                     {
@@ -1871,6 +1887,10 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     "AttentionPlugin: selected shared-KV prefill kernel is unavailable (paddingMask=%d, D=%d, SM=%d).",
                     usePaddingContextMask ? 1 : 0, mHeadSize, mSMVersion);
                 return -1;
+            }
+            if (packedPrefill)
+            {
+                kernel::gatherDenseRowsToPacked(denseAttentionOutput, cuQSeqLensTensor, attentionOutputTensor, stream);
             }
             return 0;
         }

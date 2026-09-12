@@ -218,7 +218,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                               use_dual_rope: bool = False,
                               eagle_base: bool = False,
                               vision_block_attention: bool = False,
-                              emit_hidden_states: bool = False) -> nn.Module:
+                              emit_hidden_states: bool = False,
+                              packed_prefill: bool = False) -> nn.Module:
     """Build a Gemma4 export wrapper with explicit PLE/RoPE tensor inputs."""
     has_hidden_output = eagle_base or emit_hidden_states
 
@@ -240,6 +241,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
         param_names += ["vision_block_ids"]
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
+    if packed_prefill:
+        param_names += ["packed_prefill_chunk_limit"]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
@@ -252,6 +255,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                     if eagle_base else "")
     vision_kwargs = (", vision_block_ids=vision_block_ids"
                      if vision_block_attention else "")
+    packed_kwargs = (", packed_prefill_chunk_limit=packed_prefill_chunk_limit"
+                     if packed_prefill else "")
     if use_dual_rope:
         rope_arg = "None"
         rope_kwargs = (
@@ -267,7 +272,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids"
-            f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
+            f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs}"
+            f"{packed_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
@@ -275,7 +281,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                 f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
                 f"context_lengths, kvcache_start_index, kv_page_table, "
                 f"last_token_ids"
-                f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
+                f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs}"
+                f"{packed_kwargs})\n"
                 f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -404,6 +411,9 @@ class Gemma4Attention(Attention):
         self.head_dim = _head_dim_for_attention_type(config,
                                                      self.attention_type)
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_packed_prefill = bool(config.packed_prefill)
+        self.packed_prefill_max_chunk_tokens = int(
+            config.packed_prefill_max_chunk_tokens)
         hidden_size = int(config.hidden_size)
         qkv_in_features = int(in_features or hidden_size)
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -488,6 +498,7 @@ class Gemma4Attention(Attention):
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
         context_mask_selector: torch.Tensor | None = None,
+        packed_prefill_chunk_limit: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -543,6 +554,9 @@ class Gemma4Attention(Attention):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": context_mask_selector is not None,
             "enable_vision_block_attention": enable_vision_block,
+            "enable_packed_prefill": int(self.enable_packed_prefill),
+            "packed_prefill_max_chunk_tokens":
+            self.packed_prefill_max_chunk_tokens,
             "skip_softmax_scale_factor": 0.0,
         }
         if context_mask_selector is not None:
@@ -554,6 +568,8 @@ class Gemma4Attention(Attention):
             # AttentionPlugin input slot 7 is shared with the tree mask.  The
             # static plugin attribute selects its [B,S] block-ID semantics.
             kwargs["attention_mask"] = vision_block_ids
+        if packed_prefill_chunk_limit is not None and self.enable_packed_prefill:
+            kwargs["packed_prefill_chunk_limit"] = packed_prefill_chunk_limit
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
@@ -1207,6 +1223,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         context_mask_selector: torch.Tensor | None = None,
         per_layer_input: torch.Tensor | None = None,
         phase_is_encoder: torch.Tensor | None = None,
+        packed_prefill_chunk_limit: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1221,6 +1238,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,
             context_mask_selector=context_mask_selector,
+            packed_prefill_chunk_limit=packed_prefill_chunk_limit,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -1384,6 +1402,7 @@ class Gemma4Transformer(nn.Module):
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
+        packed_prefill_chunk_limit: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Tuple, Tuple | None]:
         hidden_states = inputs_embeds
         projected_per_layer_inputs = self._project_per_layer_inputs(
@@ -1418,6 +1437,7 @@ class Gemma4Transformer(nn.Module):
                 context_mask_selector=context_mask_selector,
                 per_layer_input=per_layer_input,
                 phase_is_encoder=phase_is_encoder,
+                packed_prefill_chunk_limit=packed_prefill_chunk_limit,
             )
             present_key_values_list.append(next_key_value)
 
@@ -1572,6 +1592,9 @@ class Gemma4ForCausalLM(CausalLM):
                                      1,
                                      dtype=torch.int64,
                                      device=device)
+        packed_prefill_chunk_limit = torch.zeros(1,
+                                                 dtype=torch.int8,
+                                                 device=device)
 
         args = args + (context_lengths, kvcache_start_index, kv_page_table,
                        last_token_ids)
@@ -1593,6 +1616,8 @@ class Gemma4ForCausalLM(CausalLM):
                             [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
+        token_batch = (torch.export.Dim("token_batch", min=1, max=256)
+                       if config.packed_prefill else batch)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
@@ -1601,11 +1626,11 @@ class Gemma4ForCausalLM(CausalLM):
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
-        num_selected = torch.export.Dim(
-            "num_selected", min=1, max=256) if tree_attention_base else None
-        all_shapes: list = [{0: batch, 1: seq}]
+        num_selected = (torch.export.Dim("num_selected", min=1, max=256) if
+                        tree_attention_base or config.packed_prefill else None)
+        all_shapes: list = [{0: token_batch, 1: seq}]
         for _ in range(num_ple_inputs):
-            all_shapes.append({0: batch, 1: seq})
+            all_shapes.append({0: token_batch, 1: seq})
         for _ in range(Na):
             all_shapes.append({1:
                                num_pages})  # past_key_values_i (pool-shaped)
@@ -1615,12 +1640,12 @@ class Gemma4ForCausalLM(CausalLM):
         all_shapes.append({0: batch})
         all_shapes.append({0: kv_batch})
         all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
-        if tree_attention_base:
-            all_shapes.append({0: batch, 1: num_selected})
+        if tree_attention_base or config.packed_prefill:
+            all_shapes.append({0: token_batch, 1: num_selected})
         else:
             all_shapes.append({0: batch})
         if vision_block_attention:
-            all_shapes.append({0: batch, 1: seq})
+            all_shapes.append({0: token_batch, 1: seq})
         if tree_attention_base:
             attention_pos_id = torch.zeros(batch_size,
                                            seq_len,
@@ -1641,6 +1666,13 @@ class Gemma4ForCausalLM(CausalLM):
             all_shapes.append({0: batch, 1: eagle_seq})
             all_shapes.append({0: batch, 1: eagle_seq, 2: mask_kv_len})
 
+        if config.packed_prefill:
+            packed_chunk_dim = torch.export.Dim(
+                "packed_prefill_chunk_limit_len", min=1, max=32768)
+            args = args + (packed_prefill_chunk_limit, )
+            input_names = input_names + ["packed_prefill_chunk_limit"]
+            all_shapes.append({0: packed_chunk_dim})
+
         wrapped = _make_gemma4_flat_wrapper(
             self,
             Na,
@@ -1649,7 +1681,8 @@ class Gemma4ForCausalLM(CausalLM):
             eagle_base=tree_attention_base,
             vision_block_attention=vision_block_attention,
             emit_hidden_states=(self.emit_hidden_states
-                                or config.gemma4_mtp_base))
+                                or config.gemma4_mtp_base),
+            packed_prefill=config.packed_prefill)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1673,6 +1706,7 @@ class Gemma4ForCausalLM(CausalLM):
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
+        packed_prefill_chunk_limit: torch.Tensor | None = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         gemma4_mtp_base = self.config.gemma4_mtp_base
@@ -1708,6 +1742,7 @@ class Gemma4ForCausalLM(CausalLM):
             ple_token_embeds=ple_token_embeds,
             rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,
             rope_rotary_cos_sin_full=rope_rotary_cos_sin_full,
+            packed_prefill_chunk_limit=packed_prefill_chunk_limit,
         )
         target_hidden_concat = getattr(self.model, "target_hidden_concat",
                                        None)

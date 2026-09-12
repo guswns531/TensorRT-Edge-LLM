@@ -266,6 +266,27 @@ TEST_F(LLMEngineConfigTest, RejectsUnsupportedPackedPrefillHeadDimension)
     EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
 }
 
+TEST_F(LLMEngineConfigTest, ParsesPackedPrefillWithGemma4HeadDimensions)
+{
+    Json json = makeMinimalConfig();
+    json["head_dim"] = 256;
+    json["global_head_dim"] = 512;
+    json["layer_types"] = Json::array();
+    for (int32_t layer{}; layer < 12; ++layer)
+    {
+        json["layer_types"].push_back(layer % 5 == 4 ? "full_attention" : "sliding_attention");
+    }
+    json["packed_prefill"] = true;
+    json["packed_prefill_max_chunk_tokens"] = 128;
+    json["builder_config"]["max_prefill_chunk_tokens"] = 128;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const config = parseEngineConfig(path);
+    ASSERT_EQ(config.kvLayerConfigs.size(), 12);
+    EXPECT_EQ(config.kvLayerConfigs[0].headDim, 256);
+    EXPECT_EQ(config.kvLayerConfigs[4].headDim, 512);
+}
+
 TEST_F(LLMEngineConfigTest, ParseEagleBaseConditioningMetadata)
 {
     Json json = makeMinimalConfig();
