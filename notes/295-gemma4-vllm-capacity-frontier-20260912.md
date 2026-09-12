@@ -47,7 +47,7 @@ the remaining architectural gap; they are not citable confidence-interval result
 | Prefill | fixed 128-token chunks, packed P8 | chunked, 4,096-token iteration budget |
 | Decode | D24, independent TensorRT context | continuous batching through 24 |
 | Vision | independent E4 context | eager encoder in the unified vLLM engine |
-| Decode graphs | TensorRT/CUDA Graph runtime path | sizes 1/2/4/8/16/24 |
+| Decode graphs | online phase capture disabled; zero captures/hits | sizes 1/2/4/8/16/24 |
 | Policy | V3 Service-scaled Transition, generic 49-request calibration | vLLM V1 scheduler |
 | Prefix reuse | disabled for this comparison | disabled |
 
@@ -181,11 +181,14 @@ KV; it primarily reflects the cost of packed V3's independent TensorRT E/P/D con
    service, not decode batching or KV capacity.
 3. Prioritize vision admission/E formation and long-prefill first-token progress. Multi-image and vision-heavy lose
    35.8--49.1% throughput even though their post-first-token TPOT is much lower.
-4. Preserve P4096 as a vLLM comparison setting only, not as a new TensorRT policy constant. It is a vLLM iteration
+4. The packed V3 logs report zero P/D graph entries, captures, and hits. CUDA Graph is therefore a separate
+   unclaimed opportunity, not part of the measured Current result. Prior graph-on campaigns showed small aggregate
+   gains and workload-specific tail regressions, so replay coverage and tails must be gated before promotion.
+5. Preserve P4096 as a vLLM comparison setting only, not as a new TensorRT policy constant. It is a vLLM iteration
    token budget and has no direct equivalence to TensorRT's 128-token packed chunks.
-5. Repeat the selected full-12 at least three times before a citable comparison. Preserve request-class TTFT/TPOT,
+6. Repeat the selected full-12 at least three times before a citable comparison. Preserve request-class TTFT/TPOT,
    memory, and prompt-token totals in addition to aggregate throughput.
-6. Add exact output capture or a framework-neutral token validation pass before claiming semantic parity.
+7. Add exact output capture or a framework-neutral token validation pass before claiming semantic parity.
 
 ## Retained artifacts
 
