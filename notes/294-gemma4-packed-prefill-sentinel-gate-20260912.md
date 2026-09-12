@@ -116,6 +116,11 @@ capacity change, so it is an architectural-frontier measurement rather than a pu
 
 ## External references
 
+> **Superseded capacity comparison:** the frozen vLLM numbers below retain `max_num_seqs=8` and must not be used as
+> the final comparator for the later 24-in-flight traces. The corrected vLLM capacity sweep, full twelve-workload
+> result, and revised conclusions are in
+> [note 295](295-gemma4-vllm-capacity-frontier-20260912.md).
+
 The frozen equal-24 vLLM result uses the same model, request traces, fixed output lengths, and client-side maximum of
 24, so token throughput remains a useful external reference. Its internal sequence cap is 8 and it uses a different
 engine/runtime. It was not rerun because that contract did not change.
