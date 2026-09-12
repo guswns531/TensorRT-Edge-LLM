@@ -198,9 +198,12 @@ ownership state.
 | encoder arbiter policy | mechanism-only E executor; the global scheduler chooses E-now, prepared-E, E+D, or event-backed WAIT |
 | fixed generic calibration shape/count | capability-scaled coverage that stops when confidence/authority gates are met |
 
-`maxOverlapPrefillTokens=128` is intentionally deferred. The current Gemma engine uses 128-token dense chunks and
-the prior Cosmos winner also used 128, so changing this while expanding concurrency would confound two dimensions.
-It remains an acknowledged performance heuristic/compiled-granularity coupling, not a solved item.
+`maxOverlapPrefillTokens=128` is intentionally deferred, but it must not be described as working Gemma chunked
+prefill. The current Gemma engine reports `packedPrefill=false`, `maxPackedPrefillChunk=0`, and
+`supportsChunkedPrefill=false`. A dense row therefore submits its complete prompt, up to the compiled 1,024-token
+input limit. The value 128 only limits overlap eligibility and related scheduler accounting on this path. The prior
+Cosmos winner used an actual packed/chunked path, so enabling that mechanism for Gemma is a separate engine/runtime
+change rather than a policy-constant sweep.
 
 ### No-explicit-SLO active-capacity controller
 
@@ -262,4 +265,3 @@ or winning every instantaneous TPOT sample.
 | D64 build-only engine | `.local/artifacts/v0101-forward-port/gemma-4-e2b-it-awq/engine-asym-p4-d64-kv2048-p128-soft280` |
 | P8 build-only engine | `.local/artifacts/v0101-forward-port/gemma-4-e2b-it-awq/engine-asym-p8-d16-kv2048-p64-soft280` |
 | E8 engine | `.local/artifacts/v0101-forward-port/gemma-4-e2b-it-awq/visual-e8-soft280` |
-
