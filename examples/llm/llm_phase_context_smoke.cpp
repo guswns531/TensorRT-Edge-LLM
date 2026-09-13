@@ -923,10 +923,10 @@ int main(int argc, char** argv)
             {
                 rt::Tensor prefillPleIds(
                     {1, prefillTotalTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "prefill_ple_ids");
-                rt::Tensor decodePleIds({controlledDecodeBatchSize, 1}, rt::DeviceType::kGPU,
-                    nvinfer1::DataType::kINT32, "decode_ple_ids");
-                CUDA_CHECK(cudaMemsetAsync(
-                    prefillPleIds.rawPointer(), 0, prefillPleIds.getMemoryCapacity(), prefillStream));
+                rt::Tensor decodePleIds(
+                    {controlledDecodeBatchSize, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "decode_ple_ids");
+                CUDA_CHECK(
+                    cudaMemsetAsync(prefillPleIds.rawPointer(), 0, prefillPleIds.getMemoryCapacity(), prefillStream));
                 CUDA_CHECK(
                     cudaMemsetAsync(decodePleIds.rawPointer(), 0, decodePleIds.getMemoryCapacity(), decodeStream));
                 prefillPle->embed(prefillPleIds, prefillStream);
@@ -1874,7 +1874,9 @@ int main(int argc, char** argv)
             serverConfig.maxDecodeGraphs = static_cast<size_t>(std::stoul(value));
         }
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
-        serverConfig.allowChunkedVisionPrefill = config.packedPrefill && !config.hasVisionPrefillProfile();
+        serverConfig.allowChunkedVisionPrefill = config.packedPrefill
+            && (!config.hasVisionPrefillProfile()
+                || config.maxVisionPackedPrefillChunkTokens <= config.maxPackedPrefillChunkTokens);
         serverConfig.releaseVisionPrefillStorage = std::getenv("TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE") != nullptr;
         serverConfig.maxPendingRequests = 1024;
         serverConfig.enableGlobalWaitActions
