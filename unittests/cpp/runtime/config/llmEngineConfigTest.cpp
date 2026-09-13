@@ -199,6 +199,36 @@ TEST_F(LLMEngineConfigTest, ParsesDedicatedVisionPrefillProfileAndDims)
     EXPECT_THROW(config.visionPackedPrefillDims(5, 1024, 1024), std::runtime_error);
 }
 
+TEST_F(LLMEngineConfigTest, SelectsNarrowCompatibleAuxiliaryPackedPrefillProfile)
+{
+    LLMEngineConfig config;
+    config.packedPrefill = true;
+    config.maxSupportedPrefillBatchSize = 8;
+    config.maxPackedPrefillChunkTokens = 512;
+    config.visionPrefillProfile = 2;
+    config.maxSupportedVisionPrefillBatchSize = 8;
+    config.maxVisionPackedPrefillChunkTokens = 128;
+    EXPECT_TRUE(config.prefersAuxiliaryPackedPrefillProfile(1, 1));
+    EXPECT_TRUE(config.prefersAuxiliaryPackedPrefillProfile(8, 128));
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(9, 128));
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 129));
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(0, 128));
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 0));
+    EXPECT_EQ(config.visionPackedPrefillDims(8, 1024, 128).attnMaskSeqLen, 128);
+    EXPECT_EQ(config.packedPrefillDims(8, 4096, 512).attnMaskSeqLen, 512);
+
+    config.maxVisionPackedPrefillChunkTokens = 512;
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 128));
+    config.maxVisionPackedPrefillChunkTokens = 1024;
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 128));
+    config.maxVisionPackedPrefillChunkTokens = 128;
+    config.visionPrefillProfile = -1;
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 128));
+    config.visionPrefillProfile = 2;
+    config.packedPrefill = false;
+    EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 128));
+}
+
 TEST_F(LLMEngineConfigTest, RejectsProfileLocalPackedPrefillChunkLimitsWithoutCarrier)
 {
     Json json = makeMinimalConfig();

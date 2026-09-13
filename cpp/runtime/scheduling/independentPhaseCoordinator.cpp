@@ -190,13 +190,6 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
                    [prefillClass](PhaseWorkItem const& item) { return item.prefillClass == prefillClass; }),
         "Independent prefill batch cannot mix producer classes");
     bool const externalPrefill = prefillClass == PhasePrefillClass::kExternal;
-    ELLM_CHECK(!externalPrefill || mExecutors.hasExternalPrefillExecutor(),
-        "External prefill requires a dedicated serialized TensorRT execution context");
-    int32_t const profileIndex
-        = externalPrefill ? mExecutors.externalPrefillProfile() : mExecutors.config().prefillProfile;
-    ELLM_CHECK(profileIndex >= 0, "Selected prefill profile is not configured");
-    EngineExecutor& executor = externalPrefill ? mExecutors.externalPrefillExecutor() : mExecutors.prefillExecutor();
-
     std::vector<int32_t> slots;
     std::vector<int32_t> chunks;
     int32_t totalTokens{};
@@ -210,6 +203,20 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
     mPrefillKV.prepare(slots, stream);
     int32_t const chunkLength = chunks.front();
     int32_t const maxRowTokens = *std::max_element(chunks.begin(), chunks.end());
+    bool const auxiliaryProfileFits = mConfig.hasVisionPrefillProfile()
+        && static_cast<int64_t>(batch.size()) <= mConfig.maxSupportedVisionPrefillBatchSize
+        && maxRowTokens <= mConfig.maxVisionPackedPrefillChunkTokens;
+    bool const auxiliaryPrefill = auxiliaryProfileFits
+        && (externalPrefill
+            || (mExecutors.hasExternalPrefillExecutor()
+                && mConfig.prefersAuxiliaryPackedPrefillProfile(static_cast<int64_t>(batch.size()), maxRowTokens)));
+    bool const useExternalExecutor = externalPrefill || auxiliaryPrefill;
+    ELLM_CHECK(!useExternalExecutor || mExecutors.hasExternalPrefillExecutor(),
+        "Auxiliary prefill requires a dedicated serialized TensorRT execution context");
+    int32_t const profileIndex = auxiliaryPrefill ? mConfig.visionPrefillProfile : mExecutors.config().prefillProfile;
+    ELLM_CHECK(profileIndex >= 0, "Selected prefill profile is not configured");
+    EngineExecutor& executor
+        = useExternalExecutor ? mExecutors.externalPrefillExecutor() : mExecutors.prefillExecutor();
     if (!mConfig.packedPrefill)
     {
         ELLM_CHECK(
@@ -233,7 +240,7 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
     bool const initialPrefill
         = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
     InferenceDims const dims = mConfig.packedPrefill
-        ? (externalPrefill && mConfig.hasVisionPrefillProfile()
+        ? (auxiliaryPrefill && mConfig.hasVisionPrefillProfile()
                   ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens)
                   : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens))
         : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);

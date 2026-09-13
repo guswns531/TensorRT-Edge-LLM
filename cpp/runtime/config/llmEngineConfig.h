@@ -262,8 +262,11 @@ struct LLMEngineConfig
     //! context lengths, page-table rows, and KV starts retain logicalBatch rows.
     InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
 
-    //! Packed external-producer prefill dims, using the optional wider profile.
+    //! Packed prefill dims using the optional auxiliary profile's limits.
     InferenceDims visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
+
+    //! Whether a compatible auxiliary profile has a smaller maximum token carrier than the primary profile.
+    bool prefersAuxiliaryPackedPrefillProfile(int64_t logicalBatch, int64_t maxRowTokens) const noexcept;
 
     bool hasVisionPrefillProfile() const noexcept
     {

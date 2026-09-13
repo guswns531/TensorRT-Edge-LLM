@@ -1198,6 +1198,22 @@ InferenceDims LLMEngineConfig::visionPackedPrefillDims(
         logicalBatch, totalTokens, maxRowTokens, maxSupportedVisionPrefillBatchSize, maxVisionPackedPrefillChunkTokens);
 }
 
+bool LLMEngineConfig::prefersAuxiliaryPackedPrefillProfile(int64_t logicalBatch, int64_t maxRowTokens) const noexcept
+{
+    if (!packedPrefill || !hasVisionPrefillProfile() || logicalBatch <= 0
+        || logicalBatch > maxSupportedVisionPrefillBatchSize || maxRowTokens <= 0
+        || maxRowTokens > maxVisionPackedPrefillChunkTokens)
+    {
+        return false;
+    }
+    int64_t const primaryBatchLimit
+        = maxSupportedPrefillBatchSize > 0 ? maxSupportedPrefillBatchSize : maxSupportedBatchSize;
+    int64_t const primaryCarrier = primaryBatchLimit * maxPackedPrefillChunkTokens;
+    int64_t const auxiliaryCarrier
+        = static_cast<int64_t>(maxSupportedVisionPrefillBatchSize) * maxVisionPackedPrefillChunkTokens;
+    return auxiliaryCarrier < primaryCarrier;
+}
+
 InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(
     int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const
 {
