@@ -393,5 +393,37 @@ TEST(PhaseFormationPlannerTest, RejectsACompletionThatViolatesTheRequestDag)
     EXPECT_FALSE(phaseFormationEvaluateCompletionBoundaries(std::move(requests), std::move(completions)).feasible);
 }
 
+TEST(PhaseFormationPlannerTest, ProjectsEncoderCohortThroughOneSuccessorDecodeBoundary)
+{
+    std::vector<PhaseFormationRequestState> requests{
+        {1U, PhaseFormationRequestStage::kEncoderReady, 2U, 100U, 2048U},
+        {2U, PhaseFormationRequestStage::kEncoderReady, 1U, 200U, 4096U},
+        {7U, PhaseFormationRequestStage::kDecodeReady, 2U, 0U, 8192U},
+    };
+
+    PhaseEncoderTransitionPreview const result
+        = phaseFormationPreviewEncoderTransition(std::move(requests), {1U, 2U}, {7U}, 4.0, 3.0, 2.0, 0.5, 0.25, 0.125);
+
+    ASSERT_TRUE(result.feasible);
+    EXPECT_EQ(result.encoderRows, 2U);
+    EXPECT_EQ(result.existingDecodeRows, 1U);
+    EXPECT_EQ(result.successorDecodeRows, 3U);
+    EXPECT_DOUBLE_EQ(result.prefillReadyUs, 4.0);
+    EXPECT_DOUBLE_EQ(result.decodeReadyUs, 7.0);
+    EXPECT_DOUBLE_EQ(result.decodeCompleteUs, 9.0);
+    EXPECT_DOUBLE_EQ(result.uncertaintyUs, 0.875);
+    EXPECT_EQ(result.releasedVisionBytes, 300U);
+    EXPECT_EQ(result.releasedKvBytes, 4096U);
+}
+
+TEST(PhaseFormationPlannerTest, RejectsUnknownExistingDecodeOwner)
+{
+    std::vector<PhaseFormationRequestState> requests{
+        {1U, PhaseFormationRequestStage::kEncoderReady, 2U, 100U, 2048U},
+    };
+
+    EXPECT_FALSE(phaseFormationPreviewEncoderTransition(std::move(requests), {1U}, {9U}, 4.0, 3.0, 2.0).feasible);
+}
+
 } // namespace
 } // namespace trt_edgellm::rt

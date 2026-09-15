@@ -38,8 +38,9 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
   comparison and must record both commits, binaries, engines, and runtime contracts separately.
 - Use the root `.local/` as the shared artifact store. Do not create nested `.local/` directories in linked
   worktrees. New data belongs under `artifacts/`, `baselines/`, `builds/`, `results/`, `cache/`, `scratch/`, or
-  `registry/`; `.local/current/` contains stable pointers to the active model, ONNX, engines, build, baseline, and
-  result root.
+  `registry/`. Protect each live model lineage under `.local/current/<model-family>/`; `.local/current/active`
+  identifies the default lineage. Legacy flat pointers may remain for compatibility but are not the complete
+  cleanup protection set.
 - Result states are `scratch`, `diagnostic`, `validation`, and `citable`. Every retained campaign must have a
   manifest with its command/config, source commit and dirty state, binary and engine identity, workload, repeat
   count, summary paths, and note references. Keep raw traces only when a documented conclusion depends on them.

@@ -44,6 +44,45 @@ namespace
 //! during engine warmup or standalone server operation.
 constexpr uint64_t kTHREE_PHASE_PLAN_NAMESPACE = uint64_t{1U} << 63U;
 constexpr uint64_t kTHREE_PHASE_EXECUTION_NAMESPACE = uint64_t{1U} << 62U;
+constexpr uint64_t kPREPARATION_TRANSITION_HASH_OFFSET = 1469598103934665603ULL;
+constexpr uint64_t kPREPARATION_TRANSITION_HASH_PRIME = 1099511628211ULL;
+
+void addPreparationTransitionHash(uint64_t& hash, uint64_t value) noexcept
+{
+    hash ^= value;
+    hash *= kPREPARATION_TRANSITION_HASH_PRIME;
+}
+
+uint64_t encoderPreparationServerSignature(IndependentPhaseServerArbitrationSnapshot const& state) noexcept
+{
+    uint64_t hash{kPREPARATION_TRANSITION_HASH_OFFSET};
+    addPreparationTransitionHash(hash, state.busy ? 1U : 0U);
+    addPreparationTransitionHash(hash, static_cast<uint64_t>(state.inFlightKind));
+    addPreparationTransitionHash(hash, state.prefillRequestIds.size());
+    for (size_t index{}; index < state.prefillRequestIds.size(); ++index)
+    {
+        addPreparationTransitionHash(hash, state.prefillRequestIds[index]);
+        if (index < state.prefillTokenCounts.size())
+        {
+            addPreparationTransitionHash(hash, static_cast<uint64_t>(state.prefillTokenCounts[index]));
+        }
+    }
+    addPreparationTransitionHash(hash, state.decodeRequestIds.size());
+    for (size_t index{}; index < state.decodeRequestIds.size(); ++index)
+    {
+        addPreparationTransitionHash(hash, state.decodeRequestIds[index]);
+        if (index < state.decodeContextLengths.size())
+        {
+            addPreparationTransitionHash(hash, static_cast<uint64_t>(state.decodeContextLengths[index]));
+        }
+    }
+    for (PhaseInFlightWorkSnapshot const& work : state.inFlight.work)
+    {
+        addPreparationTransitionHash(hash, work.executionId);
+        addPreparationTransitionHash(hash, work.actionId);
+    }
+    return hash;
+}
 
 PhaseUnifiedActionDirection phaseInitialDirection(PhaseGlobalActionKind action) noexcept
 {
@@ -867,6 +906,11 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
         mConfig.throughputMaxEncodedInFlight == 0 || mConfig.throughputMaxEncodedInFlight >= mConfig.maxEncodedInFlight,
         "Three-phase throughput encoded capacity cannot be below the latency capacity");
     ELLM_CHECK(mConfig.maxEncoderBatchSize > 0, "Three-phase encoder batch size must be positive");
+    ELLM_CHECK(mConfig.encoderPreparationBatchLimit <= mConfig.maxEncoderBatchSize,
+        "Encoder preparation batch limit exceeds the physical capability");
+    ELLM_CHECK(mConfig.encoderPreparationPolicyMode == PhaseEncoderPreparationPolicyMode::kDisabled
+            || !mConfig.enableCostAwareEncoderBatching,
+        "Online and static encoder batch selection cannot both own preparation policy");
     ELLM_CHECK(std::isfinite(mConfig.globalVisionPrefillColdStartUs) && mConfig.globalVisionPrefillColdStartUs >= 0.0,
         "Global vision-prefill cold-start cost must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.globalSafeProbeSlackMultiplier) && mConfig.globalSafeProbeSlackMultiplier >= 0.0F,
@@ -1004,7 +1048,9 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
                     = std::min(requestIds.size(), static_cast<size_t>(std::max(0, key.primaryBatchSize)));
                 std::vector<uint64_t> const prefillRequestIds(
                     requestIds.begin(), requestIds.begin() + static_cast<std::ptrdiff_t>(prefillRows));
-                horizon.nearReclaimBytes = mServer.visionPayloadBytes(prefillRequestIds);
+                horizon.nearReclaimBytes = mConfig.enableReleaseAwareMemoryScoring
+                    ? mServer.visionPrefillReleaseBytes(prefillRequestIds)
+                    : mServer.visionPayloadBytes(prefillRequestIds);
             }
             return horizon;
         });
@@ -1017,9 +1063,68 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     {
         mEncoderPreparationWorker = std::make_unique<PhaseEncoderPreparationWorker>(mVision, mVision.cudaContext());
     }
+    if (mConfig.enableLifetimeEncodedAdmission)
+    {
+        setEncodedAdmissionMode(true, 0U, mConfig.enableReleaseAwareMemoryScoring);
+    }
 }
 
 PhaseThreeCoordinator::~PhaseThreeCoordinator() noexcept = default;
+
+void PhaseThreeCoordinator::setEncoderPreparationBatchLimit(size_t rows)
+{
+    ELLM_CHECK(empty(), "Encoder preparation granularity may change only after every request and GPU consumer drains");
+    ELLM_CHECK(rows <= mConfig.maxEncoderBatchSize, "Encoder preparation batch limit exceeds the physical capability");
+    mConfig.encoderPreparationBatchLimit = rows;
+}
+
+void PhaseThreeCoordinator::setEncoderPreparationPolicyMode(PhaseEncoderPreparationPolicyMode mode)
+{
+    ELLM_CHECK(empty(), "Encoder preparation policy may change only after every request and GPU consumer drains");
+    ELLM_CHECK(mode == PhaseEncoderPreparationPolicyMode::kDisabled || !mConfig.enableCostAwareEncoderBatching,
+        "Online and static encoder batch selection cannot both own preparation policy");
+    mConfig.encoderPreparationPolicyMode = mode;
+    mLastEncoderPreparationPolicyRequestIds.clear();
+    mLastEncoderPreparationPolicyChoice = {};
+    mLastEncoderPreparationPolicyChoiceValid = false;
+    mLastEncoderPreparationPolicyServerSignature = 0U;
+    mLastEncoderPreparationTransitionDecodeRows = 0U;
+    mLastEncoderPreparationTransitionHorizonMs = 0.0F;
+}
+
+void PhaseThreeCoordinator::setEncodedAdmissionMode(bool lifetime, size_t staticCapacity, bool releaseAware)
+{
+    ELLM_CHECK(empty(), "Encoded admission may change only after every request and GPU consumer drains");
+    if (staticCapacity > 0U)
+    {
+        ELLM_CHECK(staticCapacity >= mConfig.maxEncoderBatchSize && staticCapacity >= mConfig.maxPrefillBatchSize,
+            "Static encoded capacity cannot be below the encoder or prefill capability");
+        mConfig.maxEncodedInFlight = staticCapacity;
+        mConfig.throughputMaxEncodedInFlight = 0U;
+        mEffectiveEncodedCapacity = staticCapacity;
+        mMaxEffectiveEncodedCapacity = staticCapacity;
+    }
+    if (lifetime)
+    {
+        mVision.reclaimIdleStorage(true);
+        if (mConfig.maxEncodedBytes > 0U)
+        {
+            mEncodedAdmissionBudgetBytes = mConfig.maxEncodedBytes;
+        }
+        else
+        {
+            size_t freeBytes{};
+            size_t totalBytes{};
+            CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+            size_t const burstBytes = mVision.memoryStats().maxPreparedStorageBytes;
+            mEncodedAdmissionBudgetBytes = freeBytes > burstBytes ? freeBytes - burstBytes : 0U;
+        }
+        ELLM_CHECK(mEncodedAdmissionBudgetBytes > 0U, "No device-memory budget remains for lifetime vision admission");
+    }
+    mConfig.enableLifetimeEncodedAdmission = lifetime;
+    mConfig.enableReleaseAwareMemoryScoring = releaseAware;
+    mEncodedAdmissionByteBlocks = 0U;
+}
 
 PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens, PhaseSchedulingHints scheduling)
@@ -1050,6 +1155,12 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
     }
     size_t const inputTokens = mVision.estimateInputTokens(request);
     size_t const estimatedPayloadBytes = mVision.estimatePayloadBytes(request);
+    if (mConfig.enableLifetimeEncodedAdmission && estimatedPayloadBytes > mEncodedAdmissionBudgetBytes)
+    {
+        mRequestIds.erase(requestId);
+        eraseTpotTarget(requestId);
+        ELLM_CHECK(false, "Vision payload exceeds the lifetime byte budget even with an empty pipeline");
+    }
     std::vector<int64_t> const geometry = mediaGeometry(request);
     bool prefixSubmitted{};
     if (mConfig.enablePrefixBeforeVisionPrefill)
@@ -1343,6 +1454,12 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.lookaheadEscalations = mLookaheadEscalations;
     result.encodedCapacityContractions = mEncodedCapacityContractions;
     result.encodedCapacityDwellBlocks = mEncodedCapacityDwellBlocks;
+    result.lifetimeEncodedAdmission = mConfig.enableLifetimeEncodedAdmission;
+    result.releaseAwareMemoryScoring = mConfig.enableReleaseAwareMemoryScoring;
+    result.encodedAdmissionBudgetBytes = mEncodedAdmissionBudgetBytes;
+    result.encodedAdmissionReservedBytes = encodedAdmissionReservedBytes();
+    result.encodedAdmissionRetainedBytes = encodedAdmissionRetainedBytes();
+    result.encodedAdmissionByteBlocks = mEncodedAdmissionByteBlocks;
     result.decodeTpotPressure = decodeTpotPressure();
     result.encoderDispatchDeferrals = mEncoderDispatchDeferrals;
     result.encoderTextGuardDeferrals = mEncoderTextGuardDeferrals;
@@ -1358,6 +1475,14 @@ PhaseThreeCoordinatorMetrics PhaseThreeCoordinator::metrics() const noexcept
     result.encoderCostCoverageMisses = mEncoderCostCoverageMisses;
     result.lastPredictedEncoderDrainGpuMs = mLastPredictedEncoderDrainGpuMs;
     result.lastPredictedEncoderDrainTurns = mLastPredictedEncoderDrainTurns;
+    result.encoderPreparationPolicyEvaluations = mEncoderPreparationPolicyEvaluations;
+    result.encoderPreparationPolicyCoverageMisses = mEncoderPreparationPolicyCoverageMisses;
+    result.encoderPreparationPolicySelectionChanges = mEncoderPreparationPolicySelectionChanges;
+    result.encoderPreparationPolicyAppliedChanges = mEncoderPreparationPolicyAppliedChanges;
+    result.lastEncoderPreparationPolicyBatchSize = mLastEncoderPreparationPolicyBatchSize;
+    result.lastEncoderPreparationPolicyHorizonMs = mLastEncoderPreparationPolicyHorizonMs;
+    result.lastEncoderPreparationTransitionDecodeRows = mLastEncoderPreparationTransitionDecodeRows;
+    result.lastEncoderPreparationTransitionHorizonMs = mLastEncoderPreparationTransitionHorizonMs;
     result.encoderPreparationStarts = mEncoderPreparationStarts;
     result.encoderPreparationCompletions = mEncoderPreparationCompletions;
     result.lastEncoderPreparationUs = mLastEncoderPreparationUs;
@@ -3972,6 +4097,11 @@ bool PhaseThreeCoordinator::startNextEncoder()
     {
         size_t const pendingIndex = batchIndices[selectedIndex] - selectedIndex;
         PendingVisionRequest pending = std::move(mPending[pendingIndex]);
+        if (mConfig.enableLifetimeEncodedAdmission && pending.estimatedPayloadBytes == 0U)
+        {
+            pending.estimatedPayloadBytes
+                = mEstimatedEncodedBytes > 0U ? mEstimatedEncodedBytes : mEncodedAdmissionBudgetBytes;
+        }
         mPending.erase(mPending.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
         ELLM_CHECK(
             mEncoderServiceEpochs.erase(pending.requestId) == 1U, "Dispatched encoder request has no service epoch");
@@ -4405,7 +4535,9 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
             mConfig.enableHomogeneousEncoderBatching, mConfig.enableEncoderFitLookahead, mConfig.maxEncoderLookahead);
     }
     size_t capacityLimit{};
-    while (capacityLimit < mConfig.maxEncoderBatchSize && encoderCapacityAvailable(capacityLimit + 1U))
+    size_t const preparationLimit = mConfig.encoderPreparationBatchLimit > 0U ? mConfig.encoderPreparationBatchLimit
+                                                                              : mConfig.maxEncoderBatchSize;
+    while (capacityLimit < preparationLimit && encoderCapacityAvailable(capacityLimit + 1U))
     {
         ++capacityLimit;
     }
@@ -4439,6 +4571,28 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     {
         size_t const estimate = mPending[index].estimatedPayloadBytes;
         candidatePayloadBytes.push_back(estimate > 0U ? estimate : mEstimatedEncodedBytes);
+    }
+    if (mConfig.enableLifetimeEncodedAdmission)
+    {
+        if (!candidatePayloadBytes.empty() && candidatePayloadBytes.front() == 0U)
+        {
+            candidatePayloadBytes.resize(1U);
+            candidatePayloadBytes.front() = mEncodedAdmissionBudgetBytes;
+            batchIndices.resize(1U);
+        }
+        size_t const fitting = phaseVisionReservationPrefix(encodedAdmissionRetainedBytes(),
+            encodedAdmissionReservedBytes(), mEncodedAdmissionBudgetBytes, candidatePayloadBytes);
+        if (fitting < batchIndices.size())
+        {
+            ++mEncodedAdmissionByteBlocks;
+            batchIndices.resize(fitting);
+            candidatePayloadBytes.resize(fitting);
+        }
+        if (batchIndices.empty())
+        {
+            return {};
+        }
+        batchSize = batchIndices.size();
     }
     PhaseVisionMemoryStats const& visionMemory = mVision.memoryStats();
     PhaseMemoryBrokerDecision const memoryDecision = mMemoryBroker.planEncoder(
@@ -4511,6 +4665,170 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     }
     mEncoderCreditDeferred = false;
 
+    bool onlinePreparationApplied{};
+    if (mConfig.encoderPreparationPolicyMode != PhaseEncoderPreparationPolicyMode::kDisabled && batchSize > 1U)
+    {
+        std::vector<uint64_t> requestIds;
+        requestIds.reserve(batchIndices.size());
+        std::vector<size_t> onlineInputTokens;
+        onlineInputTokens.reserve(batchIndices.size());
+        for (size_t const index : batchIndices)
+        {
+            requestIds.push_back(mPending[index].requestId);
+            onlineInputTokens.push_back(inputs[index].inputTokens);
+        }
+        IndependentPhaseServerArbitrationSnapshot const serverState
+            = mConfig.encoderPreparationPolicyMode == PhaseEncoderPreparationPolicyMode::kTransitionShadow
+            ? mServer.arbitrationSnapshot(true)
+            : IndependentPhaseServerArbitrationSnapshot{};
+        uint64_t const serverSignature
+            = mConfig.encoderPreparationPolicyMode == PhaseEncoderPreparationPolicyMode::kTransitionShadow
+            ? encoderPreparationServerSignature(serverState)
+            : 0U;
+        bool const cached = mLastEncoderPreparationPolicyChoiceValid
+            && requestIds == mLastEncoderPreparationPolicyRequestIds
+            && serverSignature == mLastEncoderPreparationPolicyServerSignature;
+        PhaseVisionEncoderBatchChoice choice;
+        if (cached)
+        {
+            choice = mLastEncoderPreparationPolicyChoice;
+        }
+        else
+        {
+            std::vector<PhaseVisionEncoderBatchCost> transitionCosts;
+            std::vector<PhaseEncoderTransitionPreview> transitionPreviews;
+            mLastEncoderPreparationTransitionDecodeRows = 0U;
+            mLastEncoderPreparationTransitionHorizonMs = 0.0F;
+            for (size_t const rows : phaseEncoderCalibrationBatchSizes(batchSize))
+            {
+                size_t maxGroupTokens{};
+                for (size_t offset{}; offset + rows <= batchSize; ++offset)
+                {
+                    size_t groupTokens{};
+                    for (size_t index{}; index < rows; ++index)
+                    {
+                        groupTokens = saturatedAdd(groupTokens, inputs[batchIndices[offset + index]].inputTokens);
+                    }
+                    maxGroupTokens = std::max(maxGroupTokens, groupTokens);
+                }
+                constexpr size_t kEncoderTokenBucket = 1024U;
+                int32_t const contextBucket
+                    = static_cast<int32_t>((maxGroupTokens + kEncoderTokenBucket - 1U) / kEncoderTokenBucket);
+                PhaseGlobalActionKey const key{
+                    PhaseGlobalActionKind::kEncoder, static_cast<int32_t>(rows), 0, 0, contextBucket, 0};
+                std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->estimate(key);
+                if (!estimate.has_value())
+                {
+                    estimate = mRuntimeCostTracker->estimatePrimaryBatchCoveringContext(key);
+                }
+                if (!estimate.has_value())
+                {
+                    estimate = mRuntimeCostTracker->estimateInterpolatedPrimaryBatch(key);
+                }
+                if (!estimate.has_value())
+                {
+                    estimate = mRuntimeCostTracker->estimateCoveringPrimary(key);
+                }
+                if (!estimate.has_value() || estimate->sampleCount < mConfig.globalCostModelConfig.overlapMinSamples)
+                {
+                    continue;
+                }
+                size_t const estimatedPromptTokens = std::max<size_t>(1U,
+                    mEstimatedPromptTokens > 0U ? mEstimatedPromptTokens
+                                                : (maxGroupTokens + rows - 1U) / std::max<size_t>(1U, rows));
+                PhaseGlobalCostEstimate const prefill = mServer.estimateGlobalPrefillDrainCost(
+                    static_cast<int32_t>(rows),
+                    static_cast<int32_t>(std::min<size_t>(estimatedPromptTokens, std::numeric_limits<int32_t>::max())),
+                    PhasePrefillClass::kExternal);
+                float const encoderMs
+                    = std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs);
+                float const prefillMs
+                    = std::max(prefill.makespanP95Ms, prefill.makespanMedianMs + prefill.uncertaintyMs);
+                float transitionMs = encoderMs + prefillMs;
+                PhaseEncoderTransitionPreview transitionPreview;
+                if (mConfig.encoderPreparationPolicyMode == PhaseEncoderPreparationPolicyMode::kTransitionShadow)
+                {
+                    size_t const successorDecodeRows = serverState.decodeRequestIds.size() + rows;
+                    int32_t maxDecodeContextLength = static_cast<int32_t>(
+                        std::min<size_t>(estimatedPromptTokens + 1U, std::numeric_limits<int32_t>::max()));
+                    for (int32_t const contextLength : serverState.decodeContextLengths)
+                    {
+                        maxDecodeContextLength = std::max(maxDecodeContextLength, contextLength);
+                    }
+                    std::optional<float> const decodeMs = mServer.estimateGlobalDecodeComponentP95(
+                        static_cast<int32_t>(successorDecodeRows), maxDecodeContextLength, false);
+                    if (!decodeMs.has_value())
+                    {
+                        continue;
+                    }
+                    std::vector<PhaseFormationRequestState> requests;
+                    std::vector<uint64_t> encoderRequestIds;
+                    requests.reserve(successorDecodeRows);
+                    encoderRequestIds.reserve(rows);
+                    for (size_t index{}; index < rows; ++index)
+                    {
+                        PendingVisionRequest const& pending = mPending[batchIndices[index]];
+                        encoderRequestIds.push_back(pending.requestId);
+                        requests.push_back({pending.requestId, PhaseFormationRequestStage::kEncoderReady,
+                            static_cast<size_t>(std::max(1, pending.maxOutputTokens)), pending.estimatedPayloadBytes,
+                            0U});
+                    }
+                    for (uint64_t const requestId : serverState.decodeRequestIds)
+                    {
+                        requests.push_back({requestId, PhaseFormationRequestStage::kDecodeReady, 2U, 0U, 0U});
+                    }
+                    transitionPreview
+                        = phaseFormationPreviewEncoderTransition(std::move(requests), std::move(encoderRequestIds),
+                            serverState.decodeRequestIds, static_cast<double>(encoderMs) * 1000.0,
+                            static_cast<double>(prefillMs) * 1000.0, static_cast<double>(*decodeMs) * 1000.0);
+                    if (!transitionPreview.feasible)
+                    {
+                        continue;
+                    }
+                    transitionMs = static_cast<float>(transitionPreview.decodeCompleteUs / 1000.0);
+                }
+                transitionCosts.push_back({rows, maxGroupTokens, transitionMs});
+                transitionPreviews.push_back(transitionPreview);
+            }
+            choice = phaseVisionSelectEncoderBatch(onlineInputTokens, transitionCosts);
+            if (mConfig.encoderPreparationPolicyMode == PhaseEncoderPreparationPolicyMode::kTransitionShadow
+                && !choice.coverageMiss)
+            {
+                auto const selected = std::find_if(transitionCosts.begin(), transitionCosts.end(),
+                    [&](auto const& cost) { return cost.batchSize == choice.batchSize; });
+                if (selected != transitionCosts.end())
+                {
+                    size_t const index = static_cast<size_t>(std::distance(transitionCosts.begin(), selected));
+                    mLastEncoderPreparationTransitionDecodeRows = transitionPreviews[index].successorDecodeRows;
+                    mLastEncoderPreparationTransitionHorizonMs
+                        = static_cast<float>(transitionPreviews[index].decodeCompleteUs / 1000.0);
+                }
+            }
+            mLastEncoderPreparationPolicyRequestIds = requestIds;
+            mLastEncoderPreparationPolicyChoice = choice;
+            mLastEncoderPreparationPolicyChoiceValid = true;
+            mLastEncoderPreparationPolicyServerSignature = serverSignature;
+            ++mEncoderPreparationPolicyEvaluations;
+        }
+        mLastEncoderPreparationPolicyBatchSize = choice.batchSize;
+        mLastEncoderPreparationPolicyHorizonMs = choice.predictedDrainGpuMs;
+        if (!cached && choice.coverageMiss)
+        {
+            ++mEncoderPreparationPolicyCoverageMisses;
+        }
+        else if (!choice.coverageMiss && choice.batchSize != batchSize)
+        {
+            mEncoderPreparationPolicySelectionChanges += cached ? 0U : 1U;
+            if (mConfig.encoderPreparationPolicyMode == PhaseEncoderPreparationPolicyMode::kActive)
+            {
+                batchIndices.resize(choice.batchSize);
+                batchSize = batchIndices.size();
+                onlinePreparationApplied = true;
+                mEncoderPreparationPolicyAppliedChanges += cached ? 0U : 1U;
+            }
+        }
+    }
+
     if (mConfig.enableCostAwareEncoderBatching)
     {
         std::vector<size_t> candidateInputTokens;
@@ -4547,7 +4865,7 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
         inputBytes += input.inputBytes;
         inputTokens += input.inputTokens;
     }
-    bool const batchFull = batchSize == mConfig.maxEncoderBatchSize;
+    bool const batchFull = batchSize == preparationLimit || onlinePreparationApplied;
     bool const mediaFull = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
     bool const inputFull = mConfig.maxEncoderInputBytes > 0 && inputBytes >= mConfig.maxEncoderInputBytes;
     bool const tokenFull = mConfig.maxEncoderInputTokens > 0 && inputTokens >= mConfig.maxEncoderInputTokens;
@@ -4691,9 +5009,34 @@ PhaseVisionPrefillAdmissionDecision PhaseThreeCoordinator::nextReadyPrefillDecis
 
 bool PhaseThreeCoordinator::encoderCapacityAvailable(size_t additionalRequests) const noexcept
 {
+    if (mConfig.enableLifetimeEncodedAdmission)
+    {
+        return additionalRequests > 0U && additionalRequests <= mConfig.maxEncoderBatchSize;
+    }
     return phaseVisionEncoderCapacityAvailable(mDownstreamRequestBytes.size(), effectiveEncodedCapacity(),
         mReadyPrefillBytes + mServer.visionPayloadBytes(), mConfig.maxEncodedBytes, mEstimatedEncodedBytes,
         additionalRequests);
+}
+
+size_t PhaseThreeCoordinator::encodedAdmissionRetainedBytes() const noexcept
+{
+    std::vector<PhaseVisionPayload const*> payloads;
+    payloads.reserve(mReadyPrefill.size());
+    for (auto const& request : mReadyPrefill)
+    {
+        payloads.push_back(request.payload.get());
+    }
+    return mServer.visionRetainedStorageBytes(std::move(payloads));
+}
+
+size_t PhaseThreeCoordinator::encodedAdmissionReservedBytes() const noexcept
+{
+    size_t bytes{};
+    for (auto const& request : mEncoding)
+    {
+        bytes = saturatedAdd(bytes, request.estimatedPayloadBytes);
+    }
+    return bytes;
 }
 
 PhaseVisionEncoderDispatchDecision PhaseThreeCoordinator::nextEncoderDispatchDecision() const noexcept

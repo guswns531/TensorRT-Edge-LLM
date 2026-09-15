@@ -64,8 +64,12 @@ def parse_variant(value: str) -> tuple[str, pathlib.Path]:
 
 def load_variant(name: str, root: pathlib.Path) -> dict[str, dict]:
     results = {}
-    for path in sorted(root.glob("generic/*/worker-4/aggregate.json")):
-        workload = path.parents[1].name
+    paths = sorted(root.glob("generic/*/worker-4/aggregate.json"))
+    flat_layout = not paths
+    if flat_layout:
+        paths = sorted(root.glob("*/aggregate.json"))
+    for path in paths:
+        workload = path.parent.name if flat_layout else path.parents[1].name
         with path.open(encoding="utf-8") as stream:
             results[workload] = json.load(stream)
     if not results:
@@ -80,6 +84,22 @@ def relative_percent(value: float, baseline: float,
         return 0.0
     direction = -1.0 if lower_is_better else 1.0
     return direction * (value / baseline - 1.0) * 100.0
+
+
+def metric_value(result: dict, metric: str) -> float:
+    if metric in result:
+        return float(result[metric])
+    if metric == "gpu_memory_peak_mib_median" and "gpu_memory_peak_mib_max" in result:
+        return float(result["gpu_memory_peak_mib_max"])
+    raise KeyError(metric)
+
+
+def request_count(result: dict) -> int:
+    if "requests_per_run" in result:
+        return int(result["requests_per_run"])
+    return int(
+        sum(float(values["requests"])
+            for values in result.get("by_request_class", {}).values()))
 
 
 def main() -> int:
@@ -108,16 +128,16 @@ def main() -> int:
             row = {
                 "workload": workload,
                 "variant": name,
-                "requests": result["requests_per_run"],
+                "requests": request_count(result),
                 "token_trace_sha256": result["token_trace_sha256_per_run"][0],
                 "token_trace_matches_baseline": token_trace_matches_baseline,
             }
             for metric in METRICS:
-                value = float(result[metric])
+                value = metric_value(result, metric)
                 row[metric] = value
                 if name != baseline_name:
                     row[f"{metric}_relative_percent"] = relative_percent(
-                        value, float(baseline[metric]),
+                        value, metric_value(baseline, metric),
                         metric.endswith("_ms") or "memory" in metric)
             rows.append(row)
 

@@ -185,6 +185,23 @@ struct PhaseFormationTwoBoundaryResult
     std::vector<PhaseFormationRequestState> successorRequests;
 };
 
+//! Bounded E->P->D projection for one already-ready encoder cohort. It joins
+//! currently decode-ready requests at the successor D boundary without
+//! predicting arrivals or mutating live queues.
+struct PhaseEncoderTransitionPreview
+{
+    bool feasible{};
+    size_t encoderRows{};
+    size_t existingDecodeRows{};
+    size_t successorDecodeRows{};
+    double prefillReadyUs{};
+    double decodeReadyUs{};
+    double decodeCompleteUs{};
+    double uncertaintyUs{};
+    size_t releasedVisionBytes{};
+    size_t releasedKvBytes{};
+};
+
 //! Metadata fixed when formation-aware selection changes the concrete action
 //! chosen by the otherwise identical myopic frontier.
 struct PhaseFormationRealizedEpisodeStart
@@ -324,5 +341,12 @@ bool phaseFormationShouldReplaceMyopic(
 PhaseFormationTwoBoundaryResult phaseFormationEvaluateCompletionBoundaries(
     std::vector<PhaseFormationRequestState> requests,
     std::vector<PhaseFormationPhysicalCompletion> completions) noexcept;
+
+//! Project an encoder cohort through prefill and one successor decode service
+//! boundary using only supplied physical durations and request-local state.
+PhaseEncoderTransitionPreview phaseFormationPreviewEncoderTransition(std::vector<PhaseFormationRequestState> requests,
+    std::vector<uint64_t> encoderRequestIds, std::vector<uint64_t> existingDecodeRequestIds, double encoderCompletionUs,
+    double prefillDurationUs, double decodeDurationUs, double encoderUncertaintyUs = 0.0,
+    double prefillUncertaintyUs = 0.0, double decodeUncertaintyUs = 0.0) noexcept;
 
 } // namespace trt_edgellm::rt

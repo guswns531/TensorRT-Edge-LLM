@@ -64,6 +64,14 @@ struct PhaseVisionEncoderBatchChoice
     bool coverageMiss{};
 };
 
+enum class PhaseEncoderPreparationPolicyMode
+{
+    kDisabled,
+    kShadow,
+    kTransitionShadow,
+    kActive,
+};
+
 //! Power-of-two encoder shapes plus the deployment limit for controlled calibration.
 std::vector<size_t> phaseEncoderCalibrationBatchSizes(
     size_t maxEncoderBatchSize, std::vector<size_t> requestedBatchSizes = {});
@@ -143,8 +151,16 @@ struct PhaseThreeCoordinatorConfig
     size_t throughputMaxEncodedInFlight{};
     //! Optional byte budget for downstream request-owned vision payloads. Zero disables the byte gate.
     size_t maxEncodedBytes{};
+    //! Use GPU-safe physical vision lifetime and pre-dispatch reservations instead of encoded-request count.
+    bool enableLifetimeEncodedAdmission{};
+    //! Score only vision views that final prefill can release under their positional-storage contract.
+    bool enableReleaseAwareMemoryScoring{};
     //! Maximum logical requests coalesced into one vision encoder execution. One preserves legacy behavior.
     size_t maxEncoderBatchSize{1U};
+    //! Optional preparation granularity within the physical encoder capability; zero keeps the full frontier.
+    size_t encoderPreparationBatchLimit{};
+    //! Evaluate runtime E->P transition costs before asynchronous preparation.
+    PhaseEncoderPreparationPolicyMode encoderPreparationPolicyMode{PhaseEncoderPreparationPolicyMode::kDisabled};
     //! Physical P/D engine capacities used only to normalize continuous
     //! contextual features. They are capabilities, not policy batch targets.
     int32_t contextualPrefillBatchCapacity{8};
@@ -296,6 +312,12 @@ struct PhaseThreeCoordinatorMetrics
     size_t lookaheadEscalations{};
     size_t encodedCapacityContractions{};
     size_t encodedCapacityDwellBlocks{};
+    bool lifetimeEncodedAdmission{};
+    bool releaseAwareMemoryScoring{};
+    size_t encodedAdmissionBudgetBytes{};
+    size_t encodedAdmissionReservedBytes{};
+    size_t encodedAdmissionRetainedBytes{};
+    size_t encodedAdmissionByteBlocks{};
     float decodeTpotPressure{};
     size_t encoderDispatchDeferrals{};
     size_t encoderTextGuardDeferrals{};
@@ -311,6 +333,14 @@ struct PhaseThreeCoordinatorMetrics
     size_t encoderCostCoverageMisses{};
     float lastPredictedEncoderDrainGpuMs{};
     size_t lastPredictedEncoderDrainTurns{};
+    size_t encoderPreparationPolicyEvaluations{};
+    size_t encoderPreparationPolicyCoverageMisses{};
+    size_t encoderPreparationPolicySelectionChanges{};
+    size_t encoderPreparationPolicyAppliedChanges{};
+    size_t lastEncoderPreparationPolicyBatchSize{};
+    float lastEncoderPreparationPolicyHorizonMs{};
+    size_t lastEncoderPreparationTransitionDecodeRows{};
+    float lastEncoderPreparationTransitionHorizonMs{};
     size_t encoderPreparationStarts{};
     size_t encoderPreparationCompletions{};
     double lastEncoderPreparationUs{};
@@ -606,6 +636,12 @@ public:
     void setGlobalWarmupProbeMode(bool active);
     //! Start a fresh low-overhead decision-latency epoch.
     void resetGlobalDecisionCostTelemetry() noexcept;
+    //! Change admission only after all request/GPU leases drain. Zero static capacity retains the current limit.
+    void setEncodedAdmissionMode(bool lifetime, size_t staticCapacity = 0U, bool releaseAware = false);
+    //! Change preparation granularity only after all request and GPU leases drain; zero restores full batches.
+    void setEncoderPreparationBatchLimit(size_t rows);
+    //! Change online preparation selection authority only at a drained boundary.
+    void setEncoderPreparationPolicyMode(PhaseEncoderPreparationPolicyMode mode);
     //! Enable optional request-level encoder and prefill-handoff telemetry.
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     //! Enable one shared epoch-relative E/P/D/C activity recorder while idle.
@@ -685,6 +721,8 @@ private:
     std::vector<size_t> nextEncoderBatchIndices();
     PhaseVisionPrefillAdmissionDecision nextReadyPrefillDecision() const noexcept;
     bool encoderCapacityAvailable(size_t additionalRequests = 1U) const noexcept;
+    size_t encodedAdmissionRetainedBytes() const noexcept;
+    size_t encodedAdmissionReservedBytes() const noexcept;
     size_t effectiveEncodedCapacity() const noexcept;
     float decodeTpotPressure() const noexcept;
     void refreshEffectiveEncodedCapacity() noexcept;
@@ -712,6 +750,8 @@ private:
     PhaseGlobalScheduler mGlobalScheduler;
     std::shared_ptr<PhaseRuntimeCostTracker> mRuntimeCostTracker;
     PhaseMemoryBroker mMemoryBroker;
+    size_t mEncodedAdmissionBudgetBytes{};
+    size_t mEncodedAdmissionByteBlocks{};
     std::deque<PendingVisionRequest> mPending;
     std::unordered_map<uint64_t, EncoderServiceEpochRecord> mEncoderServiceEpochs;
     uint64_t mNextEncoderServiceEpoch{1U};
@@ -845,6 +885,18 @@ private:
     size_t mEncoderCostCoverageMisses{};
     float mLastPredictedEncoderDrainGpuMs{};
     size_t mLastPredictedEncoderDrainTurns{};
+    size_t mEncoderPreparationPolicyEvaluations{};
+    size_t mEncoderPreparationPolicyCoverageMisses{};
+    size_t mEncoderPreparationPolicySelectionChanges{};
+    size_t mEncoderPreparationPolicyAppliedChanges{};
+    size_t mLastEncoderPreparationPolicyBatchSize{};
+    float mLastEncoderPreparationPolicyHorizonMs{};
+    size_t mLastEncoderPreparationTransitionDecodeRows{};
+    float mLastEncoderPreparationTransitionHorizonMs{};
+    std::vector<uint64_t> mLastEncoderPreparationPolicyRequestIds;
+    PhaseVisionEncoderBatchChoice mLastEncoderPreparationPolicyChoice;
+    bool mLastEncoderPreparationPolicyChoiceValid{};
+    uint64_t mLastEncoderPreparationPolicyServerSignature{};
     size_t mEncoderPreparationStarts{};
     size_t mEncoderPreparationCompletions{};
     double mLastEncoderPreparationUs{};

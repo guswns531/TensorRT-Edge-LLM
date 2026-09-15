@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import statistics
 from collections import Counter
@@ -33,20 +34,36 @@ def _run_number(aggregate: Path) -> int:
 
 
 def _event_path(aggregate: Path) -> Path:
+    run = aggregate.parents[1]
+    compressed = run / "gateway.log.gz"
+    if compressed.is_file():
+        return compressed
+    gateway = run / "gateway.log"
+    if gateway.is_file():
+        return gateway
     variant = aggregate.parents[2]
     return variant / "activity" / f"run-{_run_number(aggregate):03d}-events.jsonl"
 
 
 def _interval_path(aggregate: Path) -> Path:
+    current = aggregate.parents[1] / "activity-intervals.csv"
+    if current.is_file():
+        return current
     variant = aggregate.parents[2]
     return variant / "activity" / f"run-{_run_number(aggregate):03d}-intervals.csv"
+
+
+def _open_text(path: Path):
+    return gzip.open(path, mode="rt",
+                     encoding="utf-8") if path.suffix == ".gz" else path.open(
+                         encoding="utf-8")
 
 
 def _read_scheduler_events(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     events = []
-    with path.open(encoding="utf-8") as stream:
+    with _open_text(path) as stream:
         for line in stream:
             if not line.startswith("PHASE_SCHEDULER_EVENT\t"):
                 continue
@@ -69,7 +86,7 @@ def _read_measured_timelines(
         return records
     lifecycles: dict[int, list[list[dict[str, Any]]]] = {}
     current: dict[int, list[dict[str, Any]]] = {}
-    with path.open(encoding="utf-8") as stream:
+    with _open_text(path) as stream:
         for line in stream:
             if not line.startswith(TIMELINE_MARKER):
                 continue
@@ -281,62 +298,34 @@ def analyze_run(aggregate: Path, coherent_decode_max: int,
         trajectory_family = "transitional"
     starts = [float(row["start_ms"]) for row in intervals]
     return {
-        "root":
-        str(aggregate.parents[2]),
-        "run":
-        _run_number(aggregate),
-        "request_count":
-        request_count,
-        "trajectory_family":
-        trajectory_family,
-        "generated_token_s":
-        metrics.get("generated_token_s_median"),
-        "ttft_mean_ms":
-        metrics.get("ttft_mean_of_run_means_ms"),
-        "ttft_p95_ms":
-        metrics.get("ttft_p95_median_ms"),
-        "tpot_mean_ms":
-        metrics.get("tpot_mean_of_run_means_ms"),
-        "tpot_p95_ms":
-        metrics.get("tpot_p95_median_ms"),
-        "e2e_mean_ms":
-        metrics.get("e2e_mean_of_run_means_ms"),
-        "e2e_p95_ms":
-        metrics.get("e2e_p95_median_ms"),
-        "startup_to_first_gpu_ms":
-        min(starts) if starts else None,
-        "encoder_dispatches":
-        len(phase_intervals["encoder"]),
-        "prefill_dispatches":
-        len(phase_intervals["prefill"]),
-        "decode_dispatches":
-        decode_dispatches,
-        "copy_dispatches":
-        len(phase_intervals["copy"]),
-        "encoder_gpu_ms":
-        phase_duration_ms["encoder"],
-        "prefill_gpu_ms":
-        phase_duration_ms["prefill"],
-        "decode_gpu_ms":
-        phase_duration_ms["decode"],
-        "copy_gpu_ms":
-        phase_duration_ms["copy"],
-        "scheduler_decisions":
-        len(decisions),
-        "selected_scalar_known":
-        scalar_known,
-        "contextual_fallback_disagreements":
-        fallback_disagreements,
-        "action_counts":
-        dict(sorted(action_counts.items())),
-        "learned_to_fallback_pairs":
-        dict(sorted(fallback_pairs.items())),
-        "direction_observations":
-        dict(sorted(direction_observations.items())),
-        "transition_lineage":
-        lineage,
-        "event_path":
-        str(_event_path(aggregate)),
+        "root": str(aggregate.parents[2]),
+        "run": _run_number(aggregate),
+        "request_count": request_count,
+        "trajectory_family": trajectory_family,
+        "generated_token_s": metrics.get("generated_token_s_median"),
+        "ttft_mean_ms": metrics.get("ttft_mean_of_run_means_ms"),
+        "ttft_p95_ms": metrics.get("ttft_p95_median_ms"),
+        "tpot_mean_ms": metrics.get("tpot_mean_of_run_means_ms"),
+        "tpot_p95_ms": metrics.get("tpot_p95_median_ms"),
+        "e2e_mean_ms": metrics.get("e2e_mean_of_run_means_ms"),
+        "e2e_p95_ms": metrics.get("e2e_p95_median_ms"),
+        "startup_to_first_gpu_ms": min(starts) if starts else None,
+        "encoder_dispatches": len(phase_intervals["encoder"]),
+        "prefill_dispatches": len(phase_intervals["prefill"]),
+        "decode_dispatches": decode_dispatches,
+        "copy_dispatches": len(phase_intervals["copy"]),
+        "encoder_gpu_ms": phase_duration_ms["encoder"],
+        "prefill_gpu_ms": phase_duration_ms["prefill"],
+        "decode_gpu_ms": phase_duration_ms["decode"],
+        "copy_gpu_ms": phase_duration_ms["copy"],
+        "scheduler_decisions": len(decisions),
+        "selected_scalar_known": scalar_known,
+        "contextual_fallback_disagreements": fallback_disagreements,
+        "action_counts": dict(sorted(action_counts.items())),
+        "learned_to_fallback_pairs": dict(sorted(fallback_pairs.items())),
+        "direction_observations": dict(sorted(direction_observations.items())),
+        "transition_lineage": lineage,
+        "event_path": str(_event_path(aggregate)),
     }
 
 

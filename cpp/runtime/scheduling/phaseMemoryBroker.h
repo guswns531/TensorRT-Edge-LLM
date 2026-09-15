@@ -54,6 +54,10 @@ struct PhaseMemoryBrokerSnapshot
     size_t idleVisionBytes{};
 };
 
+//! Select a fitting prefix without admitting unknown or oversized payloads through a byte ceiling.
+size_t phaseVisionReservationPrefix(
+    size_t retainedBytes, size_t reservedBytes, size_t budgetBytes, std::vector<size_t> const& candidateBytes) noexcept;
+
 enum class PhaseMemoryBrokerReason
 {
     kDisabled,

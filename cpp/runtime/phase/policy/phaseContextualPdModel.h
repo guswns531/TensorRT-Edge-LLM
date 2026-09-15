@@ -63,7 +63,7 @@ PhaseContextualPairKind phaseContextualPairKind(PhaseContextualPairDirection dir
 PhaseContextualPairDirection phaseContextualPairDirection(
     PhaseGlobalActionKind kind, PhaseGlobalResidualAnchor residualAnchor) noexcept;
 
-constexpr size_t kPHASE_CONTEXTUAL_PD_FEATURES{16U};
+constexpr size_t kPHASE_CONTEXTUAL_PD_FEATURES{14U};
 using PhaseContextualPdFeatures = std::array<double, kPHASE_CONTEXTUAL_PD_FEATURES>;
 
 struct PhaseContextualPairInput
@@ -115,8 +115,9 @@ struct PhaseContextualPdInput
 };
 
 //! Project an exact P+D action into a bounded, model- and workload-label-free
-//! decision representation. The execution cost tracker retains exact keys;
-//! only policy evidence is shared through this low-dimensional projection.
+//! decision representation. CUDA graph variants remain distinct in the exact
+//! execution model but share policy evidence because they launch the same GPU
+//! kernel geometry.
 PhaseContextualPdFeatures phaseContextualPdFeatures(PhaseContextualPdInput const& input) noexcept;
 
 struct PhaseContextualPdModelConfig

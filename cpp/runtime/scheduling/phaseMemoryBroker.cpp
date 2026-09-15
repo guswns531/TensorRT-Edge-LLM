@@ -40,6 +40,23 @@ size_t saturatedMultiply(size_t left, size_t right) noexcept
 
 } // namespace
 
+size_t phaseVisionReservationPrefix(
+    size_t retainedBytes, size_t reservedBytes, size_t budgetBytes, std::vector<size_t> const& candidateBytes) noexcept
+{
+    size_t bytes = saturatedAdd(retainedBytes, reservedBytes);
+    size_t count{};
+    for (size_t candidate : candidateBytes)
+    {
+        if (candidate == 0U || bytes > budgetBytes || candidate > budgetBytes - bytes)
+        {
+            break;
+        }
+        bytes += candidate;
+        ++count;
+    }
+    return count;
+}
+
 PhaseMemoryBroker::PhaseMemoryBroker(PhaseMemoryBrokerConfig config)
     : mConfig(config)
 {

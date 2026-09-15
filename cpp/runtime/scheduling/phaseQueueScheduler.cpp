@@ -55,8 +55,7 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     : mConfig(std::move(config))
     , mGlobalScheduler([&] {
         PhaseGlobalSchedulerConfig global = mConfig.globalSchedulerConfig;
-        global.enableServiceRecovery
-            = phasePolicyUsesServiceScale(mConfig.policyMode) && global.enableServiceRecovery;
+        global.enableServiceRecovery = phasePolicyUsesServiceScale(mConfig.policyMode) && global.enableServiceRecovery;
         return global;
     }())
     , mRuntimeCostTracker(mConfig.runtimeCostTracker != nullptr
@@ -1441,6 +1440,35 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     {
         maxBatchSize = std::min(maxBatchSize, mConfig.maxContinuationPrefillBatchSize);
     }
+    if (mConfig.enableWavefrontPrefillBatching && mConfig.enablePrefillCohortRefill
+        && !mPrefillCohortIds.empty())
+    {
+        std::vector<PhaseWorkItem const*> refillCandidates;
+        for (PhaseWorkItem const& item : queue)
+        {
+            if (mPrefillCohortIds.find(item.requestId) == mPrefillCohortIds.end() && isEligible(item, true)
+                && isPrefillBatchCompatible(item, *bucketSeed, bucketTokens, bucketInitial, allowRaggedBatch))
+            {
+                refillCandidates.push_back(&item);
+            }
+        }
+        std::stable_sort(refillCandidates.begin(), refillCandidates.end(),
+            [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
+                return orderPrefillRow(lhs, rhs, bucketTokens);
+            });
+        int32_t const refillLimit = std::min(mConfig.maxPrefillCohortSize, maxBatchSize);
+        for (PhaseWorkItem const* item : refillCandidates)
+        {
+            if (static_cast<int32_t>(mPrefillCohortIds.size()) >= refillLimit)
+            {
+                break;
+            }
+            if (mPrefillCohortIds.insert(item->requestId).second)
+            {
+                ++plan.prefillCohortRefillRows;
+            }
+        }
+    }
     if (mConfig.enableWavefrontPrefillBatching && mPrefillCohortIds.empty())
     {
         std::vector<PhaseWorkItem const*> compatible;
@@ -1468,7 +1496,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         {
             bool const cohortEligible = !mConfig.enableWavefrontPrefillBatching
                 || mPrefillCohortIds.find(item.requestId) != mPrefillCohortIds.end();
-            if (!cohortEligible || !isEligible(item, true) || (item.tokenOffset == 0) != bucketInitial)
+            if (!cohortEligible || !isEligible(item, true) || item.prefillClass != bucketSeed->prefillClass
+                || (item.tokenOffset == 0) != bucketInitial)
             {
                 continue;
             }
@@ -1718,9 +1747,16 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popGlobalCandidateBatch(std::deq
     {
         if (mConfig.enableWavefrontPrefillBatching)
         {
-            if (mPrefillCohortIds.empty())
+            bool const initializingCohort = mPrefillCohortIds.empty();
+            if (initializingCohort || mConfig.enablePrefillCohortRefill)
             {
-                mPrefillCohortIds.insert(requestIds.begin(), requestIds.end());
+                for (uint64_t const requestId : requestIds)
+                {
+                    if (mPrefillCohortIds.insert(requestId).second && !initializingCohort)
+                    {
+                        ++plan.prefillCohortRefillRows;
+                    }
+                }
             }
             ++mPrefillCohortTurns;
             plan.prefillCohortSize = static_cast<int32_t>(mPrefillCohortIds.size());

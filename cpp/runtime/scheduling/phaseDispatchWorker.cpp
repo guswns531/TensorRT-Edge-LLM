@@ -321,6 +321,7 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.predictedDecodeDrainGpuMs = mInFlight.predictedDecodeDrainGpuMs;
     mCurrentMetrics.predictedDecodeDrainTurns = mInFlight.predictedDecodeDrainTurns;
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
+    mCurrentMetrics.prefillCohortRefillRows = mInFlight.prefillCohortRefillRows;
     mCurrentMetrics.globalDecisionEvaluated = mInFlight.globalDecisionEvaluated;
     mCurrentMetrics.globalDecisionApplied = mInFlight.globalDecisionApplied;
     mCurrentMetrics.globalSafeProbe = mInFlight.globalSafeProbe;

@@ -391,6 +391,8 @@ public:
     void setTimelineCallback(std::function<void(PhaseTimelineEvent const&)> timelineCallback);
     //! Enable opt-in epoch-relative P/D stream activity recording while idle.
     void setActivityTimeline(PhaseActivityTimelineRecorder* timeline);
+    //! Change vision chunk admission only after all request and GPU work drains.
+    void setChunkedVisionPrefill(bool enabled);
     cudaStream_t phaseStream(PhaseUnifiedPhase phase) const noexcept;
     cudaEvent_t phaseStartEvent(PhaseUnifiedPhase phase) const noexcept;
     void setNextDispatchPreamble(PhaseUnifiedPhase phase, std::function<void(cudaStream_t)> preamble);
@@ -466,8 +468,12 @@ public:
     int32_t pageReservationGuaranteedPages() const;
     float decodeTpotPressure() const noexcept;
     size_t visionPayloadBytes() const noexcept;
+    //! Include coordinator-owned payloads when counting shared retained physical vision slabs.
+    size_t visionRetainedStorageBytes(std::vector<PhaseVisionPayload const*> payloads = {}) const noexcept;
     size_t visionPayloadBytes(std::vector<uint64_t> const& requestIds) const noexcept;
     bool releasesVisionPrefillStorage() const noexcept;
+    //! Final-prefill logical release potential, excluding decode-retained positional storage.
+    size_t visionPrefillReleaseBytes(std::vector<uint64_t> const& requestIds) const noexcept;
     void setGlobalMemoryHorizonSupplier(
         std::function<PhaseActionMemoryHorizon(PhaseGlobalActionKey const&, std::vector<uint64_t> const& requestIds)>
             supplier);

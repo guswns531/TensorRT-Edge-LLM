@@ -153,6 +153,11 @@ size_t PhaseVisionPayload::prefillByteSize() const noexcept
     return result;
 }
 
+size_t PhaseVisionPayload::prefillReleaseByteSize() const noexcept
+{
+    return !mropeCosSin.isEmpty() && mropeStorageOwner == nullptr ? 0U : prefillByteSize();
+}
+
 size_t PhaseVisionPayload::releasePrefillStorage() noexcept
 {
     // A legacy payload keeps M-RoPE in the same slab as the prefill tensors. Retaining the whole slab is required
@@ -166,6 +171,66 @@ size_t PhaseVisionPayload::releasePrefillStorage() noexcept
     deepstackFeatures.clear();
     storageOwner.reset();
     return releasedBytes;
+}
+
+size_t phaseVisionRetainedStorageBytes(std::vector<PhaseVisionPayload const*> const& payloads) noexcept
+{
+    size_t bytes{};
+    for (size_t index{}; index < payloads.size(); ++index)
+    {
+        PhaseVisionPayload const* payload = payloads[index];
+        if (payload == nullptr)
+        {
+            continue;
+        }
+        bool storageSeen{};
+        bool mropeSeen{};
+        bool payloadSeen{};
+        for (size_t previous{}; previous < index; ++previous)
+        {
+            PhaseVisionPayload const* other = payloads[previous];
+            if (other != nullptr)
+            {
+                payloadSeen = payloadSeen || other == payload;
+                storageSeen
+                    = storageSeen || (payload->storageOwner != nullptr && payload->storageOwner == other->storageOwner);
+                mropeSeen = mropeSeen
+                    || (payload->mropeStorageOwner != nullptr
+                        && payload->mropeStorageOwner == other->mropeStorageOwner);
+            }
+        }
+        if (payloadSeen)
+        {
+            continue;
+        }
+        auto capacity = [](Tensor const& tensor) {
+            return tensor.isEmpty() ? size_t{} : static_cast<size_t>(tensor.getMemoryCapacity());
+        };
+        if (payload->storageOwner != nullptr)
+        {
+            if (!storageSeen)
+            {
+                bytes += storageByteSize(*payload->storageOwner);
+            }
+        }
+        else
+        {
+            bytes += capacity(payload->outputEmbedding);
+            for (Tensor const& feature : payload->deepstackFeatures)
+            {
+                bytes += capacity(feature);
+            }
+            if (payload->mropeStorageOwner == nullptr)
+            {
+                bytes += capacity(payload->mropeCosSin);
+            }
+        }
+        if (payload->mropeStorageOwner != nullptr && !mropeSeen)
+        {
+            bytes += capacity(payload->mropeStorageOwner->mropeCosSin);
+        }
+    }
+    return bytes;
 }
 
 std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> const& tokenIds, int32_t imageTokenId)
@@ -437,6 +502,12 @@ std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vecto
             resizeTensor(
                 prepared->storage->deepstackFeatures[index], deepstackSpecs[index], "phase_vision_batch_deepstack");
         }
+        size_t preparedBytes = storageByteSize(*prepared->storage);
+        if (prepared->mropeStorage != nullptr && !prepared->mropeStorage->mropeCosSin.isEmpty())
+        {
+            preparedBytes += static_cast<size_t>(prepared->mropeStorage->mropeCosSin.getMemoryCapacity());
+        }
+        mMemoryStats.maxPreparedStorageBytes = std::max(mMemoryStats.maxPreparedStorageBytes, preparedBytes);
         for (std::unique_ptr<PhaseVisionPayload> const& payload : prepared->payloads)
         {
             CUDA_CHECK(cudaEventRecord(payload->preparationReadyEvent, mStream));

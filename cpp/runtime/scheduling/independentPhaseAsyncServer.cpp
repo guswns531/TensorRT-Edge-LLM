@@ -1048,6 +1048,12 @@ PhaseGlobalCostEstimate IndependentPhaseAsyncServer::estimateGlobalPrefillDrainC
     return mCoordinator.scheduler().estimateGlobalPrefillDrainCost(batchSize, promptTokens, prefillClass);
 }
 
+void IndependentPhaseAsyncServer::setChunkedVisionPrefill(bool enabled)
+{
+    ELLM_CHECK(empty() && !mCoordinator.busy(), "Vision chunk mode can change only while the server is idle");
+    mConfig.allowChunkedVisionPrefill = enabled;
+}
+
 std::optional<float> IndependentPhaseAsyncServer::estimateGlobalDecodeComponentP95(
     int32_t batchSize, int32_t maxContextLength, bool prefillActive) const
 {
@@ -1152,10 +1158,7 @@ bool IndependentPhaseAsyncServer::shouldWaitForGlobalDecodeRefill()
     size_t pendingDecodeRows{};
     for (auto const& ticket : mSamplingTickets)
     {
-        if (!ticket->fromPrefill)
-        {
-            pendingDecodeRows += ticket->requestIds.size();
-        }
+        pendingDecodeRows += ticket->requestIds.size();
     }
     bool const retainGrowthCohort = mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom
         && !mPageGrowthRequestIds.empty();
@@ -1214,10 +1217,6 @@ std::vector<PhaseDecodeCompletionPreview> IndependentPhaseAsyncServer::previewPe
     double cumulativeP95Us{};
     for (auto const& ticket : mSamplingTickets)
     {
-        if (ticket->fromPrefill)
-        {
-            continue;
-        }
         double const ageUs = ticket->submittedAt == std::chrono::steady_clock::time_point{}
             ? 0.0
             : std::chrono::duration<double, std::micro>(now - ticket->submittedAt).count();
@@ -1670,6 +1669,30 @@ size_t IndependentPhaseAsyncServer::visionPayloadBytes() const noexcept
     return result;
 }
 
+size_t IndependentPhaseAsyncServer::visionRetainedStorageBytes(
+    std::vector<PhaseVisionPayload const*> payloads) const noexcept
+{
+    for (auto const& request : mRequests)
+    {
+        if (request.second.visionPayload != nullptr)
+        {
+            payloads.push_back(request.second.visionPayload.get());
+        }
+        if (request.second.pendingVisionPayload != nullptr)
+        {
+            payloads.push_back(request.second.pendingVisionPayload.get());
+        }
+    }
+    for (PendingRequest const& request : mPendingRequests)
+    {
+        if (request.visionPayload != nullptr)
+        {
+            payloads.push_back(request.visionPayload.get());
+        }
+    }
+    return phaseVisionRetainedStorageBytes(payloads);
+}
+
 size_t IndependentPhaseAsyncServer::visionPayloadBytes(std::vector<uint64_t> const& requestIds) const noexcept
 {
     size_t result{};
@@ -1679,6 +1702,20 @@ size_t IndependentPhaseAsyncServer::visionPayloadBytes(std::vector<uint64_t> con
         if (request != mRequests.end() && request->second.visionPayload != nullptr)
         {
             result += request->second.visionPayload->byteSize();
+        }
+    }
+    return result;
+}
+
+size_t IndependentPhaseAsyncServer::visionPrefillReleaseBytes(std::vector<uint64_t> const& requestIds) const noexcept
+{
+    size_t result{};
+    for (uint64_t const requestId : requestIds)
+    {
+        auto const request = mRequests.find(requestId);
+        if (request != mRequests.end() && request->second.visionPayload != nullptr)
+        {
+            result += request->second.visionPayload->prefillReleaseByteSize();
         }
     }
     return result;

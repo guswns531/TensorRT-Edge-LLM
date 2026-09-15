@@ -601,6 +601,81 @@ PhaseFormationTwoBoundaryResult phaseFormationEvaluateCompletionBoundaries(
     return result;
 }
 
+PhaseEncoderTransitionPreview phaseFormationPreviewEncoderTransition(std::vector<PhaseFormationRequestState> requests,
+    std::vector<uint64_t> encoderRequestIds, std::vector<uint64_t> existingDecodeRequestIds, double encoderCompletionUs,
+    double prefillDurationUs, double decodeDurationUs, double encoderUncertaintyUs, double prefillUncertaintyUs,
+    double decodeUncertaintyUs) noexcept
+{
+    PhaseEncoderTransitionPreview result;
+    if (encoderRequestIds.empty() || !std::isfinite(encoderCompletionUs) || encoderCompletionUs < 0.0
+        || !std::isfinite(prefillDurationUs) || prefillDurationUs < 0.0 || !std::isfinite(decodeDurationUs)
+        || decodeDurationUs < 0.0)
+    {
+        return result;
+    }
+    double const prefillCompletionUs = encoderCompletionUs + prefillDurationUs;
+    if (!std::isfinite(prefillCompletionUs))
+    {
+        return result;
+    }
+    std::vector<PhaseFormationPhysicalCompletion> producerCompletions{
+        {PhaseGlobalActionKind::kEncoder, encoderRequestIds, encoderCompletionUs, std::max(0.0, encoderUncertaintyUs)},
+        {PhaseGlobalActionKind::kPrefill, encoderRequestIds, prefillCompletionUs,
+            std::max(0.0, encoderUncertaintyUs) + std::max(0.0, prefillUncertaintyUs)},
+    };
+    PhaseFormationTwoBoundaryResult producer
+        = phaseFormationEvaluateCompletionBoundaries(std::move(requests), std::move(producerCompletions));
+    if (!producer.feasible)
+    {
+        return result;
+    }
+
+    std::vector<uint64_t> successorDecodeIds = producer.second.decodeRequestIds;
+    std::sort(existingDecodeRequestIds.begin(), existingDecodeRequestIds.end());
+    existingDecodeRequestIds.erase(
+        std::unique(existingDecodeRequestIds.begin(), existingDecodeRequestIds.end()), existingDecodeRequestIds.end());
+    for (uint64_t const requestId : existingDecodeRequestIds)
+    {
+        if (!std::binary_search(successorDecodeIds.begin(), successorDecodeIds.end(), requestId))
+        {
+            return result;
+        }
+    }
+    if (successorDecodeIds.empty())
+    {
+        return result;
+    }
+
+    double const decodeCompletionUs = prefillCompletionUs + decodeDurationUs;
+    if (!std::isfinite(decodeCompletionUs))
+    {
+        return result;
+    }
+    std::vector<PhaseFormationPhysicalCompletion> decodeCompletions{
+        {PhaseGlobalActionKind::kDecode, successorDecodeIds, decodeCompletionUs,
+            std::max(0.0, encoderUncertaintyUs) + std::max(0.0, prefillUncertaintyUs)
+                + std::max(0.0, decodeUncertaintyUs)},
+    };
+    PhaseFormationTwoBoundaryResult successor = phaseFormationEvaluateCompletionBoundaries(
+        std::move(producer.successorRequests), std::move(decodeCompletions));
+    if (!successor.feasible)
+    {
+        return result;
+    }
+
+    result.feasible = true;
+    result.encoderRows = encoderRequestIds.size();
+    result.existingDecodeRows = existingDecodeRequestIds.size();
+    result.successorDecodeRows = successorDecodeIds.size();
+    result.prefillReadyUs = producer.first.completionUs;
+    result.decodeReadyUs = producer.second.completionUs;
+    result.decodeCompleteUs = successor.first.completionUs;
+    result.uncertaintyUs = successor.first.uncertaintyUs;
+    result.releasedVisionBytes = producer.second.releasedVisionBytes;
+    result.releasedKvBytes = successor.first.releasedKvBytes;
+    return result;
+}
+
 PhaseFormationRealizedTracker::PhaseFormationRealizedTracker(PhaseFormationRealizedTrackerConfig config)
     : mConfig(config)
 {

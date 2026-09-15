@@ -60,6 +60,7 @@ struct PhaseVisionMemoryStats
     size_t deviceCopyBytes{};
     size_t idleStorageBatches{};
     size_t idleStorageBytes{};
+    size_t maxPreparedStorageBytes{};
 };
 
 //! Incremental row interval required when staging request-owned M-RoPE data.
@@ -83,6 +84,8 @@ struct PhaseVisionPayload
 
     size_t byteSize() const noexcept;
     size_t prefillByteSize() const noexcept;
+    //! Logical bytes whose views final prefill can release; shared physical storage may outlive those views.
+    size_t prefillReleaseByteSize() const noexcept;
     size_t releasePrefillStorage() noexcept;
 
     std::vector<std::vector<int32_t>> tokenIds;
@@ -102,6 +105,9 @@ struct PhaseVisionPayload
     cudaEvent_t encoderStartEvent{};
     cudaEvent_t readyEvent{};
 };
+
+//! Count retained physical slabs once, including slabs whose other rows have already released their views.
+size_t phaseVisionRetainedStorageBytes(std::vector<PhaseVisionPayload const*> const& payloads) noexcept;
 
 //! One logical request submitted as part of a shared vision-encoder batch.
 struct PhaseVisionSubmission

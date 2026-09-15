@@ -51,12 +51,14 @@ struct PhaseServingRuntimeConfig
     size_t maxPendingRequests{};
     int32_t maxPrefillChunkTokens{128};
     int32_t maxPrefillBatchTokens{};
+    bool enablePrefillCohortRefill{};
     bool enableCudaGraphs{true};
     bool enablePersistentDecodeSelect{true};
     bool enablePersistentPageBindings{true};
     bool sharedExecutionContext{};
     size_t maxEncodedVisionRequests{};
     size_t maxEncodedVisionBytes{};
+    bool enableLifetimeEncodedAdmission{};
     size_t maxEncoderBatchSize{};
     size_t maxEncoderMediaItems{};
     size_t maxEncoderInputBytes{};

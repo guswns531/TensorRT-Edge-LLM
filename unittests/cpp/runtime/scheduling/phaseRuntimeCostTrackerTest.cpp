@@ -259,6 +259,15 @@ TEST(PhaseContextualPairModelTest, BatchFeaturesUseRuntimeCapacities)
     EXPECT_LT(widerFeatures[6], fullFeatures[6]);
 }
 
+TEST(PhaseContextualPairModelTest, GraphVariantsSharePolicyFeatures)
+{
+    PhaseContextualPdInput eager{4000.0, 8000.0, 100000.0, 4, 32, 128, 1, 2, PhaseExecutionVariant::kEager};
+    PhaseContextualPdInput graph = eager;
+    graph.executionVariant = PhaseExecutionVariant::kBothGraph;
+
+    EXPECT_EQ(phaseContextualPdFeatures(eager), phaseContextualPdFeatures(graph));
+}
+
 TEST(PhaseContextualPairModelTest, KeepsEncoderPrefillAndDecodeEvidenceIndependent)
 {
     PhaseRuntimeCostTrackerConfig config;

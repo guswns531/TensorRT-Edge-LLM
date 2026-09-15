@@ -121,6 +121,7 @@ PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& s
     config.enablePackedPrefillTokenLayout = engine.packedPrefill;
     config.prefillCompletionBonusTokens = config.maxPrefillChunkTokens;
     config.enableWavefrontPrefillBatching = true;
+    config.enablePrefillCohortRefill = serving.enablePrefillCohortRefill;
     config.maxPrefillCohortSize = config.maxPrefillBatchSize;
     config.enableMetricsPolicy = true;
     config.elideVacuousGlobalDecisions = true;
@@ -178,6 +179,7 @@ PhaseThreeCoordinatorConfig makeVisionConfig(PhaseServingRuntimeConfig const& se
     config.maxEncodedInFlight
         = serving.maxEncodedVisionRequests > 0 ? serving.maxEncodedVisionRequests : static_cast<size_t>(maxStableSlots);
     config.maxEncodedBytes = serving.maxEncodedVisionBytes;
+    config.enableLifetimeEncodedAdmission = serving.enableLifetimeEncodedAdmission;
     config.maxEncoderBatchSize = serving.maxEncoderBatchSize > 0
         ? serving.maxEncoderBatchSize
         : static_cast<size_t>(engine.maxSupportedPrefillBatchSize);
@@ -382,13 +384,14 @@ public:
             schedulerConfig.maxExternalPrefillBatchSize = schedulerConfig.maxPrefillBatchSize;
         }
         std::shared_ptr<PhaseRuntimeCostTracker> runtimeCostTracker = schedulerConfig.runtimeCostTracker;
-        schedulerConfig.globalMemoryHorizonSupplier = [this](
-                                                          PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
-            PhaseActionMemoryHorizon horizon;
-            horizon.managedBytes = static_cast<size_t>(mOwnership->config().numPages - mOwnership->availablePages());
-            horizon.budgetBytes = static_cast<size_t>(mOwnership->config().numPages);
-            return horizon;
-        };
+        schedulerConfig.globalMemoryHorizonSupplier
+            = [this](PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
+                  PhaseActionMemoryHorizon horizon;
+                  horizon.managedBytes
+                      = static_cast<size_t>(mOwnership->config().allocatablePages - mOwnership->availablePages());
+                  horizon.budgetBytes = static_cast<size_t>(mOwnership->config().allocatablePages);
+                  return horizon;
+              };
         IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
         mCoordinator = std::make_unique<IndependentPhaseCoordinator>(phaseEngineConfig, std::move(schedulerConfig),

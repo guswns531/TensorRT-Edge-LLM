@@ -176,6 +176,7 @@ struct PhaseDispatchMetrics
     int32_t plannedDecodeMaxContextLength{};
     int32_t predictedDecodeReplacementRows{};
     int32_t prefillCohortSize{};
+    int32_t prefillCohortRefillRows{};
     int32_t decodeCohortSize{};
     int32_t decodeTokens{};
     int32_t decodeContextTokens{};
@@ -526,6 +527,8 @@ struct PhaseQueueSchedulerConfig
     double maxPredictedDecodeDebtUs{50000.0};
     //! Keep a bounded set of requests advancing at similar chunk frontiers.
     bool enableWavefrontPrefillBatching{};
+    //! Admit compatible ready rows into an underfilled live wavefront.
+    bool enablePrefillCohortRefill{};
     int32_t maxPrefillCohortSize{8};
     int32_t maxPrefillCohortTurns{8};
     float decodeSlackSafetyFactor{0.8F};
@@ -627,9 +630,9 @@ struct PhaseQueueSchedulerConfig
     PhaseQueueResourceSupplier resourceSupplier{};
 };
 
-//! One concrete sampling completion horizon. Request IDs are stable ownership
-//! identities expected to re-enter decode after this event. For an ordered
-//! decode stream, later previews may contain the cumulative earlier cohorts.
+//! One concrete sampling completion horizon. A final prefill or decode result
+//! can produce the next decode row; both are stable ownership identities. For
+//! an ordered sampling stream, later previews may contain cumulative cohorts.
 struct PhaseDecodeCompletionPreview
 {
     uint64_t eventId{};
@@ -683,6 +686,7 @@ struct PhaseDispatchPlan
     float adaptiveChunkObservedTpotPressure{};
     float adaptiveChunkCombinedPressure{};
     int32_t prefillCohortSize{};
+    int32_t prefillCohortRefillRows{};
     PhaseDrainPreference drainPreference{PhaseDrainPreference::kNone};
     bool drainPreferenceApplied{};
     bool globalDecisionEvaluated{};

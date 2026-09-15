@@ -45,6 +45,7 @@ public:
         int32_t numPages{};
         int32_t maxSequenceLength{};
         int32_t tokensPerPage{128};
+        int32_t allocatablePages{0}; //!< Zero exposes the full physical pool; never changes the K/V binding stride.
     };
     //! \endcond
 
@@ -88,6 +89,9 @@ public:
     int32_t availablePages() const noexcept;
     int32_t maxPagesPerSequence() const noexcept;
     Config const& config() const noexcept;
+
+    //! Change the host allocation budget only when no stable leases remain.
+    void setAllocationBudget(int32_t pages);
 
 private:
     void validateSlot(int32_t stableSlot) const;

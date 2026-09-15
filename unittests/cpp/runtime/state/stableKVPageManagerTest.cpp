@@ -33,6 +33,71 @@ rt::StableKVPageManager makeManager(int32_t pages = 12)
 
 } // namespace
 
+TEST(StableKVPageManagerTest, AllocationBudgetDefaultsToPhysicalCapacity)
+{
+    auto manager = makeManager();
+    EXPECT_EQ(manager.config().allocatablePages, 12);
+    EXPECT_EQ(manager.availablePages(), 12);
+}
+
+TEST(StableKVPageManagerTest, AllocationBudgetExhaustionAndReusePreservePhysicalStride)
+{
+    rt::StableKVPageManager manager({4, 3, 12, 512, 128, 4});
+    int32_t const source = manager.reserve();
+    int32_t const target = manager.reserve();
+    manager.ensureCapacity(source, 384);
+    manager.ensureCapacity(target, 128);
+    EXPECT_EQ(manager.availablePages(), 0);
+    EXPECT_THROW(manager.ensureCapacity(target, 256), std::runtime_error);
+    EXPECT_EQ(manager.pages(target), (std::vector<int32_t>{3}));
+    EXPECT_EQ(manager.config().numPages, 12);
+
+    rt::KVPageTable pageTable(3, 4, 12);
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    EXPECT_TRUE(manager.bindActiveRows({target, source}, pageTable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    EXPECT_EQ(pageTable.hostRow(0)[0], 3);
+    EXPECT_EQ(pageTable.hostRow(0)[4], 15);
+    EXPECT_EQ(pageTable.hostRow(1)[4], 12);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    manager.release(source);
+    EXPECT_EQ(manager.availablePages(), 3);
+    manager.ensureCapacity(target, 256);
+    EXPECT_EQ(manager.pages(target), (std::vector<int32_t>{3, 0}));
+    manager.release(target);
+    EXPECT_EQ(manager.availablePages(), 4);
+}
+
+TEST(StableKVPageManagerTest, BudgetChangesRequireAllLeasesReleased)
+{
+    auto manager = makeManager();
+    int32_t const slot = manager.reserve();
+    EXPECT_THROW(manager.setAllocationBudget(4), std::runtime_error);
+    manager.ensureCapacity(slot, 128);
+    EXPECT_THROW(manager.setAllocationBudget(4), std::runtime_error);
+    EXPECT_EQ(manager.availablePages(), 11);
+    manager.release(slot);
+    manager.setAllocationBudget(4);
+    EXPECT_EQ(manager.availablePages(), 4);
+    EXPECT_EQ(manager.config().numPages, 12);
+    manager.setAllocationBudget(12);
+    EXPECT_EQ(manager.availablePages(), 12);
+    EXPECT_THROW(manager.setAllocationBudget(13), std::runtime_error);
+    EXPECT_EQ(manager.availablePages(), 12);
+}
+
+TEST(StableKVPageManagerTest, RejectsInvalidAllocationBudgets)
+{
+    rt::StableKVPageManager::Config config{4, 3, 12, 512, 128, -1};
+    EXPECT_THROW(rt::StableKVPageManager{config}, std::runtime_error);
+    config.allocatablePages = 13;
+    EXPECT_THROW(rt::StableKVPageManager{config}, std::runtime_error);
+    config.allocatablePages = 3;
+    EXPECT_THROW(rt::StableKVPageManager{config}, std::runtime_error);
+}
+
 TEST(StableKVPageManagerTest, ReusesReleasedSlotsAndPagesDeterministically)
 {
     auto manager = makeManager();

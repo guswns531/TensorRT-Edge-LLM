@@ -114,8 +114,6 @@ PhaseContextualPdFeatures phaseContextualPairFeatures(PhaseContextualPairInput c
     double const maximumUs = std::max({1.0, primaryUs, secondaryUs});
     double const minimumUs = std::min(primaryUs, secondaryUs);
     double const slackRatio = clampFinite(input.minimumSlackUs / serialUs, -4.0, 8.0);
-    bool const primaryGraph = phaseExecutionVariantUsesPrimaryGraph(input.executionVariant);
-    bool const secondaryGraph = phaseExecutionVariantUsesSecondaryGraph(input.executionVariant);
     double const primaryBatchDenominator = std::log1p(std::max(1, input.primaryBatchCapacity));
     double const secondaryBatchDenominator = std::log1p(std::max(1, input.secondaryBatchCapacity));
     double const primaryBatchFill
@@ -130,8 +128,7 @@ PhaseContextualPdFeatures phaseContextualPairFeatures(PhaseContextualPairInput c
         clampFinite(static_cast<double>(std::max(0, input.primaryContextBucket)) / 4.0, 0.0, 4.0),
         clampFinite(static_cast<double>(std::max(0, input.secondaryContextBucket)) / 4.0, 0.0, 4.0), slackRatio / 8.0,
         input.residualAugmentation ? 1.0 : 0.0, input.residualAnchor == PhaseGlobalResidualAnchor::kPrefill ? 1.0 : 0.0,
-        input.residualAnchor == PhaseGlobalResidualAnchor::kDecode ? 1.0 : 0.0, primaryGraph ? 1.0 : 0.0,
-        secondaryGraph ? 1.0 : 0.0};
+        input.residualAnchor == PhaseGlobalResidualAnchor::kDecode ? 1.0 : 0.0};
 }
 
 double phaseContextualDecisionMakespanUs(double referenceWorkUs, double conservativeAdvantage) noexcept

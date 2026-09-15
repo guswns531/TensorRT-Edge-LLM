@@ -22,8 +22,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <set>
 #include <thread>
 
@@ -3188,6 +3190,86 @@ TEST(PhaseQueueSchedulerTest, WavefrontKeepsARequestCohortAcrossChunks)
     EXPECT_EQ(second.prefillBatch[0].tokenOffset, 128);
 }
 
+TEST(PhaseQueueSchedulerTest, SmallWavefrontCohortExcludesLaterCompatibleContinuations)
+{
+    for (bool const wavefront : {false, true})
+    {
+        PhaseQueueSchedulerConfig config;
+        config.maxPrefillBatchSize = 4;
+        config.maxPrefillChunkTokens = 128;
+        config.enableWavefrontPrefillBatching = wavefront;
+        config.maxPrefillCohortSize = 4;
+        config.maxPrefillCohortTurns = 8;
+        PhaseQueueScheduler scheduler(config);
+        scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+        PhaseDispatchPlan const first = scheduler.next();
+        ASSERT_EQ(first.prefillBatch.size(), 1U);
+        scheduler.completePrefill(first.prefillBatch.front(), 128);
+        for (uint64_t requestId = 2; requestId <= 4; ++requestId)
+        {
+            scheduler.enqueuePrefill({requestId, 384, static_cast<int32_t>(requestId - 1), 128, 512});
+        }
+        PhaseDispatchPlan const second = scheduler.next();
+        EXPECT_EQ(second.prefillBatch.size(), wavefront ? 1U : 4U);
+        if (wavefront)
+        {
+            EXPECT_EQ(second.prefillBatch.front().requestId, 1U);
+            EXPECT_EQ(second.prefillCohortSize, 1);
+        }
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, WavefrontRefillAdmitsCompatibleContinuations)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.enableWavefrontPrefillBatching = true;
+    config.enablePrefillCohortRefill = true;
+    config.maxPrefillCohortSize = 4;
+    config.maxPrefillCohortTurns = 8;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 512, 0, 0, 512});
+
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 1U);
+    scheduler.completePrefill(first.prefillBatch.front(), 128);
+    for (uint64_t requestId = 2; requestId <= 4; ++requestId)
+    {
+        scheduler.enqueuePrefill({requestId, 384, static_cast<int32_t>(requestId - 1), 128, 512});
+    }
+
+    PhaseDispatchPlan const second = scheduler.next();
+    ASSERT_EQ(second.prefillBatch.size(), 4U);
+    EXPECT_EQ(second.prefillCohortSize, 4);
+    EXPECT_EQ(second.prefillCohortRefillRows, 3);
+    EXPECT_TRUE(std::all_of(second.prefillBatch.begin(), second.prefillBatch.end(),
+        [](PhaseWorkItem const& item) { return item.tokenOffset == 128; }));
+}
+
+TEST(PhaseQueueSchedulerTest, RaggedPrefillWithoutWavefrontKeepsProducerClassesSeparate)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxPrefillChunkTokens = 128;
+    config.maxPrefillBatchTokens = 512;
+    config.enableRaggedPrefillBatching = true;
+    PhaseQueueScheduler scheduler(config);
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        PhaseWorkItem item{requestId, 128, static_cast<int32_t>(requestId - 1), 0, 128};
+        item.prefillClass = requestId % 2 == 0 ? PhasePrefillClass::kExternal : PhasePrefillClass::kText;
+        scheduler.enqueuePrefill(item);
+    }
+    PhaseDispatchPlan const first = scheduler.next();
+    ASSERT_EQ(first.prefillBatch.size(), 2U);
+    PhasePrefillClass const producer = first.prefillBatch.front().prefillClass;
+    for (PhaseWorkItem const& item : first.prefillBatch)
+    {
+        EXPECT_EQ(item.prefillClass, producer);
+    }
+}
+
 TEST(PhaseQueueSchedulerTest, DynamicPrefillUsesLargestBatchInsideDecodeSlack)
 {
     PhaseQueueSchedulerConfig config;
@@ -3648,6 +3730,48 @@ TEST(PhaseMemoryBrokerTest, PreservesCandidateBatchWhileDisabled)
     EXPECT_FALSE(decision.reclaimIdleVision);
 }
 
+TEST(PhaseMemoryBrokerTest, LifetimeReservationsUseBytesRatherThanRequestCount)
+{
+    EXPECT_EQ(phaseVisionReservationPrefix(20, 10, 100, {10, 20, 40, 1}), 3U);
+    EXPECT_EQ(phaseVisionReservationPrefix(0, 0, 100, {101}), 0U);
+    EXPECT_EQ(phaseVisionReservationPrefix(0, 100, 100, {1}), 0U);
+    EXPECT_EQ(phaseVisionReservationPrefix(0, 0, 100, {0, 10}), 0U);
+    EXPECT_EQ(phaseVisionReservationPrefix(101, 0, 100, {1}), 0U);
+    EXPECT_EQ(phaseVisionReservationPrefix(100, 0, 100, {}), 0U);
+}
+
+TEST(PhaseMemoryBrokerTest, ReleasedPrefillCreditDoesNotReleaseDecodeMropeCredit)
+{
+    EXPECT_EQ(phaseVisionReservationPrefix(70, 0, 100, {40}), 0U);
+    EXPECT_EQ(phaseVisionReservationPrefix(20, 0, 100, {40, 40}), 2U);
+    EXPECT_EQ(phaseVisionReservationPrefix(20, 30, 100, {40, 40}), 1U);
+}
+
+TEST(PhaseMemoryBrokerTest, LifetimeReservationArithmeticDoesNotWrap)
+{
+    size_t const maximum = std::numeric_limits<size_t>::max();
+    EXPECT_EQ(phaseVisionReservationPrefix(maximum - 1U, 10, maximum, {1}), 0U);
+    EXPECT_EQ(phaseVisionReservationPrefix(0, 0, maximum, {maximum, 1}), 1U);
+}
+
+TEST(PhaseMemoryBrokerTest, RetainedPayloadAccountingDeduplicatesAndRetainsLegacyMrope)
+{
+    std::array<uint16_t, 16> embedding{};
+    std::array<float, 16> mrope{};
+    PhaseVisionPayload payload;
+    payload.outputEmbedding
+        = Tensor(embedding.data(), Coords{4, 4}, DeviceType::kCPU, nvinfer1::DataType::kHALF, "test_vision_view");
+    EXPECT_EQ(phaseVisionRetainedStorageBytes({&payload, nullptr, &payload}), sizeof(embedding));
+    EXPECT_EQ(payload.releasePrefillStorage(), sizeof(embedding));
+    EXPECT_EQ(phaseVisionRetainedStorageBytes({&payload}), 0U);
+    payload.outputEmbedding
+        = Tensor(embedding.data(), Coords{4, 4}, DeviceType::kCPU, nvinfer1::DataType::kHALF, "test_vision_view");
+    payload.mropeCosSin
+        = Tensor(mrope.data(), Coords{4, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "test_mrope_view");
+    EXPECT_EQ(payload.releasePrefillStorage(), 0U);
+    EXPECT_EQ(phaseVisionRetainedStorageBytes({&payload}), sizeof(embedding) + sizeof(mrope));
+}
+
 TEST(PhaseMemoryBrokerTest, ContractsAndBlocksEncoderAtKVWatermarks)
 {
     PhaseMemoryBrokerConfig config;
@@ -4082,6 +4206,7 @@ TEST(PhaseThreeCoordinatorPolicyTest, RetainsLegacyVisionSlabForMrope)
 
     EXPECT_EQ(payload.prefillByteSize(), 64U);
     EXPECT_EQ(payload.byteSize(), 96U);
+    EXPECT_EQ(payload.prefillReleaseByteSize(), 0U);
     EXPECT_EQ(payload.releasePrefillStorage(), 0U);
     EXPECT_FALSE(payload.outputEmbedding.isEmpty());
     EXPECT_FALSE(payload.deepstackFeatures.empty());
@@ -4096,6 +4221,7 @@ TEST(PhaseThreeCoordinatorPolicyTest, ReleasesNonMropePrefillVisionStorage)
 
     EXPECT_EQ(payload.prefillByteSize(), 64U);
     EXPECT_EQ(payload.byteSize(), 64U);
+    EXPECT_EQ(payload.prefillReleaseByteSize(), 64U);
     EXPECT_EQ(payload.releasePrefillStorage(), 64U);
     EXPECT_TRUE(payload.outputEmbedding.isEmpty());
     EXPECT_TRUE(payload.deepstackFeatures.empty());

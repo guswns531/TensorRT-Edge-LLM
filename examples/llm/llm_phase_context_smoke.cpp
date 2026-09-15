@@ -860,8 +860,14 @@ int main(int argc, char** argv)
         }
         int32_t const maxPhaseBatch = std::max(config.maxSupportedPrefillBatchSize, decodeBatchCapacity);
         ELLM_CHECK(maxStableSlots >= maxPhaseBatch, "Stable slot capacity must cover the largest phase batch");
+        int32_t allocatableKVPages{};
+        if (char const* value = std::getenv("TRT_EDGELLM_ALLOCATABLE_KV_PAGES"))
+        {
+            allocatableKVPages = std::stoi(value);
+        }
         rt::StableKVPageManager ownership(
-            {maxStableSlots, maxPhaseBatch, config.kvPoolPages, config.maxKVCacheCapacity, 128});
+            {maxStableSlots, maxPhaseBatch, config.kvPoolPages, config.maxKVCacheCapacity, 128, allocatableKVPages});
+        LOG_INFO("KV pool: physical=%d allocatable=%d pages", config.kvPoolPages, ownership.config().allocatablePages);
         bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
         if (!semanticOnly)
         {
@@ -1806,8 +1812,9 @@ int main(int argc, char** argv)
                 = [&ownership](rt::PhaseGlobalActionKey const&, std::vector<uint64_t> const&) {
                       rt::StableKVPageManager::Config const& ownershipConfig = ownership.config();
                       rt::PhaseActionMemoryHorizon horizon;
-                      horizon.managedBytes = static_cast<size_t>(ownershipConfig.numPages - ownership.availablePages());
-                      horizon.budgetBytes = static_cast<size_t>(ownershipConfig.numPages);
+                      horizon.managedBytes
+                          = static_cast<size_t>(ownershipConfig.allocatablePages - ownership.availablePages());
+                      horizon.budgetBytes = static_cast<size_t>(ownershipConfig.allocatablePages);
                       // Request admission and growth-owner leases reserve physical
                       // pages before a phase becomes runnable, so dispatch itself
                       // introduces no unreserved KV allocation here.
@@ -2510,6 +2517,8 @@ int main(int argc, char** argv)
                 {
                     threePhaseConfig.maxEncodedBytes = static_cast<size_t>(std::stoull(value));
                 }
+                threePhaseConfig.enableLifetimeEncodedAdmission
+                    = std::getenv("TRT_EDGELLM_LIFETIME_ENCODED_ADMISSION") != nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE"))
                 {
                     threePhaseConfig.maxEncoderBatchSize = static_cast<size_t>(std::stoul(value));
@@ -3307,9 +3316,7 @@ int main(int argc, char** argv)
                             ++ingestedLines;
                             continue;
                         }
-                        if (serverConfig.enableCudaGraphs
-                            && std::getenv("TRT_EDGELLM_CAPTURE_CALIBRATION_GRAPHS") != nullptr
-                            && input.kind != PhaseIpcKind::kCalibrationStatus)
+                        if (serverConfig.enableCudaGraphs && input.kind != PhaseIpcKind::kCalibrationStatus)
                         {
                             semanticCoordinator.setGraphCaptureEnabled(
                                 active || std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") != nullptr);
@@ -3449,11 +3456,66 @@ int main(int argc, char** argv)
                             {
                                 semanticCoordinator.scheduler().resetPolicyPosterior();
                             }
+                            if (char const* value = std::getenv("TRT_EDGELLM_MEASUREMENT_KV_PAGES"))
+                            {
+                                ownership.setAllocationBudget(std::stoi(value));
+                                LOG_INFO("Measurement KV pool: physical=%d allocatable=%d pages",
+                                    ownership.config().numPages, ownership.config().allocatablePages);
+                            }
                             ++measurementEpoch;
                             diagnosticMeasurement = diagnosticLogitDir != nullptr;
                             diagnosticVisionDumped = false;
                             if (ipcThreePhase != nullptr)
                             {
+                                if (char const* value = std::getenv("TRT_EDGELLM_MEASUREMENT_ENCODER_PREPARATION_ROWS"))
+                                {
+                                    size_t const rows = static_cast<size_t>(std::stoull(value));
+                                    ipcThreePhase->setEncoderPreparationBatchLimit(rows);
+                                    LOG_INFO("Measurement encoder preparation rows: %zu; physical capability unchanged",
+                                        rows);
+                                }
+                                if (char const* value
+                                    = std::getenv("TRT_EDGELLM_MEASUREMENT_ENCODER_PREPARATION_POLICY"))
+                                {
+                                    std::string const mode(value);
+                                    ELLM_CHECK(mode == "shadow" || mode == "transition-shadow" || mode == "active",
+                                        "Measurement encoder preparation policy must be shadow, transition-shadow or "
+                                        "active");
+                                    rt::PhaseEncoderPreparationPolicyMode policyMode
+                                        = rt::PhaseEncoderPreparationPolicyMode::kShadow;
+                                    if (mode == "transition-shadow")
+                                    {
+                                        policyMode = rt::PhaseEncoderPreparationPolicyMode::kTransitionShadow;
+                                    }
+                                    else if (mode == "active")
+                                    {
+                                        policyMode = rt::PhaseEncoderPreparationPolicyMode::kActive;
+                                    }
+                                    ipcThreePhase->setEncoderPreparationPolicyMode(policyMode);
+                                    LOG_INFO("Measurement encoder preparation policy: %s", mode.c_str());
+                                }
+                                if (char const* value = std::getenv("TRT_EDGELLM_MEASUREMENT_CHUNKED_VISION_PREFILL"))
+                                {
+                                    ELLM_CHECK(config.packedPrefill && std::string(value) == "1",
+                                        "Measurement vision chunking requires packed prefill and value 1");
+                                    semanticServer.setChunkedVisionPrefill(true);
+                                    LOG_INFO("Measurement vision prefill: chunked with configured text chunk limit");
+                                }
+                                if (char const* value = std::getenv("TRT_EDGELLM_MEASUREMENT_ENCODED_ADMISSION"))
+                                {
+                                    std::string const mode(value);
+                                    ELLM_CHECK(mode == "lifetime" || mode == "static" || mode == "ownership",
+                                        "Measurement encoded admission must be lifetime, static or ownership");
+                                    size_t staticCapacity{};
+                                    if (char const* capacity = std::getenv("TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY"))
+                                    {
+                                        staticCapacity = static_cast<size_t>(std::stoull(capacity));
+                                    }
+                                    ipcThreePhase->setEncodedAdmissionMode(
+                                        mode != "static", staticCapacity, mode == "ownership");
+                                    LOG_INFO("Measurement encoded admission: mode=%s budget_bytes=%zu", value,
+                                        ipcThreePhase->metrics().encodedAdmissionBudgetBytes);
+                                }
                                 ipcThreePhase->resetGlobalDecisionCostTelemetry();
                             }
                             emittedMetrics = semanticCoordinator.metrics().size();
@@ -3656,6 +3718,8 @@ int main(int argc, char** argv)
                         {"prefill_chunk_length", metrics.prefillCostLookupChunkLength},
                         {"prefill_initial_rows", metrics.prefillInitialRows},
                         {"prefill_continuation_rows", metrics.prefillContinuationRows},
+                        {"prefill_cohort_size", metrics.prefillCohortSize},
+                        {"prefill_cohort_refill_rows", metrics.prefillCohortRefillRows},
                         {"prefill_past_kv_max", metrics.prefillPastKVMax}, {"decode_tokens", metrics.decodeTokens},
                         {"prefill_gpu_ms", metrics.prefillGpuMs},
                         {"prefill_completion_ms", metrics.prefillCompletionMs},
@@ -3922,8 +3986,13 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().encoderContendedDecodeCostSampleCount},
                         {"prefill_contended_decode_cost_samples",
                             semanticCoordinator.scheduler().telemetry().prefillContendedDecodeCostSampleCount},
-                        {"prefill_graph_hits", prefillGraphs.hits}, {"prefill_graph_misses", prefillGraphs.misses},
-                        {"decode_graph_hits", decodeGraphs.hits}, {"decode_graph_misses", decodeGraphs.misses},
+                        {"prefill_graph_entries", prefillGraphs.entries}, {"prefill_graph_hits", prefillGraphs.hits},
+                        {"prefill_graph_misses", prefillGraphs.misses},
+                        {"prefill_graph_captures", prefillGraphs.captures},
+                        {"prefill_graph_evictions", prefillGraphs.evictions},
+                        {"decode_graph_entries", decodeGraphs.entries}, {"decode_graph_hits", decodeGraphs.hits},
+                        {"decode_graph_misses", decodeGraphs.misses}, {"decode_graph_captures", decodeGraphs.captures},
+                        {"decode_graph_evictions", decodeGraphs.evictions},
                         {"sampling_event_slots", samplingSlotPool.size()},
                         {"sampling_event_reuses", samplingSlotPool.reuseCount()},
                         {"vision_pending", visionMetrics.pendingVisionRequests},
@@ -3938,6 +4007,12 @@ int main(int argc, char** argv)
                         {"vision_encoded_capacity_escalations", visionMetrics.lookaheadEscalations},
                         {"vision_encoded_capacity_contractions", visionMetrics.encodedCapacityContractions},
                         {"vision_encoded_capacity_dwell_blocks", visionMetrics.encodedCapacityDwellBlocks},
+                        {"vision_lifetime_admission", visionMetrics.lifetimeEncodedAdmission},
+                        {"vision_admission_budget_bytes", visionMetrics.encodedAdmissionBudgetBytes},
+                        {"vision_admission_reserved_bytes", visionMetrics.encodedAdmissionReservedBytes},
+                        {"vision_admission_retained_bytes", visionMetrics.encodedAdmissionRetainedBytes},
+                        {"vision_admission_byte_blocks", visionMetrics.encodedAdmissionByteBlocks},
+                        {"vision_release_aware_memory_scoring", visionMetrics.releaseAwareMemoryScoring},
                         {"vision_decode_tpot_pressure", visionMetrics.decodeTpotPressure},
                         {"vision_prefill_storage_releases", visionMetrics.prefillStorageReleases},
                         {"vision_prefill_storage_released_bytes", visionMetrics.prefillStorageReleasedBytes},
@@ -3977,6 +4052,22 @@ int main(int argc, char** argv)
                         {"vision_encoder_cost_coverage_misses", visionMetrics.encoderCostCoverageMisses},
                         {"vision_encoder_predicted_drain_gpu_ms", visionMetrics.lastPredictedEncoderDrainGpuMs},
                         {"vision_encoder_predicted_drain_turns", visionMetrics.lastPredictedEncoderDrainTurns},
+                        {"vision_encoder_preparation_policy_evaluations",
+                            visionMetrics.encoderPreparationPolicyEvaluations},
+                        {"vision_encoder_preparation_policy_coverage_misses",
+                            visionMetrics.encoderPreparationPolicyCoverageMisses},
+                        {"vision_encoder_preparation_policy_selection_changes",
+                            visionMetrics.encoderPreparationPolicySelectionChanges},
+                        {"vision_encoder_preparation_policy_applied_changes",
+                            visionMetrics.encoderPreparationPolicyAppliedChanges},
+                        {"vision_encoder_preparation_policy_batch",
+                            visionMetrics.lastEncoderPreparationPolicyBatchSize},
+                        {"vision_encoder_preparation_policy_horizon_ms",
+                            visionMetrics.lastEncoderPreparationPolicyHorizonMs},
+                        {"vision_encoder_preparation_transition_decode_rows",
+                            visionMetrics.lastEncoderPreparationTransitionDecodeRows},
+                        {"vision_encoder_preparation_transition_horizon_ms",
+                            visionMetrics.lastEncoderPreparationTransitionHorizonMs},
                         {"vision_encoder_preparation_starts", visionMetrics.encoderPreparationStarts},
                         {"vision_encoder_preparation_completions", visionMetrics.encoderPreparationCompletions},
                         {"vision_encoder_preparation_ms", visionMetrics.lastEncoderPreparationUs / 1000.0},

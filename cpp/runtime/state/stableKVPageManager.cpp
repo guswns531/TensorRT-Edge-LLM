@@ -39,12 +39,18 @@ StableKVPageManager::StableKVPageManager(Config const& config)
 
     mMaxPagesPerSequence = (mConfig.maxSequenceLength + mConfig.tokensPerPage - 1) / mConfig.tokensPerPage;
     ELLM_CHECK(mConfig.numPages >= mMaxPagesPerSequence, "Stable KV page pool cannot hold one maximum-length sequence");
+    if (mConfig.allocatablePages == 0)
+    {
+        mConfig.allocatablePages = mConfig.numPages;
+    }
+    ELLM_CHECK(mConfig.allocatablePages >= mMaxPagesPerSequence && mConfig.allocatablePages <= mConfig.numPages,
+        "Stable KV allocation budget must hold one maximum-length sequence and fit the physical pool");
 
     for (int32_t slot = 0; slot < mConfig.maxStableSlots; ++slot)
     {
         mFreeSlots.insert(slot);
     }
-    for (int32_t page = 0; page < mConfig.numPages; ++page)
+    for (int32_t page = 0; page < mConfig.allocatablePages; ++page)
     {
         mFreePages.insert(page);
     }
@@ -53,6 +59,21 @@ StableKVPageManager::StableKVPageManager(Config const& config)
     mLengths.assign(static_cast<size_t>(mConfig.maxStableSlots), 0);
     mSlotPages.resize(static_cast<size_t>(mConfig.maxStableSlots));
     mPageRefCounts.assign(static_cast<size_t>(mConfig.numPages), 0);
+}
+
+void StableKVPageManager::setAllocationBudget(int32_t pages)
+{
+    ELLM_CHECK(pages >= mMaxPagesPerSequence && pages <= mConfig.numPages,
+        "Stable KV allocation budget must hold one maximum-length sequence and fit the physical pool");
+    ELLM_CHECK(availableSlots() == mConfig.maxStableSlots,
+        "Stable KV allocation budget may change only when every lease has been released");
+    std::set<int32_t> freePages;
+    for (int32_t page = 0; page < pages; ++page)
+    {
+        freePages.insert(page);
+    }
+    mFreePages.swap(freePages);
+    mConfig.allocatablePages = pages;
 }
 
 int32_t StableKVPageManager::reserve()
