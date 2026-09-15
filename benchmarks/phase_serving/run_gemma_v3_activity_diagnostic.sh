@@ -41,6 +41,10 @@ graph_environment=()
 if [[ "${ENABLE_CUDA_GRAPHS:-0}" == 1 ]]; then
     graph_environment=(-e TRT_EDGELLM_CAPTURE_PHASE_GRAPHS=1)
 fi
+context_environment=()
+if [[ "${SHARED_PHASE_CONTEXT:-0}" == 1 ]]; then
+    context_environment=(-e TRT_EDGELLM_SHARED_PHASE_CONTEXT=1)
+fi
 vision_environment=()
 if [[ "${ENABLE_VISION:-1}" == 1 ]]; then
     vision_environment=(-e TRT_EDGELLM_VISION_ENGINE_DIR=/opt/vision)
@@ -98,6 +102,7 @@ for workload in $cases; do
         -e TRT_EDGELLM_PHASE_IPC=1 -e TRT_EDGELLM_SEMANTIC_ONLY=1 -e TRT_EDGELLM_IGNORE_EOS=1 \
         -e TRT_EDGELLM_MAX_STABLE_SLOTS=24 -e TRT_EDGELLM_MAX_INFLIGHT=24 \
         "${kv_environment[@]}" "${formation_environment[@]}" "${graph_environment[@]}" \
+        "${context_environment[@]}" \
         -e TRT_EDGELLM_MAX_PREFILL_BATCH=8 -e TRT_EDGELLM_MAX_DECODE_BATCH=24 \
         -e "TRT_EDGELLM_FIXED_PREFILL_CHUNK=$prefill_chunk" \
         -e "TRT_EDGELLM_MAX_PREFILL_BATCH_TOKENS=$prefill_batch_tokens" \

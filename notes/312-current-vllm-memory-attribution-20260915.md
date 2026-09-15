@@ -95,35 +95,90 @@ text P, so it does not add another 175 MiB allocation.
 
 The graph-disabled Current campaigns peak near 9,373--9,377 MiB; the retained graph-enabled campaign is generally
 9,449--9,469 MiB. Current graph residency therefore adds approximately 76--92 MiB in these runs. vLLM explicitly
-reports 0.31 GiB, approximately 317 MiB. CUDA graph storage is not Current's relative excess; Current retains about
-225--241 MiB less graph memory under these contracts.
+reports a 0.31 GiB graph-capture allocation. A fresh-process causal run measures a smaller 158 MiB net process
+increment because vLLM releases or reuses other allocations while capturing. Current's corresponding fresh net
+increment is 76 MiB. CUDA graph storage is not Current's relative excess under either accounting method.
+
+## Fresh-process causal matrix
+
+The direct experiment kept the Current binary, LLM engine, 96-page KV pool, P8/D24 limits, P128 chunk, balanced
+HTTP trace, and 49-request text calibration fixed. Only execution-context, vision-engine, and graph residency were
+changed. Each row started from a quiescent GPU in a fresh process.
+
+| Current cell | Ready MiB | Peak MiB | Increment | Balanced req/s |
+|---|---:|---:|---:|---:|
+| shared P/D, no E, graph off | 8,547 | 8,547 | baseline | 12.329 |
+| independent P/D, no E, graph off | 8,585 | 8,585 | +38 | 13.941 |
+| independent E/P/D, graph off | 9,369 | 9,369 | +784 | 13.496 |
+| independent E/P/D, graph on | 9,445 | 9,445 | +76 | 13.602 |
+
+The P/D independence price is only 38 MiB, including the additional 27.09 MiB decode workspace and approximately
+11 MiB of context/runtime state. In this diagnostic balanced run it also raises request throughput by 13.1% over
+the shared-context cell. This is not a repeated performance result, but it is strong evidence against recovering
+memory by merging P and D.
+
+The dominant Current increment is the 784 MiB vision execution substrate. It includes the separately loaded vision
+engine weights, 299 MiB E workspace, E context state, vision I/O, and preparation buffers. The entire increment is
+resident before a vision request executes. Current's first full multi-image trace adds only 6 MiB with graphs off;
+the retained graph-on multi-image campaign grows by 24 MiB from ready to peak.
+
+The matching fresh vLLM processes fixed the model, 480 MiB KV pool, sequence limit 24, batched-token limit 4096,
+and all server settings. Only `--enforce-eager` versus graph sizes 1/2/4/8/16/24 changed.
+
+| vLLM cell | Ready MiB | First text peak MiB | First vision peak MiB | Increment |
+|---|---:|---:|---:|---:|
+| enforce-eager | 8,239 | 8,239 | 8,239 | baseline |
+| graph enabled | 8,397 | 8,397 | 8,399 | +158 ready, +2 first vision |
+
+vLLM integrates the vision module in the loaded model and reuses its common allocator, so a single image request
+does not require another persistent engine/context allocation. Larger retained VLM workloads eventually raise its
+allocator high-water mark from 8,397 to approximately 8,843 MiB, a 446 MiB dynamic increment. Current instead pays
+most of the VLM execution cost at startup and has a much smaller request-time increment.
+
+The fresh graph-on ready gap closes exactly into four measured or derived categories:
+
+```text
+Current independent E/P/D graph-on       9,445 MiB
+vLLM graph-on                            8,397 MiB
+observed gap                            +1,048 MiB
+
+Current KV advantage                    -264 MiB
+Current graph net-residency advantage    -82 MiB
+Current base text substrate excess      +610 MiB
+Current vision E substrate              +784 MiB
+------------------------------------------------
+accounted gap                          +1,048 MiB
+```
+
+The 610 MiB base-text excess is obtained from the independent-P/D graph-off gap after correcting for KV:
+`8,585 - 8,239 + 264 = 610 MiB`. Only 38 MiB of it is caused by P/D independence. The remaining approximately
+572 MiB exists even in shared-P/D mode and belongs to common TensorRT/PLE/model representation, base context,
+phase I/O, sampling, and allocator state.
 
 ## Relative-gap accounting
 
-Use the stable mixed VLM point as an example:
+Use the stable mixed VLM point after the fresh-process matrix:
 
 ```text
-observed Current - vLLM process peak       +618 MiB
-Current - vLLM physical KV                 -264 MiB
-Current - vLLM graph storage, approximate  -241 MiB
+fresh graph-on ready gap                  +1,048 MiB
+Current mixed request-time growth            +16 MiB
+vLLM mixed allocator high-water growth      -446 MiB
 ---------------------------------------------------
-unattributed execution/model/runtime delta +1,123 MiB
+observed warmed mixed peak gap               +618 MiB
 ```
 
-The 1,123 MiB residual is not all TensorRT context memory. It contains:
+The fresh 1,048 MiB gap consists of:
 
-- 501 MiB of known independent E/P/D context workspaces;
-- phase-local PipelineIO, PLE output, logits, sampling and staging buffers;
-- TensorRT versus PyTorch model-weight representation differences;
-- TensorRT context/tactic state and CUDA auxiliary streams;
-- allocator reserve and fragmentation differences;
-- vLLM's retained multimodal allocator/cache high-water state.
+- -264 MiB from Current's smaller KV pool;
+- -82 MiB from Current's smaller net graph residency;
+- +610 MiB from Current's base text execution/model substrate;
+- +784 MiB from Current's separately resident vision E substrate.
 
 The evidence nevertheless rules out three incorrect explanations:
 
 1. Current does not duplicate the 6.92 GiB model once per phase context.
 2. Current KV is not larger; it is 264 MiB smaller but has much less token capacity.
-3. Current CUDA graph cache is not larger; it is approximately 0.23 GiB smaller.
+3. Current CUDA graph cache is not larger; its fresh net increment is 82 MiB smaller.
 
 The Current-specific target is therefore the independently materialized execution substrate, especially context
 workspaces and phase-local maximum-shape I/O.
@@ -153,10 +208,11 @@ pays stable workspace residency to make E/P/D independently enqueueable. The mem
 whether to merge the CUDA context; both already use one CUDA context. It is how much of the TensorRT workspace and
 phase I/O can be safely aliased without removing the profitable P+D and E+D execution frontier.
 
-## Required causal measurement before optimization
+## Remaining fine-grained attribution
 
-Peak process memory alone cannot split the remaining 1.1 GiB residual. The next experiment should use the same
-Current engine/model/KV and record `cudaMemGetInfo` plus the sum of owned Tensor capacities at these boundaries:
+The fresh-process matrix resolves the major architectural deltas. Fine-grained ownership counters are still useful
+for splitting the remaining 572 MiB base-text excess. The next instrumentation should record `cudaMemGetInfo` plus
+the sum of owned Tensor capacities at these boundaries:
 
 1. CUDA runtime initialized;
 2. shared engine and external weights loaded;
@@ -169,24 +225,20 @@ Current engine/model/KV and record `cudaMemGetInfo` plus the sum of owned Tensor
 9. each graph capture;
 10. first text and first vision request.
 
-The matching vLLM cells should be fresh processes with fixed 480 MiB KV:
-
-1. eager/no-graph ready;
-2. graph-enabled ready;
-3. first text request;
-4. first vision request and post-drain allocator state.
-
-The primary Current A/B is shared-context versus independent P/D versus independent E/P/D. This directly prices
-the execution freedom rather than inferring it from different engines or KV budgets. Only after this attribution
-should workspace aliasing, graph trimming, PLE caching, or KV resizing be implemented.
+The vLLM eager/graph/first-request cells and the primary Current shared-P/D/independent-P/D/independent-E/P/D cells
+are now complete. The remaining counters should therefore target base-text TensorRT/PLE allocations rather than
+repeat the already-resolved architectural matrix.
 
 ## Current conclusion
 
-For equal configured process contracts, Current is approximately 0.61 GiB larger in warmed VLM serving despite
-holding 0.26 GiB less KV and approximately 0.23 GiB less CUDA graph memory. The known 0.49 GiB of independent phase
-workspace and additional phase-local buffers make the execution substrate the first optimization target.
+For equal configured process contracts, Current is approximately 0.61 GiB larger after heavy VLM allocator warmup
+and 1.02 GiB larger at fresh graph-on readiness, despite holding 0.26 GiB less KV and 82 MiB less net graph
+residency. The largest directly observed Current-specific increment is the 784 MiB separately resident vision E
+substrate. Independent P/D costs only 38 MiB and preserves a valuable overlap frontier, so merging P/D is the wrong
+first optimization.
 
-PLE remains the largest absolute allocation, but optimizing it first would reduce total memory without explaining
-or isolating Current's relative inefficiency. KV resizing would be actively misleading: matching vLLM's KV token
-capacity would increase Current's relative memory gap to roughly 0.87 GiB unless execution-substrate memory is
-recovered first.
+The first architectural target is therefore lazy/tiered E residency and stronger E/P or E/D arena aliasing when an
+overlap action is not outstanding. The second target is the approximately 572 MiB common base-text excess, using
+owned-buffer accounting before changing representation. PLE remains the largest absolute allocation, but KV
+resizing would be actively misleading: matching vLLM's KV token capacity would add roughly 259 MiB without fixing
+either execution-substrate excess.
