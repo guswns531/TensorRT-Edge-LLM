@@ -1154,6 +1154,7 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
         mTpotTargets.insert(scheduling.tpotTargetUs);
     }
     size_t const inputTokens = mVision.estimateInputTokens(request);
+    size_t const profileInputTokens = mVision.estimateProfileInputTokens(request);
     size_t const estimatedPayloadBytes = mVision.estimatePayloadBytes(request);
     if (mConfig.enableLifetimeEncodedAdmission && estimatedPayloadBytes > mEncodedAdmissionBudgetBytes)
     {
@@ -1181,8 +1182,8 @@ PhaseThreeSubmissionStatus PhaseThreeCoordinator::submit(
             }
         }
     }
-    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, estimatedPayloadBytes,
-        geometry, prefixSubmitted});
+    mPending.push_back({requestId, std::move(request), maxOutputTokens, scheduling, inputTokens, profileInputTokens,
+        estimatedPayloadBytes, geometry, prefixSubmitted});
     mEncoderServiceEpochs.emplace(
         requestId, EncoderServiceEpochRecord{arrival, makeEncoderServiceReference(inputTokens)});
     recordTimeline(requestId, PhaseTimelineStage::kVisionQueued);
@@ -2934,6 +2935,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
 
     size_t encoderInputTokens{};
+    size_t encoderProfileInputTokens{};
     size_t encoderPayloadBytes{};
     double encoderSlackUs{std::numeric_limits<double>::infinity()};
     double encoderServiceLagUs{};
@@ -2945,6 +2947,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     {
         PendingVisionRequest const& request = encoderRequest(index);
         encoderInputTokens += request.inputTokens;
+        encoderProfileInputTokens += request.profileInputTokens;
         encoderPayloadBytes
             += request.estimatedPayloadBytes > 0U ? request.estimatedPayloadBytes : mEstimatedEncodedBytes;
         double const ageUs = std::chrono::duration<double, std::micro>(now - request.scheduling.submittedAt).count();
@@ -3141,7 +3144,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
     }
     bool const encoderPrefillExclusive = mConfig.serializeAllEncoderPrefill
         || (mConfig.exclusiveEncoderInputTokenThreshold > 0
-            && encoderInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
+            && encoderProfileInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
     auto addEncoderOverlap = [&](PhaseGlobalActionKind kind, PhaseGlobalActionCandidate const& phase) {
         ++mGlobalEncoderOverlapOpportunities;
         int32_t const chunkLength = kind == PhaseGlobalActionKind::kEncoderPrefill ? phase.key.chunkLength : 0;
@@ -4038,7 +4041,7 @@ bool PhaseThreeCoordinator::startNextEncoder()
     size_t candidateInputTokens{};
     for (size_t const pendingIndex : batchIndices)
     {
-        size_t const requestInputTokens = mPending[pendingIndex].inputTokens;
+        size_t const requestInputTokens = mPending[pendingIndex].profileInputTokens;
         candidateInputTokens = requestInputTokens > std::numeric_limits<size_t>::max() - candidateInputTokens
             ? std::numeric_limits<size_t>::max()
             : candidateInputTokens + requestInputTokens;
@@ -4047,7 +4050,9 @@ bool PhaseThreeCoordinator::startNextEncoder()
         || (mConfig.exclusiveEncoderInputTokenThreshold > 0
             && candidateInputTokens > mConfig.exclusiveEncoderInputTokenThreshold);
     bool const exclusiveEncoderDecode = mConfig.serializeAllEncoderDecode;
-    if (exclusiveEncoderPrefill || exclusiveEncoderDecode)
+    bool const deferExclusiveOwnership
+        = mConfig.enableAsyncEncoderPreparation && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive;
+    if ((exclusiveEncoderPrefill || exclusiveEncoderDecode) && !deferExclusiveOwnership)
     {
         IndependentPhaseServerArbitrationSnapshot const snapshot = mServer.arbitrationSnapshot();
         bool const prefillInFlight = snapshot.busy
@@ -4072,6 +4077,8 @@ bool PhaseThreeCoordinator::startNextEncoder()
             mExclusiveEncoderDecodeInFlight = true;
         }
     }
+    mEncoderPrefillExclusiveAfterPreparation = deferExclusiveOwnership && exclusiveEncoderPrefill;
+    mEncoderDecodeExclusiveAfterPreparation = deferExclusiveOwnership && exclusiveEncoderDecode;
 
     std::vector<PhaseVisionSubmission> submissions;
     submissions.reserve(batchSize);
@@ -4156,6 +4163,8 @@ bool PhaseThreeCoordinator::startNextEncoder()
     catch (...)
     {
         mServer.setExternalEncoderActive(false);
+        mEncoderPrefillExclusiveAfterPreparation = false;
+        mEncoderDecodeExclusiveAfterPreparation = false;
         if (mExclusiveEncoderPrefillInFlight)
         {
             mServer.setPrefillDispatchBlocked(false);
@@ -4236,6 +4245,8 @@ bool PhaseThreeCoordinator::completeEncoderPreparation()
     catch (...)
     {
         mServer.setExternalEncoderActive(false);
+        mEncoderPrefillExclusiveAfterPreparation = false;
+        mEncoderDecodeExclusiveAfterPreparation = false;
         if (mExclusiveEncoderPrefillInFlight)
         {
             mServer.setPrefillDispatchBlocked(false);
@@ -4320,6 +4331,30 @@ bool PhaseThreeCoordinator::submitPreparedEncoder()
 {
     if (mPreparedEncoder == nullptr || mEncoding.empty() || mVision.busy())
     {
+        return false;
+    }
+    if (mEncoderPrefillExclusiveAfterPreparation)
+    {
+        mServer.setPrefillDispatchBlocked(true);
+        mExclusiveEncoderPrefillInFlight = true;
+        mEncoderPrefillExclusiveAfterPreparation = false;
+    }
+    if (mEncoderDecodeExclusiveAfterPreparation)
+    {
+        mServer.setDecodeDispatchBlocked(true);
+        mExclusiveEncoderDecodeInFlight = true;
+        mEncoderDecodeExclusiveAfterPreparation = false;
+    }
+    IndependentPhaseServerArbitrationSnapshot const snapshot = mServer.arbitrationSnapshot();
+    bool const prefillInFlight = snapshot.busy
+        && (snapshot.inFlightKind == PhaseDispatchKind::kPrefill
+            || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
+    bool const decodeInFlight = snapshot.busy
+        && (snapshot.inFlightKind == PhaseDispatchKind::kDecode
+            || snapshot.inFlightKind == PhaseDispatchKind::kOverlap);
+    if ((mExclusiveEncoderPrefillInFlight && prefillInFlight) || (mExclusiveEncoderDecodeInFlight && decodeInFlight))
+    {
+        ++mExclusiveEncoderPrefillDeferrals;
         return false;
     }
     std::shared_ptr<PhaseVisionPreparedBatch> prepared = std::move(mPreparedEncoder);

@@ -38,11 +38,12 @@ namespace builder
 //! for visual encoders used in Vision-Language Models.
 struct VisualBuilderConfig
 {
-    int64_t minImageTokens{4};           //!< Minimum number of image tokens in a batch
-    int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
-    int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
-    bool profilingDetailed{false};       //!< Enable detailed profiling verbosity for layer info extraction
-    bool useTrtNativeVitAttn{false};     //!< Use TRT IAttention
+    int64_t minImageTokens{4};            //!< Minimum number of image tokens in a batch
+    int64_t maxImageTokens{1024};         //!< Maximum number of image tokens in a batch
+    int64_t maxImageTokensPerImage{512};  //!< Maximum number of image tokens per image
+    int64_t smallProfileMaxImageTokens{}; //!< Optional upper bound for a second, smaller optimization profile
+    bool profilingDetailed{false};        //!< Enable detailed profiling verbosity for layer info extraction
+    bool useTrtNativeVitAttn{false};      //!< Use TRT IAttention
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -52,6 +53,7 @@ struct VisualBuilderConfig
         json["min_image_tokens"] = minImageTokens;
         json["max_image_tokens"] = maxImageTokens;
         json["max_image_tokens_per_image"] = maxImageTokensPerImage;
+        json["small_profile_max_image_tokens"] = smallProfileMaxImageTokens;
         // The cu_seqlens profile capacity, so the server can budget request
         // media against the real engine limit instead of re-deriving it.
         json["max_cu_seqlen_groups"] = rt::imageUtils::maxCuSeqlenGroups(maxImageTokens);
@@ -77,6 +79,10 @@ struct VisualBuilderConfig
         {
             config.maxImageTokensPerImage = json["max_image_tokens_per_image"];
         }
+        if (json.contains("small_profile_max_image_tokens"))
+        {
+            config.smallProfileMaxImageTokens = json["small_profile_max_image_tokens"];
+        }
         if (json.contains("use_trt_native_vit_attn"))
         {
             config.useTrtNativeVitAttn = json["use_trt_native_vit_attn"];
@@ -93,6 +99,7 @@ struct VisualBuilderConfig
         oss << "  minImageTokens: " << minImageTokens << "\n";
         oss << "  maxImageTokens: " << maxImageTokens << "\n";
         oss << "  maxImageTokensPerImage: " << maxImageTokensPerImage << "\n";
+        oss << "  smallProfileMaxImageTokens: " << smallProfileMaxImageTokens << "\n";
         return oss.str();
     }
 };
@@ -133,8 +140,8 @@ private:
     //! @return true if parsing was successful, false otherwise
     bool parseConfig();
 
-    //! Set up optimization profile for visual models.
-    //! Creates a single optimization profile with appropriate dynamic shapes.
+    //! Set up optimization profiles for visual models.
+    //! Gemma4 may add a smaller profile before the full-capacity profile.
     //! @param builder TensorRT builder object
     //! @param config TensorRT builder config object
     //! @param network TensorRT network definition

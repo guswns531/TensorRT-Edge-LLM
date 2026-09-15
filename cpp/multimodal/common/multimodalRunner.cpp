@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -77,6 +78,54 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
 
 bool MultimodalRunner::prepareInference(cudaStream_t /*stream*/)
 {
+    return true;
+}
+
+bool MultimodalRunner::selectVisualProfileForInputTokens(int64_t inputTokens, cudaStream_t stream) noexcept
+{
+    if (!mVisualEngine || mVisualEngine->getNbOptimizationProfiles() <= 1)
+    {
+        return true;
+    }
+    int32_t selectedProfile{-1};
+    int64_t selectedLimit{std::numeric_limits<int64_t>::max()};
+    for (int32_t profile = 0; profile < mVisualEngine->getNbOptimizationProfiles(); ++profile)
+    {
+        nvinfer1::Dims const maximum
+            = mVisualEngine->getProfileShape(binding_names::kVisualInput, profile, nvinfer1::OptProfileSelector::kMAX);
+        if (maximum.nbDims > 0 && maximum.d[0] >= inputTokens && maximum.d[0] < selectedLimit)
+        {
+            selectedProfile = profile;
+            selectedLimit = maximum.d[0];
+        }
+    }
+    if (selectedProfile < 0)
+    {
+        LOG_ERROR("No visual optimization profile supports %lld input tokens", static_cast<long long>(inputTokens));
+        return false;
+    }
+    if (selectedProfile == mCurrentOptimizationProfile)
+    {
+        return true;
+    }
+    if (mProfileContextMemories.size() <= static_cast<size_t>(selectedProfile))
+    {
+        LOG_ERROR("Visual optimization profile %d has no assigned context memory", selectedProfile);
+        return false;
+    }
+    ProfileContextMemory const& memory = mProfileContextMemories[static_cast<size_t>(selectedProfile)];
+    if (memory.pointer == nullptr || memory.capacity < getRequiredContextMemorySizeForProfile(selectedProfile))
+    {
+        LOG_ERROR("Visual optimization profile %d has no valid context memory", selectedProfile);
+        return false;
+    }
+    if (!mVisualContext->setOptimizationProfileAsync(selectedProfile, stream))
+    {
+        LOG_ERROR("Failed to select visual optimization profile %d", selectedProfile);
+        return false;
+    }
+    mVisualContext->setDeviceMemoryV2(memory.pointer, memory.capacity);
+    mCurrentOptimizationProfile = selectedProfile;
     return true;
 }
 
@@ -383,6 +432,16 @@ int64_t MultimodalRunner::estimateOutputTokens(rt::LLMGenerationRequest const& r
 int64_t MultimodalRunner::maxInputTokens() const noexcept
 {
     return 0;
+}
+
+int64_t MultimodalRunner::estimateProfileInputTokens(rt::LLMGenerationRequest const& request)
+{
+    return estimateInputTokens(request);
+}
+
+int64_t MultimodalRunner::profileInputTokenLimitForProfile(int32_t profileIndex) const
+{
+    return getInputTokenLimitForProfile(profileIndex);
 }
 
 bool MultimodalRunner::preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,

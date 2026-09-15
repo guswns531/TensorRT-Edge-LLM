@@ -242,3 +242,8 @@ overlap action is not outstanding. The second target is the approximately 572 Mi
 owned-buffer accounting before changing representation. PLE remains the largest absolute allocation, but KV
 resizing would be actively misleading: matching vLLM's KV token capacity would add roughly 259 MiB without fixing
 either execution-substrate excess.
+
+The first tiered E/P implementation and its non-promotable initial screen are documented in
+[note 313](313-tiered-vision-context-memory-20260915.md). It recovers 70 MiB with an E3/E4 arena while preserving
+small-E/P overlap, but repeated performance validation under the retained lifetime-admission contract remains
+required.

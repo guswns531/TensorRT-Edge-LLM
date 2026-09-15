@@ -170,6 +170,7 @@ public:
     bool cancel(uint64_t requestId);
     bool busy() const noexcept;
     size_t estimateInputTokens(LLMGenerationRequest const& request);
+    size_t estimateProfileInputTokens(LLMGenerationRequest const& request);
     //! Estimate request-owned encoder output, deepstack, and M-RoPE bytes retained through prefill.
     size_t estimatePayloadBytes(LLMGenerationRequest const& request);
     //! Tokenize the causal text prefix before the first image placeholder without launching encoder work.

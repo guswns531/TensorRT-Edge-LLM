@@ -192,6 +192,8 @@ public:
     virtual int64_t estimateInputTokens(rt::LLMGenerationRequest const& request);
     virtual int64_t estimateOutputTokens(rt::LLMGenerationRequest const& request);
     virtual int64_t maxInputTokens() const noexcept;
+    virtual int64_t estimateProfileInputTokens(rt::LLMGenerationRequest const& request);
+    virtual int64_t profileInputTokenLimitForProfile(int32_t profileIndex) const;
 
     /*!
      * @brief Validate and fill configuration from file
@@ -263,6 +265,8 @@ protected:
     int32_t mCurrentOptimizationProfile{};
     rt::Tensor mOwnedContextMemory;
     bool mExternalWeightsLoaded{false}; //!< Guards the idempotent load
+
+    bool selectVisualProfileForInputTokens(int64_t inputTokens, cudaStream_t stream) noexcept;
 };
 
 } // namespace rt

@@ -268,44 +268,60 @@ bool VisualBuilder::parseConfig()
 bool VisualBuilder::setupVisualOptimizationProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
-    auto* visualProfile = builder.createOptimizationProfile();
-    bool result = true;
-
-    switch (mModelType)
+    if (mBuilderConfig.smallProfileMaxImageTokens > 0 && mModelType != multimodal::ModelType::GEMMA4_VISION)
     {
-    case multimodal::ModelType::QWEN2_VL:
-    case multimodal::ModelType::QWEN2_5_VL:
-    case multimodal::ModelType::QWEN3_VL:
-    case multimodal::ModelType::QWEN3_5:
-    case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
-    case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
-
-    case multimodal::ModelType::INTERNVL:
-    case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
-
-    case multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER:
-        result = setupNemotronOmniViTProfile(*visualProfile);
-        break;
-
-    case multimodal::ModelType::GEMMA4_VISION: result = setupGemma4ViTProfile(*visualProfile, network); break;
-
-    case multimodal::ModelType::GEMMA4_UNIFIED_VISION:
-        result = setupGemma4UnifiedVisionProfile(*visualProfile, network);
-        break;
-
-    default: LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType)); return false;
-    }
-
-    if (!result)
-    {
-        LOG_ERROR("Failed to setup optimization profile");
+        LOG_ERROR("A smaller visual optimization profile is currently supported only for Gemma4 vision engines");
         return false;
     }
+    auto addProfile = [&](int64_t maxImageTokens, std::string const& name) {
+        auto* visualProfile = builder.createOptimizationProfile();
+        int64_t const configuredMaxImageTokens = mBuilderConfig.maxImageTokens;
+        mBuilderConfig.maxImageTokens = maxImageTokens;
+        bool result = true;
+        switch (mModelType)
+        {
+        case multimodal::ModelType::QWEN2_VL:
+        case multimodal::ModelType::QWEN2_5_VL:
+        case multimodal::ModelType::QWEN3_VL:
+        case multimodal::ModelType::QWEN3_5:
+        case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
+        case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
 
-    LOG_DEBUG("%s", printOptimizationProfile(visualProfile, "visual_profile", &network).c_str());
+        case multimodal::ModelType::INTERNVL:
+        case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
 
-    config.addOptimizationProfile(visualProfile);
-    return true;
+        case multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER:
+            result = setupNemotronOmniViTProfile(*visualProfile);
+            break;
+
+        case multimodal::ModelType::GEMMA4_VISION: result = setupGemma4ViTProfile(*visualProfile, network); break;
+
+        case multimodal::ModelType::GEMMA4_UNIFIED_VISION:
+            result = setupGemma4UnifiedVisionProfile(*visualProfile, network);
+            break;
+
+        default:
+            LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType));
+            result = false;
+            break;
+        }
+        mBuilderConfig.maxImageTokens = configuredMaxImageTokens;
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup optimization profile");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(visualProfile, name, &network).c_str());
+        config.addOptimizationProfile(visualProfile);
+        return true;
+    };
+
+    if (mBuilderConfig.smallProfileMaxImageTokens > 0
+        && !addProfile(mBuilderConfig.smallProfileMaxImageTokens, "visual_small_profile"))
+    {
+        return false;
+    }
+    return addProfile(mBuilderConfig.maxImageTokens, "visual_profile");
 }
 
 bool VisualBuilder::setupQwenViTProfile(

@@ -671,6 +671,7 @@ private:
         int32_t maxOutputTokens{};
         PhaseSchedulingHints scheduling;
         size_t inputTokens{};
+        size_t profileInputTokens{};
         size_t estimatedPayloadBytes{};
         std::vector<int64_t> mediaGeometry;
         bool prefixSubmitted{};
@@ -910,6 +911,8 @@ private:
     size_t mExclusiveEncoderBatches{};
     size_t mUnknownPayloadBootstrapSelections{};
     size_t mExclusiveEncoderPrefillDeferrals{};
+    bool mEncoderPrefillExclusiveAfterPreparation{};
+    bool mEncoderDecodeExclusiveAfterPreparation{};
     bool mExclusiveEncoderPrefillInFlight{};
     bool mExclusiveEncoderDecodeInFlight{};
     bool mEncoderSerializationGate{};

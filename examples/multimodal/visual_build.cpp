@@ -39,7 +39,8 @@ enum VLMBuildOptionId : int
     MIN_IMAGE_TOKENS = 605,
     MAX_IMAGE_TOKENS = 606,
     MAX_IMAGE_TOKENS_PER_IMAGE = 607,
-    PROFILING_DETAILED = 608
+    PROFILING_DETAILED = 608,
+    SMALL_PROFILE_MAX_IMAGE_TOKENS = 609
 };
 
 struct ViTBuildArgs
@@ -51,6 +52,7 @@ struct ViTBuildArgs
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
     int64_t maxImageTokensPerImage{512};
+    int64_t smallProfileMaxImageTokens{};
     bool maxImageTokensPerImageExplicit{false};
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
 };
@@ -74,6 +76,8 @@ void printUsage(char const* programName)
     std::cerr << "  --maxImageTokensPerImage     Maximum image tokens per image. Default = 512; Gemma4 uses the "
                  "model default when omitted"
               << std::endl;
+    std::cerr << "  --smallProfileMaxImageTokens Optional maximum for a smaller first optimization profile"
+              << std::endl;
     std::cerr << "  --profilingDetailed  Enable detailed profiling verbosity to include ONNX op names. "
                  "Use for DLSim analysis."
               << std::endl;
@@ -88,6 +92,7 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
         {"minImageTokens", required_argument, 0, VLMBuildOptionId::MIN_IMAGE_TOKENS},
         {"maxImageTokens", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS},
         {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE},
+        {"smallProfileMaxImageTokens", required_argument, 0, VLMBuildOptionId::SMALL_PROFILE_MAX_IMAGE_TOKENS},
         {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};
 
     int opt;
@@ -138,6 +143,12 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
                 args.maxImageTokensPerImageExplicit = true;
             }
             break;
+        case VLMBuildOptionId::SMALL_PROFILE_MAX_IMAGE_TOKENS:
+            if (optarg)
+            {
+                args.smallProfileMaxImageTokens = std::stoi(optarg);
+            }
+            break;
         case VLMBuildOptionId::PROFILING_DETAILED: args.profilingDetailed = true; break;
         default: LOG_ERROR("ERROR: Invalid Argument %c is %s", opt, optarg); return false;
         }
@@ -182,12 +193,11 @@ int main(int argc, char** argv)
     {
         nlohmann::json modelConfig;
         configFile >> modelConfig;
-        if (modelConfig.value("model_type", std::string{}) == "gemma4_vision"
-            && modelConfig.contains("vision_config") && modelConfig["vision_config"].is_object())
+        if (modelConfig.value("model_type", std::string{}) == "gemma4_vision" && modelConfig.contains("vision_config")
+            && modelConfig["vision_config"].is_object())
         {
             auto const& visionConfig = modelConfig["vision_config"];
-            args.maxImageTokensPerImage
-                = visionConfig.value("default_output_length", args.maxImageTokensPerImage);
+            args.maxImageTokensPerImage = visionConfig.value("default_output_length", args.maxImageTokensPerImage);
             LOG_INFO("Using Gemma4 model default maxImageTokensPerImage=%ld", args.maxImageTokensPerImage);
         }
     }
@@ -203,10 +213,18 @@ int main(int argc, char** argv)
             args.minImageTokens, args.maxImageTokens, args.maxImageTokensPerImage);
         return EXIT_FAILURE;
     }
+    if (args.smallProfileMaxImageTokens != 0
+        && (args.smallProfileMaxImageTokens < args.maxImageTokensPerImage
+            || args.smallProfileMaxImageTokens >= args.maxImageTokens))
+    {
+        LOG_ERROR("smallProfileMaxImageTokens must be zero or in [maxImageTokensPerImage, maxImageTokens).");
+        return EXIT_FAILURE;
+    }
     builder::VisualBuilderConfig config;
     config.minImageTokens = args.minImageTokens;
     config.maxImageTokens = args.maxImageTokens;
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
+    config.smallProfileMaxImageTokens = args.smallProfileMaxImageTokens;
     config.profilingDetailed = args.profilingDetailed;
 
     // The server loads <engineDir>/visual.engine, so land the engine under a

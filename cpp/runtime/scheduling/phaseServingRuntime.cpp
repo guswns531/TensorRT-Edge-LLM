@@ -307,7 +307,7 @@ public:
                 TieredVisionContextMemoryInfo const info
                     = mExecutors->configureTieredVisionContextMemory(*mVisionRunner, 0, profileCount - 1);
                 exclusiveEncoderInputTokenThreshold
-                    = static_cast<size_t>(mVisionRunner->getInputTokenLimitForProfile(0));
+                    = static_cast<size_t>(mVisionRunner->profileInputTokenLimitForProfile(0));
                 LOG_INFO("Phase workspace mode: tiered E/P arena=%lld bytes, exclusive input threshold=%zu",
                     static_cast<long long>(info.arenaBytes), exclusiveEncoderInputTokenThreshold);
             }

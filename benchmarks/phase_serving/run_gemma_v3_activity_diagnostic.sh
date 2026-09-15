@@ -18,10 +18,13 @@ replay_tools=$(realpath "$replay_tools")
 build_root=$(realpath "$build_root")
 model_root=$(realpath "$model_root")
 engine_root=${ENGINE_ROOT:-$model_root/engine-packed-p8-d24-kv2048-p96}
+vision_engine_root=${VISION_ENGINE_ROOT:-$model_root/visual-e4-soft280/visual}
+vision_engine_root=$(realpath "$vision_engine_root")
 allocatable_kv_pages=${ALLOCATABLE_KV_PAGES:-0}
 encoded_capacity=${ENCODED_CAPACITY:-4}
-encoded_admission_mode=${ENCODED_ADMISSION_MODE:-}
+encoded_admission_mode=${ENCODED_ADMISSION_MODE:-lifetime}
 encoded_admission_capacity=${ENCODED_ADMISSION_CAPACITY:-12}
+vision_encoder_max_input_tokens=${VISION_ENCODER_MAX_INPUT_TOKENS:-1120}
 prefill_chunk=${PREFILL_CHUNK:-128}
 prefill_batch_tokens=${MAX_PREFILL_BATCH_TOKENS:-$((8 * prefill_chunk))}
 decode_active_prefill_chunk=${DECODE_ACTIVE_PREFILL_CHUNK:-0}
@@ -53,7 +56,7 @@ if [[ "${ENABLE_VISION:-1}" == 1 ]]; then
     fi
 fi
 encoded_admission_environment=()
-if [[ -n "$encoded_admission_mode" ]]; then
+if [[ -n "$encoded_admission_mode" && "$encoded_admission_mode" != off ]]; then
     encoded_admission_environment=(-e "TRT_EDGELLM_MEASUREMENT_ENCODED_ADMISSION=$encoded_admission_mode"
         -e "TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY=$encoded_admission_capacity")
 fi
@@ -69,6 +72,34 @@ if [[ "${NSYS_CAPTURE:-0}" == 1 ]]; then
     profiler_command=(/opt/nsys/target-linux-x64/nsys profile --sample none --cpuctxsw none
         --trace cuda,nvtx --output "/opt/results/run-{run}/nsys")
 fi
+
+mkdir -p "$result_root"
+{
+    printf 'source_commit=%s\n' "$(git rev-parse HEAD)"
+    printf 'source_dirty=%s\n' "$(git status --short | wc -l)"
+    printf 'container_image=%s\n' "$image"
+    printf 'build_root=%s\n' "$build_root"
+    printf 'binary_sha256=%s\n' "$(sha256sum "$build_root/examples/llm/llm_phase_context_smoke" | cut -d' ' -f1)"
+    printf 'engine_root=%s\n' "$engine_root"
+    printf 'llm_engine_sha256=%s\n' "$(sha256sum "$engine_root/llm.engine" | cut -d' ' -f1)"
+    printf 'vision_engine_root=%s\n' "$vision_engine_root"
+    printf 'vision_engine_sha256=%s\n' "$(sha256sum "$vision_engine_root/visual.engine" | cut -d' ' -f1)"
+    printf 'trace_root=%s\n' "$trace_root"
+    printf 'calibration=%s\n' "$calibration"
+    printf 'phase_policy=%s\n' "$phase_policy"
+    printf 'prefill_chunk=%s\n' "$prefill_chunk"
+    printf 'prefill_batch_tokens=%s\n' "$prefill_batch_tokens"
+    printf 'encoded_capacity=%s\n' "$encoded_capacity"
+    printf 'encoded_admission_mode=%s\n' "$encoded_admission_mode"
+    printf 'encoded_admission_capacity=%s\n' "$encoded_admission_capacity"
+    printf 'vision_encoder_max_input_tokens=%s\n' "$vision_encoder_max_input_tokens"
+    printf 'allocatable_kv_pages=%s\n' "$allocatable_kv_pages"
+    printf 'cuda_graphs=%s\n' "${ENABLE_CUDA_GRAPHS:-0}"
+    printf 'shared_phase_context=%s\n' "${SHARED_PHASE_CONTEXT:-0}"
+    printf 'tiered_vision_context_memory=%s\n' "${TIERED_VISION_CONTEXT_MEMORY:-0}"
+    printf 'cases=%s\n' "$cases"
+    printf 'repeats=%s\n' "$repeats"
+} > "$result_root/contract.env"
 
 for workload in $cases; do
     cell=$result_root/$workload
@@ -90,7 +121,7 @@ for workload in $cases; do
         -i --user "$(id -u):$(id -g)" \
         -v "$build_root:/opt/edgellm:ro" \
         -v "$engine_root:/opt/model:ro" \
-        -v "$model_root/visual-e4-soft280/visual:/opt/vision:ro" \
+        -v "$vision_engine_root:/opt/vision:ro" \
         -v "$hf_root:/opt/hf:ro" \
         -v "$repo_root/examples/multimodal/pics:/workspace/examples/multimodal/pics:ro" \
         -v "$cell:/opt/results:rw" \
@@ -112,7 +143,8 @@ for workload in $cases; do
         -e TRT_EDGELLM_ENABLE_BATCHED_VISION_PREFILL=1 -e TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE=1 \
         -e "TRT_EDGELLM_MAX_ENCODED_VISION=$encoded_capacity" -e TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE=4 \
         "${encoded_admission_environment[@]}" \
-        -e TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS=1120 -e TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA=4 \
+        -e "TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS=$vision_encoder_max_input_tokens" \
+        -e TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA=4 \
         -e TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US=25000 -e TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE=4 \
         -e TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD=1 -e TRT_EDGELLM_VISION_IDLE_SLABS=0 \
         -e TRT_EDGELLM_GLOBAL_SCHEDULER=active -e TRT_EDGELLM_SYNCHRONIZE_DECODE_SAMPLING=1 \

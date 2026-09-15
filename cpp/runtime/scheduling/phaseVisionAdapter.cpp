@@ -709,6 +709,13 @@ size_t PhaseVisionAdapter::estimateInputTokens(LLMGenerationRequest const& reque
     return static_cast<size_t>(tokens);
 }
 
+size_t PhaseVisionAdapter::estimateProfileInputTokens(LLMGenerationRequest const& request)
+{
+    int64_t const tokens = mRunner.estimateProfileInputTokens(request);
+    ELLM_CHECK(tokens >= 0, "Vision runner returned a negative profile input-token estimate");
+    return static_cast<size_t>(tokens);
+}
+
 size_t PhaseVisionAdapter::estimatePayloadBytes(LLMGenerationRequest const& request)
 {
     int64_t const outputTokens = mRunner.estimateOutputTokens(request);

@@ -2063,7 +2063,7 @@ int main(int argc, char** argv)
                 int32_t const largeProfile = profileCount - 1;
                 rt::TieredVisionContextMemoryInfo const info
                     = pair->configureTieredVisionContextMemory(runner, 0, largeProfile);
-                tieredVisionExclusiveInputTokens = static_cast<size_t>(runner.getInputTokenLimitForProfile(0));
+                tieredVisionExclusiveInputTokens = static_cast<size_t>(runner.profileInputTokenLimitForProfile(0));
                 LOG_INFO(
                     "Tiered E/P context arena: total=%lld prefill=%lld small_vision=%lld large_vision=%lld "
                     "exclusive_above_input_tokens=%zu",

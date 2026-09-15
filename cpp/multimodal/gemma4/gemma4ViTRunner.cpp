@@ -158,10 +158,19 @@ bool Gemma4ViTRunner::validateAndFillConfig(std::string const& engineDir)
     mConfig.imageStd = imageProcessorConfig.value("image_std", std::vector<float>{1.0F, 1.0F, 1.0F});
     mConfig.maxPatchesPerImage = mConfig.maxImageTokensPerImage * mConfig.poolingKernelSize * mConfig.poolingKernelSize;
 
-    nvinfer1::Dims const inputShapeMax
+    nvinfer1::Dims inputShapeMax
         = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMAX);
     nvinfer1::Dims const inputShapeMin
         = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN);
+    for (int32_t profile = 1; profile < mVisualEngine->getNbOptimizationProfiles(); ++profile)
+    {
+        nvinfer1::Dims const candidate
+            = mVisualEngine->getProfileShape(binding_names::kVisualInput, profile, nvinfer1::OptProfileSelector::kMAX);
+        if (candidate.nbDims > 0 && candidate.d[0] > inputShapeMax.d[0])
+        {
+            inputShapeMax = candidate;
+        }
+    }
     mConfig.maxPatches = inputShapeMax.d[0];
     mConfig.minPatches = inputShapeMin.d[0];
     mConfig.inputDim = mVisualContext->getTensorShape(binding_names::kVisualInput).d[1];
@@ -381,6 +390,23 @@ void Gemma4ViTRunner::imagePreprocessTokenLengthsOnly(
             check::check(mOutputEmbedding.reshape(mOutputEmbeddingShape), "Tensor reshape failed");
         }
     }
+}
+
+int64_t Gemma4ViTRunner::estimateProfileInputTokens(rt::LLMGenerationRequest const& request)
+{
+    int64_t totalPatches{};
+    for (auto const& logicalRequest : request.requests)
+    {
+        for (auto const& image : logicalRequest.imageBuffers)
+        {
+            auto const [height, width] = image.doResize
+                ? rt::imageUtils::gemma4ResizeTarget(image.height, image.width, mConfig.maxImageTokensPerImage,
+                      mConfig.poolingKernelSize, mConfig.patchSize)
+                : std::make_tuple(image.height, image.width);
+            totalPatches += (height / mConfig.patchSize) * (width / mConfig.patchSize);
+        }
+    }
+    return totalPatches;
 }
 
 void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
@@ -654,6 +680,11 @@ bool Gemma4ViTRunner::infer(cudaStream_t stream) noexcept
     }
 
     return true;
+}
+
+bool Gemma4ViTRunner::prepareInference(cudaStream_t stream)
+{
+    return selectVisualProfileForInputTokens(mVitInput.getShape()[0], stream);
 }
 
 MultimodalOutputSpec Gemma4ViTRunner::getOutputEmbeddingSpec() const

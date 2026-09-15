@@ -64,6 +64,7 @@ public:
         cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     bool infer(cudaStream_t stream) noexcept override;
+    bool prepareInference(cudaStream_t stream) override;
 
     bool validateAndFillConfig(std::string const& engineDir) override;
 
@@ -74,6 +75,8 @@ public:
 
     bool bindExternalOutputStorage(
         rt::Tensor& outputEmbedding, std::vector<std::reference_wrapper<rt::Tensor>> const& deepstackFeatures) override;
+
+    int64_t estimateProfileInputTokens(rt::LLMGenerationRequest const& request) override;
 
 private:
     struct ImageGrid
