@@ -40,6 +40,8 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -128,6 +130,42 @@ PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& s
     config.enableDecodeFormationHorizon = true;
     config.supportsChunkedPrefill = engine.packedPrefill;
     config.globalDispatchUsesPreReservedMemory = true;
+    config.enableAdaptivePrefillChunking = serving.enableAdaptivePrefillChunking;
+    config.adaptivePrefillChunkCandidates = serving.adaptivePrefillChunkCandidates;
+    config.enableCostAwarePrefillShapeSelection = serving.enableCostAwarePrefillShapeSelection;
+    if (char const* const envAdaptive = std::getenv("TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING");
+        envAdaptive != nullptr)
+    {
+        config.enableAdaptivePrefillChunking
+            = std::strcmp(envAdaptive, "0") != 0 && std::strcmp(envAdaptive, "false") != 0;
+    }
+    if (char const* const envCandidates = std::getenv("TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES");
+        envCandidates != nullptr)
+    {
+        config.adaptivePrefillChunkCandidates.clear();
+        std::stringstream ss(envCandidates);
+        std::string item;
+        while (std::getline(ss, item, ','))
+        {
+            if (!item.empty())
+            {
+                config.adaptivePrefillChunkCandidates.push_back(std::stoi(item));
+            }
+        }
+        if (!config.adaptivePrefillChunkCandidates.empty())
+        {
+            config.enableAdaptivePrefillChunking = true;
+            config.minPrefillChunkTokens = config.adaptivePrefillChunkCandidates.front();
+            config.maxPrefillChunkTokens = std::max(
+                config.maxPrefillChunkTokens, config.adaptivePrefillChunkCandidates.back());
+        }
+    }
+    if (char const* const envCostAware = std::getenv("TRT_EDGELLM_ENABLE_COST_AWARE_PREFILL_SHAPE");
+        envCostAware != nullptr)
+    {
+        config.enableCostAwarePrefillShapeSelection
+            = std::strcmp(envCostAware, "0") != 0 && std::strcmp(envCostAware, "false") != 0;
+    }
 
     PhaseRuntimeCostTrackerConfig trackerConfig;
     trackerConfig.policyMode = serving.policyMode;

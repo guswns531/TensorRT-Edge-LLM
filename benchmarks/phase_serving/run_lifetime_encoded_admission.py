@@ -248,6 +248,10 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
             ("shadow" if variant.endswith("shadow") else "active"))
     if variant in ("shared_ep", "tiered_ep", "independent"):
         environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = variant
+    if variant == "unified_action":
+        environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = "shared_ep"
+        environment["TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING"] = 1
+        environment["TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES"] = "128,256,512"
     backend = [
         "docker", "run", "--rm", "--gpus", "all", "--network", "none",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -311,7 +315,8 @@ def main():
                                  "lifetime", "ownership", "chunked", "e1",
                                  "e2", "e-dynamic-shadow",
                                  "e-transition-shadow", "e-dynamic-active",
-                                 "shared_ep", "tiered_ep", "independent"),
+                                 "shared_ep", "tiered_ep", "independent",
+                                 "unified_action"),
                         default=["static-base", "static-large", "lifetime"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--byte-budget", type=int, default=0)

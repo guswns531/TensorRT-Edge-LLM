@@ -120,6 +120,38 @@
         semanticSchedulerConfig.maxPrefillCohortSize = semanticSchedulerConfig.maxPrefillBatchSize;
         semanticSchedulerConfig.maxPrefillCohortTurns = 8;
         semanticSchedulerConfig.enableAdaptivePrefillChunking = false;
+        if (char const* value = std::getenv("TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING"))
+        {
+            semanticSchedulerConfig.enableAdaptivePrefillChunking
+                = std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES"))
+        {
+            semanticSchedulerConfig.adaptivePrefillChunkCandidates.clear();
+            std::stringstream ss(value);
+            std::string item;
+            while (std::getline(ss, item, ','))
+            {
+                if (!item.empty())
+                {
+                    semanticSchedulerConfig.adaptivePrefillChunkCandidates.push_back(std::stoi(item));
+                }
+            }
+            if (!semanticSchedulerConfig.adaptivePrefillChunkCandidates.empty())
+            {
+                semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
+                semanticSchedulerConfig.minPrefillChunkTokens
+                    = semanticSchedulerConfig.adaptivePrefillChunkCandidates.front();
+                semanticSchedulerConfig.maxPrefillChunkTokens = std::max(
+                    semanticSchedulerConfig.maxPrefillChunkTokens,
+                    semanticSchedulerConfig.adaptivePrefillChunkCandidates.back());
+            }
+        }
+        if (char const* value = std::getenv("TRT_EDGELLM_ENABLE_COST_AWARE_PREFILL_SHAPE"))
+        {
+            semanticSchedulerConfig.enableCostAwarePrefillShapeSelection
+                = std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+        }
         semanticSchedulerConfig.enableDecodeTpotTelemetry
             = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr
             || std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr

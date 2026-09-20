@@ -2038,7 +2038,15 @@ int main(int argc, char** argv)
             int64_t const requiredBytes = runner.getRequiredContextMemorySize();
             LOG_INFO("Vision context workspace: required=%lld prefill_available=%zu bytes",
                 static_cast<long long>(requiredBytes), pair->prefillContextMemory().getMemoryCapacity());
-            if (std::getenv("TRT_EDGELLM_SHARED_VISION_DECODE_CONTEXT_MEMORY") != nullptr)
+            char const* const envWorkspaceMode = std::getenv("TRT_EDGELLM_PHASE_WORKSPACE_MODE");
+            bool const sharedEpMode = envWorkspaceMode != nullptr && (std::strcmp(envWorkspaceMode, "shared_ep") == 0);
+            bool const tieredEpMode = (envWorkspaceMode != nullptr
+                && (std::strcmp(envWorkspaceMode, "tiered_ep") == 0 || std::strcmp(envWorkspaceMode, "tiered") == 0))
+                || std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr;
+            bool const sharedEdMode = (envWorkspaceMode != nullptr && std::strcmp(envWorkspaceMode, "shared_ed") == 0)
+                || std::getenv("TRT_EDGELLM_SHARED_VISION_DECODE_CONTEXT_MEMORY") != nullptr;
+
+            if (sharedEdMode)
             {
                 rt::TieredVisionContextMemoryInfo const info = pair->configureSharedVisionDecodeContextMemory(runner);
                 serializeAllEncoderDecode = true;
@@ -2047,7 +2055,16 @@ int main(int argc, char** argv)
                     static_cast<long long>(info.largeVisionBytes));
                 return;
             }
-            if (std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr)
+            if (sharedEpMode)
+            {
+                rt::TieredVisionContextMemoryInfo const info = pair->configureSharedVisionContextMemory(runner, 0);
+                serializeAllEncoderPrefill = true;
+                LOG_INFO("Shared E/P context arena: total=%lld prefill=%lld vision=%lld serialize_all_encoder=yes",
+                    static_cast<long long>(info.arenaBytes), static_cast<long long>(info.prefillBytes),
+                    static_cast<long long>(info.largeVisionBytes));
+                return;
+            }
+            if (tieredEpMode)
             {
                 int32_t const profileCount = runner.getOptimizationProfileCount();
                 ELLM_CHECK(profileCount > 0, "Tiered vision context memory requires a visual profile");

@@ -101,6 +101,9 @@ struct PhaseServingRuntimeConfig
     int32_t maxPrefillChunkTokens{128};
     int32_t maxPrefillBatchTokens{};
     bool enablePrefillCohortRefill{};
+    bool enableAdaptivePrefillChunking{false};
+    std::vector<int32_t> adaptivePrefillChunkCandidates{};
+    bool enableCostAwarePrefillShapeSelection{false};
     bool enableCudaGraphs{true};
     bool enablePersistentDecodeSelect{true};
     bool enablePersistentPageBindings{true};
