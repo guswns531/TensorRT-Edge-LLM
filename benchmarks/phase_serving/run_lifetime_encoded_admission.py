@@ -49,14 +49,19 @@ def model_config(repo, name):
             "model":
             "google/gemma-4-e2b-it",
             "engine":
-            model / "engine-packed-p8-d24-kv2048-p96",
+            pathlib.Path(
+                os.environ.get("GEMMA_ENGINE_DIR",
+                               str(model / "engine-packed-p8-d24-kv2048-p96"))),
             "vision":
             model / "visual-e4-soft280/visual",
             "hf":
             artifacts / "models/gemma-4-e2b-it-awq/hf",
             "traces": {
                 w: inputs / (w + ".json")
-                for w in ("balanced", "mixed", "vision-heavy", "multi-image")
+                for w in (
+                    "balanced", "mixed", "vision-heavy", "multi-image",
+                    "long-prefill", "bimodal", "decode-heavy", "short",
+                    "text-heavy", "poisson", "wave-drain", "late-vision")
             },
             "calibration":
             repo /
@@ -296,7 +301,9 @@ def main():
     parser.add_argument("--workloads",
                         nargs="+",
                         choices=("balanced", "mixed", "vision-heavy",
-                                 "multi-image"),
+                                 "multi-image", "long-prefill", "bimodal",
+                                 "decode-heavy", "short", "text-heavy",
+                                 "poisson", "wave-drain", "late-vision"),
                         default=["mixed", "vision-heavy", "multi-image"])
     parser.add_argument("--variants",
                         nargs="+",
