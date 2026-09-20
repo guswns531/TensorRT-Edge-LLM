@@ -279,6 +279,22 @@ public:
     Tensor(void* data, Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType,
         std::string const& name = "");
 
+    /*!
+     * @brief Constructor that reuses external memory with explicit capacity
+     *
+     * Memory is not owned by the tensor object. The caller must ensure the
+     * lifecycle of the memory.
+     *
+     * @param data Pointer to existing memory
+     * @param extent The shape of the tensor
+     * @param capacity Total capacity of the memory buffer in bytes
+     * @param deviceType The device type of the memory
+     * @param dataType The data type of the tensor
+     * @param name Optional name for the tensor
+     */
+    Tensor(void* data, Coords const& extent, int64_t capacity, DeviceType deviceType, nvinfer1::DataType dataType,
+        std::string const& name = "");
+
     //! @brief Get the shape of the tensor
     //! @return Coordinates representing the tensor shape
     Coords getShape() const noexcept;
@@ -298,6 +314,18 @@ public:
     //! @brief Check if tensor owns its memory
     //! @return True if memory is owned, false otherwise
     bool getOwnMemory() const noexcept;
+
+    //! @brief Enable or disable reshaping for non-owning views
+    void setAllowReshape(bool allow) noexcept
+    {
+        mAllowReshape = allow;
+    }
+
+    //! @brief Check if reshaping is allowed for non-owning views
+    [[nodiscard]] bool getAllowReshape() const noexcept
+    {
+        return mAllowReshape;
+    }
 
     //! @brief Check if tensor is empty
     //! @return True if tensor is empty, false otherwise
@@ -372,7 +400,7 @@ public:
      * @brief Reshape the tensor
      *
      * Explicitly disallows reshape when the memory is not owned by the tensor
-     * object to avoid misuse. Reshape will not happen when memory capacity
+     * object unless allowReshape is set to true. Reshape will not happen when memory capacity
      * is insufficient.
      *
      * @param extent New shape
@@ -388,6 +416,7 @@ private:
     nvinfer1::DataType mDataType{};
     void* data{};
     bool ownMemory{};
+    bool mAllowReshape{};
 
     // Determined once the tensor is constructed.
     int64_t memoryCapacity{};

@@ -424,10 +424,30 @@ public:
         int32_t const prefillSequenceCapacity = engineConfig.packedPrefill
             ? std::min(mServingConfig.maxPrefillChunkTokens, engineConfig.maxPackedPrefillChunkTokens)
             : engineConfig.maxSupportedInputLength;
-        mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(
-            engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
-        mDecodeIO = std::make_unique<PipelineIO>(
-            PipelineIO::createForLLMPhase(engineConfig, decodeBatchCapacity, 1, setupStream));
+        bool const enablePooledPipelineIO = mServingConfig.enablePooledPipelineIO
+            || std::getenv("TRT_EDGELLM_ENABLE_POOLED_PIPELINE_IO") != nullptr
+            || (std::getenv("TRT_EDGELLM_PHASE_PIPELINE_IO_MODE") != nullptr
+                && std::string_view(std::getenv("TRT_EDGELLM_PHASE_PIPELINE_IO_MODE")) == "pooled");
+        if (enablePooledPipelineIO)
+        {
+            mPipelineIOPool = std::make_unique<PipelineIOPool>(PipelineIOPool::create(
+                engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity,
+                decodeBatchCapacity, 1, setupStream));
+            mPrefillIO = std::make_unique<PipelineIO>(mPipelineIOPool->createPrefillView(
+                engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity));
+            mDecodeIO = std::make_unique<PipelineIO>(mPipelineIOPool->createDecodeView(
+                engineConfig, decodeBatchCapacity, 1));
+            LOG_INFO("PipelineIO pooled allocation enabled: total allocated = %zu bytes (%.2f MB)",
+                mPipelineIOPool->totalAllocatedBytes(),
+                static_cast<double>(mPipelineIOPool->totalAllocatedBytes()) / (1024.0 * 1024.0));
+        }
+        else
+        {
+            mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(
+                engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
+            mDecodeIO = std::make_unique<PipelineIO>(
+                PipelineIO::createForLLMPhase(engineConfig, decodeBatchCapacity, 1, setupStream));
+        }
         buildTensorMap(mPrefillMap, *mPrefillIO, resources, engineConfig, 0);
         buildTensorMap(mDecodeMap, *mDecodeIO, resources, engineConfig, 0);
         if (engineConfig.pleEnabled)
@@ -573,6 +593,7 @@ public:
         mExecutors.reset();
         mPrefillIO.reset();
         mDecodeIO.reset();
+        mPipelineIOPool.reset();
         if (mPrefillStream != nullptr)
         {
             static_cast<void>(cudaStreamDestroy(mPrefillStream));
@@ -801,6 +822,7 @@ public:
     cudaStream_t mCopyStream{};
     std::unique_ptr<IndependentEngineExecutorPair> mExecutors;
     std::unique_ptr<MultimodalRunner> mVisionRunner;
+    std::unique_ptr<PipelineIOPool> mPipelineIOPool;
     std::unique_ptr<PipelineIO> mPrefillIO;
     std::unique_ptr<PipelineIO> mDecodeIO;
     std::unique_ptr<Gemma4EmbeddingPreprocessor> mPrefillPle;

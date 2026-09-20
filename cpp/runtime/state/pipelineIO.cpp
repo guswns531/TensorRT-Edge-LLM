@@ -611,5 +611,177 @@ PipelineIO PipelineIO::createForSpecDecode(
     return io;
 }
 
+PipelineIOPool PipelineIOPool::create(LLMEngineConfig const& cfg, int32_t prefillBatch, int32_t prefillSeq,
+    int32_t decodeBatch, int32_t decodeSeq, cudaStream_t stream)
+{
+    PipelineIOPool pool;
+    int32_t const maxBatch = std::max(prefillBatch, decodeBatch);
+    int32_t const maxSeq = std::max(prefillSeq, decodeSeq);
+
+    pool.mInputsEmbeds = Tensor({maxBatch, maxSeq, cfg.hiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF,
+        "PipelineIOPool::inputsEmbeds");
+    pool.mTotalAllocatedBytes += pool.mInputsEmbeds.getMemoryCapacity();
+
+    pool.mOutputLogits = Tensor({maxBatch, cfg.outputVocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+        "PipelineIOPool::outputLogits");
+    pool.mTotalAllocatedBytes += pool.mOutputLogits.getMemoryCapacity();
+
+    pool.mSelectTokenIndices = Tensor({maxBatch, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT64,
+        "PipelineIOPool::selectTokenIndices");
+    pool.mTotalAllocatedBytes += pool.mSelectTokenIndices.getMemoryCapacity();
+
+    pool.mPhaseIsEncoder = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+        "PipelineIOPool::phaseIsEncoder");
+    pool.mTotalAllocatedBytes += pool.mPhaseIsEncoder.getMemoryCapacity();
+
+    pool.mContextMaskSelector = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+        "PipelineIOPool::contextMaskSelector");
+    pool.mTotalAllocatedBytes += pool.mContextMaskSelector.getMemoryCapacity();
+
+    pool.mContextLengths = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+        "PipelineIOPool::contextLengths");
+    pool.mTotalAllocatedBytes += pool.mContextLengths.getMemoryCapacity();
+
+    pool.mHostContextLengths = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32,
+        "PipelineIOPool::hostContextLengths");
+    pool.mHostSelectTokenIndices = Tensor({maxBatch, 1}, DeviceType::kCPU, nvinfer1::DataType::kINT64,
+        "PipelineIOPool::hostSelectTokenIndices");
+    pool.mHostPhaseIsEncoder = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32,
+        "PipelineIOPool::hostPhaseIsEncoder");
+
+    if (cfg.isDiffusionBackbone)
+    {
+        pool.mVisionBlockIds = Tensor({maxBatch, maxSeq}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "PipelineIOPool::visionBlockIds");
+        pool.mTotalAllocatedBytes += pool.mVisionBlockIds.getMemoryCapacity();
+    }
+    else
+    {
+        if (hasDeepstackFeatures(cfg))
+        {
+            pool.mDeepstackEmbeds.clear();
+            pool.mDeepstackEmbeds.reserve(cfg.numDeepstackFeatures);
+            for (int32_t i = 0; i < cfg.numDeepstackFeatures; ++i)
+            {
+                pool.mDeepstackEmbeds.emplace_back(Coords{maxBatch, maxSeq, cfg.hiddenSize}, DeviceType::kGPU,
+                    nvinfer1::DataType::kHALF, "PipelineIOPool::deepstackEmbeds");
+                pool.mTotalAllocatedBytes += pool.mDeepstackEmbeds.back().getMemoryCapacity();
+            }
+        }
+        if (cfg.ropeConfig.type == RopeType::kMRope)
+        {
+            pool.mMRopeCosSin = Tensor({maxBatch, cfg.maxKVCacheCapacity, cfg.rotaryDim}, DeviceType::kGPU,
+                nvinfer1::DataType::kFLOAT, "PipelineIOPool::mropeCosSin");
+            pool.mTotalAllocatedBytes += pool.mMRopeCosSin.getMemoryCapacity();
+        }
+    }
+
+    return pool;
+}
+
+PipelineIO PipelineIOPool::createPrefillView(LLMEngineConfig const& cfg, int32_t prefillBatch, int32_t prefillSeq)
+{
+    PipelineIO io;
+    io.inputsEmbeds = Tensor(mInputsEmbeds.rawPointer(), {prefillBatch, prefillSeq, cfg.hiddenSize},
+        mInputsEmbeds.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::inputsEmbeds");
+    io.inputsEmbeds.setAllowReshape(true);
+
+    io.outputLogits = Tensor(mOutputLogits.rawPointer(), {prefillBatch, cfg.outputVocabSize},
+        mOutputLogits.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
+    io.selectTokenIndices = Tensor(mSelectTokenIndices.rawPointer(), {prefillBatch, 1},
+        mSelectTokenIndices.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
+    io.phaseIsEncoder = Tensor(mPhaseIsEncoder.rawPointer(), {prefillBatch},
+        mPhaseIsEncoder.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::phaseIsEncoder");
+    io.contextMaskSelector = Tensor(mContextMaskSelector.rawPointer(), {prefillBatch},
+        mContextMaskSelector.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextMaskSelector");
+    io.contextLengths = Tensor(mContextLengths.rawPointer(), {prefillBatch},
+        mContextLengths.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextLengths");
+    io.hostContextLengths = Tensor(mHostContextLengths.rawPointer(), {prefillBatch},
+        mHostContextLengths.getMemoryCapacity(), DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostContextLengths");
+    io.hostSelectTokenIndices = Tensor(mHostSelectTokenIndices.rawPointer(), {prefillBatch, 1},
+        mHostSelectTokenIndices.getMemoryCapacity(), DeviceType::kCPU, nvinfer1::DataType::kINT64, "PipelineIO::hostSelectTokenIndices");
+    io.hostPhaseIsEncoder = Tensor(mHostPhaseIsEncoder.rawPointer(), {prefillBatch},
+        mHostPhaseIsEncoder.getMemoryCapacity(), DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostPhaseIsEncoder");
+
+    if (cfg.isDiffusionBackbone)
+    {
+        io.visionBlockIds = Tensor(mVisionBlockIds.rawPointer(), {prefillBatch, prefillSeq},
+            mVisionBlockIds.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+    }
+    else
+    {
+        if (hasDeepstackFeatures(cfg))
+        {
+            io.deepstackEmbeds.clear();
+            io.deepstackEmbeds.reserve(mDeepstackEmbeds.size());
+            for (size_t i = 0; i < mDeepstackEmbeds.size(); ++i)
+            {
+                io.deepstackEmbeds.emplace_back(mDeepstackEmbeds[i].rawPointer(),
+                    Coords{prefillBatch, prefillSeq, cfg.hiddenSize}, mDeepstackEmbeds[i].getMemoryCapacity(),
+                    DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::deepstackEmbeds");
+            }
+        }
+        if (cfg.ropeConfig.type == RopeType::kMRope)
+        {
+            io.mropeCosSin = Tensor(mMRopeCosSin.rawPointer(), {prefillBatch, cfg.maxKVCacheCapacity, cfg.rotaryDim},
+                mMRopeCosSin.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::mropeCosSin");
+        }
+    }
+
+    return io;
+}
+
+PipelineIO PipelineIOPool::createDecodeView(LLMEngineConfig const& cfg, int32_t decodeBatch, int32_t decodeSeq)
+{
+    PipelineIO io;
+    io.inputsEmbeds = Tensor(mInputsEmbeds.rawPointer(), {decodeBatch, decodeSeq, cfg.hiddenSize},
+        mInputsEmbeds.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::inputsEmbeds");
+    io.inputsEmbeds.setAllowReshape(true);
+
+    io.outputLogits = Tensor(mOutputLogits.rawPointer(), {decodeBatch, cfg.outputVocabSize},
+        mOutputLogits.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
+    io.selectTokenIndices = Tensor(mSelectTokenIndices.rawPointer(), {decodeBatch, 1},
+        mSelectTokenIndices.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
+    io.phaseIsEncoder = Tensor(mPhaseIsEncoder.rawPointer(), {decodeBatch},
+        mPhaseIsEncoder.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::phaseIsEncoder");
+    io.contextMaskSelector = Tensor(mContextMaskSelector.rawPointer(), {decodeBatch},
+        mContextMaskSelector.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextMaskSelector");
+    io.contextLengths = Tensor(mContextLengths.rawPointer(), {decodeBatch},
+        mContextLengths.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextLengths");
+    io.hostContextLengths = Tensor(mHostContextLengths.rawPointer(), {decodeBatch},
+        mHostContextLengths.getMemoryCapacity(), DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostContextLengths");
+    io.hostSelectTokenIndices = Tensor(mHostSelectTokenIndices.rawPointer(), {decodeBatch, 1},
+        mHostSelectTokenIndices.getMemoryCapacity(), DeviceType::kCPU, nvinfer1::DataType::kINT64, "PipelineIO::hostSelectTokenIndices");
+    io.hostPhaseIsEncoder = Tensor(mHostPhaseIsEncoder.rawPointer(), {decodeBatch},
+        mHostPhaseIsEncoder.getMemoryCapacity(), DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostPhaseIsEncoder");
+
+    if (cfg.isDiffusionBackbone)
+    {
+        io.visionBlockIds = Tensor(mVisionBlockIds.rawPointer(), {decodeBatch, decodeSeq},
+            mVisionBlockIds.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+    }
+    else
+    {
+        if (hasDeepstackFeatures(cfg))
+        {
+            io.deepstackEmbeds.clear();
+            io.deepstackEmbeds.reserve(mDeepstackEmbeds.size());
+            for (size_t i = 0; i < mDeepstackEmbeds.size(); ++i)
+            {
+                io.deepstackEmbeds.emplace_back(mDeepstackEmbeds[i].rawPointer(),
+                    Coords{decodeBatch, decodeSeq, cfg.hiddenSize}, mDeepstackEmbeds[i].getMemoryCapacity(),
+                    DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::deepstackEmbeds");
+            }
+        }
+        if (cfg.ropeConfig.type == RopeType::kMRope)
+        {
+            io.mropeCosSin = Tensor(mMRopeCosSin.rawPointer(), {decodeBatch, cfg.maxKVCacheCapacity, cfg.rotaryDim},
+                mMRopeCosSin.getMemoryCapacity(), DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::mropeCosSin");
+        }
+    }
+
+    return io;
+}
+
 } // namespace rt
 } // namespace trt_edgellm

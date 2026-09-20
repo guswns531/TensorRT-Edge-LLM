@@ -174,30 +174,35 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     }
 }
 
-Tensor::Tensor(
-    void* data, Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name)
+Tensor::Tensor(void* data, Coords const& shape, int64_t capacity, DeviceType deviceType, nvinfer1::DataType dataType,
+    std::string const& name)
 {
-    // Populate the tensor information and only serve as a data container with shape.
     mShape = shape;
     mDeviceType = deviceType;
     mDataType = dataType;
     ownMemory = false;
+    mAllowReshape = false;
 
-    // Allow construction of a non-owned tensor with zero volume.
-    // The data pointer won't be granted to the tensor object since no access is needed for zero-volume tensors.
     if (shape.volume() != 0)
     {
         mStrides = utils::computeStrides(shape);
         this->data = data;
-        memoryCapacity = shape.volume() * utils::getTypeSize(dataType);
+        int64_t const minCap = static_cast<int64_t>(shape.volume() * utils::getTypeSize(dataType));
+        memoryCapacity = capacity >= minCap ? capacity : minCap;
     }
     else
     {
-        this->data = nullptr;
-        memoryCapacity = 0;
+        this->data = data;
+        memoryCapacity = capacity;
         mStrides = {};
     }
     mName = name;
+}
+
+Tensor::Tensor(
+    void* data, Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name)
+    : Tensor(data, shape, static_cast<int64_t>(shape.volume() * utils::getTypeSize(dataType)), deviceType, dataType, name)
+{
 }
 
 Tensor::~Tensor() noexcept
@@ -223,6 +228,7 @@ Tensor::Tensor(Tensor&& other) noexcept
     this->mDeviceType = other.mDeviceType;
     this->mDataType = other.mDataType;
     this->ownMemory = other.ownMemory;
+    this->mAllowReshape = other.mAllowReshape;
     this->memoryCapacity = other.memoryCapacity;
     this->mName = other.mName;
     // Reset the other tensor.
@@ -232,6 +238,7 @@ Tensor::Tensor(Tensor&& other) noexcept
     other.mDeviceType = DeviceType::kCPU;
     other.mDataType = DataType::kFLOAT;
     other.ownMemory = false;
+    other.mAllowReshape = false;
     other.memoryCapacity = 0;
     other.mName = {};
 }
@@ -253,6 +260,7 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
         this->mDeviceType = other.mDeviceType;
         this->mDataType = other.mDataType;
         this->ownMemory = other.ownMemory;
+        this->mAllowReshape = other.mAllowReshape;
         this->memoryCapacity = other.memoryCapacity;
         this->mName = other.mName;
         // Reset the other tensor.
@@ -262,6 +270,7 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
         other.mDeviceType = {};
         other.mDataType = {};
         other.ownMemory = false;
+        other.mAllowReshape = false;
         other.memoryCapacity = 0;
         other.mName = {};
     }
@@ -335,7 +344,12 @@ void const* Tensor::rawPointer() const noexcept
 
 bool Tensor::reshape(Coords shape) noexcept
 {
-    if (!ownMemory)
+    if (!ownMemory && !mAllowReshape)
+    {
+        return false;
+    }
+
+    if (data == nullptr && shape.volume() > 0)
     {
         return false;
     }

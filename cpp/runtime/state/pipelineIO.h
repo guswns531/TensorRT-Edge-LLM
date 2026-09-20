@@ -142,6 +142,41 @@ struct PipelineIO
         DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize, cudaStream_t stream, bool hasAcceptHiddenOutput);
 };
 
+//! Backing storage pool that allocates unified GPU/CPU buffers for prefill and decode phases.
+//! When serialized execution is guaranteed (e.g. shared_ep, shared_pd, or pooled I/O mode),
+//! prefill and decode PipelineIO instances can share backing memory without duplication.
+class PipelineIOPool
+{
+public:
+    PipelineIOPool() noexcept = default;
+
+    static PipelineIOPool create(LLMEngineConfig const& cfg, int32_t prefillBatch, int32_t prefillSeq,
+        int32_t decodeBatch, int32_t decodeSeq, cudaStream_t stream);
+
+    PipelineIO createPrefillView(LLMEngineConfig const& cfg, int32_t prefillBatch, int32_t prefillSeq);
+    PipelineIO createDecodeView(LLMEngineConfig const& cfg, int32_t decodeBatch, int32_t decodeSeq);
+
+    [[nodiscard]] size_t totalAllocatedBytes() const noexcept
+    {
+        return mTotalAllocatedBytes;
+    }
+
+private:
+    Tensor mInputsEmbeds;
+    Tensor mOutputLogits;
+    Tensor mSelectTokenIndices;
+    Tensor mPhaseIsEncoder;
+    Tensor mContextMaskSelector;
+    Tensor mContextLengths;
+    Tensor mHostContextLengths;
+    Tensor mHostSelectTokenIndices;
+    Tensor mHostPhaseIsEncoder;
+    Tensor mVisionBlockIds;
+    std::vector<Tensor> mDeepstackEmbeds;
+    Tensor mMRopeCosSin;
+    size_t mTotalAllocatedBytes{0};
+};
+
 void allocateBasicIO(
     PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype);
 

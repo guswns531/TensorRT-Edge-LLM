@@ -213,6 +213,31 @@ TEST(TensorTest, DeviceTensorNonOwnMemory)
     CUDA_CHECK(cudaFreeAsync(devicePtr, 0));
 }
 
+TEST(TensorTest, DeviceTensorNonOwnMemoryAllowReshape)
+{
+    void* devicePtr{nullptr};
+    CUDA_CHECK(cudaMallocAsync(&devicePtr, 1024, 0));
+
+    rt::Tensor tensor(devicePtr, {4, 8, 16}, 1024, rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
+    ASSERT_FALSE(tensor.getOwnMemory());
+    ASSERT_FALSE(tensor.getAllowReshape());
+    ASSERT_EQ(tensor.getMemoryCapacity(), 1024);
+
+    // Without allowReshape, reshape fails
+    ASSERT_FALSE(tensor.reshape({4, 4, 16}));
+
+    // With allowReshape, reshape within capacity succeeds
+    tensor.setAllowReshape(true);
+    ASSERT_TRUE(tensor.getAllowReshape());
+    ASSERT_TRUE(tensor.reshape({4, 4, 16}));
+    ASSERT_EQ(tensor.getShape()[1], 4);
+
+    // Reshape exceeding capacity fails
+    ASSERT_FALSE(tensor.reshape({16, 16, 16}));
+
+    CUDA_CHECK(cudaFreeAsync(devicePtr, 0));
+}
+
 TEST(TensorTest, TensorNameFunctionality)
 {
     // Test tensor with name
