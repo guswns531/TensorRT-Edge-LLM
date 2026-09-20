@@ -4229,6 +4229,54 @@ TEST(PhaseThreeCoordinatorPolicyTest, ReleasesNonMropePrefillVisionStorage)
     EXPECT_EQ(payload.releasePrefillStorage(), 0U);
 }
 
+TEST(PhaseQueueSchedulerTest, AdaptsDecodeBurstAndOverlapWithTransitionPredictor)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 4;
+    config.maxDecodeBatchSize = 16;
+    config.decodeBurstLimit = 8;
+    config.maxOverlapPrefillTokens = 128;
+    config.enableTransitionPredictor = true;
+    config.transitionPredictorConfig.minimumObservations = 2U;
+
+    PhaseQueueScheduler scheduler(config);
+
+    // Initial state: predictor has 0 observations
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry(PhaseTransitionDelayKind::kPrefillToDecode).observations, 0U);
+
+    // Simulate dispatches with high decode wait times (indicating severe P->D handoff bottleneck)
+    for (size_t i{}; i < 10U; ++i)
+    {
+        PhaseDispatchMetrics metrics;
+        metrics.decodeBatchSize = 8;
+        metrics.decodeTokens = 1024;
+        metrics.decodeQueueWaitUs = 2500.0;
+        metrics.decodeGpuMs = 0.2F; // 200 us per step
+        metrics.makespanGpuMs = 0.5F;
+        scheduler.observeMetrics(metrics);
+    }
+
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry(PhaseTransitionDelayKind::kPrefillToDecode).observations, 10U);
+
+    // Enqueue decode work to test dynamic burst and overlap adaptation
+    for (uint64_t id{1}; id <= 12; ++id)
+    {
+        scheduler.enqueueDecode(PhaseWorkItem{id, 1, 0, 0, 1});
+    }
+
+    PhaseQueueSnapshot const snap = scheduler.queueSnapshot();
+    EXPECT_EQ(snap.decodeQueued, 12);
+
+    // Test that resetPolicyPosterior clears predictor observations
+    for (uint64_t id{1}; id <= 12; ++id)
+    {
+        scheduler.cancel(id);
+    }
+    scheduler.resetPolicyPosterior();
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry(PhaseTransitionDelayKind::kPrefillToDecode).observations, 0U);
+}
+
 } // namespace
 } // namespace rt
 } // namespace trt_edgellm
+

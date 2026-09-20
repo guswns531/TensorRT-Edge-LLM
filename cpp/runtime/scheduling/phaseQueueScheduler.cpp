@@ -71,7 +71,13 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     , mRecentDecodeTpotUs(std::make_shared<RecentDecodeTpot>())
     , mRecentDecodeServiceAges(std::make_shared<RecentDecodeServiceAge>())
     , mDecodeComponentObservationActive(mConfig.enableDecodeComponentObservation)
+    , mTransitionPredictor(mConfig.transitionPredictorConfig)
 {
+    if (char const* const envPredictor = std::getenv("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR"); envPredictor != nullptr)
+    {
+        mConfig.enableTransitionPredictor
+            = std::strcmp(envPredictor, "0") != 0 && std::strcmp(envPredictor, "false") != 0;
+    }
     check::check(mConfig.maxPrefillBatchSize > 0, "maxPrefillBatchSize must be positive");
     check::check(
         mConfig.maxExternalPrefillBatchSize >= 0 && mConfig.maxExternalPrefillBatchSize <= mConfig.maxPrefillBatchSize,
@@ -747,6 +753,46 @@ void PhaseQueueScheduler::setPendingPrefillProducerRows(
     mPendingPrefillProducerRowsClassified = true;
 }
 
+int32_t PhaseQueueScheduler::effectiveDecodeBurstLimit(PhaseQueueSnapshot const& state) const noexcept
+{
+    if (!mConfig.enableTransitionPredictor)
+    {
+        return mConfig.decodeBurstLimit;
+    }
+    double const kvUtil = state.pagePoolTotalBundles > 0
+        ? static_cast<double>(state.pagePoolAllocatedBundles) / state.pagePoolTotalBundles
+        : 0.0;
+    double const pdDelayUs = mTransitionPredictor.predictPdTransitionDelayUs(
+        state.decodeQueued, state.decodeCandidateTokens, kvUtil);
+    double decodeStepUs = 200.0;
+    if (mTelemetry.lastDispatch.has_value() && mTelemetry.lastDispatch->decodeGpuMs > 0.0F)
+    {
+        decodeStepUs = static_cast<double>(mTelemetry.lastDispatch->decodeGpuMs) * 1000.0;
+    }
+    else if (mTelemetry.decodeGpuMsPerContextToken > 0.0F && state.decodeCandidateTokens > 0)
+    {
+        decodeStepUs
+            = static_cast<double>(mTelemetry.decodeGpuMsPerContextToken * state.decodeCandidateTokens) * 1000.0;
+    }
+    return static_cast<int32_t>(
+        mTransitionPredictor.recommendedDecodeBurst(state.decodeQueued, pdDelayUs, decodeStepUs));
+}
+
+int32_t PhaseQueueScheduler::effectiveOverlapPrefillTokens(PhaseQueueSnapshot const& state) const noexcept
+{
+    if (!mConfig.enableTransitionPredictor)
+    {
+        return mConfig.maxOverlapPrefillTokens;
+    }
+    double const kvUtil = state.pagePoolTotalBundles > 0
+        ? static_cast<double>(state.pagePoolAllocatedBundles) / state.pagePoolTotalBundles
+        : 0.0;
+    double const pdDelayUs = mTransitionPredictor.predictPdTransitionDelayUs(
+        state.decodeQueued, state.decodeCandidateTokens, kvUtil);
+    return mTransitionPredictor.recommendedOverlapPrefillTokens(
+        state.decodeQueued, pdDelayUs, mConfig.maxOverlapPrefillTokens);
+}
+
 PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const& state) const noexcept
 {
     if (state.prefillQueued == 0 && state.decodeQueued == 0)
@@ -761,11 +807,11 @@ PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const&
     {
         return PhaseDispatchKind::kPrefill;
     }
-    if (state.consecutiveDecodeBatches >= mConfig.decodeBurstLimit)
+    if (state.consecutiveDecodeBatches >= effectiveDecodeBurstLimit(state))
     {
         return PhaseDispatchKind::kPrefill;
     }
-    if (state.prefillCandidateTokens <= mConfig.maxOverlapPrefillTokens)
+    if (state.prefillCandidateTokens <= effectiveOverlapPrefillTokens(state))
     {
         return PhaseDispatchKind::kOverlap;
     }
@@ -797,7 +843,7 @@ PhaseDispatchKind PhaseQueueScheduler::metricsDecision(
             ? PhaseDispatchKind::kPrefill
             : PhaseDispatchKind::kDecode;
     }
-    if (state.consecutiveDecodeBatches >= mConfig.decodeBurstLimit)
+    if (state.consecutiveDecodeBatches >= effectiveDecodeBurstLimit(state))
     {
         return PhaseDispatchKind::kPrefill;
     }
@@ -976,7 +1022,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     }
     int32_t const available = std::min<int32_t>(prefillBatchLimit(candidates.front()->prefillClass), candidates.size());
     bool const evaluateOversizedOverlap = overlap && mConfig.enableCostAwareOverlapAdmission && !mLatencySafeFallback
-        && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
+        && state.prefillCandidateTokens > effectiveOverlapPrefillTokens(state);
     if (available <= 0 || (!mConfig.enableDynamicPrefillBatching && !evaluateOversizedOverlap))
     {
         return 0;
@@ -3562,7 +3608,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.latencySafeFallback = mLatencySafeFallback;
     plan.decodeServiceReferenceUs = state.decodeService.reference.valid ? state.decodeService.reference.serviceUs : 0.0;
     plan.overlapEvaluatedByCost = kind == PhaseDispatchKind::kOverlap && mConfig.enableCostAwareOverlapAdmission
-        && !mLatencySafeFallback && state.prefillCandidateTokens > mConfig.maxOverlapPrefillTokens;
+        && !mLatencySafeFallback && state.prefillCandidateTokens > effectiveOverlapPrefillTokens(state);
     plan.externalEncoderActive = mExternalEncoderActive;
     plan.concurrentPrefillActive = kind == PhaseDispatchKind::kOverlap;
     plan.plannedDecodeBatchSize = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap
@@ -3756,7 +3802,7 @@ PhaseDispatchKind PhaseQueueScheduler::applyExternalDrainPreference(
         applied = true;
         return PhaseDispatchKind::kPrefill;
     }
-    if (state.consecutiveDecodeBatches >= mConfig.decodeBurstLimit)
+    if (state.consecutiveDecodeBatches >= effectiveDecodeBurstLimit(state))
     {
         return baseline;
     }
@@ -4436,6 +4482,51 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     mTelemetry.contextualPdLastMean = contextualTelemetry.lastMean;
     mTelemetry.contextualPdLastUncertainty = contextualTelemetry.lastUncertainty;
     mTelemetry.contextualPdLastLowerConfidenceBound = contextualTelemetry.lastLowerConfidenceBound;
+    if (mConfig.enableTransitionPredictor)
+    {
+        double const kvUtil = metrics.pagePoolTotalBundles > 0
+            ? static_cast<double>(metrics.pagePoolAllocatedBundles) / static_cast<double>(metrics.pagePoolTotalBundles)
+            : 0.0;
+        if (metrics.makespanGpuMs > 0.0F)
+        {
+            PhaseTransitionFeatures const features{
+                1.0,
+                static_cast<double>(metrics.prefillTokens) / 1024.0,
+                static_cast<double>(metrics.decodeBatchSize) / 16.0,
+                metrics.kind == PhaseDispatchKind::kOverlap ? 1.0 : 0.0,
+                kvUtil,
+                0.0,
+            };
+            mTransitionPredictor.observe(
+                PhaseTransitionDelayKind::kActionMakespan, features, static_cast<double>(metrics.makespanGpuMs) * 1000.0);
+        }
+        if (metrics.decodeQueueWaitUs > 0.0 && metrics.decodeBatchSize > 0)
+        {
+            PhaseTransitionFeatures const features{
+                1.0,
+                static_cast<double>(metrics.decodeBatchSize) / 16.0,
+                static_cast<double>(metrics.decodeTokens) / 1024.0,
+                1.0,
+                kvUtil,
+                0.0,
+            };
+            mTransitionPredictor.observe(
+                PhaseTransitionDelayKind::kPrefillToDecode, features, metrics.decodeQueueWaitUs);
+        }
+        if (metrics.prefillQueueWaitUs > 0.0 && metrics.prefillBatchSize > 0)
+        {
+            PhaseTransitionFeatures const features{
+                1.0,
+                static_cast<double>(metrics.prefillBatchSize) / 4.0,
+                static_cast<double>(metrics.prefillTokens) / 1024.0,
+                0.0,
+                kvUtil,
+                0.0,
+            };
+            mTransitionPredictor.observe(
+                PhaseTransitionDelayKind::kEncoderToPrefill, features, metrics.prefillQueueWaitUs);
+        }
+    }
     ++mTelemetry.sampleCount;
     mTelemetry.lastDispatch = metrics;
 }
@@ -4501,6 +4592,7 @@ void PhaseQueueScheduler::resetPolicyPosterior()
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Policy posterior can only be reset while the scheduler is idle");
     mRuntimeCostTracker->resetPolicyPosterior();
+    mTransitionPredictor.reset();
 }
 
 void PhaseQueueScheduler::resetExecutionCostHistory()
@@ -4516,6 +4608,7 @@ void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
     if (!preserveRuntimeCosts)
     {
         mRuntimeCostTracker->reset();
+        mTransitionPredictor.reset();
     }
 }
 

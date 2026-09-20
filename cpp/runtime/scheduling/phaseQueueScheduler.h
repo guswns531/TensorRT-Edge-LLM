@@ -20,6 +20,7 @@
 #include "runtime/phase/cost/phaseRuntimeCostTracker.h"
 #include "runtime/phase/mechanism/phaseReadySnapshot.h"
 #include "runtime/phase/policy/phaseGlobalScheduler.h"
+#include "runtime/phase/policy/phaseTransitionPredictor.h"
 
 #include <chrono>
 #include <cstddef>
@@ -574,6 +575,10 @@ struct PhaseQueueSchedulerConfig
     //! Admit one prefill batch after this many decode-only decisions so a
     //! continuous decode queue cannot starve new requests forever.
     int32_t decodeBurstLimit{8};
+    //! Online learned completion-aware transition predictor for P->D / E->P handoff latency,
+    //! dynamic decode burst sizing, and adaptive overlap token bounds.
+    bool enableTransitionPredictor{true};
+    PhaseTransitionPredictorConfig transitionPredictorConfig{};
     //! Opt in to the provided queue-deadline + EWMA GPU-cost policy.
     bool enableMetricsPolicy{};
     //! Dispatch expired prefill work before decode even when decode queue pressure is numerically larger.
@@ -855,6 +860,15 @@ public:
     //! costs without applying production-request slack. Disable before serving.
     void setGlobalWarmupProbeMode(bool active);
 
+    PhaseTransitionPredictor const& transitionPredictor() const noexcept
+    {
+        return mTransitionPredictor;
+    }
+    PhaseTransitionPredictor& transitionPredictor() noexcept
+    {
+        return mTransitionPredictor;
+    }
+
 private:
     struct ServiceEpochRecord
     {
@@ -877,6 +891,8 @@ private:
     PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
     PhaseDispatchKind legacyQueueDecision(PhaseQueueSnapshot const& snapshot) const;
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
+    int32_t effectiveDecodeBurstLimit(PhaseQueueSnapshot const& snapshot) const noexcept;
+    int32_t effectiveOverlapPrefillTokens(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind metricsDecision(
         PhaseQueueSnapshot const& snapshot, PhaseSchedulerTelemetry const& telemetry) const noexcept;
@@ -970,6 +986,7 @@ private:
     std::vector<PhaseGlobalActionCandidate> mLastGlobalPreviewCandidates;
     std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)>
         mGlobalExecutionVariantSupplier;
+    PhaseTransitionPredictor mTransitionPredictor;
 };
 
 } // namespace rt
