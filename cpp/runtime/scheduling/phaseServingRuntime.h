@@ -43,9 +43,58 @@ struct LLMEngineConfig;
 struct SharedResources;
 struct LLMGenerationRequest;
 
+enum class PhaseWorkspaceMode
+{
+    kAuto,
+    kIndependent,
+    kTieredEp,
+    kSharedEp,
+    kSharedEd,
+};
+
+inline char const* phaseWorkspaceModeName(PhaseWorkspaceMode mode) noexcept
+{
+    switch (mode)
+    {
+    case PhaseWorkspaceMode::kAuto: return "auto";
+    case PhaseWorkspaceMode::kIndependent: return "independent";
+    case PhaseWorkspaceMode::kTieredEp: return "tiered_ep";
+    case PhaseWorkspaceMode::kSharedEp: return "shared_ep";
+    case PhaseWorkspaceMode::kSharedEd: return "shared_ed";
+    }
+    return "unknown";
+}
+
+inline std::optional<PhaseWorkspaceMode> phaseWorkspaceModeFromName(std::string_view name) noexcept
+{
+    if (name == "auto")
+    {
+        return PhaseWorkspaceMode::kAuto;
+    }
+    if (name == "independent")
+    {
+        return PhaseWorkspaceMode::kIndependent;
+    }
+    if (name == "tiered_ep" || name == "tiered")
+    {
+        return PhaseWorkspaceMode::kTieredEp;
+    }
+    if (name == "shared_ep")
+    {
+        return PhaseWorkspaceMode::kSharedEp;
+    }
+    if (name == "shared_ed")
+    {
+        return PhaseWorkspaceMode::kSharedEd;
+    }
+    return std::nullopt;
+}
+
 struct PhaseServingRuntimeConfig
 {
     PhasePolicyMode policyMode{PhasePolicyMode::kContextualScalarTransition};
+    PhaseWorkspaceMode workspaceMode{PhaseWorkspaceMode::kAuto};
+    size_t workspaceHeadroomBytes{96U * 1024U * 1024U};
     int32_t maxStableSlots{};
     size_t maxInFlightRequests{};
     size_t maxPendingRequests{};

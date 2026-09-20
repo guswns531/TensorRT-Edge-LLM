@@ -16,6 +16,7 @@
  */
 
 #include "runtime/phase/cost/phaseRuntimeCostTracker.h"
+#include "runtime/scheduling/phaseServingRuntime.h"
 
 #include <gtest/gtest.h>
 
@@ -376,6 +377,23 @@ TEST(PhasePolicyModeTest, ExactModeCannotAccidentallyEnableContextualAuthority)
         tracker.contextualPairConfig(PhaseContextualPairKind::kEncoderPrefill).mode, PhaseContextualPdMode::kDisabled);
     EXPECT_EQ(
         tracker.contextualPairConfig(PhaseContextualPairKind::kEncoderDecode).mode, PhaseContextualPdMode::kDisabled);
+}
+
+TEST(PhaseWorkspaceModeTest, ParsesOnlyCanonicalWorkspaceVariants)
+{
+    EXPECT_EQ(phaseWorkspaceModeFromName("auto"), PhaseWorkspaceMode::kAuto);
+    EXPECT_EQ(phaseWorkspaceModeFromName("independent"), PhaseWorkspaceMode::kIndependent);
+    EXPECT_EQ(phaseWorkspaceModeFromName("tiered_ep"), PhaseWorkspaceMode::kTieredEp);
+    EXPECT_EQ(phaseWorkspaceModeFromName("tiered"), PhaseWorkspaceMode::kTieredEp);
+    EXPECT_EQ(phaseWorkspaceModeFromName("shared_ep"), PhaseWorkspaceMode::kSharedEp);
+    EXPECT_EQ(phaseWorkspaceModeFromName("shared_ed"), PhaseWorkspaceMode::kSharedEd);
+    EXPECT_FALSE(phaseWorkspaceModeFromName("invalid").has_value());
+
+    EXPECT_STREQ(phaseWorkspaceModeName(PhaseWorkspaceMode::kAuto), "auto");
+    EXPECT_STREQ(phaseWorkspaceModeName(PhaseWorkspaceMode::kIndependent), "independent");
+    EXPECT_STREQ(phaseWorkspaceModeName(PhaseWorkspaceMode::kTieredEp), "tiered_ep");
+    EXPECT_STREQ(phaseWorkspaceModeName(PhaseWorkspaceMode::kSharedEp), "shared_ep");
+    EXPECT_STREQ(phaseWorkspaceModeName(PhaseWorkspaceMode::kSharedEd), "shared_ed");
 }
 
 } // namespace

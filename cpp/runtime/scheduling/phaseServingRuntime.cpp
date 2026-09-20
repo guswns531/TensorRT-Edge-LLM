@@ -271,19 +271,70 @@ public:
             int64_t const prefillBytes = static_cast<int64_t>(mExecutors->prefillContextMemory().getMemoryCapacity());
             int64_t const visionBytes = mVisionRunner->getRequiredContextMemorySize();
             ELLM_CHECK(visionBytes > 0, "TensorRT returned an empty vision workspace for phase execution");
-            constexpr size_t kWORKSPACE_HEADROOM_BYTES = 96U * 1024U * 1024U;
-            size_t const independentVisionBytes = static_cast<size_t>(visionBytes);
-            bool const independentVisionFits = freeBytes >= independentVisionBytes
-                && freeBytes - independentVisionBytes >= kWORKSPACE_HEADROOM_BYTES;
-            size_t const prefillShareGrowth = static_cast<size_t>(std::max<int64_t>(0, visionBytes - prefillBytes));
-            bool const prefillShareFits
-                = freeBytes >= prefillShareGrowth && freeBytes - prefillShareGrowth >= kWORKSPACE_HEADROOM_BYTES;
-            if (independentVisionFits)
+            PhaseWorkspaceMode effectiveWorkspaceMode = mServingConfig.workspaceMode;
+            if (char const* const envMode = std::getenv("TRT_EDGELLM_PHASE_WORKSPACE_MODE"); envMode != nullptr)
             {
+                if (auto const parsed = phaseWorkspaceModeFromName(envMode))
+                {
+                    effectiveWorkspaceMode = *parsed;
+                }
+            }
+            else if (std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr)
+            {
+                effectiveWorkspaceMode = PhaseWorkspaceMode::kTieredEp;
+            }
+            else if (std::getenv("TRT_EDGELLM_SHARED_VISION_DECODE_CONTEXT_MEMORY") != nullptr)
+            {
+                effectiveWorkspaceMode = PhaseWorkspaceMode::kSharedEd;
+            }
+
+            size_t effectiveHeadroom = mServingConfig.workspaceHeadroomBytes;
+            if (char const* const envHeadroom = std::getenv("TRT_EDGELLM_WORKSPACE_HEADROOM_BYTES");
+                envHeadroom != nullptr)
+            {
+                try
+                {
+                    effectiveHeadroom = static_cast<size_t>(std::stoull(envHeadroom));
+                }
+                catch (...)
+                {
+                }
+            }
+
+            PhaseWorkspaceMode resolvedMode = effectiveWorkspaceMode;
+            if (resolvedMode == PhaseWorkspaceMode::kAuto)
+            {
+                size_t const independentVisionBytes = static_cast<size_t>(visionBytes);
+                bool const independentVisionFits = freeBytes >= independentVisionBytes
+                    && freeBytes - independentVisionBytes >= effectiveHeadroom;
+                size_t const prefillShareGrowth = static_cast<size_t>(std::max<int64_t>(0, visionBytes - prefillBytes));
+                bool const prefillShareFits
+                    = freeBytes >= prefillShareGrowth && freeBytes - prefillShareGrowth >= effectiveHeadroom;
+                if (independentVisionFits)
+                {
+                    resolvedMode = PhaseWorkspaceMode::kIndependent;
+                }
+                else if (!prefillShareFits)
+                {
+                    resolvedMode = PhaseWorkspaceMode::kSharedEd;
+                }
+                else if (profileCount == 1)
+                {
+                    resolvedMode = PhaseWorkspaceMode::kSharedEp;
+                }
+                else
+                {
+                    resolvedMode = PhaseWorkspaceMode::kTieredEp;
+                }
+            }
+
+            switch (resolvedMode)
+            {
+            case PhaseWorkspaceMode::kIndependent:
                 mVisionRunner->allocateContextMemory();
                 LOG_INFO("Phase workspace mode: independent E/P/D arenas; all pairwise overlap remains available");
-            }
-            else if (!prefillShareFits)
+                break;
+            case PhaseWorkspaceMode::kSharedEd:
             {
                 TieredVisionContextMemoryInfo const info
                     = mExecutors->configureSharedVisionDecodeContextMemory(*mVisionRunner);
@@ -293,23 +344,42 @@ public:
                 LOG_INFO("Phase workspace mode: shared E/D arena=%lld bytes; E/P overlap remains available",
                     static_cast<long long>(info.arenaBytes));
                 LOG_INFO("Phase memory-constrained decode capacity: %d rows", decodeBatchCapacity);
+                break;
             }
-            else if (profileCount == 1)
+            case PhaseWorkspaceMode::kSharedEp:
             {
                 TieredVisionContextMemoryInfo const info
                     = mExecutors->configureSharedVisionContextMemory(*mVisionRunner, 0);
                 serializeAllEncoderPrefill = true;
                 LOG_INFO("Phase workspace mode: shared E/P arena=%lld bytes; E/D overlap remains available",
                     static_cast<long long>(info.arenaBytes));
+                break;
             }
-            else
+            case PhaseWorkspaceMode::kTieredEp:
             {
-                TieredVisionContextMemoryInfo const info
-                    = mExecutors->configureTieredVisionContextMemory(*mVisionRunner, 0, profileCount - 1);
-                exclusiveEncoderInputTokenThreshold
-                    = static_cast<size_t>(mVisionRunner->profileInputTokenLimitForProfile(0));
-                LOG_INFO("Phase workspace mode: tiered E/P arena=%lld bytes, exclusive input threshold=%zu",
-                    static_cast<long long>(info.arenaBytes), exclusiveEncoderInputTokenThreshold);
+                if (profileCount == 1)
+                {
+                    TieredVisionContextMemoryInfo const info
+                        = mExecutors->configureSharedVisionContextMemory(*mVisionRunner, 0);
+                    serializeAllEncoderPrefill = true;
+                    LOG_INFO(
+                        "Phase workspace mode: shared E/P arena=%lld bytes (fallback from tiered for 1 profile); E/D "
+                        "overlap remains available",
+                        static_cast<long long>(info.arenaBytes));
+                }
+                else
+                {
+                    TieredVisionContextMemoryInfo const info
+                        = mExecutors->configureTieredVisionContextMemory(*mVisionRunner, 0, profileCount - 1);
+                    exclusiveEncoderInputTokenThreshold
+                        = static_cast<size_t>(mVisionRunner->profileInputTokenLimitForProfile(0));
+                    LOG_INFO("Phase workspace mode: tiered E/P arena=%lld bytes, exclusive input threshold=%zu",
+                        static_cast<long long>(info.arenaBytes), exclusiveEncoderInputTokenThreshold);
+                }
+                break;
+            }
+            case PhaseWorkspaceMode::kAuto:
+                break;
             }
         }
 
