@@ -89,14 +89,11 @@ def model_config(repo, name):
     traces = {}
     calibration = None
     for record in commands:
-        if record["case"] in ("balanced", "mixed", "vision-heavy",
-                              "multi-image"):
-            command = record["command"]
-            traces[record["case"]] = repo / command[command.index("--trace") +
-                                                    1]
-            if record["case"] == "mixed":
-                calibration = repo / command[
-                    command.index("--generic-warmup-trace") + 1]
+        command = record["command"]
+        traces[record["case"]] = repo / command[command.index("--trace") + 1]
+        if record["case"] == "mixed" and calibration is None:
+            calibration = repo / command[
+                command.index("--generic-warmup-trace") + 1]
     return {
         "model":
         "nvidia/Cosmos-Reason2-2B",
@@ -335,7 +332,10 @@ def main():
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
                                 text=True).strip())
     configs = {m: model_config(repo, m) for m in args.models}
-    binary = repo / ".local/builds/v0101-release/examples/llm/llm_phase_context_smoke"
+    build = pathlib.Path(
+        os.environ.get("BUILD_ROOT", str(repo / ".local/builds/v0101-validation")))
+    binary = build / "examples/llm/llm_phase_context_smoke"
+    plugin = build / "libNvInfer_edgellm_plugin.so.1.0"
     identity = {
         "source_commit":
         subprocess.check_output(["git", "rev-parse", "HEAD"],
@@ -348,8 +348,7 @@ def main():
         "runner_sha256":
         digest(pathlib.Path(__file__).resolve()),
         "plugin_sha256":
-        digest(repo /
-               ".local/builds/v0101-release/libNvInfer_edgellm_plugin.so.1.0"),
+        digest(plugin),
         "container":
         IMAGE,
         "models": {}
