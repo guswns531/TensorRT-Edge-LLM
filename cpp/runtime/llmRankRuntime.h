@@ -354,6 +354,7 @@ private:
 
     // [4] Host pinned memory tensors for optimized CPU-GPU memory transfers
     rt::Tensor mHostPackedTokenIds;      //!< Host pinned memory for packed token IDs
+    rt::Tensor mHostVisionBlockIds;      //!< Host pinned memory for vision block IDs
     rt::Tensor mHostSelectedTokenIds;    //!< Host pinned memory for selected token IDs from sampling
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 

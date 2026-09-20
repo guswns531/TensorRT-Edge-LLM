@@ -69,10 +69,17 @@ int32_t baseVerifyIntermediateSeqLen(DeploymentConfig const& bundle)
 }
 } // namespace
 
-void allocateZeroBuffer(SharedResources& res, int64_t bytes)
+void allocateZeroBuffer(SharedResources& res, int64_t bytes, cudaStream_t stream)
 {
     res.zeroBuffer = Tensor({bytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8, "SharedResources::zeroBuffer");
-    CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
+    if (stream != nullptr)
+    {
+        CUDA_CHECK(cudaMemsetAsync(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity(), stream));
+    }
+    else
+    {
+        CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
+    }
 }
 
 //! Build the initially identity-mapped page table sized from `kv`.
@@ -182,7 +189,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
             deepstackSize = maxBatch * deepstackSeqLen * cfg.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
         }
         int64_t const zeroBufferBytes = std::max(deepstackSize, static_cast<int64_t>(256));
-        allocateZeroBuffer(*resources, zeroBufferBytes);
+        allocateZeroBuffer(*resources, zeroBufferBytes, stream);
     }
 
     return resources;
@@ -332,7 +339,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         int64_t const attnPosIdSize
             = maxBatch * std::max(maxDraftProposalSize, 1) * static_cast<int64_t>(sizeof(int32_t));
         int64_t const zeroBufferBytes = std::max({deepstackSize, attnPosIdSize, static_cast<int64_t>(256)});
-        allocateZeroBuffer(*resources, zeroBufferBytes);
+        allocateZeroBuffer(*resources, zeroBufferBytes, stream);
     }
 
     return resources;

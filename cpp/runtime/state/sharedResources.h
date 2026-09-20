@@ -81,7 +81,7 @@ struct SharedResources
         cudaStream_t stream);
 };
 
-void allocateZeroBuffer(SharedResources& res, int64_t bytes);
+void allocateZeroBuffer(SharedResources& res, int64_t bytes, cudaStream_t stream = nullptr);
 
 } // namespace rt
 } // namespace trt_edgellm

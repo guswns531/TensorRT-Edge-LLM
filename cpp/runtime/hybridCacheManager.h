@@ -261,6 +261,7 @@ private:
         std::vector<int32_t> localKVIndices;        //!< Local KV-layer indices belonging to this group
         rt::Tensor deviceLayerInfos;                //!< Device buffer of KVLayerInfo for this group
         rt::Tensor deviceScratchInfos;              //!< Pre-allocated device scratch buffer for save/restore uploads
+        rt::Tensor hostScratchInfos;                //!< Pre-allocated pinned host scratch buffer for save/restore uploads
         std::vector<kernel::KVLayerInfo> hostInfos; //!< Host copy for building save/restore info arrays
     };
 

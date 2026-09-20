@@ -460,7 +460,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     // -----------------------------------------------------------------------
     if (mSharedResources->loraManager)
     {
-        mSharedResources->loraManager->initializeEngineBindings(*mBaseExecutor);
+        mSharedResources->loraManager->initializeEngineBindings(*mBaseExecutor, stream);
         mSharedResources->loraManager->refreshTensorMap(mBaseTensorMap);
     }
 
@@ -2546,11 +2546,9 @@ bool LLMRankRuntime::runBaseModelPrefill(
             return false;
         }
         check::check(mPipelineIO->visionBlockIds.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
-        rt::Tensor hostVisionBlockIds = generateVisionBlockIds(mHostPackedTokenIds, mDeployment.base.imageTokenId);
-        // hostVisionBlockIds owns short-lived pinned storage. Keep this copy
-        // synchronous so the source remains alive until H2D completion.
-        CUDA_CHECK(cudaMemcpy(mPipelineIO->visionBlockIds.rawPointer(), hostVisionBlockIds.rawPointer(),
-            activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice));
+        mHostVisionBlockIds = generateVisionBlockIds(mHostPackedTokenIds, mDeployment.base.imageTokenId);
+        CUDA_CHECK(cudaMemcpyAsync(mPipelineIO->visionBlockIds.rawPointer(), mHostVisionBlockIds.rawPointer(),
+            activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
     }
 
     // Embedding lookup (text / vision / audio-multimodal) into mPipelineIO->inputsEmbeds;

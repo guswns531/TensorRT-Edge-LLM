@@ -94,7 +94,7 @@ struct PhaseServingRuntimeConfig
 {
     PhasePolicyMode policyMode{PhasePolicyMode::kContextualScalarTransition};
     PhaseWorkspaceMode workspaceMode{PhaseWorkspaceMode::kAuto};
-    size_t workspaceHeadroomBytes{96U * 1024U * 1024U};
+    size_t workspaceHeadroomBytes{48U * 1024U * 1024U};
     int32_t maxStableSlots{};
     size_t maxInFlightRequests{};
     size_t maxPendingRequests{};

@@ -133,7 +133,7 @@ public:
     //!   - `lora_B_*` weights have shape [rank, n]; dummy sets first dim to 1.
     //!
     //! @param runner Source of the engine I/O list and per-binding max shapes.
-    void initializeEngineBindings(EngineExecutor const& runner);
+    void initializeEngineBindings(EngineExecutor const& runner, cudaStream_t stream = nullptr);
 
     //! Refresh all LoRA entries in the given TensorMap.
     //!

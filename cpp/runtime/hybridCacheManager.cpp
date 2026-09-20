@@ -90,7 +90,7 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
                 headDimToGroupIdx[lc.headDim] = mHeadDimGroups.size();
                 // Positional init to satisfy -Werror=missing-field-initializers; order matches
                 // the HeadDimGroup field declaration in hybridCacheManager.h.
-                mHeadDimGroups.push_back(HeadDimGroup{lc.headDim, 0, 0, {}, {}, {}, {}});
+                mHeadDimGroups.push_back(HeadDimGroup{lc.headDim, 0, 0, {}, {}, {}, {}, {}});
             }
             size_t const gIdx = headDimToGroupIdx[lc.headDim];
             auto& group = mHeadDimGroups[gIdx];
@@ -118,6 +118,8 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
 
             group.deviceScratchInfos = rt::Tensor({static_cast<int64_t>(infoBytes)}, DeviceType::kGPU, DataType::kINT8,
                 "HybridCacheManager::scratchInfos_" + std::to_string(group.headDim));
+            group.hostScratchInfos = rt::Tensor({static_cast<int64_t>(infoBytes)}, DeviceType::kCPU, DataType::kINT8,
+                "HybridCacheManager::hostScratchInfos_" + std::to_string(group.headDim));
         }
     }
 
@@ -420,11 +422,8 @@ std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
     // Batch the copies per headDim group (non-const ref: scratch buffer is overwritten).
     for (auto& group : mHeadDimGroups)
     {
-        // Build destination KVLayerInfo array on host, then upload to pre-allocated device scratch.
-        // The vector is pageable; cudaMemcpyAsync stages it through the runtime's internal pinned
-        // buffer (blocking briefly for the staging), which is what makes it safe to reuse the
-        // vector immediately on return. For KB-sized uploads the staging cost is in the microseconds.
-        std::vector<kernel::KVLayerInfo> dstInfos(group.numLayers);
+        // Build destination KVLayerInfo array in pinned host scratch, then upload asynchronously.
+        auto* dstInfos = reinterpret_cast<kernel::KVLayerInfo*>(group.hostScratchInfos.rawPointer());
         for (int32_t g = 0; g < group.numLayers; ++g)
         {
             int32_t const kvIdx = group.localKVIndices[g];
@@ -434,9 +433,9 @@ std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
             dstInfos[g].maxSeqLen = sequenceLength; // destination tensor's "maxSeqLen" == sequenceLength
         }
 
-        size_t const infoBytes = dstInfos.size() * sizeof(kernel::KVLayerInfo);
+        size_t const infoBytes = static_cast<size_t>(group.numLayers) * sizeof(kernel::KVLayerInfo);
         CUDA_CHECK(cudaMemcpyAsync(
-            group.deviceScratchInfos.rawPointer(), dstInfos.data(), infoBytes, cudaMemcpyHostToDevice, stream));
+            group.deviceScratchInfos.rawPointer(), dstInfos, infoBytes, cudaMemcpyHostToDevice, stream));
 
         auto const* srcLayerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
         auto const* dstLayerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceScratchInfos.rawPointer());
@@ -458,8 +457,8 @@ void HybridCacheManager::restoreKVCache(std::vector<rt::Tensor> const& saved, in
     // Batch the copies per headDim group (non-const ref: scratch buffer is overwritten).
     for (auto& group : mHeadDimGroups)
     {
-        // Pageable staging (see captureKVCache for rationale).
-        std::vector<kernel::KVLayerInfo> srcInfos(group.numLayers);
+        // Build source KVLayerInfo array in pinned host scratch, then upload asynchronously.
+        auto* srcInfos = reinterpret_cast<kernel::KVLayerInfo*>(group.hostScratchInfos.rawPointer());
         for (int32_t g = 0; g < group.numLayers; ++g)
         {
             int32_t const kvIdx = group.localKVIndices[g];
@@ -470,9 +469,9 @@ void HybridCacheManager::restoreKVCache(std::vector<rt::Tensor> const& saved, in
             srcInfos[g].maxSeqLen = srcShape[1]; // sequenceLength from the saved tensor [2, seqLen, H, D]
         }
 
-        size_t const infoBytes = srcInfos.size() * sizeof(kernel::KVLayerInfo);
+        size_t const infoBytes = static_cast<size_t>(group.numLayers) * sizeof(kernel::KVLayerInfo);
         CUDA_CHECK(cudaMemcpyAsync(
-            group.deviceScratchInfos.rawPointer(), srcInfos.data(), infoBytes, cudaMemcpyHostToDevice, stream));
+            group.deviceScratchInfos.rawPointer(), srcInfos, infoBytes, cudaMemcpyHostToDevice, stream));
 
         auto const* dstLayerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
         auto const* srcLayerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceScratchInfos.rawPointer());

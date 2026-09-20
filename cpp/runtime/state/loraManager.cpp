@@ -167,7 +167,7 @@ bool LoRAManager::hasWeightFor(std::string const& bindingName) const noexcept
     return adapterIt->second.find(bindingName) != adapterIt->second.end();
 }
 
-void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
+void LoRAManager::initializeEngineBindings(EngineExecutor const& runner, cudaStream_t stream)
 {
     constexpr int32_t kEmptyLoraRank = 1;
 
@@ -199,7 +199,14 @@ void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
         // must read deterministic zeros, not uninitialized cudaMalloc memory.
         auto [it, inserted] = dummyTensors.emplace(
             name, rt::Tensor(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "loraDummy_" + name));
-        CUDA_CHECK(cudaMemset(it->second.rawPointer(), 0, it->second.getMemoryCapacity()));
+        if (stream != nullptr)
+        {
+            CUDA_CHECK(cudaMemsetAsync(it->second.rawPointer(), 0, it->second.getMemoryCapacity(), stream));
+        }
+        else
+        {
+            CUDA_CHECK(cudaMemset(it->second.rawPointer(), 0, it->second.getMemoryCapacity()));
+        }
     }
 
     mEngineBindingNames = std::move(names);
