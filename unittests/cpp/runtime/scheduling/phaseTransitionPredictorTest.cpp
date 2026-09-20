@@ -139,5 +139,68 @@ TEST(PhaseTransitionPredictorTest, DynamicOverlapPrefillTokens)
     EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(0U, 50.0, 128), 256);
 }
 
+TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderBalancedWorkload)
+{
+    PhaseTransitionPredictor predictor;
+
+    // Balanced workload: 16 decode rows active, no prefill queued -> maximum burst to saturate SMs
+    PhaseOptimizationContext ctx{};
+    ctx.decodeQueued = 16U;
+    ctx.prefillQueued = 0U;
+    ctx.decodeTokens = 16;
+    ctx.predictedDecodeStepUs = 500.0;
+    ctx.predictedTransitionDelayUs = 300.0;
+
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 16U);
+
+    // Fresh prefill arrival (wait time = 0) -> burst remains high (>= 8) to amortize phase transition
+    ctx.prefillQueued = 1U;
+    ctx.prefillTokens = 128;
+    ctx.prefillWaitUs = 0.0;
+    ctx.predictedPrefillStepUs = 2000.0;
+
+    size_t const burst = predictor.recommendedDecodeBurst(ctx);
+    EXPECT_GE(burst, 8U);
+}
+
+TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderPoissonBurst)
+{
+    PhaseTransitionPredictor predictor;
+
+    // Poisson burst: prefill requests have been waiting in queue (20ms) -> yields immediately (burst = 1)
+    PhaseOptimizationContext ctx{};
+    ctx.decodeQueued = 8U;
+    ctx.prefillQueued = 4U;
+    ctx.decodeTokens = 8;
+    ctx.prefillWaitUs = 20000.0; // 20ms queue wait
+    ctx.predictedDecodeStepUs = 1000.0;
+    ctx.predictedTransitionDelayUs = 500.0;
+    ctx.predictedPrefillStepUs = 3000.0;
+
+    EXPECT_LE(predictor.recommendedDecodeBurst(ctx), 3U);
+
+    // When TTFT slack is tight (only 1 decode step remaining before deadline violation) -> strictly 1
+    ctx.prefillSlackUs = 21000.0;
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 1U);
+}
+
+TEST(PhaseTransitionPredictorTest, OptimalOverlapTokensWithSlack)
+{
+    PhaseTransitionPredictor predictor;
+
+    PhaseOptimizationContext ctx{};
+    ctx.decodeQueued = 8U;
+    ctx.prefillQueued = 1U;
+    ctx.predictedDecodeStepUs = 500.0;
+
+    // Ample decode slack -> full 512 tokens allowed
+    ctx.decodeSlackUs = 2000.0;
+    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(ctx, 512), 512);
+
+    // Tight decode slack (50us < 20% slowdown of 500us = 100us) -> throttled to 64
+    ctx.decodeSlackUs = 50.0;
+    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(ctx, 512), 64);
+}
+
 } // namespace
 } // namespace trt_edgellm::rt

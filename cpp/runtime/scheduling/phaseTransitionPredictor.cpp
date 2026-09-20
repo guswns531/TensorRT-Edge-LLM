@@ -214,6 +214,65 @@ double PhaseTransitionPredictor::predictPdTransitionDelayUs(
     return est.ready ? est.meanUs : 200.0;
 }
 
+size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext const& ctx) const noexcept
+{
+    if (ctx.decodeQueued == 0U)
+    {
+        return 0U;
+    }
+    if (ctx.prefillQueued == 0U)
+    {
+        return 16U;
+    }
+
+    // When decode queue is small, bound burst to 2 to prevent starvation while avoiding 1-turn thrashing
+    if (ctx.decodeQueued <= 2U)
+    {
+        return 2U;
+    }
+
+    double const decodeStepUs = std::max(10.0, ctx.predictedDecodeStepUs);
+    double const transitionUs = std::max(10.0, ctx.predictedTransitionDelayUs);
+    double const prefillStepUs = std::max(50.0, ctx.predictedPrefillStepUs);
+    double const decodeTokens = static_cast<double>(
+        std::max(1, ctx.decodeTokens > 0 ? ctx.decodeTokens : static_cast<int32_t>(ctx.decodeQueued)));
+
+    size_t bestBurst = 1U;
+    double maxObjective = -std::numeric_limits<double>::infinity();
+
+    for (size_t burst = 1U; burst <= 16U; ++burst)
+    {
+        double const burstTimeUs = static_cast<double>(burst) * decodeStepUs;
+        double const cycleTimeUs = burstTimeUs + transitionUs;
+        double const tokens = static_cast<double>(burst) * decodeTokens;
+        double const serviceRate = tokens / cycleTimeUs;
+
+        double const projectedPrefillWaitUs = ctx.prefillWaitUs + burstTimeUs;
+
+        double slackPenalty = 0.0;
+        if (std::isfinite(ctx.prefillSlackUs))
+        {
+            double const violationUs = std::max(0.0, projectedPrefillWaitUs - ctx.prefillSlackUs);
+            slackPenalty = violationUs / prefillStepUs;
+        }
+
+        // Urgency penalty applies when projected wait exceeds grace period (20ms) or when slack is violated
+        double const urgency = (projectedPrefillWaitUs > 20000.0)
+            ? (projectedPrefillWaitUs - 20000.0) / (prefillStepUs + transitionUs)
+            : 0.0;
+        double const penaltyFactor = 1.0 + slackPenalty + urgency;
+
+        double const objective = serviceRate / penaltyFactor;
+        if (objective > maxObjective)
+        {
+            maxObjective = objective;
+            bestBurst = burst;
+        }
+    }
+
+    return bestBurst;
+}
+
 size_t PhaseTransitionPredictor::recommendedDecodeBurst(
     size_t decodeQueueLength, double predictedPdDelayUs, double predictedDecodeDurationUs) const noexcept
 {
@@ -227,6 +286,26 @@ size_t PhaseTransitionPredictor::recommendedDecodeBurst(
         return std::clamp<size_t>(burst, 2U, 16U);
     }
     return std::min<size_t>(decodeQueueLength, 8U);
+}
+
+int32_t PhaseTransitionPredictor::recommendedOverlapPrefillTokens(
+    PhaseOptimizationContext const& ctx, int32_t defaultTokens) const noexcept
+{
+    int32_t const maxTokens = std::max(64, defaultTokens);
+    if (ctx.decodeQueued == 0U)
+    {
+        return std::max(maxTokens, 256);
+    }
+
+    double const decodeStepUs = std::max(10.0, ctx.predictedDecodeStepUs);
+    double const estimatedSlowdownUs = 0.20 * decodeStepUs;
+
+    if (std::isfinite(ctx.decodeSlackUs) && estimatedSlowdownUs > ctx.decodeSlackUs)
+    {
+        return std::min(maxTokens, 64);
+    }
+
+    return maxTokens;
 }
 
 int32_t PhaseTransitionPredictor::recommendedOverlapPrefillTokens(

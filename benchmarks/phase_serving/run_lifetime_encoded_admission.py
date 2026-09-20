@@ -51,7 +51,7 @@ def model_config(repo, name):
             "engine":
             pathlib.Path(
                 os.environ.get("GEMMA_ENGINE_DIR",
-                               str(model / "engine-packed-p8-d24-kv2048-p96"))),
+                               str(model / "engine-packed-p8-d24-kv2048-p192" if (model / "engine-packed-p8-d24-kv2048-p192").exists() else (model / "engine-packed-p8-d24-kv2048-p96")))),
             "vision":
             model / "visual-e4-soft280/visual",
             "hf":
@@ -243,7 +243,7 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         environment["TRT_EDGELLM_MEASUREMENT_ENCODER_PREPARATION_POLICY"] = (
             "transition-shadow" if variant == "e-transition-shadow" else
             ("shadow" if variant.endswith("shadow") else "active"))
-    if variant in ("shared_ep", "tiered_ep", "independent"):
+    if variant in ("shared_ep", "tiered_ep", "independent", "auto"):
         environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = variant
     if variant == "unified_action":
         environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = "shared_ep"

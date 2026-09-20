@@ -20,6 +20,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace trt_edgellm::rt
 {
@@ -67,6 +68,20 @@ struct PhaseTransitionTelemetry
     double absoluteErrorSumUs{};
 };
 
+struct PhaseOptimizationContext
+{
+    size_t decodeQueued{};
+    size_t prefillQueued{};
+    int32_t decodeTokens{};
+    int32_t prefillTokens{};
+    double prefillWaitUs{};
+    double prefillSlackUs{std::numeric_limits<double>::infinity()};
+    double decodeSlackUs{std::numeric_limits<double>::infinity()};
+    double predictedTransitionDelayUs{200.0};
+    double predictedDecodeStepUs{200.0};
+    double predictedPrefillStepUs{1000.0};
+};
+
 class PhaseTransitionPredictor
 {
 public:
@@ -82,8 +97,13 @@ public:
 
     double predictPdTransitionDelayUs(size_t queueDepth, size_t tokens, double kvUtil) const noexcept;
 
+    size_t recommendedDecodeBurst(PhaseOptimizationContext const& ctx) const noexcept;
+
     size_t recommendedDecodeBurst(
         size_t decodeQueueLength, double predictedPdDelayUs, double predictedDecodeDurationUs) const noexcept;
+
+    int32_t recommendedOverlapPrefillTokens(
+        PhaseOptimizationContext const& ctx, int32_t defaultTokens = 128) const noexcept;
 
     int32_t recommendedOverlapPrefillTokens(
         size_t decodeQueueLength, double predictedPdDelayUs, int32_t defaultTokens = 128) const noexcept;

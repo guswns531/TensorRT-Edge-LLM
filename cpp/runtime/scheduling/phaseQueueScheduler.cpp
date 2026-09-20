@@ -774,8 +774,38 @@ int32_t PhaseQueueScheduler::effectiveDecodeBurstLimit(PhaseQueueSnapshot const&
         decodeStepUs
             = static_cast<double>(mTelemetry.decodeGpuMsPerContextToken * state.decodeCandidateTokens) * 1000.0;
     }
-    return static_cast<int32_t>(
-        mTransitionPredictor.recommendedDecodeBurst(state.decodeQueued, pdDelayUs, decodeStepUs));
+
+    double prefillStepUs = 1000.0;
+    if (mTelemetry.lastDispatch.has_value() && mTelemetry.lastDispatch->prefillGpuMs > 0.0F)
+    {
+        prefillStepUs = static_cast<double>(mTelemetry.lastDispatch->prefillGpuMs) * 1000.0;
+    }
+    else if (mTelemetry.prefillGpuMsPerToken > 0.0F && state.prefillCandidateTokens > 0)
+    {
+        prefillStepUs
+            = static_cast<double>(mTelemetry.prefillGpuMsPerToken * state.prefillCandidateTokens) * 1000.0;
+    }
+
+    PhaseOptimizationContext ctx{};
+    ctx.decodeQueued = state.decodeQueued;
+    ctx.prefillQueued = state.prefillQueued;
+    ctx.decodeTokens = state.decodeCandidateTokens;
+    ctx.prefillTokens = state.prefillCandidateTokens;
+    ctx.prefillWaitUs = state.prefillOldestWaitUs;
+    ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo
+        ? state.prefillMinTtftSlackUs
+        : std::numeric_limits<double>::infinity();
+    ctx.decodeSlackUs = state.decodeMinimumSlackHasExplicitSlo
+        ? state.decodeMinTpotSlackUs
+        : std::numeric_limits<double>::infinity();
+    ctx.predictedTransitionDelayUs = pdDelayUs;
+    ctx.predictedDecodeStepUs = decodeStepUs;
+    ctx.predictedPrefillStepUs = prefillStepUs;
+
+    int32_t const recommended = static_cast<int32_t>(mTransitionPredictor.recommendedDecodeBurst(ctx));
+    return (mConfig.decodeBurstLimit > 0 && mConfig.decodeBurstLimit < 8)
+        ? std::min(mConfig.decodeBurstLimit, recommended)
+        : recommended;
 }
 
 int32_t PhaseQueueScheduler::effectiveOverlapPrefillTokens(PhaseQueueSnapshot const& state) const noexcept
@@ -789,8 +819,28 @@ int32_t PhaseQueueScheduler::effectiveOverlapPrefillTokens(PhaseQueueSnapshot co
         : 0.0;
     double const pdDelayUs = mTransitionPredictor.predictPdTransitionDelayUs(
         state.decodeQueued, state.decodeCandidateTokens, kvUtil);
-    return mTransitionPredictor.recommendedOverlapPrefillTokens(
-        state.decodeQueued, pdDelayUs, mConfig.maxOverlapPrefillTokens);
+    double decodeStepUs = 200.0;
+    if (mTelemetry.lastDispatch.has_value() && mTelemetry.lastDispatch->decodeGpuMs > 0.0F)
+    {
+        decodeStepUs = static_cast<double>(mTelemetry.lastDispatch->decodeGpuMs) * 1000.0;
+    }
+
+    PhaseOptimizationContext ctx{};
+    ctx.decodeQueued = state.decodeQueued;
+    ctx.prefillQueued = state.prefillQueued;
+    ctx.decodeTokens = state.decodeCandidateTokens;
+    ctx.prefillTokens = state.prefillCandidateTokens;
+    ctx.prefillWaitUs = state.prefillOldestWaitUs;
+    ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo
+        ? state.prefillMinTtftSlackUs
+        : std::numeric_limits<double>::infinity();
+    ctx.decodeSlackUs = state.decodeMinimumSlackHasExplicitSlo
+        ? state.decodeMinTpotSlackUs
+        : std::numeric_limits<double>::infinity();
+    ctx.predictedTransitionDelayUs = pdDelayUs;
+    ctx.predictedDecodeStepUs = decodeStepUs;
+
+    return mTransitionPredictor.recommendedOverlapPrefillTokens(ctx, mConfig.maxOverlapPrefillTokens);
 }
 
 PhaseDispatchKind PhaseQueueScheduler::defaultDecision(PhaseQueueSnapshot const& state) const noexcept
