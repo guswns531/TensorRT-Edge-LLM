@@ -130,10 +130,11 @@ def model_config(repo, name):
 def command_for(repo, config, cell, workload, variant, byte_budget):
     """Construct a restricted, network-free GPU backend with measured-boundary activation."""
     tools = repo / ".local/results/v0101-forward-port/replay-tools"
-    build = repo / ".local/builds/v0101-release"
+    build = pathlib.Path(os.environ.get("BUILD_ROOT", str(repo / ".local/builds/v0101-validation")))
     mode = variant if variant in ("lifetime", "ownership") else "static"
     if variant in ("chunked", "e1", "e2", "e-dynamic-shadow",
-                   "e-transition-shadow", "e-dynamic-active"):
+                   "e-transition-shadow", "e-dynamic-active", "shared_ep",
+                   "tiered_ep", "independent"):
         mode = "lifetime"
     capacity = config["initial_capacity"]
     if variant == "static-large":
@@ -240,6 +241,8 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         environment["TRT_EDGELLM_MEASUREMENT_ENCODER_PREPARATION_POLICY"] = (
             "transition-shadow" if variant == "e-transition-shadow" else
             ("shadow" if variant.endswith("shadow") else "active"))
+    if variant in ("shared_ep", "tiered_ep", "independent"):
+        environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = variant
     backend = [
         "docker", "run", "--rm", "--gpus", "all", "--network", "none",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -300,7 +303,8 @@ def main():
                         choices=("static-base", "static-large", "static-slot",
                                  "lifetime", "ownership", "chunked", "e1",
                                  "e2", "e-dynamic-shadow",
-                                 "e-transition-shadow", "e-dynamic-active"),
+                                 "e-transition-shadow", "e-dynamic-active",
+                                 "shared_ep", "tiered_ep", "independent"),
                         default=["static-base", "static-large", "lifetime"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--byte-budget", type=int, default=0)
