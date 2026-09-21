@@ -258,6 +258,8 @@ struct PhaseThreeCoordinatorConfig
     bool serializeAllEncoderPrefill{};
     //! Every encoder dispatch exclusively owns the shared E/D arena.
     bool serializeAllEncoderDecode{};
+    //! Transfer vision payloads directly to downstream prefill without host-side completion polling.
+    bool enableDirectEventHandoff{true};
 };
 
 struct PhaseThreeCoordinatorMetrics
@@ -836,6 +838,7 @@ private:
     float mLastEncoderExecutionGpuMs{};
     float mMaxEncoderExecutionGpuMs{};
     bool mEncoderGpuSubmitted{};
+    bool mExternalEncoderActive{};
     uint64_t mEncoderDispatchHostNs{};
     uint64_t mEncoderPrepareStartHostNs{};
     uint64_t mEncoderPrepareEndHostNs{};

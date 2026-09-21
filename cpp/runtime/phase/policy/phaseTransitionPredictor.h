@@ -45,6 +45,7 @@ struct PhaseTransitionPredictorConfig
     double initialResidualVariance{1.0};
     double forgettingFactor{0.99};
     double maxLatencyClipUs{5000000.0};
+    double burstGracePeriodUs{20000.0};
 };
 
 struct PhaseTransitionEstimate

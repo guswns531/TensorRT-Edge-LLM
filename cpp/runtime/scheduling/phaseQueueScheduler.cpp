@@ -3119,7 +3119,7 @@ std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalActi
     }
     PhaseQueueSnapshot const state = snapshot();
     std::optional<GlobalQueueSelection> selection
-        = selectGlobalQueueAction(state, true, true, true, std::nullopt, audit);
+        = selectGlobalQueueAction(state, !mPrefillDispatchBlocked, !mDecodeDispatchBlocked, true, std::nullopt, audit);
     mLastGlobalPreviewCandidates
         = selection.has_value() ? std::move(selection->candidateFrontier) : std::vector<PhaseGlobalActionCandidate>{};
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(std::move(selection->candidate))
@@ -3134,7 +3134,7 @@ std::vector<PhaseGlobalActionCandidate> const& PhaseQueueScheduler::lastGlobalPr
 std::optional<PhaseGlobalActionCandidate> PhaseQueueScheduler::previewGlobalPrefillAction()
 {
     std::optional<GlobalQueueSelection> const selection
-        = selectGlobalQueueAction(snapshot(), true, false, false, PhaseDispatchKind::kPrefill);
+        = selectGlobalQueueAction(snapshot(), !mPrefillDispatchBlocked, false, false, PhaseDispatchKind::kPrefill);
     return selection.has_value() ? std::optional<PhaseGlobalActionCandidate>(selection->candidate) : std::nullopt;
 }
 
@@ -3602,7 +3602,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         kind = state.prefillQueued > 0U ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
         drainPreferenceApplied = false;
     }
-    else if (std::optional<GlobalQueueSelection> const global = selectGlobalQueueAction(state, true, true, true))
+    else if (std::optional<GlobalQueueSelection> const global
+        = selectGlobalQueueAction(state, !mPrefillDispatchBlocked, !mDecodeDispatchBlocked, true))
     {
         plan.globalDecisionEvaluated = true;
         plan.globalSelectedAction = global->candidate.key;

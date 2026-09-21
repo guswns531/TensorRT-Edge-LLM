@@ -45,6 +45,12 @@ def model_config(repo, name):
     if name == "gemma":
         model = artifacts / "v0101-forward-port/gemma-4-e2b-it-awq"
         inputs = repo / ".local/results/gemma4-e2b-awq-full12-20260911/inputs"
+        vision_path = pathlib.Path(
+            os.environ.get(
+                "GEMMA_VISION_DIR",
+                str(model / "visual-e6-soft280/visual" if (model / "visual-e6-soft280/visual").exists() else (model / "visual-e4-soft280/visual"))))
+        e_batch = 6 if "e6" in str(vision_path) else (8 if "e8" in str(vision_path) else 4)
+        e_tokens = e_batch * 280
         return {
             "model":
             "google/gemma-4-e2b-it",
@@ -53,7 +59,7 @@ def model_config(repo, name):
                 os.environ.get("GEMMA_ENGINE_DIR",
                                str(model / "engine-packed-p8-d24-kv2048-p192" if (model / "engine-packed-p8-d24-kv2048-p192").exists() else (model / "engine-packed-p8-d24-kv2048-p96")))),
             "vision":
-            model / "visual-e4-soft280/visual",
+            vision_path,
             "hf":
             artifacts / "models/gemma-4-e2b-it-awq/hf",
             "traces": {
@@ -75,9 +81,11 @@ def model_config(repo, name):
             "decode_batch":
             24,
             "encoder_input_tokens":
-            1120,
+            int(os.environ.get("GEMMA_ENCODER_INPUT_TOKENS", str(e_tokens))),
             "initial_capacity":
-            4,
+            int(os.environ.get("GEMMA_INITIAL_CAPACITY", str(e_batch))),
+            "vision_batch_size":
+            int(os.environ.get("GEMMA_VISION_BATCH_SIZE", str(e_batch))),
             "larger_capacity":
             12,
             "frozen_vllm":
@@ -143,6 +151,11 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         capacity = config["larger_capacity"]
     elif variant == "static-slot":
         capacity = config["stable_slots"]
+    if "TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY" in os.environ:
+        capacity = int(os.environ["TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY"])
+    vision_batch = int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE", str(config.get("vision_batch_size", 4))))
+    vision_prefill = int(os.environ.get("TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE", str(config.get("vision_batch_size", 4))))
+    capacity = max(capacity, vision_prefill)
     environment = {
         "TRT_PACKAGE_DIR":
         "/usr/local/tensorrt",
@@ -179,21 +192,21 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         "TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE":
         1,
         "TRT_EDGELLM_MAX_ENCODED_VISION":
-        config["initial_capacity"],
+        capacity,
         "TRT_EDGELLM_MEASUREMENT_ENCODED_ADMISSION":
         mode,
         "TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY":
         capacity,
         "TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE":
-        4,
+        vision_batch,
         "TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS":
-        config["encoder_input_tokens"],
+        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS", str(config["encoder_input_tokens"]))),
         "TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA":
-        4,
+        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA", str(vision_batch))),
         "TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US":
-        25000,
+        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US", "25000")),
         "TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE":
-        4,
+        vision_prefill,
         "TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD":
         1,
         "TRT_EDGELLM_VISION_IDLE_SLABS":
@@ -231,6 +244,9 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL":
         "full"
     }
+    if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
+        environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
+            "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"]
     if byte_budget > 0:
         environment["TRT_EDGELLM_MAX_ENCODED_VISION_BYTES"] = byte_budget
     if variant == "chunked":
@@ -249,9 +265,18 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = "shared_ep"
         environment["TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING"] = 1
         environment["TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES"] = "128,256,512"
-    if variant == "pooled_io":
-        environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = "shared_ep"
-        environment["TRT_EDGELLM_ENABLE_POOLED_PIPELINE_IO"] = 1
+    if os.environ.get("ENABLE_CUDA_GRAPHS") == "1" or "TRT_EDGELLM_CAPTURE_PHASE_GRAPHS" in os.environ:
+        environment["TRT_EDGELLM_CAPTURE_PHASE_GRAPHS"] = os.environ.get("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS", 1)
+        environment["TRT_EDGELLM_MAX_PREFILL_GRAPHS"] = os.environ.get("TRT_EDGELLM_MAX_PREFILL_GRAPHS", 0)
+        environment["TRT_EDGELLM_MAX_DECODE_GRAPHS"] = os.environ.get("TRT_EDGELLM_MAX_DECODE_GRAPHS", 64)
+        if "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES" in os.environ:
+            environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = os.environ[
+                "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"]
+        else:
+            batches = [1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64]
+            filtered = [str(b) for b in batches if b <= config["decode_batch"]]
+            environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = ",".join(filtered)
+
     backend = [
         "docker", "run", "--rm", "--gpus", "all", "--network", "none",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -316,7 +341,7 @@ def main():
                                  "e2", "e-dynamic-shadow",
                                  "e-transition-shadow", "e-dynamic-active",
                                  "shared_ep", "tiered_ep", "independent",
-                                 "unified_action", "pooled_io"),
+                                 "unified_action"),
                         default=["static-base", "static-large", "lifetime"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--byte-budget", type=int, default=0)

@@ -1382,6 +1382,10 @@ int main(int argc, char** argv)
                     if (view.visionPayload != nullptr && imageRange(view).second > 0)
                     {
                         visionViews.push_back(&view);
+                        if (view.visionPayload->readyEvent != nullptr)
+                        {
+                            CUDA_CHECK(cudaStreamWaitEvent(stream, view.visionPayload->readyEvent, 0));
+                        }
                     }
                 }
             }
@@ -2239,6 +2243,12 @@ int main(int argc, char** argv)
                     requestedWarmupBatchSizes.push_back(std::stoi(batchSize));
                 }
             }
+            std::vector<int32_t> warmupBatchSizes;
+            if (std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr)
+            {
+                warmupBatchSizes
+                    = rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes));
+            }
             std::vector<DecodeWarmupShape> warmupShapes;
             if (char const* value = std::getenv("TRT_EDGELLM_IPC_WARMUP_DECODE_SHAPES"))
             {
@@ -2261,8 +2271,6 @@ int main(int argc, char** argv)
             }
             else if (std::getenv("TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP") == nullptr)
             {
-                std::vector<int32_t> const warmupBatchSizes
-                    = rt::phaseServingWarmupBatchSizes(warmupBatchLimit, std::move(requestedWarmupBatchSizes));
                 for (int32_t const batchSize : warmupBatchSizes)
                 {
                     warmupShapes.push_back({batchSize, 0, 0});
@@ -2405,6 +2413,17 @@ int main(int argc, char** argv)
             {
                 semanticCoordinator.scheduler().resetPolicyPosterior();
             }
+            if (serverConfig.enableCudaGraphs && warmupBatchLimit > 0)
+            {
+                std::vector<int32_t> primeBatchSizes;
+                primeBatchSizes.reserve(static_cast<size_t>(warmupBatchLimit));
+                for (int32_t b = 1; b <= warmupBatchLimit; ++b)
+                {
+                    primeBatchSizes.push_back(b);
+                }
+                size_t const primed = semanticCoordinator.primeDecodeGraphs(primeBatchSizes, decodeStream);
+                LOG_INFO("Phase CUDA decode graphs primed: count=%zu", primed);
+            }
             if (serverConfig.enableCudaGraphs && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") == nullptr)
             {
                 // Retain the primed graph cache, but do not synchronously capture
@@ -2518,6 +2537,8 @@ int main(int argc, char** argv)
                 threePhaseConfig.exclusiveEncoderInputTokenThreshold = tieredVisionExclusiveInputTokens;
                 threePhaseConfig.serializeAllEncoderPrefill = serializeAllEncoderPrefill;
                 threePhaseConfig.serializeAllEncoderDecode = serializeAllEncoderDecode;
+                threePhaseConfig.enableDirectEventHandoff
+                    = std::getenv("TRT_EDGELLM_DISABLE_DIRECT_EVENT_HANDOFF") == nullptr;
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_EXCLUSIVE_INPUT_TOKENS"))
                 {
                     threePhaseConfig.exclusiveEncoderInputTokenThreshold = static_cast<size_t>(std::stoull(value));
@@ -3336,7 +3357,7 @@ int main(int argc, char** argv)
                         if (serverConfig.enableCudaGraphs && input.kind != PhaseIpcKind::kCalibrationStatus)
                         {
                             semanticCoordinator.setGraphCaptureEnabled(
-                                active || std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") != nullptr);
+                                active && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") != nullptr);
                         }
                         rt::PhaseThreeCoordinatorMetrics const calibrationMetrics
                             = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
@@ -3679,7 +3700,7 @@ int main(int argc, char** argv)
                     emittedMetrics = semanticCoordinator.metrics().size();
                 }
                 // Compact records retain execution timestamps; defer JSON work until the serving batch drains.
-                bool const deferCompactMetrics = collectPhaseDispatchMetrics && phaseTelemetryLevel == "dispatch"
+                bool const deferCompactMetrics = collectPhaseDispatchMetrics
                     && !(ipcThreePhase != nullptr ? ipcThreePhase->empty() : semanticServer.empty());
                 while (collectPhaseDispatchMetrics && !deferCompactMetrics
                     && emittedMetrics < semanticCoordinator.metrics().size())

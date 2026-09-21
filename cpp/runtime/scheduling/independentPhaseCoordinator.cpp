@@ -388,6 +388,87 @@ bool IndependentPhaseCoordinator::capturePreparedGraphs()
     return prefillCaptured && decodeCaptured;
 }
 
+size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const& batchSizes, cudaStream_t stream)
+{
+    ELLM_CHECK(!busy(), "Decode graphs cannot be primed while work is in flight");
+    int32_t maxNeededBatch = 0;
+    for (int32_t const batchSize : batchSizes)
+    {
+        if (batchSize > 0 && batchSize <= mConfig.maxSupportedDecodeBatchSize)
+        {
+            maxNeededBatch = std::max(maxNeededBatch, batchSize);
+        }
+    }
+    if (maxNeededBatch == 0)
+    {
+        return 0U;
+    }
+
+    std::vector<int32_t> reservedSlots;
+    reservedSlots.reserve(static_cast<size_t>(maxNeededBatch));
+    for (int32_t i = 0; i < maxNeededBatch; ++i)
+    {
+        if (mOwnership.availableSlots() == 0 || mOwnership.availablePages() == 0)
+        {
+            break;
+        }
+        int32_t const slot = mOwnership.reserve();
+        mOwnership.ensureCapacity(slot, 1);
+        reservedSlots.push_back(slot);
+    }
+
+    if (reservedSlots.empty())
+    {
+        return 0U;
+    }
+
+    size_t captured{};
+    for (int32_t const batchSize : batchSizes)
+    {
+        if (batchSize <= 0 || batchSize > mConfig.maxSupportedDecodeBatchSize
+            || static_cast<size_t>(batchSize) > reservedSlots.size())
+        {
+            continue;
+        }
+        std::string const graphShape = std::to_string(batchSize);
+        if (mCapturedDecodeShapes.find(graphShape) != mCapturedDecodeShapes.end()
+            || (mMaxDecodeGraphs > 0U && mCapturedDecodeShapes.size() >= mMaxDecodeGraphs))
+        {
+            continue;
+        }
+        std::vector<int32_t> slots(reservedSlots.begin(), reservedSlots.begin() + batchSize);
+        mDecodeKV.prepare(slots, stream);
+        if (!mDecodeIO.inputsEmbeds.reshape({static_cast<int64_t>(batchSize), 1, mConfig.hiddenSize}))
+        {
+            mDecodeKV.complete();
+            continue;
+        }
+        CUDA_CHECK(cudaMemsetAsync(
+            mDecodeIO.inputsEmbeds.rawPointer(), 0, mDecodeIO.inputsEmbeds.getMemoryCapacity(), stream));
+        mDecodeKV.prepareDecodeMetadata(mDecodeIO, stream);
+        if (!mExecutors.decodeExecutor().prepare(mExecutors.config().decodeProfile,
+                mConfig.decodeDims(static_cast<int64_t>(batchSize)), mDecodeMap, stream))
+        {
+            mDecodeKV.complete();
+            continue;
+        }
+        if (mExecutors.decodeExecutor().captureGraph(stream))
+        {
+            mCapturedDecodeShapes.insert(graphShape);
+            ++captured;
+        }
+        mDecodeKV.complete();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (int32_t const slot : reservedSlots)
+    {
+        mOwnership.release(slot);
+    }
+
+    return captured;
+}
+
 void IndependentPhaseCoordinator::setGraphCaptureEnabled(bool enabled) noexcept
 {
     mGraphCaptureEnabled = enabled;

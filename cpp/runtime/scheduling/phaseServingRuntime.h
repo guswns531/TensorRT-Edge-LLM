@@ -108,7 +108,8 @@ struct PhaseServingRuntimeConfig
     bool enablePersistentDecodeSelect{true};
     bool enablePersistentPageBindings{true};
     bool sharedExecutionContext{};
-    bool enablePooledPipelineIO{false};
+    size_t maxDecodeGraphs{};
+    size_t maxPrefillGraphs{};
     size_t maxEncodedVisionRequests{};
     size_t maxEncodedVisionBytes{};
     bool enableLifetimeEncodedAdmission{};

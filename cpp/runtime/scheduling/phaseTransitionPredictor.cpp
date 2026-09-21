@@ -256,9 +256,12 @@ size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext
             slackPenalty = violationUs / prefillStepUs;
         }
 
-        // Urgency penalty applies when projected wait exceeds grace period (20ms) or when slack is violated
-        double const urgency = (projectedPrefillWaitUs > 20000.0)
-            ? (projectedPrefillWaitUs - 20000.0) / (prefillStepUs + transitionUs)
+        // Urgency penalty applies when projected wait exceeds grace period or when slack is violated
+        double const gracePeriodUs = (std::isfinite(ctx.prefillSlackUs) && ctx.prefillSlackUs > 0.0)
+            ? std::max(mConfig.burstGracePeriodUs, ctx.prefillSlackUs * 0.75)
+            : mConfig.burstGracePeriodUs;
+        double const urgency = (projectedPrefillWaitUs > gracePeriodUs)
+            ? (projectedPrefillWaitUs - gracePeriodUs) / (prefillStepUs + transitionUs)
             : 0.0;
         double const penaltyFactor = 1.0 + slackPenalty + urgency;
 

@@ -276,36 +276,3 @@ TEST(PhaseKVActiveViewTest, RejectsNestedPrepareAndLengthMismatch)
     view.complete();
     EXPECT_THROW(view.complete(), std::runtime_error);
 }
-
-TEST(PipelineIOPoolTest, SharedViewsAndReshape)
-{
-    cudaStream_t stream{nullptr};
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    rt::LLMEngineConfig config;
-    config.maxSupportedBatchSize = 8;
-    config.maxSupportedInputLength = 256;
-    config.maxKVCacheCapacity = 512;
-    config.hiddenSize = 64;
-    config.outputVocabSize = 1000;
-    config.numDeepstackFeatures = 2;
-
-    rt::PipelineIOPool pool = rt::PipelineIOPool::create(config, 8, 128, 4, 1, stream);
-    EXPECT_GT(pool.totalAllocatedBytes(), 0U);
-
-    rt::PipelineIO prefillIO = pool.createPrefillView(config, 8, 128);
-    rt::PipelineIO decodeIO = pool.createDecodeView(config, 4, 1);
-
-    EXPECT_EQ(prefillIO.inputsEmbeds.rawPointer(), decodeIO.inputsEmbeds.rawPointer());
-    EXPECT_EQ(prefillIO.outputLogits.rawPointer(), decodeIO.outputLogits.rawPointer());
-    ASSERT_EQ(prefillIO.deepstackEmbeds.size(), 2U);
-    ASSERT_EQ(decodeIO.deepstackEmbeds.size(), 2U);
-    EXPECT_EQ(prefillIO.deepstackEmbeds[0].rawPointer(), decodeIO.deepstackEmbeds[0].rawPointer());
-
-    EXPECT_TRUE(prefillIO.inputsEmbeds.reshape({4, 64, 64}));
-    EXPECT_TRUE(decodeIO.inputsEmbeds.reshape({2, 1, 64}));
-
-    EXPECT_FALSE(prefillIO.inputsEmbeds.reshape({16, 256, 64}));
-
-    CUDA_CHECK(cudaStreamDestroy(stream));
-}

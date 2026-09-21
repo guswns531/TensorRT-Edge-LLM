@@ -1369,7 +1369,9 @@ bool PhaseThreeCoordinator::poll()
     {
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && mConfig.enableAsyncEncoderPreparation
             && mEncoding.empty() && !encoderPreparationActive() && mPreparedEncoder == nullptr && !mPending.empty()
-            && !mVision.busy())
+            && !mVision.busy()
+            && (!mConfig.serializeAllEncoderPrefill
+                || (mReadyPrefill.empty() && mServer.visionPayloadBytes() == 0U)))
         {
             // Preparation is a mechanism stage, not an E execution action.
             // Materialize the real encoder cohort while P/D continue, then
@@ -4034,7 +4036,9 @@ bool PhaseThreeCoordinator::startNextEncoder()
         = globalAuthorized ? std::move(*mGlobalEncoderBatchIndices) : nextEncoderBatchIndices();
     mGlobalEncoderBatchIndices.reset();
     size_t const batchSize = batchIndices.size();
-    if (batchSize == 0)
+    if (batchSize == 0
+        || (mConfig.serializeAllEncoderPrefill
+            && (!mReadyPrefill.empty() || mServer.visionPayloadBytes() > 0U)))
     {
         return false;
     }
@@ -4156,12 +4160,14 @@ bool PhaseThreeCoordinator::startNextEncoder()
             ELLM_CHECK(mVision.submit(std::move(submissions)), "Failed to start queued encoder batch");
             mEncoderPrepareEndHostNs = phaseTimelineNowNs();
             mEncoderExecuteEndHostNs = mEncoderPrepareEndHostNs;
+            mExternalEncoderActive = true;
             mServer.setExternalEncoderActive(true);
             markUnifiedEncoderSubmitted();
         }
     }
     catch (...)
     {
+        mExternalEncoderActive = false;
         mServer.setExternalEncoderActive(false);
         mEncoderPrefillExclusiveAfterPreparation = false;
         mEncoderDecodeExclusiveAfterPreparation = false;
@@ -4238,12 +4244,14 @@ bool PhaseThreeCoordinator::completeEncoderPreparation()
         else
         {
             ELLM_CHECK(mVision.submitPrepared(std::move(prepared)), "Failed to submit prepared encoder batch");
+            mExternalEncoderActive = true;
             mServer.setExternalEncoderActive(true);
             markUnifiedEncoderSubmitted();
         }
     }
     catch (...)
     {
+        mExternalEncoderActive = false;
         mServer.setExternalEncoderActive(false);
         mEncoderPrefillExclusiveAfterPreparation = false;
         mEncoderDecodeExclusiveAfterPreparation = false;
@@ -4362,6 +4370,7 @@ bool PhaseThreeCoordinator::submitPreparedEncoder()
     mEncoderExecuteStartHostNs = mEncoderDispatchHostNs;
     ELLM_CHECK(mVision.submitPrepared(std::move(prepared)), "Failed to submit staged encoder batch");
     mEncoderExecuteEndHostNs = phaseTimelineNowNs();
+    mExternalEncoderActive = true;
     mServer.setExternalEncoderActive(true);
     markUnifiedEncoderSubmitted();
     return true;
@@ -4369,6 +4378,95 @@ bool PhaseThreeCoordinator::submitPreparedEncoder()
 
 bool PhaseThreeCoordinator::completeEncoder()
 {
+    if (mConfig.enableDirectEventHandoff && !mConfig.serializeAllEncoderPrefill)
+    {
+        if (mEncoderGpuSubmitted && !mEncoding.empty())
+        {
+            size_t const batchSize = mEncoding.size();
+            for (PendingVisionRequest& encoding : mEncoding)
+            {
+                uint64_t const requestId = encoding.requestId;
+                std::unique_ptr<PhaseVisionPayload> encoded = mVision.take(requestId, true);
+                recordTimeline(requestId, PhaseTimelineStage::kEncoderDone, mEncoding.size());
+                ++mEncoderCompletions;
+                if (mCancelRequested.erase(requestId) > 0)
+                {
+                    if (encoding.prefixSubmitted)
+                    {
+                        ELLM_CHECK(mServer.cancel(requestId), "Cancelled encoder prefix could not be released");
+                    }
+                    mRequestIds.erase(requestId);
+                    eraseTpotTarget(requestId);
+                    continue;
+                }
+                ELLM_CHECK(encoded != nullptr && encoded->tokenIds.size() == 1U && !encoded->tokenIds.front().empty(),
+                    "Phase encoder must produce one non-empty token row per logical request");
+                auto sharedPayload = std::shared_ptr<PhaseVisionPayload>(std::move(encoded));
+                size_t const encodedBytes = sharedPayload->byteSize();
+                std::vector<int32_t> promptTokens = sharedPayload->tokenIds.front();
+                mEstimatedPromptTokens = std::max(mEstimatedPromptTokens, promptTokens.size());
+                ELLM_CHECK(mDownstreamRequestBytes.emplace(requestId, encodedBytes).second,
+                    "Encoded phase request is already downstream");
+                mReadyPrefill.push_back({requestId, std::move(promptTokens), std::move(sharedPayload),
+                    encoding.maxOutputTokens, encoding.scheduling, encodedBytes, std::chrono::steady_clock::now(),
+                    encoding.prefixSubmitted});
+                recordTimeline(requestId, PhaseTimelineStage::kPrefillReady, batchSize);
+                mReadyPrefillTokens += mReadyPrefill.back().promptTokens.size();
+                mReadyPrefillBytes += encodedBytes;
+                mEstimatedEncodedBytes = std::max(mEstimatedEncodedBytes, encodedBytes);
+            }
+            mEncoding.clear();
+            mEncoderGpuSubmitted = false;
+            return true;
+        }
+        if (!mVision.encoderInFlight() && (mInFlightGlobalEncoderKey.has_value() || mSerializedEncoderInFlight || mExternalEncoderActive))
+        {
+            mExternalEncoderActive = false;
+            mServer.setExternalEncoderActive(false);
+            if (mVision.startEvent() != nullptr && mVision.encoderDoneEvent() != nullptr)
+            {
+                float encoderGpuMs{};
+                if (cudaEventElapsedTime(&encoderGpuMs, mVision.startEvent(), mVision.encoderDoneEvent()) == cudaSuccess)
+                {
+                    mLastEncoderGpuMs = encoderGpuMs;
+                    mLastEncoderExecutionGpuMs = encoderGpuMs;
+                }
+            }
+            float const encoderActionGpuMs = lastEncoderActionGpuMs();
+            if (mInFlightGlobalEncoderKey.has_value() && encoderActionGpuMs > 0.0F && mInFlightGlobalEncoderReferenceMs > 0.0)
+            {
+                mRuntimeCostTracker->observe(
+                    *mInFlightGlobalEncoderKey, {static_cast<float>(mInFlightGlobalEncoderReferenceMs), encoderActionGpuMs});
+            }
+            mInFlightGlobalEncoderKey.reset();
+            mInFlightGlobalEncoderReferenceMs = 0.0;
+            if (mPendingGlobalOverlapObservation.has_value())
+            {
+                mPendingGlobalOverlapObservation->encoderGpuMs = encoderActionGpuMs;
+            }
+            if (mSerializedEncoderInFlight)
+            {
+                mSerializedEncoderInFlight = false;
+                if (mEncoderSerializationBurstSize >= mConfig.encoderSerializationMaxBurst)
+                {
+                    mEncoderSerializationGate = false;
+                    mServer.setDispatchBlocked(false);
+                    mEncoderSerializationBurstSize = 0;
+                    mEncoderSerializationYieldPending = true;
+                }
+            }
+            return true;
+        }
+        if (mEncoding.empty())
+        {
+            return false;
+        }
+        if (!completeEncoderPreparation())
+        {
+            return false;
+        }
+        return false;
+    }
     if (mEncoding.empty())
     {
         return false;
@@ -4377,7 +4475,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     {
         return false;
     }
-    if (mPreparedEncoder != nullptr && !mEncoderGpuSubmitted)
+    if (mPreparedEncoder != nullptr || !mEncoderGpuSubmitted)
     {
         return false;
     }
@@ -4387,6 +4485,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     {
         return false;
     }
+    mExternalEncoderActive = false;
     mServer.setExternalEncoderActive(false);
     if (mExclusiveEncoderPrefillInFlight)
     {
@@ -4902,18 +5001,23 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     }
     bool const batchFull = batchSize == preparationLimit || onlinePreparationApplied;
     bool const mediaFull = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
+    bool const multiMediaReady = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
     bool const inputFull = mConfig.maxEncoderInputBytes > 0 && inputBytes >= mConfig.maxEncoderInputBytes;
     bool const tokenFull = mConfig.maxEncoderInputTokens > 0 && inputTokens >= mConfig.maxEncoderInputTokens;
     bool const resourceLimited = batchSize < inputs.size();
     bool const capacityFull = !encoderCapacityAvailable(batchSize + 1U);
-    if (!globalActive && !batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
-        && oldestWaitUs < mConfig.encoderBatchWaitUs)
+    double const waitLimitUs = (mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0)
+        ? std::min(mConfig.encoderBatchWaitUs, mVisionInterarrivalEwmaUs)
+        : mConfig.encoderBatchWaitUs;
+    if (!globalActive && !batchFull && !mediaFull && !multiMediaReady && !inputFull && !tokenFull && !resourceLimited
+        && !capacityFull && oldestWaitUs < waitLimitUs)
     {
         return {};
     }
-    if (globalActive && mConfig.encoderBatchWaitUs > 0.0 && !batchFull && !mediaFull && !inputFull && !tokenFull
-        && !resourceLimited && !capacityFull && batchSize == inputs.size() && mVisionInterarrivalSamples > 0U
-        && mVisionInterarrivalEwmaUs > 0.0 && mLastVisionArrival != std::chrono::steady_clock::time_point{})
+    if (globalActive && mConfig.encoderBatchWaitUs > 0.0 && !batchFull && !mediaFull && !multiMediaReady && !inputFull
+        && !tokenFull && !resourceLimited && !capacityFull && batchSize == inputs.size()
+        && mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0
+        && mLastVisionArrival != std::chrono::steady_clock::time_point{})
     {
         double const sinceArrivalUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mLastVisionArrival).count();
@@ -4942,8 +5046,28 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
                     selected = &cost;
                 }
             }
-            return selected != nullptr ? std::optional<double>(static_cast<double>(selected->p95GpuMs) * 1000.0)
-                                       : std::nullopt;
+            if (selected != nullptr)
+            {
+                return static_cast<double>(selected->p95GpuMs) * 1000.0;
+            }
+            if (!mConfig.encoderBatchCosts.empty())
+            {
+                PhaseVisionEncoderBatchCost const* maxCost = &mConfig.encoderBatchCosts.front();
+                for (PhaseVisionEncoderBatchCost const& cost : mConfig.encoderBatchCosts)
+                {
+                    if (cost.batchSize > maxCost->batchSize)
+                    {
+                        maxCost = &cost;
+                    }
+                }
+                if (maxCost->batchSize > 0)
+                {
+                    double const perRowMs
+                        = static_cast<double>(maxCost->p95GpuMs) / static_cast<double>(maxCost->batchSize);
+                    return static_cast<double>(rows) * perRowMs * 1000.0;
+                }
+            }
+            return std::nullopt;
         };
         size_t const averageInputTokens = (inputTokens + batchSize - 1U) / batchSize;
         std::optional<double> const currentEncoder = estimateEncoder(batchSize, inputTokens);

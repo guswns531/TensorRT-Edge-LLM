@@ -166,9 +166,11 @@ public:
     //! Bind retained outputs and enqueue an already prepared encoder batch.
     bool submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch> prepared);
     bool ready(uint64_t requestId) const;
-    std::unique_ptr<PhaseVisionPayload> take(uint64_t requestId);
+    std::unique_ptr<PhaseVisionPayload> take(uint64_t requestId, bool allowInFlight = false);
     bool cancel(uint64_t requestId);
     bool busy() const noexcept;
+    bool encoderInFlight() const noexcept;
+    cudaEvent_t encoderDoneEvent() const noexcept;
     size_t estimateInputTokens(LLMGenerationRequest const& request);
     size_t estimateProfileInputTokens(LLMGenerationRequest const& request);
     //! Estimate request-owned encoder output, deepstack, and M-RoPE bytes retained through prefill.
@@ -214,6 +216,7 @@ private:
     std::function<void(PhaseVisionDebugSnapshot const&)> mDebugCallback;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
     bool mRequiresExternalOutputStorage{};
+    bool mEncoderInFlight{};
 };
 
 } // namespace trt_edgellm::rt

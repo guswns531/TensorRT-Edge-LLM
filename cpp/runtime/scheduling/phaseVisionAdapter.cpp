@@ -287,7 +287,7 @@ PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Toke
     CUcontext copyContext{};
     CUDA_DRIVER_CHECK(cuStreamGetCtx(mCopyStream, &copyContext));
     ELLM_CHECK(copyContext == mCudaContext, "Phase vision copy stream must share the encoder CUDA context");
-    CUDA_CHECK(cudaEventCreateWithFlags(&mEncoderDoneEvent, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreate(&mEncoderDoneEvent));
     mRequiresExternalOutputStorage = mRunner.releaseInternalOutputStorage();
 }
 
@@ -399,7 +399,8 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
 
 std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vector<PhaseVisionSubmission> submissions)
 {
-    ELLM_CHECK(mRequests.empty(), "Phase vision adapter currently permits one in-flight encoder batch");
+    ELLM_CHECK(mRequests.empty() && !encoderInFlight(),
+        "Phase vision adapter currently permits one in-flight encoder batch");
     ELLM_CHECK(!submissions.empty(), "Phase vision encoder batch cannot be empty");
     std::unordered_set<uint64_t> requestIds;
     requestIds.reserve(submissions.size());
@@ -626,6 +627,7 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
             embeddingOffset += rowCount;
             CUDA_CHECK(cudaEventRecord(payload.readyEvent, completionStream));
         }
+        CUDA_CHECK(cudaEventRecord(mEncoderDoneEvent, completionStream));
         ELLM_CHECK(embeddingOffset == totalEmbeddingRows, "Phase vision embedding slicing did not consume all rows");
         if (!debugSnapshots.empty())
         {
@@ -653,6 +655,7 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
             mRequests.emplace(prepared->submissions[index].requestId, std::move(prepared->payloads[index])).second,
             "Failed to register phase vision batch request");
     }
+    mEncoderInFlight = true;
     return true;
 }
 
@@ -669,16 +672,19 @@ bool PhaseVisionAdapter::ready(uint64_t requestId) const
     return true;
 }
 
-std::unique_ptr<PhaseVisionPayload> PhaseVisionAdapter::take(uint64_t requestId)
+std::unique_ptr<PhaseVisionPayload> PhaseVisionAdapter::take(uint64_t requestId, bool allowInFlight)
 {
     auto it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Unknown phase vision request");
-    ELLM_CHECK(ready(requestId), "Phase vision request is not complete");
-    CUDA_CHECK(
-        cudaEventElapsedTime(&it->second->preparationGpuMs, it->second->startEvent, it->second->preparationReadyEvent));
-    CUDA_CHECK(cudaEventElapsedTime(
-        &it->second->encoderExecutionGpuMs, it->second->encoderStartEvent, it->second->readyEvent));
-    CUDA_CHECK(cudaEventElapsedTime(&it->second->encoderGpuMs, it->second->startEvent, it->second->readyEvent));
+    if (!allowInFlight)
+    {
+        ELLM_CHECK(ready(requestId), "Phase vision request is not complete");
+        CUDA_CHECK(
+            cudaEventElapsedTime(&it->second->preparationGpuMs, it->second->startEvent, it->second->preparationReadyEvent));
+        CUDA_CHECK(cudaEventElapsedTime(
+            &it->second->encoderExecutionGpuMs, it->second->encoderStartEvent, it->second->readyEvent));
+        CUDA_CHECK(cudaEventElapsedTime(&it->second->encoderGpuMs, it->second->startEvent, it->second->readyEvent));
+    }
     std::unique_ptr<PhaseVisionPayload> result = std::move(it->second);
     mRequests.erase(it);
     releaseBatchStorageIfIdle();
@@ -699,7 +705,32 @@ bool PhaseVisionAdapter::cancel(uint64_t requestId)
 
 bool PhaseVisionAdapter::busy() const noexcept
 {
-    return !mRequests.empty();
+    return !mRequests.empty() || encoderInFlight();
+}
+
+bool PhaseVisionAdapter::encoderInFlight() const noexcept
+{
+    if (mEncoderInFlight)
+    {
+        if (mEncoderDoneEvent != nullptr)
+        {
+            cudaError_t const status = cudaEventQuery(mEncoderDoneEvent);
+            if (status == cudaSuccess)
+            {
+                const_cast<PhaseVisionAdapter*>(this)->mEncoderInFlight = false;
+            }
+            else if (status != cudaErrorNotReady)
+            {
+                static_cast<void>(cudaGetLastError());
+            }
+        }
+    }
+    return mEncoderInFlight;
+}
+
+cudaEvent_t PhaseVisionAdapter::encoderDoneEvent() const noexcept
+{
+    return mEncoderDoneEvent;
 }
 
 size_t PhaseVisionAdapter::estimateInputTokens(LLMGenerationRequest const& request)

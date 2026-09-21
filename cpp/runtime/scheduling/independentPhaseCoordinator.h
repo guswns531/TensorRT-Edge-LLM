@@ -89,6 +89,8 @@ public:
     //! Capture graphs for the currently prepared phase bindings. Callers must
     //! prepare both phase views with stable shapes before invoking this method.
     bool capturePreparedGraphs();
+    //! Pre-capture decode graphs across the specified batch sizes.
+    size_t primeDecodeGraphs(std::vector<int32_t> const& batchSizes, cudaStream_t stream);
     //! Capture recurring production phase shapes after the configured promotion threshold.
     void setGraphCaptureEnabled(bool enabled) noexcept;
     //! Require this many observations before promoting an unseen production
