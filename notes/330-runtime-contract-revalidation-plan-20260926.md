@@ -5,8 +5,11 @@ Date: 2026-09-26. Branch: `codex/v0101-phase-forward-port`.
 ## Scope
 
 Preserve the existing contextual scalar controller and stable indexed-paged KV ownership. Repair observable-state
-contracts before adding a new learned controller. No workload-label policies, new quantization, or engine rebuilds
-are part of this campaign.
+contracts before adding a new learned controller. No workload-label policies or new quantization are part of this
+campaign. The initial no-rebuild plan was revised after finding an undersized packed-decode plugin workspace:
+correctness required new plans from the same ONNX and builder configuration. Existing engines and current pointers
+are preserved; this changes the artifact contract, so final measurements are not source-only performance A/B.
+See note 331 sections 13–14 for the defect, evidence, and retained artifacts.
 
 ## Frozen reference
 

@@ -633,7 +633,7 @@ Three-phase의 request ID 및 downstream memory accounting도 실제 회수까�
 ### 13.3 단위 검증과 sanitizer 판정
 
 `unit-tests-safety-final.log`: plugin 7/7, runtime 688 pass/2 optional skip.
-Python: baseline/report28, lifecycle11, singleton5, output-audit9, rebuild4 tests pass.
+Python at this checkpoint: baseline/report28, lifecycle14, singleton5, output-audit9, rebuild4 tests pass.
 기존 `NormalizeImage.Accuracy`의 반복 간 실패는 별개로 남긴다(앞 절 참조).
 
 수정 전 Gemma minimal-startup memcheck는 ready 이후 target이 비정상 종료했다.
@@ -652,3 +652,201 @@ Peak MiB: Gemma balanced9785/vision-heavy9795/multi-image9795;
 Cosmos9345/9379/9343. 단일 run이며 최종 default로 승격하지 않는다.
 성능 일곱 지표는 `two-slab-report.md`, 요청별 검사는 `two-slab-quality.md`에 보존한다.
 동일 새 engine의 one-slab/ two-slab 비교와 Full24×3 완료 뒤 최종 결론을 갱신한다.
+
+## 14. Workspace-corrected engines와 최종 lifecycle evidence
+
+### 14.1 재빌드 identity와 공정성 제한
+
+두 모델 모두 기존 ONNX와 같은 builder configuration으로 새 plan을 만들었다. 기존 plan과
+`.local/current/`는 변경하지 않았다. `builder_config.json`은 기존과 byte-identical이며 KV pool,
+FP16 KV, quantization, batch capability를 줄이지 않았다. 생성 절차는
+`scripts/rebuild_phase_attention_workspace.py`, build manifest는 campaign의
+`workspace-rebuild/{gemma,cosmos}/manifest.json`에 있다. Build-only manifest의
+`built_not_inference_validated`는 build 단계의 상태이며 이후 검증은 아래 별도 artifact에 기록한다.
+
+| Model | 새 engine 디렉터리 | Engine SHA256 |
+|---|---|---|
+| Gemma | `.local/artifacts/v0101-forward-port/workspace-corrected-20260926/gemma` | `fef5210c22b0ceb064cdce07658f6dace7737d66cad7e35a3f625602f2c9405e` |
+| Cosmos | `.local/artifacts/v0101-forward-port/workspace-corrected-20260926/cosmos` | `c4f873c30db785cb87aba4475cc80b935112f225c3e2204f22c2ade09356026d` |
+
+새 runtime/plugin의 C++ source build는 `43c680a`다. 최종 반복 campaign은 `47a9cf7` checkout에서
+시작했고 source dirty 상태, binary/plugin SHA, engine SHA를 manifest에 분리 기록한다.
+Report/helper/note 변경은 실행 중인 binary 변경과 동일하지 않다. Runner는 매 cell에서 실행 파일과
+plugin hash가 달라지면 실패하도록 되어 있다.
+
+Gemma에는 예상 밖의 resident weight 증가가 있었다.
+
+| 항목 | 보존된 이전 plan | 새 plan |
+|---|---:|---:|
+| Engine 파일 bytes | 1,388,545,260 | 1,461,395,724 |
+| TRT LLM managed memory 로그 MiB | 1,290 | 1,360 |
+| Vision 로드 후 managed memory 로그 MiB | 1,612 | 1,682 |
+| P context workspace bytes | 183,647,744 | 183,647,744 |
+| D context workspace bytes | 28,401,664 | 28,401,664 |
+
+Plan 파일 증가는 약69.48MiB, resident managed-memory 차이는 약70MiB다. **KV 증가나 P/D context
+workspace 증가가 아니다.** Attention workspace 선언 수정 후 새로 빌드하며 tactic/weight packing이
+달라졌을 가능성은 있지만 특정 tactic이 원인이라고 입증하지는 않았다. 과거 September13 build
+manifest의 engine size는 현재 보존된 이전 plan과 일치하지 않으므로 그 build weight log를 정확히
+이전 artifact의 측정값으로 가져오지 않는다. Cosmos의 D workspace21,548,544bytes는 유지됐다.
+
+따라서 새 binary의 성능을 frozen prior와 비교할 수는 있어도, 그 차이를 controller 변경만의 효과라고
+말할 수는 없다. 이번에는 correctness 수정, graph coverage 변화, plan 재빌드가 함께 들어갔다.
+
+### 14.2 실제 GPU cancel → survivor → readmission
+
+`lifecycle-safety/{gemma,cosmos}/result.json`의 두 모델 모두 성공했다.
+
+| Model | Cancel 시도 / busy 거절 | Survivor output | Readmission output | D graph 준비 |
+|---|---:|---:|---:|---:|
+| Gemma | 1 / 0 | 32 tokens | 16 tokens | 24 |
+| Cosmos | 1 / 0 | 32 tokens | 16 tokens | 64 |
+
+이는 cancellation intent를 접수한 뒤 outstanding GPU/sampling consumer가 끝날 때까지 ownership을
+보존하는 실제 경로의 검사다. 취소 접수 직후 메모리를 회수하는 것이 아니다. 모든 cancellation
+interleaving을 증명하는 것은 아니지만 이전 Cosmos의 busy-only starvation은 이 fixture에서 재현되지
+않았다. 실행 contract는 `lifecycle-new-contract.json`과 개별 result의 launched identity에 보존했다.
+
+### 14.3 새 plan의 production API graph on/off
+
+`production-safety/manifest.json`과 네 개 실행 artifact를 확인했다. 두 모델×graph on/off 각각
+3requests, 총12requests가 정상 EOS로 완료됐다. 모델별 paired request의 IDs, text, token count,
+prompt count, finish reason은 모두 같다. 같은 세 질문에 대해 재빌드 이전 `production-final`과도
+출력이 일치했다. D graph 준비 수는 Gemma0/24, Cosmos0/64다.
+
+이 검사는 production entry point가 새 plan에서 graph 설정을 실제로 반영한다는 evidence다.
+Small smoke의 output identity이며 Full12의 cross-repeat exact identity나 HTTP latency gate를
+대체하지 않는다. Graph priming의 warm-up 차이 때문에 이 네 실행으로 pure graph speedup도 주장하지 않는다.
+
+### 14.4 Sanitizer: 오류0 문자열은 통과가 아니다
+
+Gemma의 기존 minimal-startup memcheck와 새 plan Cosmos의 memcheck가 모두 ready 이후 첫 E 요청
+부근에서 target abnormal exit로 끝났다. 각각 `lifecycle-memcheck/gemma`,
+`lifecycle-safety-memcheck/cosmos`에 실패를 보존했다. `ERROR SUMMARY: 0 errors`가 출력되어도
+cancel/reuse fixture를 끝내지 못했으므로 **sanitizer gate는 실패/미확정**이다.
+
+Kernel journal의 CPU SIGSEGV instruction을 동일 container의 ELF offset과 대조하면 두 실행 모두
+glibc `__pthread_rwlock_rdlock+0x15`의 `mov 0x18(%rdi),%edx`다. 잘못된 lock pointer가 보이지만
+caller stack이 아직 없으므로 TensorRT, sanitizer, 우리 runtime 중 어느 쪽의 원인이라고 단정하지
+않는다. 이 정보는 CPU crash 위치를 좁힌 것이지 GPU memory safety를 증명한 것이 아니다.
+Text-only fixture와 bounded backtrace로 vision execution 의존성 및 caller를 추가 확인한다.
+
+### 14.5 출력 반복 동일성과 request 완료는 별도 gate
+
+중간 Gemma mixed R1/R2에서는64requests 중56개가 전체 token sequence 동일했다. 첫 stop token을
+포함한 prefix까지 비교하면58개가 같다. 두 요청은 정상 답변/종료 이후 강제 `ignore_eos` 출력만
+달랐고 나머지6개는 실제 응답 안에서 분기했다. 두-image 요청에서는 Dog→Red Panda 순서가
+유지됐지만 이것을 full semantic identity로 취급하지 않는다.
+
+8개 raw-divergent 요청 모두 P1 tail이 없었다. 유일한 P1 tail 요청29는 두 반복에서 전체 출력이
+같았다. 반면 첫 token divergence에 대응하는 D batch는 다음처럼 달랐다.
+
+| Request ID | 첫 분기 token index (0-based) | R1 → R2 D batch |
+|---|---:|---|
+| 2 | 18 | 8 → 24 |
+| 10 | 26 | 6 → 24 |
+| 46 | 20 | 22 → 23 |
+| 48 | 22 | 22 → 23 |
+| 51 | 20 | 21 secondary graph → 20 primary graph |
+| 59 | 30 | 5 → 11 |
+| 60 | 30 | 5 → 4 |
+| 61 | 20 | 7 → 15 |
+
+특히 text requests2/10은 P membership/shape가 같았다. 다음 진단 축은 동일 요청/KV 상태에서
+D binding batch와 graph/eager만 바꾸는 controlled comparison이다. 현재 logits가 없으므로
+이를 benign FP16 rounding이라고 단정하지 않으며 exact-output promotion은 통과로 표시하지 않는다.
+
+## 15. 선택된 기본 계약: 두 모델 Full12 ×3 완료
+
+`full24-final-3x`는 **72/72 완료, failed/missing0**이다. Source build `43c680a`, binary
+`aab919194709253bdc377830653e1c201abf4a0b34967469cf0db0832cb1552b`, plugin
+`ddabc5df4d481bc2440d77a46862565f12343a8db8ba00ee34e42496dddad6c2`를 사용했다.
+Primary 완료 뒤 같은 binary/plugin을
+`.local/baselines/runtime-contract-43c680a-20260926/bin/`에 보존했다.
+
+이후 M-RoPE admission 후보 `5520216`은 targeted screen에서 resident text latency 회귀로
+기각했고 `1ebaf63`으로 그 변경만 되돌렸다. `git diff 43c680a -- cpp unittests`는 비어 있다.
+따라서 아래 표는 선택된 기본 runtime의 결과이며, 기각 후보의 좋은 수치를 섞지 않는다.
+자세한 causal 검사는 [333](333-encoder-admission-mrope-lifetime-fix-20260926.md)에 있다.
+
+### 15.1 전체 일곱 지표: Current / frozen vLLM (변화율)
+
+Throughput은 높을수록 좋고 모든 latency는 낮을수록 좋다. 단위는 token/s와ms다.
+Mean은 run별 mean의 산술평균, throughput/p95는 run별 수치의 중앙값이다. Pooled request p95나
+confidence interval이 아니다. Current는 각3회, Gemma frozen vLLM은1회이며 Cosmos는
+대부분3회·vision-heavy2회 성공+1회 실패다. 실패를 성공으로 치환하거나 vLLM까지 모두3회라고
+표시하지 않는다. 기존 계약이 유지된 vLLM raw를 재사용했고 이번에 fresh vLLM은 실행하지 않았다.
+
+| Model/variant/workload | Runs | tok/s | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| cosmos/shared_ep-predictor-on/balanced | 3 | 4264.36 / 4315.77 (-1.19%) | 65.88 / 112.40 (-41.39%) | 163.02 / 254.04 (-35.83%) | 12.67 / 12.20 (+3.86%) | 14.47 / 13.58 (+6.50%) | 1141.89 / 1154.35 (-1.08%) | 1793.42 / 1771.35 (+1.25%) |
+| cosmos/shared_ep-predictor-on/bimodal | 3 | 1910.88 / 1873.00 (+2.02%) | 1884.44 / 1548.74 (+21.68%) | 4027.70 / 2631.30 (+53.07%) | 16.93 / 22.59 (-25.03%) | 27.10 / 37.47 (-27.69%) | 4245.18 / 4642.60 (-8.56%) | 8924.95 / 9020.73 (-1.06%) |
+| cosmos/shared_ep-predictor-on/decode-heavy | 3 | 4991.78 / 4937.33 (+1.10%) | 67.71 / 118.57 (-42.90%) | 161.37 / 321.61 (-49.82%) | 10.78 / 11.01 (-2.08%) | 11.40 / 11.63 (-1.96%) | 2851.77 / 2969.42 (-3.96%) | 4355.96 / 4491.39 (-3.02%) |
+| cosmos/shared_ep-predictor-on/late-vision | 3 | 2425.67 / 2165.09 (+12.04%) | 115.28 / 250.16 (-53.92%) | 443.39 / 847.64 (-47.69%) | 9.71 / 10.77 (-9.85%) | 9.79 / 10.78 (-9.19%) | 1505.66 / 1792.55 (-16.00%) | 1901.53 / 2130.19 (-10.73%) |
+| cosmos/shared_ep-predictor-on/long-prefill | 3 | 1313.27 / 1123.89 (+16.85%) | 1969.66 / 1916.21 (+2.79%) | 2546.50 / 2947.28 (-13.60%) | 22.35 / 32.19 (-30.56%) | 26.45 / 37.37 (-29.22%) | 3869.56 / 4652.88 (-16.84%) | 5285.02 / 6586.48 (-19.76%) |
+| cosmos/shared_ep-predictor-on/mixed | 3 | 694.89 / 923.32 (-24.74%) | 1064.57 / 858.42 (+24.01%) | 3458.87 / 2542.45 (+36.04%) | 10.64 / 47.70 (-77.70%) | 15.44 / 83.92 (-81.60%) | 1580.06 / 2997.41 (-47.29%) | 3686.67 / 3132.22 (+17.70%) |
+| cosmos/shared_ep-predictor-on/multi-image | 3 | 215.69 / 243.90 (-11.57%) | 314.79 / 262.02 (+20.14%) | 518.97 / 401.97 (+29.11%) | 6.92 / 12.28 (-43.60%) | 7.58 / 16.27 (-53.42%) | 529.42 / 642.59 (-17.61%) | 736.33 / 654.42 (+12.52%) |
+| cosmos/shared_ep-predictor-on/poisson | 3 | 1608.98 / 1781.11 (-9.66%) | 353.20 / 435.59 (-18.92%) | 1840.57 / 923.41 (+99.32%) | 14.13 / 22.35 (-36.81%) | 18.42 / 46.23 (-60.15%) | 1407.74 / 1815.85 (-22.47%) | 2096.52 / 2287.42 (-8.35%) |
+| cosmos/shared_ep-predictor-on/short | 3 | 2286.71 / 2046.18 (+11.76%) | 98.14 / 180.00 (-45.48%) | 208.14 / 256.73 (-18.93%) | 12.78 / 12.82 (-0.31%) | 21.08 / 24.13 (-12.64%) | 335.01 / 420.08 (-20.25%) | 427.40 / 492.75 (-13.26%) |
+| cosmos/shared_ep-predictor-on/text-heavy | 3 | 1349.71 / 1292.39 (+4.44%) | 412.51 / 843.35 (-51.09%) | 1828.46 / 2108.36 (-13.28%) | 12.15 / 19.29 (-36.99%) | 15.44 / 41.45 (-62.75%) | 1072.30 / 1806.03 (-40.63%) | 2037.52 / 2518.49 (-19.10%) |
+| cosmos/shared_ep-predictor-on/vision-heavy | 3 | 390.47 / 577.19 (-32.35%) | 2289.59 / 1630.87 (+40.39%) | 5484.20 / 3544.35 (+54.73%) | 8.46 / 65.15 (-87.02%) | 12.36 / 120.75 (-89.76%) | 2627.20 / 4087.81 (-35.73%) | 5708.65 / 4240.20 (+34.63%) |
+| cosmos/shared_ep-predictor-on/wave-drain | 3 | 94.87 / 95.82 (-0.99%) | 297.21 / 254.96 (+16.57%) | 499.27 / 420.78 (+18.65%) | 7.00 / 12.43 (-43.68%) | 8.22 / 17.27 (-52.43%) | 514.13 / 640.15 (-19.69%) | 717.37 / 650.51 (+10.28%) |
+| gemma/shared_ep-predictor-on/balanced | 3 | 1203.25 / 771.46 (+55.97%) | 139.97 / 134.27 (+4.25%) | 608.01 / 234.33 (+159.47%) | 15.68 / 23.76 (-34.00%) | 17.33 / 24.56 (-29.45%) | 1448.48 / 2128.03 (-31.93%) | 2144.43 / 3244.79 (-33.91%) |
+| gemma/shared_ep-predictor-on/bimodal | 3 | 808.80 / 600.16 (+34.76%) | 728.29 / 317.41 (+129.45%) | 1319.47 / 878.39 (+50.21%) | 20.20 / 28.83 (-29.94%) | 35.97 / 37.42 (-3.89%) | 3446.81 / 4389.95 (-21.48%) | 7090.75 / 9582.02 (-26.00%) |
+| gemma/shared_ep-predictor-on/decode-heavy | 3 | 1317.72 / 812.43 (+62.19%) | 516.77 / 153.61 (+236.41%) | 1477.86 / 249.66 (+491.94%) | 14.29 / 23.04 (-37.96%) | 15.03 / 23.41 (-35.82%) | 4133.93 / 6006.17 (-31.17%) | 5773.86 / 9096.01 (-36.52%) |
+| gemma/shared_ep-predictor-on/late-vision | 3 | 1496.75 / 990.82 (+51.06%) | 132.78 / 137.71 (-3.58%) | 426.04 / 243.29 (+75.12%) | 13.80 / 22.55 (-38.78%) | 13.97 / 22.55 (-38.06%) | 2110.24 / 3367.53 (-37.34%) | 2750.48 / 4416.79 (-37.73%) |
+| gemma/shared_ep-predictor-on/long-prefill | 3 | 503.19 / 500.26 (+0.59%) | 1528.53 / 543.92 (+181.02%) | 3803.05 / 1442.01 (+163.73%) | 24.72 / 36.37 (-32.04%) | 33.88 / 44.60 (-24.03%) | 3611.43 / 3554.56 (+1.60%) | 7542.20 / 5866.97 (+28.55%) |
+| gemma/shared_ep-predictor-on/mixed | 3 | 720.57 / 703.81 (+2.38%) | 255.74 / 276.41 (-7.48%) | 465.69 / 410.58 (+13.42%) | 27.56 / 26.48 (+4.07%) | 36.65 / 32.39 (+13.18%) | 1497.34 / 1473.77 (+1.60%) | 2234.18 / 2162.56 (+3.31%) |
+| gemma/shared_ep-predictor-on/multi-image | 3 | 372.42 / 381.34 (-2.34%) | 318.02 / 188.86 (+68.39%) | 527.86 / 227.16 (+132.37%) | 29.43 / 29.70 (-0.92%) | 45.18 / 35.54 (+27.14%) | 1230.27 / 1109.61 (+10.87%) | 1546.38 / 1300.30 (+18.92%) |
+| gemma/shared_ep-predictor-on/poisson | 3 | 867.69 / 681.95 (+27.24%) | 168.44 / 119.77 (+40.63%) | 618.31 / 169.82 (+264.09%) | 21.20 / 26.02 (-18.52%) | 26.39 / 29.23 (-9.70%) | 1655.24 / 1968.88 (-15.93%) | 2913.67 / 3502.62 (-16.81%) |
+| gemma/shared_ep-predictor-on/short | 3 | 804.75 / 567.55 (+41.79%) | 117.86 / 155.42 (-24.17%) | 315.09 / 242.31 (+30.03%) | 20.67 / 26.39 (-21.68%) | 26.12 / 30.11 (-13.25%) | 532.23 / 695.40 (-23.46%) | 809.01 / 1068.16 (-24.26%) |
+| gemma/shared_ep-predictor-on/text-heavy | 3 | 855.07 / 404.66 (+111.30%) | 165.05 / 1658.73 (-90.05%) | 426.43 / 4312.05 (-90.11%) | 22.22 / 22.47 (-1.13%) | 27.47 / 27.54 (-0.24%) | 1321.45 / 2814.97 (-53.06%) | 1689.78 / 5848.75 (-71.11%) |
+| gemma/shared_ep-predictor-on/vision-heavy | 3 | 498.63 / 559.83 (-10.93%) | 497.48 / 280.57 (+77.31%) | 1132.11 / 390.78 (+189.70%) | 33.96 / 30.59 (+11.04%) | 51.46 / 40.54 (+26.92%) | 1741.81 / 1420.68 (+22.60%) | 2379.54 / 2138.33 (+11.28%) |
+| gemma/shared_ep-predictor-on/wave-drain | 3 | 96.87 / 92.62 (+4.58%) | 209.04 / 178.23 (+17.29%) | 327.39 / 204.42 (+60.15%) | 10.66 / 22.48 (-52.58%) | 13.53 / 24.58 (-44.95%) | 539.47 / 874.97 (-38.34%) | 576.91 / 884.36 (-34.76%) |
+
+### 15.2 해석: 모든 workload·모든 지표에서 이긴 결과가 아니다
+
+| 모델 | tok/s 승리 | TTFT mean / p95 승리 | TPOT mean / p95 승리 | E2E mean / p95 승리 |
+|---|---:|---:|---:|---:|
+| Gemma | 10/12 | 4/12 · 1/12 | 10/12 · 9/12 | 8/12 · 8/12 |
+| Cosmos | 6/12 | 6/12 · 6/12 | 11/12 · 11/12 | 12/12 · 7/12 |
+
+Gemma의 decode-heavy는 throughput+62.19%, E2E p95−36.52%지만 TTFT p95+491.94%다.
+Cosmos vision-heavy는 E2E mean−35.73%, TPOT p95−89.76%지만 throughput−32.35%,
+TTFT p95+54.73%, E2E p95+34.63%다. Throughput 또는 E2E mean 하나로 전면 승리를 주장하면
+이 상충관계를 놓친다. 이번 수치는 source-only 개선률이 아니라 최종 실행 계약 대 frozen vLLM이다.
+
+### 15.3 출력·메모리 promotion 제한
+
+6,435 request instances의 HTTP/count/token-capture integrity 검사는 통과했고 first-token EOS
+flag는0이었다. 하지만 강제 길이 출력 완료는 semantic correctness나 exact-output gate와 다르다.
+
+| 모델 | 서로 다른 request positions | 3회 raw exact | 첫 stop 포함 prefix exact |
+|---|---:|---:|---:|
+| Cosmos | 1,513 | 1,513/1,513 | 1,513/1,513 |
+| Gemma | 632 | 561/632 | 569/632 |
+
+Gemma의71개 raw /63개 prefix request positions는 반복 중 적어도 한 번 다르다. Wave-drain만
+workload 전체 raw exact이며 나머지11개는 하나 이상의 차이가 있다. 분기 원인을 logits 없이
+FP16 rounding 또는 KV 오류로 단정하지 않는다. Exact-output promotion은 미통과다.
+
+Peak VRAM은 Cosmos9,299MiB, Gemma9,849–9,853MiB다. SMI total은10,240MiB지만 driver reservation
+약365–366MiB를 제외한 usable budget은 약9,874–9,875MiB다. 따라서 추정 headroom은
+Cosmos575–576MiB, Gemma최악21–22MiB다. 다른 시각에 읽은 rounded SMI 항목을 peak와
+동시 측정한 값처럼 취급하지 않는다. Gemma는 역사적512MiB 목표를 크게 밑돌며 OOM이 이번에
+없었다는 것만으로 production capacity를 안전하다고 할 수 없다.
+
+### 15.4 산출물과 후속 범위
+
+Campaign root: `.local/results/runtime-contract-revalidation-20260926/`.
+
+- `full24-final-3x/manifest.json`: 실행 contract, 원본72회, hashes.
+- `full24-final-report.{json,csv,md,manifest.json}`: frozen vLLM 비교와 각 run의 범위/편차.
+- `full24-final-report-scope.md`: repeatability와 headroom 해석.
+- `full24-quality-audit.{json,md}`: 요청별 capture 및 stop-prefix exact.
+- `mrope-gate-screen/`: 기각된5520216 후보의6회 screen; primary 표와 합치지 않는다.
+- [332](332-gemma-owner-allocation-memory-audit-20260926.md): 다음 메모리 개선 후보의 코드 감사.
+
+다음 memory 후보인 donor-KV 중복 할당576MiB와 image scratch 약72MiB는 아직 **계산·설계**다.
+이번에 절감한 실측량으로 보고하지 않는다. KV capacity 감소 없이 접근할 수 있지만 physical owner
+alias/copy 안전성과 dynamic scratch의 GPU consumer lifetime을 별도 구현·검증해야 한다.
