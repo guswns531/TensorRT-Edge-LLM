@@ -16,6 +16,7 @@
 
 import argparse
 import copy
+import hashlib
 import json
 import pathlib
 import queue
@@ -63,6 +64,61 @@ def replace_docker_environment(command, overrides, image_index):
         if value is not None:
             result.extend(["-e", name + "=" + value])
     return result + command[image_index:]
+
+
+def collect_launched_identity(command, repository):
+    """Hash the actual mounted executable/plugin independently of parent metadata."""
+    mount = None
+    plugin = "/opt/edgellm/libNvInfer_edgellm_plugin.so.1.0"
+    for index, token in enumerate(command):
+        if token in ("-v", "--volume") and index + 1 < len(command):
+            parts = command[index + 1].split(":")
+            if len(parts) >= 2 and parts[1] == "/opt/edgellm":
+                mount = pathlib.Path(parts[0]).resolve(strict=True)
+        assignment = ""
+        if token in ("-e", "--env") and index + 1 < len(command):
+            assignment = command[index + 1]
+        elif token.startswith("--env="):
+            assignment = token[len("--env="):]
+        if assignment.startswith("EDGELLM_PLUGIN_PATH="):
+            plugin = assignment.split("=", 1)[1]
+    if mount is None:
+        raise ValueError("Lifecycle command must bind mount /opt/edgellm")
+
+    def mounted_file(container_path):
+        relative = pathlib.PurePosixPath(container_path).relative_to(
+            "/opt/edgellm")
+        host_path = (mount / relative).resolve(strict=True)
+        digest = hashlib.sha256()
+        with host_path.open("rb") as data:
+            for block in iter(lambda: data.read(1024 * 1024), b""):
+                digest.update(block)
+        return {
+            "container_path": container_path,
+            "host_path": str(host_path),
+            "sha256": digest.hexdigest(),
+            "size_bytes": host_path.stat().st_size,
+        }
+
+    source_commit = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        text=True).strip()
+    source_status = subprocess.check_output(
+        ["git", "-C", str(repository), "status", "--porcelain"], text=True)
+    return {
+        "observed_at": "immediately_before_backend_launch",
+        "build_mount": str(mount),
+        "binary":
+        mounted_file("/opt/edgellm/examples/llm/llm_phase_context_smoke"),
+        "plugin": mounted_file(plugin),
+        "source_checkout": {
+            "path": str(repository),
+            "commit": source_commit,
+            "dirty": bool(source_status),
+            "status_porcelain": source_status.splitlines(),
+            "proves_artifact_build_commit": False,
+        },
+    }
 
 
 class CancellationAttempts:
@@ -137,6 +193,9 @@ def run(args):
     requests = trace["requests"]
     events = queue.Queue()
     observed = []
+    launched_identity = collect_launched_identity(
+        command,
+        pathlib.Path(__file__).resolve().parents[2])
     process = subprocess.Popen(command,
                                stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE,
@@ -242,7 +301,12 @@ def run(args):
                 True,
             },
             "command": command,
-            "source_identity": manifest["identity"],
+            "parent_manifest_reference": {
+                "path": str(args.manifest.resolve()),
+                "identity": manifest["identity"],
+                "is_actual_launch_provenance": False,
+            },
+            "launched_identity": launched_identity,
             "events": observed,
             "cancellation": cancellation.report(),
             "survivor_readmission_output_tokens": completions,
@@ -254,7 +318,8 @@ def run(args):
                 "memcheck" if args.sanitizer else "not checked",
                 "kv_page_reuse_verified": False,
                 "encoder_or_sampling_pending_cancel_verified": False,
-                "source_identity_reverified": False,
+                "binary_plugin_identity_observed_before_launch": True,
+                "artifact_build_commit_verified": False,
             },
         }
         (output /

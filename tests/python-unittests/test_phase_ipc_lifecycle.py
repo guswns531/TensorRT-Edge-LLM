@@ -14,9 +14,12 @@
 # limitations under the License.
 """CPU-only cancellation protocol tests, without inference or GPU dependencies."""
 
+import hashlib
 import importlib.util
 import pathlib
+import tempfile
 import unittest
+import unittest.mock
 
 
 def load_tool():
@@ -30,6 +33,57 @@ def load_tool():
 
 
 G_TOOL = load_tool()
+
+
+class LaunchedIdentityTest(unittest.TestCase):
+    """The launch hashes describe mounted files, not the source campaign's build."""
+
+    def test_hashes_mounted_files_with_sanitizer_and_current_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            executable = root / "examples/llm/llm_phase_context_smoke"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"current binary")
+            plugin = root / "current-plugin.so"
+            plugin.write_bytes(b"changed plugin")
+            command = [
+                "docker",
+                "run",
+                "-v",
+                str(root) + ":/opt/edgellm:ro",
+                "-e",
+                "EDGELLM_PLUGIN_PATH=/opt/edgellm/current-plugin.so",
+                "image",
+                "compute-sanitizer",
+                "--tool",
+                "memcheck",
+                "--error-exitcode",
+                "99",
+                "/opt/edgellm/examples/llm/llm_phase_context_smoke",
+                "/opt/model",
+            ]
+            original = command.copy()
+            with unittest.mock.patch.object(
+                    G_TOOL.subprocess,
+                    "check_output",
+                    side_effect=["current-head\n", " M source.cpp\n"]):
+                result = G_TOOL.collect_launched_identity(command, root)
+            self.assertEqual(command, original)
+            self.assertEqual(result["binary"]["sha256"],
+                             hashlib.sha256(b"current binary").hexdigest())
+            self.assertEqual(result["plugin"]["sha256"],
+                             hashlib.sha256(b"changed plugin").hexdigest())
+            self.assertEqual(result["plugin"]["size_bytes"], 14)
+            self.assertEqual(result["source_checkout"]["commit"],
+                             "current-head")
+            self.assertTrue(result["source_checkout"]["dirty"])
+            self.assertFalse(
+                result["source_checkout"]["proves_artifact_build_commit"])
+
+    def test_missing_build_mount_is_not_inferred_from_parent(self):
+        with self.assertRaises(ValueError):
+            G_TOOL.collect_launched_identity(["docker", "run", "image"],
+                                             pathlib.Path("/tmp"))
 
 
 class DockerEnvironmentTest(unittest.TestCase):
