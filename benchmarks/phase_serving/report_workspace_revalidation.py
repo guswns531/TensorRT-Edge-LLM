@@ -125,6 +125,17 @@ def compare_runs(runs, baseline):
             "maximum": max(values),
             "stddev": statistics.stdev(values) if len(values) > 1 else None,
         }
+    throughput_reference = result["metrics"]["generated_token_s_median"][
+        "frozen_vllm"]
+    result["throughput_repeats"] = [{
+        "generated_token_s_median":
+        float(run["generated_token_s_median"]),
+        "delta_percent":
+        (float(run["generated_token_s_median"]) / throughput_reference - 1.0) *
+        100.0,
+        "beats_frozen_vllm":
+        float(run["generated_token_s_median"]) > throughput_reference,
+    } for run in runs]
     result["peak_memory_mib"] = max(
         run.get("gpu_memory_peak_mib_median", 0) for run in runs)
     return result
@@ -183,6 +194,8 @@ def collect_campaign(root, baselines):
                    variant=variant,
                    workload=workload,
                    origins=group["origins"])
+        for repeat, origin in zip(row["throughput_repeats"], group["origins"]):
+            repeat["origin"] = origin
         row["baseline_trace_identity"] = (
             "hash_matched" if baselines[model][workload].get("trace_sha256")
             else "not_available_in_frozen_summary")
@@ -294,6 +307,33 @@ def markdown(report):
                                           row["workload"])) + " | " +
                          str(row["run_count"]) + " | " + " | ".join(cells) +
                          " |")
+        lines += [
+            "", "### Throughput repeat margins", "",
+            "Each retained cell is compared strictly against the same frozen baseline aggregate; "
+            "a tie is not a win. These are not paired baseline runs or confidence intervals.",
+            "",
+            "| Model/variant/workload | Per-repeat tok/s (change; beats frozen) | Min | Max | Frozen | Wins/runs |",
+            "|---|---|---:|---:|---:|---:|"
+        ]
+        for row in campaign["rows"]:
+            repeats = row.get("throughput_repeats", [])
+            if not repeats:
+                continue
+            values = row["metrics"]["generated_token_s_median"]
+            cells = [
+                "%s: %.2f (%+.2f%%; %s)" %
+                (repeat.get("origin", {}).get("repeat", str(index + 1)),
+                 repeat["generated_token_s_median"], repeat["delta_percent"],
+                 "yes" if repeat["beats_frozen_vllm"] else "no")
+                for index, repeat in enumerate(repeats)
+            ]
+            lines.append("| %s | %s | %.2f | %.2f | %.2f | %d/%d |" %
+                         ("/".join(
+                             (row["model"], row["variant"], row["workload"])),
+                          "; ".join(cells), values["minimum"],
+                          values["maximum"], values["frozen_vllm"],
+                          sum(repeat["beats_frozen_vllm"]
+                              for repeat in repeats), len(repeats)))
         lines.append("")
     return "\n".join(lines) + "\n"
 

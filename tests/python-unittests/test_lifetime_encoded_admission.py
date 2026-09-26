@@ -378,6 +378,11 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             self.assertEqual(
                 report["rows"][0]["metrics"]["generated_token_s_median"]
                 ["current"], 20.0)
+            repeat = report["rows"][0]["throughput_repeats"][0]
+            self.assertEqual(repeat["origin"], report["rows"][0]["origins"][0])
+            self.assertEqual(repeat["origin"]["repeat"], "repeat-001")
+            self.assertEqual(repeat["generated_token_s_median"], 20.0)
+            self.assertTrue(repeat["beats_frozen_vllm"])
             baseline["gemma"]["mixed"]["trace_sha256"] = "another"
             with self.assertRaises(ValueError):
                 G_REPORTER.collect_campaign(root, baseline)
@@ -398,6 +403,80 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(row["metrics"]["generated_token_s_median"]["current"],
                          20)
         self.assertEqual(row["metrics"]["e2e_p95_median_ms"]["current"], 20)
+
+    def test_throughput_repeat_values_follow_original_cell_identities(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            for repeat, value in ((3, 9), (1, 11)):
+                cell = root / "gemma/independent" / ("repeat-%03d" %
+                                                     repeat) / "mixed"
+                cell.mkdir(parents=True)
+                aggregate = {metric: value for metric in G_REPORTER.METRICS}
+                aggregate.update(generated_tokens_per_run_min=4,
+                                 requested_output_tokens_per_run=4,
+                                 trace_sha256="trace")
+                (cell / "aggregate.json").write_text(json.dumps(aggregate))
+            baseline = {
+                "gemma": {
+                    "mixed": {
+                        "metrics": {
+                            metric: 10.0
+                            for metric in G_REPORTER.METRICS
+                        },
+                        "trace_sha256": "trace"
+                    }
+                }
+            }
+            row = G_REPORTER.collect_campaign(root, baseline)["rows"][0]
+            self.assertEqual([(repeat["origin"]["repeat"],
+                               repeat["generated_token_s_median"],
+                               repeat["beats_frozen_vllm"])
+                              for repeat in row["throughput_repeats"]],
+                             [("repeat-001", 11, True),
+                              ("repeat-003", 9, False)])
+            self.assertEqual(
+                [repeat["origin"] for repeat in row["throughput_repeats"]],
+                row["origins"])
+
+    def test_report_exposes_all_throughput_repeats_and_does_not_count_ties(
+            self):
+        baseline = {"metrics": {metric: 10.0 for metric in G_REPORTER.METRICS}}
+        runs = [{
+            metric: value
+            for metric in G_REPORTER.METRICS
+        } for value in (11, 9, 10)]
+        row = G_REPORTER.compare_runs(runs, baseline)
+        repeats = row["throughput_repeats"]
+        self.assertEqual(
+            [repeat["generated_token_s_median"] for repeat in repeats],
+            [11, 9, 10])
+        self.assertEqual([repeat["beats_frozen_vllm"] for repeat in repeats],
+                         [True, False, False])
+        for repeat, expected in zip(repeats, (10, -10, 0)):
+            self.assertAlmostEqual(repeat["delta_percent"], expected)
+        values = row["metrics"]["generated_token_s_median"]
+        self.assertEqual(
+            (values["current"], values["minimum"], values["maximum"]),
+            (10, 9, 11))
+        row.update(model="test",
+                   variant="independent",
+                   workload="mixed",
+                   baseline_trace_identity="hash_matched")
+        rendered = G_REPORTER.markdown({
+            "campaigns": {
+                "test": {
+                    "rows": [row],
+                    "retained_cells": 3,
+                    "expected_cells": 3
+                }
+            }
+        })
+        self.assertIn("11.00 (+10.00%; yes)", rendered)
+        self.assertIn("9.00 (-10.00%; no)", rendered)
+        self.assertIn("10.00 (+0.00%; no)", rendered)
+        self.assertIn("| 1/3 |", rendered)
+        self.assertIn("not paired baseline runs or confidence intervals",
+                      rendered)
 
     def test_failed_aggregate_cannot_make_a_campaign_complete(self):
         with tempfile.TemporaryDirectory() as folder:
