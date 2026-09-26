@@ -780,6 +780,13 @@ void IndependentPhaseAsyncServer::releaseCancelledRequest(uint64_t requestId)
 {
     auto const it = mRequests.find(requestId);
     ELLM_CHECK(it != mRequests.end(), "Cancelled request is missing");
+    ELLM_CHECK(!mCoordinator.scheduler().hasRequest(requestId), "Cancelled request still has scheduled GPU work");
+    ELLM_CHECK(std::none_of(mSamplingTickets.begin(), mSamplingTickets.end(),
+                   [requestId](auto const& ticket) {
+                       return std::find(ticket->requestIds.begin(), ticket->requestIds.end(), requestId)
+                           != ticket->requestIds.end();
+                   }),
+        "Cancelled request still has pending sampling consumers");
     mOwnership.release(it->second.kvSlotId);
     recordTimeline(requestId, PhaseTimelineStage::kSlotReleased, it->second.kvSlotId);
     auto const promptLength = mActivePromptTokens.find(static_cast<int32_t>(it->second.promptTokens.size()));
