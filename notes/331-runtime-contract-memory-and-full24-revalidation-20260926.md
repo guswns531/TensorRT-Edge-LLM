@@ -5,7 +5,13 @@
 
 작성일: 2026-09-26. 활성 브랜치: `codex/v0101-phase-forward-port`.
 
-상태: **구현 및 단위 검증 기록. 최종 GPU 성능·승격 판정은 pending.**
+상태: **핵심 runtime 수정 및 Full24 ×3 재검증 완료. 전체 promotion은 보류.**
+
+최종 성능 표는 §15다. 두 모델×12 workload×3회, 72/72 실행이 완료됐지만 Gemma의
+cross-repeat exact output과 memory headroom은 통과하지 못했다. 아래 중간 checkpoint는
+재현 이력이며, 과거 `pending`을 최종 상태로 해석하지 않는다. Workspace 대조 실험은
+[334](334-workspace-memory-mode-final-screen-20260926.md)에 분리한다. Scalar controller를
+교체하거나 workload별 최적 cell을 합쳐 새 champion을 만들지 않았다.
 
 이 문서는 [330 실행 계획](330-runtime-contract-revalidation-plan-20260926.md)의 후속이다.
 현재 controller를 새로운 학습기로 교체하는 작업이 아니라, 기존 결과를 해석하는 데 필요한
@@ -18,15 +24,17 @@
 | 항목 | 구현 상태 | 이 문서 작성 시 검증 상태 |
 |---|---|---|
 | Decode queue 관측 feature/label 일치 | 완료 | 단위 검증 완료 |
-| Smoke/production 실행 옵션 resolver 공유 | 완료 | 단위 검증 완료; GPU entrypoint 비교 판정 pending |
-| Production decode graph 초기화 연결 | 완료 | 모델당3-request graph on/off smoke 완료; Full-suite quality 판정 pending |
-| Shared workspace 교체 시 graph invalidation | 완료 | graph generation/binding 단위 검증 완료; 실제 재현·재발 gate pending |
-| Packed-prefill 1-token tail의 P/D 분류 수정 | 완료 (`5075ae6`) | 동일 binary/plugin 교체 전후 3-request GPU fixture에서 첫 EOS 오류 제거; 확장 gate pending |
-| Shared E/P activation lease와 vision slab retention 분리 | 완료 | helper 단위 검증 완료; 실제 two-slab lifecycle pending |
-| Predictor/workspace 동일 binary A/B runner | 완료 | CPU contract test 완료; GPU screening 진행 대상 |
+| Smoke/production 실행 옵션 resolver 공유 | 완료 | 새 plan의 두 모델 production graph on/off 12requests 통과 |
+| Production decode graph 초기화 연결 | 완료 | paired 6requests output 동일; primary D graph Gemma24/Cosmos64 |
+| Shared workspace 교체 시 graph invalidation | 완료 | generation/binding 단위 검증 통과; graph-cap4 GPU 결과는 §16/334 |
+| Packed-prefill 1-token tail의 P/D 분류 수정 | 완료 (`5075ae6`) | 동일 binary/plugin 교체 fixture에서 첫 EOS 오류 제거; Full24 6,435requests 첫 EOS0; Gemma exact는 별도 미통과 |
+| Shared E/P activation lease와 vision slab retention 분리 | 완료 | bounded two-slab 6/6 HTTP 실행·capture 통과; 승격은334 참조 |
+| Predictor/workspace 동일 binary A/B runner | 완료 | 24attempts: 18성공 / Gemma independent 6startup OOM; 실패도 보존 |
 | Failed/missing campaign fail-closed | 완료 | CPU 검증 완료 |
 | Cosmos frozen vLLM raw provenance·평균 복구 | 완료 | 12 trace / 35 successful runs 검증 완료 |
-| 두 모델 Full12 ×3 | 미완료 | pending; 전체 승리/무회귀 주장 금지 |
+| Packed decode plugin workspace 선언 | 완료 (`55b3c8e`) | 같은 ONNX/config로 두 plan 재빌드; KV capacity 유지 |
+| Inflight cancellation intent 및 deferred release | 완료 (`43c680a`) | 두 모델 cancel/survivor/readmission 및 bounded vision memcheck 통과 |
+| 두 모델 Full12 ×3 | 완료 | 72/72, 6,435requests; 전체 승리/무회귀는 아님 (§15) |
 | 새로운 physical handoff learner | **구현하지 않음** | 이번 범위 밖 |
 
 주요 구현 커밋:
@@ -380,7 +388,8 @@ Cosmos/Gemma의 frozen vLLM version과 모델/양자화가 서로 같다는 비�
 
 실제 `submit → progress → cancel → drain → reuse`와 busy cancellation contract를 확인하는
 [`check_phase_ipc_lifecycle.py`](../benchmarks/phase_serving/check_phase_ipc_lifecycle.py)를 추가했다.
-실제 model/GPU를 사용한 최종 lifecycle 결과와 sanitizer 판정은 pending으로 남긴다.
+실제 model/GPU의 최종 lifecycle은 §14.2, unrestricted sanitizer 실패는 §14.4,
+bounded vision memcheck 성공 및 그 제한은 §16에 구분해 기록한다.
 
 ### 9.1 Fixed-output 성능 성공과 output identity는 다른 gate다
 
@@ -556,25 +565,25 @@ pre-fix Current output-quality 문제가 사라진 것은 아니므로 final vLL
 특히 two-slab 실험은 shared의 memory 이점을 일부 유지하면서 producer 병목을 줄일 수 있는지
 검증하는 가설이며, 위 independent 수치를 그대로 기대 개선치로 옮기지 않는다.
 
-### 11.2 최종 GPU gate — 아직 pending
+### 11.2 최종 GPU gate — 완료 여부와 승격 여부를 구분
 
-다음 표에는 최종 결과가 확보된 후에만 raw artifact를 연결한다. 현재 빈 항목을 historical
-single-run 수치나 targeted 최고 수치로 채우지 않는다.
+최종 artifact를 기준으로 갱신했다. 실패한 gate를 historical single-run 최고 수치로
+대체하지 않는다. 메모리 모드의1회 screening은 기본 설정 승격용 반복 실험이 아니다.
 
 | Gate | 요구 evidence | 상태 |
 |---|---|---|
-| Prior/current 동일 canonical contract | 같은 engine·trace·calibration·graphs·memory, source만 구분 | pending |
-| Predictor on/off | 동일 binary에서 burst/token-limit authority만 변경 | pending |
-| Independent/shared_ep | 같은 KV pool, engine frontier 및 memory peak를 함께 비교 | pending |
-| Shared 1-slab/2-slab | 실제 retained batches, release/reuse, peak, serving latency | pending |
-| Tiered | genuine multi-profile visual engine; small/large lease 검증 | pending |
-| Production graph on/off | 실제 API initialization 및 request outputs | 모델당3-request smoke 완료; Full-suite quality pending |
-| P graph cap4 safety regression | 기존 stale-workspace 문제의 실제 재발 여부 | pending |
-| P1 continuation 확장 gate | 수정 plugin의 graph-on·ragged paired identity·Full12 재검증 | singleton graph-off fixture 완료; 나머지 pending |
-| Cancel/continuous admission/reuse | 실제 GPU lifecycle, no invalid ownership | pending |
-| Two-model Full12 ×3 | 72 cells per selected fixed configuration; seven metrics+memory | pending |
-| Cross-variant output identity | Fixed-output 성공과 분리한 captured token/semantic 비교 | Gemma divergence 관측; exact gate 미통과 |
-| Promotion | correctness + repeated regression review + known failure disclosure | 미결정 |
+| Prior/current 동일 canonical contract | 같은 engine·trace·calibration·graphs·memory, source만 구분 | source-only 비교 취소: correctness 때문에 plan 재빌드·graph coverage 변경 (§14.1) |
+| Predictor on/off | 동일 binary에서 해당 옵션만 변경 | 24screen 완료; 현재 queue learner는 shadow, scalar-RLS on/off 비교가 아님 |
+| Independent/shared_ep | 같은 KV pool, engine frontier 및 memory peak를 함께 비교 | Cosmos12성공/Gemma independent6OOM,334 |
+| Shared 1-slab/2-slab | 실제 retained batches, release/reuse, peak, serving latency | 6/6 완료,334; correctness invariant와 지연 trade-off 별도 |
+| Tiered | genuine multi-profile visual engine; small/large lease 검증 | Gemma 별도 screen,334; Cosmos engine 미지원으로 명시적 preflight 거부 |
+| Production graph on/off | 실제 API initialization 및 request outputs | 두 모델 총12requests 성공, 모델별 paired outputs 동일 (§14.3) |
+| P graph cap4 safety regression | 기존 stale-workspace 문제의 실제 재발 여부 | 최신 binary의 별도 graph smoke, §16/334 |
+| P1 continuation 확장 gate | 수정 plugin의 graph-on·ragged paired identity·Full12 재검증 | P1 fixture 성공/Full24 완료; 모든 shape exact 입증은 아님 |
+| Cancel/continuous admission/reuse | 실제 GPU lifecycle, no invalid ownership | normal 및 bounded memcheck 완료; physical page reuse 자체는 미계측 (§16) |
+| Two-model Full12 ×3 | 72 cells per selected fixed configuration; seven metrics+memory | 72/72, §15 |
+| Cross-variant output identity | Fixed-output 성공과 분리한 captured token/semantic 비교 | Gemma cross-repeat exact 미통과; Cosmos 해당3반복 exact 통과 |
+| Promotion | correctness + repeated regression review + known failure disclosure | 보류: Gemma exact/headroom, unrestricted sanitizer, latency trade-off |
 
 ## 12. 다음 판단 원칙
 
@@ -718,7 +727,7 @@ prompt count, finish reason은 모두 같다. 같은 세 질문에 대해 재빌
 Small smoke의 output identity이며 Full12의 cross-repeat exact identity나 HTTP latency gate를
 대체하지 않는다. Graph priming의 warm-up 차이 때문에 이 네 실행으로 pure graph speedup도 주장하지 않는다.
 
-### 14.4 Sanitizer: 오류0 문자열은 통과가 아니다
+### 14.4 Unrestricted sanitizer 실패 이력: 오류0 문자열은 통과가 아니다
 
 Gemma의 기존 minimal-startup memcheck와 새 plan Cosmos의 memcheck가 모두 ready 이후 첫 E 요청
 부근에서 target abnormal exit로 끝났다. 각각 `lifecycle-memcheck/gemma`,
@@ -729,7 +738,8 @@ Kernel journal의 CPU SIGSEGV instruction을 동일 container의 ELF offset과 �
 glibc `__pthread_rwlock_rdlock+0x15`의 `mov 0x18(%rdi),%edx`다. 잘못된 lock pointer가 보이지만
 caller stack이 아직 없으므로 TensorRT, sanitizer, 우리 runtime 중 어느 쪽의 원인이라고 단정하지
 않는다. 이 정보는 CPU crash 위치를 좁힌 것이지 GPU memory safety를 증명한 것이 아니다.
-Text-only fixture와 bounded backtrace로 vision execution 의존성 및 caller를 추가 확인한다.
+이 unrestricted 실패는 뒤의 bounded vision memcheck 성공(§16.1)과 다른 실행 계약이다.
+Bounded 성공이 이 unrestricted 실패의 원인을 입증하거나 지우지는 않는다.
 
 ### 14.5 출력 반복 동일성과 request 완료는 별도 gate
 
@@ -776,6 +786,8 @@ Mean은 run별 mean의 산술평균, throughput/p95는 run별 수치의 중앙�
 confidence interval이 아니다. Current는 각3회, Gemma frozen vLLM은1회이며 Cosmos는
 대부분3회·vision-heavy2회 성공+1회 실패다. 실패를 성공으로 치환하거나 vLLM까지 모두3회라고
 표시하지 않는다. 기존 계약이 유지된 vLLM raw를 재사용했고 이번에 fresh vLLM은 실행하지 않았다.
+TPOT는 output이2tokens 이상인 요청의 `(E2E−TTFT)/(output_tokens−1)`이다.
+Late-vision에는 모델당8개의1-token 요청이 있어 TPOT 집계에서 제외되지만 TTFT/E2E에는 포함된다.
 
 | Model/variant/workload | Runs | tok/s | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -850,3 +862,143 @@ Campaign root: `.local/results/runtime-contract-revalidation-20260926/`.
 다음 memory 후보인 donor-KV 중복 할당576MiB와 image scratch 약72MiB는 아직 **계산·설계**다.
 이번에 절감한 실측량으로 보고하지 않는다. KV capacity 감소 없이 접근할 수 있지만 physical owner
 alias/copy 안전성과 dynamic scratch의 GPU consumer lifetime을 별도 구현·검증해야 한다.
+
+## 16. 마지막 safety·screening 종료 및 최종 판단
+
+### 16.1 Bounded vision memcheck — 두 모델 통과, 범위 제한 있음
+
+`lifecycle-bounded-vision/{gemma,cosmos}/result.json`은 두 모델 모두 `passed=true`다.
+실제 image trace를 사용했고 cancel target의 첫 token 이후 intent를 접수했다.
+각각 cancel1회/busy0회, survivor32tokens, readmission16tokens, target exit0이며
+harness가 terminate/kill하지 않았다. Backend log의 memcheck error summary는 모두0이다.
+실행 직전 관측한 binary/plugin hash는 §15의 선택된 기본 artifact와 같다.
+
+중요한 제한:
+
+- `--force-synchronization-limit 1`은 sanitizer가 다루는 outstanding launch 수를 제한한다.
+  이 성공은 unrestricted concurrency/racecheck 통과가 아니다.
+- `--minimal-startup`으로 graph/policy/shape warm-up을 생략했다. KV pages·batch capability를
+  줄인 것은 아니지만 Full24 성능 계약과 다르다. Sanitizer latency는 성능 숫자로 사용하지 않는다.
+- Fixture는 vision 요청을 실행했지만 실제 physical page의 재사용 주소, 모든 vision lease의
+  retain/release, encoder나 sampling이 pending인 순간의 cancel까지 직접 입증하지는 않는다.
+- §14.4의 unrestricted CPU crash는 미해결이다. 오류0 문자열만으로 통과 처리하지 않았다.
+
+### 16.2 최신 artifact의 P/D graph smoke
+
+`workspace-graph-p4-d8-corrected`는 두 모델 balanced 각1회, 2/2 HTTP 완료 및 output-capture
+integrity 통과다. `P4/D8`은 **graph cache 상한**이며 실제 batch 상한은 P8 및 GemmaD24/CosmosD64다.
+Same binary/plugin, 새 corrected plan, same KV, single-storage1을 사용했다.
+
+| Model | P entries / captures | P hits / misses | D entries / captures | D hits / misses | Evictions |
+|---|---:|---:|---:|---:|---:|
+| Gemma | 4 / 4 | 124 / 134 | 8 / 8 | 436 / 201 | 0 |
+| Cosmos | 4 / 4 | 468 / 379 | 8 / 8 | 774 / 1110 | 0 |
+
+Graph telemetry는 warm-up을 포함한 process 종료 시 누계다. 두 로그 모두 error/OOM0,
+`action_fidelity=false`0이다. Miss는 이 제한된 cache 밖의 eager execution이며 실패가 아니다.
+이 결과는 이전 stale-workspace fault가 해당 capture/replay 경로에서 재현되지 않았음을 보인다.
+모든 shape, runtime arena resize, graph eviction을 검증한 것은 아니다. Primary 성능 표는 여전히
+P graphs0/D graphs24·64 설정이며 이 smoke의 단일 실행을 섞지 않는다.
+
+### 16.3 테스트·대조실험 최종 집계
+
+| 검사 | 최종 결과 | 원본 |
+|---|---|---|
+| Runtime GTest | 688pass / 2optional skip, 690total | `unit-tests-default-final.log` |
+| Plugin GTest | 7/7pass | `unit-tests-safety-final.log` |
+| State GTest | 78/78pass | 이 campaign의 state test 로그 |
+| Python contract/report/lifecycle tests | 68pass (28+4+13+5+18) | 5개 standalone unit-test suite |
+| Primary Full24 ×3 | 72/72, fixed-output/capture integrity 통과 | `full24-final-3x`, `full24-quality-audit` |
+| Normal GPU cancel/re-admission | 2/2pass | `lifecycle-safety` |
+| Bounded vision memcheck | 2/2pass, unrestricted gate와 구분 | `lifecycle-bounded-vision` |
+| Production graph on/off | 12requests, paired6 outputs 동일 | `production-safety` |
+| Workspace/predictor screen | 18success / 6Gemma independent startup OOM | `workspace-final-screen` |
+| Bounded two-slab screen | 6/6 완료; 일부 latency 악화, 승격하지 않음 | `two-slab-final-screen` |
+| Genuine tiered visual engine | balanced2/3 HTTP완료, vision0/3; fallback/지원 오류/OOM을 분리 | `tiered-final-screen`, `tiered-final-vision-screen` |
+| P4/D8 graph cache smoke | 2/2pass, P/D hits 관측 | `workspace-graph-p4-d8-corrected` |
+
+Common suite의 `NormalizeImage.Accuracy`는 초기119/120 이후 반복5회에서3pass/2fail이었다.
+같은 upstream kernel/test 경로지만 원인이 확정되지 않았다. Tolerance를 완화하거나 성공한
+repeat만 골라 all-tests-pass로 표시하지 않았다. Python suite는 시스템 pytest가 없어
+각 `unittest` entry point로 실행했으며 export→build→inference 신규 model onboarding 결과와는 다르다.
+
+### 16.4 채택·기각·후속의 구분
+
+**유지한 구현:** feature/label 일치, 공통 execution option resolver, decode graph 준비,
+arena 교체 시 capture invalidation, P1 continuation 분류, packed-D workspace 선언,
+inflight cancel intent와 deferred release, 결과/provenance 감사. Primary 측정·rollback 후의
+C++와 unit-test source는 `43c680a`와 동일하며 해당 build의 실행 artifact를 보존했다.
+그 이후의 작은 multi-profile 초기화 수정은 §17에 별도 기록한다.
+
+**기각한 변경:** `5520216`의 M-RoPE-only ownership admission 완화는 Cosmos vision throughput을
+약82% 높였지만 resident text E2E mean을 약345% 악화시켰다. `1ebaf63`으로 되돌렸다.
+Two-slab/independent도 producer progress와 resident D continuity의 교환이 있으므로 workload별로
+좋은 설정만 고르는 default 전환을 하지 않았다. 자세한 paired 수치는333/334에 있다.
+
+**현재 승격을 막는 것:** Gemma exact-output 미통과, worst-case headroom 약21–22MiB,
+unrestricted memcheck CPU crash, 일부 TTFT/tail 회귀, genuine tiered의 capacity 실패다.
+Shared multi-profile binding 실패는 후속 초기화 수정과 별도 검증으로 해결했다(§17).
+따라서 “검증 실행과 보고 완료”와 “모든 correctness/performance gate 통과”를 구분한다.
+
+다음 구현 우선순위는 (1) donor-owner KV 중복 및 eager image scratch 절감으로 여유 확보,
+(2) 동일 요청/KV에서 D batch/graph만 바꾸는 Gemma divergence 재현,
+(3) memory-safe admission과 resident decode service 보호를 분리하는 bounded policy다.
+이번 범위에서는 새 memory allocator, workload별 rule, 신규 RLS/physical-handoff predictor를
+추가하지 않았다. 미구현 절감 예상량576+72MiB를 현재의 성능·메모리 성과에 합산하지 않는다.
+
+## 17. 마지막 multi-profile integration 수정 — primary와 provenance 분리
+
+Tiered 비교에 실제2-profile visual engine을 사용하면서 추가 integration 결함을 발견했다.
+`configureSharedVisionContextMemory(vision, 0)`은 profile0 크기만 할당하고 profile0만 연결했다.
+그러나 Gemma runner는 입력 token 수에 맞춰 profile을 자동 선택하므로 E4가 profile1을 요구하면
+`Visual optimization profile 1 has no valid context memory`로 실패했다. 단일-profile primary와는
+다른 경로이며 이 실패를 메모리 부족이나 scheduler 판단 탓으로 분류하지 않는다.
+
+`e8164e0`은 multi-profile일 때 전체 profile 최대 workspace를 할당하고 기존
+`MultimodalRunner::setContextMemory()`로 모든 profile의 binding을 같은 arena에 등록한 뒤
+초기 profile을 선택한다. 단일-profile은 기존 크기 조회·할당·binding 순서가 그대로다.
+기존 graph invalidation/drain 순서와 E/P 배타 실행도 유지한다. KV, weights, scheduler,
+batch limits, tiered policy, quantization은 바꾸지 않았다.
+
+이 초기화 수정의 artifact:
+
+- Smoke SHA256: `c07a91bc1164fa66e00daaaa09800e42607e84ae92e3f3591528e9aee702f79d`.
+- Production SHA256: `06c356ffae4a967e92297072e5515f61ec55060b553196aae22fb81eff27a377`.
+- Plugin은 §15의 `ddabc5df…` 그대로이며 engine 재빌드는 추가하지 않았다.
+- Runtime test 재실행: `unit-tests-shared-all-profiles.log`, 688pass/2optional skip.
+- `shared-all-profiles-fixed`: 실제2-profile Gemma balanced/vision-heavy2/2 완료.
+  모든7개 지표 및 profile-switch evidence는334의 마지막 절에 있다.
+- Binary 보존: `.local/baselines/runtime-contract-e8164e0-20260926/bin/`.
+
+**72회 primary 수치는 여전히 `43c680a` binary의 결과**다. 최종 source의 tiny initialization fix를
+적용해72회를 다시 돌렸다고 쓰지 않는다. 기존 single-profile source path가 동일하다는 코드 감사와
+`single-profile-final-screen`의 별도 representative 검증으로 범위를 한정한다.
+기존 `current` engine 포인터는 자동 전환하지 않았다. 재현 시에는 위 manifest의 binary와
+`workspace-corrected-20260926/{gemma,cosmos}` engine을 명시적으로 사용해야 한다.
+
+### 17.1 마지막 대표 screen과 ABBA 대조 — 무회귀 승격하지 않음
+
+`single-profile-final-screen`의 두 모델×balanced/vision-heavy/multi-image6개는 모두 요청/capture를
+완료했다. Error/OOM은0, 기존과 같은 D graph24/64, graph miss0이었다. 그러나 Gemma multi-image는
+310.17tokens/s, vision-heavy E2E p95는3,923.93ms로 primary 중앙값보다 나빴다. 단일-profile
+코드 경로가 같다는 이유로 이 수치를 무시하지 않았다.
+
+두 frozen executable로 같은 Gemma vision-heavy/multi-image를 **old-a → new-a → new-b → old-b**
+순서로 추가 실행했다. `paired-profile-guard-{old-a,new-a,new-b,old-b}` 총8/8 HTTP 완료,
+336requests capture integrity0이다. 각 variant/workload는2회이며 phase limits, engines,
+plugin, request/calibration, KV, runner/environment를 동일하게 유지했다.
+
+| New e8164e0 / old43c680a, fresh 각2회 | Throughput | TTFT mean | TTFT p95 | TPOT mean | TPOT p95 | E2E mean | E2E p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Gemma vision-heavy | +15.87% | −49.43% | −47.38% | +3.83% | −0.09% | −16.28% | −26.55% |
+| Gemma multi-image | −11.09% | +56.91% | +37.35% | −9.08% | −11.48% | +7.61% | +8.22% |
+
+전체7지표와 모든 개별 반복은334 §15 및 `paired-profile-guard-report`에 있다. 기존 binary에서도
+vision-heavy402.61tokens/s, E2E p95 3,522.69ms의 낮은 실행이 있었고, primary 3회 p95 범위도
+2,335.08–4,008.98ms였다. 이는 poor tail이 새 초기화 변경에만 나타나는 것이 아님을 보여주지만
+변동 원인이나 새 binary의 무회귀를 입증하지 않는다. 특히 multi-image fresh 대조가 나쁘므로
+**3% performance gate 통과, 새 champion, 일관된 speedup을 주장하지 않는다.**
+
+최신 source의 기능 수정과 primary의 성능 검증 상태를 분리한다. 추가 policy tuning 없이
+controlled same-state/graph/cohort 재현과 충분한 paired 반복이 다음 조건이다. 이 추가8회를
+primary의3회 표에 합쳐 유리한 평균을 만들지 않았다.

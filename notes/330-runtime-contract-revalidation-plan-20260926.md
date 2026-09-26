@@ -1,6 +1,16 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # 330. Runtime contract repair and dual-model revalidation
 
 Date: 2026-09-26. Branch: `codex/v0101-phase-forward-port`.
+
+Status: the fixed-contract dual-model Full12 x3 campaign is complete (72/72 runs).
+Implementation, validation failures, and promotion limits are recorded in
+[331](331-runtime-contract-memory-and-full24-revalidation-20260926.md).
+Workspace controls and rejected memory-mode alternatives are separated in
+[334](334-workspace-memory-mode-final-screen-20260926.md). Completion of the campaign does not imply
+all correctness or performance gates passed; in particular, Gemma exact output and headroom remain unresolved.
 
 ## Scope
 
