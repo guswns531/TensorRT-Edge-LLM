@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "runtime/scheduling/phaseGlobalScheduler.h"
+#include "runtime/phase/policy/phaseGlobalScheduler.h"
 
 #include "common/checkMacros.h"
 

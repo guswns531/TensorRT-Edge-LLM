@@ -577,9 +577,7 @@ struct PhaseQueueSchedulerConfig
     //! Admit one prefill batch after this many decode-only decisions so a
     //! continuous decode queue cannot starve new requests forever.
     int32_t decodeBurstLimit{8};
-    //! Online learned completion-aware transition predictor for P->D / E->P handoff latency,
-    //! dynamic decode burst sizing, and adaptive overlap token bounds.
-    //! Enables the burst controller and shadow decode-queue residence model, not physical handoff learning.
+    //! Enable deterministic decode-burst sizing and overlap-token bounds from observed service costs and slack.
     bool enableTransitionPredictor{true};
     PhaseTransitionPredictorConfig transitionPredictorConfig{};
     //! Opt in to the provided queue-deadline + EWMA GPU-cost policy.
@@ -864,15 +862,6 @@ public:
     //! Permit deterministic synthetic startup traffic to collect unknown P+D
     //! costs without applying production-request slack. Disable before serving.
     void setGlobalWarmupProbeMode(bool active);
-
-    PhaseTransitionPredictor const& transitionPredictor() const noexcept
-    {
-        return mTransitionPredictor;
-    }
-    PhaseTransitionPredictor& transitionPredictor() noexcept
-    {
-        return mTransitionPredictor;
-    }
 
 private:
     struct ServiceEpochRecord

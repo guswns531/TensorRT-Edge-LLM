@@ -110,15 +110,56 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
 
     def test_compact_telemetry_changes_only_instrumentation(self):
         default = environment(self.command("independent"))
-        compact = environment(
+        full = environment(
             G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
                                  "mixed", "independent", 0,
-                                 {"telemetry_level": "dispatch"}))
+                                 {"telemetry_level": "full"}))
         self.assertEqual(default.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"),
-                         "full")
-        self.assertEqual(compact.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"),
                          "dispatch")
-        self.assertEqual(default, compact)
+        self.assertEqual(full.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"), "full")
+        self.assertEqual(default, full)
+
+    def test_serving_defaults_match_repeated_configuration(self):
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            args = G_RUNNER.parse_args([])
+        self.assertEqual(args.variants, ["independent"])
+        self.assertEqual(args.telemetry_level, "dispatch")
+        self.assertEqual(args.transition_predictors, ["on"])
+        self.assertEqual(args.serving_overlap_probes, "on")
+        self.assertEqual(args.cuda_graphs, "on")
+        self.assertEqual((args.max_prefill_graphs, args.max_decode_graphs),
+                         (0, 64))
+        self.assertEqual(args.build_root, G_RUNNER.DEFAULT_BUILD_ROOT)
+
+    def test_diagnostic_variants_still_require_explicit_selection(self):
+        args = G_RUNNER.parse_args([
+            "--variants", "static-base", "shared_ep", "--telemetry-level",
+            "full"
+        ])
+        self.assertEqual(args.variants, ["static-base", "shared_ep"])
+        self.assertEqual(args.telemetry_level, "full")
+
+    def test_frozen_default_build_provenance_checks_both_artifacts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            build = root / "bin"
+            binary = build / "examples/llm/llm_phase_context_smoke"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"runtime")
+            plugin = build / "libNvInfer_edgellm_plugin.so.1.0"
+            plugin.write_bytes(b"plugin")
+            manifest = {
+                "source_commit": "frozen-source",
+                "smoke_sha256": G_RUNNER.digest(binary),
+                "plugin_sha256": G_RUNNER.digest(plugin)
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(G_RUNNER.frozen_binary_source(build),
+                             "frozen-source")
+            plugin.write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError,
+                                        "Frozen build manifest mismatch"):
+                G_RUNNER.frozen_binary_source(build)
 
     def test_chunking_changes_only_after_common_calibration(self):
         lifetime = environment(self.command("lifetime"))
@@ -190,8 +231,8 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
                                             "exists",
                                             return_value=True):
                 config = G_RUNNER.model_config(self.repo, "gemma")
-        self.assertEqual(config["engine"].name,
-                         "engine-packed-p8-d24-kv2048-p192")
+        self.assertEqual(config["engine"],
+                         self.repo / ".local/current/gemma4/engine")
         self.assertEqual(config["vision"].parent.name, "visual-e4-soft280")
         self.assertEqual(config["vision_batch_size"], 4)
         self.assertEqual(config["calibration_requests"], 49)

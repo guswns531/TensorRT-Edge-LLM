@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compare static windows and lifetime admission after a common calibration procedure."""
+"""Run the retained V3 serving configuration or explicit admission ablations."""
 
 import argparse
 import hashlib
@@ -33,6 +33,7 @@ WORKLOADS = ("balanced", "mixed", "vision-heavy", "multi-image",
              "poisson", "wave-drain", "late-vision")
 WARMUP_DECODE_BATCHES = (1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48,
                          52, 56, 60, 64)
+DEFAULT_BUILD_ROOT = pathlib.Path(".local/current/active/runtime")
 
 
 def digest(path):
@@ -62,8 +63,8 @@ def model_config(repo, name, overrides=None):
             "engine":
             pathlib.Path(
                 os.environ.get("GEMMA_ENGINE_DIR",
-                               str(model /
-                                   "engine-packed-p8-d24-kv2048-p192"))),
+                               str(repo /
+                                   ".local/current/gemma4/engine"))).resolve(),
             "vision":
             pathlib.Path(
                 os.environ.get("GEMMA_VISION_DIR",
@@ -116,9 +117,7 @@ def model_config(repo, name, overrides=None):
     config = {
         "model":
         "nvidia/Cosmos-Reason2-2B",
-        "engine":
-        artifacts /
-        "v0101-forward-port/text/cosmos-reason2-2b/engine-p8-d64-kv256-p128-vp1024-atomic",
+        "engine": (repo / ".local/current/cosmos/engine-vp").resolve(),
         "vision":
         artifacts /
         "v0101-forward-port/cosmos-reason2-2b/vision-exact-gelu/engine/visual",
@@ -167,8 +166,7 @@ def command_for(repo,
     build = pathlib.Path(
         options.get(
             "build_root",
-            os.environ.get("BUILD_ROOT",
-                           str(repo / ".local/builds/v0101-validation"))))
+            os.environ.get("BUILD_ROOT", str(repo / DEFAULT_BUILD_ROOT))))
     mode = variant if variant in ("lifetime", "ownership") else "static"
     if variant in ("chunked", "e1", "e2", "e-dynamic-shadow",
                    "e-transition-shadow", "e-dynamic-active", "shared_ep",
@@ -279,7 +277,7 @@ def command_for(repo,
         "TRT_EDGELLM_EMIT_PHASE_METRICS":
         1,
         "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL":
-        options.get("telemetry_level", "full")
+        options.get("telemetry_level", "dispatch")
     }
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
         environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
@@ -436,8 +434,8 @@ def campaign_completion(manifest, finished=False):
     }
 
 
-def main():
-    """Run immutable paired cells and retain their exact source, engine and workload contract."""
+def parse_args(argv=None):
+    """Keep the serving default separate from explicitly selected diagnostic variants."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models",
                         nargs="+",
@@ -457,14 +455,14 @@ def main():
                  "ownership", "chunked", "e1", "e2", "e-dynamic-shadow",
                  "e-transition-shadow", "e-dynamic-active", "shared_ep",
                  "tiered_ep", "independent", "unified_action"),
-        default=["static-base", "static-large", "lifetime"])
+        default=["independent"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--full12", action="store_true")
     parser.add_argument("--build-root",
                         type=pathlib.Path,
                         default=pathlib.Path(
                             os.environ.get("BUILD_ROOT",
-                                           ".local/builds/v0101-validation")))
+                                           str(DEFAULT_BUILD_ROOT))))
     parser.add_argument(
         "--binary-source-commit",
         help="Build provenance for an explicitly frozen binary")
@@ -481,7 +479,7 @@ def main():
     parser.add_argument(
         "--telemetry-level",
         choices=("full", "dispatch"),
-        default="full",
+        default="dispatch",
         help="Full causal diagnostics or compact dispatch metrics")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--max-prefill-graphs", type=int, default=0)
@@ -494,18 +492,39 @@ def main():
                         choices=("0", "1"),
                         default="1")
     parser.add_argument("--byte-budget", type=int, default=0)
-    parser.add_argument(
-        "--result-root",
-        type=pathlib.Path,
-        default=pathlib.Path(
-            ".local/results/lifetime-encoded-admission-20260913"))
+    parser.add_argument("--result-root",
+                        type=pathlib.Path,
+                        default=pathlib.Path(".local/scratch/current-serving"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--compress-closed-logs", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.repeats < 1 or args.byte_budget < 0 or min(
             args.max_decode_graphs, args.max_prefill_graphs) < 0:
         parser.error(
             "Repeat count must be positive and byte budget non-negative")
+    return args
+
+
+def frozen_binary_source(build, explicit=None):
+    """Recover build provenance only when the retained executable and plugin hashes match."""
+    if explicit:
+        return explicit
+    manifest_path = build.parent / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    for key, path in (("smoke_sha256",
+                       build / "examples/llm/llm_phase_context_smoke"),
+                      ("plugin_sha256",
+                       build / "libNvInfer_edgellm_plugin.so.1.0")):
+        if manifest.get(key) != digest(path):
+            raise ValueError("Frozen build manifest mismatch: " + str(path))
+    return manifest["source_commit"]
+
+
+def main():
+    """Run immutable paired cells and retain their exact source, engine and workload contract."""
+    args = parse_args()
     repo = pathlib.Path(
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
                                 text=True).strip())
@@ -529,6 +548,7 @@ def main():
         }
         configs[model_name] = model_config(repo, model_name, overrides)
     build = args.build_root.resolve()
+    binary_source = frozen_binary_source(build, args.binary_source_commit)
     binary = build / "examples/llm/llm_phase_context_smoke"
     plugin = build / "libNvInfer_edgellm_plugin.so.1.0"
     identity = {
@@ -556,8 +576,8 @@ def main():
         "container":
         IMAGE,
         "binary_source_commit": (subprocess.check_output(
-            ["git", "rev-parse", args.binary_source_commit + "^{commit}"],
-            text=True).strip() if args.binary_source_commit else None),
+            ["git", "rev-parse", binary_source +
+             "^{commit}"], text=True).strip() if binary_source else None),
         "models": {}
     }
     for name, config in configs.items():

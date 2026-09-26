@@ -785,7 +785,6 @@ int32_t PhaseQueueScheduler::effectiveDecodeBurstLimit(PhaseQueueSnapshot const&
     ctx.decodeQueued = state.decodeQueued;
     ctx.prefillQueued = state.prefillQueued;
     ctx.decodeTokens = static_cast<int32_t>(state.decodeQueued);
-    ctx.prefillTokens = state.prefillCandidateTokens;
     ctx.prefillWaitUs = state.prefillOldestWaitUs;
     ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo ? state.prefillMinTtftSlackUs
                                                                  : std::numeric_limits<double>::infinity();
@@ -816,7 +815,6 @@ int32_t PhaseQueueScheduler::effectiveOverlapPrefillTokens(PhaseQueueSnapshot co
     ctx.decodeQueued = state.decodeQueued;
     ctx.prefillQueued = state.prefillQueued;
     ctx.decodeTokens = static_cast<int32_t>(state.decodeQueued);
-    ctx.prefillTokens = state.prefillCandidateTokens;
     ctx.prefillWaitUs = state.prefillOldestWaitUs;
     ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo ? state.prefillMinTtftSlackUs
                                                                  : std::numeric_limits<double>::infinity();
@@ -4601,12 +4599,6 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     mTelemetry.contextualPdLastMean = contextualTelemetry.lastMean;
     mTelemetry.contextualPdLastUncertainty = contextualTelemetry.lastUncertainty;
     mTelemetry.contextualPdLastLowerConfidenceBound = contextualTelemetry.lastLowerConfidenceBound;
-    if (mConfig.enableTransitionPredictor && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F)
-    {
-        // Queue residence is policy-dependent; it must not become an amortizable physical handoff cost.
-        mTransitionPredictor.observeDecodeQueueWait(
-            {metrics.decodeBatchSize, metrics.decodeContextTokens}, metrics.decodeQueueWaitUs);
-    }
     ++mTelemetry.sampleCount;
     mTelemetry.lastDispatch = metrics;
 }
@@ -4672,7 +4664,6 @@ void PhaseQueueScheduler::resetPolicyPosterior()
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Policy posterior can only be reset while the scheduler is idle");
     mRuntimeCostTracker->resetPolicyPosterior();
-    mTransitionPredictor.reset();
 }
 
 void PhaseQueueScheduler::resetExecutionCostHistory()
@@ -4688,7 +4679,6 @@ void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
     if (!preserveRuntimeCosts)
     {
         mRuntimeCostTracker->reset();
-        mTransitionPredictor.reset();
     }
 }
 

@@ -19,107 +19,39 @@
 
 #include <gtest/gtest.h>
 
-#include <cmath>
+#include <limits>
+#include <stdexcept>
 
 namespace trt_edgellm::rt
 {
 namespace
 {
 
-TEST(PhaseTransitionPredictorTest, InitialState)
-{
-    PhaseTransitionPredictor predictor;
-    auto const estimate = predictor.predictDecodeQueueWait({32, 32768});
-    EXPECT_FALSE(estimate.ready);
-    EXPECT_EQ(estimate.observations, 0U);
-    EXPECT_GE(estimate.meanUs, 0.0);
-}
-
-TEST(PhaseTransitionPredictorTest, NormalizesBatchRowsAndSummedKvContext)
-{
-    PhaseTransitionFeatures const expected{1.0, 0.5, 0.25};
-    EXPECT_EQ(phaseDecodeQueueFeatures({32, 16384}), expected);
-}
-
-TEST(PhaseTransitionPredictorTest, LearnsDecodeReadyQueueResidence)
+TEST(PhaseTransitionPredictorTest, RejectsInvalidBurstGracePeriod)
 {
     PhaseTransitionPredictorConfig config;
-    config.minimumObservations = 4U;
-    config.forgettingFactor = 0.99;
-    PhaseTransitionPredictor predictor(config);
-
-    PhaseDecodeQueueState const state{16, 32768};
-    constexpr double kTargetLatencyUs = 850.0;
-
-    for (size_t i{}; i < 30U; ++i)
-    {
-        EXPECT_TRUE(predictor.observeDecodeQueueWait(state, kTargetLatencyUs));
-    }
-
-    auto const estimate = predictor.predictDecodeQueueWait(state);
-    EXPECT_TRUE(estimate.ready);
-    EXPECT_EQ(estimate.observations, 30U);
-    EXPECT_NEAR(estimate.meanUs, kTargetLatencyUs, 50.0);
-    EXPECT_LT(estimate.uncertaintyUs, 200.0);
-    EXPECT_GE(estimate.upperConfidenceBoundUs, estimate.meanUs);
-
-    auto const& telemetry = predictor.telemetry();
-    EXPECT_EQ(telemetry.observations, 30U);
-    EXPECT_EQ(telemetry.rejectedObservations, 0U);
-    EXPECT_NEAR(telemetry.lastMeasuredUs, kTargetLatencyUs, 1e-3);
+    config.burstGracePeriodUs = -1.0;
+    EXPECT_THROW(PhaseTransitionPredictor{config}, std::runtime_error);
+    config.burstGracePeriodUs = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_THROW(PhaseTransitionPredictor{config}, std::runtime_error);
+    config.burstGracePeriodUs = std::numeric_limits<double>::infinity();
+    EXPECT_THROW(PhaseTransitionPredictor{config}, std::runtime_error);
+    config.burstGracePeriodUs = 0.0;
+    EXPECT_NO_THROW(PhaseTransitionPredictor{config});
 }
 
-TEST(PhaseTransitionPredictorTest, AcceptsZeroResidenceAndRejectsInvalidSamples)
-{
-    PhaseTransitionPredictor predictor;
-    PhaseDecodeQueueState const state{4, 2048};
-    EXPECT_TRUE(predictor.observeDecodeQueueWait(state, 0.0));
-    EXPECT_FALSE(predictor.observeDecodeQueueWait({0, 0}, 100.0));
-    EXPECT_FALSE(predictor.observeDecodeQueueWait({4, -1}, 100.0));
-    EXPECT_FALSE(predictor.observeDecodeQueueWait(state, -1.0));
-    EXPECT_FALSE(predictor.observeDecodeQueueWait(state, std::numeric_limits<double>::quiet_NaN()));
-    EXPECT_FALSE(predictor.observeDecodeQueueWait(state, std::numeric_limits<double>::infinity()));
-    EXPECT_EQ(predictor.telemetry().observations, 1U);
-    EXPECT_EQ(predictor.telemetry().rejectedObservations, 5U);
-    EXPECT_DOUBLE_EQ(predictor.predictDecodeQueueWait(state).meanUs, 0.0);
-    EXPECT_FALSE(predictor.predictDecodeQueueWait({0, 0}).ready);
-}
-
-TEST(PhaseTransitionPredictorTest, UncertaintyDecreasesWithObservations)
-{
-    PhaseTransitionPredictorConfig config;
-    config.initialResidualVariance = 2000.0 * 2000.0;
-    PhaseTransitionPredictor predictor(config);
-    PhaseDecodeQueueState const state{8, 8192};
-
-    auto const initial = predictor.predictDecodeQueueWait(state);
-
-    for (size_t i{}; i < 20U; ++i)
-    {
-        predictor.observeDecodeQueueWait(state, 1500.0);
-    }
-
-    auto const updated = predictor.predictDecodeQueueWait(state);
-    EXPECT_LT(updated.uncertaintyUs, initial.uncertaintyUs);
-}
-
-TEST(PhaseTransitionPredictorTest, ShadowQueueLearningCannotChangeBurstOrOverlap)
+TEST(PhaseTransitionPredictorTest, HandlesEmptyAndSmallDecodeQueues)
 {
     PhaseTransitionPredictor predictor;
     PhaseOptimizationContext ctx{};
-    ctx.decodeQueued = 16U;
-    ctx.prefillQueued = 8U;
-    ctx.prefillWaitUs = 22000.0;
-    ctx.predictedDecodeStepUs = 1000.0;
-    ctx.predictedPrefillStepUs = 3000.0;
-    size_t const burst = predictor.recommendedDecodeBurst(ctx);
-    int32_t const overlap = predictor.recommendedOverlapPrefillTokens(ctx);
-    for (size_t index{}; index < 40U; ++index)
-    {
-        ASSERT_TRUE(predictor.observeDecodeQueueWait({16, 16384}, 1000000.0));
-    }
-    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), burst);
-    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(ctx), overlap);
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 0U);
+    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(ctx), 256);
+    ctx.decodeQueued = 1U;
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 16U);
+    ctx.prefillQueued = 1U;
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 2U);
+    ctx.decodeQueued = 2U;
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 2U);
 }
 
 TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderBalancedWorkload)
@@ -138,7 +70,6 @@ TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderBalancedWorkload)
 
     // Fresh prefill arrival (wait time = 0) -> burst remains high (>= 8) to amortize phase transition
     ctx.prefillQueued = 1U;
-    ctx.prefillTokens = 128;
     ctx.prefillWaitUs = 0.0;
     ctx.predictedPrefillStepUs = 2000.0;
 

@@ -4380,30 +4380,30 @@ int main(int argc, char** argv)
                                 {"dispatch_host_ns", work.dispatchHostNs}, {"dispatch_age_us", work.dispatchAgeUs},
                                 {"request_ids", work.requestIds}, {"cohort", workJson(work.work)}});
                         }
+                        auto protectedCompletions = [](auto const& completions) {
+                            nlohmann::json result = nlohmann::json::array();
+                            for (rt::PhaseProtectedCompletion const& completion : completions)
+                            {
+                                result.push_back({{"kind", rt::phaseProtectedKindName(completion.kind)},
+                                    {"request_id", completion.requestId}, {"slack_us", completion.slackUs},
+                                    {"predicted_completion_us", completion.predictedCompletionUs},
+                                    {"uncertainty_us", completion.uncertaintyUs},
+                                    {"reference_us", completion.referenceUs},
+                                    {"elapsed_service_us", completion.elapsedServiceUs},
+                                    {"has_explicit_slo", completion.hasExplicitSlo},
+                                    {"absolute_slack_us",
+                                        std::isfinite(completion.absoluteSlackUs)
+                                            ? nlohmann::json(completion.absoluteSlackUs)
+                                            : nlohmann::json(nullptr)},
+                                    {"service_epoch", completion.serviceEpoch},
+                                    {"reference_source",
+                                        rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
+                            }
+                            return result;
+                        };
                         nlohmann::json candidates = nlohmann::json::array();
                         for (rt::PhaseUnifiedCandidateSnapshot const& candidate : event.candidates)
                         {
-                            auto protectedCompletions = [](auto const& completions) {
-                                nlohmann::json result = nlohmann::json::array();
-                                for (rt::PhaseProtectedCompletion const& completion : completions)
-                                {
-                                    result.push_back({{"kind", rt::phaseProtectedKindName(completion.kind)},
-                                        {"request_id", completion.requestId}, {"slack_us", completion.slackUs},
-                                        {"predicted_completion_us", completion.predictedCompletionUs},
-                                        {"uncertainty_us", completion.uncertaintyUs},
-                                        {"reference_us", completion.referenceUs},
-                                        {"elapsed_service_us", completion.elapsedServiceUs},
-                                        {"has_explicit_slo", completion.hasExplicitSlo},
-                                        {"absolute_slack_us",
-                                            std::isfinite(completion.absoluteSlackUs)
-                                                ? nlohmann::json(completion.absoluteSlackUs)
-                                                : nlohmann::json(nullptr)},
-                                        {"service_epoch", completion.serviceEpoch},
-                                        {"reference_source",
-                                            rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
-                                }
-                                return result;
-                            };
                             candidates.push_back({{"action_id", candidate.actionId},
                                 {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
                                 {"primary_batch_size", candidate.key.primaryBatchSize},
@@ -4432,27 +4432,6 @@ int main(int argc, char** argv)
                         nlohmann::json mechanismCandidates = nlohmann::json::array();
                         for (rt::PhaseUnifiedCandidateSnapshot const& candidate : event.mechanismCandidates)
                         {
-                            auto protectedCompletions = [](auto const& completions) {
-                                nlohmann::json result = nlohmann::json::array();
-                                for (rt::PhaseProtectedCompletion const& completion : completions)
-                                {
-                                    result.push_back({{"kind", rt::phaseProtectedKindName(completion.kind)},
-                                        {"request_id", completion.requestId}, {"slack_us", completion.slackUs},
-                                        {"predicted_completion_us", completion.predictedCompletionUs},
-                                        {"uncertainty_us", completion.uncertaintyUs},
-                                        {"reference_us", completion.referenceUs},
-                                        {"elapsed_service_us", completion.elapsedServiceUs},
-                                        {"has_explicit_slo", completion.hasExplicitSlo},
-                                        {"absolute_slack_us",
-                                            std::isfinite(completion.absoluteSlackUs)
-                                                ? nlohmann::json(completion.absoluteSlackUs)
-                                                : nlohmann::json(nullptr)},
-                                        {"service_epoch", completion.serviceEpoch},
-                                        {"reference_source",
-                                            rt::phaseServiceReferenceSourceName(completion.referenceSource)}});
-                                }
-                                return result;
-                            };
                             mechanismCandidates.push_back({{"action_id", candidate.actionId},
                                 {"action_kind", rt::phaseGlobalActionKindName(candidate.key.kind)},
                                 {"primary_batch_size", candidate.key.primaryBatchSize},

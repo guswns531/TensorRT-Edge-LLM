@@ -55,6 +55,13 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
   when that contract is unchanged; rerun vLLM when it changes.
 - Container writes to `.local/` must use the host UID/GID whenever possible. Never commit models, engines, tokens,
   or `.local/` data.
+- Local serving-benchmark defaults: V3, independent E/P/D, serving probes on, dispatch telemetry; use
+  `benchmarks/phase_serving/run_lifetime_encoded_admission.py`. Model engines live behind
+  `.local/current/<model-family>/`; `.local/current/active/runtime` selects the immutable serving binary,
+  not the mutable CMake build. Record promotion evidence in `.local/registry/current.json` and notes.
+  Full telemetry and V0/V1/V2 remain explicit diagnostics/ablations. These local Gemma/Cosmos capacities are
+  not portable model/GPU defaults. Fixed-output benchmarks ignore EOS; production need not. Throughput
+  promotion does not waive unresolved output-quality gates.
 
 ## Common Commands
 

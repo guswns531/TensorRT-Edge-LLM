@@ -5117,7 +5117,6 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     }
     bool const batchFull = batchSize == preparationLimit || onlinePreparationApplied;
     bool const mediaFull = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
-    bool const multiMediaReady = mConfig.maxEncoderMediaItems > 0 && mediaItems >= mConfig.maxEncoderMediaItems;
     bool const inputFull = mConfig.maxEncoderInputBytes > 0 && inputBytes >= mConfig.maxEncoderInputBytes;
     bool const tokenFull = mConfig.maxEncoderInputTokens > 0 && inputTokens >= mConfig.maxEncoderInputTokens;
     bool const resourceLimited = batchSize < inputs.size();
@@ -5125,15 +5124,14 @@ std::vector<size_t> PhaseThreeCoordinator::nextEncoderBatchIndices()
     double const waitLimitUs = (mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0)
         ? std::min(mConfig.encoderBatchWaitUs, mVisionInterarrivalEwmaUs)
         : mConfig.encoderBatchWaitUs;
-    if (!globalActive && !batchFull && !mediaFull && !multiMediaReady && !inputFull && !tokenFull && !resourceLimited
-        && !capacityFull && oldestWaitUs < waitLimitUs)
+    if (!globalActive && !batchFull && !mediaFull && !inputFull && !tokenFull && !resourceLimited && !capacityFull
+        && oldestWaitUs < waitLimitUs)
     {
         return {};
     }
-    if (globalActive && mConfig.encoderBatchWaitUs > 0.0 && !batchFull && !mediaFull && !multiMediaReady && !inputFull
-        && !tokenFull && !resourceLimited && !capacityFull && batchSize == inputs.size()
-        && mVisionInterarrivalSamples > 0U && mVisionInterarrivalEwmaUs > 0.0
-        && mLastVisionArrival != std::chrono::steady_clock::time_point{})
+    if (globalActive && mConfig.encoderBatchWaitUs > 0.0 && !batchFull && !mediaFull && !inputFull && !tokenFull
+        && !resourceLimited && !capacityFull && batchSize == inputs.size() && mVisionInterarrivalSamples > 0U
+        && mVisionInterarrivalEwmaUs > 0.0 && mLastVisionArrival != std::chrono::steady_clock::time_point{})
     {
         double const sinceArrivalUs
             = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mLastVisionArrival).count();
