@@ -32,5 +32,11 @@ constexpr bool isPackedPrefillInvocation(
     return enabled && physicalBatchSize == 1 && (sequenceLength > 1 || (sequenceLength == 1 && profileChunkLimit > 1));
 }
 
+//! Packed P uses [1, totalTokens], while D uses [batch, 1]; scratch must cover both physical carriers.
+constexpr int64_t packedAttentionScratchTokens(int64_t physicalBatchSize, int64_t sequenceLength) noexcept
+{
+    return physicalBatchSize * sequenceLength;
+}
+
 } // namespace plugins
 } // namespace trt_edgellm

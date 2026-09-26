@@ -49,3 +49,26 @@ TEST(PackedPrefillContractTest, RequiresPackedEngineAndNonemptySinglePhysicalRow
     EXPECT_FALSE(plugins::isPackedPrefillInvocation(true, 8, 128, 128));
     EXPECT_FALSE(plugins::isPackedPrefillInvocation(true, 1, 0, 128));
 }
+
+TEST(PackedAttentionWorkspaceTest, KeepsPackedPrefillCarrierCompact)
+{
+    EXPECT_EQ(plugins::packedAttentionScratchTokens(1, 8 * 128), 8 * 128);
+    EXPECT_EQ(plugins::packedAttentionScratchTokens(1, 4 * 1024), 4 * 1024);
+    EXPECT_EQ(plugins::packedAttentionScratchTokens(1, 1), 1);
+}
+
+TEST(PackedAttentionWorkspaceTest, IncludesEveryPhysicalDecodeRow)
+{
+    EXPECT_EQ(plugins::packedAttentionScratchTokens(24, 1), 24);
+    EXPECT_EQ(plugins::packedAttentionScratchTokens(64, 1), 64);
+    EXPECT_EQ(plugins::packedAttentionScratchTokens(1, 1), 1);
+}
+
+TEST(PackedAttentionWorkspaceTest, CoversGemmaAndCosmosDecodeQueryScratch)
+{
+    int64_t const gemmaTokens = plugins::packedAttentionScratchTokens(24, 1);
+    int64_t const cosmosTokens = plugins::packedAttentionScratchTokens(64, 1);
+    EXPECT_EQ(gemmaTokens * 8 * 256 * sizeof(uint16_t), 98304U);
+    EXPECT_EQ(gemmaTokens * 8 * 512 * sizeof(uint16_t), 196608U);
+    EXPECT_EQ(cosmosTokens * 16 * 128 * sizeof(uint16_t), 262144U);
+}

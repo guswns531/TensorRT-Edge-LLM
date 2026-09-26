@@ -356,9 +356,9 @@ std::vector<uint8_t> parsePluginBytesField(char const* fieldName, PluginFieldCol
 //     vision-block attention respectively).
 //
 // Total allocation is the sum of all conditional slots (safe upper bound).
-size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCacheCapacity, int32_t numQHeads,
-    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache, bool enableVisionBlockAttention,
-    bool enablePackedPrefill)
+size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t physicalBatchSize, int64_t seqLen, int64_t kvCacheCapacity,
+    int32_t numQHeads, int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache,
+    bool enableVisionBlockAttention, bool enablePackedPrefill)
 {
     size_t workspaceSize = 0;
 
@@ -372,12 +372,13 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
 
     // Packed FP16 prefill and XQA decode do not consume the dense split-K/V carrier below.
-    // The compact packed carrier has physical batch one and requires only Q/output boundary scratch.
+    // P has one packed physical row; D retains its physical batch dimension.
     if (enablePackedPrefill)
     {
+        int64_t const scratchTokens = packedAttentionScratchTokens(physicalBatchSize, seqLen);
         workspaceSize
-            = accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
-        return accumulateWorkspaceSize(workspaceSize, rt::Coords{1, seqLen, numQHeads, headSize}, DataType::kHALF);
+            = accumulateWorkspaceSize(workspaceSize, rt::Coords{scratchTokens, numQHeads, headSize}, DataType::kHALF);
+        return accumulateWorkspaceSize(workspaceSize, rt::Coords{scratchTokens, numQHeads, headSize}, DataType::kHALF);
     }
 
     workspaceSize = accumulateWorkspaceSize(
@@ -1264,13 +1265,15 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     // Packed QKV: max batch/seq derived from packed input's first two dims (same as Q).
     int64_t const maxBatchSize
         = mEnablePackedPrefill ? inputs[kIN_CONTEXT_LENGTH_IDX].max.d[0] : inputs[kIN_QKV_IDX].max.d[0];
+    int64_t const maxPhysicalBatchSize = inputs[kIN_QKV_IDX].max.d[0];
     int64_t const maxSeqLen = inputs[kIN_QKV_IDX].max.d[1];
     // KV binding is the paged pool [2, numPages, 128, Hkv, D]; the per-slot padded capacity is the
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
-    size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
-        mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
-        mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0);
+    size_t const workspaceSize
+        = getAttentionWorkspaceSize(maxBatchSize, maxPhysicalBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
+            mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL,
+            mEnableFp8KVCache, mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0);
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
     return workspaceSize;
