@@ -2580,6 +2580,37 @@ TEST(PhaseQueueSchedulerTest, ServiceEpochResetsAcrossDecodeCommitCancelAndReque
     EXPECT_GT(scheduler.queueSnapshot().decodeService.reference.epoch, committedEpoch);
 }
 
+TEST(PhaseQueueSchedulerTest, CancellationCannotRetireInflightOrSamplingOwnedDecode)
+{
+    PhaseQueueScheduler scheduler;
+    scheduler.enqueueDecode({7, 128});
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.decodeBatch.size(), 1U);
+    EXPECT_FALSE(scheduler.cancel(7U));
+
+    // The async server transfers ownership to a sampling ticket on finished=true.
+    scheduler.completeDecode(plan.decodeBatch.front(), 129, true);
+    EXPECT_FALSE(scheduler.cancel(7U));
+    EXPECT_TRUE(scheduler.empty());
+}
+
+TEST(PhaseQueueSchedulerTest, CancellationStopsContinuationOnlyAfterPrefillCompletes)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxPrefillChunkTokens = 128;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({7, 257});
+    PhaseDispatchPlan const plan = scheduler.next();
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    ASSERT_EQ(plan.prefillBatch.front().tokenCount, 128);
+    EXPECT_FALSE(scheduler.cancel(7U));
+
+    scheduler.completePrefill(plan.prefillBatch.front(), 128, false);
+    EXPECT_TRUE(scheduler.cancel(7U));
+    EXPECT_TRUE(scheduler.empty());
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+}
+
 TEST(PhaseQueueSchedulerTest, PagePressurePrefersDecodeWithoutOverridingAnExpiredPrefill)
 {
     PhaseQueueSchedulerConfig config;

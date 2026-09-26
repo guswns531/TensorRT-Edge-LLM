@@ -630,6 +630,7 @@ public:
 
     PhaseThreeSubmissionStatus submit(uint64_t requestId, LLMGenerationRequest request, int32_t maxOutputTokens,
         PhaseSchedulingHints scheduling = {});
+    //! Accept cancellation without reclaiming storage still used by GPU or sampling work.
     bool cancel(uint64_t requestId);
     bool poll();
     bool empty() const noexcept;
@@ -736,6 +737,8 @@ private:
     void refreshEncoderSerializationGate() noexcept;
     void eraseTpotTarget(uint64_t requestId);
     void observeServerCompletion(uint64_t requestId);
+    void trackServerCancellation(uint64_t requestId);
+    bool retireServerCancellations();
     PhaseInFlightSnapshot unifiedInFlightSnapshot(uint64_t hostSnapshotNs = 0U, bool includeRequestIds = true) const;
     void recordUnifiedDecision(PhaseGlobalActionCandidate const& candidate, PhaseGlobalDispatchPlan const& plan,
         std::vector<PhaseGlobalActionCandidate> const* candidateFrontier = nullptr,
@@ -770,6 +773,7 @@ private:
     std::multiset<double> mTpotTargets;
     std::unordered_map<uint64_t, size_t> mDownstreamRequestBytes;
     std::unordered_set<uint64_t> mCancelRequested;
+    std::unordered_set<uint64_t> mDeferredServerCancellations;
     std::optional<std::vector<size_t>> mGlobalEncoderBatchIndices;
     std::optional<PhaseGlobalActionKey> mInFlightGlobalEncoderKey;
     double mInFlightGlobalEncoderReferenceMs{};

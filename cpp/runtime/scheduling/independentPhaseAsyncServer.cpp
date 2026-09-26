@@ -724,17 +724,64 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
         mPendingRequests.erase(pending);
         return true;
     }
+    mCancellationRequests.insert(requestId);
+    mTokenEvents.erase(
+        std::remove_if(mTokenEvents.begin(), mTokenEvents.end(),
+            [requestId](IndependentPhaseServerToken const& token) { return token.requestId == requestId; }),
+        mTokenEvents.end());
+    static_cast<void>(tryCancelReadyRequest(requestId));
+    return true;
+}
+
+bool IndependentPhaseAsyncServer::tryCancelReadyRequest(uint64_t requestId)
+{
+    auto const it = mRequests.find(requestId);
+    ELLM_CHECK(it != mRequests.end(), "Cancellation refers to an unknown active request");
+    // A finished scheduler row can still own logits/host staging through its sampling ticket.
+    for (auto const& ticket : mSamplingTickets)
+    {
+        if (std::find(ticket->requestIds.begin(), ticket->requestIds.end(), requestId) != ticket->requestIds.end())
+        {
+            return false;
+        }
+    }
     if (mPendingDecodeRequestIds.erase(requestId) > 0)
     {
         auto const waiting = std::find(mPendingDecodeRequests.begin(), mPendingDecodeRequests.end(), requestId);
         ELLM_CHECK(waiting != mPendingDecodeRequests.end(), "Pending decode request index is inconsistent");
         mPendingDecodeRequests.erase(waiting);
     }
-    else if (!mCoordinator.scheduler().cancel(requestId))
+    else if (!(it->second.awaitingVisionPayload && it->second.visionPrefixComplete)
+        && !mCoordinator.scheduler().cancel(requestId))
     {
         return false;
     }
+    releaseCancelledRequest(requestId);
+    return true;
+}
+
+bool IndependentPhaseAsyncServer::cancellationPending(uint64_t requestId) const noexcept
+{
+    return mCancellationRequests.find(requestId) != mCancellationRequests.end();
+}
+
+bool IndependentPhaseAsyncServer::retireCancelledRequests()
+{
+    bool retired{};
+    for (auto it = mCancellationRequests.begin(); it != mCancellationRequests.end();)
+    {
+        uint64_t const requestId = *it++;
+        retired = tryCancelReadyRequest(requestId) || retired;
+    }
+    return retired;
+}
+
+void IndependentPhaseAsyncServer::releaseCancelledRequest(uint64_t requestId)
+{
+    auto const it = mRequests.find(requestId);
+    ELLM_CHECK(it != mRequests.end(), "Cancelled request is missing");
     mOwnership.release(it->second.kvSlotId);
+    recordTimeline(requestId, PhaseTimelineStage::kSlotReleased, it->second.kvSlotId);
     auto const promptLength = mActivePromptTokens.find(static_cast<int32_t>(it->second.promptTokens.size()));
     ELLM_CHECK(promptLength != mActivePromptTokens.end(), "Active prompt-length index is inconsistent");
     mActivePromptTokens.erase(promptLength);
@@ -742,11 +789,11 @@ bool IndependentPhaseAsyncServer::cancel(uint64_t requestId)
     ELLM_CHECK(outputLength != mActiveOutputTokens.end(), "Active output-length index is inconsistent");
     mActiveOutputTokens.erase(outputLength);
     mRequests.erase(it);
+    mCancellationRequests.erase(requestId);
     if (mConfig.pageReservationMode == IndependentPhasePageReservationMode::kHeadroom)
     {
         refreshPageGrowthOwners();
     }
-    return true;
 }
 
 bool IndependentPhaseAsyncServer::capturePreparedGraphs()
@@ -811,6 +858,8 @@ bool IndependentPhaseAsyncServer::pollCompletions()
     bool progressed = admitPendingRequests();
     progressed = resumePendingDecodeRequests() || progressed;
     progressed = mCoordinator.poll() || progressed;
+    // Partial prefill continuations are queued by completion, before any new dispatch.
+    progressed = retireCancelledRequests() || progressed;
     progressed = activateReadyVisionSuffixes() || progressed;
     progressed = processSamplingTickets() || progressed;
     progressed = resumePendingDecodeRequests() || progressed;
@@ -2402,6 +2451,12 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         auto it = mRequests.find(requestId);
         if (it == mRequests.end())
         {
+            continue;
+        }
+        if (mCancellationRequests.find(requestId) != mCancellationRequests.end())
+        {
+            // The ticket's ready event and collect() have completed; no next decode is enqueued.
+            releaseCancelledRequest(requestId);
             continue;
         }
         RequestState& state = it->second;

@@ -1218,8 +1218,7 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         }
         mPending.erase(pending);
         mEncoderServiceEpochs.erase(requestId);
-        mRequestIds.erase(requestId);
-        eraseTpotTarget(requestId);
+        trackServerCancellation(requestId);
         return true;
     }
     auto const encoding = std::find_if(mEncoding.begin(), mEncoding.end(),
@@ -1233,26 +1232,22 @@ bool PhaseThreeCoordinator::cancel(uint64_t requestId)
         [&](ReadyPrefillRequest const& request) { return request.requestId == requestId; });
     if (ready != mReadyPrefill.end())
     {
+        if (ready->prefixSubmitted)
+        {
+            ELLM_CHECK(mServer.cancel(requestId), "Ready vision prefix could not be cancelled");
+        }
         ELLM_CHECK(ready->promptTokens.size() <= mReadyPrefillTokens, "Ready prefill token accounting underflow");
         mReadyPrefillTokens -= ready->promptTokens.size();
         ELLM_CHECK(ready->payloadBytes <= mReadyPrefillBytes, "Ready prefill byte accounting underflow");
         mReadyPrefillBytes -= ready->payloadBytes;
         mReadyPrefill.erase(ready);
-        mDownstreamRequestBytes.erase(requestId);
-        mRequestIds.erase(requestId);
-        eraseTpotTarget(requestId);
+        trackServerCancellation(requestId);
         return true;
     }
     bool const cancelled = mServer.cancel(requestId);
     if (cancelled)
     {
-        mRequestIds.erase(requestId);
-        eraseTpotTarget(requestId);
-        auto const downstream = mDownstreamRequestBytes.find(requestId);
-        if (downstream != mDownstreamRequestBytes.end())
-        {
-            mDownstreamRequestBytes.erase(downstream);
-        }
+        trackServerCancellation(requestId);
     }
     return cancelled;
 }
@@ -1320,7 +1315,7 @@ bool PhaseThreeCoordinator::poll()
         && mDownstreamRequestBytes.empty() && !mVision.busy() && !encoderPreparationActive()
         && mPreparedEncoder == nullptr && !mGlobalExecutionLease.has_value()
         && !mPendingGlobalOverlapObservation.has_value() && !phasePolicyUsesTransition(mConfig.policyMode)
-        && !mUnifiedEventCallback && !mFormationEpisodeCallback;
+        && !mUnifiedEventCallback && !mFormationEpisodeCallback && mDeferredServerCancellations.empty();
     if (pdOnlyFastPath)
     {
         // Project an E-empty global state directly onto the common P/D actor.
@@ -1369,6 +1364,7 @@ bool PhaseThreeCoordinator::poll()
     mServer.setExternalPendingRequests(
         upstreamRequests + mReadyPrefill.size(), minTpotTargetUs, mRequestIds.size(), mAdmissionProfilePrefillTokens);
     progressed = (globalScheduling ? mServer.pollCompletions() : mServer.poll()) || progressed;
+    progressed = retireServerCancellations() || progressed;
     refreshGlobalExecutionLease();
     refreshEffectiveEncodedCapacity();
     if (mEncoderSerializationYieldPending)
@@ -1797,6 +1793,35 @@ void PhaseThreeCoordinator::observeServerCompletion(uint64_t requestId)
     mRequestIds.erase(requestId);
     eraseTpotTarget(requestId);
     mDownstreamRequestBytes.erase(requestId);
+}
+
+void PhaseThreeCoordinator::trackServerCancellation(uint64_t requestId)
+{
+    if (mServer.cancellationPending(requestId))
+    {
+        mDeferredServerCancellations.insert(requestId);
+    }
+    else
+    {
+        observeServerCompletion(requestId);
+    }
+}
+
+bool PhaseThreeCoordinator::retireServerCancellations()
+{
+    bool retired{};
+    for (auto it = mDeferredServerCancellations.begin(); it != mDeferredServerCancellations.end();)
+    {
+        if (mServer.cancellationPending(*it))
+        {
+            ++it;
+            continue;
+        }
+        observeServerCompletion(*it);
+        it = mDeferredServerCancellations.erase(it);
+        retired = true;
+    }
+    return retired;
 }
 
 void PhaseThreeCoordinator::emitUnifiedEvent(PhaseUnifiedEvent event)
@@ -4408,8 +4433,7 @@ bool PhaseThreeCoordinator::completeEncoder()
                     {
                         ELLM_CHECK(mServer.cancel(requestId), "Cancelled encoder prefix could not be released");
                     }
-                    mRequestIds.erase(requestId);
-                    eraseTpotTarget(requestId);
+                    trackServerCancellation(requestId);
                     continue;
                 }
                 ELLM_CHECK(encoded != nullptr && encoded->tokenIds.size() == 1U && !encoded->tokenIds.front().empty(),
@@ -4534,8 +4558,7 @@ bool PhaseThreeCoordinator::completeEncoder()
             {
                 ELLM_CHECK(mServer.cancel(requestId), "Cancelled encoder prefix could not be released");
             }
-            mRequestIds.erase(requestId);
-            eraseTpotTarget(requestId);
+            trackServerCancellation(requestId);
             continue;
         }
         ELLM_CHECK(encoded->tokenIds.size() == 1U && !encoded->tokenIds.front().empty(),

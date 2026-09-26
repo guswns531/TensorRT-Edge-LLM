@@ -156,6 +156,7 @@ public:
         int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
     PhaseThreeSubmissionStatus submitVision(uint64_t requestId, LLMGenerationRequest request,
         int32_t maxOutputTokens = 0, PhaseSchedulingHints scheduling = {});
+    //! Accept cancellation; ownership is reclaimed after outstanding GPU/sampling consumers finish.
     bool cancel(uint64_t requestId);
     bool poll();
     void runUntilIdle(size_t maxPolls);

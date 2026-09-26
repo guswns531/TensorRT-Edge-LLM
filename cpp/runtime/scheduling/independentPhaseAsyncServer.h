@@ -380,7 +380,11 @@ public:
     IndependentPhaseServerSubmission submitOrQueueWithVision(uint64_t requestId, std::vector<int32_t> promptTokens,
         std::shared_ptr<PhaseVisionPayload> visionPayload, int32_t maxOutputTokens = 0,
         PhaseSchedulingHints scheduling = {});
+    //! Accept cancellation of a known request. True does not imply immediate reclamation:
+    //! GPU and sampling consumers retain ownership until their completion boundary.
     bool cancel(uint64_t requestId);
+    //! Whether an accepted cancellation still owns GPU/sampling resources.
+    bool cancellationPending(uint64_t requestId) const noexcept;
     //! Capture the currently prepared phase shapes for later execute() replay.
     bool capturePreparedGraphs();
     //! Deliver ready events directly after the next GPU dispatch is enqueued.
@@ -564,6 +568,9 @@ private:
     size_t costLimitedAdmissionLimit() const noexcept;
     void updateAdaptiveAdmissionMode() noexcept;
     bool processSamplingTickets();
+    bool retireCancelledRequests();
+    bool tryCancelReadyRequest(uint64_t requestId);
+    void releaseCancelledRequest(uint64_t requestId);
     void completeSamplingTicket(std::unique_ptr<IndependentPhaseSampleTicket> ticket);
     std::unique_ptr<IndependentPhaseSampleTicket> submitSamplingWithActivity(
         std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream, bool fromPrefill);
@@ -588,6 +595,7 @@ private:
     std::unordered_set<uint64_t> mPendingRequestIds;
     std::deque<uint64_t> mPendingDecodeRequests;
     std::unordered_set<uint64_t> mPendingDecodeRequestIds;
+    std::unordered_set<uint64_t> mCancellationRequests;
     std::unordered_set<uint64_t> mPageGrowthRequestIds;
     std::deque<std::unique_ptr<IndependentPhaseSampleTicket>> mSamplingTickets;
     std::deque<double> mSamplingLatencyUs;

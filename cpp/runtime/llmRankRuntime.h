@@ -145,6 +145,7 @@ public:
         int32_t maxOutputTokens, PhaseSchedulingHints scheduling = {});
     PhaseThreeSubmissionStatus submitPhaseVisionRequest(uint64_t requestId, LLMGenerationRequest request,
         int32_t maxOutputTokens, PhaseSchedulingHints scheduling = {});
+    //! True acknowledges cancellation, not immediate GPU/KV reclamation; keep polling to drain consumers.
     bool cancelPhaseRequest(uint64_t requestId);
     bool pollPhaseServing();
     std::optional<IndependentPhaseServerToken> tryPopPhaseToken();
