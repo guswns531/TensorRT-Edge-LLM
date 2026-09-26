@@ -141,7 +141,7 @@ def compare_runs(runs, baseline):
     return result
 
 
-def collect_campaign(root, baselines):
+def collect_campaign(root, baselines, require_completed=False):
     """Load raw cell aggregates, preserving each artifact's identity and incomplete coverage."""
     groups = {}
     manifest_path = root / "manifest.json"
@@ -157,21 +157,20 @@ def collect_campaign(root, baselines):
         record_key(record)
         for record in manifest.get("completed", [])
     }
-    failed = {record_key(record)
-              for record in manifest.get("failures", [])} - completed
+    failed = {record_key(record) for record in manifest.get("failures", [])}
+    if not require_completed:
+        failed -= completed
     expected = len(requested)
     accepted = set()
     excluded = []
     for path in sorted(root.glob("*/*/repeat-*/*/aggregate.json")):
         model, variant, repeat, workload = path.relative_to(root).parts[:4]
         cell_key = (model, variant, int(repeat.split("-", 1)[1]), workload)
-        if cell_key in failed or (requested and cell_key not in requested):
-            excluded.append({
-                "path":
-                str(path),
-                "reason":
-                "failed_cell" if cell_key in failed else "not_requested"
-            })
+        reason = ("failed_cell" if cell_key in failed else "not_requested" if
+                  requested and cell_key not in requested else "not_completed"
+                  if require_completed and cell_key not in completed else None)
+        if reason:
+            excluded.append({"path": str(path), "reason": reason})
             continue
         data = json.loads(path.read_text())
         if (data.get("requested_output_tokens_per_run", 0) <= 0
@@ -215,6 +214,198 @@ def collect_campaign(root, baselines):
         "missing_cells": len(requested - accepted) if expected else None,
         "excluded_aggregates": excluded,
         "rows": rows,
+    }
+
+
+def merged_cell_contract(root, manifest, record):
+    """Validate recorded identities; only the cell's output destination may differ."""
+    identity = manifest["identity"]
+    global_fields = ("binary_source_commit", "binary_sha256", "plugin_sha256",
+                     "container", "runner_sha256", "replay_tools_sha256")
+    for field in global_fields:
+        if not identity.get(field):
+            raise ValueError("Missing runtime identity: " + field)
+    model = identity["models"][record["model"]]
+    for field in ("engine_sha256", "config_sha256", "vision_sha256",
+                  "vision_config_sha256", "engine_sidecars_sha256",
+                  "calibration_sha256", "effective_model_config",
+                  "engine_builder_config", "vision_builder_config"):
+        if not model.get(field):
+            raise ValueError("Missing model identity: " + field)
+    trace_hash = model["traces"][record["workload"]]
+    if not trace_hash:
+        raise ValueError("Missing workload hash")
+    cell = (root / record["model"] / record["variant"] /
+            ("repeat-%03d" % int(record["repeat"])) / record["workload"])
+    if pathlib.Path(record["cell"]).resolve() != cell.resolve():
+        raise ValueError("Cell path does not match its source campaign: " +
+                         str(cell))
+    command = list(record["command"])
+    output_index = command.index("--output-dir") + 1
+    if command[output_index] != record["cell"]:
+        raise ValueError("Command output directory differs from cell")
+    command[output_index] = "<CELL_OUTPUT>"
+    output_mount = record["cell"] + ":/opt/results:rw"
+    command = [
+        "<CELL_OUTPUT>:/opt/results:rw" if token == output_mount else token
+        for token in command
+    ]
+    environment = {}
+    for index, token in enumerate(command[:-1]):
+        if token == "-e":
+            name, value = command[index + 1].split("=", 1)
+            if name in environment:
+                raise ValueError("Duplicate command environment variable: " +
+                                 name)
+            environment[name] = value
+    if environment != record["effective_environment"]:
+        raise ValueError("Recorded environment differs from command")
+    return {
+        "runtime": {
+            field: identity[field]
+            for field in global_fields
+        },
+        "model": {
+            key: value
+            for key, value in model.items() if key != "traces"
+        },
+        "trace_sha256": trace_hash,
+        "command": command,
+        "effective_environment": environment,
+        "activation": manifest.get("activation"),
+        "byte_budget": manifest.get("byte_budget"),
+        "calibration_requests": manifest["calibration"][record["model"]],
+        "record_options": {
+            key: value
+            for key, value in record.items()
+            if key not in ("model", "variant", "workload", "repeat", "cell",
+                           "command", "effective_environment")
+        },
+    }
+
+
+def collect_merged_campaign(roots, baselines):
+    """Pool compatible single-run cells, never campaign summary medians."""
+    roots = [root.resolve() for root in roots]
+    if not roots or len(set(roots)) != len(roots):
+        raise ValueError("Merged campaigns need distinct source roots")
+    contracts = {}
+    groups = {}
+    sources = []
+    runtime_contract = None
+    model_contracts = {}
+    seen_origins = set()
+    for source_index, root in enumerate(roots, 1):
+        manifest = json.loads((root / "manifest.json").read_text())
+        records = {}
+        for record in manifest["commands"]:
+            key = (record["model"], record["variant"], int(record["repeat"]),
+                   record["workload"])
+            if key in records:
+                raise ValueError("Duplicate requested source cell: " +
+                                 str(key))
+            contract = merged_cell_contract(root, manifest, record)
+            group_key = (record["model"], record["variant"],
+                         record["workload"])
+            if runtime_contract is not None and contract[
+                    "runtime"] != runtime_contract:
+                raise ValueError("Merged runtime identity mismatch: " +
+                                 str(root))
+            runtime_contract = contract["runtime"]
+            model_key = record["model"]
+            if model_key in model_contracts and model_contracts[
+                    model_key] != contract["model"]:
+                raise ValueError("Merged model identity mismatch: " +
+                                 model_key)
+            model_contracts[model_key] = contract["model"]
+            if group_key in contracts and contracts[group_key] != contract:
+                raise ValueError("Merged cell contract mismatch: " +
+                                 str(group_key))
+            contracts[group_key] = contract
+            records[key] = record
+        for field in ("completed", "failures"):
+            seen = set()
+            for record in manifest.get(field, []):
+                key = (record["model"], record["variant"],
+                       int(record["repeat"]), record["workload"])
+                if key in seen or key not in records:
+                    raise ValueError("Invalid " + field + " source cell: " +
+                                     str(key))
+                seen.add(key)
+        source = collect_campaign(root, baselines, require_completed=True)
+        source_id = "source-%02d:%s" % (source_index, root.name)
+        for row in source["rows"]:
+            group_key = (row["model"], row["variant"], row["workload"])
+            group = groups.setdefault(group_key, {"runs": [], "origins": []})
+            for origin in row["origins"]:
+                path = pathlib.Path(origin["path"]).resolve()
+                if path in seen_origins:
+                    raise ValueError("Duplicate raw source cell: " + str(path))
+                seen_origins.add(path)
+                data = json.loads(path.read_text())
+                if data.get("repeats") != 1:
+                    raise ValueError(
+                        "Merged aggregate must contain exactly one run: " +
+                        str(path))
+                if data.get("trace_sha256"
+                            ) != contracts[group_key]["trace_sha256"]:
+                    raise ValueError(
+                        "Aggregate trace differs from manifest: " + str(path))
+                group["runs"].append(data)
+                group["origins"].append(
+                    dict(origin,
+                         source_root=str(root),
+                         source_repeat=origin["repeat"],
+                         repeat=source_id + "/" + origin["repeat"]))
+        sources.append({
+            key: value
+            for key, value in source.items() if key != "rows"
+        })
+    rows = []
+    for (model, variant, workload), group in sorted(groups.items()):
+        row = compare_runs(group["runs"], baselines[model][workload])
+        row.update(model=model,
+                   variant=variant,
+                   workload=workload,
+                   origins=group["origins"])
+        for repeat, origin in zip(row["throughput_repeats"], group["origins"]):
+            repeat["origin"] = origin
+        row["baseline_trace_identity"] = (
+            "hash_matched" if baselines[model][workload].get("trace_sha256")
+            else "not_available_in_frozen_summary")
+        rows.append(row)
+    return {
+        "roots": [str(root) for root in roots],
+        "manifest": [source["manifest"] for source in sources],
+        "sources":
+        sources,
+        "runtime_identity":
+        runtime_contract,
+        "cell_contract_sha256": [{
+            "model":
+            key[0],
+            "variant":
+            key[1],
+            "workload":
+            key[2],
+            "sha256":
+            hashlib.sha256(json.dumps(value,
+                                      sort_keys=True).encode()).hexdigest()
+        } for key, value in sorted(contracts.items())],
+        "expected_cells":
+        sum(source["expected_cells"] or 0 for source in sources),
+        "retained_cells":
+        sum(source["retained_cells"] for source in sources),
+        "requested_cells_complete":
+        all(source["requested_cells_complete"] for source in sources),
+        "failed_cells":
+        sum(source["failed_cells"] for source in sources),
+        "missing_cells":
+        sum(source["missing_cells"] or 0 for source in sources),
+        "excluded_aggregates":
+        [item for source in sources for item in source["excluded_aggregates"]],
+        "rows":
+        rows,
     }
 
 
@@ -342,8 +533,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign",
                         action="append",
-                        required=True,
+                        default=[],
                         help="LABEL=RESULT_ROOT")
+    parser.add_argument(
+        "--merged-campaign",
+        action="append",
+        default=[],
+        help="LABEL=ROOT1,ROOT2,...; strict same-runtime single-run merge")
     parser.add_argument(
         "--gemma-vllm",
         type=pathlib.Path,
@@ -355,6 +551,9 @@ def main():
                         default=DEFAULT_COSMOS_VLLM)
     parser.add_argument("--output-prefix", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    if not args.campaign and not args.merged_campaign:
+        parser.error(
+            "At least one --campaign or --merged-campaign is required")
     baselines = {
         "gemma": load_frozen(args.gemma_vllm),
         "cosmos": load_frozen(args.cosmos_vllm)
@@ -365,9 +564,16 @@ def main():
         "campaigns": {}
     }
     flat_rows = []
-    for assignment in args.campaign:
+    assignments = [(item, False) for item in args.campaign
+                   ] + [(item, True) for item in args.merged_campaign]
+    for assignment, merged in assignments:
         label, path = assignment.split("=", 1)
-        campaign = collect_campaign(pathlib.Path(path), baselines)
+        if label in report["campaigns"]:
+            raise ValueError("Duplicate campaign label: " + label)
+        campaign = (collect_merged_campaign(
+            [pathlib.Path(root)
+             for root in path.split(",")], baselines) if merged else
+                    collect_campaign(pathlib.Path(path), baselines))
         campaign["summary"] = summary_by_model(campaign["rows"])
         report["campaigns"][label] = campaign
         for row in campaign["rows"]:

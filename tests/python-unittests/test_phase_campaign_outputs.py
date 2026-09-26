@@ -14,10 +14,12 @@
 # limitations under the License.
 """CPU-only quality audits for retained fixed-output HTTP campaign artifacts."""
 
+import copy
 import csv
 import importlib.util
 import json
 import pathlib
+import shutil
 import tempfile
 import unittest
 
@@ -94,6 +96,17 @@ class PhaseCampaignOutputsTest(unittest.TestCase):
 
     def write_manifest(self):
         (self.root / "manifest.json").write_text(json.dumps(self.manifest))
+
+    def additional_campaign(self):
+        root = self.root / "additional"
+        source = self.records[0]
+        cell = root / "cosmos/shared_ep-predictor-on/repeat-001/mixed"
+        shutil.copytree(source["cell"], cell)
+        record = dict(source, cell=str(cell))
+        manifest = copy.deepcopy(self.manifest)
+        manifest.update(commands=[record], completed=[record], failures=[])
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        return root, cell / "run-001/client/run-001/requests.csv"
 
     @staticmethod
     def row(index, tokens, count=2, status=200, error=""):
@@ -267,6 +280,82 @@ class PhaseCampaignOutputsTest(unittest.TestCase):
     def test_gemma_eos_diagnostic_includes_turn_boundary(self):
         tokens, _ = G_AUDIT.model_eos("gemma", self.model)
         self.assertTrue({1, 50, 106}.issubset(tokens))
+
+    def test_multiple_sources_keep_colliding_repeat_ids(self):
+        additional, _ = self.additional_campaign()
+        report = G_AUDIT.audit_campaigns([self.root, additional])
+        self.assertTrue(report["integrity_passed"])
+        self.assertEqual(report["completed_cells"], 3)
+        self.assertEqual(len(report["cross_repeat"][0]["repeats"]), 3)
+        self.assertEqual(
+            len({cell["source_run_id"]
+                 for cell in report["cells"]}), 3)
+        self.assertEqual([cell["source_repeat"] for cell in report["cells"]],
+                         [1, 2, 1])
+        self.assertEqual(report["cross_repeat"][0]["exact_request_agreement"],
+                         1)
+        self.assertIn("not_validated", G_AUDIT.markdown(report))
+        self.assertIn("source-02:additional/repeat-001",
+                      G_AUDIT.markdown(report))
+
+    def test_multi_source_difference_uses_all_three_runs(self):
+        additional, _ = self.additional_campaign()
+        self.write_rows(self.csv_paths[0],
+                        [self.row(0, "151645 9"),
+                         self.row(1, "3 5")])
+        report = G_AUDIT.audit_campaigns([self.root, additional])
+        comparison = report["cross_repeat"][0]
+        self.assertEqual(comparison["different_request_ids"], [0, 1])
+        self.assertEqual(
+            comparison["through_first_stop"]["different_request_ids"], [1])
+        self.assertEqual(comparison["comparable_requests"], 2)
+
+    def test_duplicate_source_roots_and_artifacts_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "distinct campaign roots"):
+            G_AUDIT.audit_campaigns([self.root, self.root / "."])
+        additional, _ = self.additional_campaign()
+        (additional / "manifest.json").write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(ValueError, "Duplicate source output"):
+            G_AUDIT.audit_campaigns([self.root, additional])
+
+    def test_partial_additional_source_is_not_three_complete_repeats(self):
+        additional, _ = self.additional_campaign()
+        manifest_path = additional / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(completed=[], failures=manifest["commands"])
+        manifest_path.write_text(json.dumps(manifest))
+        report = G_AUDIT.audit_campaigns([self.root, additional])
+        self.assertFalse(report["integrity_passed"])
+        self.assertEqual(report["requested_cells"], 3)
+        self.assertEqual(report["completed_cells"], 2)
+        self.assertEqual(report["missing_cells"], 1)
+        self.assertEqual(report["unresolved_failed_cells"], 1)
+        self.assertEqual(len(report["cross_repeat"][0]["repeats"]), 2)
+
+    def test_multi_source_incomplete_capture_cannot_look_equal(self):
+        additional, csv_path = self.additional_campaign()
+        self.write_rows(csv_path, [self.row(0, "151645"), self.row(1, "3 4")])
+        report = G_AUDIT.audit_campaigns([self.root, additional])
+        self.assertFalse(report["integrity_passed"])
+        self.assertEqual(report["cross_repeat"][0]["status"],
+                         "invalid_or_incomplete")
+        self.assertEqual(report["cross_repeat"][0]["comparable_requests"], 1)
+
+    def test_cross_source_trace_contract_mismatch_is_rejected(self):
+        additional, _ = self.additional_campaign()
+        manifest_path = additional / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        trace = additional / "trace.json"
+        trace.write_text(self.trace.read_text() + "\n")
+        trace_hash = G_AUDIT.identity(trace)["sha256"]
+        manifest["identity"]["models"]["cosmos"]["traces"][
+            "mixed"] = trace_hash
+        manifest["commands"][0]["command"][-1] = str(trace)
+        manifest["completed"][0]["command"][-1] = str(trace)
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError,
+                                    "trace/stop contract mismatch"):
+            G_AUDIT.audit_campaigns([self.root, additional])
 
 
 if __name__ == "__main__":

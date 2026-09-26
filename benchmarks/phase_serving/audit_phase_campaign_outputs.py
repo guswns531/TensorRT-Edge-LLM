@@ -311,6 +311,82 @@ def audit_campaign(root):
     }
 
 
+def audit_campaigns(roots):
+    """Combine output audits without asserting cross-source runtime equivalence."""
+    roots = [root.resolve() for root in roots]
+    if not roots or len(set(roots)) != len(roots):
+        raise ValueError("Output audits need distinct campaign roots")
+    sources = []
+    cells = []
+    seen_cells = set()
+    seen_csvs = set()
+    token_contracts = {}
+    for source_index, root in enumerate(roots, 1):
+        source = audit_campaign(root)
+        source_id = "source-%02d:%s" % (source_index, root.name)
+        for cell in source["cells"]:
+            cell_path = str(pathlib.Path(cell["cell"]).resolve())
+            csv_path = cell.get("request_csv", {}).get("path")
+            if cell_path in seen_cells or (csv_path and csv_path in seen_csvs):
+                raise ValueError("Duplicate source output artifact: " +
+                                 cell_path)
+            seen_cells.add(cell_path)
+            if csv_path:
+                seen_csvs.add(csv_path)
+            group = (cell["model"], cell["variant"], cell["workload"])
+            if cell.get("trace"):
+                contract = (cell["trace"]["sha256"],
+                            tuple(
+                                source["models"][cell["model"]]["eos_tokens"]))
+                if group in token_contracts and token_contracts[
+                        group] != contract:
+                    raise ValueError(
+                        "Cross-source trace/stop contract mismatch: " +
+                        str(group))
+                token_contracts[group] = contract
+            local_repeat = cell["repeat"]
+            run_id = source_id + "/repeat-%03d" % local_repeat
+            cells.append(
+                dict(cell,
+                     source_root=str(root),
+                     source_repeat=local_repeat,
+                     source_run_id=run_id,
+                     repeat=run_id))
+        sources.append(
+            dict(source_id=source_id,
+                 root=str(root),
+                 **{
+                     key: value
+                     for key, value in source.items()
+                     if key not in ("cells", "cross_repeat")
+                 }))
+    report = {
+        "operation":
+        "retained_multi_campaign_output_audit_no_inference",
+        "sources":
+        sources,
+        "manifest": [source["manifest"] for source in sources],
+        "integrity_passed":
+        all(source["integrity_passed"] for source in sources),
+        "semantics":
+        sources[0]["semantics"],
+        "comparison_contract":
+        sources[0]["comparison_contract"],
+        "cross_source_runtime_contract":
+        "not_validated; this audit verifies per-source output integrity and shared trace/stop semantics, "
+        "not binary, engine, calibration, command or environment equality; validate those separately",
+        "cells":
+        cells,
+        "cross_repeat":
+        compare_repeats(cells),
+    }
+    for field in ("requested_cells", "completed_cells", "missing_cells",
+                  "unresolved_failed_cells", "integrity_issue_count",
+                  "first_eos_count"):
+        report[field] = sum(source[field] for source in sources)
+    return report
+
+
 def markdown(report):
     """Render transport/count integrity separately from EOS anomalies and repeatability."""
     lines = [
@@ -319,11 +395,12 @@ def markdown(report):
         % (report["completed_cells"], report["requested_cells"],
            report["unresolved_failed_cells"], report["integrity_issue_count"]),
         "", report["semantics"], "",
+        report.get("cross_source_runtime_contract", ""), "",
         "| Model/variant/workload | Repeat | Requests | Integrity issues | First-EOS request IDs |",
         "|---|---:|---:|---:|---|"
     ]
     for cell in report["cells"]:
-        lines.append("| %s | %d | %s | %d | %s |" %
+        lines.append("| %s | %s | %s | %d | %s |" %
                      ("/".join(cell[field]
                                for field in ("model", "variant", "workload")),
                       cell["repeat"], cell.get("observed_requests", "missing"),
@@ -357,9 +434,18 @@ def markdown(report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--additional-campaign",
+        type=pathlib.Path,
+        action="append",
+        default=[],
+        help=
+        "Combine another retained source; runtime-contract equality must be checked separately"
+    )
     parser.add_argument("--output-prefix", type=pathlib.Path, required=True)
     args = parser.parse_args()
-    report = audit_campaign(args.campaign)
+    report = (audit_campaigns([args.campaign] + args.additional_campaign)
+              if args.additional_campaign else audit_campaign(args.campaign))
     report["command"] = [sys.executable] + sys.argv
     report["analyzer"] = identity(pathlib.Path(__file__))
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
