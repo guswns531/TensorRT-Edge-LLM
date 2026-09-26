@@ -31,6 +31,8 @@ METRICS = ("generated_token_s_median", "ttft_mean_of_run_means_ms",
 WORKLOADS = ("balanced", "mixed", "vision-heavy", "multi-image",
              "long-prefill", "bimodal", "decode-heavy", "short", "text-heavy",
              "poisson", "wave-drain", "late-vision")
+WARMUP_DECODE_BATCHES = (1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48,
+                         52, 56, 60, 64)
 
 
 def digest(path):
@@ -40,6 +42,12 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             value.update(chunk)
     return value.hexdigest()
+
+
+def warmup_decode_batches(maximum):
+    """Preserve the documented calibration workload; graph priming is separate."""
+    return ",".join(
+        str(batch) for batch in WARMUP_DECODE_BATCHES if batch <= maximum)
 
 
 def model_config(repo, name, overrides=None):
@@ -314,13 +322,9 @@ def command_for(repo,
             environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = os.environ[
                 "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"]
         else:
-            batches = [
-                1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
-                64
-            ]
-            filtered = [str(b) for b in batches if b <= config["decode_batch"]]
-            environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = ",".join(
-                filtered)
+            environment[
+                "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = warmup_decode_batches(
+                    config["decode_batch"])
     environment.update(options.get("environment", {}))
 
     backend = [
@@ -402,6 +406,33 @@ def token_repeatability(runs):
     }
 
 
+def campaign_completion(manifest, finished=False):
+    """Count requested cells rather than mistaking a partial summary for success."""
+    requested = {record["cell"] for record in manifest["commands"]}
+    completed = {record["cell"]
+                 for record in manifest.get("completed", [])} & requested
+    failed = {record["cell"]
+              for record in manifest.get("failures", [])
+              } & (requested - completed)
+    missing = requested - completed
+    return {
+        "completion_status":
+        ("complete" if not missing else "partial") if finished else "running",
+        "requested_cells":
+        len(requested),
+        "completed_cells":
+        len(completed),
+        "failed_cells":
+        len(failed),
+        "missing_cells":
+        len(missing),
+        "missing_cell_paths":
+        sorted(missing),
+        "exit_code":
+        1 if finished and missing else 0,
+    }
+
+
 def main():
     """Run immutable paired cells and retain their exact source, engine and workload contract."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -445,7 +476,7 @@ def main():
                         default=["on"])
     parser.add_argument("--cuda-graphs", choices=("on", "off"), default="on")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
-    parser.add_argument("--max-prefill-graphs", type=int, default=4)
+    parser.add_argument("--max-prefill-graphs", type=int, default=0)
     parser.add_argument("--shared-ep-single-storage",
                         choices=("0", "1"),
                         default="1")
@@ -586,9 +617,10 @@ def main():
                                 "TRT_EDGELLM_MAX_DECODE_GRAPHS":
                                 args.max_decode_graphs,
                                 "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES":
-                                ",".join(
-                                    str(batch) for batch in range(
-                                        1, config["decode_batch"] + 1)),
+                                os.environ.get(
+                                    "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES",
+                                    warmup_decode_batches(
+                                        config["decode_batch"])),
                             },
                         }
                         command = command_for(repo, config, cell, workload,
@@ -665,6 +697,7 @@ def main():
             )
         manifest["completed"] = previous.get("completed", [])
         manifest["failures"] = previous.get("failures", [])
+    manifest.update(campaign_completion(manifest))
     path.write_text(json.dumps(manifest, indent=2) + "\n")
     (root / "runner-source.py").write_bytes(
         pathlib.Path(__file__).read_bytes())
@@ -705,6 +738,7 @@ def main():
                         for k in ("model", "workload", "variant", "repeat", "cell")
                     }, "return_code": outcome.returncode
                 })
+                manifest.update(campaign_completion(manifest))
                 path.write_text(json.dumps(manifest, indent=2) + "\n")
                 print("Failed",
                       record["model"],
@@ -744,13 +778,21 @@ def main():
         }
         if completion not in manifest["completed"]:
             manifest["completed"].append(completion)
+        manifest.update(campaign_completion(manifest))
         path.write_text(json.dumps(manifest, indent=2) + "\n")
         if args.compress_closed_logs:
             closed_log = cell / "run-001/gateway.log"
             if closed_log.exists():
                 subprocess.run(
                     ["gzip", "-1", "--", str(closed_log)], check=True)
+    manifest.update(campaign_completion(manifest, finished=True))
+    path.write_text(json.dumps(manifest, indent=2) + "\n")
+    if manifest["missing_cells"]:
+        print("Incomplete campaign: %d/%d requested cells completed" %
+              (manifest["completed_cells"], manifest["requested_cells"]),
+              file=sys.stderr)
+    return manifest["exit_code"]
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

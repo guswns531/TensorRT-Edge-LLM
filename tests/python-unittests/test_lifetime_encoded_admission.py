@@ -172,6 +172,20 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(config["vision_batch_size"], 4)
         self.assertEqual(config["calibration_requests"], 49)
 
+    def test_calibration_shapes_preserve_retained_sparse_contract(self):
+        self.assertEqual(G_RUNNER.warmup_decode_batches(24),
+                         "1,2,4,8,12,16,20,24")
+        self.assertEqual(G_RUNNER.warmup_decode_batches(64),
+                         "1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64")
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            command = G_RUNNER.command_for(self.repo, self.config,
+                                           self.repo / "cell", "mixed",
+                                           "independent", 0,
+                                           {"cuda_graphs": True})
+        self.assertEqual(
+            environment(command)["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"],
+            "1,2,4,8,12,16,20,24")
+
     def test_predictor_ablation_changes_one_environment_field(self):
         commands = []
         for enabled in ("0", "1"):
@@ -228,6 +242,40 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
                     "token_trace_sha256_per_run": ["xyz"]
                 }])["status"], "observed_different")
 
+    def test_campaign_partial_failure_is_nonzero_even_with_some_success(self):
+        manifest = {
+            "commands": [{
+                "cell": "a"
+            }, {
+                "cell": "b"
+            }],
+            "completed": [{
+                "cell": "a"
+            }],
+            "failures": [{
+                "cell": "b"
+            }]
+        }
+        result = G_RUNNER.campaign_completion(manifest, finished=True)
+        self.assertEqual(result["completion_status"], "partial")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["missing_cells"], 1)
+        self.assertEqual(result["failed_cells"], 1)
+        manifest["completed"].append({"cell": "b"})
+        result = G_RUNNER.campaign_completion(manifest, finished=True)
+        self.assertEqual(result["completion_status"], "complete")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["failed_cells"], 0)
+
+    def test_campaign_unattempted_cells_are_not_success(self):
+        result = G_RUNNER.campaign_completion({"commands": [{
+            "cell": "a"
+        }]},
+                                              finished=True)
+        self.assertEqual(result["completion_status"], "partial")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["failed_cells"], 0)
+
     def test_report_keeps_throughput_and_latency_wins_separate(self):
         baseline = {"metrics": {metric: 10.0 for metric in G_REPORTER.METRICS}}
         run = {metric: 20.0 for metric in G_REPORTER.METRICS}
@@ -238,6 +286,10 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(summary["generated_token_s_median"]["wins"], 1)
         self.assertEqual(summary["ttft_p95_median_ms"]["wins"], 0)
         self.assertIsNone(row["metrics"]["ttft_p95_median_ms"]["stddev"])
+        coverage = G_REPORTER.summary_by_model([row])["test/independent"]
+        self.assertFalse(coverage["full12_three_repeat_coverage"])
+        self.assertEqual(coverage["minimum_repeats"], 1)
+        self.assertEqual(len(coverage["missing_full12_workloads"]), 11)
 
     def test_report_uses_raw_aggregates_not_existing_summary(self):
         with tempfile.TemporaryDirectory() as folder:

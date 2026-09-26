@@ -35,6 +35,9 @@ METRICS = (
 )
 LABELS = ("tok/s", "TTFT mean", "TTFT p95", "TPOT mean", "TPOT p95",
           "E2E mean", "E2E p95")
+WORKLOADS = ("balanced", "mixed", "vision-heavy", "multi-image",
+             "long-prefill", "bimodal", "decode-heavy", "short", "text-heavy",
+             "poisson", "wave-drain", "late-vision")
 
 
 def file_identity(path):
@@ -156,12 +159,15 @@ def collect_campaign(root, baselines):
         rows.append(row)
     if not rows:
         raise ValueError("No raw cell aggregates: " + str(root))
+    retained_cells = sum(len(group["runs"]) for group in groups.values())
     return {
         "root": str(root.resolve()),
         "manifest":
         file_identity(manifest_path) if manifest_path.exists() else None,
         "expected_cells": expected or None,
-        "retained_cells": sum(len(group["runs"]) for group in groups.values()),
+        "retained_cells": retained_cells,
+        "requested_cells_complete":
+        retained_cells == expected if expected else None,
         "rows": rows,
     }
 
@@ -173,7 +179,16 @@ def summary_by_model(rows):
         groups.setdefault(row["model"] + "/" + row["variant"], []).append(row)
     result = {}
     for key, group in groups.items():
-        result[key] = {"workloads": len(group), "metrics": {}}
+        missing = sorted(set(WORKLOADS) - {row["workload"] for row in group})
+        minimum_repeats = min(row["run_count"] for row in group)
+        result[key] = {
+            "workloads": len(group),
+            "missing_full12_workloads": missing,
+            "minimum_repeats": minimum_repeats,
+            "full12_three_repeat_coverage": not missing
+            and minimum_repeats >= 3,
+            "metrics": {},
+        }
         for metric in METRICS:
             ratios = [
                 row["metrics"][metric]["current"] /
@@ -203,6 +218,17 @@ def markdown(report):
     for label, campaign in report["campaigns"].items():
         lines += [
             "## " + label, "",
+            "Retained/requested cells: %s/%s. Full-12 coverage and repeat counts are independent of metric wins."
+            % (campaign["retained_cells"], campaign["expected_cells"]), ""
+        ]
+        for key, coverage in summary_by_model(campaign["rows"]).items():
+            lines.append(
+                "- %s: %d/12 workloads; minimum %d repeats; Full-12 ×3 coverage: %s."
+                %
+                (key, coverage["workloads"], coverage["minimum_repeats"],
+                 "yes" if coverage["full12_three_repeat_coverage"] else "no"))
+        lines += [
+            "",
             "| Model/variant/workload | Runs | " + " | ".join(LABELS) + " |",
             "|---|---:|" + "---:|" * len(METRICS)
         ]
