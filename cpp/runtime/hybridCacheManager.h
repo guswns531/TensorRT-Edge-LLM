@@ -159,7 +159,7 @@ public:
 
     //! @brief Read-only views of the pre-computed KV head-dim groups.
     //!
-    //! Uniform models return a single group; hybrid Gemma4-style models
+    //! Physical owners appear exactly once. Uniform models return a single group; hybrid Gemma4-style models
     //! return one group per distinct head dim. The underlying
     //! `KVLayerInfo` arrays are owned by this manager and remain valid
     //! for its lifetime.
@@ -230,11 +230,11 @@ public:
     //! @param batchIdx Batch slot to capture.
     //! @param sequenceLength Number of tokens to capture from the cache.
     //! @param stream CUDA stream.
-    //! @return Vector of captured tensors (one per attention layer).
+    //! @return Logical-layer-indexed tensors; borrower views alias owners retained in the same vector.
     std::vector<rt::Tensor> captureKVCache(int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
     //! Restore KV cache for a single batch slot across all attention layers.
-    //! @param saved Previously captured KV cache tensors.
+    //! @param saved Previously captured logical-layer tensors, preserving owner/borrower aliases.
     //! @param batchIdx Target batch slot.
     //! @param stream CUDA stream.
     void restoreKVCache(std::vector<rt::Tensor> const& saved, int32_t batchIdx, cudaStream_t stream);
@@ -255,13 +255,13 @@ private:
     //! Pre-computed group of KV layers sharing the same headDim for batched kernel launches.
     struct HeadDimGroup
     {
-        int32_t headDim;                            //!< Head dimension shared by all layers in this group
-        int32_t maxKVHeads;                         //!< Maximum numKVHeads across layers in this group
-        int32_t numLayers;                          //!< Number of layers in this group
-        std::vector<int32_t> localKVIndices;        //!< Local KV-layer indices belonging to this group
-        rt::Tensor deviceLayerInfos;                //!< Device buffer of KVLayerInfo for this group
-        rt::Tensor deviceScratchInfos;              //!< Pre-allocated device scratch buffer for save/restore uploads
-        rt::Tensor hostScratchInfos;                //!< Pre-allocated pinned host scratch buffer for save/restore uploads
+        int32_t headDim;                     //!< Head dimension shared by all layers in this group
+        int32_t maxKVHeads;                  //!< Maximum numKVHeads across layers in this group
+        int32_t numLayers;                   //!< Number of layers in this group
+        std::vector<int32_t> localKVIndices; //!< Local KV-layer indices belonging to this group
+        rt::Tensor deviceLayerInfos;         //!< Device buffer of KVLayerInfo for this group
+        rt::Tensor deviceScratchInfos;       //!< Pre-allocated device scratch buffer for save/restore uploads
+        rt::Tensor hostScratchInfos;         //!< Pre-allocated pinned host scratch buffer for save/restore uploads
         std::vector<kernel::KVLayerInfo> hostInfos; //!< Host copy for building save/restore info arrays
     };
 

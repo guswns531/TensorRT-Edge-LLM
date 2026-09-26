@@ -96,6 +96,7 @@ private:
     int32_t mBoundaryHiddenDim{};
     std::vector<Tensor> mRecurrentSnapshots;
     std::vector<Tensor> mConvSnapshots;
+    //! Indexed by physicalOwnerLayerIndices() order, never by logical borrower index.
     std::vector<Tensor> mPartialKvSnapshots;
     std::vector<Tensor> mDraftPartialKvSnapshots;
     //! One [recurrentSlotCount, boundaryHiddenDim] slab holding each checkpoint's saved boundary hidden state.

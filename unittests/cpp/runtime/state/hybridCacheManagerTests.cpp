@@ -746,6 +746,59 @@ TEST(HybridCacheManagerTests, CaptureRestoreRoundTripUniform)
     }
 }
 
+TEST(HybridCacheManagerTests, SharingOwnersDeduplicateCompactionAndPromptSnapshot)
+{
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    rt::HybridCacheManager::Config config;
+    config.layerTypes.assign(4, rt::HybridCacheManager::LayerType::kAttention);
+    config.kvConfig = {4, 3, 128, {{1, 256}, {1, 512}, {1, 256}, {1, 256}}, DataType::kHALF};
+    config.kvConfig.sharingDonors = {-1, -1, 0, 2};
+    config.mambaConfig = makeMambaConfig(0, 3);
+    config.maxBatchSize = 3;
+    rt::HybridCacheManager cache(config, stream);
+    int32_t groupOwners = 0;
+    for (auto const& group : cache.getKVHeadDimGroups())
+    {
+        groupOwners += group.numLayers;
+    }
+    EXPECT_EQ(groupOwners, 2);
+    EXPECT_EQ(&cache.getCombinedKVCache(3), &cache.getCombinedKVCache(0));
+    for (int32_t owner : {0, 1})
+    {
+        for (int32_t slot = 0; slot < 3; ++slot)
+        {
+            fillSlotNhd(cache, owner, slot, static_cast<float>(owner * 10 + slot + 1));
+        }
+    }
+    auto saved = cache.captureKVCache(2, 9, stream);
+    ASSERT_EQ(saved.size(), 4U);
+    EXPECT_EQ(saved[2].rawPointer(), saved[0].rawPointer());
+    EXPECT_EQ(saved[3].rawPointer(), saved[0].rawPointer());
+    rt::Tensor lengths({3}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::fill_n(static_cast<int32_t*>(lengths.rawPointer()), 3, 9);
+    cache.resetForNewSequences(lengths, stream);
+    auto mapping = uploadMapping({-1, 0, 1});
+    cache.compactBatch(mapping, 3, 2, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int32_t layer = 0; layer < 4; ++layer)
+    {
+        int32_t const owner = cache.getKVCacheManager().physicalOwner(layer);
+        expectSlotTokenRangeEqNhd(cache, layer, 0, 0, 9, static_cast<float>(owner * 10 + 2), "shared compact");
+    }
+    cache.restoreKVCache(saved, 0, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int32_t layer = 0; layer < 4; ++layer)
+    {
+        int32_t const owner = cache.getKVCacheManager().physicalOwner(layer);
+        expectSlotTokenRangeEqNhd(cache, layer, 0, 0, 9, static_cast<float>(owner * 10 + 3), "shared restore");
+    }
+    saved[2] = rt::Tensor({2, 9, 1, 256}, rt::DeviceType::kGPU, DataType::kHALF);
+    EXPECT_THROW(cache.restoreKVCache(saved, 0, stream), std::runtime_error);
+    EXPECT_THROW(cache.captureKVCache(3, 9, stream), std::runtime_error);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 TEST(HybridCacheManagerTests, CaptureRestoreWithExtraRetainedPages)
 {
     cudaStream_t stream{nullptr};

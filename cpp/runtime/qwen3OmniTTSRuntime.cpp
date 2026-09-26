@@ -4262,13 +4262,13 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
             cpCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
             {
                 auto& talkerKVManager = talkerCacheManager.getKVCacheManager();
-                for (int32_t i = 0; i < talkerKVManager.numLayers(); ++i)
+                for (int32_t const i : talkerKVManager.physicalOwnerLayerIndices())
                 {
                     rt::Tensor& layerKV = talkerKVManager.getCombinedKVCache(i);
                     CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
                 }
                 auto& cpKVManager = cpCacheManager.getKVCacheManager();
-                for (int32_t i = 0; i < cpKVManager.numLayers(); ++i)
+                for (int32_t const i : cpKVManager.physicalOwnerLayerIndices())
                 {
                     rt::Tensor& layerKV = cpKVManager.getCombinedKVCache(i);
                     CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));

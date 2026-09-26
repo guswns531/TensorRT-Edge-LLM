@@ -170,8 +170,8 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
 
     if (partialKvSlotCount > 0)
     {
-        mPartialKvSnapshots.reserve(static_cast<size_t>(kv.numLayers()));
-        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        mPartialKvSnapshots.reserve(static_cast<size_t>(kv.numPhysicalOwners()));
+        for (int32_t layer : kv.physicalOwnerLayerIndices())
         {
             KVLayerConfig const& layerConfig = kv.getLayerConfig(layer);
             size_t const tokenElements = checkedMultiply(static_cast<size_t>(layerConfig.numKVHeads),
@@ -194,8 +194,8 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
             KVCacheManager::Config const& draftKvConfig = draftKv.getConfig();
             ELLM_CHECK(
                 draftKv.numLayers() > 0, "Hybrid MTP snapshot storage requires at least one draft attention layer");
-            mDraftPartialKvSnapshots.reserve(static_cast<size_t>(draftKv.numLayers()));
-            for (int32_t layer = 0; layer < draftKv.numLayers(); ++layer)
+            mDraftPartialKvSnapshots.reserve(static_cast<size_t>(draftKv.numPhysicalOwners()));
+            for (int32_t layer : draftKv.physicalOwnerLayerIndices())
             {
                 KVLayerConfig const& layerConfig = draftKv.getLayerConfig(layer);
                 size_t const tokenElements = checkedMultiply(static_cast<size_t>(layerConfig.numKVHeads),
@@ -236,12 +236,15 @@ size_t HybridSnapshotStorage::recurrentBytesPerSlot(MambaCacheManager::Config co
 
 size_t HybridSnapshotStorage::partialKvBytesPerSlot(KVCacheManager::Config const& config)
 {
-    ELLM_CHECK(
-        config.numAttentionLayers >= 0 && config.layerConfigs.size() == static_cast<size_t>(config.numAttentionLayers),
-        "Hybrid snapshot attention layer schema is inconsistent");
+    auto const owners = KVCacheManager::resolveLayerOwners(config);
     size_t bytes{};
-    for (KVLayerConfig const& layer : config.layerConfigs)
+    for (int32_t index = 0; index < config.numAttentionLayers; ++index)
     {
+        if (owners[index] != index)
+        {
+            continue;
+        }
+        KVLayerConfig const& layer = config.layerConfigs[index];
         size_t elements = checkedMultiply(
             static_cast<size_t>(layer.numKVHeads), static_cast<size_t>(layer.headDim), "partial KV heads");
         elements = checkedMultiply(elements, static_cast<size_t>(2 * kTOKENS_PER_PAGE), "partial KV page");
@@ -353,10 +356,12 @@ void HybridSnapshotStorage::capturePartialKv(HybridCacheManager& cacheManager, s
 {
     validatePartialSlots(cacheManager, snapshotSlot, sourcePage, validTokenCount);
     KVCacheManager& kvCache = cacheManager.getKVCacheManager();
-    ELLM_CHECK(snapshots.size() == static_cast<size_t>(kvCache.numLayers()),
-        "Hybrid partial KV snapshot layer count does not match the cache manager");
-    for (int32_t layer = 0; layer < kvCache.numLayers(); ++layer)
+    auto const& owners = kvCache.physicalOwnerLayerIndices();
+    ELLM_CHECK(
+        snapshots.size() == owners.size(), "Hybrid partial KV snapshot owner count does not match the cache manager");
+    for (size_t ownerIndex = 0; ownerIndex < owners.size(); ++ownerIndex)
     {
+        int32_t const layer = owners[ownerIndex];
         KVLayerConfig const& config = kvCache.getLayerConfig(layer);
         size_t const tokenElements = checkedMultiply(
             static_cast<size_t>(config.numKVHeads), static_cast<size_t>(config.headDim), "partial KV token heads");
@@ -366,7 +371,7 @@ void HybridSnapshotStorage::capturePartialKv(HybridCacheManager& cacheManager, s
         size_t const copyBytes = checkedMultiply(tokenBytes, static_cast<size_t>(validTokenCount), "partial KV copy");
         size_t const snapshotBase = static_cast<size_t>(snapshotSlot) * 2U * pageBytes;
         size_t const pageOffset = static_cast<size_t>(sourcePage) * pageBytes;
-        Tensor& snapshot = snapshots[static_cast<size_t>(layer)];
+        Tensor& snapshot = snapshots[ownerIndex];
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(snapshot.rawPointer(), snapshotBase),
             byteOffset(kvCache.kPoolPtr(layer), pageOffset), copyBytes, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes),
@@ -379,10 +384,12 @@ void HybridSnapshotStorage::restorePartialKv(HybridCacheManager& cacheManager, s
 {
     validatePartialSlots(cacheManager, snapshotSlot, destinationPage, validTokenCount);
     KVCacheManager& kvCache = cacheManager.getKVCacheManager();
-    ELLM_CHECK(snapshots.size() == static_cast<size_t>(kvCache.numLayers()),
-        "Hybrid partial KV snapshot layer count does not match the cache manager");
-    for (int32_t layer = 0; layer < kvCache.numLayers(); ++layer)
+    auto const& owners = kvCache.physicalOwnerLayerIndices();
+    ELLM_CHECK(
+        snapshots.size() == owners.size(), "Hybrid partial KV snapshot owner count does not match the cache manager");
+    for (size_t ownerIndex = 0; ownerIndex < owners.size(); ++ownerIndex)
     {
+        int32_t const layer = owners[ownerIndex];
         KVLayerConfig const& config = kvCache.getLayerConfig(layer);
         size_t const tokenElements = checkedMultiply(
             static_cast<size_t>(config.numKVHeads), static_cast<size_t>(config.headDim), "partial KV token heads");
@@ -392,7 +399,7 @@ void HybridSnapshotStorage::restorePartialKv(HybridCacheManager& cacheManager, s
         size_t const copyBytes = checkedMultiply(tokenBytes, static_cast<size_t>(validTokenCount), "partial KV copy");
         size_t const snapshotBase = static_cast<size_t>(snapshotSlot) * 2U * pageBytes;
         size_t const pageOffset = static_cast<size_t>(destinationPage) * pageBytes;
-        Tensor& snapshot = snapshots[static_cast<size_t>(layer)];
+        Tensor& snapshot = snapshots[ownerIndex];
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(kvCache.kPoolPtr(layer), pageOffset),
             byteOffset(snapshot.rawPointer(), snapshotBase), copyBytes, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(kvCache.vPoolPtr(layer), pageOffset),

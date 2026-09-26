@@ -81,7 +81,7 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
     {
         // Group KV layers by headDim, preserving insertion order via an auxiliary vector.
         std::unordered_map<int32_t, size_t> headDimToGroupIdx;
-        for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
+        for (int32_t i : mKVCache.physicalOwnerLayerIndices())
         {
             auto const& lc = mKVCache.getLayerConfig(i);
             auto it = headDimToGroupIdx.find(lc.headDim);
@@ -351,6 +351,12 @@ bool HybridCacheManager::getKVCacheAllEmpty() const noexcept
 void HybridCacheManager::compactBatch(
     rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
 {
+    check::check(oldBatch >= 0 && oldBatch <= mConfig.maxBatchSize && newBatch >= 0 && newBatch <= oldBatch,
+        "compactBatch: invalid batch dimensions.");
+    check::check(mKVCache.numLayers() == 0
+            || static_cast<int64_t>(oldBatch) * mKVCache.maxCapPadded()
+                <= static_cast<int64_t>(mKVCache.numPages()) * kTOKENS_PER_PAGE,
+        "compactBatch requires physical pages for identity-addressed slots.");
     // Active-slot K/V views have [maxBatch, capPadded, H, D] shape. Compaction moves only each
     // survivor's live prefix while the identity page table retains row == slot.
     for (auto const& group : mHeadDimGroups)
@@ -407,16 +413,31 @@ std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
         "HybridCacheManager::captureKVCache currently only supports kHALF KV cache; "
         "FP8 system-prompt cache is not implemented.");
 
-    // Allocate all per-layer destination tensors first.
-    std::vector<rt::Tensor> result;
-    result.reserve(mKVCache.numLayers());
-    for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
+    check::check(batchIdx >= 0 && batchIdx < mConfig.maxBatchSize && sequenceLength > 0
+            && sequenceLength <= mConfig.kvConfig.maxSequenceLength,
+        "captureKVCache: batch slot or sequence length is out of range.");
+    check::check(static_cast<int64_t>(batchIdx + 1) * mKVCache.maxCapPadded()
+            <= static_cast<int64_t>(mKVCache.numPages()) * kTOKENS_PER_PAGE,
+        "captureKVCache requires physical pages for the identity-addressed slot.");
+
+    std::vector<rt::Tensor> result(static_cast<size_t>(mKVCache.numLayers()));
+    for (int32_t i : mKVCache.physicalOwnerLayerIndices())
     {
         KVLayerConfig const& lc = mKVCache.getLayerConfig(i);
         // NHD saved layout: [2, sequenceLength, H, D] (K plane then V plane), each plane a
         // contiguous sequenceLength*H*D span — matches batchedKVCacheCopyKernel's NHD addressing.
-        result.emplace_back(rt::Tensor({2, sequenceLength, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
-            mConfig.kvConfig.kvCacheType, "HybridCacheManager::capturedKVCache_" + std::to_string(i)));
+        result[i] = rt::Tensor({2, sequenceLength, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
+            mConfig.kvConfig.kvCacheType, "HybridCacheManager::capturedKVCache_" + std::to_string(i));
+    }
+    // Borrower views remain valid while the returned vector retains its owning entries.
+    for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
+    {
+        int32_t const owner = mKVCache.physicalOwner(i);
+        if (owner != i)
+        {
+            result[i] = rt::Tensor(
+                result[owner].rawPointer(), result[owner].getShape(), DeviceType::kGPU, mConfig.kvConfig.kvCacheType);
+        }
     }
 
     // Batch the copies per headDim group (non-const ref: scratch buffer is overwritten).
@@ -453,6 +474,33 @@ void HybridCacheManager::restoreKVCache(std::vector<rt::Tensor> const& saved, in
     check::check(mConfig.kvConfig.kvCacheType == nvinfer1::DataType::kHALF,
         "HybridCacheManager::restoreKVCache currently only supports kHALF KV cache; "
         "FP8 system-prompt cache is not implemented.");
+
+    check::check(saved.size() == static_cast<size_t>(mKVCache.numLayers()),
+        "restoreKVCache: snapshot must retain every logical layer entry.");
+    check::check(batchIdx >= 0 && batchIdx < mConfig.maxBatchSize, "restoreKVCache: batch slot is out of range.");
+    check::check(static_cast<int64_t>(batchIdx + 1) * mKVCache.maxCapPadded()
+            <= static_cast<int64_t>(mKVCache.numPages()) * kTOKENS_PER_PAGE,
+        "restoreKVCache requires physical pages for the identity-addressed slot.");
+    int64_t capturedLength = -1;
+    for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
+    {
+        auto const& source = saved[i];
+        auto const& shape = source.getShape();
+        auto const& config = mKVCache.getLayerConfig(i);
+        check::check(shape.getNumDims() == 4 && shape[0] == 2 && shape[1] > 0
+                && shape[1] <= mConfig.kvConfig.maxSequenceLength && shape[2] == config.numKVHeads
+                && shape[3] == config.headDim && source.getDataType() == mConfig.kvConfig.kvCacheType
+                && source.getDeviceType() == DeviceType::kGPU && source.rawPointer() != nullptr,
+            "restoreKVCache: snapshot layout does not match the logical KV layer.");
+        check::check(capturedLength < 0 || capturedLength == shape[1],
+            "restoreKVCache: all layers must retain the same sequence length.");
+        check::check(source.getMemoryCapacity()
+                >= shape.volume() * static_cast<int64_t>(rt::utils::getTypeSize(source.getDataType())),
+            "restoreKVCache: snapshot backing allocation is smaller than its shape.");
+        capturedLength = shape[1];
+        check::check(source.rawPointer() == saved[mKVCache.physicalOwner(i)].rawPointer(),
+            "restoreKVCache: snapshot donor ownership does not match the cache manager.");
+    }
 
     // Batch the copies per headDim group (non-const ref: scratch buffer is overwritten).
     for (auto& group : mHeadDimGroups)

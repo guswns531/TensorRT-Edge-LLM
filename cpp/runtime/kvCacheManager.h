@@ -36,7 +36,7 @@ struct KVLayerConfig
 };
 
 //! Per-layer KV cache manager that supports heterogeneous head configurations across layers.
-//! Each attention layer gets its own independently-sized page pool with shape
+//! Each physical owner gets an independently-sized page pool with shape
 //! [2, numPages, kTOKENS_PER_PAGE, numKVHeads_i, headDim_i], where the K/V split is outermost.
 //! Separate K/V active-slot views use maxBatchSize and capPadded =
 //! ceil(maxSequenceLength / kTOKENS_PER_PAGE) * kTOKENS_PER_PAGE.
@@ -63,6 +63,8 @@ public:
         int32_t numPages{0};
         //! Allow a physical pool smaller than the maximum simultaneous full-length occupancy.
         bool allowPoolUndercommit{false};
+        //! Local attention donor indices; empty or -1 entries own their pool.
+        std::vector<int32_t> sharingDonors{};
     };
     //! \endcond
 
@@ -72,7 +74,7 @@ public:
     /*!
      * @brief Construct and initialize per-layer KV cache
      *
-     * Allocates one device tensor per attention layer. Once allocated, memory won't be reallocated.
+     * Allocates one device tensor per canonical owner. Once allocated, memory won't be reallocated.
      * Determines whether all layers share the same numKVHeads and headDim (uniform mode).
      *
      * @param config Cache configuration with per-layer configs
@@ -148,12 +150,33 @@ public:
     //! @return Cache configuration
     Config const& getConfig() const noexcept;
 
+    //! Validate the logical schema and resolve donor chains without allocating device memory.
+    static std::vector<int32_t> resolveLayerOwners(Config const& config);
+
+    //! Canonical local attention layer owning the requested logical layer's pool.
+    int32_t physicalOwner(int32_t attnLayerIdx) const noexcept;
+
+    //! Unique owning logical layer indices, in increasing order.
+    std::vector<int32_t> const& physicalOwnerLayerIndices() const noexcept;
+
+    //! Number of allocated pools; numLayers() remains the logical layer count.
+    int32_t numPhysicalOwners() const noexcept;
+
+    //! Total bytes of unique KV pool allocations, excluding metadata and snapshots.
+    size_t allocatedBytes() const noexcept;
+
+    //! Physical bytes per page bundle across all unique owners.
+    size_t bytesPerPage() const noexcept;
+
 private:
     Config mConfig{};                     //!< Cache configuration
-    std::vector<rt::Tensor> mLayerCaches; //!< Per-layer KV page pools on device
-    bool mIsUniform{true};                //!< True if all layers share the same numKVHeads and headDim
-    int32_t mCapPadded{};                 //!< maxSequenceLength padded up to a multiple of kTOKENS_PER_PAGE
-    int32_t mNumPages{}; //!< Resolved total page count (Config::numPages, or minimum active pages if 0)
+    std::vector<rt::Tensor> mLayerCaches; //!< Logical-indexed pools; only canonical owners allocate storage
+    std::vector<int32_t> mLayerOwners;
+    std::vector<int32_t> mPhysicalOwnerLayers;
+    size_t mAllocatedBytes{};
+    bool mIsUniform{true}; //!< True if all layers share the same numKVHeads and headDim
+    int32_t mCapPadded{};  //!< maxSequenceLength padded up to a multiple of kTOKENS_PER_PAGE
+    int32_t mNumPages{};   //!< Resolved total page count (Config::numPages, or minimum active pages if 0)
 };
 
 } // namespace rt

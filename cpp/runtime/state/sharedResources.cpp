@@ -112,6 +112,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.kvCacheType=*/cfg.kvCacheDtype,
         /*.numPages=*/cfg.kvPoolPages,
         /*.allowPoolUndercommit=*/cfg.allowKVPoolUndercommit,
+        /*.sharingDonors=*/cfg.kvSharingDonors,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -221,6 +222,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
             /*.numPages=*/bundle.base.kvPoolPages,
             /*.allowPoolUndercommit=*/bundle.base.allowKVPoolUndercommit,
+            /*.sharingDonors=*/bundle.base.kvSharingDonors,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -264,6 +266,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
             /*.numPages=*/bundle.draft->kvPoolPages,
             /*.allowPoolUndercommit=*/bundle.draft->allowKVPoolUndercommit,
+            /*.sharingDonors=*/bundle.draft->kvSharingDonors,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,

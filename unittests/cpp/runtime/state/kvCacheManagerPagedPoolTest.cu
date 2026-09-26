@@ -232,3 +232,80 @@ TEST(KvCacheManagerPagedPoolTest, ExplicitUndercommitAllocatesConfiguredPool)
     rt::KVCacheManager mgr(config, stream);
     EXPECT_EQ(mgr.numPages(), 1);
 }
+
+TEST(KvCacheManagerPagedPoolTest, OwnerSchemaResolvesIdentityAndChainsWithoutAllocation)
+{
+    auto config = makeHeteroConfig(2, 256, 1, 256, 1, 256, DataType::kHALF);
+    EXPECT_EQ(rt::KVCacheManager::resolveLayerOwners(config), (std::vector<int32_t>{0, 1}));
+    config.numAttentionLayers = 4;
+    config.layerConfigs = {{1, 256}, {1, 512}, {1, 256}, {1, 256}};
+    config.sharingDonors = {-1, -1, 0, 2};
+    EXPECT_EQ(rt::KVCacheManager::resolveLayerOwners(config), (std::vector<int32_t>{0, 1, 0, 0}));
+    config.numAttentionLayers = 0;
+    config.layerConfigs.clear();
+    config.sharingDonors.clear();
+    EXPECT_TRUE(rt::KVCacheManager::resolveLayerOwners(config).empty());
+}
+
+TEST(KvCacheManagerPagedPoolTest, OwnerSchemaRejectsInvalidDonorsBeforeAllocation)
+{
+    auto config = makeHeteroConfig(2, 256, 1, 256, 1, 256, DataType::kHALF);
+    for (auto const& donors : std::vector<std::vector<int32_t>>{{-1}, {-1, 2}, {-2, -1}, {0, -1}, {1, 0}})
+    {
+        config.sharingDonors = donors;
+        EXPECT_THROW(rt::KVCacheManager::resolveLayerOwners(config), std::runtime_error);
+        EXPECT_THROW(rt::KVCacheManager(config, nullptr), std::runtime_error);
+    }
+    config.sharingDonors = {-1, 0};
+    config.layerConfigs[1].headDim = 512;
+    EXPECT_THROW(rt::KVCacheManager::resolveLayerOwners(config), std::runtime_error);
+    config.layerConfigs[1] = {2, 256};
+    EXPECT_THROW(rt::KVCacheManager::resolveLayerOwners(config), std::runtime_error);
+    config.layerConfigs[1] = {1, 256};
+    config.kvCacheType = DataType::kFLOAT;
+    EXPECT_THROW(rt::KVCacheManager::resolveLayerOwners(config), std::runtime_error);
+}
+
+TEST(KvCacheManagerPagedPoolTest, OwnerAllocationKeepsCapacityAndAliasesAllAccessors)
+{
+    for (auto dtype : {DataType::kHALF, DataType::kFP8})
+    {
+        rt::KVCacheManager::Config config{4, 2, 256, {{1, 256}, {1, 512}, {1, 256}, {1, 256}}, dtype};
+        config.sharingDonors = {-1, -1, 0, 2};
+        config.numPages = 1;
+        config.allowPoolUndercommit = true;
+        rt::KVCacheManager cache(config, nullptr);
+        EXPECT_EQ(cache.numLayers(), 4);
+        EXPECT_EQ(cache.numPhysicalOwners(), 2);
+        EXPECT_EQ(cache.physicalOwnerLayerIndices(), (std::vector<int32_t>{0, 1}));
+        EXPECT_EQ(cache.numPages(), 1);
+        EXPECT_EQ(cache.maxCapPadded(), 256);
+        size_t const pageBytes = 2U * rt::kTOKENS_PER_PAGE * (256U + 512U) * rt::utils::getTypeSize(dtype);
+        EXPECT_EQ(cache.allocatedBytes(), pageBytes);
+        EXPECT_EQ(cache.bytesPerPage(), pageBytes);
+        EXPECT_NE(cache.kPoolPtr(0), cache.kPoolPtr(1));
+        rt::KVCacheManager const& immutable = cache;
+        for (int32_t layer : {2, 3})
+        {
+            EXPECT_EQ(cache.physicalOwner(layer), 0);
+            EXPECT_EQ(&cache.getCombinedKVCache(layer), &cache.getCombinedKVCache(0));
+            EXPECT_EQ(immutable.getCombinedKVCache(layer).rawPointer(), cache.kPoolPtr(0));
+            EXPECT_EQ(cache.kPoolPtr(layer), cache.kPoolPtr(0));
+            EXPECT_EQ(cache.vPoolPtr(layer), cache.vPoolPtr(0));
+            auto views = cache.getSeparateKVCache(layer);
+            EXPECT_EQ(views.first.rawPointer(), cache.kPoolPtr(0));
+            EXPECT_EQ(views.second.rawPointer(), cache.vPoolPtr(0));
+        }
+        void* const ownerPointer = cache.kPoolPtr(0);
+        rt::KVCacheManager moved(std::move(cache));
+        EXPECT_EQ(moved.kPoolPtr(3), ownerPointer);
+        EXPECT_EQ(moved.allocatedBytes(), pageBytes);
+        EXPECT_EQ(cache.allocatedBytes(), 0U);
+        EXPECT_EQ(cache.numPhysicalOwners(), 0);
+        rt::KVCacheManager assigned;
+        assigned = std::move(moved);
+        EXPECT_EQ(assigned.kPoolPtr(3), ownerPointer);
+        EXPECT_EQ(assigned.allocatedBytes(), pageBytes);
+        EXPECT_EQ(moved.numPhysicalOwners(), 0);
+    }
+}

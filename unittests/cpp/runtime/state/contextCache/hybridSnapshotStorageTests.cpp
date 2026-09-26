@@ -57,6 +57,43 @@ TEST(HybridSnapshotStorageTests, ReportsExactBytesPerSlot)
     HybridCacheManager::Config const config = makeHybridConfig();
     EXPECT_EQ(HybridSnapshotStorage::recurrentBytesPerSlot(config.mambaConfig), 216U);
     EXPECT_EQ(HybridSnapshotStorage::partialKvBytesPerSlot(config.kvConfig), 8192U);
+    EXPECT_EQ(HybridSnapshotStorage::partialKvBytesPerSlot(KVCacheManager::Config{}), 0U);
+}
+
+TEST(HybridSnapshotStorageTests, SharingCountsPhysicalPartialBytesAndRestoresBorrower)
+{
+    auto config = makeHybridConfig();
+    config.kvConfig.layerConfigs[1] = config.kvConfig.layerConfigs[0];
+    config.kvConfig.sharingDonors = {-1, 0};
+    EXPECT_EQ(HybridSnapshotStorage::partialKvBytesPerSlot(config.kvConfig), 4096U);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    HybridCacheManager cache(config, stream);
+    HybridSnapshotStorage storage(cache, 1, 1);
+    auto& kv = cache.getKVCacheManager();
+    size_t const tokenBytes = 2U * 4U * sizeof(half);
+    size_t const pageBytes = static_cast<size_t>(kTOKENS_PER_PAGE) * tokenBytes;
+    int32_t constexpr kSOURCE_PAGE{7};
+    int32_t constexpr kVALID_TOKENS{17};
+    for (void* pointer : {kv.kPoolPtr(0), kv.vPoolPtr(0)})
+    {
+        CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(pointer) + kSOURCE_PAGE * pageBytes, 0x31, pageBytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(pointer, 0, pageBytes, stream));
+    }
+    storage.capturePartialKv(0, kSOURCE_PAGE, kVALID_TOKENS, stream);
+    storage.restorePartialKv(0, 0, kVALID_TOKENS, stream);
+    Tensor host({static_cast<int64_t>(pageBytes)}, trt_edgellm::rt::DeviceType::kCPU, DataType::kINT8);
+    for (void* pointer : {kv.kPoolPtr(1), kv.vPoolPtr(1)})
+    {
+        CUDA_CHECK(cudaMemcpyAsync(host.rawPointer(), pointer, pageBytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto const* bytes = static_cast<uint8_t const*>(host.rawPointer());
+        for (size_t i = 0; i < pageBytes; ++i)
+        {
+            EXPECT_EQ(bytes[i], i < kVALID_TOKENS * tokenBytes ? 0x31 : 0);
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
 TEST(HybridSnapshotStorageTests, RejectsLiveRecurrentShapeDrift)

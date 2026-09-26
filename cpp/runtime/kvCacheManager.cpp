@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/pagedKvTypes.h"
+#include <limits>
 
 using namespace nvinfer1;
 
@@ -27,8 +28,50 @@ namespace trt_edgellm
 namespace rt
 {
 
+std::vector<int32_t> KVCacheManager::resolveLayerOwners(Config const& config)
+{
+    check::check(
+        config.numAttentionLayers >= 0 && config.layerConfigs.size() == static_cast<size_t>(config.numAttentionLayers),
+        "KV layer schema must match numAttentionLayers.");
+    check::check(config.sharingDonors.empty() || config.sharingDonors.size() == config.layerConfigs.size(),
+        "KV sharingDonors must be empty or match the logical attention layer count.");
+    check::check(
+        config.numAttentionLayers == 0 || config.kvCacheType == DataType::kHALF || config.kvCacheType == DataType::kFP8,
+        "Unsupported KV cache dtype.");
+    for (int32_t layer = 0; layer < config.numAttentionLayers; ++layer)
+    {
+        auto const& shape = config.layerConfigs[layer];
+        check::check(shape.numKVHeads > 0 && shape.headDim > 0, "KV layer dimensions must be positive.");
+        if (!config.sharingDonors.empty())
+        {
+            int32_t const donor = config.sharingDonors[layer];
+            check::check(donor >= -1 && donor < config.numAttentionLayers, "KV donor index is out of range.");
+            if (donor >= 0)
+            {
+                auto const& donorShape = config.layerConfigs[donor];
+                check::check(shape.numKVHeads == donorShape.numKVHeads && shape.headDim == donorShape.headDim,
+                    "KV donor and borrower layouts must match.");
+            }
+        }
+    }
+    std::vector<int32_t> owners(static_cast<size_t>(config.numAttentionLayers));
+    for (int32_t layer = 0; layer < config.numAttentionLayers; ++layer)
+    {
+        int32_t owner = layer;
+        int32_t hops = 0;
+        while (!config.sharingDonors.empty() && config.sharingDonors[owner] >= 0)
+        {
+            check::check(hops++ < config.numAttentionLayers, "KV donor graph contains a cycle.");
+            owner = config.sharingDonors[owner];
+        }
+        owners[layer] = owner;
+    }
+    return owners;
+}
+
 KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     : mConfig(config)
+    , mLayerOwners(resolveLayerOwners(config))
 {
     check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF || mConfig.kvCacheType == nvinfer1::DataType::kFP8,
         "Unsupported KV cache dtype.");
@@ -53,7 +96,7 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
             || static_cast<int64_t>(mConfig.numPages) >= minimumActivePages,
         "KVCacheManager: Config::numPages (" + std::to_string(mConfig.numPages)
             + ") must be >= the minimum active pages (" + std::to_string(minimumActivePages) + ") when non-zero.");
-    check::check(mConfig.numPages <= kMAX_KV_POOL_PAGES,
+    check::check(mConfig.numPages >= 0 && mConfig.numPages <= kMAX_KV_POOL_PAGES,
         "KVCacheManager: Config::numPages exceeds the largest supported paged-KV pool.");
     mNumPages = (mConfig.numPages == 0) ? static_cast<int32_t>(minimumActivePages) : mConfig.numPages;
 
@@ -80,25 +123,37 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         }
     }
 
-    size_t totalBytes = 0;
-    mLayerCaches.reserve(mConfig.numAttentionLayers);
+    mLayerCaches.resize(mConfig.numAttentionLayers);
     for (int32_t i = 0; i < mConfig.numAttentionLayers; ++i)
     {
+        if (mLayerOwners[i] != i)
+        {
+            continue;
+        }
         KVLayerConfig const& lc = mConfig.layerConfigs[i];
         check::check(lc.numKVHeads > 0, "numKVHeads must be positive for layer " + std::to_string(i) + ".");
         check::check(lc.headDim > 0, "headDim must be positive for layer " + std::to_string(i) + ".");
 
-        int64_t const layerVolume = 2 * static_cast<int64_t>(mNumPages) * kTOKENS_PER_PAGE * lc.numKVHeads * lc.headDim;
-        size_t const layerBytes = static_cast<size_t>(layerVolume) * elemSize;
-        totalBytes += layerBytes;
+        size_t layerBytes = elemSize;
+        for (int64_t dimension : {int64_t{2}, static_cast<int64_t>(mNumPages), static_cast<int64_t>(kTOKENS_PER_PAGE),
+                 static_cast<int64_t>(lc.numKVHeads), static_cast<int64_t>(lc.headDim)})
+        {
+            check::check(layerBytes <= static_cast<size_t>(std::numeric_limits<int64_t>::max() / dimension),
+                "KV pool allocation size overflows int64.");
+            layerBytes *= static_cast<size_t>(dimension);
+        }
+        check::check(mAllocatedBytes <= std::numeric_limits<size_t>::max() - layerBytes,
+            "Total KV pool allocation size overflows size_t.");
+        mAllocatedBytes += layerBytes;
+        mPhysicalOwnerLayers.push_back(i);
 
-        mLayerCaches.emplace_back(rt::Tensor({2, mNumPages, kTOKENS_PER_PAGE, lc.numKVHeads, lc.headDim},
-            DeviceType::kGPU, mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
+        mLayerCaches[i] = rt::Tensor({2, mNumPages, kTOKENS_PER_PAGE, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
+            mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i));
     }
 
-    LOG_DEBUG("KVCacheManager(dtype=%s, layers=%d, uniform=%s) allocated %.2f MB total GPU memory", kvCacheTypeStr,
-        mConfig.numAttentionLayers, mIsUniform ? "true" : "false",
-        static_cast<float>(totalBytes) / (1024.0f * 1024.0f));
+    LOG_DEBUG("KVCacheManager(dtype=%s, layers=%d, owners=%d, uniform=%s) allocated %.2f MB total GPU memory",
+        kvCacheTypeStr, mConfig.numAttentionLayers, numPhysicalOwners(), mIsUniform ? "true" : "false",
+        static_cast<float>(mAllocatedBytes) / (1024.0f * 1024.0f));
 }
 
 KVCacheManager::~KVCacheManager() noexcept {}
@@ -107,11 +162,16 @@ KVCacheManager::KVCacheManager(KVCacheManager&& other) noexcept
 {
     mConfig = std::move(other.mConfig);
     mLayerCaches = std::move(other.mLayerCaches);
+    mLayerOwners = std::move(other.mLayerOwners);
+    mPhysicalOwnerLayers = std::move(other.mPhysicalOwnerLayers);
+    mAllocatedBytes = std::exchange(other.mAllocatedBytes, 0U);
     mIsUniform = other.mIsUniform;
     mCapPadded = other.mCapPadded;
     mNumPages = other.mNumPages;
 
     other.mConfig = Config{};
+    other.mLayerOwners.clear();
+    other.mPhysicalOwnerLayers.clear();
     other.mIsUniform = true;
     other.mCapPadded = 0;
     other.mNumPages = 0;
@@ -123,11 +183,16 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
     {
         mConfig = std::move(other.mConfig);
         mLayerCaches = std::move(other.mLayerCaches);
+        mLayerOwners = std::move(other.mLayerOwners);
+        mPhysicalOwnerLayers = std::move(other.mPhysicalOwnerLayers);
+        mAllocatedBytes = std::exchange(other.mAllocatedBytes, 0U);
         mIsUniform = other.mIsUniform;
         mCapPadded = other.mCapPadded;
         mNumPages = other.mNumPages;
 
         other.mConfig = Config{};
+        other.mLayerOwners.clear();
+        other.mPhysicalOwnerLayers.clear();
         other.mIsUniform = true;
         other.mCapPadded = 0;
         other.mNumPages = 0;
@@ -137,12 +202,12 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
 
 rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) noexcept
 {
-    return mLayerCaches[attnLayerIdx];
+    return mLayerCaches[mLayerOwners[attnLayerIdx]];
 }
 
 rt::Tensor const& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) const noexcept
 {
-    return mLayerCaches[attnLayerIdx];
+    return mLayerCaches[mLayerOwners[attnLayerIdx]];
 }
 
 std::pair<rt::Tensor, rt::Tensor> KVCacheManager::getSeparateKVCache(int32_t attnLayerIdx) const noexcept
@@ -167,7 +232,7 @@ int32_t KVCacheManager::numPages() const noexcept
 
 void* KVCacheManager::kPoolPtr(int32_t attnLayerIdx) const noexcept
 {
-    return const_cast<void*>(mLayerCaches[attnLayerIdx].rawPointer());
+    return const_cast<void*>(getCombinedKVCache(attnLayerIdx).rawPointer());
 }
 
 void* KVCacheManager::vPoolPtr(int32_t attnLayerIdx) const noexcept
@@ -196,6 +261,31 @@ bool KVCacheManager::isUniform() const noexcept
 KVCacheManager::Config const& KVCacheManager::getConfig() const noexcept
 {
     return mConfig;
+}
+
+int32_t KVCacheManager::physicalOwner(int32_t attnLayerIdx) const noexcept
+{
+    return mLayerOwners[attnLayerIdx];
+}
+
+std::vector<int32_t> const& KVCacheManager::physicalOwnerLayerIndices() const noexcept
+{
+    return mPhysicalOwnerLayers;
+}
+
+int32_t KVCacheManager::numPhysicalOwners() const noexcept
+{
+    return static_cast<int32_t>(mPhysicalOwnerLayers.size());
+}
+
+size_t KVCacheManager::allocatedBytes() const noexcept
+{
+    return mAllocatedBytes;
+}
+
+size_t KVCacheManager::bytesPerPage() const noexcept
+{
+    return mNumPages > 0 ? mAllocatedBytes / static_cast<size_t>(mNumPages) : 0U;
 }
 
 } // namespace rt

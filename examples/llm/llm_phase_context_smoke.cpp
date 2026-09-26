@@ -795,6 +795,9 @@ int main(int argc, char** argv)
 
         std::unordered_map<std::string, std::string> const emptyLoraMap;
         auto resources = rt::SharedResources::createForLLM(config, emptyLoraMap, setupStream);
+        auto const& physicalKV = resources->cacheManagers.front()->getKVCacheManager();
+        LOG_INFO("PHASE_KV_ALLOCATION logical_layers=%d physical_owners=%d pages=%d allocated_bytes=%zu",
+            physicalKV.numLayers(), physicalKV.numPhysicalOwners(), physicalKV.numPages(), physicalKV.allocatedBytes());
         rt::EmbeddingData embedding;
         bool const reuseTiedEmbedding = rt::ExternalWeightManager::requiresTiedEmbedding(engineDir / "config.json");
         if (reuseTiedEmbedding)
@@ -2706,11 +2709,8 @@ int main(int argc, char** argv)
                     threePhaseConfig.encoderSerializationMaxBurst = static_cast<size_t>(std::stoul(value));
                 }
                 threePhaseConfig.memoryBroker.enabled = std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr;
-                threePhaseConfig.memoryBroker.committedKVPages = config.kvPoolPages;
-                constexpr size_t kTOKENS_PER_KV_PAGE = 128U;
-                threePhaseConfig.memoryBroker.bytesPerKVPage = static_cast<size_t>(config.numAttentionLayers) * 2U
-                    * kTOKENS_PER_KV_PAGE * static_cast<size_t>(config.numKVHeads) * static_cast<size_t>(config.headDim)
-                    * rt::utils::getTypeSize(config.kvCacheDtype);
+                threePhaseConfig.memoryBroker.committedKVPages = physicalKV.numPages();
+                threePhaseConfig.memoryBroker.bytesPerKVPage = physicalKV.bytesPerPage();
                 if (char const* value = std::getenv("TRT_EDGELLM_PHASE_MEMORY_KV_RESERVE_PAGES"))
                 {
                     threePhaseConfig.memoryBroker.kvReservePages = std::stoi(value);
