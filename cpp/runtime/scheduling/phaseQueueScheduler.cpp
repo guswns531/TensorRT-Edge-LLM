@@ -2671,9 +2671,82 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         {
             double const currentActionUs
                 = candidate.decisionCostKnown ? candidate.decisionMakespanUs : candidate.predictedMakespanUs;
-            candidate.predictedHorizonUs = currentActionUs + decodeFormation->newlyProduced.makespanUs;
             candidate.horizonReferenceWorkUs
                 = prefill->makespanUs + decode->makespanUs + decodeFormation->newlyProduced.makespanUs;
+            auto remainingWork
+                = [](std::vector<PhaseWorkItem> const& target, std::vector<PhaseWorkItem> const& dispatched,
+                      bool isPrefill) -> std::optional<std::vector<PhaseWorkItem>> {
+                std::vector<PhaseWorkItem> remaining = target;
+                for (PhaseWorkItem const& item : dispatched)
+                {
+                    auto found = std::find_if(remaining.begin(), remaining.end(),
+                        [&](PhaseWorkItem const& row) { return row.requestId == item.requestId; });
+                    if (found == remaining.end() || found->kvSlotId != item.kvSlotId
+                        || found->tokenOffset != item.tokenOffset || found->promptTokenCount != item.promptTokenCount
+                        || found->prefillClass != item.prefillClass || item.tokenCount <= 0
+                        || item.tokenCount > found->tokenCount || (!isPrefill && item.tokenCount != found->tokenCount)
+                        || (isPrefill && item.tokenCount != found->tokenCount && !found->allowChunkedPrefill))
+                    {
+                        return std::nullopt;
+                    }
+                    found->tokenOffset += isPrefill ? item.tokenCount : 0;
+                    found->tokenCount -= item.tokenCount;
+                }
+                return remaining;
+            };
+            auto const residualPrefill = remainingWork(prefillPlan.prefillBatch, overlapPlan.prefillBatch, true);
+            auto const residualDecode = remainingWork(decodePlan.decodeBatch, overlapPlan.decodeBatch, false);
+            if (residualPrefill.has_value() && residualDecode.has_value())
+            {
+                // The successor D rows belong to the serial frontier. Smaller overlap
+                // shapes must finish its exact missing rows/token suffixes first.
+                double residualUs{};
+                for (PhaseWorkItem const& item : *residualPrefill)
+                {
+                    if (item.tokenCount == 0)
+                    {
+                        continue;
+                    }
+                    PhaseGlobalActionKey residualKey{
+                        PhaseGlobalActionKind::kPrefill, 1, 0, item.tokenCount, contextBucket(item.tokenOffset), 0};
+                    residualKey.primaryWorkClass = static_cast<int32_t>(item.prefillClass);
+                    residualKey.executionVariant = executionVariant(residualKey, item.tokenCount);
+                    Prediction const residual = predictPrefill(residualKey, 1, item.tokenCount, item.tokenOffset,
+                        item.tokenOffset == 0, item.prefillClass, item.tokenCount);
+                    // Singleton completion is bounded and feasible, but can overprice
+                    // residual rows that could be rebatched. Cold costs retain their guard.
+                    residualUs += residual.makespanUs + residual.uncertaintyUs;
+                }
+                int32_t residualDecodeRows{};
+                int32_t residualDecodeMaxContext{};
+                int64_t residualDecodeContextTokens{};
+                for (PhaseWorkItem const& item : *residualDecode)
+                {
+                    if (item.tokenCount > 0)
+                    {
+                        ++residualDecodeRows;
+                        residualDecodeMaxContext = std::max(residualDecodeMaxContext, item.tokenCount);
+                        residualDecodeContextTokens += item.tokenCount;
+                    }
+                }
+                if (residualDecodeRows > 0)
+                {
+                    PhaseGlobalActionKey residualKey{PhaseGlobalActionKind::kDecode, residualDecodeRows, 0, 1,
+                        contextBucket(residualDecodeMaxContext), 0};
+                    residualKey.executionVariant = executionVariant(residualKey, 0);
+                    Prediction const residual = predictDecode(
+                        residualKey, residualDecodeRows, residualDecodeMaxContext, residualDecodeContextTokens);
+                    residualUs += residual.makespanUs + residual.uncertaintyUs;
+                }
+                candidate.predictedHorizonUs = currentActionUs + residualUs + decodeFormation->newlyProduced.makespanUs;
+            }
+            else
+            {
+                // An unmatched frontier receives no completion credit. This finite
+                // envelope is deliberately conservative, not an immediate-action fallback.
+                candidate.predictedHorizonUs = currentActionUs + candidate.horizonReferenceWorkUs
+                    + prefill->uncertaintyUs + decode->uncertaintyUs + decodeFormation->newlyProduced.uncertaintyUs;
+            }
         }
         candidates.push_back(std::move(candidate));
     }

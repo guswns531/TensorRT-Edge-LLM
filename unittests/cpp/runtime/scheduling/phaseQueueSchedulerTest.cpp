@@ -537,8 +537,10 @@ TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationUsesSerialPrefillWhenOverlapF
     config.maxPrefillBatchTokens = 1024;
     config.prefillQueueWaitTargetUs = 1.0e9;
     config.globalDecodeTpotTargetUs = 1.0e9;
-    config.prefillBatchCosts = {{2, 512, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.prefillBatchCosts = {{1, 512, 0, 0, true, 8.0F, 0.0F, PhasePrefillClass::kExternal},
+        {2, 512, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
     config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}, {3, 1024, 3.0F, 3072}};
+    config.overlapBatchCosts = {{1, 1, 512, 0, 1024, true, 8.0F, 2.0F, 8.0F, 0.0F, PhasePrefillClass::kExternal}};
     PhaseQueueScheduler scheduler(config);
     scheduler.enqueuePrefill({1, 512, 1, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
     scheduler.enqueuePrefill({2, 512, 2, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
@@ -560,6 +562,124 @@ TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationUsesSerialPrefillWhenOverlapF
     });
     ASSERT_NE(overlap, frontier.end());
     EXPECT_EQ(overlap->key.primaryBatchSize, 1);
+    EXPECT_TRUE(overlap->overlapCostKnown);
+    EXPECT_NEAR(overlap->predictedMakespanUs, 8000.0, 1.0e-3);
+    EXPECT_NEAR(overlap->predictedHorizonUs, 18500.0, 1.0e-3);
+    EXPECT_NEAR(overlap->horizonReferenceWorkUs, 14500.0, 1.0e-3);
+    EXPECT_EQ(overlap->primaryRequestIds, (std::vector<uint64_t>{1}));
+    EXPECT_EQ(candidate->primaryRequestIds, (std::vector<uint64_t>{1, 2}));
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationKeepsIdenticalOverlapFrontierCost)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableDecodeFormationHorizon = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxPrefillBatchTokens = 1024;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{2, 512, 0, 0, true, 10.0F, 0.0F, PhasePrefillClass::kExternal}};
+    config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}, {3, 1024, 3.0F, 3072}};
+    config.overlapBatchCosts = {{2, 1, 512, 0, 1024, true, 8.0F, 2.0F, 8.0F, 0.0F, PhasePrefillClass::kExternal}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 512, 1, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueuePrefill({2, 512, 2, 0, 512, false, {}, false, PhasePrefillClass::kExternal});
+    scheduler.enqueueDecode({3, 512, 3});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefillDecode);
+    EXPECT_EQ(candidate->primaryRequestIds, (std::vector<uint64_t>{1, 2}));
+    EXPECT_NEAR(candidate->predictedHorizonUs, 10500.0, 1.0e-3);
+    EXPECT_NEAR(candidate->horizonReferenceWorkUs, 14500.0, 1.0e-3);
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationChargesPartialOverlapTokenSuffix)
+{
+    for (bool const measuredSuffix : {false, true})
+    {
+        SCOPED_TRACE(measuredSuffix);
+        PhaseQueueSchedulerConfig config;
+        config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+        config.enableDecodeFormationHorizon = true;
+        config.globalSafeProbeSlackMultiplier = 0.0F;
+        config.maxPrefillChunkTokens = 128;
+        config.enableAdaptivePrefillChunking = true;
+        config.adaptivePrefillChunkCandidates = {64, 128};
+        config.allowAdaptivePrefillCompletionSplit = true;
+        config.enableDynamicPrefillBatching = true;
+        config.enableCostAwarePrefillShapeSelection = true;
+        config.prefillShapeDecodePenaltyWeight = 0.0F;
+        config.prefillQueueWaitTargetUs = 1.0e9;
+        config.globalDecodeTpotTargetUs = 1.0e9;
+        config.globalColdPrefillMsPerToken = 0.1F;
+        config.globalCostModelConfig.coldStartUncertaintyMs = 2.0F;
+        config.prefillBatchCosts = {{1, 64, 0, 0, true, 8.0F, 0.0F}, {1, 128, 0, 0, true, 10.0F, 0.0F},
+            {1, 64, 0, 1, true, 8.0F, 0.0F}, {1, 128, 0, 1, true, 10.0F, 0.0F}};
+        if (measuredSuffix)
+        {
+            config.prefillBatchCosts.push_back({1, 64, 64, 0, false, 7.0F, 0.0F});
+        }
+        config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}};
+        config.overlapBatchCosts
+            = {{1, 1, 64, 0, 1024, true, 4.0F, 2.0F, 4.0F, 0.0F}, {1, 1, 128, 0, 1024, true, 10.0F, 2.0F, 10.0F, 0.0F}};
+        PhaseQueueScheduler scheduler(config);
+        scheduler.enqueuePrefill({1, 128, 1, 0, 128});
+        scheduler.enqueueDecode({2, 512, 2});
+
+        std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+        ASSERT_TRUE(candidate.has_value());
+        EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefill);
+        EXPECT_EQ(candidate->key.chunkLength, 128);
+        EXPECT_NEAR(candidate->predictedHorizonUs, 12500.0, 1.0e-3);
+        auto const& frontier = scheduler.lastGlobalPreviewCandidates();
+        auto const overlap = std::find_if(frontier.begin(), frontier.end(),
+            [](auto const& action) { return action.key.kind == PhaseGlobalActionKind::kPrefillDecode; });
+        ASSERT_NE(overlap, frontier.end());
+        EXPECT_EQ(overlap->key.chunkLength, 64);
+        EXPECT_EQ(overlap->primaryRequestIds, candidate->primaryRequestIds);
+        EXPECT_NEAR(overlap->predictedHorizonUs, measuredSuffix ? 13000.0 : 14400.0, 1.0e-3);
+        EXPECT_NEAR(overlap->horizonReferenceWorkUs, 14000.0, 1.0e-3);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, GlobalDecodeFormationDoesNotCreditUnmatchedOverlapRequest)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableDecodeFormationHorizon = true;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.maxPrefillBatchSize = 2;
+    config.maxOverlapPrefillBatchSize = 1;
+    config.maxPrefillBatchTokens = 512;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.globalDecodeTpotTargetUs = 1.0e9;
+    config.prefillBatchCosts = {{1, 192, 0, 0, true, 8.0F, 0.0F}, {2, 128, 0, 0, true, 10.0F, 0.0F}};
+    config.decodeBatchCosts = {{1, 1024, 2.0F, 1024}, {2, 1024, 2.5F, 2048}, {3, 1024, 3.0F, 3072}};
+    config.overlapBatchCosts = {{1, 1, 192, 0, 1024, true, 8.0F, 2.0F, 8.0F, 0.0F}};
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128, 1, 0, 128});
+    scheduler.enqueuePrefill({2, 128, 2, 0, 128});
+    scheduler.enqueuePrefill({3, 192, 3, 0, 192});
+    scheduler.enqueueDecode({4, 512, 4});
+
+    std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction();
+
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->key.kind, PhaseGlobalActionKind::kPrefill);
+    EXPECT_EQ(candidate->primaryRequestIds, (std::vector<uint64_t>{1, 2}));
+    EXPECT_NEAR(candidate->predictedHorizonUs, 13000.0, 1.0e-3);
+    auto const& frontier = scheduler.lastGlobalPreviewCandidates();
+    auto const overlap = std::find_if(frontier.begin(), frontier.end(),
+        [](auto const& action) { return action.key.kind == PhaseGlobalActionKind::kPrefillDecode; });
+    ASSERT_NE(overlap, frontier.end());
+    EXPECT_EQ(overlap->primaryRequestIds, (std::vector<uint64_t>{3}));
+    EXPECT_NEAR(overlap->predictedHorizonUs, 22500.0, 1.0e-3);
+    EXPECT_NEAR(overlap->horizonReferenceWorkUs, 14500.0, 1.0e-3);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalPreviewRetainsTheCompletePolicyNeutralCandidateFrontier)
