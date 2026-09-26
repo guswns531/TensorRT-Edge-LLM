@@ -196,6 +196,26 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(config["vision_batch_size"], 4)
         self.assertEqual(config["calibration_requests"], 49)
 
+    def test_cosmos_defaults_use_raw_corrected_frozen_baseline(self):
+        commands = [{
+            "case":
+            "mixed",
+            "command": [
+                "client", "--trace", "mixed.json", "--generic-warmup-trace",
+                "generic.json"
+            ]
+        }]
+        with unittest.mock.patch.object(pathlib.Path,
+                                        "read_text",
+                                        return_value=json.dumps(commands)):
+            config = G_RUNNER.model_config(self.repo, "cosmos")
+        expected = pathlib.Path(".local/results/review-correction-20260926/"
+                                "cosmos-vllm-frozen-raw-corrected.json")
+        self.assertEqual(config["frozen_vllm"], self.repo / expected)
+        self.assertEqual(G_REPORTER.DEFAULT_COSMOS_VLLM, expected)
+        self.assertEqual(config["calibration_requests"], 239)
+        self.assertEqual(config["traces"]["mixed"], self.repo / "mixed.json")
+
     def test_calibration_shapes_preserve_retained_sparse_contract(self):
         self.assertEqual(G_RUNNER.warmup_decode_batches(24),
                          "1,2,4,8,12,16,20,24")
@@ -428,6 +448,20 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
                           "test": report
                       }}))
 
+    def test_historical_frozen_schema_remains_readable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "historical.json"
+            row = {"vllm_" + metric: 10.0 for metric in G_REPORTER.METRICS}
+            row["workload"] = "mixed"
+            path.write_text(json.dumps({"rows": [row]}))
+            loaded = G_REPORTER.load_frozen(path)["mixed"]
+        self.assertEqual(loaded["metrics"],
+                         {metric: 10.0
+                          for metric in G_REPORTER.METRICS})
+        self.assertIsNone(loaded["repeat_count"])
+        self.assertIsNone(loaded["trace_sha256"])
+        self.assertEqual(loaded["raw_origins"], [])
+
     def test_frozen_raw_recovery_checks_hashes_coverage_and_mean_contract(
             self):
         with tempfile.TemporaryDirectory() as folder:
@@ -472,6 +506,7 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             corrected.write_text(json.dumps(result))
             loaded = G_REPORTER.load_frozen(corrected)["mixed"]
             self.assertEqual(loaded["trace_sha256"], trace_hash)
+            self.assertEqual(loaded["repeat_count"], 3)
             self.assertEqual(len(loaded["raw_origins"]), 3)
             with self.assertRaisesRegex(ValueError, "Repeated raw baseline"):
                 G_FROZEN_RECOVERY.reconstruct(summary, [raw_root, raw_root],

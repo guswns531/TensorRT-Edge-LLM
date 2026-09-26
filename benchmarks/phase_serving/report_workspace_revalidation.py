@@ -38,6 +38,8 @@ LABELS = ("tok/s", "TTFT mean", "TTFT p95", "TPOT mean", "TPOT p95",
 WORKLOADS = ("balanced", "mixed", "vision-heavy", "multi-image",
              "long-prefill", "bimodal", "decode-heavy", "short", "text-heavy",
              "poisson", "wave-drain", "late-vision")
+DEFAULT_COSMOS_VLLM = pathlib.Path(".local/results/review-correction-20260926/"
+                                   "cosmos-vllm-frozen-raw-corrected.json")
 
 
 def file_identity(path):
@@ -49,7 +51,7 @@ def file_identity(path):
 
 
 def load_frozen(path):
-    """Accept the retained Cosmos comparison summary or Gemma per-workload aggregates."""
+    """Accept corrected or historical Cosmos rows and Gemma per-workload aggregates."""
     if path.is_file():
         data = json.loads(path.read_text())
         return {
@@ -308,12 +310,9 @@ def main():
         default=pathlib.Path(
             ".local/results/gemma4-vllm-capacity-sweep-20260912/"
             "selected-seq24-kv480-p4096-g24-full12"))
-    parser.add_argument(
-        "--cosmos-vllm",
-        type=pathlib.Path,
-        default=pathlib.Path(
-            ".local/results/v0101-forward-port/v3-service-scale-20260910/"
-            "vllm-fresh-equal-summary.json"))
+    parser.add_argument("--cosmos-vllm",
+                        type=pathlib.Path,
+                        default=DEFAULT_COSMOS_VLLM)
     parser.add_argument("--output-prefix", type=pathlib.Path, required=True)
     args = parser.parse_args()
     baselines = {

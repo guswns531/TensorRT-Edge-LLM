@@ -148,7 +148,7 @@ def model_config(repo, name, overrides=None):
         80,
         "frozen_vllm":
         repo /
-        ".local/results/v0101-forward-port/v3-service-scale-20260910/vllm-fresh-equal-summary.json"
+        ".local/results/review-correction-20260926/cosmos-vllm-frozen-raw-corrected.json"
     }
     config.update(overrides or {})
     return config
