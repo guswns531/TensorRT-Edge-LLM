@@ -15,6 +15,7 @@
 """CPU-only contracts for paired lifetime-admission HTTP experiments."""
 
 import gzip
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -37,6 +38,7 @@ G_RUNNER = load_tool("run_lifetime_encoded_admission")
 G_ANALYZER = load_tool("analyze_lifetime_encoded_admission")
 G_SERVICE_ANALYZER = load_tool("analyze_decode_service_admission")
 G_REPORTER = load_tool("report_workspace_revalidation")
+G_FROZEN_RECOVERY = load_tool("rederive_frozen_vllm")
 
 
 def environment(command):
@@ -387,6 +389,62 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
                       G_REPORTER.markdown({"campaigns": {
                           "test": report
                       }}))
+
+    def test_frozen_raw_recovery_checks_hashes_coverage_and_mean_contract(
+            self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            trace = root / "trace.json"
+            trace.write_text("[]\n")
+            trace_hash = hashlib.sha256(trace.read_bytes()).hexdigest()
+            commands = root / "commands.json"
+            commands.write_text(
+                json.dumps([{
+                    "case": "mixed",
+                    "command": ["client", "--trace",
+                                str(trace)]
+                }]))
+            summary = root / "historical.json"
+            summary.write_text(
+                json.dumps({
+                    "rows": [{
+                        "workload": "mixed",
+                        "success_runs": 3,
+                        "attempted_runs": 4,
+                        "failed_runs": 1
+                    }]
+                }))
+            raw_root = root / "raw"
+            for index, value in enumerate((10, 20, 90)):
+                path = raw_root / "mixed" / str(
+                    index) / "client" / "aggregate.json"
+                path.parent.mkdir(parents=True)
+                data = {metric: value for metric in G_FROZEN_RECOVERY.METRICS}
+                data.update(repeats=1, trace_sha256=trace_hash)
+                path.write_text(json.dumps(data))
+            result = G_FROZEN_RECOVERY.reconstruct(summary, [raw_root],
+                                                   commands)
+            row = result["rows"][0]
+            self.assertEqual(row["vllm_ttft_mean_of_run_means_ms"], 40)
+            self.assertEqual(row["vllm_ttft_p95_median_ms"], 20)
+            self.assertEqual(row["vllm_generated_token_s_median"], 20)
+            self.assertEqual(row["failed_runs"], 1)
+            self.assertEqual(len(row["raw_origins"]), 3)
+            corrected = root / "corrected.json"
+            corrected.write_text(json.dumps(result))
+            loaded = G_REPORTER.load_frozen(corrected)["mixed"]
+            self.assertEqual(loaded["trace_sha256"], trace_hash)
+            self.assertEqual(len(loaded["raw_origins"]), 3)
+            with self.assertRaisesRegex(ValueError, "Repeated raw baseline"):
+                G_FROZEN_RECOVERY.reconstruct(summary, [raw_root, raw_root],
+                                              commands)
+            trace.write_text("[1]\n")
+            with self.assertRaisesRegex(ValueError, "workload hash differs"):
+                G_FROZEN_RECOVERY.reconstruct(summary, [raw_root], commands)
+            trace.write_text("[]\n")
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "success count differs"):
+                G_FROZEN_RECOVERY.reconstruct(summary, [raw_root], commands)
 
     def test_description_does_not_require_an_exact_key_or_model_dependency(
             self):

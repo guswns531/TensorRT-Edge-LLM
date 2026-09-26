@@ -59,6 +59,8 @@ def load_frozen(path):
                     for metric in METRICS
                 },
                 "repeat_count": row.get("success_runs"),
+                "trace_sha256": row.get("trace_sha256"),
+                "raw_origins": row.get("raw_origins", []),
                 "identity": file_identity(path),
             }
             for row in data["rows"]
@@ -368,6 +370,13 @@ def main():
                                                 "HEAD"])).hexdigest(),
         "analyzer":
         file_identity(pathlib.Path(__file__)),
+        "baseline_inputs": {
+            model: {
+                workload: baseline["identity"]
+                for workload, baseline in workloads.items()
+            }
+            for model, workloads in baselines.items()
+        },
         "campaign_manifests": {
             label: campaign["manifest"]
             for label, campaign in report["campaigns"].items()
