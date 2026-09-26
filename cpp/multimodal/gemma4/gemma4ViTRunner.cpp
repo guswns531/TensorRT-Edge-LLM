@@ -25,10 +25,13 @@
 #include "profiling/timer.h"
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 
 using Json = nlohmann::json;
 
@@ -36,6 +39,236 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+namespace
+{
+int64_t checkedScratchProduct(int64_t lhs, int64_t rhs)
+{
+    ELLM_CHECK(lhs > 0 && rhs > 0 && lhs <= std::numeric_limits<int64_t>::max() / rhs,
+        "Gemma4 resize scratch size is invalid or overflows");
+    return lhs * rhs;
+}
+} // namespace
+
+Gemma4ResizeScratch::Requirements Gemma4ResizeScratch::requirements(
+    int64_t rawHeight, int64_t rawWidth, int64_t channels, int64_t outHeight, int64_t outWidth)
+{
+    ELLM_CHECK(rawHeight > 0 && rawWidth > 0 && channels > 0 && outHeight > 0 && outWidth > 0,
+        "Gemma4 resize dimensions and channels must be positive");
+    if (rawHeight == outHeight && rawWidth == outWidth)
+    {
+        return {};
+    }
+    ELLM_CHECK(rawHeight <= kernel::kGpuResizeMaxRawDim && rawWidth <= kernel::kGpuResizeMaxRawDim,
+        "Gemma4 raw image exceeds the GPU-resize dimension limit");
+    return {checkedScratchProduct(checkedScratchProduct(rawHeight, rawWidth), channels),
+        checkedScratchProduct(checkedScratchProduct(checkedScratchProduct(rawHeight, outWidth), channels),
+            static_cast<int64_t>(sizeof(float)))};
+}
+
+void Gemma4ResizeScratch::initialize(int64_t channels, int64_t maxImagePixels, bool memoryPoolsSupported)
+{
+    ELLM_CHECK(!mInitialized, "Gemma4 resize scratch is already initialized");
+    ELLM_CHECK(channels > 0 && maxImagePixels > 0, "Gemma4 resize scratch capacity must be positive");
+    CUDA_CHECK(cudaEventCreateWithFlags(&mLastUse, cudaEventDisableTiming));
+    mInitialized = true;
+    mMetrics.streamOrdered = memoryPoolsSupported;
+    if (!memoryPoolsSupported)
+    {
+        int64_t const maxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
+        int64_t const temporaryElements
+            = checkedScratchProduct(static_cast<int64_t>(std::sqrt(static_cast<double>(maxImagePixels) * maxRawPixels)
+                                        * kernel::kGpuResizeScratchMargin),
+                channels);
+        kernel::allocateResizeScratch(channels, temporaryElements, mRaw, mTemporary);
+        mMetrics.rawAllocatedBytes = mRaw.getMemoryCapacity();
+        mMetrics.temporaryAllocatedBytes = mTemporary.getMemoryCapacity();
+        mMetrics.allocatedHighWaterBytes = mMetrics.rawAllocatedBytes + mMetrics.temporaryAllocatedBytes;
+        LOG_INFO("Gemma4 resize scratch uses startup allocation: CUDA memory pools are unsupported");
+    }
+    logAllocation();
+}
+
+Gemma4ResizeScratch::~Gemma4ResizeScratch() noexcept
+{
+    if (mUseRecorded)
+    {
+        // Caller streams may already be destroyed; the owned event remains the completion boundary.
+        cudaError_t const status = cudaEventSynchronize(mLastUse);
+        if (status != cudaSuccess)
+        {
+            mCompletionUncertain = true;
+            LOG_ERROR("Gemma4 resize scratch completion failed during destruction: %s", cudaGetErrorString(status));
+        }
+    }
+    if (mInitialized)
+    {
+        logAllocation();
+    }
+    if (mMetrics.streamOrdered)
+    {
+        if (mCompletionUncertain)
+        {
+            LOG_ERROR("Gemma4 resize scratch retained until CUDA context teardown: completion is unknown");
+        }
+        else
+        {
+            for (void* pointer : {mRaw.rawPointer(), mTemporary.rawPointer()})
+            {
+                if (pointer != nullptr)
+                {
+                    cudaError_t const status = cudaFree(pointer);
+                    if (status != cudaSuccess)
+                    {
+                        LOG_ERROR("Gemma4 resize scratch release failed: %s", cudaGetErrorString(status));
+                    }
+                }
+            }
+        }
+    }
+    if (mLastUse != nullptr)
+    {
+        static_cast<void>(cudaEventDestroy(mLastUse));
+    }
+}
+
+void Gemma4ResizeScratch::recordUse(cudaStream_t stream)
+{
+    ELLM_CHECK(mInitialized && stream != nullptr, "Gemma4 resize scratch requires an explicit initialized stream");
+    mCompletionUncertain = true;
+    if (mUseRecorded)
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, mLastUse, 0));
+    }
+    CUDA_CHECK(cudaEventRecord(mLastUse, stream));
+    mUseRecorded = true;
+    mCompletionUncertain = false;
+}
+
+void Gemma4ResizeScratch::reserve(Requirements required, cudaStream_t stream)
+{
+    ELLM_CHECK(mInitialized && stream != nullptr, "Gemma4 resize scratch requires an explicit initialized stream");
+    ELLM_CHECK(required.rawBytes >= 0 && required.temporaryBytes >= 0
+            && required.temporaryBytes % static_cast<int64_t>(sizeof(float)) == 0
+            && required.rawBytes <= std::numeric_limits<int64_t>::max() - required.temporaryBytes,
+        "Gemma4 resize scratch byte requirements are invalid");
+    cudaStreamCaptureStatus captureStatus{};
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &captureStatus));
+    ELLM_CHECK(captureStatus == cudaStreamCaptureStatusNone,
+        "Gemma4 growable resize scratch does not support preprocessing graph capture");
+    if (mUseRecorded)
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, mLastUse, 0));
+    }
+    mMetrics.requiredHighWaterBytes
+        = std::max(mMetrics.requiredHighWaterBytes, required.rawBytes + required.temporaryBytes);
+    bool const growRaw = required.rawBytes > mMetrics.rawAllocatedBytes;
+    bool const growTemporary = required.temporaryBytes > mMetrics.temporaryAllocatedBytes;
+    ELLM_CHECK(std::max(required.rawBytes, mMetrics.rawAllocatedBytes) <= std::numeric_limits<int64_t>::max()
+                - std::max(required.temporaryBytes, mMetrics.temporaryAllocatedBytes),
+        "Gemma4 retained resize scratch capacities overflow");
+    if (!growRaw && !growTemporary)
+    {
+        return;
+    }
+    ELLM_CHECK(mMetrics.streamOrdered, "Gemma4 image exceeds startup resize scratch capacity");
+
+    void* newRaw{};
+    void* newTemporary{};
+    try
+    {
+        // Stage both replacements before retiring either old allocation, so OOM preserves reusable capacity.
+        if (growRaw)
+        {
+            CUDA_CHECK(cudaMallocAsync(&newRaw, static_cast<size_t>(required.rawBytes), stream));
+        }
+        if (growTemporary)
+        {
+            CUDA_CHECK(cudaMallocAsync(&newTemporary, static_cast<size_t>(required.temporaryBytes), stream));
+        }
+        Tensor rawView(newRaw, {growRaw ? required.rawBytes : 0}, DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+        Tensor temporaryView(newTemporary,
+            {growTemporary ? required.temporaryBytes / static_cast<int64_t>(sizeof(float)) : 0}, DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT);
+        rawView.setAllowReshape(true);
+        temporaryView.setAllowReshape(true);
+        if (growRaw)
+        {
+            if (mRaw.rawPointer() != nullptr)
+            {
+                CUDA_CHECK(cudaFreeAsync(mRaw.rawPointer(), stream));
+            }
+            mRaw = std::move(rawView);
+            newRaw = nullptr;
+            mMetrics.rawAllocatedBytes = required.rawBytes;
+        }
+        if (growTemporary)
+        {
+            if (mTemporary.rawPointer() != nullptr)
+            {
+                CUDA_CHECK(cudaFreeAsync(mTemporary.rawPointer(), stream));
+            }
+            mTemporary = std::move(temporaryView);
+            newTemporary = nullptr;
+            mMetrics.temporaryAllocatedBytes = required.temporaryBytes;
+        }
+        recordUse(stream);
+    }
+    catch (...)
+    {
+        std::exception_ptr const failure = std::current_exception();
+        for (void* pointer : {newRaw, newTemporary})
+        {
+            if (pointer != nullptr)
+            {
+                cudaError_t const status = cudaFreeAsync(pointer, stream);
+                if (status != cudaSuccess)
+                {
+                    LOG_ERROR("Gemma4 staged resize scratch retirement failed: %s", cudaGetErrorString(status));
+                }
+            }
+        }
+        try
+        {
+            recordUse(stream);
+        }
+        catch (std::exception const& error)
+        {
+            LOG_ERROR("Gemma4 resize scratch rollback completion failed: %s", error.what());
+            // Error recovery must protect any allocation/work submitted before the event-record failure.
+            mCompletionUncertain = cudaStreamSynchronize(stream) != cudaSuccess;
+        }
+        std::rethrow_exception(failure);
+    }
+    ++mMetrics.growthCount;
+    mMetrics.allocatedHighWaterBytes
+        = std::max(mMetrics.allocatedHighWaterBytes, mMetrics.rawAllocatedBytes + mMetrics.temporaryAllocatedBytes);
+    logAllocation();
+}
+
+void Gemma4ResizeScratch::logAllocation() noexcept
+{
+    if (mMetrics.streamOrdered)
+    {
+        int device{};
+        cudaMemPool_t pool{};
+        if (cudaGetDevice(&device) == cudaSuccess && cudaDeviceGetMemPool(&pool, device) == cudaSuccess)
+        {
+            static_cast<void>(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &mMetrics.poolUsedBytes));
+            static_cast<void>(
+                cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &mMetrics.poolReservedBytes));
+        }
+    }
+    LOG_INFO(
+        "Gemma4 resize scratch: async=%d raw_bytes=%lld temporary_bytes=%lld allocated_high_water_bytes=%lld "
+        "required_high_water_bytes=%lld growth_count=%llu device_pool_used_bytes=%llu device_pool_reserved_bytes=%llu",
+        mMetrics.streamOrdered, static_cast<long long>(mMetrics.rawAllocatedBytes),
+        static_cast<long long>(mMetrics.temporaryAllocatedBytes),
+        static_cast<long long>(mMetrics.allocatedHighWaterBytes),
+        static_cast<long long>(mMetrics.requiredHighWaterBytes), static_cast<unsigned long long>(mMetrics.growthCount),
+        static_cast<unsigned long long>(mMetrics.poolUsedBytes),
+        static_cast<unsigned long long>(mMetrics.poolReservedBytes));
+}
 
 Gemma4ViTRunner::Gemma4ViTRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner(engineDir, stream)
@@ -281,15 +514,11 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
     mNormalizedImageDevice = rt::Tensor({maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "Gemma4ViTRunner::mNormalizedImageDevice");
 
-    // GPU image-resize scratch.
-    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
-    // Horizontal-pass scratch holds [rawH, outW, C] floats. gemma4ResizeTarget preserves aspect ratio,
-    // so rawH * outW <= sqrt(maxImagePixels * rawH * rawW) <= sqrt(maxImagePixels * kMaxRawPixels).
-    int64_t const kMaxResizeTmpElems
-        = static_cast<int64_t>(
-              std::sqrt(static_cast<double>(maxImagePixels) * kMaxRawPixels) * kernel::kGpuResizeScratchMargin)
-        * channels;
-    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
+    int device{};
+    int memoryPoolsSupported{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&memoryPoolsSupported, cudaDevAttrMemoryPoolsSupported, device));
+    mResizeScratch.initialize(channels, maxImagePixels, memoryPoolsSupported != 0);
 
     return true;
 }
@@ -431,9 +660,13 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 auto [resizedHeight, resizedWidth] = rt::imageUtils::gemma4ResizeTarget(image.height, image.width,
                     mConfig.maxImageTokensPerImage, mConfig.poolingKernelSize, mConfig.patchSize);
-                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
-                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                mResizeScratch.reserve(Gemma4ResizeScratch::requirements(
+                                           image.height, image.width, image.channels, resizedHeight, resizedWidth),
                     stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mResizeScratch.raw(), mResizeScratch.temporary(), mImageDevice, resizedHeight,
+                    resizedWidth, stream);
+                mResizeScratch.recordUse(stream);
                 formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageGrids, imageTokenLengths,
                     cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
@@ -441,7 +674,8 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
                 kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
-                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
+                    image.channels, mResizeScratch.raw(), mResizeScratch.temporary(), mImageDevice, image.height,
+                    image.width, stream);
                 formatPatch(image, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
             ++numImage;
@@ -614,6 +848,17 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
+        if (!skipEncoderWork)
+        {
+            try
+            {
+                mResizeScratch.recordUse(stream);
+            }
+            catch (std::exception const& scratchError)
+            {
+                LOG_ERROR("Gemma4 resize scratch completion recording failed: %s", scratchError.what());
+            }
+        }
         bool const actionable = isCallerActionable(e);
         if (!actionable)
         {
