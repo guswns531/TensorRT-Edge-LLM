@@ -23,6 +23,47 @@ import subprocess
 import threading
 import time
 
+MINIMAL_STARTUP_OVERRIDES = {
+    "TRT_EDGELLM_DISABLE_IPC_SHAPE_WARMUP": "1",
+    "TRT_EDGELLM_DISABLE_GLOBAL_OVERLAP_WARMUP": "1",
+    "TRT_EDGELLM_CAPTURE_PHASE_GRAPHS": "0",
+    "TRT_EDGELLM_ONLINE_GRAPH_CAPTURE": "0",
+    "TRT_EDGELLM_MAX_PREFILL_GRAPHS": "0",
+    "TRT_EDGELLM_MAX_DECODE_GRAPHS": "0",
+    "TRT_EDGELLM_POLICY_WARMUP_MODE": "zero_start",
+    # Explicit shape lists take precedence over the disable-shape-warmup flag.
+    "TRT_EDGELLM_IPC_WARMUP_DECODE_SHAPES": None,
+}
+
+
+def replace_docker_environment(command, overrides, image_index):
+    """Replace/add Docker environment entries; None removes a named entry."""
+    if command[:2] != ["docker", "run"] or not 2 < image_index < len(command):
+        raise ValueError(
+            "Expected a docker run command with an image boundary")
+    result = []
+    index = 0
+    while index < image_index:
+        token = command[index]
+        if token in ("-e", "--env"):
+            if index + 1 >= image_index:
+                raise ValueError("Docker environment argument has no value")
+            assignment = command[index + 1]
+            if assignment.split("=", 1)[0] not in overrides:
+                result.extend(command[index:index + 2])
+            index += 2
+        elif token.startswith("--env="):
+            if token[len("--env="):].split("=", 1)[0] not in overrides:
+                result.append(token)
+            index += 1
+        else:
+            result.append(token)
+            index += 1
+    for name, value in overrides.items():
+        if value is not None:
+            result.extend(["-e", name + "=" + value])
+    return result + command[image_index:]
+
 
 class CancellationAttempts:
     """Retry only after another token when the runtime rejects a busy cancellation."""
@@ -77,6 +118,13 @@ def run(args):
     for index, value in enumerate(command):
         if value.endswith(":/opt/results:rw"):
             command[index] = str(output) + ":/opt/results:rw"
+    startup_overrides = (MINIMAL_STARTUP_OVERRIDES
+                         if args.minimal_startup else {})
+    if startup_overrides:
+        image_index = command.index(
+            "/opt/edgellm/examples/llm/llm_phase_context_smoke") - 1
+        command = replace_docker_environment(command, startup_overrides,
+                                             image_index)
     if args.sanitizer:
         index = command.index(
             "/opt/edgellm/examples/llm/llm_phase_context_smoke")
@@ -180,6 +228,19 @@ def run(args):
             "error": error,
             "model": args.model,
             "sanitizer": args.sanitizer,
+            "result_state": "diagnostic",
+            "startup_contract": {
+                "mode": ("minimal_startup"
+                         if args.minimal_startup else "source_campaign"),
+                "environment_overrides":
+                startup_overrides,
+                "null_override_means":
+                "unset",
+                "performance_comparable":
+                False,
+                "source_memory_and_batch_limits_preserved":
+                True,
+            },
             "command": command,
             "source_identity": manifest["identity"],
             "events": observed,
@@ -214,6 +275,11 @@ def main():
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--sanitizer", action="store_true")
+    parser.add_argument(
+        "--minimal-startup",
+        action="store_true",
+        help="Diagnostic only: disable startup policy/shape warmup and graphs; "
+        "retain the source memory and batch limits (not a performance run)")
     return run(parser.parse_args())
 
 
