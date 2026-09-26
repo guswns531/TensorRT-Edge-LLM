@@ -322,6 +322,72 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 G_REPORTER.collect_campaign(root, baseline)
 
+    def test_report_aggregation_matches_frozen_metric_names(self):
+        baseline = {"metrics": {metric: 10.0 for metric in G_REPORTER.METRICS}}
+        runs = [{
+            metric: value
+            for metric in G_REPORTER.METRICS
+        } for value in (10, 20, 90)]
+        row = G_REPORTER.compare_runs(runs, baseline)
+        self.assertEqual(
+            row["metrics"]["ttft_mean_of_run_means_ms"]["current"], 40)
+        self.assertEqual(
+            row["metrics"]["tpot_mean_of_run_means_ms"]["current"], 40)
+        self.assertEqual(row["metrics"]["e2e_mean_of_run_means_ms"]["current"],
+                         40)
+        self.assertEqual(row["metrics"]["generated_token_s_median"]["current"],
+                         20)
+        self.assertEqual(row["metrics"]["e2e_p95_median_ms"]["current"], 20)
+
+    def test_failed_aggregate_cannot_make_a_campaign_complete(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            cell = root / "gemma/shared_ep/repeat-001/mixed"
+            cell.mkdir(parents=True)
+            aggregate = {metric: 20.0 for metric in G_REPORTER.METRICS}
+            aggregate.update(generated_tokens_per_run_min=4,
+                             requested_output_tokens_per_run=4)
+            (cell / "aggregate.json").write_text(json.dumps(aggregate))
+            record = {
+                "model": "gemma",
+                "variant": "shared_ep",
+                "repeat": 1,
+                "workload": "mixed"
+            }
+            (root / "manifest.json").write_text(
+                json.dumps({
+                    "commands": [record],
+                    "failures": [record]
+                }))
+            report = G_REPORTER.collect_campaign(root, {})
+            self.assertEqual(report["rows"], [])
+            self.assertEqual(report["retained_cells"], 0)
+            self.assertFalse(report["requested_cells_complete"])
+            self.assertEqual(report["missing_cells"], 1)
+            self.assertEqual(report["failed_cells"], 1)
+            self.assertEqual(report["excluded_aggregates"][0]["reason"],
+                             "failed_cell")
+            self.assertIn("not a complete campaign",
+                          G_REPORTER.markdown({"campaigns": {
+                              "test": report
+                          }}))
+
+    def test_frozen_missing_trace_hash_is_prominently_disclosed(self):
+        baseline = {"metrics": {metric: 10.0 for metric in G_REPORTER.METRICS}}
+        row = G_REPORTER.compare_runs([{
+            metric: 10.0
+            for metric in G_REPORTER.METRICS
+        }], baseline)
+        row.update(model="cosmos",
+                   variant="shared_ep",
+                   workload="mixed",
+                   baseline_trace_identity="not_available_in_frozen_summary")
+        report = {"rows": [row], "retained_cells": 1, "expected_cells": 1}
+        self.assertIn("cannot verify byte-identical traces",
+                      G_REPORTER.markdown({"campaigns": {
+                          "test": report
+                      }}))
+
     def test_description_does_not_require_an_exact_key_or_model_dependency(
             self):
         self.assertEqual(G_ANALYZER.distribution([]), {"samples": 0})

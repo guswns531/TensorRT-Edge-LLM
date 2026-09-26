@@ -96,7 +96,7 @@ def repeatability(runs):
 
 
 def compare_runs(runs, baseline):
-    """Use median across runs consistently for all seven metrics, retaining dispersion."""
+    """Respect each metric's mean-of-means or median contract, retaining dispersion."""
     result = {
         "run_count": len(runs),
         "repeatability": repeatability(runs),
@@ -106,7 +106,8 @@ def compare_runs(runs, baseline):
     for metric in METRICS:
         values = [float(run[metric]) for run in runs]
         reference = float(baseline["metrics"][metric])
-        current = statistics.median(values)
+        current = (statistics.mean(values) if "mean_of_run_means" in metric
+                   else statistics.median(values))
         if not all(
                 math.isfinite(value) and value > 0.0
                 for value in values + [reference]):
@@ -131,12 +132,36 @@ def collect_campaign(root, baselines):
     manifest_path = root / "manifest.json"
     manifest = json.loads(
         manifest_path.read_text()) if manifest_path.exists() else {}
-    expected = len(manifest.get("commands", []))
+
+    def record_key(record):
+        return (record["model"], record["variant"], int(record["repeat"]),
+                record["workload"])
+
+    requested = {record_key(record) for record in manifest.get("commands", [])}
+    completed = {
+        record_key(record)
+        for record in manifest.get("completed", [])
+    }
+    failed = {record_key(record)
+              for record in manifest.get("failures", [])} - completed
+    expected = len(requested)
+    accepted = set()
+    excluded = []
     for path in sorted(root.glob("*/*/repeat-*/*/aggregate.json")):
         model, variant, repeat, workload = path.relative_to(root).parts[:4]
+        cell_key = (model, variant, int(repeat.split("-", 1)[1]), workload)
+        if cell_key in failed or (requested and cell_key not in requested):
+            excluded.append({
+                "path":
+                str(path),
+                "reason":
+                "failed_cell" if cell_key in failed else "not_requested"
+            })
+            continue
         data = json.loads(path.read_text())
-        if data.get("generated_tokens_per_run_min") != data.get(
-                "requested_output_tokens_per_run"):
+        if (data.get("requested_output_tokens_per_run", 0) <= 0
+                or data.get("generated_tokens_per_run_min")
+                != data["requested_output_tokens_per_run"]):
             raise ValueError("Incomplete fixed-output workload: " + str(path))
         baseline = baselines[model][workload]
         if baseline.get("trace_sha256") and baseline[
@@ -146,6 +171,7 @@ def collect_campaign(root, baselines):
         group = groups.setdefault(key, {"runs": [], "origins": []})
         group["runs"].append(data)
         group["origins"].append(dict(file_identity(path), repeat=repeat))
+        accepted.add(cell_key)
     rows = []
     for (model, variant, workload), group in sorted(groups.items()):
         row = compare_runs(group["runs"], baselines[model][workload])
@@ -157,7 +183,7 @@ def collect_campaign(root, baselines):
             "hash_matched" if baselines[model][workload].get("trace_sha256")
             else "not_available_in_frozen_summary")
         rows.append(row)
-    if not rows:
+    if not rows and not requested:
         raise ValueError("No raw cell aggregates: " + str(root))
     retained_cells = sum(len(group["runs"]) for group in groups.values())
     return {
@@ -167,7 +193,10 @@ def collect_campaign(root, baselines):
         "expected_cells": expected or None,
         "retained_cells": retained_cells,
         "requested_cells_complete":
-        retained_cells == expected if expected else None,
+        requested == accepted if expected else None,
+        "failed_cells": len(failed & requested),
+        "missing_cells": len(requested - accepted) if expected else None,
+        "excluded_aggregates": excluded,
         "rows": rows,
     }
 
@@ -210,7 +239,8 @@ def markdown(report):
     """Render paired values and delta for every metric, not throughput-only victory labels."""
     lines = [
         "# Raw-result workspace revalidation", "",
-        "Values are median across retained run aggregates; latency units are ms. "
+        "Latency means are arithmetic means of per-run means; throughput and latency p95 are medians across runs. "
+        "Latency units are ms. "
         "Each cell is Current / frozen vLLM (relative change). Lower latency is better. "
         "A one-run token hash does not test repeatability; no confidence interval is claimed.",
         ""
@@ -221,6 +251,23 @@ def markdown(report):
             "Retained/requested cells: %s/%s. Full-12 coverage and repeat counts are independent of metric wins."
             % (campaign["retained_cells"], campaign["expected_cells"]), ""
         ]
+        if campaign.get("missing_cells"):
+            lines += [
+                "Warning: %d requested cells are missing; %d cells have unresolved failures. "
+                "Only successful retained cells are tabulated; this is not a complete campaign."
+                % (campaign["missing_cells"], campaign["failed_cells"]), ""
+            ]
+        unverified = sorted({
+            row["model"]
+            for row in campaign["rows"]
+            if row["baseline_trace_identity"] != "hash_matched"
+        })
+        if unverified:
+            lines += [
+                "Warning: frozen baseline trace hashes are unavailable for %s. These comparisons reuse the "
+                "documented historical contract, but this report cannot verify byte-identical traces."
+                % ", ".join(unverified), ""
+            ]
         for key, coverage in summary_by_model(campaign["rows"]).items():
             lines.append(
                 "- %s: %d/12 workloads; minimum %d repeats; Full-12 ×3 coverage: %s."
@@ -272,7 +319,7 @@ def main():
         "cosmos": load_frozen(args.cosmos_vllm)
     }
     report = {
-        "aggregation": "median_of_run_aggregates",
+        "aggregation": "mean_of_run_means_for_latency_means_otherwise_median",
         "baselines": baselines,
         "campaigns": {}
     }
@@ -302,7 +349,9 @@ def main():
     args.output_prefix.with_suffix(".md").write_text(markdown(report))
     with args.output_prefix.with_suffix(".csv").open("w",
                                                      newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(flat_rows[0]))
+        writer = csv.DictWriter(stream,
+                                fieldnames=list(flat_rows[0]) if flat_rows else
+                                ["campaign", "model", "workload"])
         writer.writeheader()
         writer.writerows(flat_rows)
     manifest = {
