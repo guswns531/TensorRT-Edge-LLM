@@ -65,21 +65,28 @@ TEST(PhaseQueueSchedulerTest, GlobalActiveOwnsPhaseDecision)
     config.prefillQueueWaitTargetUs = 1.0e9;
     config.policy = [&](PhaseQueueSnapshot const&) {
         ++legacyPolicyCalls;
-        return PhaseDispatchKind::kPrefill;
+        return PhaseDispatchKind::kDecode;
     };
     PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 32});
+    PhaseSchedulingHints prefillScheduling;
+    prefillScheduling.submittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    scheduler.enqueuePrefill({1, 32, -1, 0, 0, true, prefillScheduling});
     scheduler.enqueueDecode({2, 128});
+    PhaseQueueSnapshot const state = scheduler.queueSnapshot();
+    ASSERT_GT(state.prefillOldestRequestAgeUs, state.decodeOldestWaitUs);
 
     PhaseDispatchPlan const plan = scheduler.next();
 
-    EXPECT_EQ(plan.kind, PhaseDispatchKind::kDecode);
+    EXPECT_EQ(plan.kind, PhaseDispatchKind::kPrefill);
     EXPECT_TRUE(plan.globalDecisionEvaluated);
     EXPECT_TRUE(plan.globalDecisionApplied);
-    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kDecode);
+    EXPECT_EQ(plan.globalSelectedAction.kind, PhaseGlobalActionKind::kPrefill);
     EXPECT_NE(plan.globalPlanId, 0U);
     EXPECT_NE(plan.globalSnapshotEpoch, 0U);
-    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kDecode);
+    EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill);
+    ASSERT_EQ(plan.prefillBatch.size(), 1U);
+    EXPECT_EQ(plan.prefillBatch.front().requestId, 1U);
+    EXPECT_TRUE(plan.decodeBatch.empty());
     EXPECT_TRUE(plan.globalActionFidelity);
     EXPECT_EQ(scheduler.telemetry().globalActiveDecisionCount, 1U);
     EXPECT_EQ(legacyPolicyCalls, 0U);

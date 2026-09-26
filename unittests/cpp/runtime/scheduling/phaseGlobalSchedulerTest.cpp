@@ -20,6 +20,7 @@
 #include "runtime/phase/policy/phaseContextualPdModel.h"
 
 #include <gtest/gtest.h>
+#include <limits>
 
 namespace trt_edgellm::rt
 {
@@ -105,6 +106,81 @@ TEST(PhaseGlobalSchedulerTest, AdditionalViolationAuditExcludesExistingLateness)
     EXPECT_EQ(plain.selectedIndex, measured.selectedIndex);
     EXPECT_DOUBLE_EQ(audit[0].predictedViolationUs, 1200.0);
     EXPECT_DOUBLE_EQ(audit[0].additionalViolationUs, 200.0);
+}
+
+TEST(PhaseGlobalSchedulerTest, DominancePreservesOlderServiceAtCommonWorkHorizon)
+{
+    PhaseGlobalScheduler scheduler;
+    for (bool const allLate : {false, true})
+    {
+        auto prefill
+            = candidate(PhaseGlobalActionKind::kPrefill, 10000.0, 10000.0, std::numeric_limits<double>::infinity());
+        auto decode
+            = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, std::numeric_limits<double>::infinity());
+        prefill.predictedHorizonUs = 11000.0;
+        decode.predictedHorizonUs = 11000.0;
+        prefill.horizonReferenceWorkUs = 11000.0;
+        decode.horizonReferenceWorkUs = 11000.0;
+        prefill.uncertaintyUs = 1000.0;
+        decode.uncertaintyUs = 100.0;
+        prefill.requestServiceLagUs = 50000.0;
+        decode.requestServiceLagUs = 10.0;
+        if (allLate)
+        {
+            prefill.protectedCompletions = {{100.0, 200.0, 0.0, PhaseProtectedKind::kDecode}};
+            decode.protectedCompletions = prefill.protectedCompletions;
+        }
+        std::vector<PhaseGlobalCandidateAudit> audit;
+
+        PhaseGlobalDecision const decision = scheduler.select({prefill, decode}, &audit);
+
+        ASSERT_TRUE(decision.selectedIndex.has_value());
+        EXPECT_EQ(*decision.selectedIndex, 0U);
+        ASSERT_EQ(audit.size(), 2U);
+        EXPECT_FALSE(audit[0].dominated);
+        EXPECT_FALSE(audit[1].dominated);
+        EXPECT_EQ(decision.reason,
+            allLate ? PhaseGlobalDecisionReason::kAllLateEfficiencyRecovery
+                    : PhaseGlobalDecisionReason::kDeadlineSafeEfficiency);
+    }
+}
+
+TEST(PhaseGlobalSchedulerTest, DominancePreservesReclaimAtCommonWorkHorizon)
+{
+    PhaseGlobalScheduler scheduler;
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 1000.0, 1000.0, std::numeric_limits<double>::infinity());
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, std::numeric_limits<double>::infinity());
+    prefill.uncertaintyUs = 100.0;
+    prefill.memory.nearReclaimBytes = 4096U;
+    std::vector<PhaseGlobalCandidateAudit> audit;
+
+    PhaseGlobalDecision const decision = scheduler.select({prefill, decode}, &audit);
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+    ASSERT_EQ(audit.size(), 2U);
+    EXPECT_FALSE(audit[0].dominated);
+    EXPECT_FALSE(audit[1].dominated);
+}
+
+TEST(PhaseGlobalSchedulerTest, DominanceStillPrunesWhenReclaimAndServiceLagAreNoWorse)
+{
+    PhaseGlobalScheduler scheduler;
+    auto prefill = candidate(PhaseGlobalActionKind::kPrefill, 1000.0, 1000.0, std::numeric_limits<double>::infinity());
+    auto decode = candidate(PhaseGlobalActionKind::kDecode, 1000.0, 1000.0, std::numeric_limits<double>::infinity());
+    prefill.requestServiceLagUs = 1000.0;
+    prefill.memory.nearReclaimBytes = 4096U;
+    decode.uncertaintyUs = 100.0;
+    std::vector<PhaseGlobalCandidateAudit> audit;
+
+    PhaseGlobalDecision const decision = scheduler.select({prefill, decode}, &audit);
+
+    ASSERT_TRUE(decision.selectedIndex.has_value());
+    EXPECT_EQ(*decision.selectedIndex, 0U);
+    ASSERT_EQ(audit.size(), 2U);
+    EXPECT_FALSE(audit[0].dominated);
+    EXPECT_TRUE(audit[1].dominated);
+    EXPECT_EQ(decision.dominatedCandidates, 1U);
 }
 
 TEST(PhaseGlobalSchedulerTest, FinalProtectionCanInvalidateSameIdPreview)

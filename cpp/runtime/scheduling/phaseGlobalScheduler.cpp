@@ -173,6 +173,12 @@ double serviceCompression(PhaseGlobalActionCandidate const& candidate) noexcept
     return std::max(0.0, selectionReferenceWorkUs(candidate)) / makespan;
 }
 
+size_t selectionReclaimBytes(PhaseGlobalActionCandidate const& candidate) noexcept
+{
+    return saturatedAdd(candidate.memory.immediateReclaimObserved ? candidate.memory.immediateReclaimBytes : 0U,
+        candidate.memory.nearReclaimBytes);
+}
+
 double protectedSlackPressure(PhaseGlobalActionCandidate const& candidate) noexcept
 {
     double pressure{};
@@ -330,10 +336,12 @@ bool dominates(
     size_t const rightPeak = hardPeakManagedBytes(right.memory);
     double const leftPressure = protectedSlackPressure(left);
     double const rightPressure = protectedSlackPressure(right);
+    // Pruning must preserve candidates preferred by the final reclaim/service-lag tie-breaks.
     bool const noWorse = leftViolation <= rightViolation && leftPressure <= rightPressure
         && selectionHorizonUs(left) <= selectionHorizonUs(right)
         && selectionReferenceWorkUs(left) >= selectionReferenceWorkUs(right) && leftPeak <= rightPeak
-        && left.uncertaintyUs <= right.uncertaintyUs;
+        && left.uncertaintyUs <= right.uncertaintyUs && selectionReclaimBytes(left) >= selectionReclaimBytes(right)
+        && left.requestServiceLagUs >= right.requestServiceLagUs;
     bool const strictlyBetter = leftViolation < rightViolation || selectionHorizonUs(left) < selectionHorizonUs(right)
         || selectionReferenceWorkUs(left) > selectionReferenceWorkUs(right) || leftPeak < rightPeak
         || left.uncertaintyUs < right.uncertaintyUs || leftPressure < rightPressure;
@@ -1303,10 +1311,8 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
         {
             return lhsCompression > rhsCompression;
         }
-        size_t const lhsReclaim = saturatedAdd(
-            lhs.memory.immediateReclaimObserved ? lhs.memory.immediateReclaimBytes : 0U, lhs.memory.nearReclaimBytes);
-        size_t const rhsReclaim = saturatedAdd(
-            rhs.memory.immediateReclaimObserved ? rhs.memory.immediateReclaimBytes : 0U, rhs.memory.nearReclaimBytes);
+        size_t const lhsReclaim = selectionReclaimBytes(lhs);
+        size_t const rhsReclaim = selectionReclaimBytes(rhs);
         auto const lhsRank = std::tie(lhsReclaim, lhs.requestServiceLagUs);
         auto const rhsRank = std::tie(rhsReclaim, rhs.requestServiceLagUs);
         if (lhsRank != rhsRank)
@@ -1326,10 +1332,8 @@ PhaseGlobalDecision PhaseGlobalScheduler::select(
         {
             return lhsCompression > rhsCompression;
         }
-        size_t const lhsReclaim = saturatedAdd(
-            lhs.memory.immediateReclaimObserved ? lhs.memory.immediateReclaimBytes : 0U, lhs.memory.nearReclaimBytes);
-        size_t const rhsReclaim = saturatedAdd(
-            rhs.memory.immediateReclaimObserved ? rhs.memory.immediateReclaimBytes : 0U, rhs.memory.nearReclaimBytes);
+        size_t const lhsReclaim = selectionReclaimBytes(lhs);
+        size_t const rhsReclaim = selectionReclaimBytes(rhs);
         auto const lhsRank = std::tie(lhsReclaim, lhs.requestServiceLagUs);
         auto const rhsRank = std::tie(rhsReclaim, rhs.requestServiceLagUs);
         if (lhsRank != rhsRank)
