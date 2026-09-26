@@ -245,7 +245,9 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
         "Vision optimization profile is out of range");
 
     int64_t const prefillBytes = maxPrefillContextMemoryBytes();
-    int64_t const visionBytes = vision.getRequiredContextMemorySizeForProfile(visionProfile);
+    bool const multipleVisionProfiles = vision.getOptimizationProfileCount() > 1;
+    int64_t const visionBytes = multipleVisionProfiles ? vision.getRequiredContextMemorySize()
+                                                       : vision.getRequiredContextMemorySizeForProfile(visionProfile);
     int64_t const arenaBytes = std::max(prefillBytes, visionBytes);
 
     prepareContextMemoryReplacement(true);
@@ -261,6 +263,11 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     Tensor visionMemory(arenaBase, {visionBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "IndependentEngineExecutorPair::sharedVisionProfileContextMemory");
 
+    if (multipleVisionProfiles)
+    {
+        // Automatic vision profile selection must retain a valid binding for every profile.
+        ELLM_CHECK(vision.setContextMemory(visionMemory), "Failed to assign all shared vision profile workspaces");
+    }
     ELLM_CHECK(vision.setContextMemoryForProfile(visionProfile, visionMemory, mConfig.setupStream),
         "Failed to assign the shared vision profile workspace");
     ELLM_CHECK(mPrefillExecutor->setContextMemoryForProfile(

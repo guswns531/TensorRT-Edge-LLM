@@ -97,9 +97,9 @@ public:
     TieredVisionContextMemoryInfo configureTieredVisionContextMemory(
         MultimodalRunner& vision, int32_t smallVisionProfile, int32_t largeVisionProfile);
 
-    //! Replace the independent prefill workspace with one arena shared by a
-    //! single-profile vision context. E/P dispatch must be serialized while
-    //! either context uses this arena.
+    //! Replace the independent prefill workspace with one arena shared by all
+    //! vision profiles, initially selecting visionProfile. Vision must be idle
+    //! during rebinding; E/P dispatch must be serialized while either uses the arena.
     TieredVisionContextMemoryInfo configureSharedVisionContextMemory(MultimodalRunner& vision, int32_t visionProfile);
 
     //! Replace the independent decode workspace with one arena shared by all
