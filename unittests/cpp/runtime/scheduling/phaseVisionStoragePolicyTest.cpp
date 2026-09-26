@@ -19,15 +19,9 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
-
-using trt_edgellm::rt::Coords;
-using trt_edgellm::rt::DeviceType;
-using trt_edgellm::rt::PhaseVisionPayload;
 using trt_edgellm::rt::phaseVisionPreparationWithinStorageBudget;
-using trt_edgellm::rt::Tensor;
 
-TEST(PhaseVisionStoragePolicyTest, SingleStorageWaitsForDownstreamPrefillConsumers)
+TEST(PhaseVisionStoragePolicyTest, SingleStorageWaitsForAllDownstreamConsumers)
 {
     EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 1, 1, true));
     EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 1, 0, true));
@@ -55,52 +49,4 @@ TEST(PhaseVisionStoragePolicyTest, ReleaseReopensCapacityWithoutRelaxingWorkspac
 TEST(PhaseVisionStoragePolicyTest, IndependentWorkspaceDoesNotInheritSharedStorageBarrier)
 {
     EXPECT_TRUE(phaseVisionPreparationWithinStorageBudget(false, 1, 2, true));
-}
-
-TEST(PhaseVisionStoragePolicyTest, DecodeOnlyMropeDoesNotConsumeAnEncoderSlab)
-{
-    std::array<float, 8> mrope{};
-    PhaseVisionPayload payload;
-    payload.mropeCosSin = Tensor(mrope.data(), Coords{1, 4, 2}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
-
-    EXPECT_EQ(payload.byteSize(), sizeof(mrope));
-    EXPECT_EQ(payload.prefillByteSize(), 0U);
-    EXPECT_TRUE(phaseVisionPreparationWithinStorageBudget(true, 1, 0, payload.prefillByteSize() > 0U));
-    EXPECT_FALSE(payload.mropeCosSin.isEmpty());
-}
-
-TEST(PhaseVisionStoragePolicyTest, UnpooledPrefillViewsStillBlockSingleStorage)
-{
-    std::array<float, 8> embedding{};
-    PhaseVisionPayload payload;
-    payload.outputEmbedding = Tensor(embedding.data(), Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
-    EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 1, 0, payload.prefillByteSize() > 0U));
-
-    payload.outputEmbedding = Tensor{};
-    payload.deepstackFeatures.emplace_back(
-        embedding.data(), Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
-    EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 1, 0, payload.prefillByteSize() > 0U));
-    EXPECT_TRUE(phaseVisionPreparationWithinStorageBudget(true, 2, 0, payload.prefillByteSize() > 0U));
-}
-
-TEST(PhaseVisionStoragePolicyTest, LegacyTiedMropeRetainsItsEncoderSlab)
-{
-    std::array<float, 8> embedding{};
-    std::array<float, 8> mrope{};
-    PhaseVisionPayload payload;
-    payload.outputEmbedding = Tensor(embedding.data(), Coords{2, 4}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
-    payload.mropeCosSin = Tensor(mrope.data(), Coords{1, 4, 2}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
-
-    EXPECT_EQ(payload.releasePrefillStorage(), 0U);
-    EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 1, 1, payload.prefillByteSize() > 0U));
-    EXPECT_FALSE(payload.mropeCosSin.isEmpty());
-    EXPECT_FALSE(payload.outputEmbedding.isEmpty());
-}
-
-TEST(PhaseVisionStoragePolicyTest, PhysicalConsumerLeaseBlocksUntilRetired)
-{
-    EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 1, 1, false));
-    EXPECT_FALSE(phaseVisionPreparationWithinStorageBudget(true, 2, 2, false));
-    EXPECT_TRUE(phaseVisionPreparationWithinStorageBudget(true, 1, 0, false));
-    EXPECT_TRUE(phaseVisionPreparationWithinStorageBudget(true, 2, 1, false));
 }

@@ -1725,26 +1725,6 @@ size_t IndependentPhaseAsyncServer::visionPayloadBytes() const noexcept
     return result;
 }
 
-bool IndependentPhaseAsyncServer::hasVisionPrefillPayload() const noexcept
-{
-    auto hasPrefillData = [](auto const& payload) { return payload != nullptr && payload->prefillByteSize() > 0U; };
-    for (auto const& request : mRequests)
-    {
-        if (hasPrefillData(request.second.visionPayload) || hasPrefillData(request.second.pendingVisionPayload))
-        {
-            return true;
-        }
-    }
-    for (PendingRequest const& request : mPendingRequests)
-    {
-        if (hasPrefillData(request.visionPayload))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 size_t IndependentPhaseAsyncServer::visionRetainedStorageBytes(
     std::vector<PhaseVisionPayload const*> payloads) const noexcept
 {
