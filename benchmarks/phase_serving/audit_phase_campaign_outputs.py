@@ -121,6 +121,11 @@ def audit_cell(record, model_identity, eos_tokens):
                 first_token = token_ids[0] if token_ids else None
                 if first_token in eos_tokens:
                     report["first_eos_requests"].append(request_id)
+                stop_index = next((index
+                                   for index, token in enumerate(token_ids)
+                                   if token in eos_tokens), None)
+                prefix = token_ids[:stop_index +
+                                   1] if stop_index is not None else token_ids
                 report["requests"].append({
                     "request_id":
                     request_id,
@@ -139,6 +144,18 @@ def audit_cell(record, model_identity, eos_tokens):
                         json.dumps(token_ids,
                                    separators=(",",
                                                ":")).encode()).hexdigest(),
+                    "first_stop_index":
+                    stop_index,
+                    "first_stop_token_id":
+                    token_ids[stop_index] if stop_index is not None else None,
+                    "through_first_stop_token_count":
+                    len(prefix),
+                    "through_first_stop_sha256":
+                    hashlib.sha256(
+                        json.dumps(prefix,
+                                   separators=(",",
+                                               ":")).encode()).hexdigest()
+                    if captured_complete else None,
                 })
             except (KeyError, TypeError, ValueError) as error:
                 issue("malformed_request", str(error), row.get("request_id"))
@@ -187,6 +204,8 @@ def compare_repeats(cells):
              for request_id in rows})
         comparable = []
         mismatches = []
+        prefix_comparable = []
+        prefix_mismatches = []
         for request_id in request_ids:
             rows = [repeat.get(request_id) for repeat in by_repeat]
             if len(rows) < 2 or not all(row and row["capture_complete"]
@@ -195,11 +214,29 @@ def compare_repeats(cells):
             comparable.append(request_id)
             if len({row["token_ids_sha256"] for row in rows}) > 1:
                 mismatches.append(request_id)
-        status = ("not_tested" if len(group) < 2 else "observed_different"
-                  if mismatches else "invalid_or_incomplete"
-                  if len(comparable) != len(request_ids) or not all(
-                      cell["integrity_passed"]
-                      for cell in group) else "observed_equal")
+            if all(row["through_first_stop_token_count"] > 0
+                   and row["through_first_stop_sha256"] for row in rows):
+                prefix_comparable.append(request_id)
+                if len({row["through_first_stop_sha256"] for row in rows}) > 1:
+                    prefix_mismatches.append(request_id)
+
+        def result(compared, different):
+            status = ("not_tested" if len(group) < 2 else "observed_different"
+                      if different else "invalid_or_incomplete"
+                      if len(compared) != len(request_ids) or not all(
+                          cell["integrity_passed"]
+                          for cell in group) else "observed_equal")
+            return {
+                "status":
+                status,
+                "comparable_requests":
+                len(compared),
+                "different_request_ids":
+                different,
+                "exact_request_agreement": (len(compared) - len(different)) /
+                len(compared) if compared else None,
+            }
+
         comparisons.append({
             "model":
             model,
@@ -208,15 +245,9 @@ def compare_repeats(cells):
             "workload":
             workload,
             "repeats": [cell["repeat"] for cell in group],
-            "status":
-            status,
-            "comparable_requests":
-            len(comparable),
-            "different_request_ids":
-            mismatches,
-            "exact_request_agreement":
-            ((len(comparable) - len(mismatches)) /
-             len(comparable) if comparable else None),
+            **result(comparable, mismatches),
+            "through_first_stop":
+            result(prefix_comparable, prefix_mismatches),
         })
     return comparisons
 
@@ -270,6 +301,9 @@ def audit_campaign(root):
         sum(cell["first_eos_count"] for cell in cells),
         "semantics":
         "not_evaluated; first EOS is an anomaly flag under forced ignore-EOS, not proof of corruption",
+        "comparison_contract":
+        "raw compares all captured tokens; through_first_stop includes the first model EOS/stop token, "
+        "or the full capture when absent; both require complete nonempty capture and at least two repeats",
         "cells":
         cells,
         "cross_repeat":
@@ -297,17 +331,26 @@ def markdown(report):
     lines += [
         "", "## Per-request exact token comparison across repeats", "",
         "Equality is observational, not a proof of semantic correctness. Single runs are not tested.",
-        "",
-        "| Model/variant/workload | Repeats | Status | Comparable requests | Different request IDs |",
-        "|---|---|---|---:|---|"
+        "", report["comparison_contract"], "",
+        "| Model/variant/workload | Repeats | Raw exact | Through first stop exact | Raw different IDs | Prefix different IDs |",
+        "|---|---|---|---|---|---|"
     ]
+
+    def agreement(row):
+        count = row["comparable_requests"]
+        if not count:
+            return row["status"]
+        return "%d/%d (%s)" % (count - len(row["different_request_ids"]),
+                               count, row["status"])
+
     for row in report["cross_repeat"]:
-        lines.append(
-            "| %s | %s | %s | %d | %s |" %
-            ("/".join(row[field]
-                      for field in ("model", "variant", "workload")),
-             row["repeats"], row["status"], row["comparable_requests"],
-             row["different_request_ids"]))
+        lines.append("| %s | %s | %s | %s | %s | %s |" %
+                     ("/".join(row[field]
+                               for field in ("model", "variant",
+                                             "workload")), row["repeats"],
+                      agreement(row), agreement(row["through_first_stop"]),
+                      row["different_request_ids"],
+                      row["through_first_stop"]["different_request_ids"]))
     return "\n".join(lines) + "\n"
 
 

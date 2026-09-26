@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exercise best-effort decode cancellation and readmission with a campaign contract."""
+"""Exercise decode cancellation and readmission with a campaign contract."""
 
 import argparse
 import copy
@@ -35,6 +35,83 @@ MINIMAL_STARTUP_OVERRIDES = {
     # Explicit shape lists take precedence over the disable-shape-warmup flag.
     "TRT_EDGELLM_IPC_WARMUP_DECODE_SHAPES": None,
 }
+
+DEBUG_BACKTRACE_FRAMES = 24
+
+
+def sanitizer_prefix(force_synchronization_limit=None):
+    """Build optional instrumentation-only launch bounds without runtime overrides."""
+    command = [
+        "compute-sanitizer", "--tool", "memcheck", "--error-exitcode", "99"
+    ]
+    if force_synchronization_limit is not None:
+        if force_synchronization_limit <= 0:
+            raise ValueError(
+                "Sanitizer synchronization limit must be positive")
+        command.extend([
+            "--force-synchronization-limit",
+            str(force_synchronization_limit)
+        ])
+    return command
+
+
+def enable_debug_backtrace(command):
+    """Follow only this launch's sanitizer child, with no core dump or host attach."""
+    sanitizer_index = command.index("compute-sanitizer")
+    image_index = sanitizer_index - 1
+    docker_options = command[:image_index]
+    network_none = "--network=none" in docker_options or any(
+        docker_options[index:index + 2] == ["--network", "none"]
+        for index in range(len(docker_options)))
+    if not network_none:
+        raise ValueError("Debug backtrace requires Docker --network none")
+    command = replace_docker_environment(
+        command, {
+            "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "0",
+            "CUDA_ENABLE_CPU_COREDUMP_ON_EXCEPTION": "0",
+            "CUDA_ENABLE_USER_TRIGGERED_COREDUMP": "0",
+        }, image_index)
+    sanitizer_index = command.index("compute-sanitizer")
+    image_index = sanitizer_index - 1
+    debug_prefix = [
+        "cuda-gdb-minimal", "--nx", "--quiet", "--batch",
+        "--return-child-result"
+    ]
+    for instruction in ("set pagination off", "set confirm off",
+                        "set startup-with-shell off",
+                        "set follow-fork-mode child", "set detach-on-fork on",
+                        "set follow-exec-mode same",
+                        "set print thread-events off",
+                        "set print frame-arguments none",
+                        "set print elements 16", "set debuginfod enabled off",
+                        "handle SIGPIPE nostop noprint pass", "run",
+                        "info inferiors", "info proc exe",
+                        "thread apply all -c bt " +
+                        str(DEBUG_BACKTRACE_FRAMES)):
+        debug_prefix.extend(["-ex", instruction])
+    debug_prefix.append("--args")
+    return (command[:image_index] + [
+        "--cap-add=SYS_PTRACE", "--security-opt=seccomp=unconfined",
+        "--ulimit=core=0:0", command[image_index]
+    ] + debug_prefix + command[sanitizer_index:])
+
+
+def make_request_fixture(source_requests, text_only):
+    """Return independent request payloads without changing backend limits."""
+    if text_only:
+        prompts = (
+            "Explain how a computer stores and retrieves information.",
+            "Explain why seasons change throughout the year.",
+        )
+        return [{
+            "messages": [{
+                "role": "user",
+                "content": prompt
+            }]
+        } for prompt in prompts]
+    if not source_requests:
+        raise ValueError("The source lifecycle trace has no requests")
+    return copy.deepcopy(source_requests)
 
 
 def replace_docker_environment(command, overrides, image_index):
@@ -142,7 +219,7 @@ class CancellationAttempts:
         return True
 
     def acknowledge(self, accepted):
-        """Record the synchronous best-effort API result, not deferred cancellation."""
+        """Record acceptance of cancellation, not completion of reclamation."""
         if not self.pending or not isinstance(accepted, bool):
             raise AssertionError("Unexpected cancellation acknowledgement")
         self.pending = False
@@ -162,7 +239,7 @@ class CancellationAttempts:
 
 
 def run(args):
-    """Cancel an active vision request, then verify surviving and readmitted work."""
+    """Cancel active decode, then verify surviving and readmitted work."""
     manifest = json.loads(args.manifest.read_text())
     record = next(
         item for item in manifest["commands"]
@@ -184,15 +261,17 @@ def run(args):
     if args.sanitizer:
         index = command.index(
             "/opt/edgellm/examples/llm/llm_phase_context_smoke")
-        command[index:index] = [
-            "compute-sanitizer", "--tool", "memcheck", "--error-exitcode", "99"
-        ]
-    trace = json.loads(
-        pathlib.Path(full_command[full_command.index("--trace") +
-                                  1]).read_text())
-    requests = trace["requests"]
+        command[index:index] = sanitizer_prefix(
+            args.force_synchronization_limit)
+        if args.debug_backtrace:
+            command = enable_debug_backtrace(command)
+    source_trace = pathlib.Path(full_command[full_command.index("--trace") +
+                                             1])
+    trace = json.loads(source_trace.read_text())
+    requests = make_request_fixture(trace["requests"], args.text_only)
     events = queue.Queue()
     observed = []
+    submitted = []
     launched_identity = collect_launched_identity(
         command,
         pathlib.Path(__file__).resolve().parents[2])
@@ -232,10 +311,14 @@ def run(args):
     def submit(request_id, source, tokens):
         request = copy.deepcopy(source)
         request["max_output_tokens"] = tokens
-        send({"request_index": request_id, "request": request})
+        payload = {"request_index": request_id, "request": request}
+        submitted.append(payload)
+        send(payload)
 
     passed = False
     error = None
+    harness_initiated_terminate = False
+    harness_initiated_kill = False
     cancellation = CancellationAttempts()
     completions = {}
     try:
@@ -275,19 +358,61 @@ def run(args):
         error = str(exc)
     finally:
         if process.poll() is None:
+            harness_initiated_terminate = True
             process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                harness_initiated_kill = True
                 process.kill()
                 process.wait()
         thread.join(timeout=10)
         report = {
             "passed": passed,
             "error": error,
+            "backend_exit": {
+                "returncode":
+                process.returncode,
+                "returncode_owner":
+                ("docker_debugger_wrapper"
+                 if args.debug_backtrace else "docker_backend_wrapper"),
+                "harness_initiated_terminate":
+                harness_initiated_terminate,
+                "harness_initiated_kill":
+                harness_initiated_kill,
+            },
             "model": args.model,
             "sanitizer": args.sanitizer,
+            "sanitizer_instrumentation": {
+                "force_synchronization_limit":
+                args.force_synchronization_limit,
+                "changes_execution_concurrency":
+                args.force_synchronization_limit is not None,
+            },
+            "debug_backtrace": {
+                "enabled": args.debug_backtrace,
+                "frame_limit_per_thread": DEBUG_BACKTRACE_FRAMES,
+                "host_attach": False,
+                "core_dump_requested": False,
+                "target_identity_must_be_verified_from_backtrace":
+                args.debug_backtrace,
+                "independent_memory_safety_gate": False,
+            },
             "result_state": "diagnostic",
+            "request_fixture": {
+                "kind": ("builtin_text_only"
+                         if args.text_only else "source_multimodal_trace"),
+                "source_trace":
+                str(source_trace.resolve()),
+                "source_trace_requests_used":
+                not args.text_only,
+                "submitted_requests":
+                submitted,
+                "vision_engine_loading":
+                "source_campaign_unchanged",
+                "performance_comparable":
+                False,
+            },
             "startup_contract": {
                 "mode": ("minimal_startup"
                          if args.minimal_startup else "source_campaign"),
@@ -317,6 +442,8 @@ def run(args):
                 "gpu_memory_safety":
                 "memcheck" if args.sanitizer else "not checked",
                 "kv_page_reuse_verified": False,
+                "encoder_requested_by_fixture": not args.text_only,
+                "vision_payload_lifecycle_verified": False,
                 "encoder_or_sampling_pending_cancel_verified": False,
                 "binary_plugin_identity_observed_before_launch": True,
                 "artifact_build_commit_verified": False,
@@ -341,11 +468,36 @@ def main():
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--sanitizer", action="store_true")
     parser.add_argument(
+        "--force-synchronization-limit",
+        type=int,
+        help="With --sanitizer only: bound pending instrumented launches; "
+        "changes concurrency and is not a performance measurement")
+    parser.add_argument(
+        "--debug-backtrace",
+        action="store_true",
+        help=
+        "With --sanitizer only: batch cuda-gdb-minimal follows the launched "
+        "child; enable container SYS_PTRACE/seccomp override, no host attach/core"
+    )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Diagnostic only: replace image requests with simple text; "
+        "retain backend engine loading, memory/batch limits, and output lengths"
+    )
+    parser.add_argument(
         "--minimal-startup",
         action="store_true",
         help="Diagnostic only: disable startup policy/shape warmup and graphs; "
         "retain the source memory and batch limits (not a performance run)")
-    return run(parser.parse_args())
+    args = parser.parse_args()
+    if args.force_synchronization_limit is not None:
+        if not args.sanitizer or args.force_synchronization_limit <= 0:
+            parser.error("--force-synchronization-limit requires --sanitizer "
+                         "and a positive integer")
+    if args.debug_backtrace and not args.sanitizer:
+        parser.error("--debug-backtrace requires --sanitizer")
+    return run(args)
 
 
 if __name__ == "__main__":

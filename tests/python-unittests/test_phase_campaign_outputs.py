@@ -121,6 +121,12 @@ class PhaseCampaignOutputsTest(unittest.TestCase):
         self.assertEqual(report["cross_repeat"][0]["comparable_requests"], 2)
         self.assertEqual(report["cross_repeat"][0]["exact_request_agreement"],
                          1)
+        self.assertEqual(
+            report["cross_repeat"][0]["through_first_stop"]
+            ["exact_request_agreement"], 1)
+        self.assertEqual(
+            report["cells"][0]["requests"][0]
+            ["through_first_stop_token_count"], 1)
         self.assertIn("not proof of corruption", G_AUDIT.markdown(report))
 
     def test_compensating_output_counts_cannot_hide_request_errors(self):
@@ -151,6 +157,11 @@ class PhaseCampaignOutputsTest(unittest.TestCase):
         self.assertEqual(report["cross_repeat"][0]["status"],
                          "invalid_or_incomplete")
         self.assertIsNone(report["cross_repeat"][0]["exact_request_agreement"])
+        prefix = report["cross_repeat"][0]["through_first_stop"]
+        self.assertEqual(prefix["status"], "invalid_or_incomplete")
+        self.assertIsNone(prefix["exact_request_agreement"])
+        self.assertIsNone(
+            report["cells"][0]["requests"][0]["through_first_stop_sha256"])
 
     def test_cross_repeat_mismatch_is_localized_to_request(self):
         self.write_rows(self.csv_paths[1],
@@ -162,6 +173,62 @@ class PhaseCampaignOutputsTest(unittest.TestCase):
         self.assertEqual(comparison["status"], "observed_different")
         self.assertEqual(comparison["different_request_ids"], [1])
         self.assertEqual(comparison["exact_request_agreement"], 0.5)
+        self.assertEqual(
+            comparison["through_first_stop"]["different_request_ids"], [1])
+
+    def test_tokens_after_first_stop_only_affect_raw_exact(self):
+        self.write_rows(self.csv_paths[1],
+                        [self.row(0, "151645 9"),
+                         self.row(1, "3 4")])
+        report = G_AUDIT.audit_campaign(self.root)
+        comparison = report["cross_repeat"][0]
+        self.assertTrue(report["integrity_passed"])
+        self.assertEqual(comparison["different_request_ids"], [0])
+        self.assertEqual(comparison["exact_request_agreement"], 0.5)
+        prefix = comparison["through_first_stop"]
+        self.assertEqual(prefix["status"], "observed_equal")
+        self.assertEqual(prefix["different_request_ids"], [])
+        self.assertEqual(prefix["exact_request_agreement"], 1)
+        self.assertIn("1/2 (observed_different)", G_AUDIT.markdown(report))
+        self.assertIn("2/2 (observed_equal)", G_AUDIT.markdown(report))
+
+    def test_tokens_before_stop_remain_different(self):
+        self.write_rows(self.csv_paths[0],
+                        [self.row(0, "151645 2"),
+                         self.row(1, "3 151643")])
+        self.write_rows(self.csv_paths[1],
+                        [self.row(0, "151645 2"),
+                         self.row(1, "4 151643")])
+        report = G_AUDIT.audit_campaign(self.root)
+        prefix = report["cross_repeat"][0]["through_first_stop"]
+        self.assertEqual(prefix["different_request_ids"], [1])
+        self.assertEqual(prefix["exact_request_agreement"], 0.5)
+        row = report["cells"][0]["requests"][1]
+        self.assertEqual(row["first_stop_index"], 1)
+        self.assertEqual(row["first_stop_token_id"], 151643)
+        self.assertEqual(row["through_first_stop_token_count"], 2)
+
+    def test_different_first_stop_tokens_are_not_empty_prefix_agreement(self):
+        self.write_rows(self.csv_paths[1],
+                        [self.row(0, "151643 2"),
+                         self.row(1, "3 4")])
+        report = G_AUDIT.audit_campaign(self.root)
+        prefix = report["cross_repeat"][0]["through_first_stop"]
+        self.assertEqual(prefix["different_request_ids"], [0])
+        self.assertEqual(prefix["exact_request_agreement"], 0.5)
+        self.assertEqual(
+            report["cells"][1]["requests"][0]
+            ["through_first_stop_token_count"], 1)
+
+    def test_incomplete_capture_cannot_be_redeemed_by_stop(self):
+        self.write_rows(
+            self.csv_paths[1],
+            [self.row(0, "151645"), self.row(1, "3 4")])
+        report = G_AUDIT.audit_campaign(self.root)
+        prefix = report["cross_repeat"][0]["through_first_stop"]
+        self.assertFalse(report["integrity_passed"])
+        self.assertEqual(prefix["status"], "invalid_or_incomplete")
+        self.assertEqual(prefix["comparable_requests"], 1)
 
     def test_partial_campaign_does_not_audit_failed_cell_as_success(self):
         self.manifest["completed"] = self.records[:1]
@@ -172,6 +239,9 @@ class PhaseCampaignOutputsTest(unittest.TestCase):
         self.assertEqual(report["unresolved_failed_cells"], 1)
         self.assertEqual(len(report["cells"]), 1)
         self.assertEqual(report["cross_repeat"][0]["status"], "not_tested")
+        self.assertEqual(
+            report["cross_repeat"][0]["through_first_stop"]["status"],
+            "not_tested")
 
     def test_duplicate_and_missing_requests_are_detected(self):
         self.write_rows(

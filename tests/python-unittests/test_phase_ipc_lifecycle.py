@@ -14,6 +14,7 @@
 # limitations under the License.
 """CPU-only cancellation protocol tests, without inference or GPU dependencies."""
 
+import copy
 import hashlib
 import importlib.util
 import pathlib
@@ -33,6 +34,109 @@ def load_tool():
 
 
 G_TOOL = load_tool()
+
+
+class SanitizerDiagnosticTest(unittest.TestCase):
+    """Instrumentation changes are explicit and restricted to one Docker launch."""
+
+    def test_default_memcheck_has_no_forced_synchronization(self):
+        self.assertEqual(G_TOOL.sanitizer_prefix(), [
+            "compute-sanitizer", "--tool", "memcheck", "--error-exitcode", "99"
+        ])
+
+    def test_positive_limit_is_forwarded_only_to_sanitizer(self):
+        self.assertEqual(
+            G_TOOL.sanitizer_prefix(1)[-2:],
+            ["--force-synchronization-limit", "1"])
+        for invalid in (0, -1):
+            with self.assertRaises(ValueError):
+                G_TOOL.sanitizer_prefix(invalid)
+
+    def test_debug_wrapper_preserves_ipc_tail_network_and_runtime_limits(self):
+        runtime = [
+            "/opt/edgellm/examples/llm/llm_phase_context_smoke", "/model"
+        ]
+        command = [
+            "docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+            "--read-only", "-i", "-e", "TRT_EDGELLM_MAX_DECODE_BATCH=24", "-e",
+            "CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1", "image:fixed"
+        ] + G_TOOL.sanitizer_prefix(1) + runtime
+        original = command.copy()
+        result = G_TOOL.enable_debug_backtrace(command)
+        self.assertEqual(command, original)
+        self.assertEqual(result[result.index("compute-sanitizer"):],
+                         G_TOOL.sanitizer_prefix(1) + runtime)
+        self.assertEqual(result[result.index("--network") + 1], "none")
+        for preserved in ("-i", "--read-only", "ALL",
+                          "TRT_EDGELLM_MAX_DECODE_BATCH=24"):
+            self.assertIn(preserved, result)
+        for scoped in ("--cap-add=SYS_PTRACE",
+                       "--security-opt=seccomp=unconfined",
+                       "--ulimit=core=0:0"):
+            self.assertLess(result.index(scoped), result.index("image:fixed"))
+        self.assertIn("CUDA_ENABLE_COREDUMP_ON_EXCEPTION=0", result)
+        self.assertNotIn("CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1", result)
+        self.assertLess(result.index("cuda-gdb-minimal"),
+                        result.index("compute-sanitizer"))
+        for instruction in ("set startup-with-shell off",
+                            "set follow-fork-mode child", "info proc exe",
+                            "thread apply all -c bt 24"):
+            self.assertIn(instruction, result)
+        self.assertNotIn("--pid=host", result)
+        self.assertNotIn("--privileged", result)
+
+    def test_debug_requires_isolated_network(self):
+        command = ["docker", "run", "image"] + G_TOOL.sanitizer_prefix()
+        with self.assertRaises(ValueError):
+            G_TOOL.enable_debug_backtrace(command)
+
+
+class RequestFixtureTest(unittest.TestCase):
+    """Text-only diagnosis excludes vision requests, not vision engine loading."""
+
+    def test_text_only_drops_images_and_all_source_request_metadata(self):
+        source = [{
+            "messages": [{
+                "role":
+                "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": "image.png"
+                }],
+            }],
+            "images": ["another.png"],
+            "max_output_tokens":
+            999,
+            "metadata": {
+                "vision": True
+            },
+        }]
+        original = copy.deepcopy(source)
+        fixture = G_TOOL.make_request_fixture(source, text_only=True)
+        self.assertEqual(source, original)
+        self.assertEqual(len(fixture), 2)
+        for request in fixture:
+            self.assertEqual(set(request), {"messages"})
+            self.assertEqual(len(request["messages"]), 1)
+            message = request["messages"][0]
+            self.assertEqual(message["role"], "user")
+            self.assertIsInstance(message["content"], str)
+            self.assertTrue(message["content"])
+
+    def test_default_preserves_source_payload_without_aliasing(self):
+        source = [{"messages": [{"role": "user", "content": "hello"}]}]
+        fixture = G_TOOL.make_request_fixture(source, text_only=False)
+        self.assertEqual(fixture, source)
+        fixture[0]["messages"][0]["content"] = "changed"
+        self.assertEqual(source[0]["messages"][0]["content"], "hello")
+
+    def test_text_fixture_does_not_require_source_images(self):
+        first = G_TOOL.make_request_fixture([], text_only=True)
+        first[0]["messages"][0]["content"] = "changed"
+        second = G_TOOL.make_request_fixture([], text_only=True)
+        self.assertNotEqual(first, second)
+        with self.assertRaises(ValueError):
+            G_TOOL.make_request_fixture([], text_only=False)
 
 
 class LaunchedIdentityTest(unittest.TestCase):
