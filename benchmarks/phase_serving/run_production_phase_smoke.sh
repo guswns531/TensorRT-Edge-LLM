@@ -27,6 +27,8 @@ case "$model" in
         ;;
     *) exit 2 ;;
 esac
+engine=${ENGINE_DIR:-$engine}
+vision=${VISION_DIR:-$vision}
 case "$workload" in text|mixed) ;; *) exit 2 ;; esac
 case "$graphs" in 0|1) ;; *) exit 2 ;; esac
 test -f "$result_root/$workload.json"

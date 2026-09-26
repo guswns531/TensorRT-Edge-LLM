@@ -711,8 +711,10 @@ def main():
         ))
     summary = {}
     for record in commands:
-        if digest(binary) != identity["binary_sha256"]:
-            raise ValueError("Runtime binary changed during campaign")
+        if (digest(binary) != identity["binary_sha256"]
+                or digest(plugin) != identity["plugin_sha256"]):
+            raise ValueError(
+                "Runtime binary or plugin changed during campaign")
         cell = pathlib.Path(record["cell"])
         cell.mkdir(parents=True, exist_ok=True)
         contract = {"identity": identity, "record": record}
