@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exercise cancellation and readmission using an immutable campaign backend contract."""
+"""Exercise best-effort decode cancellation and readmission with a campaign contract."""
 
 import argparse
 import copy
@@ -22,6 +22,46 @@ import queue
 import subprocess
 import threading
 import time
+
+
+class CancellationAttempts:
+    """Retry only after another token when the runtime rejects a busy cancellation."""
+
+    def __init__(self):
+        self.attempts = 0
+        self.busy_rejections = 0
+        self.pending = False
+        self.accepted = False
+        self.last_attempt_output_index = -1
+
+    def at_token(self, output_index):
+        """Return whether this new token boundary should initiate one attempt."""
+        if (self.accepted or self.pending
+                or output_index <= self.last_attempt_output_index):
+            return False
+        self.attempts += 1
+        self.pending = True
+        self.last_attempt_output_index = output_index
+        return True
+
+    def acknowledge(self, accepted):
+        """Record the synchronous best-effort API result, not deferred cancellation."""
+        if not self.pending or not isinstance(accepted, bool):
+            raise AssertionError("Unexpected cancellation acknowledgement")
+        self.pending = False
+        self.accepted = accepted
+        self.busy_rejections += int(not accepted)
+        return accepted
+
+    def report(self):
+        """Return cancellation outcome without classifying busy as corruption."""
+        return {
+            "attempts": self.attempts,
+            "busy_rejections": self.busy_rejections,
+            "accepted": self.accepted,
+            "acknowledgement_pending": self.pending,
+            "last_attempt_output_index": self.last_attempt_output_index,
+        }
 
 
 def run(args):
@@ -89,30 +129,31 @@ def run(args):
 
     passed = False
     error = None
+    cancellation = CancellationAttempts()
+    completions = {}
     try:
         while receive()["type"] != "ready":
             pass
         submit(1, requests[0], 128)
         submit(2, requests[-1], 32)
-        cancelled = False
-        acknowledged = False
-        completions = {}
-        while not acknowledged or set(completions) != {2, 3}:
+        while not cancellation.accepted or set(completions) != {2, 3}:
             event = receive()
             request_id = event.get("request_index")
-            if event["type"] == "token" and request_id == 1 and not cancelled:
-                send({"type": "cancel", "request_index": 1})
-                cancelled = True
+            if event["type"] == "token" and request_id == 1:
+                if cancellation.at_token(event["output_index"]):
+                    send({"type": "cancel", "request_index": 1})
             elif event["type"] == "cancelled" and request_id == 1:
-                if not event.get("cancelled"):
-                    raise AssertionError(
-                        "Active cancellation was not accepted")
-                acknowledged = True
-                submit(3, requests[-1], 16)
+                if cancellation.acknowledge(event.get("cancelled")):
+                    submit(3, requests[-1], 16)
             elif event["type"] == "completion":
                 if request_id == 1:
+                    if cancellation.accepted:
+                        raise AssertionError(
+                            "Accepted cancellation completed normally")
                     raise AssertionError(
-                        "Cancelled request completed normally")
+                        "No cancellation was accepted before "
+                        "request completion; in-flight "
+                        "rejections are legitimate busy outcomes")
                 completions[request_id] = event["output_tokens"]
         if completions != {2: 32, 3: 16}:
             raise AssertionError(
@@ -141,7 +182,19 @@ def run(args):
             "sanitizer": args.sanitizer,
             "command": command,
             "source_identity": manifest["identity"],
-            "events": observed
+            "events": observed,
+            "cancellation": cancellation.report(),
+            "survivor_readmission_output_tokens": completions,
+            "coverage": {
+                "cancel_target": "decode after first emitted token",
+                "retry_boundary":
+                "subsequent token after busy acknowledgement",
+                "gpu_memory_safety":
+                "memcheck" if args.sanitizer else "not checked",
+                "kv_page_reuse_verified": False,
+                "encoder_or_sampling_pending_cancel_verified": False,
+                "source_identity_reverified": False,
+            },
         }
         (output /
          "result.json").write_text(json.dumps(report, indent=2) + "\n")
