@@ -844,6 +844,16 @@ float phaseEncoderActionGpuMs(
     return asyncPreparation && separatePreparationCost && executionGpuMs > 0.0F ? executionGpuMs : pipelineGpuMs;
 }
 
+void phaseEncoderResidualCompletionFallback(bool overlapEstimateAvailable, double serialReferenceUs,
+    double serialUncertaintyUs, double& completionUs, double& uncertaintyUs) noexcept
+{
+    if (!overlapEstimateAvailable)
+    {
+        completionUs = serialReferenceUs;
+        uncertaintyUs = serialUncertaintyUs;
+    }
+}
+
 PhaseVisionEncoderDispatchDecision phaseVisionEncoderDispatchDecision(bool enabled, double oldestVisionAgeUs,
     double sinceLastForcedStartUs, double maxDeferUs, double forcedIntervalUs, double oldestTextAgeUs,
     double predictedEncoderCostUs, double textGuardAgeUs, float decodeTpotPressure, float decodeTpotPressureLimit,
@@ -3452,6 +3462,12 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 phaseOverlapCompletionUs = residualPhaseProbeUs;
                 phaseOverlapCompletionUncertaintyUs = phase.uncertaintyUs;
             }
+        }
+        if (residualAugmentation)
+        {
+            phaseEncoderResidualCompletionFallback(overlapKnown || safeProbe,
+                encoderMakespanUs + phase.predictedMakespanUs, encoderUncertaintyUs + phase.uncertaintyUs,
+                phaseOverlapCompletionUs, phaseOverlapCompletionUncertaintyUs);
         }
         PhaseGlobalActionCandidate overlap;
         overlap.key = overlapKey;

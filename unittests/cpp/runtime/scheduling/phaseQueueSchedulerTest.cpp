@@ -4382,6 +4382,79 @@ TEST(PhaseThreeCoordinatorPolicyTest, SeparatesPreparedEncoderExecutionCostOnlyW
     EXPECT_FLOAT_EQ(phaseEncoderActionGpuMs(true, true, 40.0F, 0.0F), 40.0F);
 }
 
+TEST(PhaseThreeCoordinatorPolicyTest, ScalarReadyResidualEncoderWithoutProbeRetainsProtectedCompletion)
+{
+    struct ProbeState
+    {
+        char const* reason;
+        bool servingEnabled;
+        bool intervalReady;
+        bool slackSafe;
+    };
+    for (PhaseGlobalActionKind const kind :
+        {PhaseGlobalActionKind::kEncoderPrefill, PhaseGlobalActionKind::kEncoderDecode})
+    {
+        for (ProbeState const state : {ProbeState{"serving-disabled", false, true, true},
+                 ProbeState{"interval-blocked", true, false, true}, ProbeState{"slack-blocked", true, true, false}})
+        {
+            SCOPED_TRACE(::testing::Message() << static_cast<int>(kind) << " " << state.reason);
+            bool const safeProbe = state.servingEnabled && state.intervalReady && state.slackSafe;
+            ASSERT_FALSE(safeProbe);
+            PhaseGlobalActionCandidate overlap;
+            overlap.key.kind = kind;
+            overlap.key.residualAugmentation = true;
+            overlap.key.residualAnchor = kind == PhaseGlobalActionKind::kEncoderPrefill
+                ? PhaseGlobalResidualAnchor::kPrefill
+                : PhaseGlobalResidualAnchor::kDecode;
+            overlap.overlapCostKnown = false;
+            overlap.safeProbeEligible = safeProbe;
+            overlap.contextualEncoderPairReady = true;
+            overlap.contextualScalarAuthorityApplied = true;
+            overlap.decisionCostKnown = true;
+            overlap.decisionMakespanUs = 3000.0;
+            overlap.predictedMakespanUs = 8000.0;
+            overlap.predictedBlockingUs = 8000.0;
+            overlap.referenceWorkUs = 8000.0;
+            double completionUs{};
+            double uncertaintyUs{};
+            phaseEncoderResidualCompletionFallback(
+                overlap.overlapCostKnown || safeProbe, 6000.0 + 2000.0, 400.0 + 200.0, completionUs, uncertaintyUs);
+            EXPECT_DOUBLE_EQ(completionUs, 8000.0);
+            EXPECT_DOUBLE_EQ(uncertaintyUs, 600.0);
+            overlap.protectedCompletions.push_back({4000.0, completionUs, uncertaintyUs,
+                kind == PhaseGlobalActionKind::kEncoderPrefill ? PhaseProtectedKind::kPrefill
+                                                               : PhaseProtectedKind::kDecode});
+
+            PhaseGlobalScheduler scheduler;
+            PhaseGlobalDecision const decision = scheduler.select({overlap});
+            EXPECT_EQ(decision.hardFeasibleCandidates, 1U);
+            EXPECT_EQ(decision.deadlineSafeCandidates, 0U);
+            EXPECT_GT(decision.predictedViolationUs, 0.0);
+        }
+    }
+}
+
+TEST(PhaseThreeCoordinatorPolicyTest, ResidualEncoderPreservesAvailableExactAndProbeCompletion)
+{
+    for (bool const exactKnown : {false, true})
+    {
+        bool const safeProbe = !exactKnown;
+        for (double const availableCompletionUs : {0.0, 1500.0})
+        {
+            double completionUs = availableCompletionUs;
+            double uncertaintyUs = 125.0;
+            phaseEncoderResidualCompletionFallback(exactKnown || safeProbe, 8000.0, 600.0, completionUs, uncertaintyUs);
+            EXPECT_DOUBLE_EQ(completionUs, availableCompletionUs);
+            EXPECT_DOUBLE_EQ(uncertaintyUs, 125.0);
+        }
+    }
+    double unavailableCompletionUs = 1500.0;
+    double unavailableUncertaintyUs = 125.0;
+    phaseEncoderResidualCompletionFallback(false, 8000.0, 600.0, unavailableCompletionUs, unavailableUncertaintyUs);
+    EXPECT_DOUBLE_EQ(unavailableCompletionUs, 8000.0);
+    EXPECT_DOUBLE_EQ(unavailableUncertaintyUs, 600.0);
+}
+
 TEST(PhaseThreeCoordinatorPolicyTest, RecoversNoSloPhaseAfterOneServiceQuantum)
 {
     PhaseServiceState service;

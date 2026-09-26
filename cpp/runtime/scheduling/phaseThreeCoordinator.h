@@ -591,6 +591,10 @@ bool phaseEncoderPreparationBlocksPd(bool preparationActive, bool allowConcurren
 float phaseEncoderActionGpuMs(
     bool asyncPreparation, bool separatePreparationCost, float pipelineGpuMs, float executionGpuMs) noexcept;
 
+//! Fill an absent residual completion with the serial-reference estimate, not a physical upper bound.
+void phaseEncoderResidualCompletionFallback(bool overlapEstimateAvailable, double serialReferenceUs,
+    double serialUncertaintyUs, double& completionUs, double& uncertaintyUs) noexcept;
+
 //! Select the FIFO prefix released from the encoded-ready queue into the prefill scheduler.
 size_t phaseVisionReadyPrefillBatchSize(std::vector<int32_t> const& promptTokenCounts, size_t maxBatchSize,
     size_t maxBatchTokens, double oldestWaitUs, double batchWaitUs) noexcept;
