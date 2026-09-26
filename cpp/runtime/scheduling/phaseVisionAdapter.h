@@ -111,7 +111,7 @@ size_t phaseVisionRetainedStorageBytes(std::vector<PhaseVisionPayload const*> co
 
 //! Bound retained encoder slabs separately from the shared-workspace execution lease.
 inline bool phaseVisionPreparationWithinStorageBudget(
-    bool sharedWorkspace, size_t maxRetainedBatches, size_t retainedBatches, bool downstreamPending) noexcept
+    bool sharedWorkspace, size_t maxRetainedBatches, size_t retainedBatches, bool downstreamPrefillPending) noexcept
 {
     if (!sharedWorkspace)
     {
@@ -121,7 +121,7 @@ inline bool phaseVisionPreparationWithinStorageBudget(
     {
         return false;
     }
-    return maxRetainedBatches > 1U || !downstreamPending;
+    return maxRetainedBatches > 1U || !downstreamPrefillPending;
 }
 
 //! One logical request submitted as part of a shared vision-encoder batch.

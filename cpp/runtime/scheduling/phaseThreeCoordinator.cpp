@@ -1379,7 +1379,7 @@ bool PhaseThreeCoordinator::poll()
             && !mVision.busy()
             && phaseVisionPreparationWithinStorageBudget(mConfig.serializeAllEncoderPrefill,
                 mConfig.sharedEpMaxRetainedBatches, mVision.retainedStorageBatches(),
-                !mReadyPrefill.empty() || mServer.visionPayloadBytes() > 0U))
+                !mReadyPrefill.empty() || mServer.hasVisionPrefillPayload()))
         {
             // Preparation is a mechanism stage, not an E execution action.
             // Materialize the real encoder cohort while P/D continue, then
@@ -4076,7 +4076,7 @@ bool PhaseThreeCoordinator::startNextEncoder()
     if (batchSize == 0
         || !phaseVisionPreparationWithinStorageBudget(mConfig.serializeAllEncoderPrefill,
             mConfig.sharedEpMaxRetainedBatches, mVision.retainedStorageBatches(),
-            !mReadyPrefill.empty() || mServer.visionPayloadBytes() > 0U))
+            !mReadyPrefill.empty() || mServer.hasVisionPrefillPayload()))
     {
         return false;
     }

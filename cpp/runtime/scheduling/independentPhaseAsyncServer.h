@@ -472,6 +472,8 @@ public:
     int32_t pageReservationGuaranteedPages() const;
     float decodeTpotPressure() const noexcept;
     size_t visionPayloadBytes() const noexcept;
+    //! Pending prefill views exclude positional data retained solely by decode.
+    bool hasVisionPrefillPayload() const noexcept;
     //! Include coordinator-owned payloads when counting shared retained physical vision slabs.
     size_t visionRetainedStorageBytes(std::vector<PhaseVisionPayload const*> payloads = {}) const noexcept;
     size_t visionPayloadBytes(std::vector<uint64_t> const& requestIds) const noexcept;
