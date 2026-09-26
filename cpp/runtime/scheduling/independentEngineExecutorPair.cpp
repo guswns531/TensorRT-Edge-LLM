@@ -204,6 +204,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureTieredVisi
     int64_t const prefillSpanBytes = ((prefillBytes + kContextAlignment - 1) / kContextAlignment) * kContextAlignment;
     int64_t const arenaBytes = std::max(prefillSpanBytes + smallVisionBytes, largeVisionBytes);
 
+    prepareContextMemoryReplacement(true);
     // Release the old prefill allocation before acquiring the replacement arena,
     // avoiding a transient peak on memory-constrained edge GPUs.
     mPrefillContextMemory = Tensor{};
@@ -247,6 +248,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     int64_t const visionBytes = vision.getRequiredContextMemorySizeForProfile(visionProfile);
     int64_t const arenaBytes = std::max(prefillBytes, visionBytes);
 
+    prepareContextMemoryReplacement(true);
     // Release the old prefill allocation before acquiring the replacement
     // arena so the transition does not introduce a transient memory peak.
     mPrefillContextMemory = Tensor{};
@@ -284,6 +286,7 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
     int64_t const visionBytes = vision.getRequiredContextMemorySize();
     int64_t const arenaBytes = std::max(decodeBytes, visionBytes);
 
+    prepareContextMemoryReplacement(false);
     mDecodeContextMemory = Tensor{};
     mTieredContextMemoryArena = Tensor{};
     mTieredContextMemoryArena = Tensor({arenaBytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8,
@@ -300,6 +303,17 @@ TieredVisionContextMemoryInfo IndependentEngineExecutorPair::configureSharedVisi
         "Failed to rebind decode to the shared E/D context arena");
 
     return {arenaBytes, decodeBytes, visionBytes, visionBytes};
+}
+
+void IndependentEngineExecutorPair::prepareContextMemoryReplacement(bool prefill)
+{
+    CUDA_CHECK(cudaStreamQuery(prefill ? mConfig.prefillStream : mConfig.decodeStream));
+    EngineExecutor& executor = prefill ? *mPrefillExecutor : *mDecodeExecutor;
+    static_cast<void>(executor.trimGraphCache(0U));
+    if (prefill && mExternalPrefillExecutor)
+    {
+        static_cast<void>(mExternalPrefillExecutor->trimGraphCache(0U));
+    }
 }
 
 CUcontext IndependentEngineExecutorPair::cudaContext() const noexcept

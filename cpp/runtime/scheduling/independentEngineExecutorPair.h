@@ -120,6 +120,7 @@ private:
     static CUcontext streamContext(cudaStream_t stream);
     static void validateStreams(IndependentEngineExecutorPairConfig const& config, CUcontext& context);
     int64_t maxPrefillContextMemoryBytes() const;
+    void prepareContextMemoryReplacement(bool prefill);
 
     //! Declared before non-owning subviews so it is destroyed after them.
     Tensor mTieredContextMemoryArena;

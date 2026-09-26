@@ -66,6 +66,33 @@ TEST(EngineExecutorTest, BindingSnapshotDifferentAddresses)
     EXPECT_FALSE(s1 == s2);
 }
 
+TEST(EngineExecutorTest, BindingSnapshotRejectsReboundWorkspaceWithIdenticalIO)
+{
+    EngineExecutor::BindingSnapshot captured;
+    nvinfer1::Dims shape{};
+    shape.nbDims = 2;
+    shape.d[0] = 1;
+    shape.d[1] = 23;
+    captured.profileIndex = 0;
+    captured.contextMemoryGeneration = 1U;
+    captured.bindings = {{0x1000, shape}, {0x2000, shape}};
+
+    EngineExecutor::BindingSnapshot rebound = captured;
+    ++rebound.contextMemoryGeneration;
+    EXPECT_FALSE(captured == rebound);
+}
+
+TEST(EngineExecutorTest, BindingSnapshotKeepsStableWorkspaceReplayable)
+{
+    EngineExecutor::BindingSnapshot captured;
+    captured.profileIndex = 1;
+    captured.contextMemoryGeneration = 3U;
+    EngineExecutor::BindingSnapshot replay = captured;
+    EXPECT_TRUE(captured == replay);
+    replay.profileIndex = 0;
+    EXPECT_FALSE(captured == replay);
+}
+
 TEST(EngineExecutorTest, BindingSnapshotDifferentNbDims)
 {
     EngineExecutor::BindingSnapshot s1;

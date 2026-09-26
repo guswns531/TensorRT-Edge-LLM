@@ -87,6 +87,7 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
         sharedContext ? PhaseTensorRTContextMode::kSharedSerialized : PhaseTensorRTContextMode::kIndependentConcurrent,
         safety);
     mScheduler.setGlobalExecutionVariantSupplier([this](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
+        refreshGraphWorkspaceGenerations();
         int32_t const prefillGraphTokens = mConfig.packedPrefill ? primaryTokenCount : key.chunkLength;
         std::string const shapeSuffix
             = ":" + std::to_string(key.primaryBatchSize) + ":" + std::to_string(prefillGraphTokens);
@@ -357,12 +358,14 @@ void IndependentPhaseCoordinator::enqueueDecode(PhaseWorkItem item)
 
 bool IndependentPhaseCoordinator::dispatchNext()
 {
+    refreshGraphWorkspaceGenerations();
     return mWorker->dispatchNext();
 }
 
 bool IndependentPhaseCoordinator::augmentGlobalAction(PhaseGlobalActionCandidate missingPhase,
     PhaseGlobalActionCandidate aggregate, uint64_t planId, uint64_t snapshotEpoch)
 {
+    refreshGraphWorkspaceGenerations();
     return mWorker->augmentNext(std::move(missingPhase), std::move(aggregate), planId, snapshotEpoch);
 }
 
@@ -378,12 +381,14 @@ void IndependentPhaseCoordinator::wait()
 
 void IndependentPhaseCoordinator::runUntilIdle(size_t maxDispatches)
 {
+    refreshGraphWorkspaceGenerations();
     mWorker->runUntilIdle(maxDispatches);
 }
 
 bool IndependentPhaseCoordinator::capturePreparedGraphs()
 {
     ELLM_CHECK(!busy(), "Independent phase graphs cannot be captured while work is in flight");
+    refreshGraphWorkspaceGenerations();
     bool const prefillCaptured = mExecutors.prefillExecutor().captureGraph(mPrefillStream);
     bool const decodeCaptured = mExecutors.decodeExecutor().captureGraph(mDecodeStream);
     return prefillCaptured && decodeCaptured;
@@ -393,6 +398,7 @@ size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const
     std::function<void(int32_t, cudaStream_t)> const& stageInputs)
 {
     ELLM_CHECK(empty() && !busy(), "Decode graphs cannot be primed while requests are pending or in flight");
+    refreshGraphWorkspaceGenerations();
     if (mMaxDecodeGraphs == 0U)
     {
         return 0U;
@@ -503,6 +509,30 @@ size_t IndependentPhaseCoordinator::prepareServingGraphs(PhaseGraphExecutionOpti
 void IndependentPhaseCoordinator::setGraphCaptureEnabled(bool enabled) noexcept
 {
     mGraphCaptureEnabled = enabled;
+}
+
+void IndependentPhaseCoordinator::refreshGraphWorkspaceGenerations()
+{
+    uint64_t const prefill = mExecutors.prefillExecutor().contextMemoryGeneration();
+    uint64_t const externalPrefill
+        = mExecutors.hasExternalPrefillExecutor() ? mExecutors.externalPrefillExecutor().contextMemoryGeneration() : 0U;
+    uint64_t const decode = mExecutors.decodeExecutor().contextMemoryGeneration();
+    bool const changed = prefill != mPrefillWorkspaceGeneration
+        || externalPrefill != mExternalPrefillWorkspaceGeneration || decode != mDecodeWorkspaceGeneration;
+    ELLM_CHECK(!changed || !busy(), "Phase workspace rebinding requires a drained coordinator");
+    if (prefill != mPrefillWorkspaceGeneration || externalPrefill != mExternalPrefillWorkspaceGeneration)
+    {
+        mCapturedPrefillShapes.clear();
+        mPrefillGraphShapeObservations.clear();
+        mPrefillWorkspaceGeneration = prefill;
+        mExternalPrefillWorkspaceGeneration = externalPrefill;
+    }
+    if (decode != mDecodeWorkspaceGeneration)
+    {
+        mCapturedDecodeShapes.clear();
+        mDecodeGraphShapeObservations.clear();
+        mDecodeWorkspaceGeneration = decode;
+    }
 }
 
 void IndependentPhaseCoordinator::setGraphCaptureMinObservations(size_t observations)

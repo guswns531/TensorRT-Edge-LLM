@@ -2188,6 +2188,28 @@ int main(int argc, char** argv)
         }
         else if (ipcMode)
         {
+            cudaStream_t ipcEncoderStream{};
+            std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
+            std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
+            std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
+            if (visionEngineDir != nullptr)
+            {
+                ELLM_CHECK(!config.packedPrefill || pair->hasExternalPrefillExecutor(),
+                    "Three-phase packed vision requires a dedicated external-prefill context");
+                if (enablePhaseStreamPriorities)
+                {
+                    CUDA_CHECK(cudaStreamCreateWithPriority(&ipcEncoderStream, cudaStreamNonBlocking, leastPriority));
+                }
+                else
+                {
+                    CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
+                }
+                ipcVisionRunner = rt::MultimodalRunner::create(
+                    visionEngineDir, visionRunnerBatchSize, config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
+                CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+                CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+                configureVisionContextMemory(*ipcVisionRunner);
+            }
             // Publish one complete prefill cohort before each arbitration point.
             // Parsing remains asynchronous, so expensive image preparation does
             // not drain an entire burst while the device is idle.
@@ -2428,25 +2450,8 @@ int main(int argc, char** argv)
             {
                 activityTimeline->reset(setupStream);
             }
-            cudaStream_t ipcEncoderStream{};
-            std::unique_ptr<rt::MultimodalRunner> ipcVisionRunner;
-            std::unique_ptr<rt::PhaseVisionAdapter> ipcVisionAdapter;
-            std::unique_ptr<rt::PhaseThreeCoordinator> ipcThreePhase;
             if (visionEngineDir != nullptr)
             {
-                ELLM_CHECK(!config.packedPrefill || pair->hasExternalPrefillExecutor(),
-                    "Three-phase packed vision requires a dedicated external-prefill context");
-                if (enablePhaseStreamPriorities)
-                {
-                    CUDA_CHECK(cudaStreamCreateWithPriority(&ipcEncoderStream, cudaStreamNonBlocking, leastPriority));
-                }
-                else
-                {
-                    CUDA_CHECK(cudaStreamCreateWithFlags(&ipcEncoderStream, cudaStreamNonBlocking));
-                }
-                ipcVisionRunner = rt::MultimodalRunner::create(
-                    visionEngineDir, visionRunnerBatchSize, config.maxKVCacheCapacity, ipcEncoderStream, checkpointDir);
-                configureVisionContextMemory(*ipcVisionRunner);
                 ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
                     *ipcVisionRunner, tokenizer, phaseConfig, ipcEncoderStream, visionStoragePolicy, copyStream);
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_DEBUG_DIR"))

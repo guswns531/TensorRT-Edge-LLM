@@ -133,10 +133,19 @@ public:
     /*!
      * @brief Provide shared device memory for the execution context.
      *
+     * The caller must have drained this context before rebinding. Captured
+     * graphs are invalidated even if the allocation reuses the same address.
+     *
      * @param sharedMem Tensor whose memory will back the TRT context
      * @return True on success
      */
     virtual bool setContextMemory(Tensor& sharedMem) = 0;
+
+    //! Monotonic workspace-binding identity used by phase graph-shape registries.
+    virtual uint64_t contextMemoryGeneration() const noexcept
+    {
+        return 0U;
+    }
 
     //! @brief Select a fixed profile and assign profile-sized context memory.
     virtual bool setContextMemoryForProfile(int32_t profileIndex, Tensor& sharedMem, cudaStream_t stream)
@@ -204,6 +213,7 @@ public:
     struct BindingSnapshot
     {
         int32_t profileIndex{-1};
+        uint64_t contextMemoryGeneration{};
         std::vector<std::pair<uintptr_t, nvinfer1::Dims>> bindings;
 
         bool operator==(BindingSnapshot const& rhs) const noexcept;

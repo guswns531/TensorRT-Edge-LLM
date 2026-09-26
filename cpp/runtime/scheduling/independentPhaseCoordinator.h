@@ -141,6 +141,7 @@ private:
     PhaseHostExecutionTiming enqueueDecodeBatch(std::vector<PhaseWorkItem> const& batch, cudaStream_t stream);
     void completePrefillBatch(std::vector<PhaseWorkItem> const& batch);
     void completeDecodeBatch(std::vector<PhaseWorkItem> const& batch);
+    void refreshGraphWorkspaceGenerations();
 
     LLMEngineConfig mConfig;
     IndependentEngineExecutorPair& mExecutors;
@@ -160,6 +161,9 @@ private:
     bool mMetricsCollectionEnabled{true};
     std::unordered_set<std::string> mCapturedPrefillShapes;
     std::unordered_set<std::string> mCapturedDecodeShapes;
+    uint64_t mPrefillWorkspaceGeneration{};
+    uint64_t mExternalPrefillWorkspaceGeneration{};
+    uint64_t mDecodeWorkspaceGeneration{};
     std::unordered_map<std::string, size_t> mPrefillGraphShapeObservations;
     std::unordered_map<std::string, size_t> mDecodeGraphShapeObservations;
     bool mGraphCaptureEnabled{};

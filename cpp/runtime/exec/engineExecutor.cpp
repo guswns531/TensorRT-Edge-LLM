@@ -100,6 +100,7 @@ public:
     int64_t getRequiredContextMemorySize() const override;
     int64_t getRequiredContextMemorySizeForProfile(int32_t profileIndex) const override;
     bool setContextMemory(Tensor& sharedMem) override;
+    uint64_t contextMemoryGeneration() const noexcept override;
     bool setContextMemoryForProfile(int32_t profileIndex, Tensor& sharedMem, cudaStream_t stream) override;
     int32_t getNumIOTensors() const override;
     char const* getIOTensorName(int32_t index) const override;
@@ -128,6 +129,7 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     TensorRegistry mRegistry;
     int32_t mCurrentProfileIndex{-1};
+    uint64_t mContextMemoryGeneration{};
 
     //! A captured CUDA graph together with its binding snapshot for verification.
     struct CapturedGraph
@@ -435,8 +437,16 @@ int64_t TrtEngineExecutor::getRequiredContextMemorySizeForProfile(int32_t profil
 
 bool TrtEngineExecutor::setContextMemory(Tensor& sharedMem)
 {
+    static_cast<void>(trimGraphCache(0U));
+    mTracedGraphBindings.clear();
+    ++mContextMemoryGeneration;
     mContext->setDeviceMemoryV2(sharedMem.rawPointer(), sharedMem.getMemoryCapacity());
     return true;
+}
+
+uint64_t TrtEngineExecutor::contextMemoryGeneration() const noexcept
+{
+    return mContextMemoryGeneration;
 }
 
 bool TrtEngineExecutor::setContextMemoryForProfile(int32_t profileIndex, Tensor& sharedMem, cudaStream_t stream)
@@ -451,8 +461,8 @@ bool TrtEngineExecutor::setContextMemoryForProfile(int32_t profileIndex, Tensor&
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int64_t const requiredBytes = getRequiredContextMemorySizeForProfile(profileIndex);
     ELLM_CHECK(sharedMem.getMemoryCapacity() >= requiredBytes, "Profile-specific TensorRT context memory is too small");
-    mContext->setDeviceMemoryV2(sharedMem.rawPointer(), sharedMem.getMemoryCapacity());
-    return true;
+    mCurrentProfileIndex = profileIndex;
+    return setContextMemory(sharedMem);
 }
 
 int32_t TrtEngineExecutor::getNumIOTensors() const
@@ -533,7 +543,8 @@ size_t TrtEngineExecutor::trimGraphCache(size_t maxEntries) noexcept
 
 bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) const noexcept
 {
-    if (profileIndex != rhs.profileIndex || bindings.size() != rhs.bindings.size())
+    if (profileIndex != rhs.profileIndex || contextMemoryGeneration != rhs.contextMemoryGeneration
+        || bindings.size() != rhs.bindings.size())
     {
         return false;
     }
@@ -583,6 +594,7 @@ size_t TrtEngineExecutor::computeBindingHash() const
 {
     size_t seed = 0;
     hash_utils::hashCombine(seed, mCurrentProfileIndex);
+    hash_utils::hashCombine(seed, mContextMemoryGeneration);
     int32_t const numIO = mEngineState->engine->getNbIOTensors();
     for (int32_t i = 0; i < numIO; ++i)
     {
@@ -603,6 +615,7 @@ size_t TrtEngineExecutor::computeBindingHash() const
 EngineExecutor::BindingSnapshot TrtEngineExecutor::snapshotBindings() const
 {
     BindingSnapshot snap;
+    snap.contextMemoryGeneration = mContextMemoryGeneration;
     snap.profileIndex = mCurrentProfileIndex;
     int32_t const numIO = mEngineState->engine->getNbIOTensors();
     snap.bindings.reserve(numIO);
