@@ -121,6 +121,8 @@ struct PhaseThreeCoordinatorConfig
     //! Zero explicitly disables production probes.
     float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
+    //! Disable only serving-time exploration; calibration and measured actions remain enabled.
+    bool enableServingOverlapProbes{true};
     //! Maximum distinct E+P/E+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     int32_t globalDecodeContextBucketTokens{512};

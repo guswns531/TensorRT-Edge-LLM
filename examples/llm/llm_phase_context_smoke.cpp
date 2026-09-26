@@ -1762,6 +1762,14 @@ int main(int argc, char** argv)
             phasePolicyMode = *parsed;
         }
         semanticSchedulerConfig.policyMode = phasePolicyMode;
+        if (char const* value = std::getenv("TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES"))
+        {
+            std::string const disabled{value};
+            ELLM_CHECK(disabled == "0" || disabled == "1", "TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES must be 0 or 1");
+            semanticSchedulerConfig.enableServingOverlapProbes = disabled == "0";
+        }
+        LOG_INFO("Phase overlap probes: serving=%s calibration=enabled",
+            semanticSchedulerConfig.enableServingOverlapProbes ? "enabled" : "disabled");
         bool const enableServiceNormalizedAuthority = rt::phasePolicyUsesTransition(phasePolicyMode)
             && std::getenv("TRT_EDGELLM_SERVICE_NORMALIZED_AUTHORITY") != nullptr;
         semanticSchedulerConfig.globalSchedulerConfig.enableServiceNormalizedAuthority
@@ -2496,6 +2504,7 @@ int main(int argc, char** argv)
                 rt::PhaseThreeCoordinatorConfig threePhaseConfig;
                 threePhaseConfig.globalSchedulerMode = semanticSchedulerConfig.globalSchedulerMode;
                 threePhaseConfig.globalSchedulerConfig = semanticSchedulerConfig.globalSchedulerConfig;
+                threePhaseConfig.enableServingOverlapProbes = semanticSchedulerConfig.enableServingOverlapProbes;
                 threePhaseConfig.runtimeCostTracker = runtimeCostTracker;
                 threePhaseConfig.enableGlobalPdFrontier = std::getenv("TRT_EDGELLM_GLOBAL_PD_FRONTIER") != nullptr;
                 threePhaseConfig.preserveLegacyPairEligibility

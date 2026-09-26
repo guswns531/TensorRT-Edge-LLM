@@ -2723,8 +2723,8 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     {
         protectedSlackUs = std::min(protectedSlackUs, completion.slackUs);
     }
-    bool const safeProbe = !overlapMeasured && needsCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
-        && probeIntervalReady
+    bool const safeProbe = (mGlobalWarmupProbeMode || mConfig.enableServingOverlapProbes) && !overlapMeasured
+        && needsCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
         && (protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs
             || protectedSlackUs < robustSerialUs);
     overlap.overlapCostKnown = overlapMeasured;
@@ -3416,7 +3416,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
                 >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * residualPhaseProbeUs;
         bool const calibrationProbe = mGlobalWarmupProbeMode && calibrationTarget && needsLocalCalibration;
         bool const safeProbe = calibrationProbe
-            || (!overlapKnown && needsLocalCalibration
+            || ((mGlobalWarmupProbeMode || mConfig.enableServingOverlapProbes) && !overlapKnown && needsLocalCalibration
                 && ((mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
                         && protectedSlackUs
                             >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs)
@@ -3427,7 +3427,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         }
         else if (!overlapKnown && needsLocalCalibration && !mGlobalWarmupProbeMode)
         {
-            if (mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
+            if (!mConfig.enableServingOverlapProbes || mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
             {
                 ++mGlobalEncoderOverlapProbeDisabled;
             }

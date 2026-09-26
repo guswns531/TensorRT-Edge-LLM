@@ -279,7 +279,7 @@ def command_for(repo,
         "TRT_EDGELLM_EMIT_PHASE_METRICS":
         1,
         "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL":
-        "full"
+        options.get("telemetry_level", "full")
     }
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
         environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
@@ -327,6 +327,8 @@ def command_for(repo,
                 "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = warmup_decode_batches(
                     config["decode_batch"])
     environment.update(options.get("environment", {}))
+    if not options.get("serving_overlap_probes", True):
+        environment["TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES"] = "1"
 
     backend = [
         "docker", "run", "--rm", "--gpus", "all", "--network", "none",
@@ -476,8 +478,18 @@ def main():
                         choices=("on", "off"),
                         default=["on"])
     parser.add_argument("--cuda-graphs", choices=("on", "off"), default="on")
+    parser.add_argument(
+        "--telemetry-level",
+        choices=("full", "dispatch"),
+        default="full",
+        help="Full causal diagnostics or compact dispatch metrics")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--max-prefill-graphs", type=int, default=0)
+    parser.add_argument(
+        "--serving-overlap-probes",
+        choices=("on", "off"),
+        default="on",
+        help="Unknown serving probes; calibration remains enabled")
     parser.add_argument("--shared-ep-single-storage",
                         choices=("0", "1"),
                         default="1")
@@ -606,8 +618,14 @@ def main():
                         cell = root / name / variant_label / (
                             "repeat-%03d" % repeat) / workload
                         options = {
-                            "build_root": str(build),
-                            "cuda_graphs": args.cuda_graphs == "on",
+                            "build_root":
+                            str(build),
+                            "cuda_graphs":
+                            args.cuda_graphs == "on",
+                            "telemetry_level":
+                            args.telemetry_level,
+                            "serving_overlap_probes":
+                            args.serving_overlap_probes == "on",
                             "environment": {
                                 "TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR":
                                 "1" if predictor == "on" else "0",

@@ -2556,15 +2556,16 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         bool const deadlineRecoveryProbe = std::min(prefillSlack, decodeSlack) < robustSerialUs;
         bool const calibrationProbe = mGlobalWarmupProbeMode && calibrationTarget && needsLocalCalibration;
         bool const safeProbe = calibrationProbe
-            || (!overlapMeasured && needsLocalCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F
-                && probeIntervalReady && (probeSlackSafe || deadlineRecoveryProbe));
+            || ((mGlobalWarmupProbeMode || mConfig.enableServingOverlapProbes) && !overlapMeasured
+                && needsLocalCalibration && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
+                && (probeSlackSafe || deadlineRecoveryProbe));
         if (safeProbe)
         {
             ++mTelemetry.globalOverlapSafeProbeEligibleCount;
         }
         else if (!overlapMeasured && needsLocalCalibration && !mGlobalWarmupProbeMode)
         {
-            if (mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
+            if (!mConfig.enableServingOverlapProbes || mConfig.globalSafeProbeSlackMultiplier <= 0.0F)
             {
                 ++mTelemetry.globalOverlapProbeDisabledCount;
             }
@@ -3225,8 +3226,8 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
     bool const deadlineRecovery = protectedSlackUs < robustSerialUs;
     bool const slackSafe
         = protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs;
-    overlap.safeProbeEligible = !overlapKnown && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady
-        && (deadlineRecovery || slackSafe);
+    overlap.safeProbeEligible = (mGlobalWarmupProbeMode || mConfig.enableServingOverlapProbes) && !overlapKnown
+        && mConfig.globalSafeProbeSlackMultiplier > 0.0F && probeIntervalReady && (deadlineRecovery || slackSafe);
 
     PhaseContextualPdMode const contextualMode = mRuntimeCostTracker->contextualPdConfig().mode;
     if (contextualMode != PhaseContextualPdMode::kDisabled)

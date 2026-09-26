@@ -98,6 +98,28 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(values["TRT_EDGELLM_PHASE_POLICY"],
                          "service-scaled-transition")
 
+    def test_serving_probe_ablation_keeps_calibration_contract(self):
+        default = environment(self.command("independent"))
+        disabled = environment(
+            G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
+                                 "mixed", "independent", 0,
+                                 {"serving_overlap_probes": False}))
+        self.assertEqual(
+            disabled.pop("TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES"), "1")
+        self.assertEqual(default, disabled)
+
+    def test_compact_telemetry_changes_only_instrumentation(self):
+        default = environment(self.command("independent"))
+        compact = environment(
+            G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
+                                 "mixed", "independent", 0,
+                                 {"telemetry_level": "dispatch"}))
+        self.assertEqual(default.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"),
+                         "full")
+        self.assertEqual(compact.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"),
+                         "dispatch")
+        self.assertEqual(default, compact)
+
     def test_chunking_changes_only_after_common_calibration(self):
         lifetime = environment(self.command("lifetime"))
         chunked = environment(self.command("chunked"))

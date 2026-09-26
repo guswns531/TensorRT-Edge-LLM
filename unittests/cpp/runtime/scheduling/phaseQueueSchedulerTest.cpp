@@ -136,6 +136,7 @@ TEST(PhaseQueueSchedulerTest, GlobalSyntheticWarmupForcesUnknownPrefillDecodePro
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.enableServingOverlapProbes = false;
     PhaseQueueScheduler scheduler(config);
     scheduler.setGlobalWarmupProbeMode(true);
     scheduler.enqueuePrefill({1, 32});
@@ -148,6 +149,86 @@ TEST(PhaseQueueSchedulerTest, GlobalSyntheticWarmupForcesUnknownPrefillDecodePro
     EXPECT_TRUE(plan.globalSafeProbe);
     EXPECT_EQ(plan.globalAllowedOutstanding, PhaseExecutionSet::kPrefill | PhaseExecutionSet::kDecode);
     EXPECT_EQ(scheduler.telemetry().globalSafeProbeCount, 1U);
+}
+
+TEST(PhaseQueueSchedulerTest, ServingProbeAblationPreservesWarmupAndCandidateMembership)
+{
+    EXPECT_TRUE(PhaseQueueSchedulerConfig{}.enableServingOverlapProbes);
+    EXPECT_TRUE(PhaseThreeCoordinatorConfig{}.enableServingOverlapProbes);
+    for (bool const servingProbes : {false, true})
+    {
+        for (bool const warmup : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "serving=" << servingProbes << " warmup=" << warmup);
+            PhaseQueueSchedulerConfig config;
+            config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+            config.enableServingOverlapProbes = servingProbes;
+            config.prefillQueueWaitTargetUs = 1.0e9;
+            config.decodeQueueWaitTargetUs = 1.0e9;
+            PhaseQueueScheduler scheduler(config);
+            scheduler.setGlobalWarmupProbeMode(warmup);
+            scheduler.enqueuePrefill({1, 32});
+            scheduler.enqueueDecode({2, 128});
+
+            ASSERT_TRUE(scheduler.previewGlobalAction().has_value());
+            auto const& candidates = scheduler.lastGlobalPreviewCandidates();
+            ASSERT_EQ(candidates.size(), 3U);
+            auto const overlap = std::find_if(candidates.begin(), candidates.end(),
+                [](auto const& candidate) { return candidate.key.kind == PhaseGlobalActionKind::kPrefillDecode; });
+            ASSERT_NE(overlap, candidates.end());
+            EXPECT_EQ(overlap->safeProbeEligible, servingProbes || warmup);
+            EXPECT_EQ(overlap->calibrationProbe, warmup);
+            EXPECT_FALSE(overlap->overlapCostKnown);
+            EXPECT_EQ(overlap->primaryRequestIds, (std::vector<uint64_t>{1U}));
+            EXPECT_EQ(overlap->secondaryRequestIds, (std::vector<uint64_t>{2U}));
+
+            // Preview consumes the probe cooldown; compare dispatch from the same initial state.
+            PhaseQueueScheduler dispatchScheduler(config);
+            dispatchScheduler.setGlobalWarmupProbeMode(warmup);
+            dispatchScheduler.enqueuePrefill({1, 32});
+            dispatchScheduler.enqueueDecode({2, 128});
+            PhaseDispatchPlan const plan = dispatchScheduler.next();
+            EXPECT_EQ(plan.kind == PhaseDispatchKind::kOverlap, servingProbes || warmup);
+            EXPECT_EQ(plan.globalSafeProbe, servingProbes || warmup);
+        }
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, ServingProbeAblationAlsoAppliesToResidualOverlap)
+{
+    for (bool const servingProbes : {false, true})
+    {
+        for (bool const warmup : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "serving=" << servingProbes << " warmup=" << warmup);
+            PhaseQueueSchedulerConfig config;
+            config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+            config.enableServingOverlapProbes = servingProbes;
+            config.prefillQueueWaitTargetUs = 1.0e9;
+            config.globalDecodeTpotTargetUs = 1.0e9;
+            PhaseQueueScheduler scheduler(config);
+            scheduler.setGlobalWarmupProbeMode(warmup);
+            scheduler.enqueueDecode({2, 128, 4});
+
+            PhaseGlobalActionCandidate launched;
+            launched.key = {PhaseGlobalActionKind::kPrefill, 1, 0, 128, 0, 0};
+            launched.key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+            launched.primaryRequestIds = {1U};
+            launched.primaryStableSlotIds = {3};
+            launched.predictedBlockingUs = 4000.0;
+            launched.predictedMakespanUs = 4000.0;
+            launched.referenceWorkUs = 4000.0;
+            phaseGlobalFinalizeCandidate(launched);
+
+            auto const residual = scheduler.previewGlobalResidualAction(launched, 1000.0);
+            ASSERT_TRUE(residual.has_value());
+            EXPECT_EQ(residual->aggregate.safeProbeEligible, servingProbes || warmup);
+            EXPECT_EQ(residual->selected, servingProbes || warmup);
+            EXPECT_FALSE(residual->aggregate.overlapCostKnown);
+            EXPECT_EQ(residual->aggregate.primaryRequestIds, (std::vector<uint64_t>{1U}));
+            EXPECT_EQ(residual->aggregate.secondaryRequestIds, (std::vector<uint64_t>{2U}));
+        }
+    }
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalWarmupStopsProbingCalibratedUnprofitableOverlap)
@@ -229,6 +310,7 @@ TEST(PhaseQueueSchedulerTest, GlobalPrioritizesKnownOverlapTransition)
 
     PhaseQueueSchedulerConfig config;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.enableServingOverlapProbes = false;
     config.globalCostModelConfig = trackerConfig.action;
     config.runtimeCostTracker = tracker;
     config.maxPrefillBatchSize = 2;

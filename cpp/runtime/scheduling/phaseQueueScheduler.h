@@ -414,6 +414,8 @@ struct PhaseQueueSchedulerConfig
     //! on serial execution. Zero disables production probes.
     float globalSafeProbeSlackMultiplier{3.0F};
     size_t globalSafeProbeInterval{32U};
+    //! Disable only serving-time exploration; calibration and measured actions remain enabled.
+    bool enableServingOverlapProbes{true};
     //! Maximum distinct P+D shapes targeted by one calibration epoch.
     size_t globalCalibrationMaxOverlapKeys{16U};
     //! Optional ownership-aware memory horizon in one caller-defined unit.
