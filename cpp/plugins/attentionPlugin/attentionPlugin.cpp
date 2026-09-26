@@ -16,6 +16,7 @@
  */
 
 #include "attentionPlugin.h"
+#include "packedPrefillContract.h"
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -1354,11 +1355,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     int32_t const combinedHeads = sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads);
 
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
-    bool const packedPrefill = mEnablePackedPrefill && physicalBatchSize == 1 && runtimeSeqLen > 1;
-    int32_t const runtimeBatchSize
-        = packedPrefill ? static_cast<int32_t>(contextLengthInputDesc.dims.d[0]) : physicalBatchSize;
     int32_t packedPrefillChunkLimit = mPackedPrefillMaxChunkTokens;
-    if (packedPrefill && mEnableProfileLocalPackedPrefill)
+    int32_t profileChunkLimit{};
+    if (mEnableProfileLocalPackedPrefill)
     {
         int32_t const chunkLimitIdx = packedPrefillChunkLimitInputIdx(mEnableQKNorm != 0,
             mEnableContextMaskSelector != 0, mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0);
@@ -1366,7 +1365,12 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         check::check(packedPrefillChunkLimit > 0, "Packed prefill requires a positive profile-local chunk limit.");
         check::check(packedPrefillChunkLimit <= mPackedPrefillMaxChunkTokens,
             "Packed prefill runtime chunk limit exceeds the exported maximum.");
+        profileChunkLimit = packedPrefillChunkLimit;
     }
+    bool const packedPrefill
+        = isPackedPrefillInvocation(mEnablePackedPrefill != 0, physicalBatchSize, runtimeSeqLen, profileChunkLimit);
+    int32_t const runtimeBatchSize
+        = packedPrefill ? static_cast<int32_t>(contextLengthInputDesc.dims.d[0]) : physicalBatchSize;
 
     rt::Tensor packedQKVTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
         rt::Coords{physicalBatchSize, runtimeSeqLen, combinedHeads, mHeadSize}, rt::DeviceType::kGPU,

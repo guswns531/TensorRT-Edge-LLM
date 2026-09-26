@@ -174,7 +174,8 @@ edgellm_add_unit_test(
   cpp/kernels/nvfp4A16BlackwellGemv
   cpp/kernels/dart)
 
-edgellm_add_unit_test(NAME unitTestPlugins DIRS cpp/plugins/nvfp4A16GemmPlugin)
+edgellm_add_unit_test(NAME unitTestPlugins DIRS cpp/plugins/nvfp4A16GemmPlugin
+                      cpp/plugins/attentionPlugin)
 
 edgellm_add_unit_test(NAME unitTestCuteDslKernels DIRS
                       kernelSrcs/int4_fp16_gemm_cutedsl)
