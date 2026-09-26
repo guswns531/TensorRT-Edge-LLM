@@ -34,6 +34,7 @@
 #include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/scheduling/phaseServingExecutionOptions.h"
 #include "runtime/scheduling/phaseThreeCoordinator.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 #include "runtime/state/pipelineIO.h"
@@ -954,7 +955,7 @@ int main(int argc, char** argv)
             ELLM_CHECK(pair->decodeExecutor().prepare(
                            1, config.decodeDims(controlledDecodeBatchSize), decodeMap, decodeStream),
                 "Failed to bind the stable paged-KV decode view");
-            if (std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr)
+            if (rt::resolvePhaseGraphExecutionOptions({}).enabled)
             {
                 bool const prefillGraph = pair->prefillExecutor().captureGraph(prefillStream);
                 bool const decodeGraph = pair->decodeExecutor().captureGraph(decodeStream);
@@ -1866,7 +1867,11 @@ int main(int argc, char** argv)
             serverConfig.eosTokenIds = config.eosTokenIds;
         }
         serverConfig.enablePrefixReuse = enablePrefixReuse;
-        serverConfig.enableCudaGraphs = std::getenv("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS") != nullptr;
+        rt::PhaseGraphExecutionOptions phaseGraphOptions;
+        phaseGraphOptions = rt::resolvePhaseGraphExecutionOptions(phaseGraphOptions);
+        serverConfig.enableCudaGraphs = phaseGraphOptions.enabled;
+        serverConfig.maxPrefillGraphs = phaseGraphOptions.maxPrefillGraphs;
+        serverConfig.maxDecodeGraphs = phaseGraphOptions.maxDecodeGraphs;
         serverConfig.synchronizeDecodeSampling = std::getenv("TRT_EDGELLM_SYNCHRONIZE_DECODE_SAMPLING") != nullptr;
         if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_REFILL_BATCH"))
         {
@@ -1875,14 +1880,6 @@ int main(int argc, char** argv)
         if (char const* value = std::getenv("TRT_EDGELLM_ADMISSION_REFILL_WINDOW_US"))
         {
             serverConfig.admissionRefillWindowUs = std::stod(value);
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_MAX_PREFILL_GRAPHS"))
-        {
-            serverConfig.maxPrefillGraphs = static_cast<size_t>(std::stoul(value));
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_MAX_DECODE_GRAPHS"))
-        {
-            serverConfig.maxDecodeGraphs = static_cast<size_t>(std::stoul(value));
         }
         serverConfig.allowBatchedVisionPrefill = enableBatchedVisionPrefill;
         serverConfig.allowChunkedVisionPrefill = config.packedPrefill
@@ -2045,7 +2042,8 @@ int main(int argc, char** argv)
             char const* const envWorkspaceMode = std::getenv("TRT_EDGELLM_PHASE_WORKSPACE_MODE");
             bool const sharedEpMode = envWorkspaceMode != nullptr && (std::strcmp(envWorkspaceMode, "shared_ep") == 0);
             bool const tieredEpMode = (envWorkspaceMode != nullptr
-                && (std::strcmp(envWorkspaceMode, "tiered_ep") == 0 || std::strcmp(envWorkspaceMode, "tiered") == 0))
+                                          && (std::strcmp(envWorkspaceMode, "tiered_ep") == 0
+                                              || std::strcmp(envWorkspaceMode, "tiered") == 0))
                 || std::getenv("TRT_EDGELLM_TIERED_VISION_CONTEXT_MEMORY") != nullptr;
             bool const sharedEdMode = (envWorkspaceMode != nullptr && std::strcmp(envWorkspaceMode, "shared_ed") == 0)
                 || std::getenv("TRT_EDGELLM_SHARED_VISION_DECODE_CONTEXT_MEMORY") != nullptr;
@@ -2413,32 +2411,16 @@ int main(int argc, char** argv)
             {
                 semanticCoordinator.scheduler().resetPolicyPosterior();
             }
-            if (serverConfig.enableCudaGraphs && warmupBatchLimit > 0)
-            {
-                std::vector<int32_t> primeBatchSizes;
-                primeBatchSizes.reserve(static_cast<size_t>(warmupBatchLimit));
-                for (int32_t b = 1; b <= warmupBatchLimit; ++b)
-                {
-                    primeBatchSizes.push_back(b);
-                }
-                size_t const primed = semanticCoordinator.primeDecodeGraphs(primeBatchSizes, decodeStream);
-                LOG_INFO("Phase CUDA decode graphs primed: count=%zu", primed);
-            }
-            if (serverConfig.enableCudaGraphs && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") == nullptr)
-            {
-                // Retain the primed graph cache, but do not synchronously capture
-                // unseen production shapes on their latency-critical first request.
-                semanticCoordinator.setGraphCaptureEnabled(false);
-            }
-            else if (serverConfig.enableCudaGraphs)
-            {
-                size_t graphCaptureMinObservations = 8U;
-                if (char const* value = std::getenv("TRT_EDGELLM_GRAPH_CAPTURE_MIN_OBSERVATIONS"))
-                {
-                    graphCaptureMinObservations = static_cast<size_t>(std::stoul(value));
-                }
-                semanticCoordinator.setGraphCaptureMinObservations(graphCaptureMinObservations);
-            }
+            semanticCoordinator.prepareServingGraphs(
+                phaseGraphOptions, warmupBatchLimit, [&](int32_t batchSize, cudaStream_t stream) {
+                    std::vector<int32_t> const token{0};
+                    std::vector<rt::IndependentPhaseRequestView> views(static_cast<size_t>(batchSize));
+                    for (auto& view : views)
+                    {
+                        view.generatedTokens = &token;
+                    }
+                    stageTokens(views, *decodeIO, decodeMap, stream, false);
+                });
             LOG_INFO("Phase IPC shape warmup: mode=%s batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
                 phasePolicyWarmupModeName(policyWarmupMode), executionWarmupShapes.size(), warmedRequests,
                 warmupTelemetry.overlapSampleCount, warmupTelemetry.globalSafeProbeCount);
@@ -3356,8 +3338,7 @@ int main(int argc, char** argv)
                         }
                         if (serverConfig.enableCudaGraphs && input.kind != PhaseIpcKind::kCalibrationStatus)
                         {
-                            semanticCoordinator.setGraphCaptureEnabled(
-                                active && std::getenv("TRT_EDGELLM_ONLINE_GRAPH_CAPTURE") != nullptr);
+                            semanticCoordinator.setGraphCaptureEnabled(phaseGraphOptions.onlineCapture);
                         }
                         rt::PhaseThreeCoordinatorMetrics const calibrationMetrics
                             = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};

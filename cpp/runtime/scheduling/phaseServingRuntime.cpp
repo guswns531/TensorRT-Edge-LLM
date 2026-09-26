@@ -30,6 +30,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phaseActivityTimeline.h"
+#include "runtime/scheduling/phaseServingExecutionOptions.h"
 #include "runtime/scheduling/phaseVisionAdapter.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
@@ -115,13 +116,8 @@ PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& s
     int32_t const engineChunkLimit
         = engine.packedPrefill ? engine.maxPackedPrefillChunkTokens : engine.maxSupportedInputLength;
     config.maxPrefillChunkTokens = std::min(serving.maxPrefillChunkTokens, engineChunkLimit);
-    config.maxOverlapPrefillTokens = config.maxPrefillChunkTokens;
-    config.maxPrefillBatchTokens = serving.maxPrefillBatchTokens > 0
-        ? serving.maxPrefillBatchTokens
-        : config.maxPrefillBatchSize * config.maxPrefillChunkTokens;
     config.enableRaggedPrefillBatching = engine.packedPrefill;
     config.enablePackedPrefillTokenLayout = engine.packedPrefill;
-    config.prefillCompletionBonusTokens = config.maxPrefillChunkTokens;
     config.enableWavefrontPrefillBatching = true;
     config.enablePrefillCohortRefill = serving.enablePrefillCohortRefill;
     config.maxPrefillCohortSize = config.maxPrefillBatchSize;
@@ -133,48 +129,11 @@ PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& s
     config.enableAdaptivePrefillChunking = serving.enableAdaptivePrefillChunking;
     config.adaptivePrefillChunkCandidates = serving.adaptivePrefillChunkCandidates;
     config.enableCostAwarePrefillShapeSelection = serving.enableCostAwarePrefillShapeSelection;
-    if (char const* const envAdaptive = std::getenv("TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING");
-        envAdaptive != nullptr)
-    {
-        config.enableAdaptivePrefillChunking
-            = std::strcmp(envAdaptive, "0") != 0 && std::strcmp(envAdaptive, "false") != 0;
-    }
-    if (char const* const envCandidates = std::getenv("TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES");
-        envCandidates != nullptr)
-    {
-        config.adaptivePrefillChunkCandidates.clear();
-        std::stringstream ss(envCandidates);
-        std::string item;
-        while (std::getline(ss, item, ','))
-        {
-            if (!item.empty())
-            {
-                config.adaptivePrefillChunkCandidates.push_back(std::stoi(item));
-            }
-        }
-        if (!config.adaptivePrefillChunkCandidates.empty())
-        {
-            config.enableAdaptivePrefillChunking = true;
-            config.minPrefillChunkTokens = config.adaptivePrefillChunkCandidates.front();
-            config.maxPrefillChunkTokens = std::max(
-                config.maxPrefillChunkTokens, config.adaptivePrefillChunkCandidates.back());
-        }
-    }
-    if (char const* const envCostAware = std::getenv("TRT_EDGELLM_ENABLE_COST_AWARE_PREFILL_SHAPE");
-        envCostAware != nullptr)
-    {
-        config.enableCostAwarePrefillShapeSelection
-            = std::strcmp(envCostAware, "0") != 0 && std::strcmp(envCostAware, "false") != 0;
-    }
-    if (char const* const envGrace = std::getenv("TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US");
-        envGrace != nullptr)
-    {
-        config.transitionPredictorConfig.burstGracePeriodUs = std::stod(envGrace);
-    }
-    else
-    {
-        config.transitionPredictorConfig.burstGracePeriodUs = 50000.0;
-    }
+    resolvePhasePrefillExecutionOptions(config, engineChunkLimit);
+    config.prefillCompletionBonusTokens = config.maxPrefillChunkTokens;
+    config.maxPrefillBatchTokens = serving.maxPrefillBatchTokens > 0
+        ? serving.maxPrefillBatchTokens
+        : config.maxPrefillBatchSize * config.maxPrefillChunkTokens;
 
     PhaseRuntimeCostTrackerConfig trackerConfig;
     trackerConfig.policyMode = serving.policyMode;
@@ -202,29 +161,15 @@ IndependentPhaseServerConfig makeServerConfig(
         = serving.maxPendingRequests > 0 ? serving.maxPendingRequests : static_cast<size_t>(maxStableSlots);
     config.defaultMaxOutputTokens = 128;
     config.eosTokenIds = engine.eosTokenIds;
-    config.enableCudaGraphs = serving.enableCudaGraphs;
-    config.maxDecodeGraphs = serving.maxDecodeGraphs > 0 ? serving.maxDecodeGraphs : 8U;
-    config.maxPrefillGraphs = serving.maxPrefillGraphs > 0 ? serving.maxPrefillGraphs : 4U;
-    if (char const* const env = std::getenv("TRT_EDGELLM_MAX_DECODE_GRAPHS"))
-    {
-        try
-        {
-            config.maxDecodeGraphs = static_cast<size_t>(std::stoul(env));
-        }
-        catch (...)
-        {
-        }
-    }
-    if (char const* const env = std::getenv("TRT_EDGELLM_MAX_PREFILL_GRAPHS"))
-    {
-        try
-        {
-            config.maxPrefillGraphs = static_cast<size_t>(std::stoul(env));
-        }
-        catch (...)
-        {
-        }
-    }
+    PhaseGraphExecutionOptions graphOptions;
+    graphOptions.enabled = serving.enableCudaGraphs;
+    graphOptions.maxDecodeGraphs = serving.maxDecodeGraphs > 0 ? serving.maxDecodeGraphs : graphOptions.maxDecodeGraphs;
+    graphOptions.maxPrefillGraphs
+        = serving.maxPrefillGraphs > 0 ? serving.maxPrefillGraphs : graphOptions.maxPrefillGraphs;
+    graphOptions = resolvePhaseGraphExecutionOptions(graphOptions);
+    config.enableCudaGraphs = graphOptions.enabled;
+    config.maxDecodeGraphs = graphOptions.maxDecodeGraphs;
+    config.maxPrefillGraphs = graphOptions.maxPrefillGraphs;
     config.pageReservationMode = IndependentPhasePageReservationMode::kHeadroom;
     config.outputHeadroomTokens = 128;
     config.maxConcurrentPageGrowthRequests = std::max(1, engine.maxSupportedDecodeBatchSize);
@@ -374,8 +319,8 @@ public:
             if (resolvedMode == PhaseWorkspaceMode::kAuto)
             {
                 size_t const independentVisionBytes = static_cast<size_t>(visionBytes);
-                bool const independentVisionFits = freeBytes >= independentVisionBytes
-                    && freeBytes - independentVisionBytes >= effectiveHeadroom;
+                bool const independentVisionFits
+                    = freeBytes >= independentVisionBytes && freeBytes - independentVisionBytes >= effectiveHeadroom;
                 size_t const prefillShareGrowth = static_cast<size_t>(std::max<int64_t>(0, visionBytes - prefillBytes));
                 bool const prefillShareFits
                     = freeBytes >= prefillShareGrowth && freeBytes - prefillShareGrowth >= effectiveHeadroom;
@@ -447,14 +392,15 @@ public:
                 }
                 break;
             }
-            case PhaseWorkspaceMode::kAuto:
-                break;
+            case PhaseWorkspaceMode::kAuto: break;
             }
         }
 
-        int32_t const prefillSequenceCapacity = engineConfig.packedPrefill
-            ? std::min(mServingConfig.maxPrefillChunkTokens, engineConfig.maxPackedPrefillChunkTokens)
-            : engineConfig.maxSupportedInputLength;
+        LLMEngineConfig phaseEngineConfig = engineConfig;
+        phaseEngineConfig.maxSupportedDecodeBatchSize = decodeBatchCapacity;
+        PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, phaseEngineConfig);
+        int32_t const prefillSequenceCapacity
+            = engineConfig.packedPrefill ? schedulerConfig.maxPrefillChunkTokens : engineConfig.maxSupportedInputLength;
         mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(
             engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
         mDecodeIO = std::make_unique<PipelineIO>(
@@ -515,9 +461,6 @@ public:
             mDecodeMropeValid.resize(static_cast<size_t>(decodeBatchCapacity));
         }
 
-        LLMEngineConfig phaseEngineConfig = engineConfig;
-        phaseEngineConfig.maxSupportedDecodeBatchSize = decodeBatchCapacity;
-        PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, phaseEngineConfig);
         if (schedulerConfig.maxExternalPrefillBatchSize <= 0)
         {
             schedulerConfig.maxExternalPrefillBatchSize = schedulerConfig.maxPrefillBatchSize;
@@ -536,7 +479,6 @@ public:
         mCoordinator = std::make_unique<IndependentPhaseCoordinator>(phaseEngineConfig, std::move(schedulerConfig),
             *mExecutors, *mOwnership, *mPrefillIO, *mDecodeIO, mPrefillMap, mDecodeMap, mPrefillStream, mDecodeStream,
             std::move(seedCallbacks));
-        mCoordinator->setGraphCaptureEnabled(mServingConfig.enableCudaGraphs);
         mCoordinator->setPersistentDecodeSelectEnabled(mServingConfig.enablePersistentDecodeSelect);
         mCoordinator->setPersistentPageBindingsEnabled(mServingConfig.enablePersistentPageBindings);
 
@@ -549,8 +491,24 @@ public:
             = [this](std::vector<IndependentPhaseRequestView> const& views, PipelineIO& io, cudaStream_t stream,
                   bool fromPrefill) { return submitSampling(views, io, stream, fromPrefill); };
         IndependentPhaseServerConfig serverConfig = makeServerConfig(mServingConfig, phaseEngineConfig, maxStableSlots);
+        PhaseGraphExecutionOptions graphOptions;
+        graphOptions.enabled = serverConfig.enableCudaGraphs;
+        graphOptions.maxPrefillGraphs = serverConfig.maxPrefillGraphs;
+        graphOptions.maxDecodeGraphs = serverConfig.maxDecodeGraphs;
+        graphOptions = resolvePhaseGraphExecutionOptions(graphOptions);
         mServer = std::make_unique<IndependentPhaseAsyncServer>(
             std::move(serverConfig), *mCoordinator, *mOwnership, std::move(adapter));
+        CUDA_CHECK(cudaStreamSynchronize(setupStream));
+        mCoordinator->prepareServingGraphs(
+            graphOptions, decodeBatchCapacity, [this](int32_t batchSize, cudaStream_t stream) {
+                std::vector<int32_t> const token{0};
+                std::vector<IndependentPhaseRequestView> views(static_cast<size_t>(batchSize));
+                for (auto& view : views)
+                {
+                    view.generatedTokens = &token;
+                }
+                stageTokens(views, *mDecodeIO, mDecodeMap, stream, false);
+            });
         if (mVisionRunner != nullptr)
         {
             PhaseVisionStoragePolicy storagePolicy;

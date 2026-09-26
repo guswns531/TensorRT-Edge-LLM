@@ -29,64 +29,60 @@ namespace
 TEST(PhaseTransitionPredictorTest, InitialState)
 {
     PhaseTransitionPredictor predictor;
-    PhaseTransitionFeatures features{1.0, 0.5, 0.5, 0.0, 0.5, 0.0};
-
-    auto const ep = predictor.predict(PhaseTransitionDelayKind::kEncoderToPrefill, features);
-    EXPECT_FALSE(ep.ready);
-    EXPECT_EQ(ep.observations, 0U);
-    EXPECT_GE(ep.meanUs, 0.0);
-
-    auto const pd = predictor.predict(PhaseTransitionDelayKind::kPrefillToDecode, features);
-    EXPECT_FALSE(pd.ready);
-    EXPECT_EQ(pd.observations, 0U);
-
-    EXPECT_STREQ(phaseTransitionDelayKindName(PhaseTransitionDelayKind::kEncoderToPrefill), "encoder_to_prefill");
-    EXPECT_STREQ(phaseTransitionDelayKindName(PhaseTransitionDelayKind::kPrefillToDecode), "prefill_to_decode");
-    EXPECT_STREQ(phaseTransitionDelayKindName(PhaseTransitionDelayKind::kActionMakespan), "action_makespan");
+    auto const estimate = predictor.predictDecodeQueueWait({32, 32768});
+    EXPECT_FALSE(estimate.ready);
+    EXPECT_EQ(estimate.observations, 0U);
+    EXPECT_GE(estimate.meanUs, 0.0);
 }
 
-TEST(PhaseTransitionPredictorTest, LearnsEncoderToPrefillDelay)
+TEST(PhaseTransitionPredictorTest, NormalizesBatchRowsAndSummedKvContext)
+{
+    PhaseTransitionFeatures const expected{1.0, 0.5, 0.25};
+    EXPECT_EQ(phaseDecodeQueueFeatures({32, 16384}), expected);
+}
+
+TEST(PhaseTransitionPredictorTest, LearnsDecodeReadyQueueResidence)
 {
     PhaseTransitionPredictorConfig config;
     config.minimumObservations = 4U;
     config.forgettingFactor = 0.99;
     PhaseTransitionPredictor predictor(config);
 
-    PhaseTransitionFeatures features{1.0, 0.25, 0.5, 0.0, 0.3, 0.1};
+    PhaseDecodeQueueState const state{16, 32768};
     constexpr double kTargetLatencyUs = 850.0;
 
     for (size_t i{}; i < 30U; ++i)
     {
-        EXPECT_TRUE(predictor.observe(PhaseTransitionDelayKind::kEncoderToPrefill, features, kTargetLatencyUs));
+        EXPECT_TRUE(predictor.observeDecodeQueueWait(state, kTargetLatencyUs));
     }
 
-    auto const estimate = predictor.predict(PhaseTransitionDelayKind::kEncoderToPrefill, features);
+    auto const estimate = predictor.predictDecodeQueueWait(state);
     EXPECT_TRUE(estimate.ready);
     EXPECT_EQ(estimate.observations, 30U);
     EXPECT_NEAR(estimate.meanUs, kTargetLatencyUs, 50.0);
     EXPECT_LT(estimate.uncertaintyUs, 200.0);
     EXPECT_GE(estimate.upperConfidenceBoundUs, estimate.meanUs);
 
-    auto const& telemetry = predictor.telemetry(PhaseTransitionDelayKind::kEncoderToPrefill);
+    auto const& telemetry = predictor.telemetry();
     EXPECT_EQ(telemetry.observations, 30U);
     EXPECT_EQ(telemetry.rejectedObservations, 0U);
     EXPECT_NEAR(telemetry.lastMeasuredUs, kTargetLatencyUs, 1e-3);
 }
 
-TEST(PhaseTransitionPredictorTest, LearnsPrefillToDecodeDelay)
+TEST(PhaseTransitionPredictorTest, AcceptsZeroResidenceAndRejectsInvalidSamples)
 {
     PhaseTransitionPredictor predictor;
-    PhaseTransitionFeatures features{1.0, 0.5, 0.25, 1.0, 0.6, 0.2};
-    constexpr double kTargetLatencyUs = 320.0;
-
-    for (size_t i{}; i < 40U; ++i)
-    {
-        EXPECT_TRUE(predictor.observe(PhaseTransitionDelayKind::kPrefillToDecode, features, kTargetLatencyUs));
-    }
-
-    auto const estimate = predictor.predict(PhaseTransitionDelayKind::kPrefillToDecode, features);
-    EXPECT_TRUE(estimate.ready);
-    EXPECT_NEAR(estimate.meanUs, kTargetLatencyUs, 30.0);
+    PhaseDecodeQueueState const state{4, 2048};
+    EXPECT_TRUE(predictor.observeDecodeQueueWait(state, 0.0));
+    EXPECT_FALSE(predictor.observeDecodeQueueWait({0, 0}, 100.0));
+    EXPECT_FALSE(predictor.observeDecodeQueueWait({4, -1}, 100.0));
+    EXPECT_FALSE(predictor.observeDecodeQueueWait(state, -1.0));
+    EXPECT_FALSE(predictor.observeDecodeQueueWait(state, std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_FALSE(predictor.observeDecodeQueueWait(state, std::numeric_limits<double>::infinity()));
+    EXPECT_EQ(predictor.telemetry().observations, 1U);
+    EXPECT_EQ(predictor.telemetry().rejectedObservations, 5U);
+    EXPECT_DOUBLE_EQ(predictor.predictDecodeQueueWait(state).meanUs, 0.0);
+    EXPECT_FALSE(predictor.predictDecodeQueueWait({0, 0}).ready);
 }
 
 TEST(PhaseTransitionPredictorTest, UncertaintyDecreasesWithObservations)
@@ -94,49 +90,36 @@ TEST(PhaseTransitionPredictorTest, UncertaintyDecreasesWithObservations)
     PhaseTransitionPredictorConfig config;
     config.initialResidualVariance = 2000.0 * 2000.0;
     PhaseTransitionPredictor predictor(config);
-    PhaseTransitionFeatures features{1.0, 0.1, 0.1, 0.0, 0.1, 0.0};
+    PhaseDecodeQueueState const state{8, 8192};
 
-    auto const initial = predictor.predict(PhaseTransitionDelayKind::kActionMakespan, features);
+    auto const initial = predictor.predictDecodeQueueWait(state);
 
     for (size_t i{}; i < 20U; ++i)
     {
-        predictor.observe(PhaseTransitionDelayKind::kActionMakespan, features, 1500.0);
+        predictor.observeDecodeQueueWait(state, 1500.0);
     }
 
-    auto const updated = predictor.predict(PhaseTransitionDelayKind::kActionMakespan, features);
+    auto const updated = predictor.predictDecodeQueueWait(state);
     EXPECT_LT(updated.uncertaintyUs, initial.uncertaintyUs);
 }
 
-TEST(PhaseTransitionPredictorTest, DynamicDecodeBurstAdaptation)
+TEST(PhaseTransitionPredictorTest, ShadowQueueLearningCannotChangeBurstOrOverlap)
 {
     PhaseTransitionPredictor predictor;
-
-    // Small decode queue -> small burst
-    EXPECT_EQ(predictor.recommendedDecodeBurst(2U, 500.0, 250.0), 2U);
-    EXPECT_EQ(predictor.recommendedDecodeBurst(1U, 500.0, 250.0), 2U);
-
-    // Large decode queue and significant P->D handoff delay -> burst expansion
-    size_t const burst = predictor.recommendedDecodeBurst(32U, 2000.0, 200.0);
-    EXPECT_GE(burst, 8U);
-    EXPECT_LE(burst, 16U);
-
-    // Zero decode duration fallback -> bounded to 8
-    EXPECT_EQ(predictor.recommendedDecodeBurst(16U, 500.0, 0.0), 8U);
-}
-
-TEST(PhaseTransitionPredictorTest, DynamicOverlapPrefillTokens)
-{
-    PhaseTransitionPredictor predictor;
-
-    // Normal case -> default 128
-    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(4U, 200.0, 128), 128);
-
-    // Heavy decode queue (> 16) or high handoff latency -> throttle to 64
-    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(20U, 200.0, 128), 64);
-    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(4U, 1500.0, 128), 64);
-
-    // Empty decode queue and minimal handoff delay -> expand to 256
-    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(0U, 50.0, 128), 256);
+    PhaseOptimizationContext ctx{};
+    ctx.decodeQueued = 16U;
+    ctx.prefillQueued = 8U;
+    ctx.prefillWaitUs = 22000.0;
+    ctx.predictedDecodeStepUs = 1000.0;
+    ctx.predictedPrefillStepUs = 3000.0;
+    size_t const burst = predictor.recommendedDecodeBurst(ctx);
+    int32_t const overlap = predictor.recommendedOverlapPrefillTokens(ctx);
+    for (size_t index{}; index < 40U; ++index)
+    {
+        ASSERT_TRUE(predictor.observeDecodeQueueWait({16, 16384}, 1000000.0));
+    }
+    EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), burst);
+    EXPECT_EQ(predictor.recommendedOverlapPrefillTokens(ctx), overlap);
 }
 
 TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderBalancedWorkload)
@@ -149,7 +132,7 @@ TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderBalancedWorkload)
     ctx.prefillQueued = 0U;
     ctx.decodeTokens = 16;
     ctx.predictedDecodeStepUs = 500.0;
-    ctx.predictedTransitionDelayUs = 300.0;
+    ctx.dispatchOverheadUs = 300.0;
 
     EXPECT_EQ(predictor.recommendedDecodeBurst(ctx), 16U);
 
@@ -174,7 +157,7 @@ TEST(PhaseTransitionPredictorTest, OptimalDecodeBurstUnderPoissonBurst)
     ctx.decodeTokens = 8;
     ctx.prefillWaitUs = 20000.0; // 20ms queue wait
     ctx.predictedDecodeStepUs = 1000.0;
-    ctx.predictedTransitionDelayUs = 500.0;
+    ctx.dispatchOverheadUs = 500.0;
     ctx.predictedPrefillStepUs = 3000.0;
 
     EXPECT_LE(predictor.recommendedDecodeBurst(ctx), 3U);

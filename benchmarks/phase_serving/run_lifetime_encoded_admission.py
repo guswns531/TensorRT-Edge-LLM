@@ -28,6 +28,9 @@ METRICS = ("generated_token_s_median", "ttft_mean_of_run_means_ms",
            "ttft_p95_median_ms", "tpot_mean_of_run_means_ms",
            "tpot_p95_median_ms", "e2e_mean_of_run_means_ms",
            "e2e_p95_median_ms", "gpu_memory_peak_mib_median")
+WORKLOADS = ("balanced", "mixed", "vision-heavy", "multi-image",
+             "long-prefill", "bimodal", "decode-heavy", "short", "text-heavy",
+             "poisson", "wave-drain", "late-vision")
 
 
 def digest(path):
@@ -39,35 +42,31 @@ def digest(path):
     return value.hexdigest()
 
 
-def model_config(repo, name):
+def model_config(repo, name, overrides=None):
     """Resolve retained model-specific capabilities, not workload-specific policies."""
     artifacts = repo / ".local/artifacts"
     if name == "gemma":
         model = artifacts / "v0101-forward-port/gemma-4-e2b-it-awq"
         inputs = repo / ".local/results/gemma4-e2b-awq-full12-20260911/inputs"
-        vision_path = pathlib.Path(
-            os.environ.get(
-                "GEMMA_VISION_DIR",
-                str(model / "visual-e6-soft280/visual" if (model / "visual-e6-soft280/visual").exists() else (model / "visual-e4-soft280/visual"))))
-        e_batch = 6 if "e6" in str(vision_path) else (8 if "e8" in str(vision_path) else 4)
-        e_tokens = e_batch * 280
-        return {
+        config = {
             "model":
             "google/gemma-4-e2b-it",
             "engine":
             pathlib.Path(
                 os.environ.get("GEMMA_ENGINE_DIR",
-                               str(model / "engine-packed-p8-d24-kv2048-p192" if (model / "engine-packed-p8-d24-kv2048-p192").exists() else (model / "engine-packed-p8-d24-kv2048-p96")))),
+                               str(model /
+                                   "engine-packed-p8-d24-kv2048-p192"))),
             "vision":
-            vision_path,
+            pathlib.Path(
+                os.environ.get("GEMMA_VISION_DIR",
+                               str(model / "visual-e4-soft280/visual"))),
             "hf":
             artifacts / "models/gemma-4-e2b-it-awq/hf",
             "traces": {
                 w: inputs / (w + ".json")
-                for w in (
-                    "balanced", "mixed", "vision-heavy", "multi-image",
-                    "long-prefill", "bimodal", "decode-heavy", "short",
-                    "text-heavy", "poisson", "wave-drain", "late-vision")
+                for w in ("balanced", "mixed", "vision-heavy", "multi-image",
+                          "long-prefill", "bimodal", "decode-heavy", "short",
+                          "text-heavy", "poisson", "wave-drain", "late-vision")
             },
             "calibration":
             repo /
@@ -81,17 +80,21 @@ def model_config(repo, name):
             "decode_batch":
             24,
             "encoder_input_tokens":
-            int(os.environ.get("GEMMA_ENCODER_INPUT_TOKENS", str(e_tokens))),
+            int(os.environ.get("GEMMA_ENCODER_INPUT_TOKENS", "1120")),
             "initial_capacity":
-            int(os.environ.get("GEMMA_INITIAL_CAPACITY", str(e_batch))),
+            int(os.environ.get("GEMMA_INITIAL_CAPACITY", "4")),
             "vision_batch_size":
-            int(os.environ.get("GEMMA_VISION_BATCH_SIZE", str(e_batch))),
+            int(os.environ.get("GEMMA_VISION_BATCH_SIZE", "4")),
+            "kv_pages":
+            192,
             "larger_capacity":
             12,
             "frozen_vllm":
             repo /
             ".local/results/gemma4-vllm-capacity-sweep-20260912/selected-seq24-kv480-p4096-g24-full12"
         }
+        config.update(overrides or {})
+        return config
     canonical = repo / ".local/results/v0101-forward-port/heuristic-elimination-20260911/v3-profile-free-canonical-full12-3x"
     commands = json.loads((canonical / "commands.json").read_text())
     traces = {}
@@ -102,7 +105,7 @@ def model_config(repo, name):
         if record["case"] == "mixed" and calibration is None:
             calibration = repo / command[
                 command.index("--generic-warmup-trace") + 1]
-    return {
+    config = {
         "model":
         "nvidia/Cosmos-Reason2-2B",
         "engine":
@@ -125,6 +128,10 @@ def model_config(repo, name):
         64,
         "decode_batch":
         64,
+        "vision_batch_size":
+        4,
+        "kv_pages":
+        256,
         "encoder_input_tokens":
         8192,
         "initial_capacity":
@@ -135,12 +142,25 @@ def model_config(repo, name):
         repo /
         ".local/results/v0101-forward-port/v3-service-scale-20260910/vllm-fresh-equal-summary.json"
     }
+    config.update(overrides or {})
+    return config
 
 
-def command_for(repo, config, cell, workload, variant, byte_budget):
+def command_for(repo,
+                config,
+                cell,
+                workload,
+                variant,
+                byte_budget,
+                options=None):
     """Construct a restricted, network-free GPU backend with measured-boundary activation."""
     tools = repo / ".local/results/v0101-forward-port/replay-tools"
-    build = pathlib.Path(os.environ.get("BUILD_ROOT", str(repo / ".local/builds/v0101-validation")))
+    options = options or {}
+    build = pathlib.Path(
+        options.get(
+            "build_root",
+            os.environ.get("BUILD_ROOT",
+                           str(repo / ".local/builds/v0101-validation"))))
     mode = variant if variant in ("lifetime", "ownership") else "static"
     if variant in ("chunked", "e1", "e2", "e-dynamic-shadow",
                    "e-transition-shadow", "e-dynamic-active", "shared_ep",
@@ -153,8 +173,12 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         capacity = config["stable_slots"]
     if "TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY" in os.environ:
         capacity = int(os.environ["TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY"])
-    vision_batch = int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE", str(config.get("vision_batch_size", 4))))
-    vision_prefill = int(os.environ.get("TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE", str(config.get("vision_batch_size", 4))))
+    vision_batch = int(
+        os.environ.get("TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE",
+                       str(config.get("vision_batch_size", 4))))
+    vision_prefill = int(
+        os.environ.get("TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE",
+                       str(config.get("vision_batch_size", 4))))
     capacity = max(capacity, vision_prefill)
     environment = {
         "TRT_PACKAGE_DIR":
@@ -192,7 +216,7 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         "TRT_EDGELLM_RELEASE_VISION_PREFILL_STORAGE":
         1,
         "TRT_EDGELLM_MAX_ENCODED_VISION":
-        capacity,
+        max(config["initial_capacity"], vision_prefill),
         "TRT_EDGELLM_MEASUREMENT_ENCODED_ADMISSION":
         mode,
         "TRT_EDGELLM_MEASUREMENT_ENCODED_CAPACITY":
@@ -200,11 +224,16 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
         "TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE":
         vision_batch,
         "TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS":
-        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS", str(config["encoder_input_tokens"]))),
+        int(
+            os.environ.get("TRT_EDGELLM_VISION_ENCODER_MAX_INPUT_TOKENS",
+                           str(config["encoder_input_tokens"]))),
         "TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA":
-        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA", str(vision_batch))),
+        int(
+            os.environ.get("TRT_EDGELLM_VISION_ENCODER_MAX_MEDIA",
+                           str(vision_batch))),
         "TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US":
-        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US", "25000")),
+        int(os.environ.get("TRT_EDGELLM_VISION_ENCODER_BATCH_WAIT_US",
+                           "25000")),
         "TRT_EDGELLM_VISION_PREFILL_BATCH_SIZE":
         vision_prefill,
         "TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD":
@@ -247,6 +276,10 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
         environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
             "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"]
+    for key in ("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR",
+                "TRT_EDGELLM_SHARED_EP_SINGLE_STORAGE"):
+        if key in os.environ:
+            environment[key] = os.environ[key]
     if byte_budget > 0:
         environment["TRT_EDGELLM_MAX_ENCODED_VISION_BYTES"] = byte_budget
     if variant == "chunked":
@@ -264,18 +297,31 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
     if variant == "unified_action":
         environment["TRT_EDGELLM_PHASE_WORKSPACE_MODE"] = "shared_ep"
         environment["TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING"] = 1
-        environment["TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES"] = "128,256,512"
-    if os.environ.get("ENABLE_CUDA_GRAPHS") == "1" or "TRT_EDGELLM_CAPTURE_PHASE_GRAPHS" in os.environ:
-        environment["TRT_EDGELLM_CAPTURE_PHASE_GRAPHS"] = os.environ.get("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS", 1)
-        environment["TRT_EDGELLM_MAX_PREFILL_GRAPHS"] = os.environ.get("TRT_EDGELLM_MAX_PREFILL_GRAPHS", 0)
-        environment["TRT_EDGELLM_MAX_DECODE_GRAPHS"] = os.environ.get("TRT_EDGELLM_MAX_DECODE_GRAPHS", 64)
+        environment[
+            "TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES"] = "128,256,512"
+    graphs_enabled = options.get(
+        "cuda_graphs",
+        os.environ.get("ENABLE_CUDA_GRAPHS") == "1"
+        or "TRT_EDGELLM_CAPTURE_PHASE_GRAPHS" in os.environ)
+    if graphs_enabled:
+        environment["TRT_EDGELLM_CAPTURE_PHASE_GRAPHS"] = os.environ.get(
+            "TRT_EDGELLM_CAPTURE_PHASE_GRAPHS", 1)
+        environment["TRT_EDGELLM_MAX_PREFILL_GRAPHS"] = os.environ.get(
+            "TRT_EDGELLM_MAX_PREFILL_GRAPHS", 0)
+        environment["TRT_EDGELLM_MAX_DECODE_GRAPHS"] = os.environ.get(
+            "TRT_EDGELLM_MAX_DECODE_GRAPHS", 64)
         if "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES" in os.environ:
             environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = os.environ[
                 "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"]
         else:
-            batches = [1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64]
+            batches = [
+                1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
+                64
+            ]
             filtered = [str(b) for b in batches if b <= config["decode_batch"]]
-            environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = ",".join(filtered)
+            environment["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = ",".join(
+                filtered)
+    environment.update(options.get("environment", {}))
 
     backend = [
         "docker", "run", "--rm", "--gpus", "all", "--network", "none",
@@ -320,6 +366,42 @@ def command_for(repo, config, cell, workload, variant, byte_budget):
     ] + backend
 
 
+def command_environment(command):
+    """Return only the explicitly forwarded backend environment, never host secrets."""
+    return dict(command[index + 1].split("=", 1)
+                for index, value in enumerate(command) if value == "-e")
+
+
+def validate_cell_contract(cell, contract, completed):
+    """Reject stale cells instead of silently reusing output from another contract."""
+    path = cell / "contract.json"
+    if path.exists():
+        if json.loads(path.read_text()) != contract:
+            raise ValueError("Cell contract differs: " + str(cell))
+    elif completed:
+        raise ValueError(
+            "Existing aggregate has no verifiable cell contract: " + str(cell))
+    else:
+        path.write_text(json.dumps(contract, indent=2) + "\n")
+
+
+def token_repeatability(runs):
+    """A singleton's aggregate flag is not evidence of repeated token identity."""
+    hashes = [
+        value for run in runs
+        for value in run.get("token_trace_sha256_per_run", [])
+    ]
+    return {
+        "observations":
+        len(hashes),
+        "status":
+        ("not_tested" if len(hashes) < 2 else
+         "observed_equal" if len(set(hashes)) == 1 else "observed_different"),
+        "hashes":
+        hashes,
+    }
+
+
 def main():
     """Run immutable paired cells and retain their exact source, engine and workload contract."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -334,16 +416,39 @@ def main():
                                  "decode-heavy", "short", "text-heavy",
                                  "poisson", "wave-drain", "late-vision"),
                         default=["mixed", "vision-heavy", "multi-image"])
-    parser.add_argument("--variants",
-                        nargs="+",
-                        choices=("static-base", "static-large", "static-slot",
-                                 "lifetime", "ownership", "chunked", "e1",
-                                 "e2", "e-dynamic-shadow",
-                                 "e-transition-shadow", "e-dynamic-active",
-                                 "shared_ep", "tiered_ep", "independent",
-                                 "unified_action"),
-                        default=["static-base", "static-large", "lifetime"])
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=("static-base", "static-large", "static-slot", "lifetime",
+                 "ownership", "chunked", "e1", "e2", "e-dynamic-shadow",
+                 "e-transition-shadow", "e-dynamic-active", "shared_ep",
+                 "tiered_ep", "independent", "unified_action"),
+        default=["static-base", "static-large", "lifetime"])
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--full12", action="store_true")
+    parser.add_argument("--build-root",
+                        type=pathlib.Path,
+                        default=pathlib.Path(
+                            os.environ.get("BUILD_ROOT",
+                                           ".local/builds/v0101-validation")))
+    parser.add_argument(
+        "--binary-source-commit",
+        help="Build provenance for an explicitly frozen binary")
+    for model_name in ("gemma", "cosmos"):
+        parser.add_argument("--" + model_name + "-engine-dir",
+                            type=pathlib.Path)
+        parser.add_argument("--" + model_name + "-vision-dir",
+                            type=pathlib.Path)
+    parser.add_argument("--transition-predictors",
+                        nargs="+",
+                        choices=("on", "off"),
+                        default=["on"])
+    parser.add_argument("--cuda-graphs", choices=("on", "off"), default="on")
+    parser.add_argument("--max-decode-graphs", type=int, default=64)
+    parser.add_argument("--max-prefill-graphs", type=int, default=4)
+    parser.add_argument("--shared-ep-single-storage",
+                        choices=("0", "1"),
+                        default="1")
     parser.add_argument("--byte-budget", type=int, default=0)
     parser.add_argument(
         "--result-root",
@@ -353,15 +458,33 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--compress-closed-logs", action="store_true")
     args = parser.parse_args()
-    if args.repeats < 1 or args.byte_budget < 0:
+    if args.repeats < 1 or args.byte_budget < 0 or min(
+            args.max_decode_graphs, args.max_prefill_graphs) < 0:
         parser.error(
             "Repeat count must be positive and byte budget non-negative")
     repo = pathlib.Path(
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
                                 text=True).strip())
-    configs = {m: model_config(repo, m) for m in args.models}
-    build = pathlib.Path(
-        os.environ.get("BUILD_ROOT", str(repo / ".local/builds/v0101-validation")))
+    if args.full12:
+        args.workloads = list(WORKLOADS)
+    configs = {}
+    paths = {
+        "gemma": {
+            "engine": args.gemma_engine_dir,
+            "vision": args.gemma_vision_dir
+        },
+        "cosmos": {
+            "engine": args.cosmos_engine_dir,
+            "vision": args.cosmos_vision_dir
+        },
+    }
+    for model_name in args.models:
+        overrides = {
+            key: value.resolve()
+            for key, value in paths[model_name].items() if value is not None
+        }
+        configs[model_name] = model_config(repo, model_name, overrides)
+    build = args.build_root.resolve()
     binary = build / "examples/llm/llm_phase_context_smoke"
     plugin = build / "libNvInfer_edgellm_plugin.so.1.0"
     identity = {
@@ -371,6 +494,15 @@ def main():
         "tracked_diff_sha256":
         hashlib.sha256(subprocess.check_output(["git", "diff",
                                                 "HEAD"])).hexdigest(),
+        "source_status":
+        subprocess.check_output(["git", "status", "--porcelain"],
+                                text=True).splitlines(),
+        "untracked_source_sha256": {
+            name: digest(repo / name)
+            for name in subprocess.check_output(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                text=True).splitlines() if (repo / name).is_file()
+        },
         "binary_sha256":
         digest(binary),
         "runner_sha256":
@@ -379,20 +511,54 @@ def main():
         digest(plugin),
         "container":
         IMAGE,
+        "binary_source_commit": (subprocess.check_output(
+            ["git", "rev-parse", args.binary_source_commit + "^{commit}"],
+            text=True).strip() if args.binary_source_commit else None),
         "models": {}
     }
     for name, config in configs.items():
+        engine_config = json.loads(
+            (config["engine"] / "config.json").read_text())
+        builder = engine_config["builder_config"]
+        if builder.get("max_kv_pool_pages") != config["kv_pages"]:
+            raise ValueError(
+                "Expected KV pages %d for %s; got %r" %
+                (config["kv_pages"], name, builder.get("max_kv_pool_pages")))
+        vision_config = json.loads(
+            (config["vision"] / "config.json").read_text())
+        if "tiered_ep" in args.variants and not vision_config[
+                "builder_config"].get("small_profile_max_image_tokens"):
+            raise ValueError(
+                "tiered_ep requires an explicitly selected multi-profile vision engine: "
+                + name)
         identity["models"][name] = {
             "engine": str(config["engine"]),
             "engine_sha256": digest(config["engine"] / "llm.engine"),
             "config_sha256": digest(config["engine"] / "config.json"),
             "vision_sha256": digest(config["vision"] / "visual.engine"),
+            "vision_config_sha256": digest(config["vision"] / "config.json"),
+            "effective_model_config":
+            json.loads(json.dumps(config, default=str)),
+            "engine_builder_config": builder,
+            "vision_builder_config": vision_config["builder_config"],
+            "engine_sidecars_sha256": {
+                path.name: digest(path)
+                for path in sorted(config["engine"].iterdir())
+                if path.is_file() and path.name not in ("llm.engine",
+                                                        "config.json")
+            },
             "calibration_sha256": digest(config["calibration"]),
             "traces": {
                 w: digest(config["traces"][w])
                 for w in args.workloads
             }
         }
+    replay_tools = repo / ".local/results/v0101-forward-port/replay-tools"
+    identity["replay_tools_sha256"] = {
+        name: digest(replay_tools / name)
+        for name in ("run_phase_http_trace_bench.py",
+                     "run_phase_openai_gateway.py", "run_vllm_trace_bench.py")
+    }
     root = args.result_root.resolve()
     commands = []
     for repeat in range(1, args.repeats + 1):
@@ -401,23 +567,53 @@ def main():
         for name, config in configs.items():
             for workload in args.workloads:
                 for variant in variants:
-                    cell = root / name / variant / ("repeat-%03d" %
-                                                    repeat) / workload
-                    commands.append({
-                        "model":
-                        name,
-                        "workload":
-                        workload,
-                        "variant":
-                        variant,
-                        "repeat":
-                        repeat,
-                        "cell":
-                        str(cell),
-                        "command":
-                        command_for(repo, config, cell, workload, variant,
-                                    args.byte_budget)
-                    })
+                    predictors = args.transition_predictors if repeat % 2 else list(
+                        reversed(args.transition_predictors))
+                    for predictor in predictors:
+                        variant_label = variant + "-predictor-" + predictor
+                        cell = root / name / variant_label / (
+                            "repeat-%03d" % repeat) / workload
+                        options = {
+                            "build_root": str(build),
+                            "cuda_graphs": args.cuda_graphs == "on",
+                            "environment": {
+                                "TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR":
+                                "1" if predictor == "on" else "0",
+                                "TRT_EDGELLM_SHARED_EP_SINGLE_STORAGE":
+                                args.shared_ep_single_storage,
+                                "TRT_EDGELLM_MAX_PREFILL_GRAPHS":
+                                args.max_prefill_graphs,
+                                "TRT_EDGELLM_MAX_DECODE_GRAPHS":
+                                args.max_decode_graphs,
+                                "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES":
+                                ",".join(
+                                    str(batch) for batch in range(
+                                        1, config["decode_batch"] + 1)),
+                            },
+                        }
+                        command = command_for(repo, config, cell, workload,
+                                              variant, args.byte_budget,
+                                              options)
+                        commands.append({
+                            "model":
+                            name,
+                            "workload":
+                            workload,
+                            "variant":
+                            variant_label,
+                            "workspace_variant":
+                            variant,
+                            "transition_predictor":
+                            predictor,
+                            "repeat":
+                            repeat,
+                            "cell":
+                            str(cell),
+                            "command":
+                            command,
+                            "effective_environment":
+                            command_environment(command),
+                        })
     if args.dry_run:
         print(
             json.dumps({
@@ -454,7 +650,8 @@ def main():
         "note_references": [
             "notes/301-lifetime-encoded-admission-two-model-plan-20260913.md",
             "notes/303-service-admission-cause-and-experiment-20260914.md",
-            "notes/305-small-encoder-progressive-overlap-20260914.md"
+            "notes/305-small-encoder-progressive-overlap-20260914.md",
+            "notes/330-runtime-contract-revalidation-plan-20260926.md"
         ],
         "compress_closed_logs":
         args.compress_closed_logs
@@ -466,6 +663,8 @@ def main():
             raise ValueError(
                 "Cannot resume a different source, binary, engine or command contract"
             )
+        manifest["completed"] = previous.get("completed", [])
+        manifest["failures"] = previous.get("failures", [])
     path.write_text(json.dumps(manifest, indent=2) + "\n")
     (root / "runner-source.py").write_bytes(
         pathlib.Path(__file__).read_bytes())
@@ -483,6 +682,9 @@ def main():
             raise ValueError("Runtime binary changed during campaign")
         cell = pathlib.Path(record["cell"])
         cell.mkdir(parents=True, exist_ok=True)
+        contract = {"identity": identity, "record": record}
+        validate_cell_contract(cell, contract,
+                               (cell / "aggregate.json").exists())
         print("Running",
               record["model"],
               record["workload"],
@@ -517,6 +719,11 @@ def main():
                                        check=True)
                 continue
         aggregate = json.loads((cell / "aggregate.json").read_text())
+        expected_trace = identity["models"][record["model"]]["traces"][
+            record["workload"]]
+        if aggregate.get("trace_sha256") != expected_trace:
+            raise ValueError("Aggregate workload identity differs: " +
+                             str(cell))
         if aggregate["generated_tokens_per_run_min"] != aggregate[
                 "requested_output_tokens_per_run"]:
             raise ValueError("Incomplete fixed-output workload")
@@ -528,12 +735,15 @@ def main():
                 m: statistics.mean(r[m] for r in group["runs"])
                 for m in METRICS
             }
+            group["token_repeatability"] = token_repeatability(group["runs"])
         (root /
          "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-        manifest["completed"].append({
+        completion = {
             k: record[k]
             for k in ("model", "workload", "variant", "repeat", "cell")
-        })
+        }
+        if completion not in manifest["completed"]:
+            manifest["completed"].append(completion)
         path.write_text(json.dumps(manifest, indent=2) + "\n")
         if args.compress_closed_logs:
             closed_log = cell / "run-001/gateway.log"

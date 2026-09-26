@@ -2,6 +2,43 @@
 
 Date: 2026-09-21. Branch: `codex/v0101-phase-forward-port`.
 
+## Audit correction — 2026-09-26
+
+The original sections below describe a targeted screen and are retained without treating them as a verified
+Full-12 campaign. Their `383.75` / `544.87` tok/s targeted measurements are **not substantiated by the retained
+later Full-12 aggregates**. Do not splice these values into the earlier E4 table and call it one E6 Full-12 run.
+The stated `383.75 / 381.34` lead would also be about **+0.63%**, not +1.1%.
+
+The retained `.local/results/dual-model-full24-clean-sweep-20260921-v2` raw data contains one run per workload:
+
+| Gemma workload | Current tok/s | Frozen vLLM tok/s | Change | Current TTFT mean | Peak MiB |
+|---|---:|---:|---:|---:|---:|
+| mixed | 705.36 | 703.81 | +0.22% | 251.94 ms | 9865 |
+| multi-image | 376.98 | 381.34 | -1.14% | 360.40 ms | 9859 |
+| vision-heavy | 533.62 | 559.83 | -4.68% | 344.99 ms | 9867 |
+
+The later campaign's raw-derived seven-metric overview is:
+
+| Metric | Cosmos change / wins of 12 | Gemma change / wins of 12 |
+|---|---:|---:|
+| Token throughput | +10.46% / 9 | +26.36% / 10 |
+| TTFT mean | -25.39% / 10 | -12.90% / 5 |
+| TTFT p95 | -20.65% / 10 | +11.50% / 4 |
+| TPOT mean | -12.31% / 9 | -19.04% / 11 |
+| TPOT p95 | -13.32% / 9 | -10.41% / 6 |
+| E2E mean | -12.74% / 11 | -20.81% / 10 |
+| E2E p95 | -11.76% / 11 | -22.84% / 9 |
+
+Full per-workload paired values and input hashes are in
+`.local/results/review-correction-20260926/raw-seven-metrics.{md,json,csv}`, campaign `note329-later-full12`;
+see Note 328's correction for the reproducible command. Lower latency is better. These results do not establish
+repeatability, statistical significance, equal-memory superiority, or production readiness.
+
+Architecturally, `shared_ep` now requires both an empty ready-P queue and zero downstream vision payload bytes
+before preparing the next E batch. This bounds outstanding payload storage but also restricts E→P pipelining;
+it is not the same frontier as fully independent E/P/D workspaces. Separate memory-capacity and throughput tests
+are needed to establish the value of that trade-off.
+
 ## 1. Executive Summary
 
 This study resolves the vision batch scaling bottleneck in **Gemma 4 E2B AWQ** under the zero-pool-IO `shared_ep` workspace mode on an NVIDIA RTX 3080 10 GiB GPU.

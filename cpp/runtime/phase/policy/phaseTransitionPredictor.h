@@ -25,17 +25,18 @@
 namespace trt_edgellm::rt
 {
 
-enum class PhaseTransitionDelayKind
+constexpr size_t kPHASE_TRANSITION_FEATURES{3U};
+using PhaseTransitionFeatures = std::array<double, kPHASE_TRANSITION_FEATURES>;
+
+//! Decode candidate shape; contextTokens is summed KV length, not generated tokens.
+struct PhaseDecodeQueueState
 {
-    kEncoderToPrefill,
-    kPrefillToDecode,
-    kActionMakespan,
+    int32_t batchRows{};
+    int64_t contextTokens{};
 };
 
-char const* phaseTransitionDelayKindName(PhaseTransitionDelayKind kind) noexcept;
-
-constexpr size_t kPHASE_TRANSITION_FEATURES{6U};
-using PhaseTransitionFeatures = std::array<double, kPHASE_TRANSITION_FEATURES>;
+//! Shared normalization for completed dispatch observations and ready-candidate predictions.
+PhaseTransitionFeatures phaseDecodeQueueFeatures(PhaseDecodeQueueState const& state) noexcept;
 
 struct PhaseTransitionPredictorConfig
 {
@@ -59,11 +60,9 @@ struct PhaseTransitionEstimate
 
 struct PhaseTransitionTelemetry
 {
-    size_t predictions{};
     size_t observations{};
     size_t rejectedObservations{};
     double lastMeanUs{};
-    double lastUncertaintyUs{};
     double lastMeasuredUs{};
     double lastErrorUs{};
     double absoluteErrorSumUs{};
@@ -78,38 +77,29 @@ struct PhaseOptimizationContext
     double prefillWaitUs{};
     double prefillSlackUs{std::numeric_limits<double>::infinity()};
     double decodeSlackUs{std::numeric_limits<double>::infinity()};
-    double predictedTransitionDelayUs{200.0};
+    //! Uncalibrated dispatch-amortization baseline; never fitted from ready-queue residence.
+    double dispatchOverheadUs{200.0};
     double predictedDecodeStepUs{200.0};
     double predictedPrefillStepUs{1000.0};
 };
 
+//! Queue-pressure predictor and burst controller. Physical phase transitions are not learned here.
 class PhaseTransitionPredictor
 {
 public:
     explicit PhaseTransitionPredictor(PhaseTransitionPredictorConfig config = {});
 
-    PhaseTransitionEstimate predict(
-        PhaseTransitionDelayKind kind, PhaseTransitionFeatures const& features) const noexcept;
+    PhaseTransitionEstimate predictDecodeQueueWait(PhaseDecodeQueueState const& state) const noexcept;
 
-    bool observe(
-        PhaseTransitionDelayKind kind, PhaseTransitionFeatures const& features, double measuredLatencyUs) noexcept;
-
-    double predictEpTransitionDelayUs(size_t queueDepth, size_t tokens, double kvUtil) const noexcept;
-
-    double predictPdTransitionDelayUs(size_t queueDepth, size_t tokens, double kvUtil) const noexcept;
+    //! measuredQueueWaitUs is the maximum enqueue-to-dispatch residence of the selected decode rows.
+    bool observeDecodeQueueWait(PhaseDecodeQueueState const& state, double measuredQueueWaitUs) noexcept;
 
     size_t recommendedDecodeBurst(PhaseOptimizationContext const& ctx) const noexcept;
-
-    size_t recommendedDecodeBurst(
-        size_t decodeQueueLength, double predictedPdDelayUs, double predictedDecodeDurationUs) const noexcept;
 
     int32_t recommendedOverlapPrefillTokens(
         PhaseOptimizationContext const& ctx, int32_t defaultTokens = 128) const noexcept;
 
-    int32_t recommendedOverlapPrefillTokens(
-        size_t decodeQueueLength, double predictedPdDelayUs, int32_t defaultTokens = 128) const noexcept;
-
-    PhaseTransitionTelemetry const& telemetry(PhaseTransitionDelayKind kind) const noexcept;
+    PhaseTransitionTelemetry const& telemetry() const noexcept;
 
     void reset() noexcept;
 
@@ -122,11 +112,10 @@ private:
         PhaseTransitionTelemetry telemetry{};
     };
 
-    static size_t kindIndex(PhaseTransitionDelayKind kind) noexcept;
     void resetCore(ModelCore& core) noexcept;
 
     PhaseTransitionPredictorConfig mConfig;
-    std::array<ModelCore, 3> mModels{};
+    ModelCore mModel{};
 };
 
 } // namespace trt_edgellm::rt

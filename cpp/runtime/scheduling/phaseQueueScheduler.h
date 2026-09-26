@@ -577,6 +577,7 @@ struct PhaseQueueSchedulerConfig
     int32_t decodeBurstLimit{8};
     //! Online learned completion-aware transition predictor for P->D / E->P handoff latency,
     //! dynamic decode burst sizing, and adaptive overlap token bounds.
+    //! Enables the burst controller and shadow decode-queue residence model, not physical handoff learning.
     bool enableTransitionPredictor{true};
     PhaseTransitionPredictorConfig transitionPredictorConfig{};
     //! Opt in to the provided queue-deadline + EWMA GPU-cost policy.

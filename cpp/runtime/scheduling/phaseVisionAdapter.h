@@ -109,6 +109,21 @@ struct PhaseVisionPayload
 //! Count retained physical slabs once, including slabs whose other rows have already released their views.
 size_t phaseVisionRetainedStorageBytes(std::vector<PhaseVisionPayload const*> const& payloads) noexcept;
 
+//! Bound retained encoder slabs separately from the shared-workspace execution lease.
+inline bool phaseVisionPreparationWithinStorageBudget(
+    bool sharedWorkspace, size_t maxRetainedBatches, size_t retainedBatches, bool downstreamPending) noexcept
+{
+    if (!sharedWorkspace)
+    {
+        return true;
+    }
+    if (maxRetainedBatches == 0U || retainedBatches >= maxRetainedBatches)
+    {
+        return false;
+    }
+    return maxRetainedBatches > 1U || !downstreamPending;
+}
+
 //! One logical request submitted as part of a shared vision-encoder batch.
 struct PhaseVisionSubmission
 {
@@ -182,6 +197,8 @@ public:
     cudaStream_t stream() const noexcept;
     cudaEvent_t startEvent() const noexcept;
     PhaseVisionMemoryStats const& memoryStats() const noexcept;
+    //! Slabs still referenced by prepared work or downstream GPU consumers.
+    size_t retainedStorageBatches() const noexcept;
     //! Reclaim idle slabs above the configured high-water mark, or every idle slab under broker pressure.
     void reclaimIdleStorage(bool force = false);
     //! Enable synchronous debug capture only while the adapter is idle.

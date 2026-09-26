@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -895,6 +896,16 @@ PhaseThreeCoordinator::PhaseThreeCoordinator(
     , mMemoryBroker(mConfig.memoryBroker)
     , mGlobalFormationRealizedTracker({mConfig.globalFormationRealizedDispatches, 8U})
 {
+    if (char const* value = std::getenv("TRT_EDGELLM_SHARED_EP_SINGLE_STORAGE"))
+    {
+        std::string const setting(value);
+        ELLM_CHECK(setting == "0" || setting == "1", "Shared E/P single-storage option must be 0 or 1");
+        mConfig.sharedEpMaxRetainedBatches = setting == "1" ? 1U : 2U;
+    }
+    ELLM_CHECK(mConfig.sharedEpMaxRetainedBatches >= 1U && mConfig.sharedEpMaxRetainedBatches <= 2U,
+        "Shared E/P retained slab capacity must be one or two");
+    LOG_INFO("Phase shared E/P ownership: serialized=%d max_retained_batches=%zu", mConfig.serializeAllEncoderPrefill,
+        mConfig.sharedEpMaxRetainedBatches);
     if (phasePolicyUsesServiceScale(mConfig.policyMode) && !mConfig.visionTtftTargetExplicit)
     {
         mConfig.visionTtftTargetUs = 0.0;
@@ -1370,8 +1381,9 @@ bool PhaseThreeCoordinator::poll()
         if (mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive && mConfig.enableAsyncEncoderPreparation
             && mEncoding.empty() && !encoderPreparationActive() && mPreparedEncoder == nullptr && !mPending.empty()
             && !mVision.busy()
-            && (!mConfig.serializeAllEncoderPrefill
-                || (mReadyPrefill.empty() && mServer.visionPayloadBytes() == 0U)))
+            && phaseVisionPreparationWithinStorageBudget(mConfig.serializeAllEncoderPrefill,
+                mConfig.sharedEpMaxRetainedBatches, mVision.retainedStorageBatches(),
+                !mReadyPrefill.empty() || mServer.visionPayloadBytes() > 0U))
         {
             // Preparation is a mechanism stage, not an E execution action.
             // Materialize the real encoder cohort while P/D continue, then
@@ -4037,8 +4049,9 @@ bool PhaseThreeCoordinator::startNextEncoder()
     mGlobalEncoderBatchIndices.reset();
     size_t const batchSize = batchIndices.size();
     if (batchSize == 0
-        || (mConfig.serializeAllEncoderPrefill
-            && (!mReadyPrefill.empty() || mServer.visionPayloadBytes() > 0U)))
+        || !phaseVisionPreparationWithinStorageBudget(mConfig.serializeAllEncoderPrefill,
+            mConfig.sharedEpMaxRetainedBatches, mVision.retainedStorageBatches(),
+            !mReadyPrefill.empty() || mServer.visionPayloadBytes() > 0U))
     {
         return false;
     }
@@ -4407,9 +4420,9 @@ bool PhaseThreeCoordinator::completeEncoder()
                 mEstimatedPromptTokens = std::max(mEstimatedPromptTokens, promptTokens.size());
                 ELLM_CHECK(mDownstreamRequestBytes.emplace(requestId, encodedBytes).second,
                     "Encoded phase request is already downstream");
-                mReadyPrefill.push_back({requestId, std::move(promptTokens), std::move(sharedPayload),
-                    encoding.maxOutputTokens, encoding.scheduling, encodedBytes, std::chrono::steady_clock::now(),
-                    encoding.prefixSubmitted});
+                mReadyPrefill.push_back(
+                    {requestId, std::move(promptTokens), std::move(sharedPayload), encoding.maxOutputTokens,
+                        encoding.scheduling, encodedBytes, std::chrono::steady_clock::now(), encoding.prefixSubmitted});
                 recordTimeline(requestId, PhaseTimelineStage::kPrefillReady, batchSize);
                 mReadyPrefillTokens += mReadyPrefill.back().promptTokens.size();
                 mReadyPrefillBytes += encodedBytes;
@@ -4419,24 +4432,27 @@ bool PhaseThreeCoordinator::completeEncoder()
             mEncoderGpuSubmitted = false;
             return true;
         }
-        if (!mVision.encoderInFlight() && (mInFlightGlobalEncoderKey.has_value() || mSerializedEncoderInFlight || mExternalEncoderActive))
+        if (!mVision.encoderInFlight()
+            && (mInFlightGlobalEncoderKey.has_value() || mSerializedEncoderInFlight || mExternalEncoderActive))
         {
             mExternalEncoderActive = false;
             mServer.setExternalEncoderActive(false);
             if (mVision.startEvent() != nullptr && mVision.encoderDoneEvent() != nullptr)
             {
                 float encoderGpuMs{};
-                if (cudaEventElapsedTime(&encoderGpuMs, mVision.startEvent(), mVision.encoderDoneEvent()) == cudaSuccess)
+                if (cudaEventElapsedTime(&encoderGpuMs, mVision.startEvent(), mVision.encoderDoneEvent())
+                    == cudaSuccess)
                 {
                     mLastEncoderGpuMs = encoderGpuMs;
                     mLastEncoderExecutionGpuMs = encoderGpuMs;
                 }
             }
             float const encoderActionGpuMs = lastEncoderActionGpuMs();
-            if (mInFlightGlobalEncoderKey.has_value() && encoderActionGpuMs > 0.0F && mInFlightGlobalEncoderReferenceMs > 0.0)
+            if (mInFlightGlobalEncoderKey.has_value() && encoderActionGpuMs > 0.0F
+                && mInFlightGlobalEncoderReferenceMs > 0.0)
             {
-                mRuntimeCostTracker->observe(
-                    *mInFlightGlobalEncoderKey, {static_cast<float>(mInFlightGlobalEncoderReferenceMs), encoderActionGpuMs});
+                mRuntimeCostTracker->observe(*mInFlightGlobalEncoderKey,
+                    {static_cast<float>(mInFlightGlobalEncoderReferenceMs), encoderActionGpuMs});
             }
             mInFlightGlobalEncoderKey.reset();
             mInFlightGlobalEncoderReferenceMs = 0.0;

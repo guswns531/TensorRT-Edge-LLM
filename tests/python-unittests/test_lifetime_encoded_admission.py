@@ -20,6 +20,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 
 
 def load_tool(name):
@@ -35,6 +36,7 @@ def load_tool(name):
 G_RUNNER = load_tool("run_lifetime_encoded_admission")
 G_ANALYZER = load_tool("analyze_lifetime_encoded_admission")
 G_SERVICE_ANALYZER = load_tool("analyze_decode_service_admission")
+G_REPORTER = load_tool("report_workspace_revalidation")
 
 
 def environment(command):
@@ -157,6 +159,116 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertFalse(
             any("TPOT_TARGET" in value or "TTFT_TARGET" in value
                 for value in command))
+
+    def test_gemma_defaults_never_select_newer_engine_by_path_existence(self):
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            with unittest.mock.patch.object(pathlib.Path,
+                                            "exists",
+                                            return_value=True):
+                config = G_RUNNER.model_config(self.repo, "gemma")
+        self.assertEqual(config["engine"].name,
+                         "engine-packed-p8-d24-kv2048-p192")
+        self.assertEqual(config["vision"].parent.name, "visual-e4-soft280")
+        self.assertEqual(config["vision_batch_size"], 4)
+        self.assertEqual(config["calibration_requests"], 49)
+
+    def test_predictor_ablation_changes_one_environment_field(self):
+        commands = []
+        for enabled in ("0", "1"):
+            commands.append(
+                G_RUNNER.command_for(
+                    self.repo, self.config, self.repo / "cell", "mixed",
+                    "independent", 0, {
+                        "environment": {
+                            "TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR": enabled
+                        }
+                    }))
+        off, on = [environment(command) for command in commands]
+        self.assertEqual(off.pop("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR"),
+                         "0")
+        self.assertEqual(on.pop("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR"),
+                         "1")
+        self.assertEqual(off, on)
+
+    def test_graphs_off_cannot_be_overridden_by_inherited_environment(self):
+        with unittest.mock.patch.dict("os.environ",
+                                      {"ENABLE_CUDA_GRAPHS": "1"}):
+            command = G_RUNNER.command_for(self.repo, self.config,
+                                           self.repo / "cell", "mixed",
+                                           "independent", 0,
+                                           {"cuda_graphs": False})
+        self.assertNotIn("TRT_EDGELLM_CAPTURE_PHASE_GRAPHS",
+                         environment(command))
+
+    def test_contract_rejects_stale_or_unidentified_aggregate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cell = pathlib.Path(folder)
+            with self.assertRaises(ValueError):
+                G_RUNNER.validate_cell_contract(cell, {"binary": "a"}, True)
+            G_RUNNER.validate_cell_contract(cell, {"binary": "a"}, False)
+            G_RUNNER.validate_cell_contract(cell, {"binary": "a"}, True)
+            with self.assertRaises(ValueError):
+                G_RUNNER.validate_cell_contract(cell, {"binary": "b"}, True)
+
+    def test_singleton_determinism_flag_is_not_repeatability(self):
+        single = {
+            "token_trace_deterministic": True,
+            "token_trace_sha256_per_run": ["abc"]
+        }
+        self.assertEqual(
+            G_RUNNER.token_repeatability([single])["status"], "not_tested")
+        self.assertEqual(
+            G_REPORTER.repeatability([single])["status"], "not_tested")
+        self.assertEqual(
+            G_RUNNER.token_repeatability([single, single])["status"],
+            "observed_equal")
+        self.assertEqual(
+            G_RUNNER.token_repeatability(
+                [single, {
+                    "token_trace_sha256_per_run": ["xyz"]
+                }])["status"], "observed_different")
+
+    def test_report_keeps_throughput_and_latency_wins_separate(self):
+        baseline = {"metrics": {metric: 10.0 for metric in G_REPORTER.METRICS}}
+        run = {metric: 20.0 for metric in G_REPORTER.METRICS}
+        row = G_REPORTER.compare_runs([run], baseline)
+        row.update(model="test", variant="independent", workload="mixed")
+        summary = G_REPORTER.summary_by_model(
+            [row])["test/independent"]["metrics"]
+        self.assertEqual(summary["generated_token_s_median"]["wins"], 1)
+        self.assertEqual(summary["ttft_p95_median_ms"]["wins"], 0)
+        self.assertIsNone(row["metrics"]["ttft_p95_median_ms"]["stddev"])
+
+    def test_report_uses_raw_aggregates_not_existing_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            cell = root / "gemma/shared_ep/repeat-001/mixed"
+            cell.mkdir(parents=True)
+            aggregate = {metric: 20.0 for metric in G_REPORTER.METRICS}
+            aggregate.update(generated_tokens_per_run_min=4,
+                             requested_output_tokens_per_run=4,
+                             trace_sha256="trace")
+            (cell / "aggregate.json").write_text(json.dumps(aggregate))
+            (root / "summary.json").write_text('{"fabricated": 9999}')
+            baseline = {
+                "gemma": {
+                    "mixed": {
+                        "metrics": {
+                            metric: 10.0
+                            for metric in G_REPORTER.METRICS
+                        },
+                        "trace_sha256": "trace"
+                    }
+                }
+            }
+            report = G_REPORTER.collect_campaign(root, baseline)
+            self.assertEqual(report["retained_cells"], 1)
+            self.assertEqual(
+                report["rows"][0]["metrics"]["generated_token_s_median"]
+                ["current"], 20.0)
+            baseline["gemma"]["mixed"]["trace_sha256"] = "another"
+            with self.assertRaises(ValueError):
+                G_REPORTER.collect_campaign(root, baseline)
 
     def test_description_does_not_require_an_exact_key_or_model_dependency(
             self):

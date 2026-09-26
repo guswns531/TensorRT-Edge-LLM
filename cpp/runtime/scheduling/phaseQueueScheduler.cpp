@@ -73,7 +73,8 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     , mDecodeComponentObservationActive(mConfig.enableDecodeComponentObservation)
     , mTransitionPredictor(mConfig.transitionPredictorConfig)
 {
-    if (char const* const envPredictor = std::getenv("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR"); envPredictor != nullptr)
+    if (char const* const envPredictor = std::getenv("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR");
+        envPredictor != nullptr)
     {
         mConfig.enableTransitionPredictor
             = std::strcmp(envPredictor, "0") != 0 && std::strcmp(envPredictor, "false") != 0;
@@ -759,11 +760,6 @@ int32_t PhaseQueueScheduler::effectiveDecodeBurstLimit(PhaseQueueSnapshot const&
     {
         return mConfig.decodeBurstLimit;
     }
-    double const kvUtil = state.pagePoolTotalBundles > 0
-        ? static_cast<double>(state.pagePoolAllocatedBundles) / state.pagePoolTotalBundles
-        : 0.0;
-    double const pdDelayUs = mTransitionPredictor.predictPdTransitionDelayUs(
-        state.decodeQueued, state.decodeCandidateTokens, kvUtil);
     double decodeStepUs = 200.0;
     if (mTelemetry.lastDispatch.has_value() && mTelemetry.lastDispatch->decodeGpuMs > 0.0F)
     {
@@ -782,23 +778,19 @@ int32_t PhaseQueueScheduler::effectiveDecodeBurstLimit(PhaseQueueSnapshot const&
     }
     else if (mTelemetry.prefillGpuMsPerToken > 0.0F && state.prefillCandidateTokens > 0)
     {
-        prefillStepUs
-            = static_cast<double>(mTelemetry.prefillGpuMsPerToken * state.prefillCandidateTokens) * 1000.0;
+        prefillStepUs = static_cast<double>(mTelemetry.prefillGpuMsPerToken * state.prefillCandidateTokens) * 1000.0;
     }
 
     PhaseOptimizationContext ctx{};
     ctx.decodeQueued = state.decodeQueued;
     ctx.prefillQueued = state.prefillQueued;
-    ctx.decodeTokens = state.decodeCandidateTokens;
+    ctx.decodeTokens = static_cast<int32_t>(state.decodeQueued);
     ctx.prefillTokens = state.prefillCandidateTokens;
     ctx.prefillWaitUs = state.prefillOldestWaitUs;
-    ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo
-        ? state.prefillMinTtftSlackUs
-        : std::numeric_limits<double>::infinity();
-    ctx.decodeSlackUs = state.decodeMinimumSlackHasExplicitSlo
-        ? state.decodeMinTpotSlackUs
-        : std::numeric_limits<double>::infinity();
-    ctx.predictedTransitionDelayUs = pdDelayUs;
+    ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo ? state.prefillMinTtftSlackUs
+                                                                 : std::numeric_limits<double>::infinity();
+    ctx.decodeSlackUs
+        = state.decodeMinimumSlackHasExplicitSlo ? state.decodeMinTpotSlackUs : std::numeric_limits<double>::infinity();
     ctx.predictedDecodeStepUs = decodeStepUs;
     ctx.predictedPrefillStepUs = prefillStepUs;
 
@@ -814,11 +806,6 @@ int32_t PhaseQueueScheduler::effectiveOverlapPrefillTokens(PhaseQueueSnapshot co
     {
         return mConfig.maxOverlapPrefillTokens;
     }
-    double const kvUtil = state.pagePoolTotalBundles > 0
-        ? static_cast<double>(state.pagePoolAllocatedBundles) / state.pagePoolTotalBundles
-        : 0.0;
-    double const pdDelayUs = mTransitionPredictor.predictPdTransitionDelayUs(
-        state.decodeQueued, state.decodeCandidateTokens, kvUtil);
     double decodeStepUs = 200.0;
     if (mTelemetry.lastDispatch.has_value() && mTelemetry.lastDispatch->decodeGpuMs > 0.0F)
     {
@@ -828,16 +815,13 @@ int32_t PhaseQueueScheduler::effectiveOverlapPrefillTokens(PhaseQueueSnapshot co
     PhaseOptimizationContext ctx{};
     ctx.decodeQueued = state.decodeQueued;
     ctx.prefillQueued = state.prefillQueued;
-    ctx.decodeTokens = state.decodeCandidateTokens;
+    ctx.decodeTokens = static_cast<int32_t>(state.decodeQueued);
     ctx.prefillTokens = state.prefillCandidateTokens;
     ctx.prefillWaitUs = state.prefillOldestWaitUs;
-    ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo
-        ? state.prefillMinTtftSlackUs
-        : std::numeric_limits<double>::infinity();
-    ctx.decodeSlackUs = state.decodeMinimumSlackHasExplicitSlo
-        ? state.decodeMinTpotSlackUs
-        : std::numeric_limits<double>::infinity();
-    ctx.predictedTransitionDelayUs = pdDelayUs;
+    ctx.prefillSlackUs = state.prefillMinimumSlackHasExplicitSlo ? state.prefillMinTtftSlackUs
+                                                                 : std::numeric_limits<double>::infinity();
+    ctx.decodeSlackUs
+        = state.decodeMinimumSlackHasExplicitSlo ? state.decodeMinTpotSlackUs : std::numeric_limits<double>::infinity();
     ctx.predictedDecodeStepUs = decodeStepUs;
 
     return mTransitionPredictor.recommendedOverlapPrefillTokens(ctx, mConfig.maxOverlapPrefillTokens);
@@ -1536,8 +1520,7 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     {
         maxBatchSize = std::min(maxBatchSize, mConfig.maxContinuationPrefillBatchSize);
     }
-    if (mConfig.enableWavefrontPrefillBatching && mConfig.enablePrefillCohortRefill
-        && !mPrefillCohortIds.empty())
+    if (mConfig.enableWavefrontPrefillBatching && mConfig.enablePrefillCohortRefill && !mPrefillCohortIds.empty())
     {
         std::vector<PhaseWorkItem const*> refillCandidates;
         for (PhaseWorkItem const& item : queue)
@@ -1548,8 +1531,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
                 refillCandidates.push_back(&item);
             }
         }
-        std::stable_sort(refillCandidates.begin(), refillCandidates.end(),
-            [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
+        std::stable_sort(
+            refillCandidates.begin(), refillCandidates.end(), [&](PhaseWorkItem const* lhs, PhaseWorkItem const* rhs) {
                 return orderPrefillRow(lhs, rhs, bucketTokens);
             });
         int32_t const refillLimit = std::min(mConfig.maxPrefillCohortSize, maxBatchSize);
@@ -4533,50 +4516,11 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     mTelemetry.contextualPdLastMean = contextualTelemetry.lastMean;
     mTelemetry.contextualPdLastUncertainty = contextualTelemetry.lastUncertainty;
     mTelemetry.contextualPdLastLowerConfidenceBound = contextualTelemetry.lastLowerConfidenceBound;
-    if (mConfig.enableTransitionPredictor)
+    if (mConfig.enableTransitionPredictor && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F)
     {
-        double const kvUtil = metrics.pagePoolTotalBundles > 0
-            ? static_cast<double>(metrics.pagePoolAllocatedBundles) / static_cast<double>(metrics.pagePoolTotalBundles)
-            : 0.0;
-        if (metrics.makespanGpuMs > 0.0F)
-        {
-            PhaseTransitionFeatures const features{
-                1.0,
-                static_cast<double>(metrics.prefillTokens) / 1024.0,
-                static_cast<double>(metrics.decodeBatchSize) / 16.0,
-                metrics.kind == PhaseDispatchKind::kOverlap ? 1.0 : 0.0,
-                kvUtil,
-                0.0,
-            };
-            mTransitionPredictor.observe(
-                PhaseTransitionDelayKind::kActionMakespan, features, static_cast<double>(metrics.makespanGpuMs) * 1000.0);
-        }
-        if (metrics.decodeQueueWaitUs > 0.0 && metrics.decodeBatchSize > 0)
-        {
-            PhaseTransitionFeatures const features{
-                1.0,
-                static_cast<double>(metrics.decodeBatchSize) / 16.0,
-                static_cast<double>(metrics.decodeTokens) / 1024.0,
-                1.0,
-                kvUtil,
-                0.0,
-            };
-            mTransitionPredictor.observe(
-                PhaseTransitionDelayKind::kPrefillToDecode, features, metrics.decodeQueueWaitUs);
-        }
-        if (metrics.prefillQueueWaitUs > 0.0 && metrics.prefillBatchSize > 0)
-        {
-            PhaseTransitionFeatures const features{
-                1.0,
-                static_cast<double>(metrics.prefillBatchSize) / 4.0,
-                static_cast<double>(metrics.prefillTokens) / 1024.0,
-                0.0,
-                kvUtil,
-                0.0,
-            };
-            mTransitionPredictor.observe(
-                PhaseTransitionDelayKind::kEncoderToPrefill, features, metrics.prefillQueueWaitUs);
-        }
+        // Queue residence is policy-dependent; it must not become an amortizable physical handoff cost.
+        mTransitionPredictor.observeDecodeQueueWait(
+            {metrics.decodeBatchSize, metrics.decodeContextTokens}, metrics.decodeQueueWaitUs);
     }
     ++mTelemetry.sampleCount;
     mTelemetry.lastDispatch = metrics;

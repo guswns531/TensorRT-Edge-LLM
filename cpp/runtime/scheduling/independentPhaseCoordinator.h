@@ -21,6 +21,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/scheduling/phaseServingExecutionOptions.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/stableKVPageManager.h"
 
@@ -90,7 +91,11 @@ public:
     //! prepare both phase views with stable shapes before invoking this method.
     bool capturePreparedGraphs();
     //! Pre-capture decode graphs across the specified batch sizes.
-    size_t primeDecodeGraphs(std::vector<int32_t> const& batchSizes, cudaStream_t stream);
+    size_t primeDecodeGraphs(std::vector<int32_t> const& batchSizes, cudaStream_t stream,
+        std::function<void(int32_t, cudaStream_t)> const& stageInputs = {});
+    //! Prime synthetic decode shapes while idle, then apply the serving capture contract.
+    size_t prepareServingGraphs(PhaseGraphExecutionOptions const& options, int32_t maxDecodeBatch,
+        std::function<void(int32_t, cudaStream_t)> const& stageInputs = {});
     //! Capture recurring production phase shapes after the configured promotion threshold.
     void setGraphCaptureEnabled(bool enabled) noexcept;
     //! Require this many observations before promoting an unseen production

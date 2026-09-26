@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
+#include "common/logger.h"
 
 #include <algorithm>
 #include <utility>
@@ -388,9 +389,14 @@ bool IndependentPhaseCoordinator::capturePreparedGraphs()
     return prefillCaptured && decodeCaptured;
 }
 
-size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const& batchSizes, cudaStream_t stream)
+size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const& batchSizes, cudaStream_t stream,
+    std::function<void(int32_t, cudaStream_t)> const& stageInputs)
 {
-    ELLM_CHECK(!busy(), "Decode graphs cannot be primed while work is in flight");
+    ELLM_CHECK(empty() && !busy(), "Decode graphs cannot be primed while requests are pending or in flight");
+    if (mMaxDecodeGraphs == 0U)
+    {
+        return 0U;
+    }
     int32_t maxNeededBatch = 0;
     for (int32_t const batchSize : batchSizes)
     {
@@ -432,7 +438,7 @@ size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const
         }
         std::string const graphShape = std::to_string(batchSize);
         if (mCapturedDecodeShapes.find(graphShape) != mCapturedDecodeShapes.end()
-            || (mMaxDecodeGraphs > 0U && mCapturedDecodeShapes.size() >= mMaxDecodeGraphs))
+            || mCapturedDecodeShapes.size() >= mMaxDecodeGraphs)
         {
             continue;
         }
@@ -443,8 +449,15 @@ size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const
             mDecodeKV.complete();
             continue;
         }
-        CUDA_CHECK(cudaMemsetAsync(
-            mDecodeIO.inputsEmbeds.rawPointer(), 0, mDecodeIO.inputsEmbeds.getMemoryCapacity(), stream));
+        if (stageInputs)
+        {
+            stageInputs(batchSize, stream);
+        }
+        else
+        {
+            CUDA_CHECK(cudaMemsetAsync(
+                mDecodeIO.inputsEmbeds.rawPointer(), 0, mDecodeIO.inputsEmbeds.getMemoryCapacity(), stream));
+        }
         mDecodeKV.prepareDecodeMetadata(mDecodeIO, stream);
         if (!mExecutors.decodeExecutor().prepare(mExecutors.config().decodeProfile,
                 mConfig.decodeDims(static_cast<int64_t>(batchSize)), mDecodeMap, stream))
@@ -466,6 +479,24 @@ size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const
         mOwnership.release(slot);
     }
 
+    return captured;
+}
+
+size_t IndependentPhaseCoordinator::prepareServingGraphs(PhaseGraphExecutionOptions const& options,
+    int32_t maxDecodeBatch, std::function<void(int32_t, cudaStream_t)> const& stageInputs)
+{
+    ELLM_CHECK(empty() && !busy(), "Serving graphs must be prepared before requests are admitted");
+    setGraphCaptureLimits(options.maxPrefillGraphs, options.maxDecodeGraphs);
+    size_t const captured = options.enabled && options.maxDecodeGraphs > 0U
+        ? primeDecodeGraphs(phaseDecodeGraphWarmupBatches(maxDecodeBatch), mDecodeStream, stageInputs)
+        : 0U;
+    setGraphCaptureMinObservations(options.minObservations);
+    setGraphCaptureEnabled(options.enabled && options.onlineCapture);
+    LOG_INFO(
+        "Phase graph contract: enabled=%d primed=%zu prefill_limit=%zu decode_limit=%zu online_capture=%d "
+        "min_observations=%zu",
+        options.enabled, captured, options.maxPrefillGraphs, options.maxDecodeGraphs, options.onlineCapture,
+        options.minObservations);
     return captured;
 }
 

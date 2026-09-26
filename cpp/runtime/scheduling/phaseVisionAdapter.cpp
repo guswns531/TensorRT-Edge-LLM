@@ -346,6 +346,12 @@ std::shared_ptr<PhaseVisionBatchStorage> PhaseVisionAdapter::acquireBatchStorage
     return storage;
 }
 
+size_t PhaseVisionAdapter::retainedStorageBatches() const noexcept
+{
+    return static_cast<size_t>(std::count_if(
+        mStoragePool.begin(), mStoragePool.end(), [](auto const& storage) { return storage.use_count() > 1; }));
+}
+
 void PhaseVisionAdapter::copyRunnerOutputs(PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding,
     OptionalInputTensors const& deepstackFeatures, cudaStream_t stream)
 {
@@ -399,8 +405,8 @@ bool PhaseVisionAdapter::submit(std::vector<PhaseVisionSubmission> submissions)
 
 std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vector<PhaseVisionSubmission> submissions)
 {
-    ELLM_CHECK(mRequests.empty() && !encoderInFlight(),
-        "Phase vision adapter currently permits one in-flight encoder batch");
+    ELLM_CHECK(
+        mRequests.empty() && !encoderInFlight(), "Phase vision adapter currently permits one in-flight encoder batch");
     ELLM_CHECK(!submissions.empty(), "Phase vision encoder batch cannot be empty");
     std::unordered_set<uint64_t> requestIds;
     requestIds.reserve(submissions.size());
@@ -679,8 +685,8 @@ std::unique_ptr<PhaseVisionPayload> PhaseVisionAdapter::take(uint64_t requestId,
     if (!allowInFlight)
     {
         ELLM_CHECK(ready(requestId), "Phase vision request is not complete");
-        CUDA_CHECK(
-            cudaEventElapsedTime(&it->second->preparationGpuMs, it->second->startEvent, it->second->preparationReadyEvent));
+        CUDA_CHECK(cudaEventElapsedTime(
+            &it->second->preparationGpuMs, it->second->startEvent, it->second->preparationReadyEvent));
         CUDA_CHECK(cudaEventElapsedTime(
             &it->second->encoderExecutionGpuMs, it->second->encoderStartEvent, it->second->readyEvent));
         CUDA_CHECK(cudaEventElapsedTime(&it->second->encoderGpuMs, it->second->startEvent, it->second->readyEvent));

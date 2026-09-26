@@ -26,26 +26,12 @@
 namespace trt_edgellm::rt
 {
 
-char const* phaseTransitionDelayKindName(PhaseTransitionDelayKind kind) noexcept
+PhaseTransitionFeatures phaseDecodeQueueFeatures(PhaseDecodeQueueState const& state) noexcept
 {
-    switch (kind)
-    {
-    case PhaseTransitionDelayKind::kEncoderToPrefill: return "encoder_to_prefill";
-    case PhaseTransitionDelayKind::kPrefillToDecode: return "prefill_to_decode";
-    case PhaseTransitionDelayKind::kActionMakespan: return "action_makespan";
-    }
-    return "unknown";
-}
-
-size_t PhaseTransitionPredictor::kindIndex(PhaseTransitionDelayKind kind) noexcept
-{
-    switch (kind)
-    {
-    case PhaseTransitionDelayKind::kEncoderToPrefill: return 0U;
-    case PhaseTransitionDelayKind::kPrefillToDecode: return 1U;
-    case PhaseTransitionDelayKind::kActionMakespan: return 2U;
-    }
-    return 0U;
+    constexpr double kBATCH_SCALE{64.0};
+    constexpr double kCONTEXT_SCALE{65536.0};
+    return {1.0, static_cast<double>(state.batchRows) / kBATCH_SCALE,
+        static_cast<double>(state.contextTokens) / kCONTEXT_SCALE};
 }
 
 PhaseTransitionPredictor::PhaseTransitionPredictor(PhaseTransitionPredictorConfig config)
@@ -56,6 +42,12 @@ PhaseTransitionPredictor::PhaseTransitionPredictor(PhaseTransitionPredictorConfi
         "Confidence beta must be finite and non-negative");
     ELLM_CHECK(std::isfinite(mConfig.initialCovariance) && mConfig.initialCovariance > 0.0,
         "Initial covariance must be finite and positive");
+    ELLM_CHECK(std::isfinite(mConfig.initialResidualVariance) && mConfig.initialResidualVariance > 0.0,
+        "Initial residual variance must be finite and positive");
+    ELLM_CHECK(std::isfinite(mConfig.maxLatencyClipUs) && mConfig.maxLatencyClipUs > 0.0,
+        "Maximum queue wait must be finite and positive");
+    ELLM_CHECK(std::isfinite(mConfig.burstGracePeriodUs) && mConfig.burstGracePeriodUs >= 0.0,
+        "Burst grace period must be finite and non-negative");
     ELLM_CHECK(
         std::isfinite(mConfig.forgettingFactor) && mConfig.forgettingFactor > 0.0 && mConfig.forgettingFactor <= 1.0,
         "Forgetting factor must be within (0, 1]");
@@ -76,16 +68,18 @@ void PhaseTransitionPredictor::resetCore(ModelCore& core) noexcept
 
 void PhaseTransitionPredictor::reset() noexcept
 {
-    for (auto& core : mModels)
-    {
-        resetCore(core);
-    }
+    resetCore(mModel);
 }
 
-PhaseTransitionEstimate PhaseTransitionPredictor::predict(
-    PhaseTransitionDelayKind kind, PhaseTransitionFeatures const& features) const noexcept
+PhaseTransitionEstimate PhaseTransitionPredictor::predictDecodeQueueWait(
+    PhaseDecodeQueueState const& state) const noexcept
 {
-    auto const& core = mModels[kindIndex(kind)];
+    if (state.batchRows <= 0 || state.contextTokens < 0)
+    {
+        return {};
+    }
+    PhaseTransitionFeatures const features = phaseDecodeQueueFeatures(state);
+    auto const& core = mModel;
     PhaseTransitionFeatures projected{};
     for (size_t row{}; row < kPHASE_TRANSITION_FEATURES; ++row)
     {
@@ -112,18 +106,19 @@ PhaseTransitionEstimate PhaseTransitionPredictor::predict(
     return {mean, uncertainty, ucb, core.telemetry.observations, ready};
 }
 
-bool PhaseTransitionPredictor::observe(
-    PhaseTransitionDelayKind kind, PhaseTransitionFeatures const& features, double measuredLatencyUs) noexcept
+bool PhaseTransitionPredictor::observeDecodeQueueWait(
+    PhaseDecodeQueueState const& state, double measuredQueueWaitUs) noexcept
 {
-    if (!std::isfinite(measuredLatencyUs) || measuredLatencyUs < 0.0)
+    auto& core = mModel;
+    if (state.batchRows <= 0 || state.contextTokens < 0 || !std::isfinite(measuredQueueWaitUs)
+        || measuredQueueWaitUs < 0.0)
     {
-        auto& core = mModels[kindIndex(kind)];
         ++core.telemetry.rejectedObservations;
         return false;
     }
 
-    double const clippedLatency = std::min(measuredLatencyUs, mConfig.maxLatencyClipUs);
-    auto& core = mModels[kindIndex(kind)];
+    double const clippedLatency = std::min(measuredQueueWaitUs, mConfig.maxLatencyClipUs);
+    PhaseTransitionFeatures const features = phaseDecodeQueueFeatures(state);
 
     PhaseTransitionFeatures projected{};
     for (size_t row{}; row < kPHASE_TRANSITION_FEATURES; ++row)
@@ -184,36 +179,6 @@ bool PhaseTransitionPredictor::observe(
     return true;
 }
 
-double PhaseTransitionPredictor::predictEpTransitionDelayUs(
-    size_t queueDepth, size_t tokens, double kvUtil) const noexcept
-{
-    PhaseTransitionFeatures features{
-        1.0,
-        static_cast<double>(queueDepth) / 64.0,
-        static_cast<double>(tokens) / 1024.0,
-        0.0,
-        std::clamp(kvUtil, 0.0, 1.0),
-        0.0,
-    };
-    auto const est = predict(PhaseTransitionDelayKind::kEncoderToPrefill, features);
-    return est.ready ? est.meanUs : 500.0;
-}
-
-double PhaseTransitionPredictor::predictPdTransitionDelayUs(
-    size_t queueDepth, size_t tokens, double kvUtil) const noexcept
-{
-    PhaseTransitionFeatures features{
-        1.0,
-        static_cast<double>(queueDepth) / 64.0,
-        static_cast<double>(tokens) / 1024.0,
-        1.0,
-        std::clamp(kvUtil, 0.0, 1.0),
-        0.0,
-    };
-    auto const est = predict(PhaseTransitionDelayKind::kPrefillToDecode, features);
-    return est.ready ? est.meanUs : 200.0;
-}
-
 size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext const& ctx) const noexcept
 {
     if (ctx.decodeQueued == 0U)
@@ -225,14 +190,13 @@ size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext
         return 16U;
     }
 
-    // When decode queue is small, bound burst to 2 to prevent starvation while avoiding 1-turn thrashing
     if (ctx.decodeQueued <= 2U)
     {
         return 2U;
     }
 
     double const decodeStepUs = std::max(10.0, ctx.predictedDecodeStepUs);
-    double const transitionUs = std::max(10.0, ctx.predictedTransitionDelayUs);
+    double const dispatchOverheadUs = std::max(10.0, ctx.dispatchOverheadUs);
     double const prefillStepUs = std::max(50.0, ctx.predictedPrefillStepUs);
     double const decodeTokens = static_cast<double>(
         std::max(1, ctx.decodeTokens > 0 ? ctx.decodeTokens : static_cast<int32_t>(ctx.decodeQueued)));
@@ -243,7 +207,7 @@ size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext
     for (size_t burst = 1U; burst <= 16U; ++burst)
     {
         double const burstTimeUs = static_cast<double>(burst) * decodeStepUs;
-        double const cycleTimeUs = burstTimeUs + transitionUs;
+        double const cycleTimeUs = burstTimeUs + dispatchOverheadUs;
         double const tokens = static_cast<double>(burst) * decodeTokens;
         double const serviceRate = tokens / cycleTimeUs;
 
@@ -256,12 +220,11 @@ size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext
             slackPenalty = violationUs / prefillStepUs;
         }
 
-        // Urgency penalty applies when projected wait exceeds grace period or when slack is violated
         double const gracePeriodUs = (std::isfinite(ctx.prefillSlackUs) && ctx.prefillSlackUs > 0.0)
             ? std::max(mConfig.burstGracePeriodUs, ctx.prefillSlackUs * 0.75)
             : mConfig.burstGracePeriodUs;
         double const urgency = (projectedPrefillWaitUs > gracePeriodUs)
-            ? (projectedPrefillWaitUs - gracePeriodUs) / (prefillStepUs + transitionUs)
+            ? (projectedPrefillWaitUs - gracePeriodUs) / (prefillStepUs + dispatchOverheadUs)
             : 0.0;
         double const penaltyFactor = 1.0 + slackPenalty + urgency;
 
@@ -274,21 +237,6 @@ size_t PhaseTransitionPredictor::recommendedDecodeBurst(PhaseOptimizationContext
     }
 
     return bestBurst;
-}
-
-size_t PhaseTransitionPredictor::recommendedDecodeBurst(
-    size_t decodeQueueLength, double predictedPdDelayUs, double predictedDecodeDurationUs) const noexcept
-{
-    if (decodeQueueLength <= 2U)
-    {
-        return 2U;
-    }
-    if (predictedDecodeDurationUs > 0.0 && predictedPdDelayUs > predictedDecodeDurationUs)
-    {
-        size_t const burst = static_cast<size_t>(predictedPdDelayUs / predictedDecodeDurationUs);
-        return std::clamp<size_t>(burst, 2U, 16U);
-    }
-    return std::min<size_t>(decodeQueueLength, 8U);
 }
 
 int32_t PhaseTransitionPredictor::recommendedOverlapPrefillTokens(
@@ -311,23 +259,9 @@ int32_t PhaseTransitionPredictor::recommendedOverlapPrefillTokens(
     return maxTokens;
 }
 
-int32_t PhaseTransitionPredictor::recommendedOverlapPrefillTokens(
-    size_t decodeQueueLength, double predictedPdDelayUs, int32_t defaultTokens) const noexcept
+PhaseTransitionTelemetry const& PhaseTransitionPredictor::telemetry() const noexcept
 {
-    if (decodeQueueLength > 16U || predictedPdDelayUs > 1000.0)
-    {
-        return std::min(defaultTokens, 64);
-    }
-    if (decodeQueueLength == 0U && predictedPdDelayUs < 100.0)
-    {
-        return std::max(defaultTokens, 256);
-    }
-    return defaultTokens;
-}
-
-PhaseTransitionTelemetry const& PhaseTransitionPredictor::telemetry(PhaseTransitionDelayKind kind) const noexcept
-{
-    return mModels[kindIndex(kind)].telemetry;
+    return mModel.telemetry;
 }
 
 } // namespace trt_edgellm::rt

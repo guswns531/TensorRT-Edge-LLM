@@ -2,6 +2,45 @@
 
 Date: 2026-09-21. Branch: `codex/v0101-phase-forward-port`.
 
+## Audit correction — 2026-09-26
+
+The original narrative below is retained as historical context, not a promotion gate. A fresh read of the 24
+per-cell `aggregate.json` files in `.local/results/dual-model-full24-clean-sweep-20260921` confirms **one run per
+workload**, not repeated validation. A singleton `token_trace_deterministic: true` does not establish repeatability
+or correctness across schedules. The 12/12 Cosmos and 10/12 Gemma numbers are **throughput-only observed wins**;
+the claim that every Cosmos workload also has lower latency is incorrect. Small margins need repeats.
+
+Gemma's engine `builder_config.max_kv_pool_pages` is **192**, not 480. The 480 figure belongs to the frozen vLLM
+KV-budget setting and is not the Current page count. The shared E/P workspace also disables the direct-event
+handoff path, so these measurements cannot demonstrate that path's benefit.
+
+Recomputed geometric-mean changes versus the retained frozen vLLM baseline follow. Negative latency changes are
+better; `wins` is counted separately for each metric over 12 workloads.
+
+| Metric | Cosmos change / wins | Gemma change / wins |
+|---|---:|---:|
+| Token throughput | +13.30% / 12 | +28.14% / 10 |
+| TTFT mean | -27.62% / 9 | -7.00% / 5 |
+| TTFT p95 | -23.23% / 11 | +30.64% / 2 |
+| TPOT mean | -14.18% / 10 | -21.51% / 11 |
+| TPOT p95 | -17.92% / 11 | -13.52% / 8 |
+| E2E mean | -14.55% / 12 | -21.70% / 10 |
+| E2E p95 | -13.76% / 12 | -24.06% / 10 |
+
+Raw-derived per-workload seven-metric tables, source hashes, and machine-readable rows are retained in
+`.local/results/review-correction-20260926/raw-seven-metrics.{md,json,csv}`, campaign `note328`. Reproduction:
+
+```bash
+python3 benchmarks/phase_serving/report_workspace_revalidation.py \
+  --campaign note328=.local/results/dual-model-full24-clean-sweep-20260921 \
+  --campaign note329-later-full12=.local/results/dual-model-full24-clean-sweep-20260921-v2 \
+  --output-prefix .local/results/review-correction-20260926/raw-seven-metrics
+```
+
+No new GPU measurement was made for this correction. The analysis reuses frozen vLLM results; it is not an
+equal-memory comparison or a confidence-interval result. Single-storage safety, cancellation and repeatability
+still require dedicated tests before claiming production readiness.
+
 ## 1. Executive Summary
 
 This campaign reports the end-to-end evaluation of **all 24 workloads** (12 workloads $\times$ 2 models) executed in a single,

@@ -256,6 +256,8 @@ struct PhaseThreeCoordinatorConfig
     size_t exclusiveEncoderInputTokenThreshold{};
     //! Every encoder dispatch exclusively owns the shared E/P arena.
     bool serializeAllEncoderPrefill{};
+    //! Retained output slab limit when E/P share activation memory; independent of the execution lease.
+    size_t sharedEpMaxRetainedBatches{1U};
     //! Every encoder dispatch exclusively owns the shared E/D arena.
     bool serializeAllEncoderDecode{};
     //! Transfer vision payloads directly to downstream prefill without host-side completion polling.

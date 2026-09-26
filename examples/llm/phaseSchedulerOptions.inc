@@ -84,10 +84,6 @@
                 && semanticSchedulerConfig.maxDecodeBatchSize <= config.maxSupportedDecodeBatchSize,
             "Semantic decode batch cap is outside the engine profile");
         semanticSchedulerConfig.maxPrefillChunkTokens = std::min(128, prefillTokenCapacity);
-        if (char const* value = std::getenv("TRT_EDGELLM_FIXED_PREFILL_CHUNK"))
-        {
-            semanticSchedulerConfig.maxPrefillChunkTokens = std::stoi(value);
-        }
         ELLM_CHECK(semanticSchedulerConfig.maxPrefillChunkTokens > 0
                 && semanticSchedulerConfig.maxPrefillChunkTokens <= prefillTokenCapacity,
             "Semantic prefill chunk is outside the engine profile");
@@ -99,20 +95,9 @@
         {
             semanticSchedulerConfig.largePrefillChunkQueueThreshold = static_cast<size_t>(std::stoull(value));
         }
-        ELLM_CHECK(semanticSchedulerConfig.decodeActivePrefillChunkTokens >= 0
-                && semanticSchedulerConfig.decodeActivePrefillChunkTokens
-                    <= semanticSchedulerConfig.maxPrefillChunkTokens,
-            "Decode-active prefill chunk is outside the configured prefill limit");
-        semanticSchedulerConfig.maxOverlapPrefillTokens
-            = std::min(128, semanticSchedulerConfig.maxPrefillChunkTokens);
-        if (char const* value = std::getenv("TRT_EDGELLM_MAX_OVERLAP_PREFILL_TOKENS"))
-        {
-            semanticSchedulerConfig.maxOverlapPrefillTokens = std::stoi(value);
-        }
         semanticSchedulerConfig.maxPrefillBatchTokens = prefillBatchTokenBudget;
         semanticSchedulerConfig.enableRaggedPrefillBatching = config.packedPrefill;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = config.packedPrefill;
-        semanticSchedulerConfig.prefillCompletionBonusTokens = semanticSchedulerConfig.maxPrefillChunkTokens;
         semanticSchedulerConfig.enableWavefrontPrefillBatching
             = std::getenv("TRT_EDGELLM_DISABLE_WAVEFRONT_PREFILL") == nullptr;
         semanticSchedulerConfig.enablePrefillCohortRefill
@@ -120,43 +105,16 @@
         semanticSchedulerConfig.maxPrefillCohortSize = semanticSchedulerConfig.maxPrefillBatchSize;
         semanticSchedulerConfig.maxPrefillCohortTurns = 8;
         semanticSchedulerConfig.enableAdaptivePrefillChunking = false;
-        if (char const* value = std::getenv("TRT_EDGELLM_ENABLE_ADAPTIVE_PREFILL_CHUNKING"))
-        {
-            semanticSchedulerConfig.enableAdaptivePrefillChunking
-                = std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_ADAPTIVE_PREFILL_CHUNK_CANDIDATES"))
-        {
-            semanticSchedulerConfig.adaptivePrefillChunkCandidates.clear();
-            std::stringstream ss(value);
-            std::string item;
-            while (std::getline(ss, item, ','))
-            {
-                if (!item.empty())
-                {
-                    semanticSchedulerConfig.adaptivePrefillChunkCandidates.push_back(std::stoi(item));
-                }
-            }
-            if (!semanticSchedulerConfig.adaptivePrefillChunkCandidates.empty())
-            {
-                semanticSchedulerConfig.enableAdaptivePrefillChunking = true;
-                semanticSchedulerConfig.minPrefillChunkTokens
-                    = semanticSchedulerConfig.adaptivePrefillChunkCandidates.front();
-                semanticSchedulerConfig.maxPrefillChunkTokens = std::max(
-                    semanticSchedulerConfig.maxPrefillChunkTokens,
-                    semanticSchedulerConfig.adaptivePrefillChunkCandidates.back());
-            }
-        }
-        if (char const* value = std::getenv("TRT_EDGELLM_ENABLE_COST_AWARE_PREFILL_SHAPE"))
-        {
-            semanticSchedulerConfig.enableCostAwarePrefillShapeSelection
-                = std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
-        }
+        rt::resolvePhasePrefillExecutionOptions(semanticSchedulerConfig, prefillTokenCapacity);
+        ELLM_CHECK(semanticSchedulerConfig.decodeActivePrefillChunkTokens >= 0
+                && semanticSchedulerConfig.decodeActivePrefillChunkTokens
+                    <= semanticSchedulerConfig.maxPrefillChunkTokens,
+            "Decode-active prefill chunk is outside the configured prefill limit");
+        semanticSchedulerConfig.prefillCompletionBonusTokens = semanticSchedulerConfig.maxPrefillChunkTokens;
         semanticSchedulerConfig.enableDecodeTpotTelemetry
             = std::getenv("TRT_EDGELLM_THROUGHPUT_MAX_ENCODED_VISION") != nullptr
             || std::getenv("TRT_EDGELLM_STEPWISE_ADMISSION") != nullptr
             || std::getenv("TRT_EDGELLM_PHASE_MEMORY_BROKER") != nullptr;
-        semanticSchedulerConfig.minPrefillChunkTokens = semanticSchedulerConfig.maxPrefillChunkTokens;
         semanticSchedulerConfig.enableMetricsPolicy = std::getenv("TRT_EDGELLM_DISABLE_METRICS_POLICY") == nullptr;
         semanticSchedulerConfig.enablePrefillTtftHardGuard
             = std::getenv("TRT_EDGELLM_PREFILL_TTFT_HARD_GUARD") != nullptr;

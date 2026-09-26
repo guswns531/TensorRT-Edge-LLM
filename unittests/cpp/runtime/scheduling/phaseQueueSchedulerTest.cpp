@@ -4229,7 +4229,7 @@ TEST(PhaseThreeCoordinatorPolicyTest, ReleasesNonMropePrefillVisionStorage)
     EXPECT_EQ(payload.releasePrefillStorage(), 0U);
 }
 
-TEST(PhaseQueueSchedulerTest, AdaptsDecodeBurstAndOverlapWithTransitionPredictor)
+TEST(PhaseQueueSchedulerTest, ObservesDecodeQueueResidenceWithCandidateFeatureContract)
 {
     PhaseQueueSchedulerConfig config;
     config.maxPrefillBatchSize = 4;
@@ -4241,42 +4241,82 @@ TEST(PhaseQueueSchedulerTest, AdaptsDecodeBurstAndOverlapWithTransitionPredictor
 
     PhaseQueueScheduler scheduler(config);
 
-    // Initial state: predictor has 0 observations
-    EXPECT_EQ(scheduler.transitionPredictor().telemetry(PhaseTransitionDelayKind::kPrefillToDecode).observations, 0U);
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry().observations, 0U);
 
-    // Simulate dispatches with high decode wait times (indicating severe P->D handoff bottleneck)
-    for (size_t i{}; i < 10U; ++i)
+    PhaseTransitionPredictor reference(config.transitionPredictorConfig);
+    for (size_t i{}; i < 30U; ++i)
     {
         PhaseDispatchMetrics metrics;
         metrics.decodeBatchSize = 8;
-        metrics.decodeTokens = 1024;
+        metrics.decodeTokens = 8;
+        metrics.decodeContextTokens = 1024;
         metrics.decodeQueueWaitUs = 2500.0;
-        metrics.decodeGpuMs = 0.2F; // 200 us per step
+        metrics.decodeGpuMs = 0.2F;
         metrics.makespanGpuMs = 0.5F;
+        metrics.pagePoolTotalBundles = 128;
+        metrics.pagePoolAllocatedBundles = 64;
         scheduler.observeMetrics(metrics);
+        ASSERT_TRUE(reference.observeDecodeQueueWait({8, 1024}, 2500.0));
     }
 
-    EXPECT_EQ(scheduler.transitionPredictor().telemetry(PhaseTransitionDelayKind::kPrefillToDecode).observations, 10U);
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry().observations, 30U);
 
-    // Enqueue decode work to test dynamic burst and overlap adaptation
-    for (uint64_t id{1}; id <= 12; ++id)
+    for (uint64_t id{1}; id <= 8; ++id)
     {
-        scheduler.enqueueDecode(PhaseWorkItem{id, 1, 0, 0, 1});
+        scheduler.enqueueDecode(PhaseWorkItem{id, 128, 0, 0, 128});
     }
 
     PhaseQueueSnapshot const snap = scheduler.queueSnapshot();
-    EXPECT_EQ(snap.decodeQueued, 12);
+    EXPECT_EQ(snap.decodeQueued, 8U);
+    EXPECT_EQ(snap.decodeCandidateContextTokens, 1024);
+    PhaseDecodeQueueState const state{static_cast<int32_t>(snap.decodeQueued), snap.decodeCandidateContextTokens};
+    auto const estimate = scheduler.transitionPredictor().predictDecodeQueueWait(state);
+    ASSERT_TRUE(estimate.ready);
+    EXPECT_NEAR(estimate.meanUs, 2500.0, 50.0);
+    EXPECT_DOUBLE_EQ(estimate.meanUs, reference.predictDecodeQueueWait(state).meanUs);
 
-    // Test that resetPolicyPosterior clears predictor observations
-    for (uint64_t id{1}; id <= 12; ++id)
+    for (uint64_t id{1}; id <= 8; ++id)
     {
         scheduler.cancel(id);
     }
     scheduler.resetPolicyPosterior();
-    EXPECT_EQ(scheduler.transitionPredictor().telemetry(PhaseTransitionDelayKind::kPrefillToDecode).observations, 0U);
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry().observations, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, TransitionFlagDisablesQueueObservation)
+{
+    PhaseQueueSchedulerConfig config;
+    config.enableTransitionPredictor = false;
+    PhaseQueueScheduler scheduler(config);
+    PhaseDispatchMetrics metrics;
+    metrics.decodeBatchSize = 8;
+    metrics.decodeContextTokens = 1024;
+    metrics.decodeGpuMs = 0.2F;
+    metrics.decodeQueueWaitUs = 2500.0;
+    scheduler.observeMetrics(metrics);
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry().observations, 0U);
+}
+
+TEST(PhaseQueueSchedulerTest, IgnoresPrefillAndUnexecutedDecodeForQueueObservation)
+{
+    PhaseQueueScheduler scheduler;
+    PhaseDispatchMetrics metrics;
+    metrics.prefillBatchSize = 8;
+    metrics.prefillTokens = 1024;
+    metrics.prefillGpuMs = 0.5F;
+    metrics.prefillQueueWaitUs = 2500.0;
+    metrics.makespanGpuMs = 0.5F;
+    scheduler.observeMetrics(metrics);
+    metrics.decodeBatchSize = 8;
+    metrics.decodeContextTokens = 1024;
+    scheduler.observeMetrics(metrics);
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry().observations, 0U);
+    metrics.decodeGpuMs = 0.2F;
+    scheduler.observeMetrics(metrics);
+    EXPECT_EQ(scheduler.transitionPredictor().telemetry().observations, 1U);
+    EXPECT_DOUBLE_EQ(scheduler.transitionPredictor().telemetry().lastMeasuredUs, 0.0);
 }
 
 } // namespace
 } // namespace rt
 } // namespace trt_edgellm
-
