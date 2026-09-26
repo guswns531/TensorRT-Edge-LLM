@@ -2475,13 +2475,16 @@ bool IndependentPhaseAsyncServer::processSamplingTickets()
     for (auto ticket = mSamplingTickets.begin(); ticket != mSamplingTickets.end();)
     {
         cudaError_t status = cudaEventQuery((*ticket)->ready);
-        PhaseQueueSnapshot const queue = mCoordinator.scheduler().queueSnapshot();
-        bool const synchronize = status == cudaErrorNotReady
-            && phaseShouldSynchronizeDecodeSampling(mConfig.synchronizeDecodeSampling, (*ticket)->fromPrefill,
-                queue.externalPrefillQueued, mExternalPendingRequests);
-        if (synchronize)
+        bool const maySynchronize = status == cudaErrorNotReady
+            && phaseShouldSynchronizeDecodeSampling(
+                mConfig.synchronizeDecodeSampling, (*ticket)->fromPrefill, false, mExternalPendingRequests);
+        if (maySynchronize)
         {
-            status = cudaEventSynchronize((*ticket)->ready);
+            PhaseQueueSnapshot const queue = mCoordinator.scheduler().queueSnapshot();
+            if (!queue.externalPrefillQueued)
+            {
+                status = cudaEventSynchronize((*ticket)->ready);
+            }
         }
         if (status == cudaErrorNotReady)
         {

@@ -47,6 +47,39 @@ TEST(IndependentPhaseAsyncServerTest, SynchronizesDecodeCompletionOnlyWithoutPro
     EXPECT_FALSE(phaseShouldSynchronizeDecodeSampling(true, false, false, 1));
 }
 
+TEST(IndependentPhaseAsyncServerTest, DefersQueueInspectionWithoutChangingSamplingSynchronization)
+{
+    for (bool const enabled : {false, true})
+    {
+        for (bool const fromPrefill : {false, true})
+        {
+            for (size_t const producerRows : {0U, 1U})
+            {
+                for (bool const externalPrefillQueued : {false, true})
+                {
+                    for (bool const ready : {false, true})
+                    {
+                        bool const expected = !ready
+                            && phaseShouldSynchronizeDecodeSampling(
+                                enabled, fromPrefill, externalPrefillQueued, producerRows);
+                        bool const maySynchronize
+                            = !ready && phaseShouldSynchronizeDecodeSampling(enabled, fromPrefill, false, producerRows);
+                        size_t queueInspections{};
+                        bool synchronize{};
+                        if (maySynchronize)
+                        {
+                            ++queueInspections;
+                            synchronize = !externalPrefillQueued;
+                        }
+                        EXPECT_EQ(synchronize, expected);
+                        EXPECT_EQ(queueInspections, !ready && enabled && !fromPrefill && producerRows == 0U ? 1U : 0U);
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(IndependentPhaseAsyncServerTest, ExposesOneCompletePrefillCohortPerIngressTurn)
 {
     EXPECT_EQ(phaseServingIngressQuantum(1024, 8), 8U);
