@@ -285,6 +285,7 @@ def command_for(repo,
         environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
             "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"]
     for key in ("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR",
+                "TRT_EDGELLM_RESIDENT_DECODE_SHADOW",
                 "TRT_EDGELLM_SHARED_EP_SINGLE_STORAGE"):
         if key in os.environ:
             environment[key] = os.environ[key]

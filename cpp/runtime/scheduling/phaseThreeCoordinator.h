@@ -745,6 +745,8 @@ private:
         PhaseGlobalSelectionAudit const* selectorAudit = nullptr);
     void observeUnifiedInFlightTransitions();
     void emitUnifiedEvent(PhaseUnifiedEvent event);
+    void recordResidentDecodeShadow(uint64_t snapshotId, PhaseGlobalActionCandidate const& selected,
+        std::vector<PhaseGlobalActionCandidate> const* frontier);
     void recordTimeline(uint64_t requestId, PhaseTimelineStage stage, size_t batchSize = 0U, int32_t kvSlotId = -1,
         uint64_t timestampNs = 0U) const;
     static size_t mediaItemCount(PendingVisionRequest const& pending) noexcept;

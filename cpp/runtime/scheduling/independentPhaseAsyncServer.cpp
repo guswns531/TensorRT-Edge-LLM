@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -380,6 +381,12 @@ IndependentPhaseAsyncServer::IndependentPhaseAsyncServer(IndependentPhaseServerC
     , mAdapter(std::move(adapter))
     , mPrefixCache(prefixCache)
 {
+    if (char const* value = std::getenv("TRT_EDGELLM_RESIDENT_DECODE_SHADOW"))
+    {
+        std::string const setting(value);
+        ELLM_CHECK(setting == "0" || setting == "1", "Resident decode shadow option must be 0 or 1");
+        mResidentDecodeShadowEnabled = setting == "1";
+    }
     ELLM_CHECK(mConfig.maxInFlightRequests > 0, "Independent phase server request capacity must be positive");
     ELLM_CHECK(mConfig.defaultMaxOutputTokens > 0, "Independent phase server output capacity must be positive");
     ELLM_CHECK(mConfig.outputHeadroomTokens >= 0, "Independent phase server output headroom must be non-negative");
@@ -1876,6 +1883,79 @@ float IndependentPhaseAsyncServer::decodeAdmissionTpotPressure() const noexcept
     return decodeTpotPressure();
 }
 
+bool IndependentPhaseAsyncServer::residentDecodeShadowEnabled() const noexcept
+{
+    return mResidentDecodeShadowEnabled;
+}
+
+PhaseResidentDecodeSnapshot IndependentPhaseAsyncServer::residentDecodeSnapshot() const
+{
+    PhaseResidentDecodeSnapshot result;
+    if (!mResidentDecodeShadowEnabled)
+    {
+        return result;
+    }
+    result.hostSnapshotNs = phaseServiceHostNs(std::chrono::steady_clock::now());
+    PhaseQueueSnapshot const queued = mCoordinator.scheduler().queueSnapshot(true);
+    PhaseInFlightSnapshot const inflight = mCoordinator.inFlightSnapshot();
+    std::unordered_set<uint64_t> ready(queued.decodeRequestIds.begin(), queued.decodeRequestIds.end());
+    auto const queueIds = mCoordinator.scheduler().queuedDecodeRequestIds();
+    std::unordered_set<uint64_t> queueMembers(queueIds.begin(), queueIds.end());
+    std::unordered_set<uint64_t> running;
+    for (auto const& work : inflight.work)
+    {
+        if (work.phase == PhaseUnifiedPhase::kDecode)
+        {
+            running.insert(work.requestIds.begin(), work.requestIds.end());
+        }
+    }
+    std::unordered_map<uint64_t, uint64_t> sampling;
+    for (auto const& ticket : mSamplingTickets)
+    {
+        for (uint64_t const requestId : ticket->requestIds)
+        {
+            sampling.emplace(requestId, phaseServiceHostNs(ticket->submittedAt));
+        }
+    }
+    result.requests.reserve(mRequests.size());
+    for (auto const& [requestId, state] : mRequests)
+    {
+        if (state.generatedTokens.empty() || state.generatedTokens.size() >= static_cast<size_t>(state.maxOutputTokens)
+            || mCancellationRequests.count(requestId) != 0U)
+        {
+            continue;
+        }
+        PhaseResidentDecodeObservation observed;
+        observed.requestId = requestId;
+        observed.reference = state.residentDecodeReference;
+        observed.referenceContextLength = state.residentDecodeReferenceContextLength;
+        observed.candidateReady = ready.count(requestId) != 0U;
+        observed.lastTokenCommittedHostNs = phaseServiceHostNs(state.lastTokenCommittedAt);
+        auto const pending = sampling.find(requestId);
+        if (pending != sampling.end())
+        {
+            observed.stage = PhaseResidentDecodeStage::kSampling;
+            observed.samplingSubmittedHostNs = pending->second;
+        }
+        else if (running.count(requestId) != 0U)
+        {
+            observed.stage = PhaseResidentDecodeStage::kInFlight;
+        }
+        else if (queueMembers.count(requestId) != 0U)
+        {
+            observed.stage = PhaseResidentDecodeStage::kQueued;
+        }
+        else if (mPendingDecodeRequestIds.count(requestId) != 0U)
+        {
+            observed.stage = PhaseResidentDecodeStage::kCapacityWait;
+        }
+        result.requests.push_back(observed);
+    }
+    std::sort(result.requests.begin(), result.requests.end(),
+        [](auto const& left, auto const& right) { return left.requestId < right.requestId; });
+    return result;
+}
+
 IndependentPhaseServerArbitrationSnapshot IndependentPhaseAsyncServer::arbitrationSnapshot(
     bool includeReadyDetails) const noexcept
 {
@@ -2469,6 +2549,14 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         RequestState& state = it->second;
         state.generatedTokens.push_back(tokens[index]);
         state.lastTokenCommittedAt = std::chrono::steady_clock::now();
+        if (mResidentDecodeShadowEnabled)
+        {
+            state.residentDecodeReferenceContextLength = mOwnership.length(state.kvSlotId);
+            state.residentDecodeReference
+                = phaseResidentDecodeReference(mCoordinator.scheduler().estimateGlobalDecodeComponentP95(
+                                                   1, state.residentDecodeReferenceContextLength, false),
+                    state.generatedTokens.size());
+        }
         recordTimeline(requestId,
             ticket->fromPrefill ? PhaseTimelineStage::kPrefillTokenCommitted
                                 : PhaseTimelineStage::kDecodeTokenCommitted,

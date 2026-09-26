@@ -4311,6 +4311,17 @@ size_t PhaseQueueScheduler::decodeQueueSize() const noexcept
     return mDecodeQueue.size();
 }
 
+std::vector<uint64_t> PhaseQueueScheduler::queuedDecodeRequestIds() const
+{
+    std::vector<uint64_t> result;
+    result.reserve(mDecodeQueue.size());
+    for (PhaseWorkItem const& item : mDecodeQueue)
+    {
+        result.push_back(item.requestId);
+    }
+    return result;
+}
+
 size_t PhaseQueueScheduler::decodeCohortSize() const noexcept
 {
     return mDecodeCohortIds.size();

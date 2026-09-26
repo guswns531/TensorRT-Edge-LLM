@@ -758,6 +758,8 @@ public:
 
     size_t prefillQueueSize() const noexcept;
     size_t decodeQueueSize() const noexcept;
+    //! Read-only queued membership, without batch caps or eligibility filtering.
+    std::vector<uint64_t> queuedDecodeRequestIds() const;
     size_t decodeCohortSize() const noexcept;
     bool empty() const noexcept;
     bool hasRequest(uint64_t requestId) const noexcept;

@@ -36,6 +36,8 @@
 #include <tuple>
 #include <utility>
 
+#include <nlohmann/json.hpp>
+
 namespace trt_edgellm::rt
 {
 namespace
@@ -1880,6 +1882,64 @@ PhaseInFlightSnapshot PhaseThreeCoordinator::unifiedInFlightSnapshot(
     return result;
 }
 
+void PhaseThreeCoordinator::recordResidentDecodeShadow(uint64_t snapshotId, PhaseGlobalActionCandidate const& selected,
+    std::vector<PhaseGlobalActionCandidate> const* frontier)
+{
+    if (!mServer.residentDecodeShadowEnabled())
+    {
+        return;
+    }
+    PhaseResidentDecodeSnapshot const snapshot = mServer.residentDecodeSnapshot();
+    PhaseResidentDecodeSummary const summary = phaseSummarizeResidentDecode(snapshot);
+    nlohmann::json requests = nlohmann::json::array();
+    size_t uncoveredSampling{};
+    for (auto const& request : snapshot.requests)
+    {
+        size_t coveredCandidates{};
+        if (frontier != nullptr)
+        {
+            for (auto const& candidate : *frontier)
+            {
+                coveredCandidates
+                    += std::any_of(candidate.protectedCompletions.begin(), candidate.protectedCompletions.end(),
+                           [&](auto const& completion) {
+                               return completion.kind == PhaseProtectedKind::kDecode
+                                   && completion.requestId == request.requestId;
+                           })
+                    ? 1U
+                    : 0U;
+            }
+        }
+        bool const coverageKnown = frontier != nullptr && !frontier->empty();
+        uncoveredSampling
+            += coverageKnown && request.stage == PhaseResidentDecodeStage::kSampling && coveredCandidates == 0U ? 1U
+                                                                                                                : 0U;
+        auto const age = phaseResidentDecodeAge(request, snapshot.hostSnapshotNs);
+        requests.push_back({{"request_id", request.requestId}, {"stage", phaseResidentDecodeStageName(request.stage)},
+            {"candidate_ready", request.candidateReady}, {"reference_us", request.reference.serviceUs},
+            {"reference_target_batch_size", 1}, {"reference_target_context_length", request.referenceContextLength},
+            {"reference_lookup", "runtime_exact_or_covering"},
+            {"reference_source", phaseServiceReferenceSourceName(request.reference.source)},
+            {"reference_valid", request.reference.valid}, {"service_epoch", request.reference.epoch},
+            {"service_age_quanta", age.has_value() ? nlohmann::json(*age) : nlohmann::json(nullptr)},
+            {"last_token_committed_host_ns", request.lastTokenCommittedHostNs},
+            {"sampling_submitted_host_ns", request.samplingSubmittedHostNs}, {"coverage_known", coverageKnown},
+            {"covered_candidates", coveredCandidates}});
+    }
+    nlohmann::json const record{{"schema_version", 1}, {"snapshot_id", snapshotId},
+        {"observation_host_ns", snapshot.hostSnapshotNs}, {"selected_action_id", selected.candidateId},
+        {"mode", "shadow"}, {"authority_applied", false}, {"observation_point", "post_selection"},
+        {"candidate_count", frontier == nullptr ? 0U : frontier->size()}, {"resident_count", snapshot.requests.size()},
+        {"unknown_count", summary.stageCounts[0]}, {"queued_count", summary.stageCounts[1]},
+        {"candidate_ready_count", summary.candidateReady}, {"inflight_count", summary.stageCounts[2]},
+        {"sampling_count", summary.stageCounts[3]}, {"capacity_wait_count", summary.stageCounts[4]},
+        {"measured_reference_count", summary.measuredReferences},
+        {"max_service_age_quanta",
+            summary.maxServiceAge.has_value() ? nlohmann::json(*summary.maxServiceAge) : nlohmann::json(nullptr)},
+        {"uncovered_sampling_count", uncoveredSampling}, {"requests", std::move(requests)}};
+    LOG_INFO("PHASE_RESIDENT_DECODE_SHADOW %s", record.dump().c_str());
+}
+
 void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate const& candidate,
     PhaseGlobalDispatchPlan const& plan, std::vector<PhaseGlobalActionCandidate> const* candidateFrontier,
     PhaseGlobalSelectionAudit const* selectorAudit)
@@ -1934,6 +1994,7 @@ void PhaseThreeCoordinator::recordUnifiedDecision(PhaseGlobalActionCandidate con
     event.encoderService = encoderServiceState();
     event.prefillService = server.prefillService;
     event.decodeService = server.decodeService;
+    recordResidentDecodeShadow(plan.snapshotEpoch, candidate, candidateFrontier);
     if (mUnifiedDetailedDecisionSnapshots)
     {
         event.serviceClocks = server.serviceClocks;

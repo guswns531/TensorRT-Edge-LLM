@@ -188,6 +188,22 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             environment(command)["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"],
             "1,2,4,8,12,16,20,24")
 
+    def test_resident_decode_shadow_is_opt_in_and_only_forwards_diagnostics(
+            self):
+        name = "TRT_EDGELLM_RESIDENT_DECODE_SHADOW"
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            baseline = environment(self.command("shared_ep"))
+            self.assertNotIn(name, baseline)
+        for value in ("0", "1"):
+            with unittest.mock.patch.dict("os.environ", {name: value},
+                                          clear=True):
+                command = self.command("shared_ep")
+                enabled = environment(command)
+            self.assertEqual(enabled.pop(name), value)
+            self.assertEqual(enabled, baseline)
+            self.assertEqual(
+                G_RUNNER.command_environment(command)[name], value)
+
     def test_predictor_ablation_changes_one_environment_field(self):
         commands = []
         for enabled in ("0", "1"):

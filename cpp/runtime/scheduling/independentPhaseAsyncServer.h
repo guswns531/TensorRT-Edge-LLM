@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/phase/mechanism/phaseResidentDecodeSnapshot.h"
 #include "runtime/phase/mechanism/phaseServiceClock.h"
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 #include "runtime/scheduling/phasePrefixReuseCache.h"
@@ -499,6 +500,9 @@ public:
     //! Return scalar arbitration state by default. Exact ready/in-flight
     //! vectors are materialized only for decision/event capture.
     IndependentPhaseServerArbitrationSnapshot arbitrationSnapshot(bool includeReadyDetails = false) const noexcept;
+    bool residentDecodeShadowEnabled() const noexcept;
+    //! Owner-thread diagnostic snapshot; not safe for concurrent or callback-reentrant access.
+    PhaseResidentDecodeSnapshot residentDecodeSnapshot() const;
     bool empty() const noexcept;
     CUcontext cudaContext() const noexcept;
     PhaseGlobalSchedulerMode globalSchedulerMode() const noexcept;
@@ -516,6 +520,8 @@ private:
         PhaseSchedulingHints scheduling;
         std::chrono::steady_clock::time_point submittedAt;
         std::chrono::steady_clock::time_point lastTokenCommittedAt;
+        PhaseServiceReference residentDecodeReference;
+        int32_t residentDecodeReferenceContextLength{};
         std::shared_ptr<PhaseVisionPayload> visionPayload;
         int32_t baseReservedPages{};
         int32_t fullReservedPages{};
@@ -584,6 +590,7 @@ private:
         uint64_t correlationId = 0U, uint64_t timestampNs = 0U) const;
 
     IndependentPhaseServerConfig mConfig;
+    bool mResidentDecodeShadowEnabled{};
     IndependentPhaseCoordinator& mCoordinator;
     StableKVPageManager& mOwnership;
     IndependentPhaseRequestAdapter mAdapter;
