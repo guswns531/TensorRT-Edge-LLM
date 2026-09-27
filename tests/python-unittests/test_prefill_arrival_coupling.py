@@ -119,6 +119,9 @@ class PrefillArrivalCouplingTest(unittest.TestCase):
             self.assertEqual(order["left_at_mismatch"], [0, 1])
             self.assertEqual(order["right_at_mismatch"], [1, 0])
             self.assertEqual(order["inversions"], 1)
+        G_TOOL.validate_ordered_server_submit(left, left)
+        with self.assertRaises(ValueError):
+            G_TOOL.validate_ordered_server_submit(right, right)
         del right[0]["server_admit"]
         with self.assertRaises(ValueError):
             G_TOOL.analyze_server_transitions(left, right)

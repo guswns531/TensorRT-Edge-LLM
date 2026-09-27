@@ -153,6 +153,15 @@ def analyze_server_transitions(left, right):
     return result
 
 
+def validate_ordered_server_submit(stages, request_ids):
+    actual = sorted(stages,
+                    key=lambda request_id:
+                    (stages[request_id]["server_submit"], request_id))
+    if actual != sorted(request_ids):
+        raise ValueError(
+            "Backend server_submit did not preserve request order")
+
+
 def prefill_summary(requests, metrics):
     prefill = [
         metric for metric in metrics if metric.get("prefill_request_ids")
@@ -297,6 +306,7 @@ def main():
     parser.add_argument("--left-cell", type=pathlib.Path, required=True)
     parser.add_argument("--right-cell", type=pathlib.Path, required=True)
     parser.add_argument("--measurement-epoch", type=int, default=1)
+    parser.add_argument("--require-ordered-server-submit", action="store_true")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     left = load_cell(args.left_cell, args.measurement_epoch)
@@ -308,6 +318,9 @@ def main():
     ) != right[0].keys():
         raise ValueError(
             "Server timeline does not match the client request IDs")
+    if args.require_ordered_server_submit:
+        validate_ordered_server_submit(left_timeline, left[0])
+        validate_ordered_server_submit(right_timeline, right[0])
     result["server_transition"] = analyze_server_transitions(
         left_timeline, right_timeline)
     args.output.parent.mkdir(parents=True, exist_ok=True)

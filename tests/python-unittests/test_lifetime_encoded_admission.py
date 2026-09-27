@@ -260,6 +260,18 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             diagnostic[diagnostic.index(flag) + 1] = "24"
         self.assertEqual(default, diagnostic)
 
+    def test_ordered_backend_ingress_changes_only_gateway(self):
+        default = self.command("independent-autotune-service")
+        ordered = G_RUNNER.command_for(self.repo, self.config,
+                                       self.repo / "cell", "mixed",
+                                       "independent-autotune-service", 0,
+                                       {"ordered_backend_ingress": True})
+        gateway_index = default.index("--gateway-script") + 1
+        self.assertTrue(
+            ordered[gateway_index].endswith("run_ordered_phase_gateway.py"))
+        ordered[gateway_index] = default[gateway_index]
+        self.assertEqual(default, ordered)
+
     def test_serving_defaults_match_repeated_configuration(self):
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
             args = G_RUNNER.parse_args([])

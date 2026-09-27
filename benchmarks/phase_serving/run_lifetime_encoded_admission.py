@@ -407,10 +407,14 @@ def command_for(repo,
         "/opt/model", "/opt/hf"
     ]
     client_limit = options.get("client_max_in_flight") or config["in_flight"]
+    gateway_script = (repo /
+                      "benchmarks/phase_serving/run_ordered_phase_gateway.py"
+                      if options.get("ordered_backend_ingress") else tools /
+                      "run_phase_openai_gateway.py")
     return [
         sys.executable,
         str(tools / "run_phase_http_trace_bench.py"), "--gateway-script",
-        str(tools / "run_phase_openai_gateway.py"), "--client-script",
+        str(gateway_script), "--client-script",
         str(tools / "run_vllm_trace_bench.py"), "--trace",
         str(config["traces"][workload]), "--output-dir",
         str(cell), "--model", config["model"], "--repeats", "1",
@@ -547,6 +551,7 @@ def parse_args(argv=None):
         help="Record ready decode rows and measured-service DP partitions")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--client-max-in-flight", type=int, default=0)
+    parser.add_argument("--ordered-backend-ingress", action="store_true")
     parser.add_argument("--max-prefill-graphs", type=int, default=0)
     parser.add_argument(
         "--startup-calibration",
@@ -697,6 +702,9 @@ def main():
         for name in ("run_phase_http_trace_bench.py",
                      "run_phase_openai_gateway.py", "run_vllm_trace_bench.py")
     }
+    if args.ordered_backend_ingress:
+        identity["ordered_gateway_sha256"] = digest(
+            repo / "benchmarks/phase_serving/run_ordered_phase_gateway.py")
     root = args.result_root.resolve()
     commands = []
     for repeat in range(1, args.repeats + 1):
@@ -722,6 +730,8 @@ def main():
                             args.decode_partition_diagnostic,
                             "client_max_in_flight":
                             args.client_max_in_flight,
+                            "ordered_backend_ingress":
+                            args.ordered_backend_ingress,
                             "serving_overlap_probes":
                             args.serving_overlap_probes == "on",
                             "startup_calibration":
