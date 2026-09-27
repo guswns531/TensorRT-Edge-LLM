@@ -1326,6 +1326,7 @@ int main(int argc, char** argv)
             rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "semantic_phase_prefill_compacted_logits");
         char const* const diagnosticLogitDir = std::getenv("TRT_EDGELLM_DIAGNOSTIC_LOGIT_DIR");
         uint64_t diagnosticRequestId{};
+        std::optional<size_t> diagnosticLogitStep;
         bool diagnosticMeasurement{};
         bool diagnosticVisionDumped{};
         bool const diagnosticInputs = std::getenv("TRT_EDGELLM_DIAGNOSTIC_VISION_INPUTS") != nullptr;
@@ -1334,6 +1335,10 @@ int main(int argc, char** argv)
             char const* const request = std::getenv("TRT_EDGELLM_DIAGNOSTIC_REQUEST_ID");
             ELLM_CHECK(request != nullptr, "Logit diagnostics require one explicit request ID");
             diagnosticRequestId = std::stoull(request);
+            if (char const* const step = std::getenv("TRT_EDGELLM_DIAGNOSTIC_LOGIT_STEP"))
+            {
+                diagnosticLogitStep = std::stoull(step);
+            }
             std::filesystem::create_directories(diagnosticLogitDir);
         }
         SamplingSlotPool samplingSlotPool(maxPhaseBatch, diagnosticLogitDir != nullptr ? config.outputVocabSize : 0);
@@ -1693,7 +1698,8 @@ int main(int argc, char** argv)
                 for (size_t row{}; row < views.size(); ++row)
                 {
                     auto const& view = views[row];
-                    if (view.requestId != diagnosticRequestId || view.generatedTokens->size() >= 64U)
+                    if (view.requestId != diagnosticRequestId || view.generatedTokens->size() >= 64U
+                        || (diagnosticLogitStep.has_value() && view.generatedTokens->size() != *diagnosticLogitStep))
                     {
                         continue;
                     }

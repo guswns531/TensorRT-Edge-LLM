@@ -320,6 +320,14 @@ def command_for(repo,
         environment["TRT_EDGELLM_PREFILL_FORMATION_DIAGNOSTIC"] = "1"
     if options.get("trusted_prefill_service_covering", False):
         environment["TRT_EDGELLM_TRUSTED_PREFILL_SERVICE_COVERING"] = "1"
+    if options.get("diagnostic_logit_request_id") is not None:
+        environment["TRT_EDGELLM_DIAGNOSTIC_REQUEST_ID"] = options[
+            "diagnostic_logit_request_id"]
+        environment[
+            "TRT_EDGELLM_DIAGNOSTIC_LOGIT_DIR"] = "/opt/results/run-{run}/logits"
+        if options.get("diagnostic_logit_step") is not None:
+            environment["TRT_EDGELLM_DIAGNOSTIC_LOGIT_STEP"] = options[
+                "diagnostic_logit_step"]
     if "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD" in os.environ:
         environment["TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"] = "1"
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
@@ -556,6 +564,8 @@ def parse_args(argv=None):
     parser.add_argument("--prefill-formation-diagnostic", action="store_true")
     parser.add_argument("--trusted-prefill-service-covering",
                         action="store_true")
+    parser.add_argument("--diagnostic-logit-request-id", type=int)
+    parser.add_argument("--diagnostic-logit-step", type=int)
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--client-max-in-flight", type=int, default=0)
     parser.add_argument("--ordered-backend-ingress", action="store_true")
@@ -585,6 +595,14 @@ def parse_args(argv=None):
     if args.repeats < 1 or args.byte_budget < 0 or args.client_max_in_flight < 0 or min(
             args.max_decode_graphs, args.max_prefill_graphs) < 0:
         parser.error("Repeat count must be positive and budgets non-negative")
+    if args.diagnostic_logit_request_id is not None and args.diagnostic_logit_request_id < 0:
+        parser.error("Diagnostic logit request ID must be non-negative")
+    if args.diagnostic_logit_step is not None and (
+            args.diagnostic_logit_step < 0
+            or args.diagnostic_logit_request_id is None):
+        parser.error(
+            "Diagnostic logit step requires a request ID and must be non-negative"
+        )
     if not math.isfinite(
             args.startup_budget_ms) or args.startup_budget_ms <= 0:
         parser.error("Startup budget must be finite and positive")
@@ -739,6 +757,10 @@ def main():
                             args.prefill_formation_diagnostic,
                             "trusted_prefill_service_covering":
                             args.trusted_prefill_service_covering,
+                            "diagnostic_logit_request_id":
+                            args.diagnostic_logit_request_id,
+                            "diagnostic_logit_step":
+                            args.diagnostic_logit_step,
                             "client_max_in_flight":
                             args.client_max_in_flight,
                             "ordered_backend_ingress":
