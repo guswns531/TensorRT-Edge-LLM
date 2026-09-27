@@ -106,8 +106,8 @@ approval remains unresolved.
 - Pinned TensorRT 26.06 container; scheduler/runtime and `llm_phase_context_smoke` rebuilt.
 - `PhaseGlobalCostModelTest.*` + `PhaseQueueSchedulerTest.*`: 184/184 passed after the final coordinator change.
 - `test_lifetime_encoded_admission.py`: 53/53 unittest cases passed; Python syntax compilation passed.
-- `git diff --check` passed. `pre-commit`, `clang-format`, and `git-clang-format` were not installed in the available
-  container/host environment, so the repository pre-commit suite could not be invoked.
+- `git diff --check` passed. The commit-time hook chain ran and passed, including CRLF normalization, license insertion,
+  clang-format, and codespell. The standalone `pre-commit` command was not on the host/container PATH.
 - Final 3x full24 screen:
   - `.local/results/external-background-key-fastpath-fix-full12-screen-20260927`
   - `.local/results/external-background-key-fastpath-fix-full12-additional-20260927`
