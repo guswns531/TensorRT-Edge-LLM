@@ -60,6 +60,99 @@ def load_cell(cell, measurement_epoch):
     return requests, metrics, events
 
 
+def load_server_timeline(cell, metrics):
+    if not metrics:
+        raise ValueError(
+            "Measurement metrics are required to isolate the timeline epoch")
+    start_us = min(x["host_dispatch_start_us"] for x in metrics) - 100000.0
+    end_us = max(x["host_completion_us"] for x in metrics) + 100000.0
+    log = cell / "gateway.log.gz"
+    stream = gzip.open(log, "rt", encoding="utf-8") if log.is_file() else (
+        cell / "gateway.log").open(encoding="utf-8")
+    stages = collections.defaultdict(dict)
+    with stream:
+        for line in stream:
+            if not line.startswith("PHASE_TIMELINE\t"):
+                continue
+            event = json.loads(line.split("\t", 1)[1])
+            if (start_us <= event["timestamp_us"] <= end_us
+                    and event["stage"] in ("server_submit", "server_admit",
+                                           "prefill_start", "first_token")):
+                stages[event["request_index"]].setdefault(
+                    event["stage"], event["timestamp_us"])
+    return dict(stages)
+
+
+def server_stage_summary(stages):
+    result = {}
+    for first, second in (("server_submit", "server_admit"),
+                          ("server_admit", "prefill_start"), ("prefill_start",
+                                                              "first_token")):
+        values = [(row[second] - row[first]) / 1000.0
+                  for row in stages.values()]
+        result[first + "_to_" + second] = {
+            "mean_ms": statistics.mean(values),
+            "p95_ms": percentile(values, .95)
+        }
+    return result
+
+
+def analyze_server_transitions(left, right):
+    if left.keys() != right.keys() or not left:
+        raise ValueError("Measurement request timelines differ")
+    required = ("server_submit", "server_admit", "prefill_start",
+                "first_token")
+    if any(stage not in row for row in (*left.values(), *right.values())
+           for stage in required):
+        raise ValueError("Incomplete server transition timeline")
+    left_epoch = min(row["server_submit"] for row in left.values())
+    right_epoch = min(row["server_submit"] for row in right.values())
+    result = {
+        "left": server_stage_summary(left),
+        "right": server_stage_summary(right),
+        "stage_order": {}
+    }
+    for stage in required:
+        left_order = sorted(left,
+                            key=lambda request_id:
+                            (left[request_id][stage], request_id))
+        right_order = sorted(right,
+                             key=lambda request_id:
+                             (right[request_id][stage], request_id))
+        right_rank = {
+            request_id: index
+            for index, request_id in enumerate(right_order)
+        }
+        first_mismatch = next(
+            (index
+             for index, (lhs, rhs) in enumerate(zip(left_order, right_order))
+             if lhs != rhs), None)
+        deltas = [
+            abs((left[request_id][stage] - left_epoch) -
+                (right[request_id][stage] - right_epoch)) / 1000.0
+            for request_id in left
+        ]
+        result["stage_order"][stage] = {
+            "first_mismatch":
+            first_mismatch,
+            "left_at_mismatch":
+            left_order[first_mismatch:first_mismatch +
+                       2] if first_mismatch is not None else [],
+            "right_at_mismatch":
+            right_order[first_mismatch:first_mismatch +
+                        2] if first_mismatch is not None else [],
+            "inversions":
+            sum(right_rank[left_order[i]] > right_rank[left_order[j]]
+                for i in range(len(left_order))
+                for j in range(i + 1, len(left_order))),
+            "relative_time_abs_delta_p95_ms":
+            percentile(deltas, .95),
+            "relative_time_abs_delta_max_ms":
+            max(deltas)
+        }
+    return result
+
+
 def prefill_summary(requests, metrics):
     prefill = [
         metric for metric in metrics if metric.get("prefill_request_ids")
@@ -209,6 +302,14 @@ def main():
     left = load_cell(args.left_cell, args.measurement_epoch)
     right = load_cell(args.right_cell, args.measurement_epoch)
     result = analyze_pair(*left, *right)
+    left_timeline = load_server_timeline(args.left_cell, left[1])
+    right_timeline = load_server_timeline(args.right_cell, right[1])
+    if left_timeline.keys() != left[0].keys() or right_timeline.keys(
+    ) != right[0].keys():
+        raise ValueError(
+            "Server timeline does not match the client request IDs")
+    result["server_transition"] = analyze_server_transitions(
+        left_timeline, right_timeline)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n",
                            encoding="utf-8")

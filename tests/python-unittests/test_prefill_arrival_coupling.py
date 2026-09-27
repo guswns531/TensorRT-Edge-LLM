@@ -87,6 +87,42 @@ class PrefillArrivalCouplingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             G_TOOL.analyze_pair(left, [], [], right, [], [])
 
+    def test_server_submit_order_is_distinct_from_client_send_order(self):
+        left = {
+            0:
+            dict(server_submit=1000,
+                 server_admit=2000,
+                 prefill_start=3000,
+                 first_token=4000),
+            1:
+            dict(server_submit=1100,
+                 server_admit=2100,
+                 prefill_start=3100,
+                 first_token=4100)
+        }
+        right = {
+            0:
+            dict(server_submit=1200,
+                 server_admit=2200,
+                 prefill_start=3200,
+                 first_token=4200),
+            1:
+            dict(server_submit=1150,
+                 server_admit=2150,
+                 prefill_start=3150,
+                 first_token=4150)
+        }
+        report = G_TOOL.analyze_server_transitions(left, right)
+        for stage in ("server_submit", "server_admit", "prefill_start"):
+            order = report["stage_order"][stage]
+            self.assertEqual(order["first_mismatch"], 0)
+            self.assertEqual(order["left_at_mismatch"], [0, 1])
+            self.assertEqual(order["right_at_mismatch"], [1, 0])
+            self.assertEqual(order["inversions"], 1)
+        del right[0]["server_admit"]
+        with self.assertRaises(ValueError):
+            G_TOOL.analyze_server_transitions(left, right)
+
 
 if __name__ == "__main__":
     unittest.main()
