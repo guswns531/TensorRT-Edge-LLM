@@ -2772,6 +2772,41 @@ TEST(PhaseQueueSchedulerTest, SparseCoveringPrefillCostCanChangeWavefrontSeed)
         filteredPlan.prefillFormation.readyReferenceUs[0], baselinePlan.prefillFormation.readyReferenceUs[0]);
 }
 
+TEST(PhaseQueueSchedulerTest, DecodeCostObservationKeepsExternalEncoderContext)
+{
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>();
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+
+    PhaseDispatchMetrics metrics;
+    metrics.kind = PhaseDispatchKind::kDecode;
+    metrics.decodeBatchSize = 1;
+    metrics.decodeContextTokens = 128;
+    metrics.plannedDecodeMaxContextLength = 128;
+    metrics.decodeGpuMs = 6.0F;
+    metrics.makespanGpuMs = 6.0F;
+    metrics.globalExecutionVariant = PhaseExecutionVariant::kPrimaryGraph;
+    scheduler.observeMetrics(metrics);
+    metrics.externalEncoderActive = true;
+    metrics.decodeGpuMs = 50.0F;
+    metrics.makespanGpuMs = 50.0F;
+    scheduler.observeMetrics(metrics);
+
+    PhaseGlobalActionKey const isolated{
+        PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0, PhaseExecutionVariant::kPrimaryGraph};
+    PhaseGlobalActionKey contended = isolated;
+    contended.externalEncoderBackground = true;
+    std::optional<PhaseGlobalCostEstimate> const isolatedCost = tracker->estimate(isolated);
+    std::optional<PhaseGlobalCostEstimate> const contendedCost = tracker->estimate(contended);
+    ASSERT_TRUE(isolatedCost.has_value());
+    ASSERT_TRUE(contendedCost.has_value());
+    EXPECT_FLOAT_EQ(isolatedCost->makespanMedianMs, 6.0F);
+    EXPECT_FLOAT_EQ(contendedCost->makespanMedianMs, 50.0F);
+    EXPECT_EQ(scheduler.telemetry().globalCostExternalEncoderContextObservationCount, 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, ServiceScaledModeKeepsExplicitDeadlinesAbsolute)
 {
     PhaseQueueSchedulerConfig config;

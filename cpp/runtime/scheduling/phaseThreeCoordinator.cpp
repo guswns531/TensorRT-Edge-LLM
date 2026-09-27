@@ -1322,10 +1322,11 @@ PhaseServiceState PhaseThreeCoordinator::encoderServiceState() const
 
 bool PhaseThreeCoordinator::poll()
 {
+    // Keep the coordinator path available until a completed E event retires its actor state.
     bool const pdOnlyFastPath = mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kDisabled
         && mRequestIds.empty() && mPending.empty() && mEncoding.empty() && mReadyPrefill.empty()
         && mDownstreamRequestBytes.empty() && !mVision.busy() && !encoderPreparationActive()
-        && mPreparedEncoder == nullptr && !mGlobalExecutionLease.has_value()
+        && mPreparedEncoder == nullptr && !mExternalEncoderActive && !mGlobalExecutionLease.has_value()
         && !mPendingGlobalOverlapObservation.has_value() && !phasePolicyUsesTransition(mConfig.policyMode)
         && !mUnifiedEventCallback && !mFormationEpisodeCallback && mDeferredServerCancellations.empty();
     if (pdOnlyFastPath)
@@ -4532,6 +4533,12 @@ bool PhaseThreeCoordinator::completeEncoder()
             }
             mEncoding.clear();
             mEncoderGpuSubmitted = false;
+            // Direct handoff can publish payloads before the encoder event is polled.
+            if (!mVision.encoderInFlight())
+            {
+                mExternalEncoderActive = false;
+                mServer.setExternalEncoderActive(false);
+            }
             return true;
         }
         if (!mVision.encoderInFlight()

@@ -30,6 +30,8 @@ namespace trt_edgellm::rt
 struct PhaseQueueSnapshot
 {
     size_t prefillQueued{};
+    //! External vision encoder GPU work can contend with this queue's P/D action.
+    bool externalEncoderActive{};
     //! At least one runnable prefill row consumes an external producer such
     //! as a vision encoder payload.
     bool externalPrefillQueued{};

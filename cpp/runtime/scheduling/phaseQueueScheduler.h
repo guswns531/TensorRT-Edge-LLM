@@ -306,6 +306,7 @@ struct PhaseSchedulerTelemetry
     size_t globalMeasuredUnprofitableOverlapSelectionCount{};
     size_t globalCostKeyObservationCount{};
     size_t globalCostKeyParityViolationCount{};
+    size_t globalCostExternalEncoderContextObservationCount{};
     size_t globalResidualPrefillAnchorObservationCount{};
     size_t globalResidualDecodeAnchorObservationCount{};
     size_t globalCandidateParityViolationCount{};
@@ -943,9 +944,10 @@ private:
     std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const;
     std::vector<PhaseWorkItem const*> decodeCandidateRows(int32_t maxRows) const;
     int32_t decodeCandidateReplacementRows(int32_t maxRows) const;
-    std::optional<float> measuredDecodeP95(int32_t batchSize, int32_t maxContextLength) const;
+    std::optional<float> measuredDecodeP95(
+        int32_t batchSize, int32_t maxContextLength, bool externalEncoderBackground = false) const;
     std::optional<float> measuredPrefillP95(int32_t batchSize, int32_t chunkLength, int32_t maxPastKVLength,
-        PhasePrefillClass prefillClass, int32_t usefulTokens) const;
+        PhasePrefillClass prefillClass, int32_t usefulTokens, bool externalEncoderBackground = false) const;
     //! Returns -1 when the TPOT guard requires decode-only, zero when no
     //! profiled dynamic decision is available, and a positive selected batch.
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,

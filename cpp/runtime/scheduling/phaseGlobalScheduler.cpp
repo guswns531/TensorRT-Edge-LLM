@@ -456,6 +456,10 @@ uint64_t phaseGlobalCandidateId(PhaseGlobalActionCandidate const& candidate) noe
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.primaryWorkClass));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.residualAugmentation));
     result = hashCombine(result, static_cast<uint64_t>(candidate.key.residualAnchor));
+    if (candidate.key.externalEncoderBackground)
+    {
+        result = hashCombine(result, 1U);
+    }
     for (uint64_t const requestId : candidate.primaryRequestIds)
     {
         result = hashCombine(result, requestId);
@@ -658,10 +662,11 @@ char const* phaseGlobalOverlapCostStatusName(PhaseGlobalOverlapCostStatus status
 bool PhaseGlobalActionKey::operator==(PhaseGlobalActionKey const& other) const noexcept
 {
     return std::tie(kind, primaryBatchSize, secondaryBatchSize, chunkLength, primaryContextBucket,
-               secondaryContextBucket, executionVariant, primaryWorkClass, residualAugmentation, residualAnchor)
+               secondaryContextBucket, executionVariant, primaryWorkClass, residualAugmentation, residualAnchor,
+               externalEncoderBackground)
         == std::tie(other.kind, other.primaryBatchSize, other.secondaryBatchSize, other.chunkLength,
             other.primaryContextBucket, other.secondaryContextBucket, other.executionVariant, other.primaryWorkClass,
-            other.residualAugmentation, other.residualAnchor);
+            other.residualAugmentation, other.residualAnchor, other.externalEncoderBackground);
 }
 
 PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept
@@ -694,6 +699,10 @@ size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key
     combine(key.primaryWorkClass);
     combine(static_cast<int32_t>(key.residualAugmentation));
     combine(static_cast<int32_t>(key.residualAnchor));
+    if (key.externalEncoderBackground)
+    {
+        combine(1);
+    }
     return result;
 }
 
@@ -771,7 +780,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateInterpolate
             || observedKey.executionVariant != target.executionVariant
             || observedKey.primaryWorkClass != target.primaryWorkClass
             || observedKey.residualAugmentation != target.residualAugmentation
-            || observedKey.residualAnchor != target.residualAnchor)
+            || observedKey.residualAnchor != target.residualAnchor
+            || observedKey.externalEncoderBackground != target.externalEncoderBackground)
         {
             continue;
         }
@@ -839,7 +849,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryBatc
             || observedKey.executionVariant != target.executionVariant
             || observedKey.primaryWorkClass != target.primaryWorkClass
             || observedKey.residualAugmentation != target.residualAugmentation
-            || observedKey.residualAnchor != target.residualAnchor)
+            || observedKey.residualAnchor != target.residualAnchor
+            || observedKey.externalEncoderBackground != target.externalEncoderBackground)
         {
             continue;
         }
@@ -924,7 +935,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringOve
             && observedKey.executionVariant == target.executionVariant
             && observedKey.primaryWorkClass == target.primaryWorkClass
             && observedKey.residualAugmentation == target.residualAugmentation
-            && observedKey.residualAnchor == target.residualAnchor;
+            && observedKey.residualAnchor == target.residualAnchor
+            && observedKey.externalEncoderBackground == target.externalEncoderBackground;
         bool const geometryCovers = observedKey.primaryBatchSize >= target.primaryBatchSize
             && observedKey.secondaryBatchSize >= target.secondaryBatchSize
             && observedKey.chunkLength >= target.chunkLength
@@ -1010,7 +1022,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringPri
             && observedKey.executionVariant == target.executionVariant
             && observedKey.primaryWorkClass == target.primaryWorkClass
             && observedKey.residualAugmentation == target.residualAugmentation
-            && observedKey.residualAnchor == target.residualAnchor;
+            && observedKey.residualAnchor == target.residualAnchor
+            && observedKey.externalEncoderBackground == target.externalEncoderBackground;
         bool const geometryCovers = observedKey.primaryBatchSize >= target.primaryBatchSize
             && observedKey.chunkLength >= target.chunkLength
             && observedKey.primaryContextBucket >= target.primaryContextBucket;
@@ -1094,7 +1107,8 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimatePrimaryLaun
             && observedKey.executionVariant == target.executionVariant
             && observedKey.primaryWorkClass == target.primaryWorkClass
             && observedKey.residualAugmentation == target.residualAugmentation
-            && observedKey.residualAnchor == target.residualAnchor;
+            && observedKey.residualAnchor == target.residualAnchor
+            && observedKey.externalEncoderBackground == target.externalEncoderBackground;
         if (!semanticMatch)
         {
             continue;

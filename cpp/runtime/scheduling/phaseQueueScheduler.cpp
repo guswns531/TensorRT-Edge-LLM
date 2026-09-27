@@ -471,6 +471,7 @@ void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
 PhaseQueueSnapshot PhaseQueueScheduler::snapshot(bool includeReadyDetails) const
 {
     PhaseQueueSnapshot result{};
+    result.externalEncoderActive = mExternalEncoderActive;
     result.prefillPendingProducerRows = mPendingPrefillProducerRows;
     result.prefillPendingTextProducerRows = mPendingTextPrefillProducerRows;
     result.prefillPendingExternalProducerRows = mPendingExternalPrefillProducerRows;
@@ -1089,8 +1090,8 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
             maxPastKV = std::max(maxPastKV, candidates[static_cast<size_t>(index)]->tokenOffset);
             usefulTokens += std::min(dispatchedPrefillTokens(*candidates[static_cast<size_t>(index)]), chunkLength);
         }
-        std::optional<float> const measuredGpuMs
-            = measuredPrefillP95(batchSize, chunkLength, maxPastKV, prefillClass, usefulTokens);
+        std::optional<float> const measuredGpuMs = measuredPrefillP95(
+            batchSize, chunkLength, maxPastKV, prefillClass, usefulTokens, state.externalEncoderActive);
         PhasePrefillBatchCost const* selected{};
         for (PhasePrefillBatchCost const& cost : mConfig.prefillBatchCosts)
         {
@@ -2018,8 +2019,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
     PhaseGlobalActionKey prefillKey{
         PhaseGlobalActionKind::kPrefill, prefillRows, 0, prefillChunk, contextBucket(prefillPastKV), 0};
     prefillKey.primaryWorkClass = static_cast<int32_t>(prefillClass);
+    prefillKey.externalEncoderBackground = state.externalEncoderActive;
     PhaseGlobalActionKey decodeKey{
         PhaseGlobalActionKind::kDecode, decodeRows, 0, 1, contextBucket(decodeMaxContext), 0};
+    decodeKey.externalEncoderBackground = state.externalEncoderActive;
 
     PhaseDispatchPlan const overlapPlan = state.prefillQueued > 0U && state.decodeQueued > 0U
         ? previewMechanismPlan(PhaseDispatchKind::kOverlap)
@@ -2201,11 +2204,13 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseGlobalActionKey overlapPrefillKey{PhaseGlobalActionKind::kPrefill, overlapPrefillRows, 0,
             overlapPrefillChunk, contextBucket(overlapPrefillPastKV), 0};
         overlapPrefillKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
+        overlapPrefillKey.externalEncoderBackground = state.externalEncoderActive;
         overlapPrefillKey.executionVariant = executionVariant(overlapPrefillKey, overlapPrefillUsefulTokens);
         overlapPrefill = predictPrefill(overlapPrefillKey, overlapPrefillRows, overlapPrefillChunk,
             overlapPrefillPastKV, overlapPrefillInitial, overlapPrefillClass, overlapPrefillUsefulTokens);
         PhaseGlobalActionKey overlapDecodeKey{
             PhaseGlobalActionKind::kDecode, overlapDecodeRows, 0, 1, contextBucket(overlapDecodeMaxContext), 0};
+        overlapDecodeKey.externalEncoderBackground = state.externalEncoderActive;
         overlapDecodeKey.executionVariant = executionVariant(overlapDecodeKey, 0);
         int64_t overlapDecodeContextTokens{};
         for (PhaseWorkItem const& item : overlapPlan.decodeBatch)
@@ -2250,9 +2255,11 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         {
             PhaseGlobalActionKey combinedKey{
                 PhaseGlobalActionKind::kDecode, combinedRows, 0, 1, contextBucket(combinedMaxContext), 0};
+            combinedKey.externalEncoderBackground = state.externalEncoderActive;
             combinedKey.executionVariant = executionVariant(combinedKey, 0);
             PhaseGlobalActionKey producedKey{
                 PhaseGlobalActionKind::kDecode, producedRows, 0, 1, contextBucket(producedMaxContext), 0};
+            producedKey.externalEncoderBackground = state.externalEncoderActive;
             producedKey.executionVariant = executionVariant(producedKey, 0);
             Prediction const combined
                 = predictDecodeSuccessor(combinedKey, combinedRows, combinedMaxContext, combinedContextTokens);
@@ -2521,6 +2528,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, overlapPrefillRows, overlapDecodeRows,
             overlapPrefillChunk, contextBucket(overlapPrefillPastKV), contextBucket(overlapDecodeMaxContext)};
         overlapKey.primaryWorkClass = static_cast<int32_t>(overlapPrefillClass);
+        overlapKey.externalEncoderBackground = state.externalEncoderActive;
         overlapKey.executionVariant = executionVariant(overlapKey, overlapPrefillUsefulTokens);
         Prediction overlap{};
         bool overlapMeasured{};
@@ -2781,6 +2789,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                     PhaseGlobalActionKey residualKey{
                         PhaseGlobalActionKind::kPrefill, 1, 0, item.tokenCount, contextBucket(item.tokenOffset), 0};
                     residualKey.primaryWorkClass = static_cast<int32_t>(item.prefillClass);
+                    residualKey.externalEncoderBackground = state.externalEncoderActive;
                     residualKey.executionVariant = executionVariant(residualKey, item.tokenCount);
                     Prediction const residual = predictPrefill(residualKey, 1, item.tokenCount, item.tokenOffset,
                         item.tokenOffset == 0, item.prefillClass, item.tokenCount);
@@ -2804,6 +2813,7 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 {
                     PhaseGlobalActionKey residualKey{PhaseGlobalActionKind::kDecode, residualDecodeRows, 0, 1,
                         contextBucket(residualDecodeMaxContext), 0};
+                    residualKey.externalEncoderBackground = state.externalEncoderActive;
                     residualKey.executionVariant = executionVariant(residualKey, 0);
                     Prediction const residual = predictDecode(
                         residualKey, residualDecodeRows, residualDecodeMaxContext, residualDecodeContextTokens);
@@ -3039,6 +3049,7 @@ bool PhaseQueueScheduler::shouldWaitForDecodeEvents(std::vector<PhaseDecodeCompl
     auto predictDecode = [&](int32_t rows, int64_t totalContextTokens, int32_t maxContextLength) {
         int32_t const contextBucket = (std::max(0, maxContextLength) + contextBucketTokens - 1) / contextBucketTokens;
         PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, rows, 0, 1, contextBucket, 0};
+        key.externalEncoderBackground = state.externalEncoderActive;
         key.executionVariant
             = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, 0) : PhaseExecutionVariant::kEager;
         DecodePrediction prediction{static_cast<double>(mConfig.globalColdDecodeMs) * 1000.0,
@@ -3481,6 +3492,7 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillCost(
     int32_t const contextBucket = (pastKVLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
     key.primaryWorkClass = static_cast<int32_t>(prefillClass);
+    key.externalEncoderBackground = mExternalEncoderActive;
     if (std::optional<PhaseGlobalCostEstimate> const online = mRuntimeCostTracker->estimate(key))
     {
         return *online;
@@ -3611,12 +3623,12 @@ size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t
         return static_cast<size_t>(mConfig.maxDecodeBatchSize);
     }
     if (mConfig.enableMeasuredDecodeBatching
-        && measuredDecodeP95(mConfig.maxDecodeBatchSize, maxContextLength).has_value())
+        && measuredDecodeP95(mConfig.maxDecodeBatchSize, maxContextLength, mExternalEncoderActive).has_value())
     {
         size_t limit{1U};
         for (int32_t rows = 1; rows <= mConfig.maxDecodeBatchSize; ++rows)
         {
-            std::optional<float> const cost = measuredDecodeP95(rows, maxContextLength);
+            std::optional<float> const cost = measuredDecodeP95(rows, maxContextLength, mExternalEncoderActive);
             if (cost.has_value() && static_cast<double>(*cost) * 1000.0 <= targetUs)
             {
                 limit = static_cast<size_t>(rows);
@@ -3812,6 +3824,7 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
             for (int32_t batch = 1; batch <= static_cast<int32_t>(plan.predictedDecodeFrontierLengths.size()); ++batch)
             {
                 PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batch, 0, 1, bucket, 0};
+                key.externalEncoderBackground = plan.externalEncoderActive;
                 key.executionVariant = executionVariantFor(key, 0);
                 auto const service = mRuntimeCostTracker->decodeServiceEstimate(key);
                 auto gpu = mRuntimeCostTracker->trustedEstimate(key);
@@ -4157,7 +4170,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     {
         int32_t const context = maxContextLengths.back();
         auto const dense = decodeServiceEstimate(available, context);
-        if (!dense.has_value() || !measuredDecodeP95(available, context).has_value())
+        if (!dense.has_value() || !measuredDecodeP95(available, context, state.externalEncoderActive).has_value())
         {
             // Execute unknown ready shapes to acquire evidence, without consulting a static prior.
             predictedDrainTurns = 1;
@@ -4170,7 +4183,7 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         for (int32_t batch = 1; batch <= available; ++batch)
         {
             auto const service = decodeServiceEstimate(batch, context);
-            auto const engine = measuredDecodeP95(batch, context);
+            auto const engine = measuredDecodeP95(batch, context, state.externalEncoderActive);
             if (!service.has_value() || !engine.has_value())
             {
                 continue;
@@ -4212,7 +4225,8 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     {
         for (int32_t rows = 1; rows <= available; ++rows)
         {
-            std::optional<float> const cost = measuredDecodeP95(rows, maxContextLengths[static_cast<size_t>(rows)]);
+            std::optional<float> const cost
+                = measuredDecodeP95(rows, maxContextLengths[static_cast<size_t>(rows)], state.externalEncoderActive);
             if (!cost.has_value())
             {
                 continue;
@@ -4446,7 +4460,8 @@ PhaseExecutionVariant PhaseQueueScheduler::executionVariantFor(
                                            : PhaseExecutionVariant::kEager;
 }
 
-std::optional<float> PhaseQueueScheduler::measuredDecodeP95(int32_t batchSize, int32_t maxContextLength) const
+std::optional<float> PhaseQueueScheduler::measuredDecodeP95(
+    int32_t batchSize, int32_t maxContextLength, bool externalEncoderBackground) const
 {
     if (!mConfig.enableMeasuredDecodeBatching || batchSize <= 0 || maxContextLength < 0)
     {
@@ -4455,6 +4470,7 @@ std::optional<float> PhaseQueueScheduler::measuredDecodeP95(int32_t batchSize, i
     int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     int32_t const contextBucket = (maxContextLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batchSize, 0, 1, contextBucket, 0};
+    key.externalEncoderBackground = externalEncoderBackground;
     key.executionVariant = executionVariantFor(key, 0);
     std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->trustedEstimate(key);
     if (!estimate.has_value())
@@ -4469,7 +4485,7 @@ std::optional<float> PhaseQueueScheduler::measuredDecodeP95(int32_t batchSize, i
 }
 
 std::optional<float> PhaseQueueScheduler::measuredPrefillP95(int32_t batchSize, int32_t chunkLength,
-    int32_t maxPastKVLength, PhasePrefillClass prefillClass, int32_t usefulTokens) const
+    int32_t maxPastKVLength, PhasePrefillClass prefillClass, int32_t usefulTokens, bool externalEncoderBackground) const
 {
     if (!mConfig.enableMeasuredPrefillBatching || batchSize <= 0 || chunkLength <= 0 || maxPastKVLength < 0)
     {
@@ -4479,6 +4495,7 @@ std::optional<float> PhaseQueueScheduler::measuredPrefillP95(int32_t batchSize, 
     int32_t const contextBucket = (maxPastKVLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, batchSize, 0, chunkLength, contextBucket, 0};
     key.primaryWorkClass = static_cast<int32_t>(prefillClass);
+    key.externalEncoderBackground = externalEncoderBackground;
     key.executionVariant = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, usefulTokens)
                                                            : PhaseExecutionVariant::kEager;
     std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->trustedEstimate(key);
@@ -4612,6 +4629,7 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
             && metrics.globalSelectedAction.residualAugmentation;
         key.residualAnchor
             = key.residualAugmentation ? metrics.globalObservedResidualAnchor : PhaseGlobalResidualAnchor::kNone;
+        key.externalEncoderBackground = metrics.externalEncoderActive;
         return key;
     }
     if (metrics.kind == PhaseDispatchKind::kPrefill)
@@ -4619,12 +4637,15 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
         PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, metrics.prefillBatchSize, 0, chunkLength,
             contextBucket(metrics.prefillPastKVMax), 0, metrics.globalExecutionVariant};
         key.primaryWorkClass = static_cast<int32_t>(metrics.prefillClass);
+        key.externalEncoderBackground = metrics.externalEncoderActive;
         return key;
     }
     if (metrics.kind == PhaseDispatchKind::kDecode)
     {
-        return {PhaseGlobalActionKind::kDecode, metrics.decodeBatchSize, 0, 1,
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, metrics.decodeBatchSize, 0, 1,
             contextBucket(metrics.plannedDecodeMaxContextLength), 0, metrics.globalExecutionVariant};
+        key.externalEncoderBackground = metrics.externalEncoderActive;
+        return key;
     }
     return {};
 }
@@ -4751,6 +4772,8 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
                 && metrics.globalSelectedAction == observedKey);
         if (observedKey.kind != PhaseGlobalActionKind::kNone && planBoundSample)
         {
+            mTelemetry.globalCostExternalEncoderContextObservationCount
+                += observedKey.externalEncoderBackground ? 1U : 0U;
             float referenceWorkMs = metrics.prefillGpuMs + metrics.decodeGpuMs;
             if (metrics.globalReferenceWorkMs > 0.0 && metrics.globalSelectedAction == observedKey)
             {

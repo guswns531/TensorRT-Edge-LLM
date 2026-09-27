@@ -1127,6 +1127,36 @@ TEST(PhaseGlobalCostModelTest, TrustedPrimaryCoverExcludesSparseNearerShape)
     EXPECT_FLOAT_EQ(model.estimateCoveringPrimary(requested, 4U)->makespanP95Ms, 18.0F);
 }
 
+TEST(PhaseGlobalCostModelTest, SeparatesDecodeCostWithExternalEncoderBackground)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});
+    PhaseGlobalActionKey isolated{PhaseGlobalActionKind::kDecode, 1, 0, 1, 2, 0};
+    PhaseGlobalActionKey contended = isolated;
+    contended.externalEncoderBackground = true;
+    model.observe(isolated, {6.0F, 6.0F});
+    model.observe(contended, {6.0F, 50.0F});
+
+    ASSERT_TRUE(model.estimate(isolated).has_value());
+    ASSERT_TRUE(model.estimate(contended).has_value());
+    EXPECT_FLOAT_EQ(model.estimate(isolated)->makespanMedianMs, 6.0F);
+    EXPECT_FLOAT_EQ(model.estimate(contended)->makespanMedianMs, 50.0F);
+    EXPECT_EQ(model.estimate(isolated)->sampleCount, 1U);
+    EXPECT_EQ(model.estimate(contended)->sampleCount, 1U);
+
+    PhaseGlobalActionKey covering = contended;
+    covering.primaryBatchSize = 4;
+    covering.primaryContextBucket = 4;
+    model.observe(covering, {12.0F, 18.0F});
+    PhaseGlobalActionKey isolatedTarget = isolated;
+    isolatedTarget.primaryBatchSize = 2;
+    isolatedTarget.primaryContextBucket = 3;
+    PhaseGlobalActionKey contendedTarget = isolatedTarget;
+    contendedTarget.externalEncoderBackground = true;
+    EXPECT_FALSE(model.estimateCoveringPrimary(isolatedTarget).has_value());
+    ASSERT_TRUE(model.estimateCoveringPrimary(contendedTarget).has_value());
+    EXPECT_EQ(model.estimateCoveringPrimary(contendedTarget)->sampleCount, 1U);
+}
+
 TEST(PhaseGlobalCostModelTest, LearnsGeometryIndependentPrimaryLaunchFloor)
 {
     PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});

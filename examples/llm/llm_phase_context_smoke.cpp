@@ -3662,6 +3662,7 @@ int main(int argc, char** argv)
                                 {"primary_context_bucket", cost.key.primaryContextBucket},
                                 {"secondary_context_bucket", cost.key.secondaryContextBucket},
                                 {"execution_variant", rt::phaseExecutionVariantName(cost.key.executionVariant)},
+                                {"external_encoder_background", cost.key.externalEncoderBackground},
                                 {"residual_anchor", rt::phaseGlobalResidualAnchorName(cost.key.residualAnchor)},
                                 {"status", rt::phaseGlobalOverlapCostStatusName(cost.diagnostic.status)},
                                 {"sample_count", cost.diagnostic.sampleCount},
@@ -4230,6 +4231,10 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().globalCostKeyObservationCount},
                         {"global_cost_key_parity_violations",
                             semanticCoordinator.scheduler().telemetry().globalCostKeyParityViolationCount},
+                        {"global_cost_external_encoder_context_observations",
+                            semanticCoordinator.scheduler()
+                                .telemetry()
+                                .globalCostExternalEncoderContextObservationCount},
                         {"global_residual_prefill_anchor_observations",
                             semanticCoordinator.scheduler().telemetry().globalResidualPrefillAnchorObservationCount},
                         {"global_residual_decode_anchor_observations",
@@ -4746,6 +4751,7 @@ int main(int argc, char** argv)
                                 {"secondary_context_bucket", candidate.key.secondaryContextBucket},
                                 {"execution_variant", rt::phaseExecutionVariantName(candidate.key.executionVariant)},
                                 {"primary_work_class", candidate.key.primaryWorkClass},
+                                {"external_encoder_background", candidate.key.externalEncoderBackground},
                                 {"residual_augmentation", candidate.key.residualAugmentation},
                                 {"residual_anchor", rt::phaseGlobalResidualAnchorName(candidate.key.residualAnchor)},
                                 {"legal", candidate.legal}, {"request_ids", candidate.requestIds},

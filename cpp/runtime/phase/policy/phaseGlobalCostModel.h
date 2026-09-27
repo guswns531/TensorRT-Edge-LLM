@@ -112,6 +112,8 @@ struct PhaseGlobalActionKey
     bool residualAugmentation{};
     //! Keep P->P+D and D->P+D observations in independent online-cost buckets.
     PhaseGlobalResidualAnchor residualAnchor{PhaseGlobalResidualAnchor::kNone};
+    //! Whether an independent vision encoder was active outside this keyed P/D action.
+    bool externalEncoderBackground{};
 
     bool operator==(PhaseGlobalActionKey const& other) const noexcept;
 };
