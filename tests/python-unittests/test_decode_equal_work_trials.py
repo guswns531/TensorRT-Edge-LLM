@@ -85,3 +85,67 @@ class DecodeEqualWorkTest(unittest.TestCase):
         for values in ([], [float("nan")], [float("inf")], [0], [-1]):
             with self.assertRaises(ValueError):
                 G_TOOL.distribution(values)
+
+    def test_row_order_summary_requires_equal_shape_pairs(self):
+        report = {
+            "config": {
+                "mode": "row_order",
+                "rows": 8,
+                "rounds": 1,
+                "iterations": 1
+            },
+            "graph_misses":
+            0,
+            "policy_applied":
+            False,
+            "compared_tokens":
+            8,
+            "mismatched_tokens":
+            1,
+            "samples": [{
+                "round": 0,
+                "iteration": 0,
+                "variant": "identity",
+                "order": 0,
+                "gpu_ms": 1.0,
+                "drain_ms": 1.2
+            }, {
+                "round": 0,
+                "iteration": 0,
+                "variant": "reversed",
+                "order": 1,
+                "gpu_ms": 1.1,
+                "drain_ms": 1.3
+            }]
+        }
+        result = G_TOOL.summarize(report)
+        self.assertAlmostEqual(result["reversed_change_pct"]["gpu_ms"]["mean"],
+                               10)
+        self.assertEqual(result["mismatched_tokens"], 1)
+        report["samples"].pop()
+        with self.assertRaises(ValueError):
+            G_TOOL.summarize(report)
+        report = self.report()
+        report["config"] = {
+            "mode": "row_order",
+            "rows": 8,
+            "rounds": 1,
+            "iterations": 1
+        }
+        report["samples"] = [{
+            "round": 0,
+            "iteration": 0,
+            "variant": "identity",
+            "order": 0,
+            "gpu_ms": 1.0,
+            "drain_ms": 1.0
+        }, {
+            "round": 0,
+            "iteration": 0,
+            "variant": "reversed",
+            "order": 1,
+            "gpu_ms": 1.0,
+            "drain_ms": 1.0
+        }]
+        with self.assertRaisesRegex(ValueError, "comparison count"):
+            G_TOOL.summarize(report)

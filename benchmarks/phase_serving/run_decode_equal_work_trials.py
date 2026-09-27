@@ -39,6 +39,8 @@ def summarize(report):
     """Reject incomplete/unpaired trials or graph fallback before comparison."""
     config = report["config"]
     samples = report["samples"]
+    if config.get("mode", "dense_split") == "row_order":
+        return summarize_row_order(report)
     expected = {(r, i, v)
                 for r in range(config["rounds"])
                 for i in range(config["iterations"])
@@ -95,6 +97,72 @@ def summarize(report):
     return result
 
 
+def summarize_row_order(report):
+    """Validate equal-shape identity/reversal trials from one pre-decode state."""
+    config = report["config"]
+    samples = report["samples"]
+    variants = ("identity", "reversed")
+    expected_comparisons = config["rows"] * config["rounds"] * config[
+        "iterations"]
+    if report["compared_tokens"] != expected_comparisons:
+        raise ValueError(
+            "Row-order output comparison count differs from the fixture")
+    if not 0 <= report["mismatched_tokens"] <= expected_comparisons:
+        raise ValueError("Invalid row-order output mismatch count")
+    expected = {(round_id, iteration, variant)
+                for round_id in range(config["rounds"])
+                for iteration in range(config["iterations"])
+                for variant in variants}
+    actual = {(sample["round"], sample["iteration"], sample["variant"])
+              for sample in samples}
+    if actual != expected or len(samples) != len(expected):
+        raise ValueError("Missing or duplicate row-order pairs")
+    if report["graph_misses"] or report["policy_applied"]:
+        raise ValueError(
+            "Row-order trial must use graphs without a serving policy")
+    for round_id in range(config["rounds"]):
+        for iteration in range(config["iterations"]):
+            pair = [
+                sample for sample in samples
+                if (sample["round"], sample["iteration"]) == (round_id,
+                                                              iteration)
+            ]
+            if {sample["order"] for sample in pair} != {0, 1}:
+                raise ValueError("Invalid paired row-order execution order")
+    metrics = ("gpu_ms", "drain_ms")
+    result = {
+        "config": config,
+        "compared_tokens": report["compared_tokens"],
+        "mismatched_tokens": report["mismatched_tokens"],
+        "identity": {
+            metric:
+            distribution([
+                sample[metric] for sample in samples
+                if sample["variant"] == "identity"
+            ])
+            for metric in metrics
+        },
+        "reversed": {
+            metric:
+            distribution([
+                sample[metric] for sample in samples
+                if sample["variant"] == "reversed"
+            ])
+            for metric in metrics
+        },
+    }
+    result["reversed_change_pct"] = {
+        metric: {
+            stat:
+            100 * (result["reversed"][metric][stat] /
+                   result["identity"][metric][stat] - 1)
+            for stat in ("mean", "median", "p95")
+        }
+        for metric in metrics
+    }
+    return result
+
+
 def main():
     """Freeze provenance and execute only the two selected equal-work points."""
     import run_lifetime_encoded_admission as serving
@@ -102,7 +170,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-root", type=pathlib.Path, required=True)
     parser.add_argument("--result-root", type=pathlib.Path, required=True)
+    parser.add_argument("--models",
+                        nargs="+",
+                        choices=("gemma", "cosmos"),
+                        default=("gemma", "cosmos"))
+    parser.add_argument("--mode",
+                        choices=("dense_split", "row_order"),
+                        default="dense_split")
+    parser.add_argument("--rows", type=int)
+    parser.add_argument("--context-step-tokens", type=int, default=0)
+    parser.add_argument("--context-buckets", type=int, default=1)
     args = parser.parse_args()
+    if args.rows is not None and args.rows < 2:
+        parser.error("rows must be at least two")
+    if args.context_step_tokens < 0 or args.context_buckets < 1:
+        parser.error(
+            "Context step must be non-negative and context buckets positive")
+    if args.mode != "row_order" and (args.context_step_tokens != 0
+                                     or args.context_buckets != 1):
+        parser.error(
+            "Variable row context lengths are supported only in row_order mode"
+        )
     repo = pathlib.Path(
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
                                 text=True).strip())
@@ -146,15 +234,27 @@ def main():
         (root / pathlib.Path(relative).name).write_bytes(
             (repo / relative).read_bytes())
     summary = {}
-    for model, rows, split in (("gemma", 8, 4), ("cosmos", 64, 32)):
+    model_shapes = {"gemma": (8, 4), "cosmos": (64, 32)}
+    for model in args.models:
+        rows, split = model_shapes[model]
+        if args.rows is not None:
+            rows = args.rows
+            split = rows // 2
         config = serving.model_config(repo, model)
+        if rows > min(config["stable_slots"], config["decode_batch"]):
+            parser.error(
+                "rows exceed the selected model's stable-slot or decode capacity"
+            )
         cell = root / model
         cell.mkdir()
         output = cell / "raw.json"
         trial = {
             "rows": rows,
             "split": split,
+            "mode": args.mode,
             "past_tokens": 128,
+            "context_step_tokens": args.context_step_tokens,
+            "context_buckets": args.context_buckets,
             "warmup": 20,
             "iterations": 50,
             "rounds": 5,
