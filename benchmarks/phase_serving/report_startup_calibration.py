@@ -24,7 +24,10 @@ import analyze_lifetime_encoded_admission as dispatch_report
 import report_workspace_revalidation as serving_report
 
 
-def summarize(root, include_dispatch=False):
+def summarize(root,
+              include_dispatch=False,
+              baseline_variant="independent-predictor-on",
+              candidate_variant="independent-startup-predictor-on"):
     """Keep startup cost separate from steady-state HTTP latency and throughput."""
     manifest = json.loads((root / "manifest.json").read_text())
     completed = {record["cell"] for record in manifest.get("completed", [])}
@@ -32,11 +35,10 @@ def summarize(root, include_dispatch=False):
     commands = manifest["commands"]
     references = {
         (record["model"], record["workload"], record["repeat"]): record
-        for record in commands
-        if record["variant"] == "independent-predictor-on"
+        for record in commands if record["variant"] == baseline_variant
     }
     for record in commands:
-        if record["variant"] != "independent-startup-predictor-on":
+        if record["variant"] != candidate_variant:
             continue
         key = (record["model"], record["workload"], record["repeat"])
         baseline = references.get(key)
@@ -52,8 +54,12 @@ def summarize(root, include_dispatch=False):
                       "requested_output_tokens_per_run"):
             if current[field] != previous[field]:
                 raise ValueError("Paired workload contract differs: " + field)
-        startup = json.loads((pathlib.Path(record["cell"]) /
-                              "run-001/startup.json").read_text())
+        startup_path = pathlib.Path(record["cell"]) / "run-001/startup.json"
+        if not startup_path.exists(
+        ) and candidate_variant != "independent-measured-predictor-on":
+            raise ValueError("Missing startup report: " + str(startup_path))
+        startup = json.loads(
+            startup_path.read_text()) if startup_path.exists() else {}
         changes = {}
         for metric in serving_report.METRICS:
             a, b = float(current[metric]), float(previous[metric])
@@ -65,14 +71,22 @@ def summarize(root, include_dispatch=False):
             "workload": key[1],
             "repeat": key[2],
             "delta_percent": changes,
-            "startup_elapsed_ms": startup["elapsed_ms"],
-            "startup_frontier_covered": startup["frontier_covered"],
-            "startup_decode_probe_requests": startup["decode_probe_requests"],
+            "startup_elapsed_ms": startup.get("elapsed_ms"),
+            "startup_frontier_covered": startup.get("frontier_covered"),
+            "startup_decode_probe_requests":
+            startup.get("decode_probe_requests"),
             "baseline_peak_mib": previous["gpu_memory_peak_mib_median"],
             "startup_peak_mib": current["gpu_memory_peak_mib_median"],
             "baseline": baseline["cell"],
             "startup": record["cell"],
         }
+        for name, cell in (("baseline", baseline["cell"]), ("startup",
+                                                            record["cell"])):
+            calibration_path = pathlib.Path(
+                cell) / "run-001/client/calibration.json"
+            if calibration_path.exists():
+                events = json.loads(calibration_path.read_text())
+                row[name + "_policy_coverage"] = events[-1] if events else None
         if include_dispatch:
             for name, cell in (("baseline", baseline["cell"]),
                                ("startup", record["cell"])):
@@ -93,6 +107,12 @@ def summarize(root, include_dispatch=False):
         and manifest.get("completion_status") == "complete",
         "source_manifest":
         str(root / "manifest.json"),
+        "baseline_variant":
+        baseline_variant,
+        "candidate_variant":
+        candidate_variant,
+        "policy_stability_validated":
+        False,
         "startup_scope":
         "Post-load preparation, not total process-to-ready time; coverage is not RLS convergence"
     }
@@ -102,12 +122,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result-root", type=pathlib.Path, required=True)
     parser.add_argument("--include-dispatch", action="store_true")
+    parser.add_argument("--baseline-variant",
+                        default="independent-predictor-on")
+    parser.add_argument("--candidate-variant",
+                        default="independent-startup-predictor-on")
+    parser.add_argument("--output-stem", default="startup-comparison")
     args = parser.parse_args()
-    report = summarize(args.result_root.resolve(), args.include_dispatch)
+    report = summarize(args.result_root.resolve(), args.include_dispatch,
+                       args.baseline_variant, args.candidate_variant)
     lines = [
         "# Startup calibration paired comparison", "",
-        "Throughput: positive is better. Latency: negative is better. All deltas are against the same-binary legacy calibration.",
-        "", "| Model/workload/repeat | " + " | ".join(serving_report.LABELS) +
+        "Throughput: positive is better. Latency: negative is better.",
+        "Comparison: %s / %s." %
+        (args.candidate_variant, args.baseline_variant), "",
+        "| Model/workload/repeat | " + " | ".join(serving_report.LABELS) +
         " | Startup ms | Peak MiB old/new |",
         "|---|" + "---:|" * (len(serving_report.METRICS) + 2)
     ]
@@ -116,10 +144,12 @@ def main():
             "%+.2f%%" % row["delta_percent"][metric]
             for metric in serving_report.METRICS
         ]
-        lines.append("| %s/%s/%s | %s | %.1f | %s/%s |" %
-                     (row["model"], row["workload"], row["repeat"],
-                      " | ".join(values), row["startup_elapsed_ms"],
-                      row["baseline_peak_mib"], row["startup_peak_mib"]))
+        elapsed = row["startup_elapsed_ms"]
+        lines.append(
+            "| %s/%s/%s | %s | %s | %s/%s |" %
+            (row["model"], row["workload"], row["repeat"], " | ".join(values),
+             "n/a" if elapsed is None else "%.1f" % elapsed,
+             row["baseline_peak_mib"], row["startup_peak_mib"]))
     for model in sorted({row["model"] for row in report["rows"]}):
         values = [row for row in report["rows"] if row["model"] == model]
         ratios = [
@@ -140,10 +170,10 @@ def main():
         report["startup_scope"],
         "Single repeats do not establish a promotion gate."
     ]
-    (args.result_root / "startup-comparison.json"
+    (args.result_root / (args.output_stem + ".json")
      ).write_text(json.dumps(report, indent=2) + "\n")
-    (args.result_root / "startup-comparison.md").write_text("\n".join(lines) +
-                                                            "\n")
+    (args.result_root /
+     (args.output_stem + ".md")).write_text("\n".join(lines) + "\n")
     return 0 if report["complete"] else 1
 
 

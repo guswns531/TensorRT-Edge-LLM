@@ -88,6 +88,23 @@ class StartupReportTest(unittest.TestCase):
             self.assertEqual(len(result["missing_pairs"]), 1)
             self.assertEqual(result["rows"], [])
 
+    def test_measured_only_has_no_probe_coverage_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            self.fixture(root)
+            manifest_path = root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            for entries in (manifest["commands"], manifest["completed"]):
+                entries[1]["variant"] = "independent-measured-predictor-on"
+            manifest_path.write_text(json.dumps(manifest))
+            (pathlib.Path(manifest["commands"][1]["cell"]) /
+             "run-001/startup.json").unlink()
+            result = report.summarize(
+                root, candidate_variant="independent-measured-predictor-on")
+            self.assertTrue(result["complete"])
+            self.assertIsNone(result["rows"][0]["startup_frontier_covered"])
+            self.assertFalse(result["policy_stability_validated"])
+
     def test_different_request_contract_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

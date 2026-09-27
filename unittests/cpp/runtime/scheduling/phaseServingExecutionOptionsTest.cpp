@@ -64,8 +64,21 @@ TEST(PhaseServingExecutionOptionsTest, StartupProbesRespectFullOutputReservation
         EXPECT_EQ(probe.promptTokens % 128, 0);
         EXPECT_LE(probe.promptTokens + probe.outputTokens, 2048);
         EXPECT_LE(((probe.promptTokens + probe.outputTokens + 127) / 128) * probe.batchSize, 192);
-        EXPECT_GE(probe.outputTokens, 4 + 2 * ((probe.batchSize + 7) / 8));
+        EXPECT_GE(probe.outputTokens, 4 + 2 * ((probe.batchSize + 7) / 8) * (probe.promptTokens / 128));
     }
+}
+
+TEST(PhaseServingExecutionOptionsTest, MeasuredDecodeBoundaryDoesNotRequireStartupProbes)
+{
+    auto const options
+        = resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS", "1"}}));
+    EXPECT_TRUE(options.measuredDecodeAtMeasurement);
+    EXPECT_FALSE(options.enabled);
+    EXPECT_FALSE(resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS", "0"}}))
+            .measuredDecodeAtMeasurement);
+    EXPECT_THROW(
+        resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS", "invalid"}})),
+        std::exception);
 }
 
 TEST(PhaseServingExecutionOptionsTest, StartupProbesDoNotInventCapacity)

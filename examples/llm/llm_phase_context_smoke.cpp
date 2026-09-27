@@ -1757,8 +1757,11 @@ int main(int argc, char** argv)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
                 "Startup calibration requires the active global scheduler");
-            semanticSchedulerConfig.decodeBatchCosts.clear();
-            semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
+            if (!startupOptions.measuredDecodeAtMeasurement)
+            {
+                semanticSchedulerConfig.decodeBatchCosts.clear();
+                semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
+            }
         }
         PhasePolicyWarmupMode const policyWarmupMode = phasePolicyWarmupMode();
         ELLM_CHECK(!startupOptions.enabled || policyWarmupMode == PhasePolicyWarmupMode::kGeneric,
@@ -2269,7 +2272,9 @@ int main(int argc, char** argv)
             };
             nlohmann::json startupReport{{"enabled", startupOptions.enabled}, {"scope", "planned_probe_frontier"},
                 {"decode", nlohmann::json::array()}, {"encoder", nlohmann::json::array()},
-                {"static_decode_table", !startupOptions.enabled}, {"budget_ms", startupOptions.budgetMs},
+                {"static_decode_table", !semanticSchedulerConfig.decodeBatchCosts.empty()},
+                {"measured_decode_at_measurement", startupOptions.measuredDecodeAtMeasurement},
+                {"policy_stability_validated", false}, {"budget_ms", startupOptions.budgetMs},
                 {"prefill_batch_limit", semanticSchedulerConfig.maxPrefillBatchSize},
                 {"decode_batch_limit", semanticSchedulerConfig.maxDecodeBatchSize},
                 {"kv_physical_pages", ownership.config().numPages},
@@ -3645,6 +3650,11 @@ int main(int argc, char** argv)
                                     "Calibration ended with an outstanding E/P/D/Copy activity interval");
                             }
                             semanticCoordinator.scheduler().resetSchedulingHistory();
+                            if (startupOptions.measuredDecodeAtMeasurement)
+                            {
+                                semanticCoordinator.scheduler().useMeasuredDecodeCosts();
+                                LOG_INFO("Measurement decode cost source: measured; calibration state preserved");
+                            }
                             // All physical observations are now complete and
                             // immutable. Retain validation evidence while
                             // starting serving-policy telemetry at zero.

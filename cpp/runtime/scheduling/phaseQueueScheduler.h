@@ -851,6 +851,8 @@ public:
     //! Reset queue/service history while leaving both execution-cost and
     //! contextual-policy state unchanged. The scheduler must be idle.
     void resetSchedulingHistory();
+    //! Switch to observed decode costs at a drained epoch boundary without resetting learned state.
+    void useMeasuredDecodeCosts();
     //! Reset only the contextual online policy posterior. The scheduler must
     //! be idle; exact CUDA execution observations remain available.
     void resetPolicyPosterior();

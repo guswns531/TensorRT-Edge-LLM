@@ -59,6 +59,10 @@ PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(PhaseEnviro
     {
         options.requireCoverage = parseBoolean(value);
     }
+    if (char const* value = environment("TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS"))
+    {
+        options.measuredDecodeAtMeasurement = parseBoolean(value);
+    }
     if (char const* value = environment("TRT_EDGELLM_STARTUP_BUDGET_MS"))
     {
         options.budgetMs = std::stod(value);
@@ -80,15 +84,17 @@ std::vector<PhaseStartupDecodeProbe> phaseStartupDecodeProbes(int32_t maxDecodeB
     for (int32_t rows = 1;; rows = static_cast<int32_t>(std::min<int64_t>(maxDecodeBatch, int64_t{rows} * 2)))
     {
         int64_t const prefillTurns = (int64_t{rows} + maxPrefillBatch - 1) / maxPrefillBatch;
-        int64_t const output = 2 * prefillTurns + minimumSamples + 2;
+        int64_t const tail = int64_t{minimumSamples} + 2;
         int64_t const capacity = std::min<int64_t>(maxSequenceLength, int64_t{allocatablePages / rows} * tokensPerPage);
-        int64_t const longest = ((capacity - output) / chunkTokens) * chunkTokens;
-        if (capacity >= output + chunkTokens && longest > 0)
+        // Keep early decode rows resident through every chunk of the later prefill rows.
+        int64_t const chunks = (capacity - tail) / (chunkTokens + 2 * prefillTurns);
+        if (chunks > 0)
         {
-            probes.push_back({rows, chunkTokens, static_cast<int32_t>(output)});
-            if (longest > chunkTokens)
+            probes.push_back({rows, chunkTokens, static_cast<int32_t>(2 * prefillTurns + tail)});
+            if (chunks > 1)
             {
-                probes.push_back({rows, static_cast<int32_t>(longest), static_cast<int32_t>(output)});
+                probes.push_back({rows, static_cast<int32_t>(chunks * chunkTokens),
+                    static_cast<int32_t>(2 * prefillTurns * chunks + tail)});
             }
         }
         if (rows == maxDecodeBatch)

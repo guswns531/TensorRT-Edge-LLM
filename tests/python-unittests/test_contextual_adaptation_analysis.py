@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gzip
 import importlib.util
 import json
 from pathlib import Path
+
+import pytest
 
 SCRIPT = (Path(__file__).parents[2] / "benchmarks" / "phase_serving" /
           "analyze_contextual_adaptation.py")
@@ -23,6 +26,46 @@ SPEC = importlib.util.spec_from_file_location("adaptation", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 ADAPTATION = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ADAPTATION)
+
+
+def test_compact_log_cannot_claim_zero_prediction_error(
+        tmp_path: Path) -> None:
+    log = tmp_path / "compact.log"
+    log.write_text('PHASE_METRIC\t{"measurement_epoch":1,"decode_batch":8}\n')
+    with pytest.raises(ValueError, match="Full contextual telemetry"):
+        ADAPTATION.analyze_log(log)
+
+
+def test_compressed_no_observation_is_unknown_not_zero_error(
+        tmp_path: Path) -> None:
+    log = tmp_path / "gateway.log.gz"
+    with gzip.open(log, "wt") as stream:
+        stream.write(
+            'PHASE_METRIC\t{"measurement_epoch":1,"contextual_pd_squared_error_sum":0}\n'
+        )
+    result = ADAPTATION.analyze_log(log)
+    assert result["bins"][0]["families"]["pd"]["rmse"] is None
+    assert result["bins"][0]["families"]["pd"]["false_safe_rate"] is None
+    assert not result["stability"]["pd"]["stable"]
+
+
+def test_drained_snapshot_only_supports_epoch_totals(tmp_path: Path) -> None:
+    log = tmp_path / "drained.log"
+    record = {
+        "measurement_epoch": 1,
+        "contextual_pd_calibration_observations": 10,
+        "contextual_pd_squared_error_sum": 0.4,
+        "contextual_pd_absolute_error_sum": 2.0,
+    }
+    log.write_text(("PHASE_METRIC\t" + json.dumps(record) + "\n") * 4)
+    with pytest.raises(ValueError, match="Repeated cumulative snapshot"):
+        ADAPTATION.analyze_log(log)
+    result = ADAPTATION.analyze_log(log, epoch_summary=True)
+    assert len(result["bins"]) == 1
+    assert result["bins"][0]["families"]["pd"]["observations"] == 10
+    assert result["bins"][0]["families"]["pd"]["rmse"] == pytest.approx(0.2)
+    assert result["bins"][0]["elapsed_end_ms"] is None
+    assert result["stability"]["pd"]["stable"] is None
 
 
 def test_adaptation_bins_use_measurement_epoch_and_cumulative_deltas(

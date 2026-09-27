@@ -2064,17 +2064,18 @@ TEST(PhaseQueueSchedulerTest, MeasuredDecodeCostsPreserveStaticDecisionIdentity)
         tracker->observe(key, {cost.p95GpuMs * static_cast<float>(cost.batchSize), cost.p95GpuMs});
     }
     PhaseQueueSchedulerConfig measuredSchedulerConfig = staticConfig;
-    measuredSchedulerConfig.decodeBatchCosts.clear();
-    measuredSchedulerConfig.enableMeasuredDecodeBatching = true;
     measuredSchedulerConfig.runtimeCostTracker = std::move(tracker);
 
     PhaseQueueScheduler staticScheduler(staticConfig);
     PhaseQueueScheduler measuredScheduler(measuredSchedulerConfig);
+    measuredScheduler.useMeasuredDecodeCosts();
+    measuredScheduler.useMeasuredDecodeCosts();
     for (uint64_t requestId = 1; requestId <= 3; ++requestId)
     {
         staticScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
         measuredScheduler.enqueueDecode({requestId, 256, static_cast<int32_t>(requestId)});
     }
+    EXPECT_THROW(measuredScheduler.useMeasuredDecodeCosts(), std::exception);
 
     PhaseDispatchPlan const staticPlan = staticScheduler.next();
     PhaseDispatchPlan const measuredPlan = measuredScheduler.next();

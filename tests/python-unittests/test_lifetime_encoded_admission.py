@@ -141,6 +141,40 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(values["TRT_EDGELLM_PHASE_POLICY"],
                          "service-scaled-transition")
 
+    def test_calibration_ablations_change_one_stage_at_a_time(self):
+        variants = ("independent", "independent-measured",
+                    "independent-calibrated", "independent-compact-shapes",
+                    "independent-compact-http")
+        commands = [
+            G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
+                                 "mixed", variant, 0, {"cuda_graphs": True})
+            for variant in variants
+        ]
+        values = [environment(command) for command in commands]
+        measured = dict(values[1])
+        self.assertEqual(
+            measured.pop("TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS"), "1")
+        self.assertEqual(measured, values[0])
+        for index in (1, 2, 3, 4):
+            self.assertEqual(
+                values[index]["TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS"],
+                "1")
+            expected = "1" if index == 4 else "49"
+            self.assertEqual(
+                commands[index][commands[index].index("--warmup-requests") +
+                                1], expected)
+        self.assertEqual(values[1]["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"],
+                         values[2]["TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"])
+        compact = dict(values[2])
+        compact.pop("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES")
+        self.assertEqual(compact, values[3])
+        self.assertEqual(values[3], values[4])
+
+    def test_calibration_ablation_rejects_combined_mode(self):
+        with self.assertRaises(ValueError):
+            G_RUNNER.calibration_contract("independent-measured",
+                                          {"startup_calibration": True})
+
     def test_serving_probe_ablation_keeps_calibration_contract(self):
         default = environment(self.command("independent"))
         disabled = environment(

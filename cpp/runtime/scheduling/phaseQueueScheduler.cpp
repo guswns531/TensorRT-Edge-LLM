@@ -4638,6 +4638,14 @@ void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference prefer
     mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
 }
 
+void PhaseQueueScheduler::useMeasuredDecodeCosts()
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Decode cost source can only change on an idle scheduler");
+    mConfig.decodeBatchCosts.clear();
+    mConfig.enableMeasuredDecodeBatching = true;
+}
+
 void PhaseQueueScheduler::resetSchedulingHistory()
 {
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),

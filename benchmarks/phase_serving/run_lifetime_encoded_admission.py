@@ -154,6 +154,30 @@ def model_config(repo, name, overrides=None):
     return config
 
 
+CALIBRATION_VARIANTS = ("independent-startup", "independent-measured",
+                        "independent-calibrated", "independent-compact-shapes",
+                        "independent-compact-http")
+
+
+def calibration_contract(variant, options=None):
+    """Separate cost-source activation, probe coverage, and two warmup reductions."""
+    options = options or {}
+    legacy_startup = options.get("startup_calibration",
+                                 False) or variant == "independent-startup"
+    boundary = variant in CALIBRATION_VARIANTS[1:]
+    if legacy_startup and boundary:
+        raise ValueError(
+            "Do not mix combined startup mode with calibration ablations")
+    return {
+        "startup": legacy_startup or variant in CALIBRATION_VARIANTS[2:],
+        "measured_at_boundary": boundary,
+        "compact_shapes": legacy_startup
+        or variant in CALIBRATION_VARIANTS[3:],
+        "compact_http": legacy_startup
+        or variant == "independent-compact-http",
+    }
+
+
 def command_for(repo,
                 config,
                 cell,
@@ -164,9 +188,9 @@ def command_for(repo,
     """Construct a restricted, network-free GPU backend with measured-boundary activation."""
     tools = repo / ".local/results/v0101-forward-port/replay-tools"
     options = options or {}
-    startup = options.get("startup_calibration",
-                          False) or variant == "independent-startup"
-    if variant == "independent-startup":
+    calibration = calibration_contract(variant, options)
+    startup = calibration["startup"]
+    if variant in CALIBRATION_VARIANTS:
         variant = "independent"
     build = pathlib.Path(
         options.get(
@@ -339,7 +363,10 @@ def command_for(repo,
             "TRT_EDGELLM_STARTUP_REPORT"] = "/opt/results/run-{run}/startup.json"
         environment["TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE"] = str(
             repo / "examples/multimodal/pics/giant_panda.jpeg")
-        environment.pop("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES", None)
+        if calibration["compact_shapes"]:
+            environment.pop("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES", None)
+    if calibration["measured_at_boundary"]:
+        environment["TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS"] = "1"
     if not options.get("serving_overlap_probes", True):
         environment["TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES"] = "1"
 
@@ -378,12 +405,14 @@ def command_for(repo,
         "--request-timeout", "600", "--policy-warmup-mode", "generic",
         "--generic-warmup-trace",
         str(config["calibration"]), "--warmup-requests",
-        str(1 if startup else config["calibration_requests"]),
+        str(1 if calibration["compact_http"] else
+            config["calibration_requests"]),
         "--phase-calibration-round-requests",
-        str(1 if startup else config["calibration_requests"]),
+        str(1 if calibration["compact_http"] else
+            config["calibration_requests"]),
         "--phase-calibration-min-requests",
-        str(1 if startup else config["calibration_requests"]), "--ignore-eos",
-        "--"
+        str(1 if calibration["compact_http"] else
+            config["calibration_requests"]), "--ignore-eos", "--"
     ] + backend
 
 
@@ -471,7 +500,7 @@ def parse_args(argv=None):
                                  "e2", "e-dynamic-shadow",
                                  "e-transition-shadow", "e-dynamic-active",
                                  "shared_ep", "tiered_ep", "independent",
-                                 "independent-startup", "unified_action"),
+                                 *CALIBRATION_VARIANTS, "unified_action"),
                         default=["independent"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--full12", action="store_true")
@@ -707,6 +736,11 @@ def main():
                             variant,
                             "transition_predictor":
                             predictor,
+                            "calibration_contract":
+                            calibration_contract(variant, options),
+                            "http_calibration_requests":
+                            int(command[command.index("--warmup-requests") +
+                                        1]),
                             "repeat":
                             repeat,
                             "cell":
@@ -736,7 +770,7 @@ def main():
         "repeat_count":
         args.repeats,
         "activation":
-        "drained post-calibration boundary; common static initialization per model",
+        "drained post-calibration boundary; per-cell calibration_contract is authoritative",
         "calibration": {
             m:
             1
@@ -744,16 +778,24 @@ def main():
             for m in configs
         },
         "startup_calibration": {
+            "variant_contracts": {
+                variant: calibration_contract(variant, vars(args))
+                for variant in args.variants
+            },
             "enabled":
-            args.startup_calibration,
+            any(
+                calibration_contract(v, vars(args))["startup"]
+                for v in args.variants),
             "explicit_startup_variant":
             "independent-startup" in args.variants,
             "budget_ms":
             args.startup_budget_ms,
             "coverage_required":
-            args.startup_calibration,
+            any(
+                calibration_contract(v, vars(args))["startup"]
+                for v in args.variants),
             "http_warmup_role":
-            "epoch_marker" if args.startup_calibration else "generic_trace",
+            "per-cell compact_http determines epoch_marker versus generic_trace",
         },
         "frozen_vllm": {
             m: str(configs[m]["frozen_vllm"])
@@ -768,7 +810,8 @@ def main():
             "notes/303-service-admission-cause-and-experiment-20260914.md",
             "notes/305-small-encoder-progressive-overlap-20260914.md",
             "notes/330-runtime-contract-revalidation-plan-20260926.md",
-            "notes/340-startup-calibration-and-readiness-20260927.md"
+            "notes/340-startup-calibration-and-readiness-20260927.md",
+            "notes/341-startup-calibration-factorization-20260927.md"
         ],
         "compress_closed_logs":
         args.compress_closed_logs

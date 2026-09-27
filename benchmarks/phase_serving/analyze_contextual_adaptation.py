@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 from pathlib import Path
@@ -38,8 +39,10 @@ DEFAULT_BINS = (16, 32, 64, 128, 256)
 def _records(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     marker = "PHASE_METRIC\t"
     records = []
-    for line in path.read_text(encoding="utf-8",
-                               errors="replace").splitlines():
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
+        lines = stream.readlines()
+    for line in lines:
         offset = line.find(marker)
         if offset < 0:
             continue
@@ -78,11 +81,28 @@ def _request_frontier(record: dict[str, Any]) -> int:
 def analyze_log(path: Path,
                 bins: tuple[int, ...] = DEFAULT_BINS,
                 minimum_observations: int = 4,
-                maximum_rmse: float = 0.20) -> dict[str, Any]:
+                maximum_rmse: float = 0.20,
+                epoch_summary: bool = False) -> dict[str, Any]:
     records, epoch_baseline = _records(path)
     if not records:
         raise ValueError(f"no PHASE_METRIC records in {path}")
-    boundaries = (*bins, math.inf)
+    if not any(f"contextual_{family}_squared_error_sum" in record
+               for family in FAMILIES for record in records):
+        raise ValueError(
+            "Full contextual telemetry is required; compact dispatch logs do not measure prediction error"
+        )
+    counters = tuple(f"contextual_{family}_calibration_observations"
+                     for family in FAMILIES)
+    repeated_snapshot = len(records) > 1 and all(
+        all(record.get(key, 0) == records[0].get(key, 0) for key in counters)
+        for record in records)
+    observed = any(
+        _delta(records[-1], epoch_baseline, key) > 0 for key in counters)
+    if repeated_snapshot and observed and not epoch_summary:
+        raise ValueError(
+            "Repeated cumulative snapshot cannot establish an adaptation curve; use --epoch-summary"
+        )
+    boundaries = (math.inf, ) if epoch_summary else (*bins, math.inf)
     rows = []
     previous = epoch_baseline
     begin = 1
@@ -134,10 +154,10 @@ def analyze_log(path: Path,
                 "cumulative_observations":
                 int(final.get(observations_key, 0)),
                 "mae":
-                absolute_error / observations if observations else 0.0,
+                absolute_error / observations if observations else None,
                 "rmse":
                 math.sqrt(squared_error /
-                          observations) if observations else 0.0,
+                          observations) if observations else None,
                 "last_mean":
                 float(final.get(f"contextual_{family}_last_mean", 0.0)),
                 "last_uncertainty":
@@ -149,7 +169,7 @@ def analyze_log(path: Path,
                 "false_safe":
                 false_safe,
                 "false_safe_rate":
-                false_safe / predicted_safe if predicted_safe else 0.0,
+                false_safe / predicted_safe if predicted_safe else None,
             }
         for direction in DIRECTIONS:
             key = f"contextual_{direction}_observations"
@@ -158,6 +178,9 @@ def analyze_log(path: Path,
                 "cumulative_observations": int(final.get(key, 0)),
             }
         rows.append(row)
+        if epoch_summary:
+            row["elapsed_end_ms"] = None
+            row["request_frontier"] = None
         previous = final
         begin = upper + 1
         if upper == len(records):
@@ -203,8 +226,32 @@ def analyze_log(path: Path,
             "maximum_rmse": maximum_rmse,
             "required_consecutive_bins": 2,
         }
+        if epoch_summary:
+            stability[family] = {
+                "stable":
+                None,
+                "final_stable":
+                None,
+                "reason":
+                "Epoch totals do not locate observations in dispatch time",
+            }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "snapshot_scope": "epoch" if epoch_summary else "dispatch",
+        "error_contract":
+        "Predict-before-update on selected actions; not independent held-out or counterfactual validation",
+        "warmup_error": {
+            family: {
+                "observations":
+                epoch_baseline.get(
+                    f"contextual_{family}_calibration_observations", 0),
+                "absolute_error_sum":
+                epoch_baseline.get(f"contextual_{family}_absolute_error_sum"),
+                "squared_error_sum":
+                epoch_baseline.get(f"contextual_{family}_squared_error_sum"),
+            }
+            for family in FAMILIES
+        },
         "source": str(path),
         "measurement_epoch": int(records[-1].get("measurement_epoch", 0)),
         "policy_warmup_mode": records[-1].get("policy_warmup_mode", "unknown"),
@@ -227,6 +274,12 @@ def main() -> int:
     parser.add_argument("--bins", default="16,32,64,128,256")
     parser.add_argument("--minimum-observations", type=int, default=4)
     parser.add_argument("--maximum-rmse", type=float, default=0.20)
+    parser.add_argument(
+        "--epoch-summary",
+        action="store_true",
+        help=
+        "Aggregate drained cumulative snapshots without estimating time to stability"
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     bins = tuple(int(value) for value in args.bins.split(",") if value)
@@ -235,7 +288,7 @@ def main() -> int:
         parser.error("bins must increase and thresholds must be non-negative")
     try:
         result = analyze_log(args.log, bins, args.minimum_observations,
-                             args.maximum_rmse)
+                             args.maximum_rmse, args.epoch_summary)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     serialized = json.dumps(result, indent=2, sort_keys=True)
