@@ -9,11 +9,17 @@ int32_t const split = trial.at("split");
 int32_t const outputs = trial.at("output_tokens");
 int32_t const rounds = trial.at("rounds");
 int32_t const splitTurns = trial.at("split_turns");
+int32_t const branchTurn = trial.value("branch_turn", -1);
 int32_t const inspectTurn = trial.value("inspect_turn", -1);
 bool const graphReplay = trial.value("graph_replay", true);
+std::vector<int32_t> const graphBatches
+    = trial.value("graph_batches", std::vector<int32_t>{1, split, rows - split, rows});
 ELLM_CHECK(rows > 1 && rows <= decodeBatchCapacity && split > 0 && split < rows
         && outputs >= 3 && outputs <= 256 && rounds > 0 && rounds <= 10 && splitTurns > 0
-        && inspectTurn < outputs - 1,
+        && inspectTurn < outputs - 1 && branchTurn >= -1 && branchTurn < outputs - 2
+        && std::all_of(graphBatches.begin(), graphBatches.end(), [rows](int32_t batch) {
+               return batch > 0 && batch <= rows;
+           }),
     "Invalid async decode trial bounds");
 ELLM_CHECK(!enablePrefixReuse && serverConfig.eosTokenIds.empty(), "Trial requires fixed output without prefix reuse");
 auto parsed = parsePhaseIpcInput(trial.at("request").dump(), outputs);
@@ -25,7 +31,7 @@ ELLM_CHECK(!prompt.empty() && prompt.size() + outputs <= static_cast<size_t>(con
     "Trial prompt exceeds KV capacity");
 if (graphReplay)
 {
-    semanticCoordinator.primeDecodeGraphs({1, split, rows - split, rows}, decodeStream,
+    semanticCoordinator.primeDecodeGraphs(graphBatches, decodeStream,
         [&](int32_t batch, cudaStream_t stream) {
             std::vector<int32_t> token{0};
             std::vector<rt::IndependentPhaseRequestView> views(static_cast<size_t>(batch));
@@ -95,7 +101,15 @@ for (int32_t round = -1; round < rounds; ++round)
         uint64_t firstDrain{}, secondDrain{};
         for (int32_t turn{}; turn < outputs - 1; ++turn)
         {
-            int32_t const batch = variant == 2 ? 1 : (variant == 1 && turn < splitTurns ? split : rows);
+            int32_t batch = rows;
+            if (variant == 2 && (branchTurn < 0 || turn == branchTurn))
+            {
+                batch = 1;
+            }
+            else if (variant == 1 && (branchTurn < 0 ? turn < splitTurns : turn == branchTurn))
+            {
+                batch = split;
+            }
             for (int32_t offset{}; offset < rows; offset += batch)
             {
                 int32_t const count = std::min(batch, rows - offset);

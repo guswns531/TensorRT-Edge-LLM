@@ -28,6 +28,20 @@ import subprocess
 import run_lifetime_encoded_admission as serving
 
 
+def decode_batch(config, variant, turn):
+    branch = config.get("branch_turn")
+    if branch is not None:
+        if turn != branch:
+            return config["rows"]
+    elif variant == 1 and turn >= config["split_turns"]:
+        return config["rows"]
+    if variant == 2:
+        return 1
+    if variant == 1:
+        return config["split"]
+    return config["rows"]
+
+
 def summarize(raw):
     """Validate dispatch contracts before summarizing isolated controlled costs."""
     cfg = raw["config"]
@@ -48,9 +62,7 @@ def summarize(raw):
                     len(t) != cfg["output_tokens"] for t in episode["tokens"]):
                 raise ValueError("Incomplete token capture")
             for turn in range(cfg["output_tokens"] - 1):
-                batch = 1 if variant == 2 else (
-                    cfg["split"] if variant == 1 and turn < cfg["split_turns"]
-                    else cfg["rows"])
+                batch = decode_batch(cfg, variant, turn)
                 dispatches = [
                     d for d in episode["dispatches"] if d["turn"] == turn
                 ]
@@ -62,7 +74,11 @@ def summarize(raw):
                 if sorted(d["actual_rows"]) != list(
                         range(d["offset"], d["offset"] + d["batch"])):
                     raise ValueError("Dispatch membership differs")
-                if d["graph"] != cfg.get("graph_replay", True):
+                expected_graph = cfg.get("graph_replay", True)
+                if "graph_batches" in cfg:
+                    expected_graph = expected_graph and d["batch"] in cfg[
+                        "graph_batches"]
+                if d["graph"] != expected_graph:
                     raise ValueError("Unexpected graph execution mode")
                 for field in ("gpu_ms", "service_ms", "commit_to_prepare_ms"):
                     if not math.isfinite(d[field]) or d[field] < 0:
@@ -113,6 +129,28 @@ def summarize(raw):
             result[name]["inspected_top2_margin"] = statistics.mean(
                 e["logits"][0]["top"][0]["logit"] -
                 e["logits"][0]["top"][1]["logit"] for e in group)
+        if "branch_turn" in cfg:
+            branch = cfg["branch_turn"]
+            branch_ticks = []
+            successor_ticks = []
+            branch_gpu = []
+            for episode in group:
+                current = [
+                    d for d in episode["dispatches"] if d["turn"] == branch
+                ]
+                successor = [
+                    d for d in episode["dispatches"] if d["turn"] == branch + 1
+                ]
+                start = min(d["prepare_ns"] for d in current)
+                branch_ticks.append(
+                    (max(d["drained_ns"] for d in current) - start) / 1e6)
+                successor_ticks.append(
+                    (max(d["drained_ns"] for d in successor) - start) / 1e6)
+                branch_gpu.append(sum(d["gpu_ms"] for d in current))
+            result[name]["branch_tick_ms"] = statistics.mean(branch_ticks)
+            result[name]["branch_two_tick_ms"] = statistics.mean(
+                successor_ticks)
+            result[name]["branch_gpu_ms"] = statistics.mean(branch_gpu)
     reference = result["singleton"]["reference_tokens"]
     for variant, name in enumerate(("dense", "split", "singleton")):
         tokens = [
@@ -132,7 +170,10 @@ def main():
     parser.add_argument("--build-root", type=pathlib.Path, required=True)
     parser.add_argument("--result-root", type=pathlib.Path, required=True)
     parser.add_argument("--inspection-only", action="store_true")
+    parser.add_argument("--branch-only", action="store_true")
     args = parser.parse_args()
+    if args.inspection_only and args.branch_only:
+        parser.error("Inspection and branch modes are mutually exclusive")
     repo = pathlib.Path(
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
                                 text=True).strip())
@@ -163,6 +204,8 @@ def main():
         serving.IMAGE,
         "cells": [],
         "note_references": [
+            "notes/347-single-turn-decode-branch-20260927.md"
+            if args.branch_only else
             "notes/346-decode-logit-and-partition-realization-20260927.md"
             if args.inspection_only else
             "notes/345-async-decode-cohort-and-token-diagnostic-20260927.md"
@@ -176,15 +219,18 @@ def main():
                    repo / "examples/llm/phaseAsyncDecodeTrial.inc"):
         (root / source.name).write_bytes(source.read_bytes())
     summary = {}
-    cells = (("gemma", "graph_logits", 8, 4, 15, 14, 2, True),
-             ("gemma", "eager_logits", 8, 4, 15, 14, 2,
-              False)) if args.inspection_only else (("gemma", "two_tick", 8, 4,
-                                                     3, 1, 5, True),
-                                                    ("gemma", "quality", 8, 4,
-                                                     128, 127, 2, True),
-                                                    ("cosmos", "two_tick", 64,
-                                                     32, 3, 1, 5, True))
-    for model, kind, rows, split, outputs, turns, rounds, graph_replay in cells:
+    if args.inspection_only:
+        cells = (("gemma", "graph_logits", 8, 4, 15, 14, 2, True, None, None),
+                 ("gemma", "eager_logits", 8, 4, 15, 14, 2, False, None, None))
+    elif args.branch_only:
+        cells = (("gemma", "single_turn_logits", 8, 4, 15, 1, 5, True, 12,
+                  None), ("gemma", "tail_drain", 3, 2, 140, 1, 5, True, 137,
+                          [1, 2]))
+    else:
+        cells = (("gemma", "two_tick", 8, 4, 3, 1, 5, True, None, None),
+                 ("gemma", "quality", 8, 4, 128, 127, 2, True, None, None),
+                 ("cosmos", "two_tick", 64, 32, 3, 1, 5, True, None, None))
+    for model, kind, rows, split, outputs, turns, rounds, graph_replay, branch_turn, graph_batches in cells:
         cell = root / (model + "-" + kind)
         cell.mkdir()
         config = serving.model_config(repo, model)
@@ -202,7 +248,11 @@ def main():
             "request": request,
             "output": mounted(cell / "raw.json")
         }
-        if args.inspection_only:
+        if branch_turn is not None:
+            trial["branch_turn"] = branch_turn
+        if graph_batches is not None:
+            trial["graph_batches"] = graph_batches
+        if args.inspection_only or kind == "single_turn_logits":
             trial["inspect_turn"] = 12
         (cell / "trial.json").write_text(json.dumps(trial, indent=2) + "\n")
         env = {

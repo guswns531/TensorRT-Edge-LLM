@@ -134,3 +134,52 @@ class AsyncDecodeTrialTest(unittest.TestCase):
         raw["episodes"][0]["logits"][0]["top"][0]["token"] = 99
         with self.assertRaises(ValueError):
             G_TOOL.summarize(raw)
+
+    def test_single_turn_branch_and_graph_coverage(self):
+        raw = self.fixture()
+        raw["config"].update({
+            "rows": 3,
+            "split": 2,
+            "output_tokens": 4,
+            "branch_turn": 1,
+            "graph_batches": [1, 2]
+        })
+        for episode in raw["episodes"]:
+            episode["tokens"] = [[1, 2, 3, 4] for _ in range(3)]
+            dispatches = []
+            for turn in range(3):
+                batch = G_TOOL.decode_batch(raw["config"], episode["variant"],
+                                            turn)
+                for offset in range(0, 3, batch):
+                    count = min(batch, 3 - offset)
+                    prepare = (turn + 1) * 1000000 + offset * 100000
+                    dispatches.append({
+                        "turn":
+                        turn,
+                        "offset":
+                        offset,
+                        "batch":
+                        count,
+                        "graph":
+                        count in (1, 2),
+                        "gpu_ms":
+                        1.0,
+                        "service_ms":
+                        1.1,
+                        "commit_to_prepare_ms":
+                        .1,
+                        "actual_rows":
+                        list(range(offset, offset + count)),
+                        "prepare_ns":
+                        prepare,
+                        "drained_ns":
+                        prepare + 100000
+                    })
+            episode["dispatches"] = dispatches
+        result = G_TOOL.summarize(raw)
+        self.assertEqual(result["dense"]["branch_tick_ms"], .1)
+        self.assertEqual(result["split"]["branch_tick_ms"], .3)
+        self.assertEqual(result["singleton"]["branch_gpu_ms"], 3.0)
+        raw["episodes"][0]["dispatches"][1]["graph"] = True
+        with self.assertRaises(ValueError):
+            G_TOOL.summarize(raw)
