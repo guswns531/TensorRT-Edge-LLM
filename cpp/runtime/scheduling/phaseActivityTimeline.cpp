@@ -223,8 +223,11 @@ bool phaseActivityIntervalsOverlap(
         && rightStartMs < leftEndMs;
 }
 
-PhaseActivityTimelineRecorder::PhaseActivityTimelineRecorder(cudaStream_t epochStream)
+PhaseActivityTimelineRecorder::PhaseActivityTimelineRecorder(cudaStream_t epochStream, uint8_t captureMask)
+    : mCaptureMask(captureMask)
 {
+    ELLM_CHECK((captureMask & static_cast<uint8_t>(~kPHASE_ACTIVITY_ALL_MASK)) == 0U,
+        "Activity capture mask contains unknown phase bits");
     initializeEpoch(epochStream);
 }
 
@@ -264,6 +267,10 @@ void PhaseActivityTimelineRecorder::initializeEpoch(cudaStream_t epochStream)
 PhaseActivityTimelineRecorder::Token PhaseActivityTimelineRecorder::begin(
     PhaseActivityKind kind, cudaStream_t stream, std::string name, uint64_t correlationId)
 {
+    if ((mCaptureMask & static_cast<uint8_t>(kind)) == 0U)
+    {
+        return 0U;
+    }
     ELLM_CHECK(stream != nullptr, "Activity interval requires an explicit CUDA stream");
     CUcontext context{};
     CUDA_DRIVER_CHECK(cuStreamGetCtx(stream, &context));
@@ -290,6 +297,10 @@ PhaseActivityTimelineRecorder::Token PhaseActivityTimelineRecorder::begin(
 
 void PhaseActivityTimelineRecorder::end(Token token, cudaStream_t stream)
 {
+    if (token == 0U)
+    {
+        return;
+    }
     std::lock_guard<std::mutex> lock(mMutex);
     auto const it = mPending.find(token);
     ELLM_CHECK(it != mPending.end(), "Unknown activity interval token");
@@ -301,6 +312,10 @@ void PhaseActivityTimelineRecorder::end(Token token, cudaStream_t stream)
 
 void PhaseActivityTimelineRecorder::cancel(Token token) noexcept
 {
+    if (token == 0U)
+    {
+        return;
+    }
     std::lock_guard<std::mutex> lock(mMutex);
     auto const it = mPending.find(token);
     if (it == mPending.end())
@@ -394,9 +409,12 @@ std::vector<PhaseActivityInterval> PhaseActivityTimelineRecorder::intervals() co
     return result;
 }
 
-std::optional<bool> PhaseActivityTimelineRecorder::overlaps(
-    PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end) const
+std::optional<bool> PhaseActivityTimelineRecorder::overlaps(PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end)
 {
+    if ((mCaptureMask & static_cast<uint8_t>(kind)) == 0U)
+    {
+        return std::nullopt;
+    }
     ELLM_CHECK(start != nullptr && end != nullptr, "Activity overlap requires a complete phase event pair");
     CUDA_CHECK(cudaEventQuery(start));
     CUDA_CHECK(cudaEventQuery(end));
@@ -410,6 +428,13 @@ std::optional<bool> PhaseActivityTimelineRecorder::overlaps(
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
+    if (mCaptureMask == kPHASE_ACTIVITY_ENCODER_MASK)
+    {
+        mIntervals.erase(
+            std::remove_if(mIntervals.begin(), mIntervals.end(),
+                [actionStartMs](PhaseActivityInterval const& interval) { return interval.endMs <= actionStartMs; }),
+            mIntervals.end());
+    }
     for (PhaseActivityInterval const& interval : mIntervals)
     {
         if (interval.kind == kind

@@ -77,20 +77,33 @@ completion is verified, but model output-quality approval remains unresolved.
 
 - `.local/results/tri-state-encoder-label-full12-screen-20260927`
 - `.local/results/tri-state-encoder-label-full12-additional-20260927`
-- C++ `PhaseActivityTimelineTest.*`, `PhaseGlobalCostModelTest.*`, `PhaseQueueSchedulerTest.*`: 189/189 passed.
+- C++ `PhaseActivityTimelineTest.*`, `PhaseGlobalCostModelTest.*`, `PhaseQueueSchedulerTest.*`: 190/190 passed.
 - Earlier Python runner contract suite: 53/53 passed. No Python source changed in the tri-state implementation.
 - Frozen vLLM baseline reused because its engine/runtime/request contract is unchanged.
 
-The activity observer remains optional. When no `PhaseActivityTimelineRecorder` is attached, the runtime falls back to
-the planned E-active state and does not have a realized physical interval label. A low-overhead always-on event tracker
-and its overhead gate remain required before claiming this behavior for every deployment.
+`PhaseServingRuntime` now creates an encoder-only interval recorder automatically for VLM serving when the caller did
+not provide a full activity recorder. It records E intervals only; P/D use their existing CUDA start/done events, and
+the encoder-only recorder prunes completed intervals after they can no longer overlap a later P/D action. The manual
+`llm_phase_context_smoke` benchmark path still uses its explicit full activity recorder. The new production-facade
+default is compiled and unit-tested, but has not had a performance run.
+
+The existing HTTP benchmark is not a `PhaseServingRuntime` HTTP test: its backend uses the research
+`llm_phase_context_smoke` IPC adapter. `PhaseServingRuntime` is a direct asynchronous C++ API, currently exercised by
+`llm_inference --phaseServing`; it is not itself an HTTP service. A valid observer-overhead comparison must therefore
+use the same direct API request path and engine, with an explicit control that disables realized-label consumption.
+Otherwise the comparison combines event-recording overhead with the scheduler-policy change caused by the new labels.
+The HTTP/IPC results remain a separate end-to-end serving measurement, not proof of the production facade's observer
+overhead.
 
 ## Next work
 
-1. Compare observer-on versus observer-off in paired runs to quantify the extra event-query and CPU bookkeeping cost.
-2. Build an always-on, bounded encoder interval history from preallocated CUDA events so production cost observations
-   receive realized labels without emitting full activity CSVs.
+1. Add a diagnostic A/B mode for the direct `PhaseServingRuntime` path that can record realized E intervals without
+   feeding those labels to cost learning; compare disabled, shadow-recording, and active-label modes on the same VLM
+   request batch. Keep the existing HTTP/IPC serving benchmark separate.
+2. Measure event-recorder cost and history size as E interval count grows, including workloads where E progresses ahead
+   of the first P/D dispatch. The current per-interval CUDA-event create/destroy path has not been shown to be cheap.
 3. When planned/realized E context differs, validate the serial-reference denominator used by normalized compression;
    the current candidate reference may have been predicted under the planned context.
-4. Once both label and reference are physically consistent, rerun the 3x full24 versus frozen vLLM and retain the
-   semantic-output gate separately.
+4. Once observer overhead, label authority, and reference semantics are validated, rerun the 3x full24 through the
+   existing HTTP/IPC adapter versus frozen vLLM; report it separately from direct-API results and retain the
+   semantic-output gate.

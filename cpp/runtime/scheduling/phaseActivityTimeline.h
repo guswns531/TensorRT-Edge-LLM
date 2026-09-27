@@ -40,6 +40,8 @@ enum class PhaseActivityKind : uint8_t
     kDecode = 0x04U,
     kCopy = 0x08U,
 };
+constexpr uint8_t kPHASE_ACTIVITY_ENCODER_MASK{static_cast<uint8_t>(PhaseActivityKind::kEncoder)};
+constexpr uint8_t kPHASE_ACTIVITY_ALL_MASK{0x0FU};
 
 char const* phaseActivityKindName(PhaseActivityKind kind) noexcept;
 std::string phaseActivityMaskString(uint8_t mask);
@@ -90,17 +92,14 @@ PhaseActivitySummary phaseActivitySummary(std::vector<PhaseActivitySegment> cons
 bool phaseActivityIntervalsOverlap(
     double leftStartMs, double leftEndMs, double rightStartMs, double rightEndMs) noexcept;
 
-//! Opt-in CUDA-event recorder for phase-stream activity rather than hardware utilization.
-//!
-//! Every interval is resolved against one synchronized event epoch in the same
-//! CUDA context. Recording adds two timing events per interval and must remain
-//! disabled on normal serving runs that do not request activity telemetry.
+//! CUDA-event recorder for phase-stream activity rather than hardware utilization.
+//! A capture mask supports encoder-only cost labeling without P/D/C event recording.
 class PhaseActivityTimelineRecorder
 {
 public:
     using Token = uint64_t;
 
-    explicit PhaseActivityTimelineRecorder(cudaStream_t epochStream);
+    explicit PhaseActivityTimelineRecorder(cudaStream_t epochStream, uint8_t captureMask = kPHASE_ACTIVITY_ALL_MASK);
     ~PhaseActivityTimelineRecorder() noexcept;
 
     PhaseActivityTimelineRecorder(PhaseActivityTimelineRecorder const&) = delete;
@@ -120,7 +119,7 @@ public:
     std::vector<PhaseActivityInterval> intervals() const;
     std::vector<PhaseActivitySegment> segments() const;
     PhaseActivitySummary summary() const;
-    std::optional<bool> overlaps(PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end) const;
+    std::optional<bool> overlaps(PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end);
     size_t pendingCount() const;
 
     //! Write <prefix>-intervals.csv, <prefix>-segments.csv, and <prefix>-summary.csv.
@@ -146,6 +145,7 @@ private:
     mutable std::mutex mMutex;
     CUcontext mCudaContext{};
     cudaEvent_t mEpoch{};
+    uint8_t mCaptureMask{kPHASE_ACTIVITY_ALL_MASK};
     std::unordered_map<Token, PendingInterval> mPending;
     std::vector<PhaseActivityInterval> mIntervals;
     Token mNextToken{1U};

@@ -114,6 +114,71 @@ TEST(PhaseActivityTimelineTest, RecordsEpochRelativeIntervalsAcrossStreams)
     CUDA_CHECK(cudaStreamDestroy(copyStream));
 }
 
+TEST(PhaseActivityTimelineTest, EncoderOnlyCaptureSkipsPDCEventAllocation)
+{
+    cudaStream_t epochStream{};
+    cudaStream_t encoderStream{};
+    cudaStream_t prefillStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&epochStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    rt::PhaseActivityTimelineRecorder recorder(epochStream, rt::kPHASE_ACTIVITY_ENCODER_MASK);
+
+    auto const ignored = recorder.begin(rt::PhaseActivityKind::kPrefill, prefillStream, "prefill");
+    EXPECT_EQ(ignored, 0U);
+    recorder.end(ignored, prefillStream);
+    EXPECT_EQ(recorder.pendingCount(), 0U);
+
+    int32_t* marker{};
+    CUDA_CHECK(cudaMalloc(&marker, sizeof(int32_t)));
+    auto const captured = recorder.begin(rt::PhaseActivityKind::kEncoder, encoderStream, "encoder");
+    ASSERT_NE(captured, 0U);
+    CUDA_CHECK(cudaMemsetAsync(marker, 1, sizeof(int32_t), encoderStream));
+
+    cudaEvent_t actionStart{};
+    cudaEvent_t actionEnd{};
+    CUDA_CHECK(cudaEventCreate(&actionStart));
+    CUDA_CHECK(cudaEventCreate(&actionEnd));
+    CUDA_CHECK(cudaStreamSynchronize(encoderStream));
+    CUDA_CHECK(cudaEventRecord(actionStart, prefillStream));
+    CUDA_CHECK(cudaMemsetAsync(marker, 2, sizeof(int32_t), prefillStream));
+    CUDA_CHECK(cudaEventRecord(actionEnd, prefillStream));
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+    EXPECT_FALSE(recorder.overlaps(rt::PhaseActivityKind::kEncoder, actionStart, actionEnd).has_value());
+
+    recorder.end(captured, encoderStream);
+    CUDA_CHECK(cudaStreamSynchronize(encoderStream));
+    std::optional<bool> const realizedOverlap
+        = recorder.overlaps(rt::PhaseActivityKind::kEncoder, actionStart, actionEnd);
+    ASSERT_TRUE(realizedOverlap.has_value());
+    EXPECT_TRUE(*realizedOverlap);
+    recorder.drain();
+    ASSERT_EQ(recorder.intervals().size(), 1U);
+    EXPECT_EQ(recorder.intervals().front().kind, rt::PhaseActivityKind::kEncoder);
+
+    cudaEvent_t afterStart{};
+    cudaEvent_t afterEnd{};
+    CUDA_CHECK(cudaEventCreate(&afterStart));
+    CUDA_CHECK(cudaEventCreate(&afterEnd));
+    CUDA_CHECK(cudaEventRecord(afterStart, prefillStream));
+    CUDA_CHECK(cudaMemsetAsync(marker, 3, sizeof(int32_t), prefillStream));
+    CUDA_CHECK(cudaEventRecord(afterEnd, prefillStream));
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+    std::optional<bool> const noOverlap = recorder.overlaps(rt::PhaseActivityKind::kEncoder, afterStart, afterEnd);
+    ASSERT_TRUE(noOverlap.has_value());
+    EXPECT_FALSE(*noOverlap);
+    EXPECT_TRUE(recorder.intervals().empty());
+
+    CUDA_CHECK(cudaEventDestroy(afterEnd));
+    CUDA_CHECK(cudaEventDestroy(afterStart));
+    CUDA_CHECK(cudaEventDestroy(actionEnd));
+    CUDA_CHECK(cudaEventDestroy(actionStart));
+    CUDA_CHECK(cudaFree(marker));
+    CUDA_CHECK(cudaStreamDestroy(epochStream));
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+}
+
 TEST(PhaseActivityTimelineTest, CountsCopyOnlyTimeAsEpdIdle)
 {
     std::vector<rt::PhaseActivityInterval> const intervals{

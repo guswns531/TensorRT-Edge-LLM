@@ -256,6 +256,11 @@ public:
             ELLM_CHECK(tokenizer != nullptr, "Phase vision serving requires a tokenizer");
             CUDA_CHECK(cudaStreamCreateWithFlags(&mEncoderStream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaStreamCreateWithFlags(&mCopyStream, cudaStreamNonBlocking));
+            if (mServingConfig.activityTimeline == nullptr)
+            {
+                mServingConfig.activityTimeline
+                    = std::make_shared<PhaseActivityTimelineRecorder>(mEncoderStream, kPHASE_ACTIVITY_ENCODER_MASK);
+            }
         }
 
         IndependentEngineExecutorPairConfig pairConfig;
