@@ -1912,6 +1912,8 @@ int main(int argc, char** argv)
         rt::PhaseGraphExecutionOptions phaseGraphOptions;
         phaseGraphOptions = rt::resolvePhaseGraphExecutionOptions(phaseGraphOptions);
         serverConfig.enableCudaGraphs = phaseGraphOptions.enabled;
+        serverConfig.requireIsolatedDecodeServiceInterval
+            = std::getenv("TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD") == nullptr;
         serverConfig.maxPrefillGraphs = phaseGraphOptions.maxPrefillGraphs;
         serverConfig.maxDecodeGraphs = phaseGraphOptions.maxDecodeGraphs;
         serverConfig.synchronizeDecodeSampling = std::getenv("TRT_EDGELLM_SYNCHRONIZE_DECODE_SAMPLING") != nullptr;
@@ -2299,7 +2301,10 @@ int main(int argc, char** argv)
                 {"measured_decode_at_measurement", startupOptions.measuredDecodeAtMeasurement},
                 {"plan_only", startupOptions.planOnly}, {"policy_stability_validated", false},
                 {"decode_batch_cost_source", startupOptions.measuredDecodeService ? "measured_host_service" : "legacy"},
-                {"decode_service_scope", "prepare_start_to_sampling_state_commit_isolated"},
+                {"decode_service_scope",
+                    serverConfig.requireIsolatedDecodeServiceInterval
+                        ? "phase_interleaving_filtered_prepare_start_to_sampling_state_commit"
+                        : "dispatch_start_only_prepare_start_to_sampling_state_commit"},
                 {"budget_ms", startupOptions.budgetMs},
                 {"prefill_batch_limit", semanticSchedulerConfig.maxPrefillBatchSize},
                 {"decode_batch_limit", semanticSchedulerConfig.maxDecodeBatchSize},
@@ -3190,6 +3195,10 @@ int main(int argc, char** argv)
                 startupReport["total_gpu_bytes"] = totalBytes;
                 startupReport["decode_graph_entries"] = semanticCoordinator.decodeGraphCacheStats().entries;
                 startupReport["prefill_graph_entries"] = semanticCoordinator.prefillGraphCacheStats().entries;
+                auto const decodeServiceStats = semanticServer.decodeServiceStats();
+                startupReport["decode_service_accepted"] = decodeServiceStats.accepted;
+                startupReport["decode_service_rejected_interleaved"] = decodeServiceStats.rejectedInterleaved;
+                startupReport["decode_service_rejected_invalid"] = decodeServiceStats.rejectedInvalid;
                 if (char const* path = std::getenv("TRT_EDGELLM_STARTUP_REPORT"))
                 {
                     std::ofstream report(path);
@@ -3977,6 +3986,7 @@ int main(int argc, char** argv)
                     }
                     auto const prefillGraphs = semanticCoordinator.prefillGraphCacheStats();
                     auto const decodeGraphs = semanticCoordinator.decodeGraphCacheStats();
+                    auto const decodeServiceStats = semanticServer.decodeServiceStats();
                     rt::PhaseThreeCoordinatorMetrics const visionMetrics
                         = ipcThreePhase != nullptr ? ipcThreePhase->metrics() : rt::PhaseThreeCoordinatorMetrics{};
                     rt::PhaseContextualPdTelemetry const contextualPdCalibration
@@ -4042,6 +4052,9 @@ int main(int argc, char** argv)
                         {"predicted_decode_frontier_ids", metrics.predictedDecodeFrontierIds},
                         {"predicted_decode_frontier_lengths", metrics.predictedDecodeFrontierLengths},
                         {"predicted_decode_candidates", decodeCandidateEvents},
+                        {"decode_service_accepted", decodeServiceStats.accepted},
+                        {"decode_service_rejected_interleaved", decodeServiceStats.rejectedInterleaved},
+                        {"decode_service_rejected_invalid", decodeServiceStats.rejectedInvalid},
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
                         {"decode_completion_ms", metrics.decodeCompletionMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},

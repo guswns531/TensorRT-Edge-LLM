@@ -47,6 +47,16 @@ TEST(IndependentPhaseAsyncServerTest, SynchronizesDecodeCompletionOnlyWithoutPro
     EXPECT_FALSE(phaseShouldSynchronizeDecodeSampling(true, false, false, 1));
 }
 
+TEST(IndependentPhaseAsyncServerTest, DecodeServiceRequiresIsolationThroughCommit)
+{
+    EXPECT_TRUE(phaseDecodeServiceSampleIsolated(100, 200, 100, 100, false, false));
+    EXPECT_FALSE(phaseDecodeServiceSampleIsolated(100, 200, 101, 100, false, false));
+    EXPECT_FALSE(phaseDecodeServiceSampleIsolated(100, 200, 100, 101, false, false));
+    EXPECT_FALSE(phaseDecodeServiceSampleIsolated(100, 200, 100, 100, true, false));
+    EXPECT_FALSE(phaseDecodeServiceSampleIsolated(100, 200, 100, 100, false, true));
+    EXPECT_FALSE(phaseDecodeServiceSampleIsolated(100, 100, 100, 100, false, false));
+}
+
 TEST(IndependentPhaseAsyncServerTest, DefersQueueInspectionWithoutChangingSamplingSynchronization)
 {
     for (bool const enabled : {false, true})

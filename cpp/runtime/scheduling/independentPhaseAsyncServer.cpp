@@ -69,6 +69,13 @@ void addVisionPayloadHash(uint64_t& hash, PhaseVisionPayload const* payload) noe
 
 } // namespace
 
+bool phaseDecodeServiceSampleIsolated(uint64_t startHostNs, uint64_t endHostNs, uint64_t latestPhaseStartHostNs,
+    uint64_t latestEncoderStartHostNs, bool phaseBusy, bool encoderActive) noexcept
+{
+    return startHostNs > 0U && endHostNs > startHostNs && latestPhaseStartHostNs <= startHostNs
+        && latestEncoderStartHostNs <= startHostNs && !phaseBusy && !encoderActive;
+}
+
 size_t phaseDecodeAlignedAdmissionCapacity(size_t requestedCapacity, size_t decodeBatchCapacity) noexcept
 {
     if (requestedCapacity == 0 || decodeBatchCapacity == 0 || requestedCapacity <= decodeBatchCapacity)
@@ -1586,6 +1593,11 @@ void IndependentPhaseAsyncServer::setDispatchBlocked(bool blocked) noexcept
 
 void IndependentPhaseAsyncServer::setExternalEncoderActive(bool active) noexcept
 {
+    if (active && !mExternalEncoderActive)
+    {
+        mLatestExternalEncoderStartHostNs = phaseTimelineNowNs();
+    }
+    mExternalEncoderActive = active;
     mCoordinator.scheduler().setExternalEncoderActive(active);
 }
 
@@ -2091,6 +2103,11 @@ PhaseSchedulerTelemetry const& IndependentPhaseAsyncServer::schedulerTelemetry()
     return mCoordinator.scheduler().telemetry();
 }
 
+IndependentPhaseDecodeServiceStats IndependentPhaseAsyncServer::decodeServiceStats() const noexcept
+{
+    return mDecodeServiceStats;
+}
+
 bool IndependentPhaseAsyncServer::admitPendingRequests()
 {
     if (shouldWaitForAdmissionRefill())
@@ -2328,6 +2345,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
 {
     IndependentPhaseCoordinatorCallbacks callbacks;
     callbacks.onMetrics = [this](PhaseDispatchMetrics const& metrics) {
+        mLatestPhaseDispatchStartHostNs = std::max(mLatestPhaseDispatchStartHostNs, metrics.hostDispatchStartNs);
         if (!mCoordinator.scheduler().usesMeasuredDecodeService() || metrics.kind != PhaseDispatchKind::kDecode
             || metrics.externalEncoderActive || metrics.concurrentPrefillActive)
         {
@@ -2609,10 +2627,21 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
     if (ticket->decodeServiceStartHostNs > 0)
     {
         uint64_t const end = phaseTimelineNowNs();
-        if (end > ticket->decodeServiceStartHostNs)
+        if (end <= ticket->decodeServiceStartHostNs)
+        {
+            ++mDecodeServiceStats.rejectedInvalid;
+        }
+        else if (!mConfig.requireIsolatedDecodeServiceInterval
+            || phaseDecodeServiceSampleIsolated(ticket->decodeServiceStartHostNs, end, mLatestPhaseDispatchStartHostNs,
+                mLatestExternalEncoderStartHostNs, mCoordinator.busy(), mExternalEncoderActive))
         {
             mCoordinator.scheduler().observeDecodeService(
                 ticket->decodeServiceKey, static_cast<float>(end - ticket->decodeServiceStartHostNs) / 1000000.0F);
+            ++mDecodeServiceStats.accepted;
+        }
+        else
+        {
+            ++mDecodeServiceStats.rejectedInterleaved;
         }
     }
     destroyTicketEvent(*ticket);

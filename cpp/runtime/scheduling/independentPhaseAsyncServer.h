@@ -170,6 +170,17 @@ struct IndependentPhaseSampleTicket
     std::function<void()> release;
 };
 
+struct IndependentPhaseDecodeServiceStats
+{
+    size_t accepted{};
+    size_t rejectedInterleaved{};
+    size_t rejectedInvalid{};
+};
+
+//! A decode service observation is isolated only through token-state commit.
+bool phaseDecodeServiceSampleIsolated(uint64_t startHostNs, uint64_t endHostNs, uint64_t latestPhaseStartHostNs,
+    uint64_t latestEncoderStartHostNs, bool phaseBusy, bool encoderActive) noexcept;
+
 //! Model-specific seam for token staging, embeddings, deepstack/M-RoPE binding, and sampling.
 struct IndependentPhaseRequestAdapter
 {
@@ -208,6 +219,8 @@ struct IndependentPhaseServerConfig
     std::vector<int32_t> eosTokenIds;
     bool enablePrefixReuse{};
     bool enableCudaGraphs{};
+    //! Research ablation only: false accepts the legacy dispatch-start-only service observation.
+    bool requireIsolatedDecodeServiceInterval{true};
     //! Allow a concrete decode-sampling event to close the next decode
     //! formation boundary synchronously. Ready/pending producer work retains
     //! priority, so this never blocks the E/P first-token critical path.
@@ -512,6 +525,7 @@ public:
     uint64_t globalPlanSequence() const noexcept;
     uint64_t globalSnapshotEpoch() const noexcept;
     PhaseSchedulerTelemetry const& schedulerTelemetry() const noexcept;
+    IndependentPhaseDecodeServiceStats decodeServiceStats() const noexcept;
 
 private:
     struct RequestState
@@ -616,6 +630,10 @@ private:
     std::function<void(PhaseTimelineEvent const&)> mTimelineCallback;
     PhaseActivityTimelineRecorder* mActivityTimeline{};
     size_t mDecodeRefillWaitCount{};
+    IndependentPhaseDecodeServiceStats mDecodeServiceStats;
+    uint64_t mLatestPhaseDispatchStartHostNs{};
+    uint64_t mLatestExternalEncoderStartHostNs{};
+    bool mExternalEncoderActive{};
     uint64_t mNextSamplingTicketSequence{1U};
     size_t mPrefillFormationWaitPeriodCount{};
     size_t mPrefillFormationDeferralCount{};

@@ -316,6 +316,8 @@ def command_for(repo,
     }
     if options.get("decode_partition_diagnostic", False):
         environment["TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"] = "1"
+    if "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD" in os.environ:
+        environment["TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"] = "1"
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
         environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
             "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"]

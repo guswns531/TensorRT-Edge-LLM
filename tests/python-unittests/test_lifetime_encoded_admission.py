@@ -237,6 +237,17 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             diagnostic.pop("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"), "1")
         self.assertEqual(default, diagnostic)
 
+    def test_decode_service_interval_guard_ablation_is_explicit(self):
+        key = "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            default = environment(self.command("independent-autotune-service"))
+        with unittest.mock.patch.dict("os.environ", {key: "1"}, clear=True):
+            ablation = environment(
+                self.command("independent-autotune-service"))
+        self.assertNotIn(key, default)
+        self.assertEqual(ablation.pop(key), "1")
+        self.assertEqual(default, ablation)
+
     def test_serving_defaults_match_repeated_configuration(self):
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
             args = G_RUNNER.parse_args([])
