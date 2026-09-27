@@ -3735,6 +3735,46 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
             plan.predictedDecodeFrontierIds.push_back(item->requestId);
             plan.predictedDecodeFrontierLengths.push_back(item->tokenCount);
         }
+        if (mConfig.enableMeasuredDecodeServiceBatching && !plan.predictedDecodeFrontierLengths.empty())
+        {
+            int32_t const context = *std::max_element(
+                plan.predictedDecodeFrontierLengths.begin(), plan.predictedDecodeFrontierLengths.end());
+            int32_t const width = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
+            int32_t const bucket = (context + width - 1) / width;
+            for (int32_t batch = 1; batch <= static_cast<int32_t>(plan.predictedDecodeFrontierLengths.size()); ++batch)
+            {
+                PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batch, 0, 1, bucket, 0};
+                key.executionVariant = executionVariantFor(key, 0);
+                auto const service = mRuntimeCostTracker->decodeServiceEstimate(key);
+                auto gpu = mRuntimeCostTracker->trustedEstimate(key);
+                bool const coveringGpu = !gpu.has_value();
+                if (coveringGpu)
+                {
+                    gpu = mRuntimeCostTracker->trustedEstimatePrimaryBatchCoveringContext(key);
+                }
+                PhaseDecodeServiceCandidateDiagnostic diagnostic;
+                diagnostic.batchSize = batch;
+                diagnostic.contextBucket = bucket;
+                diagnostic.executionVariant = key.executionVariant;
+                diagnostic.gpuCovering = coveringGpu && gpu.has_value();
+                if (service.has_value())
+                {
+                    diagnostic.serviceSamples = service->sampleCount;
+                    diagnostic.serviceMedianMs = service->makespanMedianMs;
+                    diagnostic.serviceP95Ms = service->makespanP95Ms;
+                    diagnostic.serviceUncertaintyMs = service->uncertaintyMs;
+                    diagnostic.selectionServiceMs
+                        = std::max(service->makespanP95Ms, service->makespanMedianMs + service->uncertaintyMs);
+                }
+                if (gpu.has_value())
+                {
+                    diagnostic.gpuSamples = gpu->sampleCount;
+                    diagnostic.selectionGpuMs
+                        = std::max(gpu->makespanP95Ms, gpu->makespanMedianMs + gpu->uncertaintyMs);
+                }
+                plan.predictedDecodeCandidates.push_back(diagnostic);
+            }
+        }
     }
     if (plan.plannedDecodeBatchSize > 0)
     {

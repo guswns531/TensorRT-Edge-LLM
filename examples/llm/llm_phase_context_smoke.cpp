@@ -3993,6 +3993,20 @@ int main(int argc, char** argv)
                     auto const directionObservations = [&](rt::PhaseContextualPairDirection direction) {
                         return runtimeCostTracker->contextualDirectionTelemetry(direction).observations;
                     };
+                    nlohmann::json decodeCandidateEvents = nlohmann::json::array();
+                    for (auto const& candidate : metrics.predictedDecodeCandidates)
+                    {
+                        decodeCandidateEvents.push_back(
+                            {{"batch", candidate.batchSize}, {"context_bucket", candidate.contextBucket},
+                                {"execution_variant", rt::phaseExecutionVariantName(candidate.executionVariant)},
+                                {"service_samples", candidate.serviceSamples},
+                                {"service_median_ms", candidate.serviceMedianMs},
+                                {"service_p95_ms", candidate.serviceP95Ms},
+                                {"service_uncertainty_ms", candidate.serviceUncertaintyMs},
+                                {"selection_service_ms", candidate.selectionServiceMs},
+                                {"gpu_samples", candidate.gpuSamples}, {"selection_gpu_ms", candidate.selectionGpuMs},
+                                {"gpu_covering", candidate.gpuCovering}});
+                    }
                     nlohmann::json const metricEvent{{"dispatch_index", metrics.dispatchIndex},
                         {"measurement_epoch", measurementEpoch},
                         {"policy_warmup_mode", phasePolicyWarmupModeName(policyWarmupMode)},
@@ -4027,6 +4041,7 @@ int main(int argc, char** argv)
                         {"predicted_decode_partition", metrics.predictedDecodePartition},
                         {"predicted_decode_frontier_ids", metrics.predictedDecodeFrontierIds},
                         {"predicted_decode_frontier_lengths", metrics.predictedDecodeFrontierLengths},
+                        {"predicted_decode_candidates", decodeCandidateEvents},
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
                         {"decode_completion_ms", metrics.decodeCompletionMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},

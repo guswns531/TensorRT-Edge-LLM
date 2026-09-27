@@ -324,6 +324,7 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.predictedDecodePartition = std::move(mInFlight.predictedDecodePartition);
     mCurrentMetrics.predictedDecodeFrontierIds = std::move(mInFlight.predictedDecodeFrontierIds);
     mCurrentMetrics.predictedDecodeFrontierLengths = std::move(mInFlight.predictedDecodeFrontierLengths);
+    mCurrentMetrics.predictedDecodeCandidates = std::move(mInFlight.predictedDecodeCandidates);
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     mCurrentMetrics.prefillCohortRefillRows = mInFlight.prefillCohortRefillRows;
     mCurrentMetrics.globalDecisionEvaluated = mInFlight.globalDecisionEvaluated;

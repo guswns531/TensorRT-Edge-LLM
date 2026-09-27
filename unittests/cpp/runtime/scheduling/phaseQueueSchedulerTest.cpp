@@ -2148,6 +2148,21 @@ TEST(PhaseQueueSchedulerTest, MeasuredServiceSelectsWithoutStaticPriorOrGpuOnlyB
         EXPECT_EQ(plan.predictedDecodeFrontierLengths, (std::vector<int32_t>{128, 128, 128, 128}));
         EXPECT_FLOAT_EQ(plan.predictedDecodeDrainServiceMs, denseService < 10.0F ? 9.0F : 10.0F);
         EXPECT_FLOAT_EQ(plan.predictedDecodeDrainGpuMs, denseService < 10.0F ? 10.0F : 8.0F);
+        ASSERT_EQ(plan.predictedDecodeCandidates.size(), 4U);
+        auto const& splitCandidate = plan.predictedDecodeCandidates[1];
+        auto const& denseCandidate = plan.predictedDecodeCandidates[3];
+        EXPECT_EQ(splitCandidate.batchSize, 2);
+        EXPECT_EQ(splitCandidate.contextBucket, 1);
+        EXPECT_EQ(splitCandidate.executionVariant, PhaseExecutionVariant::kEager);
+        EXPECT_EQ(splitCandidate.serviceSamples, 1U);
+        EXPECT_FLOAT_EQ(splitCandidate.selectionServiceMs, 5.0F);
+        EXPECT_EQ(splitCandidate.gpuSamples, 1U);
+        EXPECT_FLOAT_EQ(splitCandidate.selectionGpuMs, 4.0F);
+        EXPECT_FALSE(splitCandidate.gpuCovering);
+        EXPECT_EQ(denseCandidate.batchSize, 4);
+        EXPECT_EQ(denseCandidate.serviceSamples, 1U);
+        EXPECT_FLOAT_EQ(denseCandidate.selectionServiceMs, denseService);
+        EXPECT_FLOAT_EQ(denseCandidate.selectionGpuMs, 10.0F);
         EXPECT_FLOAT_EQ(
             tracker->trustedEstimate({PhaseGlobalActionKind::kDecode, 4, 0, 1, 1, 0})->makespanMedianMs, 10.0F);
     }
@@ -2179,7 +2194,9 @@ TEST(PhaseQueueSchedulerTest, UnknownServiceShapeDoesNotUseLegacyOrInventRemaind
         {
             scheduler.enqueueDecode({id, 128});
         }
-        EXPECT_EQ(scheduler.next().decodeBatch.size(), 3U);
+        auto const plan = scheduler.next();
+        EXPECT_EQ(plan.decodeBatch.size(), 3U);
+        EXPECT_TRUE(plan.predictedDecodeCandidates.empty());
         EXPECT_FALSE(scheduler.decodeServiceEstimate(2, 1024).has_value());
     }
 }

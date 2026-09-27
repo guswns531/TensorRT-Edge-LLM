@@ -122,6 +122,22 @@ struct PhaseHostExecutionTiming
     bool graphReplay{};
 };
 
+//! Optional per-shape evidence explaining a measured-service decode decision.
+struct PhaseDecodeServiceCandidateDiagnostic
+{
+    int32_t batchSize{};
+    int32_t contextBucket{};
+    PhaseExecutionVariant executionVariant{PhaseExecutionVariant::kEager};
+    size_t serviceSamples{};
+    float serviceMedianMs{};
+    float serviceP95Ms{};
+    float serviceUncertaintyMs{};
+    float selectionServiceMs{};
+    size_t gpuSamples{};
+    float selectionGpuMs{};
+    bool gpuCovering{};
+};
+
 struct PhaseDispatchMetrics
 {
     size_t dispatchIndex{};
@@ -203,6 +219,7 @@ struct PhaseDispatchMetrics
     std::vector<int32_t> predictedDecodePartition;
     std::vector<uint64_t> predictedDecodeFrontierIds;
     std::vector<int32_t> predictedDecodeFrontierLengths;
+    std::vector<PhaseDecodeServiceCandidateDiagnostic> predictedDecodeCandidates;
     //! Host page-pool snapshot after the dispatch completion; zero for linear caches.
     int32_t pagePoolTotalBundles{};
     int32_t pagePoolAllocatedBundles{};
@@ -690,6 +707,7 @@ struct PhaseDispatchPlan
     std::vector<int32_t> predictedDecodePartition;
     std::vector<uint64_t> predictedDecodeFrontierIds;
     std::vector<int32_t> predictedDecodeFrontierLengths;
+    std::vector<PhaseDecodeServiceCandidateDiagnostic> predictedDecodeCandidates;
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
