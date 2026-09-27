@@ -18,6 +18,7 @@
 #include "runtime/phase/policy/phaseGlobalScheduler.h"
 
 #include "runtime/phase/policy/phaseContextualPdModel.h"
+#include "runtime/scheduling/phaseActivityTimeline.h"
 
 #include <gtest/gtest.h>
 #include <limits>
@@ -26,6 +27,15 @@ namespace trt_edgellm::rt
 {
 namespace
 {
+
+TEST(PhaseActivityTimelineTest, UsesHalfOpenIntervalOverlap)
+{
+    EXPECT_TRUE(phaseActivityIntervalsOverlap(1.0, 3.0, 2.0, 4.0));
+    EXPECT_FALSE(phaseActivityIntervalsOverlap(1.0, 3.0, 3.0, 4.0));
+    EXPECT_FALSE(phaseActivityIntervalsOverlap(1.0, 2.0, 2.0, 3.0));
+    EXPECT_FALSE(phaseActivityIntervalsOverlap(4.0, 5.0, 1.0, 3.0));
+    EXPECT_TRUE(phaseActivityIntervalsOverlap(1.0, std::numeric_limits<double>::infinity(), 3.0, 4.0));
+}
 
 PhaseGlobalActionCandidate candidate(PhaseGlobalActionKind kind, double workUs, double blockingUs, double slackUs)
 {

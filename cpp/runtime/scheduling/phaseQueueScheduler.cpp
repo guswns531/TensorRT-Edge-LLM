@@ -4655,6 +4655,9 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     auto updateEwma = [alpha = mConfig.metricsEwmaAlpha](float& average, float sample) {
         average = average > 0.0F ? alpha * sample + (1.0F - alpha) * average : sample;
     };
+    bool const externalEncoderObserved = metrics.externalEncoderOverlapObservationValid
+        ? metrics.externalEncoderOverlapObserved
+        : metrics.externalEncoderActive;
     bool const representativePrefillCostSample = mConfig.adaptivePrefillChunkCandidates.empty()
         || metrics.prefillTokens >= mConfig.adaptivePrefillChunkCandidates.back();
     if (metrics.prefillTokens > 0 && metrics.prefillGpuMs > 0.0F && representativePrefillCostSample)
@@ -4666,13 +4669,13 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
         updateEwma(mTelemetry.decodeGpuMsPerContextToken,
             metrics.decodeGpuMs / static_cast<float>(metrics.decodeContextTokens));
     }
-    if (mDecodeComponentObservationActive && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F
-        && metrics.plannedDecodeMaxContextLength > 0)
+    if (mDecodeComponentObservationActive && !metrics.externalEncoderOverlapObservationDeferred
+        && metrics.decodeBatchSize > 0 && metrics.decodeGpuMs > 0.0F && metrics.plannedDecodeMaxContextLength > 0)
     {
         mRuntimeCostTracker->observeDecode(metrics.decodeBatchSize, metrics.plannedDecodeMaxContextLength,
-            metrics.externalEncoderActive, metrics.concurrentPrefillActive, metrics.decodeGpuMs);
+            externalEncoderObserved, metrics.concurrentPrefillActive, metrics.decodeGpuMs);
         ++mTelemetry.runtimeDecodeCostSampleCount;
-        mTelemetry.encoderContendedDecodeCostSampleCount += metrics.externalEncoderActive ? 1U : 0U;
+        mTelemetry.encoderContendedDecodeCostSampleCount += externalEncoderObserved ? 1U : 0U;
         mTelemetry.prefillContendedDecodeCostSampleCount += metrics.concurrentPrefillActive ? 1U : 0U;
         mTelemetry.runtimeDecodeCostBucketCount = mRuntimeCostTracker->decodeBucketCount();
     }
@@ -4752,12 +4755,28 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     }
     if (mConfig.globalSchedulerMode != PhaseGlobalSchedulerMode::kDisabled && metrics.makespanGpuMs > 0.0F)
     {
-        PhaseGlobalActionKey const observedKey = globalActionKey(metrics);
-        if (metrics.globalDecisionApplied && observedKey.kind != PhaseGlobalActionKind::kNone)
+        PhaseGlobalActionKey observedKey = globalActionKey(metrics);
+        observedKey.externalEncoderBackground = externalEncoderObserved;
+        auto sameActionExceptEncoderBackground = [](PhaseGlobalActionKey left, PhaseGlobalActionKey right) {
+            left.externalEncoderBackground = false;
+            right.externalEncoderBackground = false;
+            return left == right;
+        };
+        bool const actionShapeParity = sameActionExceptEncoderBackground(metrics.globalSelectedAction, observedKey);
+        if (metrics.externalEncoderOverlapObservationDeferred)
+        {
+            ++mTelemetry.globalCostEncoderContextDeferredCount;
+        }
+        if (metrics.externalEncoderOverlapObservationValid && !metrics.externalEncoderOverlapObservationDeferred
+            && metrics.externalEncoderActive != metrics.externalEncoderOverlapObserved)
+        {
+            ++mTelemetry.globalCostEncoderContextMismatchCount;
+        }
+        if (!metrics.externalEncoderOverlapObservationDeferred && metrics.globalDecisionApplied
+            && observedKey.kind != PhaseGlobalActionKind::kNone)
         {
             ++mTelemetry.globalCostKeyObservationCount;
-            bool const exactKeyParity = metrics.globalSelectedAction == observedKey;
-            mTelemetry.globalCostKeyParityViolationCount += exactKeyParity ? 0U : 1U;
+            mTelemetry.globalCostKeyParityViolationCount += actionShapeParity ? 0U : 1U;
             if (observedKey.residualAnchor == PhaseGlobalResidualAnchor::kPrefill)
             {
                 ++mTelemetry.globalResidualPrefillAnchorObservationCount;
@@ -4767,21 +4786,21 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
                 ++mTelemetry.globalResidualDecodeAnchorObservationCount;
             }
         }
-        bool const planBoundSample = !metrics.globalDecisionApplied
-            || (metrics.globalCandidateParity && metrics.globalActionFidelity
-                && metrics.globalSelectedAction == observedKey);
+        bool const planBoundSample = !metrics.externalEncoderOverlapObservationDeferred
+            && (!metrics.globalDecisionApplied
+                || (metrics.globalCandidateParity && metrics.globalActionFidelity && actionShapeParity));
         if (observedKey.kind != PhaseGlobalActionKind::kNone && planBoundSample)
         {
             mTelemetry.globalCostExternalEncoderContextObservationCount
                 += observedKey.externalEncoderBackground ? 1U : 0U;
             float referenceWorkMs = metrics.prefillGpuMs + metrics.decodeGpuMs;
-            if (metrics.globalReferenceWorkMs > 0.0 && metrics.globalSelectedAction == observedKey)
+            if (metrics.globalReferenceWorkMs > 0.0 && actionShapeParity)
             {
                 referenceWorkMs = static_cast<float>(metrics.globalReferenceWorkMs);
             }
             mRuntimeCostTracker->observe(observedKey, {referenceWorkMs, metrics.makespanGpuMs});
             if (observedKey.kind == PhaseGlobalActionKind::kPrefillDecode && metrics.contextualPdFeatureValid
-                && referenceWorkMs > 0.0F)
+                && referenceWorkMs > 0.0F && !observedKey.externalEncoderBackground)
             {
                 double const reward = (static_cast<double>(referenceWorkMs) - metrics.makespanGpuMs)
                     / static_cast<double>(referenceWorkMs);

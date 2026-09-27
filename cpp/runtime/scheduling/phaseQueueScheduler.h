@@ -210,6 +210,10 @@ struct PhaseDispatchMetrics
     float overlapRatio{};
     //! External vision encoder state captured when this dispatch was selected.
     bool externalEncoderActive{};
+    //! Encoder GPU activity overlapping this dispatch, when a CUDA-interval observer is attached.
+    bool externalEncoderOverlapObserved{};
+    bool externalEncoderOverlapObservationValid{};
+    bool externalEncoderOverlapObservationDeferred{};
     //! True when the decode cost was observed concurrently with prefill.
     bool concurrentPrefillActive{};
     //! Predicted cost and number of turns required to service the runnable decode rows.
@@ -307,6 +311,8 @@ struct PhaseSchedulerTelemetry
     size_t globalCostKeyObservationCount{};
     size_t globalCostKeyParityViolationCount{};
     size_t globalCostExternalEncoderContextObservationCount{};
+    size_t globalCostEncoderContextMismatchCount{};
+    size_t globalCostEncoderContextDeferredCount{};
     size_t globalResidualPrefillAnchorObservationCount{};
     size_t globalResidualDecodeAnchorObservationCount{};
     size_t globalCandidateParityViolationCount{};

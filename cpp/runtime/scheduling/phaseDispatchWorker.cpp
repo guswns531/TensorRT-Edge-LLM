@@ -878,6 +878,36 @@ void PhaseDispatchWorker::collectMetrics()
     {
         mCurrentMetrics.overlapRatio = std::clamp(1.0F - mCurrentMetrics.makespanGpuMs / phaseSum, 0.0F, 1.0F);
     }
+    if (mActivityTimeline != nullptr)
+    {
+        static_cast<void>(mActivityTimeline->poll());
+        bool externalEncoderOverlap{};
+        bool externalEncoderObservationUnknown{};
+        auto includeEncoderOverlap = [&](std::optional<bool> overlap) {
+            if (overlap.has_value())
+            {
+                externalEncoderOverlap = externalEncoderOverlap || *overlap;
+            }
+            else
+            {
+                externalEncoderObservationUnknown = true;
+            }
+        };
+        if (mCurrentMetrics.prefillBatchSize > 0)
+        {
+            includeEncoderOverlap(
+                mActivityTimeline->overlaps(PhaseActivityKind::kEncoder, mPrefillStart, mPrefillDone));
+        }
+        if (mCurrentMetrics.decodeBatchSize > 0)
+        {
+            includeEncoderOverlap(mActivityTimeline->overlaps(PhaseActivityKind::kEncoder, mDecodeStart, mDecodeDone));
+        }
+        mCurrentMetrics.externalEncoderOverlapObservationValid
+            = externalEncoderOverlap || !externalEncoderObservationUnknown;
+        mCurrentMetrics.externalEncoderOverlapObserved = externalEncoderOverlap;
+        mCurrentMetrics.externalEncoderOverlapObservationDeferred
+            = !externalEncoderOverlap && externalEncoderObservationUnknown;
+    }
     mLastMetrics = mCurrentMetrics;
     mScheduler.observeMetrics(*mLastMetrics);
     if (mCallbacks.onMetrics)

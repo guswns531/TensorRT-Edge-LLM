@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +87,8 @@ std::vector<PhaseActivitySegment> phaseActivitySegments(
 //! Internal mask-0000 gaps remain visible; process startup and post-drain time do not.
 std::vector<PhaseActivitySegment> phaseActivityActiveSpanSegments(std::vector<PhaseActivityInterval> const& intervals);
 PhaseActivitySummary phaseActivitySummary(std::vector<PhaseActivitySegment> const& segments, float windowEndMs = 0.0F);
+bool phaseActivityIntervalsOverlap(
+    double leftStartMs, double leftEndMs, double rightStartMs, double rightEndMs) noexcept;
 
 //! Opt-in CUDA-event recorder for phase-stream activity rather than hardware utilization.
 //!
@@ -117,6 +120,7 @@ public:
     std::vector<PhaseActivityInterval> intervals() const;
     std::vector<PhaseActivitySegment> segments() const;
     PhaseActivitySummary summary() const;
+    std::optional<bool> overlaps(PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end) const;
     size_t pendingCount() const;
 
     //! Write <prefix>-intervals.csv, <prefix>-segments.csv, and <prefix>-summary.csv.

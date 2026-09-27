@@ -21,6 +21,7 @@
 #include "runtime/scheduling/phaseKernelGroupRecorder.h"
 
 #include <gtest/gtest.h>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -93,6 +94,20 @@ TEST(PhaseActivityTimelineTest, RecordsEpochRelativeIntervalsAcrossStreams)
     EXPECT_GE(intervals[1].startMs, 0.0F);
     EXPECT_GE(intervals[1].endMs, intervals[1].startMs);
 
+    cudaEvent_t actionStart{};
+    cudaEvent_t actionEnd{};
+    CUDA_CHECK(cudaEventCreate(&actionStart));
+    CUDA_CHECK(cudaEventCreate(&actionEnd));
+    CUDA_CHECK(cudaEventRecord(actionStart, copyStream));
+    CUDA_CHECK(cudaMemsetAsync(marker, 3, sizeof(int32_t), copyStream));
+    CUDA_CHECK(cudaEventRecord(actionEnd, copyStream));
+    CUDA_CHECK(cudaStreamSynchronize(copyStream));
+    std::optional<bool> const eOverlap = recorder.overlaps(rt::PhaseActivityKind::kEncoder, actionStart, actionEnd);
+    ASSERT_TRUE(eOverlap.has_value());
+    EXPECT_FALSE(*eOverlap);
+
+    CUDA_CHECK(cudaEventDestroy(actionEnd));
+    CUDA_CHECK(cudaEventDestroy(actionStart));
     CUDA_CHECK(cudaFree(marker));
     CUDA_CHECK(cudaStreamDestroy(epochStream));
     CUDA_CHECK(cudaStreamDestroy(encoderStream));

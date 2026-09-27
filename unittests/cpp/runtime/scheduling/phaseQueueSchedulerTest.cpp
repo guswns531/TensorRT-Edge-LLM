@@ -2788,10 +2788,22 @@ TEST(PhaseQueueSchedulerTest, DecodeCostObservationKeepsExternalEncoderContext)
     metrics.decodeGpuMs = 6.0F;
     metrics.makespanGpuMs = 6.0F;
     metrics.globalExecutionVariant = PhaseExecutionVariant::kPrimaryGraph;
+    metrics.externalEncoderOverlapObservationValid = true;
     scheduler.observeMetrics(metrics);
     metrics.externalEncoderActive = true;
+    metrics.decodeGpuMs = 7.0F;
+    metrics.makespanGpuMs = 7.0F;
+    metrics.externalEncoderOverlapObserved = false;
+    scheduler.observeMetrics(metrics);
     metrics.decodeGpuMs = 50.0F;
     metrics.makespanGpuMs = 50.0F;
+    metrics.externalEncoderOverlapObserved = true;
+    scheduler.observeMetrics(metrics);
+    metrics.externalEncoderActive = false;
+    metrics.externalEncoderOverlapObservationValid = false;
+    metrics.externalEncoderOverlapObservationDeferred = true;
+    metrics.decodeGpuMs = 100.0F;
+    metrics.makespanGpuMs = 100.0F;
     scheduler.observeMetrics(metrics);
 
     PhaseGlobalActionKey const isolated{
@@ -2802,9 +2814,11 @@ TEST(PhaseQueueSchedulerTest, DecodeCostObservationKeepsExternalEncoderContext)
     std::optional<PhaseGlobalCostEstimate> const contendedCost = tracker->estimate(contended);
     ASSERT_TRUE(isolatedCost.has_value());
     ASSERT_TRUE(contendedCost.has_value());
-    EXPECT_FLOAT_EQ(isolatedCost->makespanMedianMs, 6.0F);
+    EXPECT_EQ(isolatedCost->sampleCount, 2U);
     EXPECT_FLOAT_EQ(contendedCost->makespanMedianMs, 50.0F);
     EXPECT_EQ(scheduler.telemetry().globalCostExternalEncoderContextObservationCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalCostEncoderContextMismatchCount, 1U);
+    EXPECT_EQ(scheduler.telemetry().globalCostEncoderContextDeferredCount, 1U);
 }
 
 TEST(PhaseQueueSchedulerTest, ServiceScaledModeKeepsExplicitDeadlinesAbsolute)

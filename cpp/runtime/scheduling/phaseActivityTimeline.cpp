@@ -25,6 +25,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -214,6 +215,14 @@ PhaseActivitySummary phaseActivitySummary(std::vector<PhaseActivitySegment> cons
     return result;
 }
 
+bool phaseActivityIntervalsOverlap(
+    double leftStartMs, double leftEndMs, double rightStartMs, double rightEndMs) noexcept
+{
+    return std::isfinite(leftStartMs) && std::isfinite(rightStartMs) && !std::isnan(leftEndMs)
+        && !std::isnan(rightEndMs) && leftEndMs > leftStartMs && rightEndMs > rightStartMs && leftStartMs < rightEndMs
+        && rightStartMs < leftEndMs;
+}
+
 PhaseActivityTimelineRecorder::PhaseActivityTimelineRecorder(cudaStream_t epochStream)
 {
     initializeEpoch(epochStream);
@@ -383,6 +392,78 @@ std::vector<PhaseActivityInterval> PhaseActivityTimelineRecorder::intervals() co
         return left.startMs < right.startMs || (left.startMs == right.startMs && left.intervalId < right.intervalId);
     });
     return result;
+}
+
+std::optional<bool> PhaseActivityTimelineRecorder::overlaps(
+    PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end) const
+{
+    ELLM_CHECK(start != nullptr && end != nullptr, "Activity overlap requires a complete phase event pair");
+    CUDA_CHECK(cudaEventQuery(start));
+    CUDA_CHECK(cudaEventQuery(end));
+    float actionStartMs{};
+    float actionEndMs{};
+    CUDA_CHECK(cudaEventElapsedTime(&actionStartMs, mEpoch, start));
+    CUDA_CHECK(cudaEventElapsedTime(&actionEndMs, mEpoch, end));
+    if (actionEndMs <= actionStartMs)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (PhaseActivityInterval const& interval : mIntervals)
+    {
+        if (interval.kind == kind
+            && phaseActivityIntervalsOverlap(interval.startMs, interval.endMs, actionStartMs, actionEndMs))
+        {
+            return true;
+        }
+    }
+    bool pendingOverlapUnknown{};
+    for (auto const& entry : mPending)
+    {
+        PendingInterval const& interval = entry.second;
+        if (interval.kind != kind)
+        {
+            continue;
+        }
+        cudaError_t const startStatus = cudaEventQuery(interval.start);
+        if (startStatus == cudaErrorNotReady)
+        {
+            continue;
+        }
+        CUDA_CHECK(startStatus);
+        float intervalStartMs{};
+        CUDA_CHECK(cudaEventElapsedTime(&intervalStartMs, mEpoch, interval.start));
+        if (!interval.closed)
+        {
+            pendingOverlapUnknown = pendingOverlapUnknown
+                || phaseActivityIntervalsOverlap(
+                    intervalStartMs, std::numeric_limits<double>::infinity(), actionStartMs, actionEndMs);
+            continue;
+        }
+        cudaError_t const endStatus = cudaEventQuery(interval.end);
+        if (endStatus == cudaSuccess)
+        {
+            float intervalEndMs{};
+            CUDA_CHECK(cudaEventElapsedTime(&intervalEndMs, mEpoch, interval.end));
+            if (phaseActivityIntervalsOverlap(intervalStartMs, intervalEndMs, actionStartMs, actionEndMs))
+            {
+                return true;
+            }
+        }
+        else if (endStatus == cudaErrorNotReady)
+        {
+            if (intervalStartMs < actionEndMs)
+            {
+                return true;
+            }
+        }
+        else
+        {
+            CUDA_CHECK(endStatus);
+        }
+    }
+    return pendingOverlapUnknown ? std::nullopt : std::optional<bool>{false};
 }
 
 std::vector<PhaseActivitySegment> PhaseActivityTimelineRecorder::segments() const
