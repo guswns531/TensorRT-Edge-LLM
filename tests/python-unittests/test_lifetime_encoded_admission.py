@@ -52,6 +52,23 @@ def environment(command):
 
 class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
 
+    def test_compact_dispatch_decode_accounting_matches_full_schema(self):
+        self.assertEqual(
+            G_ANALYZER.dispatch_useful_tokens({"decode_batch": 24}, "decode"),
+            24)
+        self.assertEqual(
+            G_ANALYZER.dispatch_useful_tokens(
+                {
+                    "decode_batch": 24,
+                    "decode_tokens": 20
+                }, "decode"), 20)
+        self.assertEqual(
+            G_ANALYZER.dispatch_useful_tokens(
+                {
+                    "prefill_batch": 4,
+                    "prefill_tokens": 128
+                }, "prefill"), 128)
+
     def setUp(self):
         self.repo = pathlib.Path("/tmp/lifetime-test-repo")
         self.config = {
@@ -89,6 +106,32 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(variants[0], variants[1])
         self.assertEqual(variants[1], variants[2])
         self.assertEqual(variants[2], variants[3])
+
+    def test_startup_calibration_is_explicit_and_keeps_serving_contract(self):
+        command = G_RUNNER.command_for(self.repo, self.config,
+                                       self.repo / "cell", "mixed",
+                                       "independent", 0, {
+                                           "startup_calibration": True,
+                                           "startup_budget_ms": 45000
+                                       })
+        values = environment(command)
+        self.assertEqual(values["TRT_EDGELLM_STARTUP_CALIBRATION"], "1")
+        self.assertEqual(values["TRT_EDGELLM_STARTUP_REQUIRE_COVERAGE"], "1")
+        self.assertEqual(values["TRT_EDGELLM_STARTUP_BUDGET_MS"], "45000")
+        self.assertNotIn("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES", values)
+        self.assertEqual(values["TRT_EDGELLM_MAX_DECODE_BATCH"], "24")
+        self.assertEqual(values["TRT_EDGELLM_FIXED_PREFILL_CHUNK"], "128")
+        self.assertEqual(command[command.index("--warmup-requests") + 1], "1")
+        self.assertNotIn("TRT_EDGELLM_STARTUP_CALIBRATION",
+                         environment(self.command("independent")))
+
+    def test_startup_variant_can_be_paired_with_unchanged_default(self):
+        values = environment(self.command("independent-startup"))
+        self.assertEqual(values["TRT_EDGELLM_PHASE_WORKSPACE_MODE"],
+                         "independent")
+        self.assertEqual(values["TRT_EDGELLM_MEASUREMENT_ENCODED_ADMISSION"],
+                         "lifetime")
+        self.assertEqual(values["TRT_EDGELLM_STARTUP_CALIBRATION"], "1")
 
     def test_lifetime_is_activated_only_at_measurement(self):
         values = environment(self.command("lifetime"))

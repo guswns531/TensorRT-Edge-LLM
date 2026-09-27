@@ -37,6 +37,55 @@ PhaseEnvironmentLookup lookup(std::map<std::string, std::string> values = {})
 }
 } // namespace
 
+TEST(PhaseServingExecutionOptionsTest, StartupCalibrationIsOptInAndRejectsInvalidBudget)
+{
+    EXPECT_FALSE(resolvePhaseStartupCalibrationOptions(lookup()).enabled);
+    auto const options = resolvePhaseStartupCalibrationOptions(
+        lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"}, {"TRT_EDGELLM_STARTUP_REQUIRE_COVERAGE", "1"}}));
+    EXPECT_TRUE(options.enabled);
+    EXPECT_TRUE(options.requireCoverage);
+    EXPECT_THROW(
+        resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_BUDGET_MS", "nan"}})), std::exception);
+    EXPECT_THROW(
+        resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_BUDGET_MS", "0"}})), std::exception);
+    EXPECT_THROW(
+        resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_REQUIRE_COVERAGE", "1"}})), std::exception);
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupProbesRespectFullOutputReservation)
+{
+    auto const probes = phaseStartupDecodeProbes(24, 8, 128, 2048, 192, 128, 4);
+    ASSERT_FALSE(probes.empty());
+    EXPECT_EQ(probes.front().batchSize, 1);
+    EXPECT_EQ(probes.back().batchSize, 24);
+    for (auto const& probe : probes)
+    {
+        EXPECT_LE(probe.batchSize, 24);
+        EXPECT_EQ(probe.promptTokens % 128, 0);
+        EXPECT_LE(probe.promptTokens + probe.outputTokens, 2048);
+        EXPECT_LE(((probe.promptTokens + probe.outputTokens + 127) / 128) * probe.batchSize, 192);
+        EXPECT_GE(probe.outputTokens, 4 + 2 * ((probe.batchSize + 7) / 8));
+    }
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupProbesDoNotInventCapacity)
+{
+    EXPECT_TRUE(phaseStartupDecodeProbes(64, 8, 128, 128, 256, 128, 4).empty());
+    auto const probes = phaseStartupDecodeProbes(64, 8, 128, 2048, 4, 128, 4);
+    ASSERT_FALSE(probes.empty());
+    EXPECT_LE(probes.back().batchSize, 2);
+    EXPECT_THROW(phaseStartupDecodeProbes(0, 8, 128, 2048, 256, 128, 4), std::exception);
+    EXPECT_THROW(phaseStartupDecodeProbes(64, 8, 128, 2048, 256, 0, 4), std::exception);
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupFrontierIsBoundedWithoutModelSpecificBatchList)
+{
+    auto const probes = phaseStartupDecodeProbes(64, 8, 128, 2048, 256, 128, 4);
+    EXPECT_LE(probes.size(), 14U);
+    EXPECT_EQ(probes.back().batchSize, 64);
+    EXPECT_LE(probes.back().promptTokens + probes.back().outputTokens, 512);
+}
+
 TEST(PhaseServingExecutionOptionsTest, SharedDefaultsPreserveFixedChunkAndBurstGrace)
 {
     PhaseQueueSchedulerConfig config;

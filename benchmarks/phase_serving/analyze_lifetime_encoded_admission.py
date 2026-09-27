@@ -122,6 +122,13 @@ def distribution(values):
     }
 
 
+def dispatch_useful_tokens(metric, phase):
+    """Compact vanilla-decode telemetry emits one token per active row."""
+    return metric.get(
+        phase + "_tokens",
+        metric.get("decode_batch", 0) if phase == "decode" else 0)
+
+
 def analyze_cell(cell):
     """Read only the measurement epoch; shared-slab accounting is emitted by the runtime."""
     metrics = []
@@ -167,7 +174,7 @@ def analyze_cell(cell):
             "histogram":
             dict(collections.Counter(m[phase + "_batch"] for m in selected)),
             "useful_tokens":
-            sum(m.get(phase + "_tokens", 0) for m in selected)
+            sum(dispatch_useful_tokens(m, phase) for m in selected)
         }
     dispatches["encoder"] = {
         "count":

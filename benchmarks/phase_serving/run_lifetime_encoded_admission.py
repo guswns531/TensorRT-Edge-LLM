@@ -17,6 +17,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import statistics
@@ -163,6 +164,10 @@ def command_for(repo,
     """Construct a restricted, network-free GPU backend with measured-boundary activation."""
     tools = repo / ".local/results/v0101-forward-port/replay-tools"
     options = options or {}
+    startup = options.get("startup_calibration",
+                          False) or variant == "independent-startup"
+    if variant == "independent-startup":
+        variant = "independent"
     build = pathlib.Path(
         options.get(
             "build_root",
@@ -325,6 +330,16 @@ def command_for(repo,
                 "TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES"] = warmup_decode_batches(
                     config["decode_batch"])
     environment.update(options.get("environment", {}))
+    if startup:
+        environment["TRT_EDGELLM_STARTUP_CALIBRATION"] = "1"
+        environment["TRT_EDGELLM_STARTUP_BUDGET_MS"] = options.get(
+            "startup_budget_ms", 30000)
+        environment["TRT_EDGELLM_STARTUP_REQUIRE_COVERAGE"] = "1"
+        environment[
+            "TRT_EDGELLM_STARTUP_REPORT"] = "/opt/results/run-{run}/startup.json"
+        environment["TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE"] = str(
+            repo / "examples/multimodal/pics/giant_panda.jpeg")
+        environment.pop("TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES", None)
     if not options.get("serving_overlap_probes", True):
         environment["TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES"] = "1"
 
@@ -363,11 +378,12 @@ def command_for(repo,
         "--request-timeout", "600", "--policy-warmup-mode", "generic",
         "--generic-warmup-trace",
         str(config["calibration"]), "--warmup-requests",
-        str(config["calibration_requests"]),
+        str(1 if startup else config["calibration_requests"]),
         "--phase-calibration-round-requests",
-        str(config["calibration_requests"]),
+        str(1 if startup else config["calibration_requests"]),
         "--phase-calibration-min-requests",
-        str(config["calibration_requests"]), "--ignore-eos", "--"
+        str(1 if startup else config["calibration_requests"]), "--ignore-eos",
+        "--"
     ] + backend
 
 
@@ -448,14 +464,15 @@ def parse_args(argv=None):
                                  "decode-heavy", "short", "text-heavy",
                                  "poisson", "wave-drain", "late-vision"),
                         default=["mixed", "vision-heavy", "multi-image"])
-    parser.add_argument(
-        "--variants",
-        nargs="+",
-        choices=("static-base", "static-large", "static-slot", "lifetime",
-                 "ownership", "chunked", "e1", "e2", "e-dynamic-shadow",
-                 "e-transition-shadow", "e-dynamic-active", "shared_ep",
-                 "tiered_ep", "independent", "unified_action"),
-        default=["independent"])
+    parser.add_argument("--variants",
+                        nargs="+",
+                        choices=("static-base", "static-large", "static-slot",
+                                 "lifetime", "ownership", "chunked", "e1",
+                                 "e2", "e-dynamic-shadow",
+                                 "e-transition-shadow", "e-dynamic-active",
+                                 "shared_ep", "tiered_ep", "independent",
+                                 "independent-startup", "unified_action"),
+                        default=["independent"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--full12", action="store_true")
     parser.add_argument("--build-root",
@@ -484,6 +501,13 @@ def parse_args(argv=None):
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--max-prefill-graphs", type=int, default=0)
     parser.add_argument(
+        "--startup-calibration",
+        action="store_true",
+        help=
+        "Calibrate a capability-derived frontier before readiness; fail on missing coverage"
+    )
+    parser.add_argument("--startup-budget-ms", type=float, default=30000)
+    parser.add_argument(
         "--serving-overlap-probes",
         choices=("on", "off"),
         default="on",
@@ -502,6 +526,9 @@ def parse_args(argv=None):
             args.max_decode_graphs, args.max_prefill_graphs) < 0:
         parser.error(
             "Repeat count must be positive and byte budget non-negative")
+    if not math.isfinite(
+            args.startup_budget_ms) or args.startup_budget_ms <= 0:
+        parser.error("Startup budget must be finite and positive")
     return args
 
 
@@ -646,6 +673,10 @@ def main():
                             args.telemetry_level,
                             "serving_overlap_probes":
                             args.serving_overlap_probes == "on",
+                            "startup_calibration":
+                            args.startup_calibration,
+                            "startup_budget_ms":
+                            args.startup_budget_ms,
                             "environment": {
                                 "TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR":
                                 "1" if predictor == "on" else "0",
@@ -707,8 +738,22 @@ def main():
         "activation":
         "drained post-calibration boundary; common static initialization per model",
         "calibration": {
-            m: configs[m]["calibration_requests"]
+            m:
+            1
+            if args.startup_calibration else configs[m]["calibration_requests"]
             for m in configs
+        },
+        "startup_calibration": {
+            "enabled":
+            args.startup_calibration,
+            "explicit_startup_variant":
+            "independent-startup" in args.variants,
+            "budget_ms":
+            args.startup_budget_ms,
+            "coverage_required":
+            args.startup_calibration,
+            "http_warmup_role":
+            "epoch_marker" if args.startup_calibration else "generic_trace",
         },
         "frozen_vllm": {
             m: str(configs[m]["frozen_vllm"])
@@ -722,7 +767,8 @@ def main():
             "notes/301-lifetime-encoded-admission-two-model-plan-20260913.md",
             "notes/303-service-admission-cause-and-experiment-20260914.md",
             "notes/305-small-encoder-progressive-overlap-20260914.md",
-            "notes/330-runtime-contract-revalidation-plan-20260926.md"
+            "notes/330-runtime-contract-revalidation-plan-20260926.md",
+            "notes/340-startup-calibration-and-readiness-20260927.md"
         ],
         "compress_closed_logs":
         args.compress_closed_logs

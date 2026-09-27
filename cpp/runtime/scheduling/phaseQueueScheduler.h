@@ -819,6 +819,8 @@ public:
     //! workload policy input.
     void setGlobalExecutionVariantSupplier(
         std::function<PhaseExecutionVariant(PhaseGlobalActionKey const& key, int32_t primaryTokenCount)> supplier);
+    //! Match calibration coverage to the execution path used by the current bindings.
+    PhaseExecutionVariant executionVariantFor(PhaseGlobalActionKey const& key, int32_t primaryTokenCount) const;
     //! Largest dense decode cohort whose covered p95 GPU step fits one TPOT target.
     size_t decodeAdmissionLimitForTpot(double targetUs, int32_t maxContextLength) const noexcept;
     //! Keep runtime decode refinement out of latency mode while retaining recent samples.

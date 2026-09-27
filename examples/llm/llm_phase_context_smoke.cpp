@@ -1752,7 +1752,17 @@ int main(int argc, char** argv)
         rt::IndependentPhaseCoordinatorCallbacks seedCallbacks;
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
+        rt::PhaseStartupCalibrationOptions const startupOptions = rt::resolvePhaseStartupCalibrationOptions();
+        if (startupOptions.enabled)
+        {
+            ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
+                "Startup calibration requires the active global scheduler");
+            semanticSchedulerConfig.decodeBatchCosts.clear();
+            semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
+        }
         PhasePolicyWarmupMode const policyWarmupMode = phasePolicyWarmupMode();
+        ELLM_CHECK(!startupOptions.enabled || policyWarmupMode == PhasePolicyWarmupMode::kGeneric,
+            "Startup calibration requires generic mode so measurement history survives readiness");
         rt::PhasePolicyMode phasePolicyMode{rt::PhasePolicyMode::kExact};
         if (char const* value = std::getenv("TRT_EDGELLM_PHASE_POLICY"))
         {
@@ -2252,6 +2262,19 @@ int main(int argc, char** argv)
             size_t const warmupAdmissionLimit = serverConfig.enableAdaptiveAdmission
                 ? serverConfig.latencyInFlightRequests
                 : serverConfig.maxInFlightRequests;
+            auto const startupBegin = std::chrono::steady_clock::now();
+            auto startupElapsedMs = [&]() {
+                return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startupBegin)
+                    .count();
+            };
+            nlohmann::json startupReport{{"enabled", startupOptions.enabled}, {"scope", "planned_probe_frontier"},
+                {"decode", nlohmann::json::array()}, {"encoder", nlohmann::json::array()},
+                {"static_decode_table", !startupOptions.enabled}, {"budget_ms", startupOptions.budgetMs},
+                {"prefill_batch_limit", semanticSchedulerConfig.maxPrefillBatchSize},
+                {"decode_batch_limit", semanticSchedulerConfig.maxDecodeBatchSize},
+                {"kv_physical_pages", ownership.config().numPages},
+                {"kv_allocatable_pages", ownership.config().allocatablePages}};
+            bool startupCoverage = true;
             int32_t const warmupBatchLimit
                 = std::min(semanticSchedulerConfig.maxDecodeBatchSize, static_cast<int32_t>(warmupAdmissionLimit));
             struct DecodeWarmupShape
@@ -2354,6 +2377,10 @@ int main(int argc, char** argv)
             ELLM_CHECK(warmupPollGuard > 0U, "Phase IPC warmup poll guard must be positive");
             for (DecodeWarmupShape const& shape : executionWarmupShapes)
             {
+                if (startupOptions.enabled && startupElapsedMs() >= startupOptions.budgetMs)
+                {
+                    break;
+                }
                 int32_t const batchSize = shape.batchSize;
                 std::vector<int32_t> warmupPrompt = semanticPrompts.at(20000);
                 if (shape.promptTokens > 0)
@@ -2454,6 +2481,92 @@ int main(int argc, char** argv)
                     }
                     stageTokens(views, *decodeIO, decodeMap, stream, false);
                 });
+            if (startupOptions.enabled)
+            {
+                auto const& capacity = ownership.config();
+                auto const probes = rt::phaseStartupDecodeProbes(warmupBatchLimit,
+                    semanticSchedulerConfig.maxPrefillBatchSize, semanticSchedulerConfig.maxPrefillChunkTokens,
+                    config.maxKVCacheCapacity, capacity.allocatablePages, capacity.tokensPerPage,
+                    static_cast<int32_t>(runtimeCostConfig.actionMinimumSamples));
+                startupCoverage = !probes.empty() && probes.back().batchSize == warmupBatchLimit;
+                size_t probeRequests{};
+                for (auto const& probe : probes)
+                {
+                    int32_t const bucketTokens = semanticSchedulerConfig.runtimeDecodeContextBucketTokens;
+                    rt::PhaseGlobalActionKey key{rt::PhaseGlobalActionKind::kDecode, probe.batchSize, 0, 1,
+                        (probe.promptTokens + probe.outputTokens - 1 + bucketTokens - 1) / bucketTokens, 0};
+                    auto estimate = [&]() {
+                        key.executionVariant = semanticCoordinator.scheduler().executionVariantFor(key, 0);
+                        return runtimeCostTracker->trustedEstimate(key);
+                    };
+                    rt::PhaseGlobalActionKey prefillKey{rt::PhaseGlobalActionKind::kPrefill,
+                        std::min(probe.batchSize, semanticSchedulerConfig.maxPrefillBatchSize), 0,
+                        semanticSchedulerConfig.maxPrefillChunkTokens, 0, 0};
+                    prefillKey.primaryWorkClass = static_cast<int32_t>(rt::PhasePrefillClass::kText);
+                    auto prefillEstimate = [&]() {
+                        prefillKey.executionVariant = semanticCoordinator.scheduler().executionVariantFor(
+                            prefillKey, prefillKey.primaryBatchSize * prefillKey.chunkLength);
+                        return runtimeCostTracker->trustedEstimate(prefillKey);
+                    };
+                    size_t rounds{};
+                    while ((!estimate().has_value() || !prefillEstimate().has_value())
+                        && startupElapsedMs() < startupOptions.budgetMs && rounds < runtimeCostConfig.action.windowSize)
+                    {
+                        std::vector<int32_t> prompt = semanticPrompts.at(20000);
+                        ELLM_CHECK(!prompt.empty(), "Startup calibration requires a nonempty text seed");
+                        prompt.resize(static_cast<size_t>(probe.promptTokens), prompt.back());
+                        for (int32_t row{}; row < probe.batchSize; ++row)
+                        {
+                            auto const submission
+                                = semanticServer.submit(warmupRequestId++, prompt, probe.outputTokens);
+                            ELLM_CHECK(submission.status == rt::IndependentPhaseServerStatus::kAdmitted,
+                                "Startup probe exceeded the validated admission/KV frontier");
+                        }
+                        semanticServer.runUntilIdle(warmupPollGuard);
+                        size_t completed{};
+                        while (semanticServer.tryPopCompletion().has_value())
+                        {
+                            ++completed;
+                        }
+                        while (semanticServer.tryPopToken().has_value())
+                        {
+                        }
+                        if (semanticPrefixCache != nullptr)
+                        {
+                            semanticPrefixCache->clear();
+                        }
+                        ELLM_CHECK(completed == static_cast<size_t>(probe.batchSize)
+                                && ownership.availableSlots() == maxStableSlots,
+                            "Startup probe must drain all requests and stable leases");
+                        probeRequests += completed;
+                        ++rounds;
+                    }
+                    auto const cost = estimate();
+                    auto const prefillCost = prefillEstimate();
+                    startupCoverage = startupCoverage && cost.has_value() && prefillCost.has_value();
+                    nlohmann::json record{{"batch", probe.batchSize}, {"prompt_tokens", probe.promptTokens},
+                        {"output_tokens", probe.outputTokens}, {"context_bucket", key.primaryContextBucket},
+                        {"variant", rt::phaseExecutionVariantName(key.executionVariant)}, {"rounds", rounds},
+                        {"samples", runtimeCostTracker->sampleCount(key)}, {"covered", cost.has_value()}};
+                    record["prefill_batch"] = prefillKey.primaryBatchSize;
+                    record["prefill_covered"] = prefillCost.has_value();
+                    record["prefill_samples"] = runtimeCostTracker->sampleCount(prefillKey);
+                    record["prefill_variant"] = rt::phaseExecutionVariantName(prefillKey.executionVariant);
+                    if (prefillCost.has_value())
+                    {
+                        record["prefill_median_ms"] = prefillCost->makespanMedianMs;
+                    }
+                    if (cost.has_value())
+                    {
+                        record["median_ms"] = cost->makespanMedianMs;
+                        record["sample_p95_ms"] = cost->makespanP95Ms;
+                        record["uncertainty_ms"] = cost->uncertaintyMs;
+                    }
+                    startupReport["decode"].push_back(std::move(record));
+                }
+                startupReport["decode_probe_requests"] = probeRequests;
+                semanticCoordinator.scheduler().resetSchedulingHistory();
+            }
             LOG_INFO("Phase IPC shape warmup: mode=%s batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",
                 phasePolicyWarmupModeName(policyWarmupMode), executionWarmupShapes.size(), warmedRequests,
                 warmupTelemetry.overlapSampleCount, warmupTelemetry.globalSafeProbeCount);
@@ -2782,15 +2895,23 @@ int main(int argc, char** argv)
                     };
                     size_t const encoderInputTokensPerRequest
                         = ipcVisionAdapter->estimateInputTokens(makeCalibrationRequest());
-                    ELLM_CHECK(encoderInputTokensPerRequest > 0U,
-                        "Encoder calibration image produced no encoder input tokens");
+                    size_t const encoderProfileTokensPerRequest
+                        = ipcVisionAdapter->estimateProfileInputTokens(makeCalibrationRequest());
+                    ELLM_CHECK(encoderInputTokensPerRequest > 0U || encoderProfileTokensPerRequest > 0U,
+                        "Encoder calibration image has no supported input-size estimate");
                     size_t encoderCalibrationLimit
                         = std::min(threePhaseConfig.maxEncoderBatchSize, threePhaseConfig.maxEncodedInFlight);
                     size_t const encoderInputTokenLimit = ipcVisionAdapter->maxInputTokens();
-                    if (encoderInputTokenLimit > 0U)
+                    if (encoderInputTokenLimit > 0U && encoderInputTokensPerRequest > 0U)
                     {
                         encoderCalibrationLimit
                             = std::min(encoderCalibrationLimit, encoderInputTokenLimit / encoderInputTokensPerRequest);
+                    }
+                    int64_t const encoderProfileTokenLimit = ipcVisionRunner->profileInputTokenLimitForProfile(0);
+                    if (encoderProfileTokenLimit > 0 && encoderProfileTokensPerRequest > 0U)
+                    {
+                        encoderCalibrationLimit = std::min(encoderCalibrationLimit,
+                            static_cast<size_t>(encoderProfileTokenLimit) / encoderProfileTokensPerRequest);
                     }
                     ELLM_CHECK(encoderCalibrationLimit > 0U,
                         "Encoder calibration image exceeds the physical encoder token profile");
@@ -2854,9 +2975,28 @@ int main(int argc, char** argv)
                                 : 0U;
                             for (size_t sample{}; sample < requiredExecutions; ++sample)
                             {
+                                if (startupOptions.enabled && startupElapsedMs() >= startupOptions.budgetMs)
+                                {
+                                    break;
+                                }
                                 submitEncoderCalibrationBatch(calibration, batchSize);
                                 drainCalibration(calibration, batchSize);
                                 ++encoderCalibrationExecutions;
+                            }
+                            if (startupOptions.enabled)
+                            {
+                                auto const cost = runtimeCostTracker->trustedEstimate(encoderKey);
+                                startupCoverage = startupCoverage && cost.has_value();
+                                nlohmann::json record{{"batch", batchSize}, {"input_tokens", totalInputTokens},
+                                    {"profile_input_tokens", encoderProfileTokensPerRequest * batchSize},
+                                    {"covered", cost.has_value()},
+                                    {"samples", runtimeCostTracker->sampleCount(encoderKey)}};
+                                if (cost.has_value())
+                                {
+                                    record["median_ms"] = cost->makespanMedianMs;
+                                    record["sample_p95_ms"] = cost->makespanP95Ms;
+                                }
+                                startupReport["encoder"].push_back(std::move(record));
                             }
                         }
                         if (calibrateEncoderDecode)
@@ -2865,6 +3005,10 @@ int main(int argc, char** argv)
                             {
                                 for (size_t sample{}; sample < encoderCalibrationSamples; ++sample)
                                 {
+                                    if (startupOptions.enabled && startupElapsedMs() >= startupOptions.budgetMs)
+                                    {
+                                        break;
+                                    }
                                     std::vector<rt::PhaseGlobalOverlapCostRecord> const diagnostics
                                         = calibration.globalCalibrationDiagnostics();
                                     bool const calibrated = std::any_of(diagnostics.begin(), diagnostics.end(),
@@ -2946,6 +3090,31 @@ int main(int argc, char** argv)
             {
                 ELLM_CHECK(encoderCalibrationImage == nullptr,
                     "Encoder calibration image requires TRT_EDGELLM_VISION_ENGINE_DIR");
+            }
+            if (startupOptions.enabled)
+            {
+                startupCoverage = startupCoverage && (visionEngineDir == nullptr || encoderCalibrationImage != nullptr);
+                startupReport["frontier_covered"] = startupCoverage;
+                startupReport["status"] = startupCoverage ? "calibrated_frontier" : "degraded";
+                startupReport["elapsed_ms"] = startupElapsedMs();
+                startupReport["budget_exhausted"] = startupElapsedMs() >= startupOptions.budgetMs;
+                startupReport["encoder_fixture_available"] = encoderCalibrationImage != nullptr;
+                size_t freeBytes{}, totalBytes{};
+                CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+                startupReport["free_gpu_bytes"] = freeBytes;
+                startupReport["total_gpu_bytes"] = totalBytes;
+                startupReport["decode_graph_entries"] = semanticCoordinator.decodeGraphCacheStats().entries;
+                startupReport["prefill_graph_entries"] = semanticCoordinator.prefillGraphCacheStats().entries;
+                if (char const* path = std::getenv("TRT_EDGELLM_STARTUP_REPORT"))
+                {
+                    std::ofstream report(path);
+                    ELLM_CHECK(report.good(), "Cannot open startup calibration report");
+                    report << startupReport.dump(2) << '\n';
+                    report.flush();
+                    ELLM_CHECK(report.good(), "Cannot write startup calibration report");
+                }
+                ELLM_CHECK(!startupOptions.requireCoverage || startupCoverage,
+                    "Startup coverage incomplete; serving readiness withheld");
             }
             std::deque<rt::PhaseTimelineEvent> phaseTimelineEvents;
             std::deque<rt::PhaseVisionEncoderBatchMetric> encoderBatchMetrics;
@@ -3234,7 +3403,7 @@ int main(int argc, char** argv)
                 std::lock_guard<std::mutex> lock(pendingMutex);
                 inputClosed = true;
             });
-            emitEvent({{"type", "ready"}});
+            emitEvent({{"type", "ready"}, {"startup_calibration", startupReport}});
             size_t emittedMetrics = semanticCoordinator.metrics().size();
             size_t measurementEpoch{};
             double ipcIngressUs{};

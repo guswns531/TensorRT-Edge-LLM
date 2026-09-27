@@ -4261,6 +4261,13 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
     return minimumDrainCandidate->batchSize;
 }
 
+PhaseExecutionVariant PhaseQueueScheduler::executionVariantFor(
+    PhaseGlobalActionKey const& key, int32_t primaryTokenCount) const
+{
+    return mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, primaryTokenCount)
+                                           : PhaseExecutionVariant::kEager;
+}
+
 std::optional<float> PhaseQueueScheduler::measuredDecodeP95(int32_t batchSize, int32_t maxContextLength) const
 {
     if (!mConfig.enableMeasuredDecodeBatching || batchSize <= 0 || maxContextLength < 0)
@@ -4270,8 +4277,7 @@ std::optional<float> PhaseQueueScheduler::measuredDecodeP95(int32_t batchSize, i
     int32_t const contextBucketTokens = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
     int32_t const contextBucket = (maxContextLength + contextBucketTokens - 1) / contextBucketTokens;
     PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batchSize, 0, 1, contextBucket, 0};
-    key.executionVariant
-        = mGlobalExecutionVariantSupplier ? mGlobalExecutionVariantSupplier(key, 0) : PhaseExecutionVariant::kEager;
+    key.executionVariant = executionVariantFor(key, 0);
     std::optional<PhaseGlobalCostEstimate> estimate = mRuntimeCostTracker->trustedEstimate(key);
     if (!estimate.has_value())
     {

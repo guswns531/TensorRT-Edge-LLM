@@ -49,4 +49,27 @@ PhaseGraphExecutionOptions resolvePhaseGraphExecutionOptions(
 //! Cover the maximum cohort and geometric smaller shapes before remaining sizes.
 std::vector<int32_t> phaseDecodeGraphWarmupBatches(int32_t maxBatchSize);
 
+struct PhaseStartupCalibrationOptions
+{
+    bool enabled{};
+    bool requireCoverage{};
+    double budgetMs{30000.0}; //!< Stop admitting probes at the deadline; drain submitted work before readiness.
+};
+
+PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(
+    PhaseEnvironmentLookup const& environment = std::getenv);
+
+struct PhaseStartupDecodeProbe
+{
+    int32_t batchSize{};
+    int32_t promptTokens{};
+    int32_t outputTokens{};
+};
+
+//! A bounded geometric frontier constrained by full-output KV reservation.
+//! These are calibration shapes, not serving batch-size limits.
+std::vector<PhaseStartupDecodeProbe> phaseStartupDecodeProbes(int32_t maxDecodeBatch, int32_t maxPrefillBatch,
+    int32_t chunkTokens, int32_t maxSequenceLength, int32_t allocatablePages, int32_t tokensPerPage,
+    int32_t minimumSamples);
+
 } // namespace trt_edgellm::rt

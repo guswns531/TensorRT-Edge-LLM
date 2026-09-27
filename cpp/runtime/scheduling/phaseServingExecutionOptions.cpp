@@ -48,6 +48,57 @@ size_t parseNonnegative(char const* value)
 
 } // namespace
 
+PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(PhaseEnvironmentLookup const& environment)
+{
+    PhaseStartupCalibrationOptions options;
+    if (char const* value = environment("TRT_EDGELLM_STARTUP_CALIBRATION"))
+    {
+        options.enabled = parseBoolean(value);
+    }
+    if (char const* value = environment("TRT_EDGELLM_STARTUP_REQUIRE_COVERAGE"))
+    {
+        options.requireCoverage = parseBoolean(value);
+    }
+    if (char const* value = environment("TRT_EDGELLM_STARTUP_BUDGET_MS"))
+    {
+        options.budgetMs = std::stod(value);
+    }
+    ELLM_CHECK(std::isfinite(options.budgetMs) && options.budgetMs > 0.0,
+        "Startup calibration budget must be finite and positive");
+    ELLM_CHECK(!options.requireCoverage || options.enabled, "Required startup coverage needs calibration enabled");
+    return options;
+}
+
+std::vector<PhaseStartupDecodeProbe> phaseStartupDecodeProbes(int32_t maxDecodeBatch, int32_t maxPrefillBatch,
+    int32_t chunkTokens, int32_t maxSequenceLength, int32_t allocatablePages, int32_t tokensPerPage,
+    int32_t minimumSamples)
+{
+    ELLM_CHECK(maxDecodeBatch > 0 && maxPrefillBatch > 0 && chunkTokens > 0 && maxSequenceLength > 0
+            && allocatablePages > 0 && tokensPerPage > 0 && minimumSamples > 0,
+        "Startup probe capabilities must be positive");
+    std::vector<PhaseStartupDecodeProbe> probes;
+    for (int32_t rows = 1;; rows = static_cast<int32_t>(std::min<int64_t>(maxDecodeBatch, int64_t{rows} * 2)))
+    {
+        int64_t const prefillTurns = (int64_t{rows} + maxPrefillBatch - 1) / maxPrefillBatch;
+        int64_t const output = 2 * prefillTurns + minimumSamples + 2;
+        int64_t const capacity = std::min<int64_t>(maxSequenceLength, int64_t{allocatablePages / rows} * tokensPerPage);
+        int64_t const longest = ((capacity - output) / chunkTokens) * chunkTokens;
+        if (capacity >= output + chunkTokens && longest > 0)
+        {
+            probes.push_back({rows, chunkTokens, static_cast<int32_t>(output)});
+            if (longest > chunkTokens)
+            {
+                probes.push_back({rows, static_cast<int32_t>(longest), static_cast<int32_t>(output)});
+            }
+        }
+        if (rows == maxDecodeBatch)
+        {
+            break;
+        }
+    }
+    return probes;
+}
+
 void resolvePhasePrefillExecutionOptions(
     PhaseQueueSchedulerConfig& config, int32_t engineChunkLimit, PhaseEnvironmentLookup const& environment)
 {
