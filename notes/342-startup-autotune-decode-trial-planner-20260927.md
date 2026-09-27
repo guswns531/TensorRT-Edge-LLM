@@ -3,6 +3,8 @@
 
 # 342. Startup autotuning step 1: decode trial planner
 
+후속 직접 비교 결과: [343. Equal-work decode trials](343-startup-decode-equal-work-trials-20260927.md).
+
 ## 범위
 
 사용자의 요청은 시작 시 짧은 자동 실험으로 실행 설정을 고르되, 한 단계씩 필수 실험만 수행하는 것이다.

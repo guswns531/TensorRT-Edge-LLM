@@ -873,6 +873,15 @@ int main(int argc, char** argv)
         rt::StableKVPageManager ownership(
             {maxStableSlots, maxPhaseBatch, config.kvPoolPages, config.maxKVCacheCapacity, 128, allocatableKVPages});
         LOG_INFO("KV pool: physical=%d allocatable=%d pages", config.kvPoolPages, ownership.config().allocatablePages);
+        if (char const* trialPath = std::getenv("TRT_EDGELLM_DECODE_EQUAL_WORK_TRIAL"))
+        {
+#include "phaseDecodeEqualWorkTrial.inc"
+            CUDA_CHECK(cudaStreamDestroy(setupStream));
+            CUDA_CHECK(cudaStreamDestroy(prefillStream));
+            CUDA_CHECK(cudaStreamDestroy(decodeStream));
+            CUDA_CHECK(cudaStreamDestroy(copyStream));
+            return EXIT_SUCCESS;
+        }
         bool const semanticOnly = std::getenv("TRT_EDGELLM_SEMANTIC_ONLY") != nullptr;
         if (!semanticOnly)
         {
