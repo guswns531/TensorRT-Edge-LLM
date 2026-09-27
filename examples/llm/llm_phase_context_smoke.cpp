@@ -2039,6 +2039,11 @@ int main(int argc, char** argv)
         }
         rt::IndependentPhaseAsyncServer semanticServer(
             serverConfig, semanticCoordinator, ownership, std::move(semanticAdapter), semanticPrefixCache.get());
+        if (char const* trialPath = std::getenv("TRT_EDGELLM_ASYNC_DECODE_TRIAL"))
+        {
+#include "phaseAsyncDecodeTrial.inc"
+            return 0;
+        }
         char const* activityPrefixValue = std::getenv("TRT_EDGELLM_PHASE_ACTIVITY_PREFIX");
         std::unique_ptr<rt::PhaseActivityTimelineRecorder> activityTimeline;
         std::filesystem::path activityPrefix;
