@@ -406,6 +406,7 @@ def command_for(repo,
         IMAGE, "/opt/edgellm/examples/llm/llm_phase_context_smoke",
         "/opt/model", "/opt/hf"
     ]
+    client_limit = options.get("client_max_in_flight") or config["in_flight"]
     return [
         sys.executable,
         str(tools / "run_phase_http_trace_bench.py"), "--gateway-script",
@@ -414,10 +415,9 @@ def command_for(repo,
         str(config["traces"][workload]), "--output-dir",
         str(cell), "--model", config["model"], "--repeats", "1",
         "--max-workers",
-        str(config["in_flight"]), "--max-in-flight",
-        str(config["in_flight"]), "--ready-timeout", "180",
-        "--request-timeout", "600", "--policy-warmup-mode", "generic",
-        "--generic-warmup-trace",
+        str(client_limit), "--max-in-flight",
+        str(client_limit), "--ready-timeout", "180", "--request-timeout",
+        "600", "--policy-warmup-mode", "generic", "--generic-warmup-trace",
         str(config["calibration"]), "--warmup-requests",
         str(1 if calibration["compact_http"] else
             config["calibration_requests"]),
@@ -546,6 +546,7 @@ def parse_args(argv=None):
         action="store_true",
         help="Record ready decode rows and measured-service DP partitions")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
+    parser.add_argument("--client-max-in-flight", type=int, default=0)
     parser.add_argument("--max-prefill-graphs", type=int, default=0)
     parser.add_argument(
         "--startup-calibration",
@@ -569,10 +570,9 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--compress-closed-logs", action="store_true")
     args = parser.parse_args(argv)
-    if args.repeats < 1 or args.byte_budget < 0 or min(
+    if args.repeats < 1 or args.byte_budget < 0 or args.client_max_in_flight < 0 or min(
             args.max_decode_graphs, args.max_prefill_graphs) < 0:
-        parser.error(
-            "Repeat count must be positive and byte budget non-negative")
+        parser.error("Repeat count must be positive and budgets non-negative")
     if not math.isfinite(
             args.startup_budget_ms) or args.startup_budget_ms <= 0:
         parser.error("Startup budget must be finite and positive")
@@ -720,6 +720,8 @@ def main():
                             args.telemetry_level,
                             "decode_partition_diagnostic":
                             args.decode_partition_diagnostic,
+                            "client_max_in_flight":
+                            args.client_max_in_flight,
                             "serving_overlap_probes":
                             args.serving_overlap_probes == "on",
                             "startup_calibration":

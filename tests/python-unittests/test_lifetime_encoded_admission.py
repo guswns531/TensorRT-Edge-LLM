@@ -248,6 +248,18 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(ablation.pop(key), "1")
         self.assertEqual(default, ablation)
 
+    def test_client_inflight_override_changes_only_arrival_gate(self):
+        default = self.command("independent-autotune-service")
+        diagnostic = G_RUNNER.command_for(self.repo, self.config,
+                                          self.repo / "cell", "mixed",
+                                          "independent-autotune-service", 0,
+                                          {"client_max_in_flight": 64})
+        for flag in ("--max-workers", "--max-in-flight"):
+            self.assertEqual(default[default.index(flag) + 1], "24")
+            self.assertEqual(diagnostic[diagnostic.index(flag) + 1], "64")
+            diagnostic[diagnostic.index(flag) + 1] = "24"
+        self.assertEqual(default, diagnostic)
+
     def test_serving_defaults_match_repeated_configuration(self):
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
             args = G_RUNNER.parse_args([])
