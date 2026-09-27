@@ -63,7 +63,10 @@ class PrefillArrivalCouplingTest(unittest.TestCase):
             "event_kind": "decision",
             "decision_id": 1,
             "action_kind": "prefill",
-            "ready_prefill_request_ids": ready
+            "ready_prefill_request_ids": ready,
+            "prefill_formation": {
+                "seed_request_id": ready[0]
+            }
         }]
 
     def test_pairs_actual_sends_with_ready_prefill_state(self):
@@ -79,6 +82,8 @@ class PrefillArrivalCouplingTest(unittest.TestCase):
         mismatch = result["first_prefill_mismatch"]
         self.assertEqual(mismatch["left_ready_prefill_ids"], [0, 1])
         self.assertEqual(mismatch["right_ready_prefill_ids"], [0])
+        self.assertEqual(mismatch["left_prefill_formation"]["seed_request_id"],
+                         0)
 
     def test_rejects_different_scheduled_work(self):
         left = self.requests([0, 1000])

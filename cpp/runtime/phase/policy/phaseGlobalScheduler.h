@@ -115,6 +115,34 @@ struct PhaseGlobalSelectionAudit
     PhaseGlobalDecision pdDecision;
     std::optional<PhaseDecodeGuardAudit> decodeGuard;
     std::optional<PhaseDecodeGuardAudit> pdDecodeGuard;
+    struct PrefillShapeCandidate
+    {
+        int32_t chunkLength{};
+        int32_t batchSize{};
+        int32_t usefulTokens{};
+        float gpuMs{};
+        float decodeInterferenceMs{};
+        float efficiency{};
+        bool measuredCost{};
+        bool feasible{};
+        std::vector<uint64_t> requestIds;
+    };
+    struct PrefillFormation
+    {
+        uint64_t seedRequestId{};
+        int32_t seedTokens{};
+        std::vector<uint64_t> readyRequestIds;
+        std::vector<int32_t> readyTokenCounts;
+        std::vector<double> readyWaitUs;
+        std::vector<double> readyReferenceUs;
+        std::vector<double> readyServiceAgeQuanta;
+        std::vector<uint64_t> activeCohortIds;
+        std::vector<uint64_t> compatibleRequestIds;
+        std::vector<PrefillShapeCandidate> shapeCandidates;
+        int32_t selectedChunk{};
+        int32_t selectedBatch{};
+        bool drainMode{};
+    } prefillFormation;
 };
 
 //! Profile-free selector shared by text and multimodal request DAGs.

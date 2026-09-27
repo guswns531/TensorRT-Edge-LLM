@@ -462,6 +462,7 @@ TEST(PhaseQueueSchedulerTest, GlobalCandidateUsesLegacyPrefillFormationExactly)
 TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
 {
     PhaseQueueSchedulerConfig config;
+    config.capturePrefillFormationTrace = true;
     config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
     config.globalSafeProbeSlackMultiplier = 0.0F;
     config.prefillQueueWaitTargetUs = 1.0e9;
@@ -476,6 +477,11 @@ TEST(PhaseQueueSchedulerTest, GlobalSerialPhaseChoicesUseCommonDecisionHorizon)
     std::optional<PhaseGlobalActionCandidate> const candidate = scheduler.previewGlobalAction(&audit);
 
     ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(audit.prefillFormation.seedRequestId, 1U);
+    EXPECT_EQ(audit.prefillFormation.readyRequestIds, (std::vector<uint64_t>{1}));
+    ASSERT_EQ(audit.prefillFormation.readyServiceAgeQuanta.size(), 1U);
+    EXPECT_GE(audit.prefillFormation.readyServiceAgeQuanta[0], 0.0);
+    EXPECT_EQ(audit.prefillFormation.selectedBatch, 1);
     ASSERT_TRUE(audit.decision.selectedIndex.has_value());
     EXPECT_EQ(audit.inputs.at(*audit.decision.selectedIndex).candidateId, candidate->candidateId);
     EXPECT_EQ(audit.inputs.size(), scheduler.lastGlobalPreviewCandidates().size());
@@ -2710,6 +2716,50 @@ TEST(PhaseQueueSchedulerTest, ServiceScaledModeDoesNotCreateImplicitDeadlines)
     EXPECT_GT(state.decodeMaxSloPressure, 1.0);
 }
 
+TEST(PhaseQueueSchedulerTest, SparseCoveringPrefillCostCanChangeWavefrontSeed)
+{
+    auto makeScheduler = [](bool includeSlowCover) {
+        PhaseRuntimeCostTrackerConfig trackerConfig;
+        trackerConfig.actionMinimumSamples = 4U;
+        auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+        PhaseGlobalActionKey key{PhaseGlobalActionKind::kPrefill, 1, 0, 128, 0, 0};
+        key.primaryWorkClass = static_cast<int32_t>(PhasePrefillClass::kText);
+        for (int32_t sample{}; sample < 4; ++sample)
+        {
+            tracker->observe(key, {18.0F, 18.0F});
+        }
+        if (includeSlowCover)
+        {
+            key.chunkLength = 37;
+            tracker->observe(key, {15.0F, 15.0F});
+            tracker->observe(key, {42.0F, 42.0F});
+        }
+        PhaseQueueSchedulerConfig config;
+        config.policyMode = PhasePolicyMode::kServiceScaledTransition;
+        config.maxPrefillBatchSize = 2;
+        config.maxPrefillChunkTokens = 128;
+        config.enableWavefrontPrefillBatching = true;
+        config.enableRaggedPrefillBatching = true;
+        config.capturePrefillFormationTrace = true;
+        config.runtimeCostTracker = tracker;
+        return PhaseQueueScheduler(config);
+    };
+    PhaseQueueScheduler baseline = makeScheduler(false);
+    PhaseQueueScheduler sparse = makeScheduler(true);
+    for (PhaseQueueScheduler* scheduler : {&baseline, &sparse})
+    {
+        scheduler->enqueuePrefill({1, 33, 0, 0, 33});
+        scheduler->enqueuePrefill({3, 38, 1, 0, 38});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    PhaseDispatchPlan const baselinePlan = baseline.next();
+    PhaseDispatchPlan const sparsePlan = sparse.next();
+    EXPECT_EQ(baselinePlan.prefillFormation.seedRequestId, 1U);
+    EXPECT_EQ(sparsePlan.prefillFormation.seedRequestId, 3U);
+    EXPECT_GT(sparsePlan.prefillFormation.readyReferenceUs[0], sparsePlan.prefillFormation.readyReferenceUs[1]);
+}
+
 TEST(PhaseQueueSchedulerTest, ServiceScaledModeKeepsExplicitDeadlinesAbsolute)
 {
     PhaseQueueSchedulerConfig config;
@@ -3174,6 +3224,7 @@ TEST(PhaseQueueSchedulerTest, RejectsInvalidAdaptiveChunkCandidates)
 TEST(PhaseQueueSchedulerTest, JointPrefillShapeTradesThroughputForDecodeInterference)
 {
     PhaseQueueSchedulerConfig config;
+    config.capturePrefillFormationTrace = true;
     config.maxPrefillBatchSize = 4;
     config.maxDecodeBatchSize = 1;
     config.maxPrefillChunkTokens = 128;
@@ -3202,6 +3253,12 @@ TEST(PhaseQueueSchedulerTest, JointPrefillShapeTradesThroughputForDecodeInterfer
     EXPECT_FLOAT_EQ(plan.predictedPrefillGpuMs, 8.0F);
     EXPECT_FLOAT_EQ(plan.predictedDecodeSlowdownMs, 1.0F);
     EXPECT_NEAR(plan.predictedPrefillShapeScore, 256.0F / 9.0F, 1.0e-5F);
+    ASSERT_EQ(plan.prefillFormation.shapeCandidates.size(), 2U);
+    EXPECT_EQ(plan.prefillFormation.seedRequestId, 1U);
+    EXPECT_EQ(plan.prefillFormation.selectedChunk, 64);
+    EXPECT_EQ(plan.prefillFormation.selectedBatch, 4);
+    EXPECT_EQ(plan.prefillFormation.shapeCandidates[0].chunkLength, 64);
+    EXPECT_EQ(plan.prefillFormation.shapeCandidates[1].chunkLength, 128);
 }
 
 TEST(PhaseQueueSchedulerTest, JointPrefillShapeCanMaximizePrefillThroughput)

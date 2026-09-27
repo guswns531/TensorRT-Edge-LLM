@@ -3584,6 +3584,7 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
 
     PhaseGlobalSelectionAudit selectorAudit;
     selectorAudit.mechanismInputs = pdAudit.mechanismInputs;
+    selectorAudit.prefillFormation = pdAudit.prefillFormation;
     for (PhaseGlobalActionCandidate& mechanism : selectorAudit.mechanismInputs)
     {
         bool const protectsEncoder = std::any_of(mechanism.protectedCompletions.begin(),

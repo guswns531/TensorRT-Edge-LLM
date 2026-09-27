@@ -506,6 +506,7 @@ struct PhaseQueueSchedulerConfig
     bool enableMeasuredDecodeServiceBatching{};
     //! Retain the service-DP frontier and partition in dispatch metrics for opt-in diagnostics.
     bool captureDecodePartitionTrace{};
+    bool capturePrefillFormationTrace{};
     //! Refine static decode costs from context-bucketed decode-component observations.
     bool enableDecodeComponentObservation{};
     size_t decodeComponentMinSamples{8U};
@@ -708,6 +709,7 @@ struct PhaseDispatchPlan
     std::vector<uint64_t> predictedDecodeFrontierIds;
     std::vector<int32_t> predictedDecodeFrontierLengths;
     std::vector<PhaseDecodeServiceCandidateDiagnostic> predictedDecodeCandidates;
+    PhaseGlobalSelectionAudit::PrefillFormation prefillFormation;
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
@@ -947,7 +949,8 @@ private:
     int32_t selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates, int32_t chunkLength,
         bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize, int32_t plannedDecodeMaxContextLength,
         PhaseQueueSnapshot const& snapshot, bool preferMaximumProgress, float& predictedGpuMs,
-        float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept;
+        float& predictedDecodeSlowdownMs, bool& costCoverageMiss,
+        std::vector<PhaseGlobalSelectionAudit::PrefillShapeCandidate>* diagnostics = nullptr) const noexcept;
     PhaseQueueSnapshot snapshot(bool includeReadyDetails = false) const;
     int32_t prefillBatchLimit(PhasePrefillClass prefillClass) const noexcept;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;

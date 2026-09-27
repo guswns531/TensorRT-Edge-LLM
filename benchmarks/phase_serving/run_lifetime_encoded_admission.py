@@ -316,6 +316,8 @@ def command_for(repo,
     }
     if options.get("decode_partition_diagnostic", False):
         environment["TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"] = "1"
+    if options.get("prefill_formation_diagnostic", False):
+        environment["TRT_EDGELLM_PREFILL_FORMATION_DIAGNOSTIC"] = "1"
     if "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD" in os.environ:
         environment["TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"] = "1"
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
@@ -549,6 +551,7 @@ def parse_args(argv=None):
         "--decode-partition-diagnostic",
         action="store_true",
         help="Record ready decode rows and measured-service DP partitions")
+    parser.add_argument("--prefill-formation-diagnostic", action="store_true")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--client-max-in-flight", type=int, default=0)
     parser.add_argument("--ordered-backend-ingress", action="store_true")
@@ -728,6 +731,8 @@ def main():
                             args.telemetry_level,
                             "decode_partition_diagnostic":
                             args.decode_partition_diagnostic,
+                            "prefill_formation_diagnostic":
+                            args.prefill_formation_diagnostic,
                             "client_max_in_flight":
                             args.client_max_in_flight,
                             "ordered_backend_ingress":

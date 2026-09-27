@@ -1771,6 +1771,8 @@ int main(int argc, char** argv)
         }
         semanticSchedulerConfig.captureDecodePartitionTrace
             = std::getenv("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC") != nullptr;
+        semanticSchedulerConfig.capturePrefillFormationTrace
+            = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_DIAGNOSTIC") != nullptr;
         if (startupOptions.enabled)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
@@ -4613,6 +4615,31 @@ int main(int argc, char** argv)
                         if (event.selectorAudit != nullptr)
                         {
                             auto const& audit = *event.selectorAudit;
+                            auto const& formation = audit.prefillFormation;
+                            if (!formation.readyRequestIds.empty())
+                            {
+                                nlohmann::json shapes = nlohmann::json::array();
+                                for (auto const& candidate : formation.shapeCandidates)
+                                {
+                                    shapes.push_back({{"chunk", candidate.chunkLength}, {"batch", candidate.batchSize},
+                                        {"useful_tokens", candidate.usefulTokens}, {"gpu_ms", candidate.gpuMs},
+                                        {"decode_interference_ms", candidate.decodeInterferenceMs},
+                                        {"efficiency", candidate.efficiency}, {"measured_cost", candidate.measuredCost},
+                                        {"feasible", candidate.feasible}, {"request_ids", candidate.requestIds}});
+                                }
+                                record["prefill_formation"] = {{"seed_request_id", formation.seedRequestId},
+                                    {"seed_tokens", formation.seedTokens},
+                                    {"ready_request_ids", formation.readyRequestIds},
+                                    {"ready_token_counts", formation.readyTokenCounts},
+                                    {"ready_wait_us", formation.readyWaitUs},
+                                    {"ready_reference_us", formation.readyReferenceUs},
+                                    {"ready_service_age_quanta", formation.readyServiceAgeQuanta},
+                                    {"active_cohort_ids", formation.activeCohortIds},
+                                    {"compatible_request_ids", formation.compatibleRequestIds},
+                                    {"selected_chunk", formation.selectedChunk},
+                                    {"selected_batch", formation.selectedBatch}, {"drain_mode", formation.drainMode},
+                                    {"shape_candidates", std::move(shapes)}};
+                            }
                             auto auditJson = [](auto const& evaluations, auto const& decision) {
                                 nlohmann::json inputs = nlohmann::json::array();
                                 for (auto const& input : evaluations)

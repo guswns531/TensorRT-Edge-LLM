@@ -274,6 +274,12 @@ def analyze_pair(left_requests, left_metrics, left_events, right_requests,
                 left_decision.get("action_kind") if left_decision else None,
                 "right_action":
                 right_decision.get("action_kind") if right_decision else None,
+                "left_prefill_formation":
+                left_decision.get("prefill_formation")
+                if left_decision else None,
+                "right_prefill_formation":
+                right_decision.get("prefill_formation")
+                if right_decision else None,
                 "involved_sends_us": [{
                     "request_id":
                     request_id,

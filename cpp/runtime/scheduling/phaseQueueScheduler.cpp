@@ -1051,7 +1051,8 @@ bool PhaseQueueScheduler::isPrefillBatchCompatible(PhaseWorkItem const& item, Ph
 int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem const*> const& candidates,
     int32_t chunkLength, bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize,
     int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, bool preferMaximumProgress,
-    float& predictedGpuMs, float& predictedDecodeSlowdownMs, bool& costCoverageMiss) const noexcept
+    float& predictedGpuMs, float& predictedDecodeSlowdownMs, bool& costCoverageMiss,
+    std::vector<PhaseGlobalSelectionAudit::PrefillShapeCandidate>* diagnostics) const noexcept
 {
     if (candidates.empty())
     {
@@ -1071,6 +1072,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         int32_t usefulTokens{};
         float gpuMs{};
         float decodeInterferenceMs{};
+        bool measuredCost{};
     };
     std::vector<Candidate> profiled;
     int32_t const firstBatchSize = std::min(available, mConfig.minDynamicPrefillBatchSize);
@@ -1150,7 +1152,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
             float const interference = selectedOverlap != nullptr
                 ? selectedOverlap->decodeSlowdownP95Ms
                 : (overlap && selected != nullptr ? selected->decodeSlowdownP95Ms : isolatedPrefillMs);
-            profiled.push_back({batchSize, usefulTokens, gpuMs, interference});
+            profiled.push_back({batchSize, usefulTokens, gpuMs, interference, measuredGpuMs.has_value()});
         }
     }
     if (profiled.empty())
@@ -1190,6 +1192,23 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
         bool const feasible
             = (prefillRecovery || state.decodeQueued == 0 || candidateInterferenceUs <= allowedInterferenceUs)
             && (!overlap || !mConfig.enableTpotHardGuard || debtFeasible);
+        if (diagnostics != nullptr)
+        {
+            PhaseGlobalSelectionAudit::PrefillShapeCandidate diagnostic;
+            diagnostic.chunkLength = chunkLength;
+            diagnostic.batchSize = candidate.batchSize;
+            diagnostic.usefulTokens = candidate.usefulTokens;
+            diagnostic.gpuMs = candidate.gpuMs;
+            diagnostic.decodeInterferenceMs = candidate.decodeInterferenceMs;
+            diagnostic.efficiency = static_cast<float>(candidate.usefulTokens) / candidate.gpuMs;
+            diagnostic.measuredCost = candidate.measuredCost;
+            diagnostic.feasible = feasible;
+            for (int32_t index = 0; index < candidate.batchSize; ++index)
+            {
+                diagnostic.requestIds.push_back(candidates[static_cast<size_t>(index)]->requestId);
+            }
+            diagnostics->push_back(std::move(diagnostic));
+        }
         if (!feasible)
         {
             continue;
@@ -1515,6 +1534,31 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             }
         }
     }
+    if (mConfig.capturePrefillFormationTrace)
+    {
+        auto& diagnostic = plan.prefillFormation;
+        diagnostic.seedRequestId = bucketSeed->requestId;
+        diagnostic.seedTokens = dispatchedPrefillTokens(*bucketSeed);
+        diagnostic.activeCohortIds.assign(mPrefillCohortIds.begin(), mPrefillCohortIds.end());
+        std::sort(diagnostic.activeCohortIds.begin(), diagnostic.activeCohortIds.end());
+        auto const now = std::chrono::steady_clock::now();
+        for (PhaseWorkItem const& item : queue)
+        {
+            if (!isEligible(item, true))
+            {
+                continue;
+            }
+            diagnostic.readyRequestIds.push_back(item.requestId);
+            diagnostic.readyTokenCounts.push_back(dispatchedPrefillTokens(item));
+            diagnostic.readyWaitUs.push_back(
+                std::chrono::duration<double, std::micro>(now - mQueuedSince.at(item.requestId)).count());
+            ServiceEpochRecord const& epoch = mPrefillServiceEpochs.at(item.requestId);
+            diagnostic.readyReferenceUs.push_back(epoch.reference.serviceUs);
+            diagnostic.readyServiceAgeQuanta.push_back(
+                std::chrono::duration<double, std::micro>(now - epoch.startedAt).count()
+                / std::max(1.0, epoch.reference.serviceUs));
+        }
+    }
     int32_t bucketTokens = dispatchedPrefillTokens(*bucketSeed);
     bool const bucketInitial = bucketSeed->tokenOffset == 0;
     bool const allowRaggedBatch = bucketSeed->allowChunkedPrefill;
@@ -1629,6 +1673,13 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         return std::min({maxBatchSize, budgetRows, static_cast<int32_t>(compatibleRows)});
     };
     std::vector<PhaseWorkItem const*> compatible = collectCompatible(bucketTokens, false);
+    if (mConfig.capturePrefillFormationTrace)
+    {
+        for (PhaseWorkItem const* item : compatible)
+        {
+            plan.prefillFormation.compatibleRequestIds.push_back(item->requestId);
+        }
+    }
     int32_t batchLimit = batchLimitFor(bucketTokens, compatible.size());
     int32_t costLookupRows = std::min<int32_t>(maxBatchSize, compatible.size());
     int32_t costLookupMaxPastKVLength{};
@@ -1647,6 +1698,10 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
         && state.prefillRemainingTokens >= mConfig.prefillShapeDrainBacklogTokens;
     plan.prefillShapeDrainMode
         = mConfig.enableCostAwarePrefillShapeSelection && selectedProductiveChunk && drainPrefillBacklog;
+    if (mConfig.capturePrefillFormationTrace)
+    {
+        plan.prefillFormation.drainMode = plan.prefillShapeDrainMode;
+    }
     if (mConfig.enableCostAwarePrefillShapeSelection && selectedProductiveChunk)
     {
         struct JointShape
@@ -1682,7 +1737,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             int32_t const candidateBatch = selectPrefillBatchSize(candidateRows, candidateChunk, bucketInitial,
                 plan.kind == PhaseDispatchKind::kOverlap, plan.plannedDecodeBatchSize,
                 plan.plannedDecodeMaxContextLength, state, drainPrefillBacklog, candidateGpuMs,
-                candidateDecodeSlowdownMs, candidateCoverageMiss);
+                candidateDecodeSlowdownMs, candidateCoverageMiss,
+                mConfig.capturePrefillFormationTrace ? &plan.prefillFormation.shapeCandidates : nullptr);
             plan.prefillCostCoverageMiss = plan.prefillCostCoverageMiss || candidateCoverageMiss;
             ++plan.prefillShapeCandidatesEvaluated;
             if (candidateBatch < 0)
@@ -1747,7 +1803,8 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
             dynamicLimit = selectPrefillBatchSize(costCandidates, bucketTokens, bucketInitial,
                 plan.kind == PhaseDispatchKind::kOverlap, plan.plannedDecodeBatchSize,
                 plan.plannedDecodeMaxContextLength, state, false, predictedGpuMs, predictedDecodeSlowdownMs,
-                plan.prefillCostCoverageMiss);
+                plan.prefillCostCoverageMiss,
+                mConfig.capturePrefillFormationTrace ? &plan.prefillFormation.shapeCandidates : nullptr);
         }
         if (dynamicLimit < 0)
         {
@@ -1790,6 +1847,11 @@ std::vector<PhaseWorkItem> PhaseQueueScheduler::popBatch(std::deque<PhaseWorkIte
     {
         ++mPrefillCohortTurns;
         plan.prefillCohortSize = static_cast<int32_t>(mPrefillCohortIds.size());
+    }
+    if (mConfig.capturePrefillFormationTrace)
+    {
+        plan.prefillFormation.selectedChunk = bucketTokens;
+        plan.prefillFormation.selectedBatch = static_cast<int32_t>(batch.size());
     }
     return batch;
 }
@@ -1909,6 +1971,10 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         && (!phasePolicyUsesServiceScale(mConfig.policyMode) || state.prefillMinimumSlackHasExplicitSlo);
     PhaseDispatchPlan const prefillPlan
         = state.prefillQueued > 0U ? previewMechanismPlan(PhaseDispatchKind::kPrefill) : PhaseDispatchPlan{};
+    if (audit != nullptr && mConfig.capturePrefillFormationTrace)
+    {
+        audit->prefillFormation = prefillPlan.prefillFormation;
+    }
     int32_t const prefillRows = static_cast<int32_t>(prefillPlan.prefillBatch.size());
     int32_t prefillChunk{};
     int32_t prefillPastKV{};

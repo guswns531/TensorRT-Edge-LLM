@@ -237,6 +237,17 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             diagnostic.pop("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"), "1")
         self.assertEqual(default, diagnostic)
 
+    def test_prefill_formation_trace_is_opt_in(self):
+        default = environment(self.command("independent"))
+        diagnostic = environment(
+            G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
+                                 "mixed", "independent", 0,
+                                 {"prefill_formation_diagnostic": True}))
+        self.assertNotIn("TRT_EDGELLM_PREFILL_FORMATION_DIAGNOSTIC", default)
+        self.assertEqual(
+            diagnostic.pop("TRT_EDGELLM_PREFILL_FORMATION_DIAGNOSTIC"), "1")
+        self.assertEqual(default, diagnostic)
+
     def test_decode_service_interval_guard_ablation_is_explicit(self):
         key = "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
