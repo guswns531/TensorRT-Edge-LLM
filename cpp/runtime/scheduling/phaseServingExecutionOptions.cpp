@@ -63,6 +63,10 @@ PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(PhaseEnviro
     {
         options.measuredDecodeAtMeasurement = parseBoolean(value);
     }
+    if (char const* value = environment("TRT_EDGELLM_STARTUP_PLAN_ONLY"))
+    {
+        options.planOnly = parseBoolean(value);
+    }
     if (char const* value = environment("TRT_EDGELLM_STARTUP_BUDGET_MS"))
     {
         options.budgetMs = std::stod(value);
@@ -70,7 +74,53 @@ PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(PhaseEnviro
     ELLM_CHECK(std::isfinite(options.budgetMs) && options.budgetMs > 0.0,
         "Startup calibration budget must be finite and positive");
     ELLM_CHECK(!options.requireCoverage || options.enabled, "Required startup coverage needs calibration enabled");
+    ELLM_CHECK(!options.planOnly || (options.enabled && !options.measuredDecodeAtMeasurement),
+        "Startup planning requires calibration and must not activate measured decode policy");
     return options;
+}
+
+std::vector<PhaseStartupDecodeTrial> phaseStartupDecodeTrials(int32_t rows, std::vector<PhaseStartupDecodeCost> costs)
+{
+    ELLM_CHECK(rows > 0, "Startup trial rows must be positive");
+    std::sort(costs.begin(), costs.end(),
+        [](auto const& left, auto const& right) { return left.batchSize < right.batchSize; });
+    int32_t previous{};
+    PhaseStartupDecodeCost const* dense{};
+    for (auto const& cost : costs)
+    {
+        ELLM_CHECK(cost.batchSize > previous && std::isfinite(cost.medianMs) && cost.medianMs > 0.0
+                && std::isfinite(cost.uncertaintyMs) && cost.uncertaintyMs >= 0.0,
+            "Startup trial costs must have unique positive batches and finite timings");
+        previous = cost.batchSize;
+        if (cost.batchSize == rows)
+        {
+            dense = &cost;
+        }
+    }
+    if (dense == nullptr)
+    {
+        return {};
+    }
+    std::vector<PhaseStartupDecodeTrial> trials{{{rows}, dense->medianMs, dense->uncertaintyMs, 0.0}};
+    for (auto const& first : costs)
+    {
+        if (first.batchSize > rows / 2)
+        {
+            break;
+        }
+        int32_t const remainder = rows - first.batchSize;
+        auto const second = std::find_if(
+            costs.begin(), costs.end(), [remainder](auto const& cost) { return cost.batchSize == remainder; });
+        if (second == costs.end())
+        {
+            continue;
+        }
+        double const gpuMs = first.medianMs + second->medianMs;
+        double const uncertaintyMs = first.uncertaintyMs + second->uncertaintyMs;
+        trials.push_back({{first.batchSize, second->batchSize}, gpuMs, uncertaintyMs,
+            dense->medianMs - dense->uncertaintyMs - gpuMs - uncertaintyMs});
+    }
+    return trials;
 }
 
 std::vector<PhaseStartupDecodeProbe> phaseStartupDecodeProbes(int32_t maxDecodeBatch, int32_t maxPrefillBatch,

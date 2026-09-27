@@ -55,6 +55,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1757,7 +1758,7 @@ int main(int argc, char** argv)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
                 "Startup calibration requires the active global scheduler");
-            if (!startupOptions.measuredDecodeAtMeasurement)
+            if (!startupOptions.measuredDecodeAtMeasurement && !startupOptions.planOnly)
             {
                 semanticSchedulerConfig.decodeBatchCosts.clear();
                 semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
@@ -2274,7 +2275,8 @@ int main(int argc, char** argv)
                 {"decode", nlohmann::json::array()}, {"encoder", nlohmann::json::array()},
                 {"static_decode_table", !semanticSchedulerConfig.decodeBatchCosts.empty()},
                 {"measured_decode_at_measurement", startupOptions.measuredDecodeAtMeasurement},
-                {"policy_stability_validated", false}, {"budget_ms", startupOptions.budgetMs},
+                {"plan_only", startupOptions.planOnly}, {"policy_stability_validated", false},
+                {"budget_ms", startupOptions.budgetMs},
                 {"prefill_batch_limit", semanticSchedulerConfig.maxPrefillBatchSize},
                 {"decode_batch_limit", semanticSchedulerConfig.maxDecodeBatchSize},
                 {"kv_physical_pages", ownership.config().numPages},
@@ -2495,6 +2497,8 @@ int main(int argc, char** argv)
                     static_cast<int32_t>(runtimeCostConfig.actionMinimumSamples));
                 startupCoverage = !probes.empty() && probes.back().batchSize == warmupBatchLimit;
                 size_t probeRequests{};
+                std::map<std::pair<int32_t, rt::PhaseExecutionVariant>, std::map<int32_t, rt::PhaseStartupDecodeCost>>
+                    trialCosts;
                 for (auto const& probe : probes)
                 {
                     int32_t const bucketTokens = semanticSchedulerConfig.runtimeDecodeContextBucketTokens;
@@ -2566,10 +2570,41 @@ int main(int argc, char** argv)
                         record["median_ms"] = cost->makespanMedianMs;
                         record["sample_p95_ms"] = cost->makespanP95Ms;
                         record["uncertainty_ms"] = cost->uncertaintyMs;
+                        trialCosts[{key.primaryContextBucket, key.executionVariant}][probe.batchSize]
+                            = {probe.batchSize, cost->makespanMedianMs, cost->uncertaintyMs};
                     }
                     startupReport["decode"].push_back(std::move(record));
                 }
                 startupReport["decode_probe_requests"] = probeRequests;
+                if (startupOptions.planOnly)
+                {
+                    nlohmann::json groups = nlohmann::json::array();
+                    for (auto const& [group, byBatch] : trialCosts)
+                    {
+                        std::vector<rt::PhaseStartupDecodeCost> costs;
+                        for (auto const& [batch, cost] : byBatch)
+                        {
+                            costs.push_back(cost);
+                        }
+                        for (auto const& cost : costs)
+                        {
+                            nlohmann::json candidates = nlohmann::json::array();
+                            for (auto const& trial : rt::phaseStartupDecodeTrials(cost.batchSize, costs))
+                            {
+                                candidates.push_back(
+                                    {{"batches", trial.batches}, {"estimated_gpu_ms", trial.estimatedGpuMs},
+                                        {"uncertainty_sum_ms", trial.uncertaintyMs},
+                                        {"guarded_saving_ms", trial.guardedSavingMs}});
+                            }
+                            groups.push_back({{"rows", cost.batchSize}, {"context_bucket", group.first},
+                                {"variant", rt::phaseExecutionVariantName(group.second)},
+                                {"candidates", std::move(candidates)}});
+                        }
+                    }
+                    startupReport["decode_trial_plan"] = {{"status", "requires_equal_work_validation"},
+                        {"policy_applied", false}, {"cost_scope", "bucketed_gpu_proxy_excludes_host_and_successor"},
+                        {"maximum_dispatches", 2}, {"groups", std::move(groups)}};
+                }
                 semanticCoordinator.scheduler().resetSchedulingHistory();
             }
             LOG_INFO("Phase IPC shape warmup: mode=%s batches=%zu requests=%zu overlap_samples=%zu safe_probes=%zu",

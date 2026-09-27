@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <gtest/gtest.h>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -89,6 +90,57 @@ TEST(PhaseServingExecutionOptionsTest, StartupProbesDoNotInventCapacity)
     EXPECT_LE(probes.back().batchSize, 2);
     EXPECT_THROW(phaseStartupDecodeProbes(0, 8, 128, 2048, 256, 128, 4), std::exception);
     EXPECT_THROW(phaseStartupDecodeProbes(64, 8, 128, 2048, 256, 0, 4), std::exception);
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupTrialPlanningCannotActivateMeasuredPolicy)
+{
+    auto const options = resolvePhaseStartupCalibrationOptions(
+        lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"}, {"TRT_EDGELLM_STARTUP_PLAN_ONLY", "1"}}));
+    EXPECT_TRUE(options.planOnly);
+    EXPECT_FALSE(options.measuredDecodeAtMeasurement);
+    EXPECT_THROW(
+        resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_PLAN_ONLY", "1"}})), std::exception);
+    EXPECT_THROW(resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"},
+                     {"TRT_EDGELLM_STARTUP_PLAN_ONLY", "1"}, {"TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS", "1"}})),
+        std::exception);
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupTrialsPreserveEqualWorkAndDenseReference)
+{
+    auto const trials = phaseStartupDecodeTrials(8, {{8, 10.0, 0.2}, {4, 3.0, 0.1}, {2, 2.0, 0.1}});
+    ASSERT_EQ(trials.size(), 2U);
+    EXPECT_EQ(trials[0].batches, (std::vector<int32_t>{8}));
+    EXPECT_EQ(trials[1].batches, (std::vector<int32_t>{4, 4}));
+    EXPECT_DOUBLE_EQ(trials[1].estimatedGpuMs, 6.0);
+    EXPECT_NEAR(trials[1].guardedSavingMs, 3.6, 1e-9);
+    EXPECT_TRUE(phaseStartupDecodeTrials(7, {{4, 3.0, 0.1}}).empty());
+    auto const sparse = phaseStartupDecodeTrials(7, {{7, 10.0, 0.1}, {4, 3.0, 0.1}});
+    ASSERT_EQ(sparse.size(), 1U);
+    EXPECT_EQ(sparse.front().batches, (std::vector<int32_t>{7}));
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupTrialsIncludeAsymmetricRemainderOnce)
+{
+    auto const trials = phaseStartupDecodeTrials(24, {{24, 10.0, 0.1}, {16, 5.0, 0.1}, {8, 3.0, 0.1}});
+    ASSERT_EQ(trials.size(), 2U);
+    EXPECT_EQ(trials[1].batches, (std::vector<int32_t>{8, 16}));
+    EXPECT_NEAR(trials[1].guardedSavingMs, 1.7, 1e-9);
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupTrialUncertaintyCanEraseApparentGain)
+{
+    auto const trials = phaseStartupDecodeTrials(8, {{8, 10.0, 1.0}, {4, 4.5, 0.5}});
+    ASSERT_EQ(trials.size(), 2U);
+    EXPECT_LT(trials[1].estimatedGpuMs, trials[0].estimatedGpuMs);
+    EXPECT_DOUBLE_EQ(trials[1].guardedSavingMs, -1.0);
+}
+
+TEST(PhaseServingExecutionOptionsTest, StartupTrialsRejectAmbiguousOrInvalidCosts)
+{
+    EXPECT_THROW(phaseStartupDecodeTrials(0, {}), std::exception);
+    EXPECT_THROW(phaseStartupDecodeTrials(1, {{1, 2.0, 0.1}, {1, 3.0, 0.1}}), std::exception);
+    EXPECT_THROW(phaseStartupDecodeTrials(1, {{1, std::numeric_limits<double>::quiet_NaN(), 0.1}}), std::exception);
+    EXPECT_THROW(phaseStartupDecodeTrials(1, {{1, 2.0, -0.1}}), std::exception);
 }
 
 TEST(PhaseServingExecutionOptionsTest, StartupFrontierIsBoundedWithoutModelSpecificBatchList)

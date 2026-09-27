@@ -54,6 +54,7 @@ struct PhaseStartupCalibrationOptions
     bool enabled{};
     bool requireCoverage{};
     bool measuredDecodeAtMeasurement{};
+    bool planOnly{};          //!< Generate startup trial candidates without changing the decode cost policy.
     double budgetMs{30000.0}; //!< Stop admitting probes at the deadline; drain submitted work before readiness.
 };
 
@@ -72,5 +73,24 @@ struct PhaseStartupDecodeProbe
 std::vector<PhaseStartupDecodeProbe> phaseStartupDecodeProbes(int32_t maxDecodeBatch, int32_t maxPrefillBatch,
     int32_t chunkTokens, int32_t maxSequenceLength, int32_t allocatablePages, int32_t tokensPerPage,
     int32_t minimumSamples);
+
+struct PhaseStartupDecodeCost
+{
+    int32_t batchSize{};
+    double medianMs{};
+    double uncertaintyMs{};
+};
+
+struct PhaseStartupDecodeTrial
+{
+    std::vector<int32_t> batches;
+    double estimatedGpuMs{};
+    double uncertaintyMs{};
+    double guardedSavingMs{};
+};
+
+//! Dense and two-dispatch equal-row trials from one context bucket and execution variant.
+//! Summed costs are ranking proxies, not measured end-to-end times or confidence bounds.
+std::vector<PhaseStartupDecodeTrial> phaseStartupDecodeTrials(int32_t rows, std::vector<PhaseStartupDecodeCost> costs);
 
 } // namespace trt_edgellm::rt
