@@ -87,6 +87,12 @@ enum class PhaseTensorRTContextMode
     kIndependentConcurrent,
 };
 
+enum class PhaseDecodeRowOrderMode
+{
+    kRetainAffinity,
+    kCanonicalEveryDispatch,
+};
+
 struct PhaseExecutionResourceIdentity
 {
     void const* tensorRTExecutionContext{};
@@ -119,7 +125,8 @@ public:
     PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
         cudaStream_t prefillStream, cudaStream_t decodeStream,
         PhaseTensorRTContextMode executionMode = PhaseTensorRTContextMode::kSharedSerialized,
-        PhaseExecutionSafetyContract safetyContract = {});
+        PhaseExecutionSafetyContract safetyContract = {},
+        PhaseDecodeRowOrderMode decodeRowOrderMode = PhaseDecodeRowOrderMode::kRetainAffinity);
     ~PhaseDispatchWorker() noexcept;
 
     PhaseDispatchWorker(PhaseDispatchWorker const&) = delete;
@@ -171,6 +178,7 @@ public:
 
 private:
     void enqueueDeferredDecode();
+    void orderDecodeRows(std::vector<PhaseWorkItem>& batch);
     void mergeAugmentedMetrics(PhaseDispatchPlan const& additional, PhaseGlobalActionCandidate const& aggregate,
         uint64_t planId, uint64_t snapshotEpoch);
     PhaseHostExecutionTiming enqueueActivity(PhaseActivityKind kind, char const* name,
@@ -188,6 +196,7 @@ private:
     cudaStream_t mDecodeStream{};
     CUcontext mCudaContext{};
     PhaseTensorRTContextMode mExecutionMode{PhaseTensorRTContextMode::kSharedSerialized};
+    PhaseDecodeRowOrderMode mDecodeRowOrderMode{PhaseDecodeRowOrderMode::kRetainAffinity};
     PhaseExecutionSafetyContract mSafetyContract;
     cudaEvent_t mDispatchStart{};
     cudaEvent_t mAugmentationStart{};

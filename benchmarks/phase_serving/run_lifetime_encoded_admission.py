@@ -328,6 +328,8 @@ def command_for(repo,
         if options.get("diagnostic_logit_step") is not None:
             environment["TRT_EDGELLM_DIAGNOSTIC_LOGIT_STEP"] = options[
                 "diagnostic_logit_step"]
+    if options.get("canonical_decode_rows", False):
+        environment["TRT_EDGELLM_CANONICAL_DECODE_ROW_ORDER"] = "1"
     if "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD" in os.environ:
         environment["TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"] = "1"
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
@@ -566,6 +568,7 @@ def parse_args(argv=None):
                         action="store_true")
     parser.add_argument("--diagnostic-logit-request-id", type=int)
     parser.add_argument("--diagnostic-logit-step", type=int)
+    parser.add_argument("--canonical-decode-rows", action="store_true")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--client-max-in-flight", type=int, default=0)
     parser.add_argument("--ordered-backend-ingress", action="store_true")
@@ -761,6 +764,8 @@ def main():
                             args.diagnostic_logit_request_id,
                             "diagnostic_logit_step":
                             args.diagnostic_logit_step,
+                            "canonical_decode_rows":
+                            args.canonical_decode_rows,
                             "client_max_in_flight":
                             args.client_max_in_flight,
                             "ordered_backend_ingress":

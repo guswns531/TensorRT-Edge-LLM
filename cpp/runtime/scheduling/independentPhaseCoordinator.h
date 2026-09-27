@@ -68,7 +68,8 @@ public:
     IndependentPhaseCoordinator(LLMEngineConfig const& config, PhaseQueueSchedulerConfig schedulerConfig,
         IndependentEngineExecutorPair& executors, StableKVPageManager& ownership, PipelineIO& prefillIO,
         PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap, cudaStream_t prefillStream,
-        cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks);
+        cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks,
+        PhaseDecodeRowOrderMode decodeRowOrderMode = PhaseDecodeRowOrderMode::kRetainAffinity);
     ~IndependentPhaseCoordinator() noexcept = default;
 
     IndependentPhaseCoordinator(IndependentPhaseCoordinator const&) = delete;

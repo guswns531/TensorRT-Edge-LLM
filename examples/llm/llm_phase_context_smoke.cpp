@@ -1862,6 +1862,11 @@ int main(int argc, char** argv)
         }
         auto runtimeCostTracker = std::make_shared<rt::PhaseRuntimeCostTracker>(runtimeCostConfig);
         semanticSchedulerConfig.runtimeCostTracker = runtimeCostTracker;
+        rt::PhaseDecodeRowOrderMode decodeRowOrderMode = rt::PhaseDecodeRowOrderMode::kRetainAffinity;
+        if (std::getenv("TRT_EDGELLM_CANONICAL_DECODE_ROW_ORDER") != nullptr)
+        {
+            decodeRowOrderMode = rt::PhaseDecodeRowOrderMode::kCanonicalEveryDispatch;
+        }
         if (semanticSchedulerConfig.globalSchedulerMode != rt::PhaseGlobalSchedulerMode::kDisabled)
         {
             semanticSchedulerConfig.globalDispatchUsesPreReservedMemory = true;
@@ -1879,7 +1884,8 @@ int main(int argc, char** argv)
                   };
         }
         rt::IndependentPhaseCoordinator semanticCoordinator(phaseConfig, semanticSchedulerConfig, *pair, ownership,
-            *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks));
+            *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks),
+            decodeRowOrderMode);
         if (std::getenv("TRT_EDGELLM_ENABLE_PERSISTENT_DECODE_SELECT") != nullptr)
         {
             semanticCoordinator.setPersistentDecodeSelectEnabled(true);

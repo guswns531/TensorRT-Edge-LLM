@@ -163,12 +163,13 @@ void PhaseExecutionSafetyContract::validate(PhaseTensorRTContextMode mode) const
 
 PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDispatchWorkerCallbacks callbacks,
     cudaStream_t prefillStream, cudaStream_t decodeStream, PhaseTensorRTContextMode executionMode,
-    PhaseExecutionSafetyContract safetyContract)
+    PhaseExecutionSafetyContract safetyContract, PhaseDecodeRowOrderMode decodeRowOrderMode)
     : mScheduler(scheduler)
     , mCallbacks(std::move(callbacks))
     , mPrefillStream(prefillStream)
     , mDecodeStream(decodeStream)
     , mExecutionMode(executionMode)
+    , mDecodeRowOrderMode(decodeRowOrderMode)
     , mSafetyContract(safetyContract)
 {
     mSafetyContract.validate(mExecutionMode);
@@ -191,6 +192,18 @@ PhaseDispatchWorker::PhaseDispatchWorker(PhaseQueueScheduler& scheduler, PhaseDi
     CUDA_CHECK(cudaEventCreate(&mPrefillDone));
     CUDA_CHECK(cudaEventCreate(&mDecodeStart));
     CUDA_CHECK(cudaEventCreate(&mDecodeDone));
+}
+
+void PhaseDispatchWorker::orderDecodeRows(std::vector<PhaseWorkItem>& batch)
+{
+    if (mDecodeRowOrderMode == PhaseDecodeRowOrderMode::kCanonicalEveryDispatch)
+    {
+        preservePhaseBatchRowAffinity(batch, {});
+    }
+    else
+    {
+        preservePhaseBatchRowAffinity(batch, mPreviousDecodeRowRequestIds);
+    }
 }
 
 PhaseDispatchWorker::~PhaseDispatchWorker() noexcept
@@ -245,7 +258,7 @@ bool PhaseDispatchWorker::dispatchNext()
     }
     if (mHasDecode)
     {
-        preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
+        orderDecodeRows(mInFlight.decodeBatch);
         mPreviousDecodeRowRequestIds.clear();
         mPreviousDecodeRowRequestIds.reserve(mInFlight.decodeBatch.size());
         for (PhaseWorkItem const& item : mInFlight.decodeBatch)
@@ -505,7 +518,7 @@ bool PhaseDispatchWorker::augmentNext(PhaseGlobalActionCandidate missingPhase, P
     else
     {
         mInFlight.decodeBatch = std::move(additional.decodeBatch);
-        preservePhaseBatchRowAffinity(mInFlight.decodeBatch, mPreviousDecodeRowRequestIds);
+        orderDecodeRows(mInFlight.decodeBatch);
         mPreviousDecodeRowRequestIds.clear();
         mPreviousDecodeRowRequestIds.reserve(mInFlight.decodeBatch.size());
         for (PhaseWorkItem const& item : mInFlight.decodeBatch)

@@ -277,6 +277,17 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
                          "18")
         self.assertEqual(default, diagnostic)
 
+    def test_canonical_decode_row_order_is_opt_in(self):
+        default = environment(self.command("independent"))
+        diagnostic = environment(
+            G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
+                                 "mixed", "independent", 0,
+                                 {"canonical_decode_rows": True}))
+        self.assertNotIn("TRT_EDGELLM_CANONICAL_DECODE_ROW_ORDER", default)
+        self.assertEqual(
+            diagnostic.pop("TRT_EDGELLM_CANONICAL_DECODE_ROW_ORDER"), "1")
+        self.assertEqual(default, diagnostic)
+
     def test_decode_service_interval_guard_ablation_is_explicit(self):
         key = "TRT_EDGELLM_DISABLE_DECODE_SERVICE_INTERVAL_GUARD"
         with unittest.mock.patch.dict("os.environ", {}, clear=True):

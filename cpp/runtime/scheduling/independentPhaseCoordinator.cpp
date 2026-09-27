@@ -47,7 +47,8 @@ EngineExecutor::GraphCacheStats addGraphCacheStats(
 IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& config,
     PhaseQueueSchedulerConfig schedulerConfig, IndependentEngineExecutorPair& executors, StableKVPageManager& ownership,
     PipelineIO& prefillIO, PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap,
-    cudaStream_t prefillStream, cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks)
+    cudaStream_t prefillStream, cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks,
+    PhaseDecodeRowOrderMode decodeRowOrderMode)
     : mConfig(config)
     , mExecutors(executors)
     , mOwnership(ownership)
@@ -85,7 +86,7 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
                   &mDecodeIO});
     mWorker = std::make_unique<PhaseDispatchWorker>(mScheduler, makeWorkerCallbacks(), mPrefillStream, mDecodeStream,
         sharedContext ? PhaseTensorRTContextMode::kSharedSerialized : PhaseTensorRTContextMode::kIndependentConcurrent,
-        safety);
+        safety, decodeRowOrderMode);
     mScheduler.setGlobalExecutionVariantSupplier([this](PhaseGlobalActionKey const& key, int32_t primaryTokenCount) {
         refreshGraphWorkspaceGenerations();
         int32_t const prefillGraphTokens = mConfig.packedPrefill ? primaryTokenCount : key.chunkLength;
