@@ -2718,7 +2718,7 @@ TEST(PhaseQueueSchedulerTest, ServiceScaledModeDoesNotCreateImplicitDeadlines)
 
 TEST(PhaseQueueSchedulerTest, SparseCoveringPrefillCostCanChangeWavefrontSeed)
 {
-    auto makeScheduler = [](bool includeSlowCover) {
+    auto makeScheduler = [](int32_t slowCoverSamples, bool requireTrustedCover) {
         PhaseRuntimeCostTrackerConfig trackerConfig;
         trackerConfig.actionMinimumSamples = 4U;
         auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
@@ -2728,11 +2728,14 @@ TEST(PhaseQueueSchedulerTest, SparseCoveringPrefillCostCanChangeWavefrontSeed)
         {
             tracker->observe(key, {18.0F, 18.0F});
         }
-        if (includeSlowCover)
+        if (slowCoverSamples > 0)
         {
             key.chunkLength = 37;
             tracker->observe(key, {15.0F, 15.0F});
-            tracker->observe(key, {42.0F, 42.0F});
+            for (int32_t sample = 1; sample < slowCoverSamples; ++sample)
+            {
+                tracker->observe(key, {42.0F, 42.0F});
+            }
         }
         PhaseQueueSchedulerConfig config;
         config.policyMode = PhasePolicyMode::kServiceScaledTransition;
@@ -2741,12 +2744,15 @@ TEST(PhaseQueueSchedulerTest, SparseCoveringPrefillCostCanChangeWavefrontSeed)
         config.enableWavefrontPrefillBatching = true;
         config.enableRaggedPrefillBatching = true;
         config.capturePrefillFormationTrace = true;
+        config.requireTrustedPrefillServiceCovering = requireTrustedCover;
         config.runtimeCostTracker = tracker;
         return PhaseQueueScheduler(config);
     };
-    PhaseQueueScheduler baseline = makeScheduler(false);
-    PhaseQueueScheduler sparse = makeScheduler(true);
-    for (PhaseQueueScheduler* scheduler : {&baseline, &sparse})
+    PhaseQueueScheduler baseline = makeScheduler(0, false);
+    PhaseQueueScheduler sparse = makeScheduler(2, false);
+    PhaseQueueScheduler filtered = makeScheduler(2, true);
+    PhaseQueueScheduler trusted = makeScheduler(4, true);
+    for (PhaseQueueScheduler* scheduler : {&baseline, &sparse, &filtered, &trusted})
     {
         scheduler->enqueuePrefill({1, 33, 0, 0, 33});
         scheduler->enqueuePrefill({3, 38, 1, 0, 38});
@@ -2755,9 +2761,15 @@ TEST(PhaseQueueSchedulerTest, SparseCoveringPrefillCostCanChangeWavefrontSeed)
 
     PhaseDispatchPlan const baselinePlan = baseline.next();
     PhaseDispatchPlan const sparsePlan = sparse.next();
+    PhaseDispatchPlan const filteredPlan = filtered.next();
+    PhaseDispatchPlan const trustedPlan = trusted.next();
     EXPECT_EQ(baselinePlan.prefillFormation.seedRequestId, 1U);
     EXPECT_EQ(sparsePlan.prefillFormation.seedRequestId, 3U);
+    EXPECT_EQ(filteredPlan.prefillFormation.seedRequestId, 1U);
+    EXPECT_EQ(trustedPlan.prefillFormation.seedRequestId, 3U);
     EXPECT_GT(sparsePlan.prefillFormation.readyReferenceUs[0], sparsePlan.prefillFormation.readyReferenceUs[1]);
+    EXPECT_DOUBLE_EQ(
+        filteredPlan.prefillFormation.readyReferenceUs[0], baselinePlan.prefillFormation.readyReferenceUs[0]);
 }
 
 TEST(PhaseQueueSchedulerTest, ServiceScaledModeKeepsExplicitDeadlinesAbsolute)

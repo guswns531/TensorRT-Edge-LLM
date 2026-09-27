@@ -1773,6 +1773,8 @@ int main(int argc, char** argv)
             = std::getenv("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC") != nullptr;
         semanticSchedulerConfig.capturePrefillFormationTrace
             = std::getenv("TRT_EDGELLM_PREFILL_FORMATION_DIAGNOSTIC") != nullptr;
+        semanticSchedulerConfig.requireTrustedPrefillServiceCovering
+            = std::getenv("TRT_EDGELLM_TRUSTED_PREFILL_SERVICE_COVERING") != nullptr;
         if (startupOptions.enabled)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,

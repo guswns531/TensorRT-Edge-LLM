@@ -112,6 +112,12 @@ std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::estimateCovering
     return mActions.estimateCoveringPrimary(key);
 }
 
+std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::trustedEstimateCoveringPrimary(
+    PhaseGlobalActionKey const& key) const
+{
+    return mActions.estimateCoveringPrimary(key, mConfig.actionMinimumSamples);
+}
+
 std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::estimatePrimaryLaunchFloor(
     PhaseGlobalActionKey const& key) const
 {

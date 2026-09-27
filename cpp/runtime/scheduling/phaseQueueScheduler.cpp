@@ -337,7 +337,9 @@ PhaseServiceReference PhaseQueueScheduler::makePrefillServiceReference(PhaseWork
             {PhaseExecutionVariant::kEager, PhaseExecutionVariant::kPrimaryGraph})
         {
             key.executionVariant = variant;
-            std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->estimateCoveringPrimary(key);
+            std::optional<PhaseGlobalCostEstimate> const estimate = mConfig.requireTrustedPrefillServiceCovering
+                ? mRuntimeCostTracker->trustedEstimateCoveringPrimary(key)
+                : mRuntimeCostTracker->estimateCoveringPrimary(key);
             if (estimate.has_value()
                 && (!covering.has_value()
                     || std::max(estimate->makespanP95Ms, estimate->makespanMedianMs + estimate->uncertaintyMs)

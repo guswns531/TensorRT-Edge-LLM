@@ -195,7 +195,8 @@ public:
     //! Reuse only phase-only observations whose batch, chunk, and context
     //! geometry covers the requested action. This preserves fixed launch cost
     //! for ragged prefill shapes instead of extrapolating from token count.
-    std::optional<PhaseGlobalCostEstimate> estimateCoveringPrimary(PhaseGlobalActionKey const& key) const;
+    std::optional<PhaseGlobalCostEstimate> estimateCoveringPrimary(
+        PhaseGlobalActionKey const& key, size_t minimumSamples = 1U) const;
     //! Minimum observed phase-only launch cost for the same phase, producer
     //! class, execution variant, and residual semantics. Geometry is ignored
     //! deliberately: this is a lower-bound intercept, not a shape estimate.

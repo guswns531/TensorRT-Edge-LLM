@@ -525,6 +525,8 @@ struct PhaseQueueSchedulerConfig
     //! Use confident process-local prefill observations for dynamic P batch
     //! formation. Producer class is part of the cost key.
     bool enableMeasuredPrefillBatching{};
+    //! Diagnostic ablation: exclude sparse observations from the prefill urgency reference.
+    bool requireTrustedPrefillServiceCovering{};
     //! Minimum dynamic prefill batch while at least this many compatible rows exist.
     int32_t minDynamicPrefillBatchSize{1};
     //! Let an expired TTFT override decode interference while decode remains within SLO.

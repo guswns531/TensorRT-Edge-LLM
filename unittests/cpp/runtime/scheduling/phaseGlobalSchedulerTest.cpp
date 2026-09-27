@@ -1106,6 +1106,27 @@ TEST(PhaseGlobalCostModelTest, ConservativelyMergesIncomparablePrimaryCovers)
     EXPECT_FLOAT_EQ(estimate->makespanMedianMs, 12.0F);
 }
 
+TEST(PhaseGlobalCostModelTest, TrustedPrimaryCoverExcludesSparseNearerShape)
+{
+    PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});
+    PhaseGlobalActionKey broad{PhaseGlobalActionKind::kPrefill, 1, 0, 128, 0, 0};
+    PhaseGlobalActionKey near = broad;
+    near.chunkLength = 37;
+    for (int32_t sample{}; sample < 4; ++sample)
+    {
+        model.observe(broad, {18.0F, 18.0F});
+    }
+    model.observe(near, {15.0F, 15.0F});
+    model.observe(near, {42.0F, 42.0F});
+    PhaseGlobalActionKey requested = broad;
+    requested.chunkLength = 33;
+
+    ASSERT_TRUE(model.estimateCoveringPrimary(requested).has_value());
+    EXPECT_GT(model.estimateCoveringPrimary(requested)->makespanP95Ms, 18.0F);
+    ASSERT_TRUE(model.estimateCoveringPrimary(requested, 4U).has_value());
+    EXPECT_FLOAT_EQ(model.estimateCoveringPrimary(requested, 4U)->makespanP95Ms, 18.0F);
+}
+
 TEST(PhaseGlobalCostModelTest, LearnsGeometryIndependentPrimaryLaunchFloor)
 {
     PhaseGlobalCostModel model({8U, 1U, 0.0F, 0.02F});

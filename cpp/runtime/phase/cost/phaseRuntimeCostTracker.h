@@ -72,6 +72,7 @@ public:
     std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> estimatePrimaryBatchCoveringContext(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> estimateCoveringPrimary(PhaseGlobalActionKey const& key) const;
+    std::optional<PhaseGlobalCostEstimate> trustedEstimateCoveringPrimary(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> estimatePrimaryLaunchFloor(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> trustedEstimatePrimaryBatchCoveringContext(
         PhaseGlobalActionKey const& key) const;

@@ -982,7 +982,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringOve
 }
 
 std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringPrimary(
-    PhaseGlobalActionKey const& key) const
+    PhaseGlobalActionKey const& key, size_t minimumSamples) const
 {
     PhaseGlobalActionKey const target = phaseGlobalCanonicalOverlapCostKey(key);
     if (isOverlap(target.kind) || target.kind == PhaseGlobalActionKind::kNone
@@ -991,7 +991,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringPri
         return std::nullopt;
     }
     auto const cached = mCoveringPrimaryCache.find(target);
-    if (cached != mCoveringPrimaryCache.end())
+    if (minimumSamples == 1U && cached != mCoveringPrimaryCache.end())
     {
         return cached->second;
     }
@@ -1004,7 +1004,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringPri
     std::vector<Cover> covers;
     for (auto const& [observedKey, samples] : *mSamples)
     {
-        bool const semanticMatch = !samples.values.empty() && observedKey.kind == target.kind
+        bool const semanticMatch = samples.values.size() >= minimumSamples && observedKey.kind == target.kind
             && observedKey.secondaryBatchSize == target.secondaryBatchSize
             && observedKey.secondaryContextBucket == target.secondaryContextBucket
             && observedKey.executionVariant == target.executionVariant
@@ -1060,7 +1060,10 @@ std::optional<PhaseGlobalCostEstimate> PhaseGlobalCostModel::estimateCoveringPri
         result->uncertaintyMs = std::max(result->uncertaintyMs, cover.estimate.uncertaintyMs);
         result->uncertaintyMs = std::max(result->uncertaintyMs, result->makespanP95Ms - result->makespanMedianMs);
     }
-    mCoveringPrimaryCache.emplace(target, result);
+    if (minimumSamples == 1U)
+    {
+        mCoveringPrimaryCache.emplace(target, result);
+    }
     return result;
 }
 
