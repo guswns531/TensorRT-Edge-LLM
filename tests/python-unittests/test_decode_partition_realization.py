@@ -66,6 +66,42 @@ class DecodePartitionRealizationTest(unittest.TestCase):
         self.assertEqual(report["same_frontier_realized"], 0)
         self.assertEqual(report["duplicate_before_drain"], 1)
 
+    def test_rolling_batch_can_complete_extra_work_before_frontier_drain(self):
+        metrics = [
+            self.metric(1, [1, 2], [1, 2, 3, 4]),
+            self.metric(2, [3, 4, 1])
+        ]
+        commits = {1: [1500.0, 2500.0], 2: [1500.0], 3: [2500.0], 4: [2500.0]}
+        report = G_TOOL.analyze(metrics, commits)
+        episode = report["examples"][0]
+        self.assertEqual(episode["actual_dispatch_rows"], 5)
+        self.assertEqual(episode["duplicate_dispatch_rows"], 1)
+        self.assertEqual(episode["extra_committed_tokens"], 1)
+        self.assertEqual(report["opportunities_with_extra_commits"], 1)
+
+    def test_service_density_agreement_uses_only_covered_costs(self):
+        metrics = [
+            self.metric(1, [1, 2], [1, 2, 3, 4]),
+            self.metric(2, [3, 4])
+        ]
+        metrics[0]["predicted_decode_candidates"] = [{
+            "batch":
+            batch,
+            "service_samples":
+            4,
+            "gpu_samples":
+            4,
+            "selection_service_ms":
+            cost
+        } for batch, cost in ((1, 6.0), (2, 7.0), (4, 15.0))]
+        report = G_TOOL.analyze(metrics, {})
+        self.assertEqual(report["covered_service_density_decisions"], 1)
+        self.assertEqual(report["service_density_first_batch_agreements"], 1)
+        metrics[0]["predicted_decode_candidates"][-1][
+            "selection_service_ms"] = 12.0
+        report = G_TOOL.analyze(metrics, {})
+        self.assertEqual(report["service_density_first_batch_agreements"], 0)
+
     def test_invalid_frontier_fails(self):
         metrics = [self.metric(1, [1, 2], [1, 2, 3, 3])]
         with self.assertRaises(ValueError):

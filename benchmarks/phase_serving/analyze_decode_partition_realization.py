@@ -49,10 +49,31 @@ def analyze(metrics, commits):
         raise ValueError(
             "Full decode partition diagnostic metrics are required")
     results = []
+    covered_decisions = 0
+    service_density_agreements = 0
     for start, metric in enumerate(metrics):
         partition = metric.get("predicted_decode_partition", [])
         frontier = metric.get("predicted_decode_frontier_ids", [])
         lengths = metric.get("predicted_decode_frontier_lengths", [])
+        candidates = metric.get("predicted_decode_candidates", [])
+        if partition and candidates:
+            dense = next(
+                (item
+                 for item in candidates if item["batch"] == len(frontier)),
+                None)
+            known = [
+                item for item in candidates
+                if item["service_samples"] > 0 and item["gpu_samples"] > 0
+                and item["selection_service_ms"] > 0
+            ]
+            if dense in known:
+                covered_decisions += 1
+                density_choice = min(known,
+                                     key=lambda item:
+                                     (item["selection_service_ms"] / item[
+                                         "batch"], -item["batch"]))
+                service_density_agreements += density_choice[
+                    "batch"] == partition[0]
         if len(partition) < 2:
             continue
         if sum(partition) != len(frontier) or len(frontier) != len(lengths):
@@ -69,11 +90,15 @@ def analyze(metrics, commits):
         actual = []
         duplicates = set()
         outsiders = set()
+        duplicate_dispatch_rows = 0
+        actual_dispatch_rows = 0
         for following in metrics[start:start + len(frontier) + 4]:
             ids = following.get("decode_request_ids", [])
             if not ids:
                 continue
             current = set(ids)
+            actual_dispatch_rows += len(ids)
+            duplicate_dispatch_rows += len(current & frontier_set & seen)
             duplicates.update((current & frontier_set) & seen)
             outsiders.update(current - frontier_set)
             seen.update(current & frontier_set)
@@ -105,6 +130,10 @@ def analyze(metrics, commits):
             len(actual) == len(planned)
             and all(got == expected for got, expected in zip(actual, planned)),
             "realized_batches": [len(group) for group in actual],
+            "actual_dispatch_rows":
+            actual_dispatch_rows,
+            "duplicate_dispatch_rows":
+            duplicate_dispatch_rows,
             "duplicate_before_drain":
             bool(duplicates),
             "outside_frontier_before_drain":
@@ -115,8 +144,12 @@ def analyze(metrics, commits):
             len(committed) == len(frontier),
         }
         if len(committed) == len(frontier):
-            result["observed_commit_horizon_ms"] = (max(committed) -
+            horizon = max(committed)
+            result["observed_commit_horizon_ms"] = (horizon -
                                                     start_us) / 1000.0
+            result["extra_committed_tokens"] = sum(
+                start_us <= time <= horizon for request_id in frontier
+                for time in commits.get(request_id, [])) - len(frontier)
         results.append(result)
     complete = [r for r in results if r["all_frontier_rows_committed"]]
     matched = [r for r in complete if r["same_frontier_realized"]]
@@ -133,6 +166,15 @@ def analyze(metrics, commits):
         sum(r["outside_frontier_before_drain"] for r in results),
         "complete_commit_horizons":
         len(complete),
+        "complete_commit_horizon_mean_ms":
+        statistics.mean(r["observed_commit_horizon_ms"]
+                        for r in complete) if complete else None,
+        "opportunities_with_extra_commits":
+        sum(r.get("extra_committed_tokens", 0) > 0 for r in results),
+        "covered_service_density_decisions":
+        covered_decisions,
+        "service_density_first_batch_agreements":
+        service_density_agreements,
         "matched_commit_horizon_mean_ms":
         statistics.mean(r["observed_commit_horizon_ms"]
                         for r in matched) if matched else None,
