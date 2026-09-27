@@ -9,8 +9,11 @@ int32_t const split = trial.at("split");
 int32_t const outputs = trial.at("output_tokens");
 int32_t const rounds = trial.at("rounds");
 int32_t const splitTurns = trial.at("split_turns");
+int32_t const inspectTurn = trial.value("inspect_turn", -1);
+bool const graphReplay = trial.value("graph_replay", true);
 ELLM_CHECK(rows > 1 && rows <= decodeBatchCapacity && split > 0 && split < rows
-        && outputs >= 3 && outputs <= 256 && rounds > 0 && rounds <= 10 && splitTurns > 0,
+        && outputs >= 3 && outputs <= 256 && rounds > 0 && rounds <= 10 && splitTurns > 0
+        && inspectTurn < outputs - 1,
     "Invalid async decode trial bounds");
 ELLM_CHECK(!enablePrefixReuse && serverConfig.eosTokenIds.empty(), "Trial requires fixed output without prefix reuse");
 auto parsed = parsePhaseIpcInput(trial.at("request").dump(), outputs);
@@ -20,18 +23,28 @@ ELLM_CHECK(tokenizer.applyChatTemplate(parsed.request, formatted, true, true, fa
 auto const prompt = tokenizer.encode(formatted.formattedCompleteRequest, false);
 ELLM_CHECK(!prompt.empty() && prompt.size() + outputs <= static_cast<size_t>(config.maxKVCacheCapacity),
     "Trial prompt exceeds KV capacity");
-semanticCoordinator.primeDecodeGraphs({1, split, rows - split, rows}, decodeStream,
-    [&](int32_t batch, cudaStream_t stream) {
-        std::vector<int32_t> token{0};
-        std::vector<rt::IndependentPhaseRequestView> views(static_cast<size_t>(batch));
-        for (auto& view : views)
-        {
-            view.generatedTokens = &token;
-        }
-        stageTokens(views, *decodeIO, decodeMap, stream, false);
-    });
+if (graphReplay)
+{
+    semanticCoordinator.primeDecodeGraphs({1, split, rows - split, rows}, decodeStream,
+        [&](int32_t batch, cudaStream_t stream) {
+            std::vector<int32_t> token{0};
+            std::vector<rt::IndependentPhaseRequestView> views(static_cast<size_t>(batch));
+            for (auto& view : views)
+            {
+                view.generatedTokens = &token;
+            }
+            stageTokens(views, *decodeIO, decodeMap, stream, false);
+        });
+}
 semanticCoordinator.setGraphCaptureEnabled(false);
 semanticCoordinator.setMetricsCollectionEnabled(true);
+float* inspectionLogits{};
+if (inspectTurn >= 0)
+{
+    void* pinned{};
+    CUDA_CHECK(cudaMallocHost(&pinned, static_cast<size_t>(config.outputVocabSize) * sizeof(float)));
+    inspectionLogits = static_cast<float*>(pinned);
+}
 uint64_t lastCommit{};
 semanticServer.setTimelineCallback([&](rt::PhaseTimelineEvent const& event) {
     if (event.stage == rt::PhaseTimelineStage::kDecodeTokenCommitted
@@ -77,6 +90,7 @@ for (int32_t round = -1; round < rounds; ++round)
         semanticServer.setDecodeDispatchBlocked(false);
         collect();
         nlohmann::json dispatches = nlohmann::json::array();
+        nlohmann::json inspected = nlohmann::json::array();
         uint64_t const begin = rt::phaseTimelineNowNs();
         uint64_t firstDrain{}, secondDrain{};
         for (int32_t turn{}; turn < outputs - 1; ++turn)
@@ -118,6 +132,40 @@ for (int32_t round = -1; round < rounds; ++round)
                 {
                     actualRows.push_back(static_cast<int32_t>(std::find(ids.begin(), ids.end(), id) - ids.begin()));
                 }
+                if (turn == inspectTurn)
+                {
+                    auto const row = std::find(actualRows.begin(), actualRows.end(), 0);
+                    if (row != actualRows.end())
+                    {
+                        size_t const rowBytes = static_cast<size_t>(config.outputVocabSize) * sizeof(float);
+                        auto const* logits = static_cast<std::byte const*>(decodeIO->outputLogits.rawPointer());
+                        CUDA_CHECK(cudaMemcpyAsync(inspectionLogits,
+                            logits + static_cast<size_t>(row - actualRows.begin()) * rowBytes, rowBytes,
+                            cudaMemcpyDeviceToHost, decodeStream));
+                        CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+                        std::array<int32_t, 8> topIds{};
+                        topIds.fill(-1);
+                        for (int32_t token{}; token < config.outputVocabSize; ++token)
+                        {
+                            for (size_t rank{}; rank < topIds.size(); ++rank)
+                            {
+                                if (topIds[rank] < 0 || inspectionLogits[token] > inspectionLogits[topIds[rank]])
+                                {
+                                    std::move_backward(topIds.begin() + rank, topIds.end() - 1, topIds.end());
+                                    topIds[rank] = token;
+                                    break;
+                                }
+                            }
+                        }
+                        nlohmann::json top = nlohmann::json::array();
+                        for (int32_t token : topIds)
+                        {
+                            top.push_back({{"token", token}, {"logit", inspectionLogits[token]}});
+                        }
+                        inspected.push_back({{"turn", turn}, {"actual_row", row - actualRows.begin()},
+                            {"top", std::move(top)}});
+                    }
+                }
                 dispatches.push_back({{"turn", turn}, {"batch", count}, {"offset", offset},
                     {"actual_rows", actualRows},
                     {"gpu_ms", metric.decodeGpuMs}, {"graph", timing.graphReplay},
@@ -153,11 +201,15 @@ for (int32_t round = -1; round < rounds; ++round)
         if (round >= 0)
         {
             episodes.push_back({{"round", round}, {"order", order}, {"variant", variant}, {"slots", slots},
-                {"tokens", orderedTokens}, {"dispatches", std::move(dispatches)},
+                {"tokens", orderedTokens}, {"dispatches", std::move(dispatches)}, {"logits", std::move(inspected)},
                 {"first_tick_ms", static_cast<double>(firstDrain - begin) / 1.0e6},
                 {"two_tick_ms", static_cast<double>(secondDrain - begin) / 1.0e6}});
         }
     }
+}
+if (inspectionLogits != nullptr)
+{
+    CUDA_CHECK(cudaFreeHost(inspectionLogits));
 }
 std::ofstream output(trial.at("output").get<std::string>());
 ELLM_CHECK(output.good(), "Cannot open async trial report");

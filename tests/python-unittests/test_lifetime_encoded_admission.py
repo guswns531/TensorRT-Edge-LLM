@@ -226,6 +226,17 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(full.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"), "full")
         self.assertEqual(default, full)
 
+    def test_decode_partition_trace_is_opt_in(self):
+        default = environment(self.command("independent"))
+        diagnostic = environment(
+            G_RUNNER.command_for(self.repo, self.config, self.repo / "cell",
+                                 "mixed", "independent", 0,
+                                 {"decode_partition_diagnostic": True}))
+        self.assertNotIn("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC", default)
+        self.assertEqual(
+            diagnostic.pop("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"), "1")
+        self.assertEqual(default, diagnostic)
+
     def test_serving_defaults_match_repeated_configuration(self):
         with unittest.mock.patch.dict("os.environ", {}, clear=True):
             args = G_RUNNER.parse_args([])

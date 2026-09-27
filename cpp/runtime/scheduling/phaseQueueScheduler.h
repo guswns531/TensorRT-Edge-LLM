@@ -198,7 +198,11 @@ struct PhaseDispatchMetrics
     bool concurrentPrefillActive{};
     //! Predicted cost and number of turns required to service the runnable decode rows.
     float predictedDecodeDrainGpuMs{};
+    float predictedDecodeDrainServiceMs{};
     int32_t predictedDecodeDrainTurns{};
+    std::vector<int32_t> predictedDecodePartition;
+    std::vector<uint64_t> predictedDecodeFrontierIds;
+    std::vector<int32_t> predictedDecodeFrontierLengths;
     //! Host page-pool snapshot after the dispatch completion; zero for linear caches.
     int32_t pagePoolTotalBundles{};
     int32_t pagePoolAllocatedBundles{};
@@ -483,6 +487,8 @@ struct PhaseQueueSchedulerConfig
     bool enableMeasuredDecodeBatching{};
     //! Select batch partitions from process-local host service costs, without a static prior.
     bool enableMeasuredDecodeServiceBatching{};
+    //! Retain the service-DP frontier and partition in dispatch metrics for opt-in diagnostics.
+    bool captureDecodePartitionTrace{};
     //! Refine static decode costs from context-bucketed decode-component observations.
     bool enableDecodeComponentObservation{};
     size_t decodeComponentMinSamples{8U};
@@ -679,7 +685,11 @@ struct PhaseDispatchPlan
     bool externalEncoderActive{};
     bool concurrentPrefillActive{};
     float predictedDecodeDrainGpuMs{};
+    float predictedDecodeDrainServiceMs{};
     int32_t predictedDecodeDrainTurns{};
+    std::vector<int32_t> predictedDecodePartition;
+    std::vector<uint64_t> predictedDecodeFrontierIds;
+    std::vector<int32_t> predictedDecodeFrontierLengths;
     bool prefillDeferredForTpot{};
     bool prefillCostCoverageMiss{};
     bool overlapEvaluatedByCost{};
@@ -904,7 +914,8 @@ private:
     PhaseDispatchKind applyExternalDrainPreference(
         PhaseQueueSnapshot const& snapshot, PhaseDispatchKind baseline, bool& applied) const noexcept;
     int32_t selectDecodeBatchSize(PhaseQueueSnapshot const& snapshot, bool concurrentPrefill,
-        float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const;
+        float& predictedDrainGpuMs, int32_t& predictedDrainTurns, std::vector<int32_t>* predictedPartition = nullptr,
+        float* predictedDrainServiceMs = nullptr) const;
     std::optional<float> decodeComponentP95(
         int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const;
     std::pair<int64_t, int32_t> decodeCandidateShape(int32_t maxRows) const;

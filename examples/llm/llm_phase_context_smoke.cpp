@@ -1769,6 +1769,8 @@ int main(int argc, char** argv)
             semanticSchedulerConfig.decodeBatchCosts.clear();
             semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
         }
+        semanticSchedulerConfig.captureDecodePartitionTrace
+            = std::getenv("TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC") != nullptr;
         if (startupOptions.enabled)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
@@ -4019,7 +4021,12 @@ int main(int argc, char** argv)
                         {"external_encoder_active", metrics.externalEncoderActive},
                         {"concurrent_prefill_active", metrics.concurrentPrefillActive},
                         {"predicted_decode_drain_gpu_ms", metrics.predictedDecodeDrainGpuMs},
+                        {"predicted_decode_drain_service_ms", metrics.predictedDecodeDrainServiceMs},
                         {"predicted_decode_drain_turns", metrics.predictedDecodeDrainTurns},
+                        {"planned_decode_batch", metrics.plannedDecodeBatchSize},
+                        {"predicted_decode_partition", metrics.predictedDecodePartition},
+                        {"predicted_decode_frontier_ids", metrics.predictedDecodeFrontierIds},
+                        {"predicted_decode_frontier_lengths", metrics.predictedDecodeFrontierLengths},
                         {"decode_cohort_size", metrics.decodeCohortSize}, {"decode_gpu_ms", metrics.decodeGpuMs},
                         {"decode_completion_ms", metrics.decodeCompletionMs},
                         {"makespan_gpu_ms", metrics.makespanGpuMs}, {"overlap_ratio", metrics.overlapRatio},

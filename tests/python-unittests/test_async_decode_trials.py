@@ -111,3 +111,26 @@ class AsyncDecodeTrialTest(unittest.TestCase):
         self.assertEqual(result["dense"]["unique_sequences"], 2)
         self.assertEqual(result["dense"]["identical_to_singleton"], 1)
         self.assertEqual(result["dense"]["first_divergences"], [None, 1])
+
+    def test_inspection_matches_committed_argmax_and_execution_mode(self):
+        raw = self.fixture()
+        raw["config"]["inspect_turn"] = 0
+        raw["config"]["graph_replay"] = False
+        for episode in raw["episodes"]:
+            episode["logits"] = [{
+                "turn":
+                0,
+                "actual_row":
+                0,
+                "top": [{
+                    "token": token,
+                    "logit": 10.0 - rank
+                } for rank, token in enumerate(range(2, 10))]
+            }]
+            for dispatch in episode["dispatches"]:
+                dispatch["graph"] = False
+        self.assertEqual(
+            G_TOOL.summarize(raw)["dense"]["inspected_top2_margin"], 1.0)
+        raw["episodes"][0]["logits"][0]["top"][0]["token"] = 99
+        with self.assertRaises(ValueError):
+            G_TOOL.summarize(raw)

@@ -62,11 +62,27 @@ def summarize(raw):
                 if sorted(d["actual_rows"]) != list(
                         range(d["offset"], d["offset"] + d["batch"])):
                     raise ValueError("Dispatch membership differs")
-                if not d["graph"]:
-                    raise ValueError("Unexpected eager dispatch")
+                if d["graph"] != cfg.get("graph_replay", True):
+                    raise ValueError("Unexpected graph execution mode")
                 for field in ("gpu_ms", "service_ms", "commit_to_prepare_ms"):
                     if not math.isfinite(d[field]) or d[field] < 0:
                         raise ValueError("Invalid timing")
+            if cfg.get("inspect_turn", -1) >= 0:
+                inspected = episode.get("logits", [])
+                if len(inspected
+                       ) != 1 or inspected[0]["turn"] != cfg["inspect_turn"]:
+                    raise ValueError("Missing inspected row logits")
+                top = inspected[0]["top"]
+                if len(top) != 8 or any(not math.isfinite(x["logit"])
+                                        for x in top):
+                    raise ValueError("Invalid inspected logits")
+                if any(top[i]["logit"] < top[i + 1]["logit"]
+                       for i in range(7)):
+                    raise ValueError("Inspected logits are not ranked")
+                if top[0]["token"] != episode["tokens"][0][cfg["inspect_turn"]
+                                                           + 1]:
+                    raise ValueError(
+                        "Inspected argmax differs from committed token")
         all_tokens = [t for e in group for t in e["tokens"]]
         result[name] = {
             "first_tick_ms":
@@ -92,6 +108,11 @@ def summarize(raw):
             "reference_tokens":
             all_tokens[0],
         }
+        if cfg.get("inspect_turn", -1) >= 0:
+            result[name]["inspected_top"] = group[0]["logits"][0]["top"]
+            result[name]["inspected_top2_margin"] = statistics.mean(
+                e["logits"][0]["top"][0]["logit"] -
+                e["logits"][0]["top"][1]["logit"] for e in group)
     reference = result["singleton"]["reference_tokens"]
     for variant, name in enumerate(("dense", "split", "singleton")):
         tokens = [
@@ -110,6 +131,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-root", type=pathlib.Path, required=True)
     parser.add_argument("--result-root", type=pathlib.Path, required=True)
+    parser.add_argument("--inspection-only", action="store_true")
     args = parser.parse_args()
     repo = pathlib.Path(
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
@@ -140,8 +162,11 @@ def main():
         "container":
         serving.IMAGE,
         "cells": [],
-        "note_references":
-        ["notes/345-async-decode-cohort-and-token-diagnostic-20260927.md"],
+        "note_references": [
+            "notes/346-decode-logit-and-partition-realization-20260927.md"
+            if args.inspection_only else
+            "notes/345-async-decode-cohort-and-token-diagnostic-20260927.md"
+        ],
         "summary_path":
         str(root / "summary.json")
     }
@@ -151,15 +176,15 @@ def main():
                    repo / "examples/llm/phaseAsyncDecodeTrial.inc"):
         (root / source.name).write_bytes(source.read_bytes())
     summary = {}
-    for model, kind, rows, split, outputs, turns, rounds in (("gemma",
-                                                              "two_tick", 8, 4,
-                                                              3, 1, 5),
-                                                             ("gemma",
-                                                              "quality", 8, 4,
-                                                              128, 127, 2),
-                                                             ("cosmos",
-                                                              "two_tick", 64,
-                                                              32, 3, 1, 5)):
+    cells = (("gemma", "graph_logits", 8, 4, 15, 14, 2, True),
+             ("gemma", "eager_logits", 8, 4, 15, 14, 2,
+              False)) if args.inspection_only else (("gemma", "two_tick", 8, 4,
+                                                     3, 1, 5, True),
+                                                    ("gemma", "quality", 8, 4,
+                                                     128, 127, 2, True),
+                                                    ("cosmos", "two_tick", 64,
+                                                     32, 3, 1, 5, True))
+    for model, kind, rows, split, outputs, turns, rounds, graph_replay in cells:
         cell = root / (model + "-" + kind)
         cell.mkdir()
         config = serving.model_config(repo, model)
@@ -173,9 +198,12 @@ def main():
             "output_tokens": outputs,
             "split_turns": turns,
             "rounds": rounds,
+            "graph_replay": graph_replay,
             "request": request,
             "output": mounted(cell / "raw.json")
         }
+        if args.inspection_only:
+            trial["inspect_turn"] = 12
         (cell / "trial.json").write_text(json.dumps(trial, indent=2) + "\n")
         env = {
             "TRT_PACKAGE_DIR": "/opt/tensorrt",

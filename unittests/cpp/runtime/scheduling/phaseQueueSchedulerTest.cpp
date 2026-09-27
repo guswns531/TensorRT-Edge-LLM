@@ -2132,6 +2132,7 @@ TEST(PhaseQueueSchedulerTest, MeasuredServiceSelectsWithoutStaticPriorOrGpuOnlyB
         config.maxDecodeBatchSize = 4;
         config.enableDynamicDecodeBatching = true;
         config.enableMeasuredDecodeServiceBatching = true;
+        config.captureDecodePartitionTrace = true;
         config.decodeBatchCosts = {{1, 512, 0.001F}};
         config.runtimeCostTracker = tracker;
         PhaseQueueScheduler scheduler(config);
@@ -2141,6 +2142,11 @@ TEST(PhaseQueueSchedulerTest, MeasuredServiceSelectsWithoutStaticPriorOrGpuOnlyB
         }
         auto const plan = scheduler.next();
         EXPECT_EQ(plan.decodeBatch.size(), denseService < 10.0F ? 4U : 2U);
+        EXPECT_EQ(plan.predictedDecodePartition,
+            denseService < 10.0F ? (std::vector<int32_t>{4}) : (std::vector<int32_t>{2, 2}));
+        EXPECT_EQ(plan.predictedDecodeFrontierIds, (std::vector<uint64_t>{1, 2, 3, 4}));
+        EXPECT_EQ(plan.predictedDecodeFrontierLengths, (std::vector<int32_t>{128, 128, 128, 128}));
+        EXPECT_FLOAT_EQ(plan.predictedDecodeDrainServiceMs, denseService < 10.0F ? 9.0F : 10.0F);
         EXPECT_FLOAT_EQ(plan.predictedDecodeDrainGpuMs, denseService < 10.0F ? 10.0F : 8.0F);
         EXPECT_FLOAT_EQ(
             tracker->trustedEstimate({PhaseGlobalActionKind::kDecode, 4, 0, 1, 1, 0})->makespanMedianMs, 10.0F);

@@ -3723,9 +3723,19 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
     plan.externalEncoderActive = mExternalEncoderActive;
     plan.concurrentPrefillActive = kind == PhaseDispatchKind::kOverlap;
     plan.plannedDecodeBatchSize = kind == PhaseDispatchKind::kDecode || kind == PhaseDispatchKind::kOverlap
-        ? selectDecodeBatchSize(
-              state, plan.concurrentPrefillActive, plan.predictedDecodeDrainGpuMs, plan.predictedDecodeDrainTurns)
+        ? selectDecodeBatchSize(state, plan.concurrentPrefillActive, plan.predictedDecodeDrainGpuMs,
+              plan.predictedDecodeDrainTurns,
+              mConfig.captureDecodePartitionTrace ? &plan.predictedDecodePartition : nullptr,
+              mConfig.captureDecodePartitionTrace ? &plan.predictedDecodeDrainServiceMs : nullptr)
         : 0;
+    if (mConfig.captureDecodePartitionTrace && plan.plannedDecodeBatchSize > 0)
+    {
+        for (PhaseWorkItem const* item : decodeCandidateRows(mConfig.maxDecodeBatchSize))
+        {
+            plan.predictedDecodeFrontierIds.push_back(item->requestId);
+            plan.predictedDecodeFrontierLengths.push_back(item->tokenCount);
+        }
+    }
     if (plan.plannedDecodeBatchSize > 0)
     {
         std::tie(plan.plannedDecodeContextTokens, plan.plannedDecodeMaxContextLength)
@@ -4004,7 +4014,8 @@ int32_t PhaseQueueScheduler::decodeCandidateReplacementRows(int32_t maxRows) con
 }
 
 int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& state, bool concurrentPrefill,
-    float& predictedDrainGpuMs, int32_t& predictedDrainTurns) const
+    float& predictedDrainGpuMs, int32_t& predictedDrainTurns, std::vector<int32_t>* predictedPartition,
+    float* predictedDrainServiceMs) const
 {
     int32_t const available = std::min<int32_t>(mConfig.maxDecodeBatchSize, static_cast<int32_t>(state.decodeQueued));
     bool const hasDecodeCostSource = mConfig.enableMeasuredDecodeBatching || !mConfig.decodeBatchCosts.empty();
@@ -4075,6 +4086,17 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
         }
         predictedDrainTurns = first.back() > 0 ? turns.back() : 1;
         predictedDrainGpuMs = gpu.back();
+        if (predictedDrainServiceMs != nullptr && first.back() > 0)
+        {
+            *predictedDrainServiceMs = total.back();
+        }
+        if (predictedPartition != nullptr && first.back() > 0)
+        {
+            for (int32_t remaining = available; remaining > 0; remaining -= first[static_cast<size_t>(remaining)])
+            {
+                predictedPartition->push_back(first[static_cast<size_t>(remaining)]);
+            }
+        }
         return first.back() > 0 ? first.back() : available;
     }
     bool measuredCoverage{};

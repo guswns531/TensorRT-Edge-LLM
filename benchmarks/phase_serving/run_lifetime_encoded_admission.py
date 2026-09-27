@@ -314,6 +314,8 @@ def command_for(repo,
         "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL":
         options.get("telemetry_level", "dispatch")
     }
+    if options.get("decode_partition_diagnostic", False):
+        environment["TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"] = "1"
     if "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US" in os.environ:
         environment["TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"] = os.environ[
             "TRT_EDGELLM_DECODE_BURST_GRACE_PERIOD_US"]
@@ -537,6 +539,10 @@ def parse_args(argv=None):
         choices=("full", "dispatch"),
         default="dispatch",
         help="Full causal diagnostics or compact dispatch metrics")
+    parser.add_argument(
+        "--decode-partition-diagnostic",
+        action="store_true",
+        help="Record ready decode rows and measured-service DP partitions")
     parser.add_argument("--max-decode-graphs", type=int, default=64)
     parser.add_argument("--max-prefill-graphs", type=int, default=0)
     parser.add_argument(
@@ -710,6 +716,8 @@ def main():
                             args.cuda_graphs == "on",
                             "telemetry_level":
                             args.telemetry_level,
+                            "decode_partition_diagnostic":
+                            args.decode_partition_diagnostic,
                             "serving_overlap_probes":
                             args.serving_overlap_probes == "on",
                             "startup_calibration":

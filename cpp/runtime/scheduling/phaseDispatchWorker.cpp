@@ -319,7 +319,11 @@ bool PhaseDispatchWorker::dispatchNext()
     mCurrentMetrics.externalEncoderActive = mInFlight.externalEncoderActive;
     mCurrentMetrics.concurrentPrefillActive = mInFlight.concurrentPrefillActive;
     mCurrentMetrics.predictedDecodeDrainGpuMs = mInFlight.predictedDecodeDrainGpuMs;
+    mCurrentMetrics.predictedDecodeDrainServiceMs = mInFlight.predictedDecodeDrainServiceMs;
     mCurrentMetrics.predictedDecodeDrainTurns = mInFlight.predictedDecodeDrainTurns;
+    mCurrentMetrics.predictedDecodePartition = std::move(mInFlight.predictedDecodePartition);
+    mCurrentMetrics.predictedDecodeFrontierIds = std::move(mInFlight.predictedDecodeFrontierIds);
+    mCurrentMetrics.predictedDecodeFrontierLengths = std::move(mInFlight.predictedDecodeFrontierLengths);
     mCurrentMetrics.prefillCohortSize = mInFlight.prefillCohortSize;
     mCurrentMetrics.prefillCohortRefillRows = mInFlight.prefillCohortRefillRows;
     mCurrentMetrics.globalDecisionEvaluated = mInFlight.globalDecisionEvaluated;
