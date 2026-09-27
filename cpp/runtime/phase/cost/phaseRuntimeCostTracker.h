@@ -64,6 +64,9 @@ public:
     explicit PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig config = {});
 
     void observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation);
+    //! Host preparation through sampling/state commit; never mixed with CUDA action timings.
+    void observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds);
+    std::optional<PhaseGlobalCostEstimate> decodeServiceEstimate(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> estimate(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> trustedEstimate(PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> estimateInterpolatedPrimaryBatch(PhaseGlobalActionKey const& key) const;
@@ -144,6 +147,7 @@ private:
 
     PhaseRuntimeCostTrackerConfig mConfig;
     PhaseGlobalCostModel mActions;
+    PhaseGlobalCostModel mDecodeService;
     PhaseContextualPdModel mContextualPd;
     PhaseContextualPdModel mContextualDp;
     PhaseContextualPdModel mContextualEp;

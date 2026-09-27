@@ -54,6 +54,7 @@ struct PhaseStartupCalibrationOptions
     bool enabled{};
     bool requireCoverage{};
     bool measuredDecodeAtMeasurement{};
+    bool measuredDecodeService{};
     bool planOnly{};          //!< Generate startup trial candidates without changing the decode cost policy.
     double budgetMs{30000.0}; //!< Stop admitting probes at the deadline; drain submitted work before readiness.
 };

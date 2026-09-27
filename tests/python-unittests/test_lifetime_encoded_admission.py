@@ -190,6 +190,21 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             G_RUNNER.calibration_contract("independent-autotune-shadow",
                                           {"startup_calibration": True})
 
+    def test_startup_service_is_not_legacy_or_delayed_activation(self):
+        values = environment(self.command("independent-autotune-service"))
+        self.assertEqual(values["TRT_EDGELLM_STARTUP_DECODE_SERVICE"], "1")
+        self.assertEqual(values["TRT_EDGELLM_STARTUP_CALIBRATION"], "1")
+        self.assertNotIn("TRT_EDGELLM_STARTUP_PLAN_ONLY", values)
+        self.assertNotIn("TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS",
+                         values)
+        contract = G_RUNNER.calibration_contract(
+            "independent-autotune-service")
+        self.assertFalse(contract["compact_shapes"])
+        self.assertFalse(contract["compact_http"])
+        with self.assertRaises(ValueError):
+            G_RUNNER.calibration_contract("independent-autotune-service",
+                                          {"startup_calibration": True})
+
     def test_serving_probe_ablation_keeps_calibration_contract(self):
         default = environment(self.command("independent"))
         disabled = environment(

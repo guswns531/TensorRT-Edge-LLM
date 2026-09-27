@@ -2113,6 +2113,93 @@ TEST(PhaseQueueSchedulerTest, SparseMeasuredDecodeCoveragePreservesLargestBatch)
     EXPECT_EQ(scheduler.next().decodeBatch.size(), 4U);
 }
 
+TEST(PhaseQueueSchedulerTest, MeasuredServiceSelectsWithoutStaticPriorOrGpuOnlyBias)
+{
+    for (float const denseService : {9.0F, 15.0F})
+    {
+        PhaseRuntimeCostTrackerConfig trackerConfig;
+        trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+        trackerConfig.actionMinimumSamples = 1U;
+        auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+        for (int32_t const batch : {2, 4})
+        {
+            PhaseGlobalActionKey const key{PhaseGlobalActionKind::kDecode, batch, 0, 1, 1, 0};
+            float const gpu = batch == 2 ? 4.0F : 10.0F;
+            tracker->observe(key, {gpu, gpu});
+            tracker->observeDecodeService(key, batch == 2 ? 5.0F : denseService);
+        }
+        PhaseQueueSchedulerConfig config;
+        config.maxDecodeBatchSize = 4;
+        config.enableDynamicDecodeBatching = true;
+        config.enableMeasuredDecodeServiceBatching = true;
+        config.decodeBatchCosts = {{1, 512, 0.001F}};
+        config.runtimeCostTracker = tracker;
+        PhaseQueueScheduler scheduler(config);
+        for (uint64_t id = 1; id <= 4; ++id)
+        {
+            scheduler.enqueueDecode({id, 128});
+        }
+        auto const plan = scheduler.next();
+        EXPECT_EQ(plan.decodeBatch.size(), denseService < 10.0F ? 4U : 2U);
+        EXPECT_FLOAT_EQ(plan.predictedDecodeDrainGpuMs, denseService < 10.0F ? 10.0F : 8.0F);
+        EXPECT_FLOAT_EQ(
+            tracker->trustedEstimate({PhaseGlobalActionKind::kDecode, 4, 0, 1, 1, 0})->makespanMedianMs, 10.0F);
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, UnknownServiceShapeDoesNotUseLegacyOrInventRemainder)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    tracker->observe({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, {1.0F, 1.0F});
+    tracker->observeDecodeService({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, 1.0F);
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 3;
+    config.enableDynamicDecodeBatching = true;
+    config.enableMeasuredDecodeServiceBatching = true;
+    config.decodeBatchCosts = {{1, 512, 0.001F}};
+    config.runtimeCostTracker = tracker;
+    for (bool const denseKnown : {false, true})
+    {
+        if (denseKnown)
+        {
+            tracker->observe({PhaseGlobalActionKind::kDecode, 3, 0, 1, 1, 0}, {10.0F, 10.0F});
+            tracker->observeDecodeService({PhaseGlobalActionKind::kDecode, 3, 0, 1, 1, 0}, 10.0F);
+        }
+        PhaseQueueScheduler scheduler(config);
+        for (uint64_t id = 1; id <= 3; ++id)
+        {
+            scheduler.enqueueDecode({id, 128});
+        }
+        EXPECT_EQ(scheduler.next().decodeBatch.size(), 3U);
+        EXPECT_FALSE(scheduler.decodeServiceEstimate(2, 1024).has_value());
+    }
+}
+
+TEST(PhaseQueueSchedulerTest, ServiceCoverageDoesNotPrematurelyStopGpuCalibration)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    tracker->observe({PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0}, {1.0F, 1.0F});
+    tracker->observeDecodeService({PhaseGlobalActionKind::kDecode, 1, 0, 1, 1, 0}, 1.0F);
+    tracker->observeDecodeService({PhaseGlobalActionKind::kDecode, 2, 0, 1, 1, 0}, 10.0F);
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 2;
+    config.enableDynamicDecodeBatching = true;
+    config.enableMeasuredDecodeServiceBatching = true;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueueDecode({1, 128});
+    scheduler.enqueueDecode({2, 128});
+    EXPECT_EQ(scheduler.next().decodeBatch.size(), 2U);
+    tracker->resetExecutionCostHistory();
+    EXPECT_FALSE(scheduler.decodeServiceEstimate(2, 128).has_value());
+}
+
 TEST(PhaseQueueSchedulerTest, MeasuredPrefillCostsPreserveProducerClassAndDenseBatch)
 {
     PhaseRuntimeCostTrackerConfig trackerConfig;

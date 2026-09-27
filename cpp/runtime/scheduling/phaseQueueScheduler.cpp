@@ -73,6 +73,11 @@ PhaseQueueScheduler::PhaseQueueScheduler(PhaseQueueSchedulerConfig config)
     , mDecodeComponentObservationActive(mConfig.enableDecodeComponentObservation)
     , mTransitionPredictor(mConfig.transitionPredictorConfig)
 {
+    if (mConfig.enableMeasuredDecodeServiceBatching)
+    {
+        mConfig.decodeBatchCosts.clear();
+        mConfig.enableMeasuredDecodeBatching = true;
+    }
     if (char const* const envPredictor = std::getenv("TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR");
         envPredictor != nullptr)
     {
@@ -4029,6 +4034,49 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
             = std::max(maxContextLengths[static_cast<size_t>(runnableRows - 1)], item->tokenCount);
     }
     std::vector<Candidate> candidates;
+    if (mConfig.enableMeasuredDecodeServiceBatching)
+    {
+        int32_t const context = maxContextLengths.back();
+        auto const dense = decodeServiceEstimate(available, context);
+        if (!dense.has_value() || !measuredDecodeP95(available, context).has_value())
+        {
+            // Execute unknown ready shapes to acquire evidence, without consulting a static prior.
+            predictedDrainTurns = 1;
+            return available;
+        }
+        std::vector<float> total(static_cast<size_t>(available) + 1U, std::numeric_limits<float>::infinity());
+        std::vector<float> gpu(total.size());
+        std::vector<int32_t> first(total.size()), turns(total.size());
+        total[0] = 0.0F;
+        for (int32_t batch = 1; batch <= available; ++batch)
+        {
+            auto const service = decodeServiceEstimate(batch, context);
+            auto const engine = measuredDecodeP95(batch, context);
+            if (!service.has_value() || !engine.has_value())
+            {
+                continue;
+            }
+            float const cost = std::max(service->makespanP95Ms, service->makespanMedianMs + service->uncertaintyMs);
+            for (int32_t count = batch; count <= available; ++count)
+            {
+                float const candidate = cost + total[count - batch];
+                if (!std::isfinite(candidate))
+                {
+                    continue;
+                }
+                if (candidate < total[count] || (candidate == total[count] && batch > first[count]))
+                {
+                    total[count] = candidate;
+                    first[count] = batch;
+                    turns[count] = 1 + turns[count - batch];
+                    gpu[count] = *engine + gpu[count - batch];
+                }
+            }
+        }
+        predictedDrainTurns = first.back() > 0 ? turns.back() : 1;
+        predictedDrainGpuMs = gpu.back();
+        return first.back() > 0 ? first.back() : available;
+    }
     bool measuredCoverage{};
     if (mConfig.enableMeasuredDecodeBatching)
     {
@@ -4644,6 +4692,29 @@ void PhaseQueueScheduler::useMeasuredDecodeCosts()
         "Decode cost source can only change on an idle scheduler");
     mConfig.decodeBatchCosts.clear();
     mConfig.enableMeasuredDecodeBatching = true;
+}
+
+bool PhaseQueueScheduler::usesMeasuredDecodeService() const noexcept
+{
+    return mConfig.enableMeasuredDecodeServiceBatching;
+}
+
+void PhaseQueueScheduler::observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds)
+{
+    if (usesMeasuredDecodeService())
+    {
+        mRuntimeCostTracker->observeDecodeService(key, milliseconds);
+    }
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseQueueScheduler::decodeServiceEstimate(
+    int32_t batchSize, int32_t maxContextLength) const
+{
+    int32_t const width = std::max(1, mConfig.runtimeDecodeContextBucketTokens);
+    PhaseGlobalActionKey key{
+        PhaseGlobalActionKind::kDecode, batchSize, 0, 1, (maxContextLength + width - 1) / width, 0};
+    key.executionVariant = executionVariantFor(key, 0);
+    return mRuntimeCostTracker->decodeServiceEstimate(key);
 }
 
 void PhaseQueueScheduler::resetSchedulingHistory()

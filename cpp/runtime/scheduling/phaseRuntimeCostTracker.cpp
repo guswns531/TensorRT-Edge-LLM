@@ -46,6 +46,7 @@ PhaseRuntimeCostTrackerConfig normalizePolicyConfig(PhaseRuntimeCostTrackerConfi
 PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig config)
     : mConfig(normalizePolicyConfig(config))
     , mActions(mConfig.action)
+    , mDecodeService(mConfig.action)
     , mContextualPd(mConfig.contextualPd)
     , mContextualDp(mConfig.contextualPd)
     , mContextualEp(mConfig.contextualEp)
@@ -65,6 +66,20 @@ PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig c
 void PhaseRuntimeCostTracker::observe(PhaseGlobalActionKey const& key, PhaseGlobalCostObservation observation)
 {
     mActions.observe(key, observation);
+}
+
+void PhaseRuntimeCostTracker::observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds)
+{
+    ELLM_CHECK(key.kind == PhaseGlobalActionKind::kDecode && std::isfinite(milliseconds) && milliseconds > 0.0F,
+        "Decode service observation must be finite and positive");
+    mDecodeService.observe(key, {milliseconds, milliseconds});
+}
+
+std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::decodeServiceEstimate(
+    PhaseGlobalActionKey const& key) const
+{
+    auto const estimate = mDecodeService.estimate(key);
+    return estimate.has_value() && estimate->sampleCount >= mConfig.actionMinimumSamples ? estimate : std::nullopt;
 }
 
 std::optional<PhaseGlobalCostEstimate> PhaseRuntimeCostTracker::estimate(PhaseGlobalActionKey const& key) const
@@ -418,6 +433,7 @@ size_t PhaseRuntimeCostTracker::decodeBucketCount() const noexcept
 void PhaseRuntimeCostTracker::resetExecutionCostHistory()
 {
     mActions.reset();
+    mDecodeService.reset();
     mDecodeComponents.clear();
 }
 

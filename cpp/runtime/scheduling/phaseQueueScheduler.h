@@ -481,6 +481,8 @@ struct PhaseQueueSchedulerConfig
     //! Use confident process-local decode observations as the dynamic batching
     //! cost source. Sparse coverage never shrinks the runnable batch.
     bool enableMeasuredDecodeBatching{};
+    //! Select batch partitions from process-local host service costs, without a static prior.
+    bool enableMeasuredDecodeServiceBatching{};
     //! Refine static decode costs from context-bucketed decode-component observations.
     bool enableDecodeComponentObservation{};
     size_t decodeComponentMinSamples{8U};
@@ -853,6 +855,11 @@ public:
     void resetSchedulingHistory();
     //! Switch to observed decode costs at a drained epoch boundary without resetting learned state.
     void useMeasuredDecodeCosts();
+    bool usesMeasuredDecodeService() const noexcept;
+    void observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds);
+    std::optional<PhaseGlobalCostEstimate> decodeServiceEstimate(int32_t batchSize, int32_t maxContextLength) const;
+    //! Canonical execution key shared by CUDA and separately stored host-service observations.
+    PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
     //! Reset only the contextual online policy posterior. The scheduler must
     //! be idle; exact CUDA execution observations remain available.
     void resetPolicyPosterior();
@@ -888,7 +895,6 @@ private:
         std::optional<PhaseDispatchKind> requiredKind = std::nullopt, PhaseGlobalSelectionAudit* audit = nullptr);
     PhaseDispatchPlan previewMechanismPlan(PhaseDispatchKind kind) const;
     PhaseDispatchKind legacyQueueDecision(PhaseQueueSnapshot const& snapshot) const;
-    PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
     int32_t effectiveDecodeBurstLimit(PhaseQueueSnapshot const& snapshot) const noexcept;
     int32_t effectiveOverlapPrefillTokens(PhaseQueueSnapshot const& snapshot) const noexcept;
     PhaseDispatchKind defaultDecision(PhaseQueueSnapshot const& snapshot) const noexcept;

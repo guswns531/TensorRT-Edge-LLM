@@ -67,6 +67,10 @@ PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(PhaseEnviro
     {
         options.planOnly = parseBoolean(value);
     }
+    if (char const* value = environment("TRT_EDGELLM_STARTUP_DECODE_SERVICE"))
+    {
+        options.measuredDecodeService = parseBoolean(value);
+    }
     if (char const* value = environment("TRT_EDGELLM_STARTUP_BUDGET_MS"))
     {
         options.budgetMs = std::stod(value);
@@ -74,6 +78,9 @@ PhaseStartupCalibrationOptions resolvePhaseStartupCalibrationOptions(PhaseEnviro
     ELLM_CHECK(std::isfinite(options.budgetMs) && options.budgetMs > 0.0,
         "Startup calibration budget must be finite and positive");
     ELLM_CHECK(!options.requireCoverage || options.enabled, "Required startup coverage needs calibration enabled");
+    ELLM_CHECK(!options.measuredDecodeService
+            || (options.enabled && !options.planOnly && !options.measuredDecodeAtMeasurement),
+        "Measured startup service cannot mix with planning or delayed GPU-only activation");
     ELLM_CHECK(!options.planOnly || (options.enabled && !options.measuredDecodeAtMeasurement),
         "Startup planning requires calibration and must not activate measured decode policy");
     return options;

@@ -156,6 +156,9 @@ struct IndependentPhaseRequestView
 //! collect() is called only after ready has completed and returns one token per requestId.
 struct IndependentPhaseSampleTicket
 {
+    //! Isolated decode service epoch attached by the execution metrics callback.
+    uint64_t decodeServiceStartHostNs{};
+    PhaseGlobalActionKey decodeServiceKey;
     cudaEvent_t ready{};
     //! Filled by the server when the adapter returns the ticket.
     uint64_t sequenceId{};

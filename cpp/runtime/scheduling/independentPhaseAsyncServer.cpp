@@ -2327,6 +2327,29 @@ void IndependentPhaseAsyncServer::refreshPageGrowthOwners()
 IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks()
 {
     IndependentPhaseCoordinatorCallbacks callbacks;
+    callbacks.onMetrics = [this](PhaseDispatchMetrics const& metrics) {
+        if (!mCoordinator.scheduler().usesMeasuredDecodeService() || metrics.kind != PhaseDispatchKind::kDecode
+            || metrics.externalEncoderActive || metrics.concurrentPrefillActive)
+        {
+            return;
+        }
+        PhaseGlobalActionKey const key = mCoordinator.scheduler().globalActionKey(metrics);
+        if (metrics.globalDecisionApplied
+            && (!metrics.globalCandidateParity || !metrics.globalActionFidelity
+                || !(metrics.globalSelectedAction == key)))
+        {
+            return;
+        }
+        for (auto& ticket : mSamplingTickets)
+        {
+            if (!ticket->fromPrefill && ticket->requestIds == metrics.decodeRequestIds)
+            {
+                ticket->decodeServiceStartHostNs = metrics.decodeHostExecution.prepareStartHostNs;
+                ticket->decodeServiceKey = key;
+                break;
+            }
+        }
+    };
     callbacks.stagePrefill = [this](std::vector<PhaseWorkItem> const& batch, PipelineIO& io, cudaStream_t stream) {
         if (mAdapter.stagePrefill)
         {
@@ -2581,6 +2604,15 @@ void IndependentPhaseAsyncServer::processTicket(std::unique_ptr<IndependentPhase
         {
             state.decodeProducerSequenceId = ticket->sequenceId;
             static_cast<void>(enqueueDecodeOrWait(requestId, state));
+        }
+    }
+    if (ticket->decodeServiceStartHostNs > 0)
+    {
+        uint64_t const end = phaseTimelineNowNs();
+        if (end > ticket->decodeServiceStartHostNs)
+        {
+            mCoordinator.scheduler().observeDecodeService(
+                ticket->decodeServiceKey, static_cast<float>(end - ticket->decodeServiceStartHostNs) / 1000000.0F);
         }
     }
     destroyTicketEvent(*ticket);

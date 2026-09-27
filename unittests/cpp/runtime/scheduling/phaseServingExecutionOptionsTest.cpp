@@ -105,6 +105,18 @@ TEST(PhaseServingExecutionOptionsTest, StartupTrialPlanningCannotActivateMeasure
         std::exception);
 }
 
+TEST(PhaseServingExecutionOptionsTest, StartupServiceRequiresDedicatedCalibrationContract)
+{
+    EXPECT_TRUE(resolvePhaseStartupCalibrationOptions(
+        lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"}, {"TRT_EDGELLM_STARTUP_DECODE_SERVICE", "1"}}))
+            .measuredDecodeService);
+    EXPECT_THROW(
+        resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_DECODE_SERVICE", "1"}})), std::exception);
+    EXPECT_THROW(resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"},
+                     {"TRT_EDGELLM_STARTUP_DECODE_SERVICE", "1"}, {"TRT_EDGELLM_STARTUP_PLAN_ONLY", "1"}})),
+        std::exception);
+}
+
 TEST(PhaseServingExecutionOptionsTest, StartupTrialsPreserveEqualWorkAndDenseReference)
 {
     auto const trials = phaseStartupDecodeTrials(8, {{8, 10.0, 0.2}, {4, 3.0, 0.1}, {2, 2.0, 0.1}});

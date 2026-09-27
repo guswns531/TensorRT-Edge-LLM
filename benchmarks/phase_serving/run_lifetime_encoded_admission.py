@@ -157,7 +157,8 @@ def model_config(repo, name, overrides=None):
 CALIBRATION_VARIANTS = ("independent-startup", "independent-measured",
                         "independent-calibrated", "independent-compact-shapes",
                         "independent-compact-http",
-                        "independent-autotune-shadow")
+                        "independent-autotune-shadow",
+                        "independent-autotune-service")
 
 
 def calibration_contract(variant, options=None):
@@ -166,13 +167,15 @@ def calibration_contract(variant, options=None):
     legacy_startup = options.get("startup_calibration",
                                  False) or variant == "independent-startup"
     plan_only = variant == "independent-autotune-shadow"
+    measured_service = variant == "independent-autotune-service"
     boundary = variant in CALIBRATION_VARIANTS[1:5]
-    if legacy_startup and (boundary or plan_only):
+    if legacy_startup and (boundary or plan_only or measured_service):
         raise ValueError(
             "Do not mix combined startup mode with calibration ablations")
     return {
         "startup": legacy_startup or variant in CALIBRATION_VARIANTS[2:],
         "plan_only": plan_only,
+        "measured_service": measured_service,
         "measured_at_boundary": boundary,
         "compact_shapes": legacy_startup
         or variant in CALIBRATION_VARIANTS[3:5],
@@ -372,6 +375,8 @@ def command_for(repo,
         environment["TRT_EDGELLM_MEASUREMENT_MEASURED_DECODE_COSTS"] = "1"
     if calibration["plan_only"]:
         environment["TRT_EDGELLM_STARTUP_PLAN_ONLY"] = "1"
+    if calibration["measured_service"]:
+        environment["TRT_EDGELLM_STARTUP_DECODE_SERVICE"] = "1"
     if not options.get("serving_overlap_probes", True):
         environment["TRT_EDGELLM_DISABLE_SERVING_OVERLAP_PROBES"] = "1"
 
@@ -817,7 +822,8 @@ def main():
             "notes/330-runtime-contract-revalidation-plan-20260926.md",
             "notes/340-startup-calibration-and-readiness-20260927.md",
             "notes/341-startup-calibration-factorization-20260927.md",
-            "notes/342-startup-autotune-decode-trial-planner-20260927.md"
+            "notes/342-startup-autotune-decode-trial-planner-20260927.md",
+            "notes/344-measured-startup-decode-service-20260927.md"
         ],
         "compress_closed_logs":
         args.compress_closed_logs

@@ -1763,6 +1763,12 @@ int main(int argc, char** argv)
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
         rt::PhaseStartupCalibrationOptions const startupOptions = rt::resolvePhaseStartupCalibrationOptions();
+        if (startupOptions.measuredDecodeService)
+        {
+            semanticSchedulerConfig.enableMeasuredDecodeServiceBatching = true;
+            semanticSchedulerConfig.decodeBatchCosts.clear();
+            semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
+        }
         if (startupOptions.enabled)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
@@ -2285,6 +2291,8 @@ int main(int argc, char** argv)
                 {"static_decode_table", !semanticSchedulerConfig.decodeBatchCosts.empty()},
                 {"measured_decode_at_measurement", startupOptions.measuredDecodeAtMeasurement},
                 {"plan_only", startupOptions.planOnly}, {"policy_stability_validated", false},
+                {"decode_batch_cost_source", startupOptions.measuredDecodeService ? "measured_host_service" : "legacy"},
+                {"decode_service_scope", "prepare_start_to_sampling_state_commit_isolated"},
                 {"budget_ms", startupOptions.budgetMs},
                 {"prefill_batch_limit", semanticSchedulerConfig.maxPrefillBatchSize},
                 {"decode_batch_limit", semanticSchedulerConfig.maxDecodeBatchSize},
@@ -2527,7 +2535,12 @@ int main(int argc, char** argv)
                         return runtimeCostTracker->trustedEstimate(prefillKey);
                     };
                     size_t rounds{};
-                    while ((!estimate().has_value() || !prefillEstimate().has_value())
+                    auto serviceEstimate = [&]() {
+                        return semanticCoordinator.scheduler().decodeServiceEstimate(
+                            probe.batchSize, probe.promptTokens + probe.outputTokens - 1);
+                    };
+                    while ((!estimate().has_value() || !prefillEstimate().has_value()
+                               || (startupOptions.measuredDecodeService && !serviceEstimate().has_value()))
                         && startupElapsedMs() < startupOptions.budgetMs && rounds < runtimeCostConfig.action.windowSize)
                     {
                         std::vector<int32_t> prompt = semanticPrompts.at(20000);
@@ -2561,12 +2574,28 @@ int main(int argc, char** argv)
                     }
                     auto const cost = estimate();
                     auto const prefillCost = prefillEstimate();
+                    auto const serviceCost = serviceEstimate();
                     startupCoverage = startupCoverage && cost.has_value() && prefillCost.has_value();
+                    if (startupOptions.measuredDecodeService)
+                    {
+                        startupCoverage = startupCoverage && serviceCost.has_value();
+                    }
                     nlohmann::json record{{"batch", probe.batchSize}, {"prompt_tokens", probe.promptTokens},
                         {"output_tokens", probe.outputTokens}, {"context_bucket", key.primaryContextBucket},
                         {"variant", rt::phaseExecutionVariantName(key.executionVariant)}, {"rounds", rounds},
                         {"samples", runtimeCostTracker->sampleCount(key)}, {"covered", cost.has_value()}};
                     record["prefill_batch"] = prefillKey.primaryBatchSize;
+                    if (startupOptions.measuredDecodeService)
+                    {
+                        record["service_covered"] = serviceCost.has_value();
+                        if (serviceCost.has_value())
+                        {
+                            record["service_median_ms"] = serviceCost->makespanMedianMs;
+                            record["service_p95_ms"] = serviceCost->makespanP95Ms;
+                            record["service_uncertainty_ms"] = serviceCost->uncertaintyMs;
+                            record["service_samples"] = serviceCost->sampleCount;
+                        }
+                    }
                     record["prefill_covered"] = prefillCost.has_value();
                     record["prefill_samples"] = runtimeCostTracker->sampleCount(prefillKey);
                     record["prefill_variant"] = rt::phaseExecutionVariantName(prefillKey.executionVariant);
