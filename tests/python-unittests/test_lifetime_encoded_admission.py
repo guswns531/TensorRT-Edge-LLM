@@ -205,6 +205,25 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
             G_RUNNER.calibration_contract("independent-autotune-service",
                                           {"startup_calibration": True})
 
+    def test_host_service_shadow_and_boundary_share_calibration(self):
+        shadow = environment(
+            self.command("independent-autotune-service-shadow"))
+        boundary = environment(
+            self.command("independent-autotune-service-boundary"))
+        self.assertEqual(shadow["TRT_EDGELLM_STARTUP_DECODE_SERVICE_OBSERVE"],
+                         "1")
+        self.assertEqual(shadow["TRT_EDGELLM_STARTUP_CALIBRATION"], "1")
+        self.assertNotIn("TRT_EDGELLM_STARTUP_PLAN_ONLY", shadow)
+        self.assertNotIn("TRT_EDGELLM_STARTUP_DECODE_SERVICE", shadow)
+        self.assertNotIn("TRT_EDGELLM_MEASUREMENT_DECODE_SERVICE", shadow)
+        self.assertEqual(
+            boundary.pop("TRT_EDGELLM_MEASUREMENT_DECODE_SERVICE"), "1")
+        self.assertEqual(boundary, shadow)
+        with self.assertRaises(ValueError):
+            G_RUNNER.calibration_contract(
+                "independent-autotune-service-boundary",
+                {"startup_calibration": True})
+
     def test_serving_probe_ablation_keeps_calibration_contract(self):
         default = environment(self.command("independent"))
         disabled = environment(

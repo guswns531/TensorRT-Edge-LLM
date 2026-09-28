@@ -117,6 +117,27 @@ TEST(PhaseServingExecutionOptionsTest, StartupServiceRequiresDedicatedCalibratio
         std::exception);
 }
 
+TEST(PhaseServingExecutionOptionsTest, DelayedHostServiceRequiresObservationOnlyStartup)
+{
+    auto const observed = resolvePhaseStartupCalibrationOptions(
+        lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"}, {"TRT_EDGELLM_STARTUP_DECODE_SERVICE_OBSERVE", "1"}}));
+    EXPECT_TRUE(observed.observeDecodeService);
+    EXPECT_FALSE(observed.measuredDecodeServiceAtMeasurement);
+    auto const activated = resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"},
+        {"TRT_EDGELLM_STARTUP_DECODE_SERVICE_OBSERVE", "1"}, {"TRT_EDGELLM_MEASUREMENT_DECODE_SERVICE", "1"}}));
+    EXPECT_TRUE(activated.observeDecodeService);
+    EXPECT_TRUE(activated.measuredDecodeServiceAtMeasurement);
+    EXPECT_THROW(resolvePhaseStartupCalibrationOptions(lookup({{"TRT_EDGELLM_STARTUP_DECODE_SERVICE_OBSERVE", "1"}})),
+        std::exception);
+    EXPECT_THROW(resolvePhaseStartupCalibrationOptions(lookup(
+                     {{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"}, {"TRT_EDGELLM_MEASUREMENT_DECODE_SERVICE", "1"}})),
+        std::exception);
+    EXPECT_THROW(resolvePhaseStartupCalibrationOptions(lookup(
+                     {{"TRT_EDGELLM_STARTUP_CALIBRATION", "1"}, {"TRT_EDGELLM_STARTUP_DECODE_SERVICE_OBSERVE", "1"},
+                         {"TRT_EDGELLM_MEASUREMENT_DECODE_SERVICE", "1"}, {"TRT_EDGELLM_STARTUP_PLAN_ONLY", "1"}})),
+        std::exception);
+}
+
 TEST(PhaseServingExecutionOptionsTest, StartupTrialsPreserveEqualWorkAndDenseReference)
 {
     auto const trials = phaseStartupDecodeTrials(8, {{8, 10.0, 0.2}, {4, 3.0, 0.1}, {2, 2.0, 0.1}});

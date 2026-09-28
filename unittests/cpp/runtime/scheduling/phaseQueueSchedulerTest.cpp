@@ -2174,6 +2174,46 @@ TEST(PhaseQueueSchedulerTest, MeasuredServiceSelectsWithoutStaticPriorOrGpuOnlyB
     }
 }
 
+TEST(PhaseQueueSchedulerTest, ObservedHostServiceCanTakeAuthorityAfterIdleCalibration)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.action.coldStartUncertaintyMs = 0.0F;
+    trackerConfig.actionMinimumSamples = 1U;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 4;
+    config.enableDynamicDecodeBatching = true;
+    config.enableDecodeServiceObservation = true;
+    config.decodeBatchCosts = {{2, 512, 3.0F}, {4, 512, 2.0F}};
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler before(config);
+    for (int32_t const batch : {2, 4})
+    {
+        PhaseGlobalActionKey const key{PhaseGlobalActionKind::kDecode, batch, 0, 1, 1, 0};
+        float const gpu = batch == 2 ? 4.0F : 10.0F;
+        before.observeDecodeService(key, batch == 2 ? 5.0F : 15.0F);
+        tracker->observe(key, {gpu, gpu});
+    }
+    EXPECT_TRUE(before.observesDecodeService());
+    EXPECT_FALSE(before.usesMeasuredDecodeService());
+    ASSERT_TRUE(before.decodeServiceEstimate(2, 128).has_value());
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        before.enqueueDecode({requestId, 128});
+    }
+    EXPECT_EQ(before.next().decodeBatch.size(), 4U);
+
+    PhaseQueueScheduler after(config);
+    after.useMeasuredDecodeServiceCosts();
+    EXPECT_TRUE(after.observesDecodeService());
+    EXPECT_TRUE(after.usesMeasuredDecodeService());
+    for (uint64_t requestId = 1; requestId <= 4; ++requestId)
+    {
+        after.enqueueDecode({requestId, 128});
+    }
+    EXPECT_EQ(after.next().decodeBatch.size(), 2U);
+}
+
 TEST(PhaseQueueSchedulerTest, UnknownServiceShapeDoesNotUseLegacyOrInventRemainder)
 {
     PhaseRuntimeCostTrackerConfig trackerConfig;

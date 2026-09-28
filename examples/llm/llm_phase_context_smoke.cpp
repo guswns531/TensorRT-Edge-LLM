@@ -1769,6 +1769,7 @@ int main(int argc, char** argv)
         seedCallbacks.isDecodeFinished = [](rt::PhaseWorkItem const&, int32_t) { return true; };
 #include "phaseSchedulerOptions.inc"
         rt::PhaseStartupCalibrationOptions const startupOptions = rt::resolvePhaseStartupCalibrationOptions();
+        semanticSchedulerConfig.enableDecodeServiceObservation = startupOptions.observeDecodeService;
         if (startupOptions.measuredDecodeService)
         {
             semanticSchedulerConfig.enableMeasuredDecodeServiceBatching = true;
@@ -1785,7 +1786,8 @@ int main(int argc, char** argv)
         {
             ELLM_CHECK(semanticSchedulerConfig.globalSchedulerMode == rt::PhaseGlobalSchedulerMode::kActive,
                 "Startup calibration requires the active global scheduler");
-            if (!startupOptions.measuredDecodeAtMeasurement && !startupOptions.planOnly)
+            if (!startupOptions.measuredDecodeAtMeasurement && !startupOptions.planOnly
+                && !startupOptions.observeDecodeService)
             {
                 semanticSchedulerConfig.decodeBatchCosts.clear();
                 semanticSchedulerConfig.enableMeasuredDecodeBatching = true;
@@ -2315,6 +2317,9 @@ int main(int argc, char** argv)
                 {"decode", nlohmann::json::array()}, {"encoder", nlohmann::json::array()},
                 {"static_decode_table", !semanticSchedulerConfig.decodeBatchCosts.empty()},
                 {"measured_decode_at_measurement", startupOptions.measuredDecodeAtMeasurement},
+                {"decode_service_observed",
+                    startupOptions.observeDecodeService || startupOptions.measuredDecodeService},
+                {"measured_decode_service_at_measurement", startupOptions.measuredDecodeServiceAtMeasurement},
                 {"plan_only", startupOptions.planOnly}, {"policy_stability_validated", false},
                 {"decode_batch_cost_source", startupOptions.measuredDecodeService ? "measured_host_service" : "legacy"},
                 {"decode_service_scope",
@@ -2567,8 +2572,10 @@ int main(int argc, char** argv)
                         return semanticCoordinator.scheduler().decodeServiceEstimate(
                             probe.batchSize, probe.promptTokens + probe.outputTokens - 1);
                     };
+                    bool const requireServiceCoverage
+                        = startupOptions.measuredDecodeService || startupOptions.observeDecodeService;
                     while ((!estimate().has_value() || !prefillEstimate().has_value()
-                               || (startupOptions.measuredDecodeService && !serviceEstimate().has_value()))
+                               || (requireServiceCoverage && !serviceEstimate().has_value()))
                         && startupElapsedMs() < startupOptions.budgetMs && rounds < runtimeCostConfig.action.windowSize)
                     {
                         std::vector<int32_t> prompt = semanticPrompts.at(20000);
@@ -2604,7 +2611,7 @@ int main(int argc, char** argv)
                     auto const prefillCost = prefillEstimate();
                     auto const serviceCost = serviceEstimate();
                     startupCoverage = startupCoverage && cost.has_value() && prefillCost.has_value();
-                    if (startupOptions.measuredDecodeService)
+                    if (requireServiceCoverage)
                     {
                         startupCoverage = startupCoverage && serviceCost.has_value();
                     }
@@ -2613,7 +2620,7 @@ int main(int argc, char** argv)
                         {"variant", rt::phaseExecutionVariantName(key.executionVariant)}, {"rounds", rounds},
                         {"samples", runtimeCostTracker->sampleCount(key)}, {"covered", cost.has_value()}};
                     record["prefill_batch"] = prefillKey.primaryBatchSize;
-                    if (startupOptions.measuredDecodeService)
+                    if (requireServiceCoverage)
                     {
                         record["service_covered"] = serviceCost.has_value();
                         if (serviceCost.has_value())
@@ -3760,6 +3767,13 @@ int main(int argc, char** argv)
                             {
                                 semanticCoordinator.scheduler().useMeasuredDecodeCosts();
                                 LOG_INFO("Measurement decode cost source: measured; calibration state preserved");
+                            }
+                            if (startupOptions.measuredDecodeServiceAtMeasurement)
+                            {
+                                semanticCoordinator.scheduler().useMeasuredDecodeServiceCosts();
+                                LOG_INFO(
+                                    "Measurement decode cost source: measured host service; calibration state "
+                                    "preserved");
                             }
                             // All physical observations are now complete and
                             // immutable. Retain validation evidence while

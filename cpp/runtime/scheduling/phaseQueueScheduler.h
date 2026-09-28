@@ -511,6 +511,8 @@ struct PhaseQueueSchedulerConfig
     bool enableMeasuredDecodeBatching{};
     //! Select batch partitions from process-local host service costs, without a static prior.
     bool enableMeasuredDecodeServiceBatching{};
+    //! Collect host service observations while another decode cost source owns batch selection.
+    bool enableDecodeServiceObservation{};
     //! Retain the service-DP frontier and partition in dispatch metrics for opt-in diagnostics.
     bool captureDecodePartitionTrace{};
     bool capturePrefillFormationTrace{};
@@ -894,7 +896,10 @@ public:
     void resetSchedulingHistory();
     //! Switch to observed decode costs at a drained epoch boundary without resetting learned state.
     void useMeasuredDecodeCosts();
+    //! Activate host-service batch selection after an observation-only calibration epoch.
+    void useMeasuredDecodeServiceCosts();
     bool usesMeasuredDecodeService() const noexcept;
+    bool observesDecodeService() const noexcept;
     void observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds);
     std::optional<PhaseGlobalCostEstimate> decodeServiceEstimate(int32_t batchSize, int32_t maxContextLength) const;
     //! Canonical execution key shared by CUDA and separately stored host-service observations.

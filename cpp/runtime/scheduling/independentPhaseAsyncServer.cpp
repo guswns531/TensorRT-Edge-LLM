@@ -2346,7 +2346,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
     IndependentPhaseCoordinatorCallbacks callbacks;
     callbacks.onMetrics = [this](PhaseDispatchMetrics const& metrics) {
         mLatestPhaseDispatchStartHostNs = std::max(mLatestPhaseDispatchStartHostNs, metrics.hostDispatchStartNs);
-        if (!mCoordinator.scheduler().usesMeasuredDecodeService() || metrics.kind != PhaseDispatchKind::kDecode
+        if (!mCoordinator.scheduler().observesDecodeService() || metrics.kind != PhaseDispatchKind::kDecode
             || metrics.externalEncoderActive || metrics.externalEncoderOverlapObservationDeferred
             || metrics.concurrentPrefillActive)
         {

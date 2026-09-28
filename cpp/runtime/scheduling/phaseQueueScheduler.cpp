@@ -4866,14 +4866,29 @@ void PhaseQueueScheduler::useMeasuredDecodeCosts()
     mConfig.enableMeasuredDecodeBatching = true;
 }
 
+void PhaseQueueScheduler::useMeasuredDecodeServiceCosts()
+{
+    check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
+        "Decode service cost source can only change on an idle scheduler");
+    mConfig.decodeBatchCosts.clear();
+    mConfig.enableMeasuredDecodeBatching = true;
+    mConfig.enableMeasuredDecodeServiceBatching = true;
+    mConfig.enableDecodeServiceObservation = true;
+}
+
 bool PhaseQueueScheduler::usesMeasuredDecodeService() const noexcept
 {
     return mConfig.enableMeasuredDecodeServiceBatching;
 }
 
+bool PhaseQueueScheduler::observesDecodeService() const noexcept
+{
+    return mConfig.enableDecodeServiceObservation || mConfig.enableMeasuredDecodeServiceBatching;
+}
+
 void PhaseQueueScheduler::observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds)
 {
-    if (usesMeasuredDecodeService())
+    if (observesDecodeService())
     {
         mRuntimeCostTracker->observeDecodeService(key, milliseconds);
     }
