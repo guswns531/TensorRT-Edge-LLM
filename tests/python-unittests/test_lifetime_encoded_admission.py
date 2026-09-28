@@ -245,6 +245,22 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(full.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"), "full")
         self.assertEqual(default, full)
 
+    def test_activity_observer_changes_only_activity_recording(self):
+        default = environment(self.command("independent"))
+        for mode, added in (("encoder", {
+                "TRT_EDGELLM_PHASE_ENCODER_OBSERVER": "1"
+        }), ("off", {})):
+            observed = environment(
+                G_RUNNER.command_for(self.repo, self.config,
+                                     self.repo / "cell", "mixed",
+                                     "independent", 0,
+                                     {"activity_observer": mode}))
+            for key, value in added.items():
+                self.assertEqual(observed.pop(key), value)
+            expected = dict(default)
+            expected.pop("TRT_EDGELLM_PHASE_ACTIVITY_PREFIX")
+            self.assertEqual(observed, expected)
+
     def test_decode_partition_trace_is_opt_in(self):
         default = environment(self.command("independent"))
         diagnostic = environment(

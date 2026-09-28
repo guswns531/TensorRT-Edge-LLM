@@ -322,6 +322,11 @@ def command_for(repo,
         "TRT_EDGELLM_PHASE_TELEMETRY_LEVEL":
         options.get("telemetry_level", "dispatch")
     }
+    activity_observer = options.get("activity_observer", "full")
+    if activity_observer != "full":
+        del environment["TRT_EDGELLM_PHASE_ACTIVITY_PREFIX"]
+    if activity_observer == "encoder":
+        environment["TRT_EDGELLM_PHASE_ENCODER_OBSERVER"] = "1"
     if options.get("decode_partition_diagnostic", False):
         environment["TRT_EDGELLM_DECODE_PARTITION_DIAGNOSTIC"] = "1"
     if options.get("prefill_formation_diagnostic", False):
@@ -572,6 +577,11 @@ def parse_args(argv=None):
         default="dispatch",
         help="Full causal diagnostics or compact dispatch metrics")
     parser.add_argument(
+        "--activity-observer",
+        choices=("full", "encoder", "off"),
+        default="full",
+        help="E/P/D/C activity export, encoder-only cost labels, or none")
+    parser.add_argument(
         "--decode-partition-diagnostic",
         action="store_true",
         help="Record ready decode rows and measured-service DP partitions")
@@ -766,6 +776,8 @@ def main():
                             args.cuda_graphs == "on",
                             "telemetry_level":
                             args.telemetry_level,
+                            "activity_observer":
+                            args.activity_observer,
                             "decode_partition_diagnostic":
                             args.decode_partition_diagnostic,
                             "prefill_formation_diagnostic":

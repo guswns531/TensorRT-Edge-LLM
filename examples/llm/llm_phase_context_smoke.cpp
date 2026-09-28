@@ -2080,6 +2080,16 @@ int main(int argc, char** argv)
             semanticServer.setActivityTimeline(activityTimeline.get());
             LOG_INFO("Phase activity timeline enabled: prefix=%s", activityPrefix.string().c_str());
         }
+        if (std::getenv("TRT_EDGELLM_PHASE_ENCODER_OBSERVER") != nullptr)
+        {
+            // Mirrors the PhaseServingRuntime VLM default: realized E-overlap cost labels without export history.
+            ELLM_CHECK(activityTimeline == nullptr,
+                "TRT_EDGELLM_PHASE_ENCODER_OBSERVER and TRT_EDGELLM_PHASE_ACTIVITY_PREFIX are mutually exclusive");
+            activityTimeline
+                = std::make_unique<rt::PhaseActivityTimelineRecorder>(setupStream, rt::kPHASE_ACTIVITY_ENCODER_MASK);
+            semanticServer.setActivityTimeline(activityTimeline.get());
+            LOG_INFO("Phase encoder-only activity observer enabled");
+        }
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
         ELLM_CHECK(ipcMode
                 || (!startupOptions.measuredDecodeAtMeasurement && !startupOptions.measuredDecodeServiceAtMeasurement),
@@ -5296,7 +5306,7 @@ int main(int argc, char** argv)
                 "Semantic phase requests did not drain and release every slot");
             LOG_INFO("Semantic phase requests passed through IndependentPhaseAsyncServer");
         }
-        if (activityTimeline != nullptr)
+        if (activityTimeline != nullptr && !activityPrefix.empty())
         {
             activityTimeline->drain();
             activityTimeline->writeCsv(activityPrefix);
@@ -5309,6 +5319,9 @@ int main(int argc, char** argv)
                 activity.epdIdleMs * ratioScale, activity.epdTripleMs * ratioScale, activity.fourWayMs * ratioScale,
                 activity.activityMs[0] * ratioScale, activity.activityMs[1] * ratioScale,
                 activity.activityMs[2] * ratioScale, activity.activityMs[3] * ratioScale);
+        }
+        if (activityTimeline != nullptr)
+        {
             semanticServer.setActivityTimeline(nullptr);
         }
     }
