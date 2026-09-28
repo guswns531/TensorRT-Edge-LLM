@@ -9,7 +9,10 @@ realized interval state when valid. Candidate prediction continues to use the pl
 
 The tri-state binary was validated on all 24 Gemma/Cosmos workloads with three runs per workload. Every workload's
 median throughput beat frozen vLLM and all 72 individual runs exceeded it. Compared with historical 9db3 Current,
-the largest median change is Cosmos short at -0.2%; most are small regressions or gains around measurement noise.
+the largest median regression is Gemma long-prefill at -2.6% (603.6 vs 619.5 tok/s; runs 594.7/626.7/603.6); every
+other workload is within -0.3% or better. Gemma long-prefill also fell from 629.4 tok/s in the note 361 campaign.
+The three-run spread (about 5%) exceeds the gap, so this is not yet a resolved regression, but it is the one cell
+that must be rechecked before promotion.
 This is a stronger throughput result than the preceding planned-state key iteration, but it is not a universal latency
 win or output-quality approval.
 
@@ -58,7 +61,7 @@ negative means lower latency.
 | Gemma / bimodal | 844.3 | +40.7 / -0.3% | +23.1 / +13.8% | -18.6 / +12.4% | -24.8 / -28.6% |
 | Gemma / decode-heavy | 1378.3 | +69.7 / +0.1% | -41.6 / -15.6% | -37.7 / -36.4% | -38.1 / -37.6% |
 | Gemma / late-vision | 1527.1 | +54.1 / -0.3% | -0.6 / +53.8% | -39.9 / -39.6% | -38.3 / -39.9% |
-| Gemma / long-prefill | 603.6 | +20.6 / +0.7% | +26.2 / +12.9% | -20.3 / -18.0% | -12.7 / -8.2% |
+| Gemma / long-prefill | 603.6 | +20.6 / -2.6% | +26.2 / +12.9% | -20.3 / -18.0% | -12.7 / -8.2% |
 | Gemma / mixed | 763.2 | +8.4 / +2.6% | -11.3 / +20.0% | -6.6 / +4.0% | -7.1 / -2.6% |
 | Gemma / multi-image | 412.3 | +8.1 / +6.4% | +72.9 / +131.3% | -10.5 / +17.8% | +3.7 / +16.7% |
 | Gemma / poisson | 934.8 | +37.1 / +0.6% | +5.7 / +108.3% | -21.8 / -16.9% | -20.7 / -18.6% |
@@ -94,6 +97,17 @@ use the same direct API request path and engine, with an explicit control that d
 Otherwise the comparison combines event-recording overhead with the scheduler-policy change caused by the new labels.
 The HTTP/IPC results remain a separate end-to-end serving measurement, not proof of the production facade's observer
 overhead.
+
+## Correction (2026-09-28)
+
+An earlier revision listed Gemma long-prefill as +0.7% versus 9db3 and called Cosmos short (-0.2%) the largest median
+change. Recomputing from both cited campaign summaries gives -2.6% for Gemma long-prefill; the other 23 rows and the
+72/72 vLLM result were confirmed unchanged.
+
+Two label-path defects found after this validation are fixed in the follow-up commit and are described in note 363:
+the encoder-only recorder could retire an E interval during the prefill query of a D-anchored augmented dispatch
+before the decode query saw it, and the planned serial reference was reused when the realized E context differed.
+The full-mask recorder used by these campaigns never pruned intervals, so the first defect does not affect the table.
 
 ## Next work
 

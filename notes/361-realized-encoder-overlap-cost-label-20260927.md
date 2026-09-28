@@ -10,8 +10,8 @@ possibly wrong label.
 
 After this change, a fresh full24 campaign plus two repeats completed 72/72 cells. All 24 three-run throughput medians
 and all 72 individual runs beat the frozen vLLM anchor. Against the historical 9db3 Current median, every workload is
-within -0.3% or better; this is a large improvement over the previous realized-key iteration's Gemma long-prefill
-regression. The serving default remains the recorded 9db3 binary because output-quality approval is still unresolved,
+within -0.3% or better; this is a large improvement over the previous planned-state key iteration's (note 360)
+Gemma long-prefill regression. The serving default remains the recorded 9db3 binary because output-quality approval is still unresolved,
 and the exact interval observer is currently attached through the activity-recorder path rather than proven as an
 always-on production mechanism.
 
@@ -72,14 +72,18 @@ and 10 differed; semantic output equivalence was not approved.
 
 ## Reproducibility and validation
 
-- Screen: `.local/results/observed-encoder-interval-full12-screen-20260927`
-- Additional repeats: `.local/results/observed-encoder-interval-full12-additional-20260927`
+- Screen: `.local/results/realized-encoder-label-full12-screen-20260927`
+- Additional repeats: `.local/results/realized-encoder-label-full12-additional-20260927`
+- Correction (2026-09-28): an earlier revision cited `observed-encoder-interval-full12-screen-20260927`, a separate
+  single-run screen, and a nonexistent `-additional` directory. The table above was recomputed from the
+  `realized-encoder-label` campaign and matches it row for row.
 - Both manifests use the same source snapshot, runtime binary, engines, generic calibration, traces, and frozen vLLM
   references; each has 24/24 and 48/48 completed cells respectively, no failed cells.
 - C++ `PhaseActivityTimelineTest.*`, `PhaseGlobalCostModelTest.*`, and `PhaseQueueSchedulerTest.*`: 189/189 passed.
 - The activity observer is attached only when a `PhaseActivityTimelineRecorder` is configured. Without one, metrics
   validity remains false and the runtime falls back to the planned E-active state. A lightweight always-on physical
-  interval tracker and its overhead are not yet implemented or validated.
+  interval tracker and its overhead are not yet implemented or validated. (Superseded by note 362: VLM
+  `PhaseServingRuntime` now installs an encoder-only recorder by default.)
 - No model/GPU-specific action rule or new SLO was introduced. Frozen vLLM data was reused; its contract was unchanged.
 
 ## Next steps
