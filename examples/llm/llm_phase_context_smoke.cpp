@@ -2081,6 +2081,9 @@ int main(int argc, char** argv)
             LOG_INFO("Phase activity timeline enabled: prefix=%s", activityPrefix.string().c_str());
         }
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
+        ELLM_CHECK(ipcMode
+                || (!startupOptions.measuredDecodeAtMeasurement && !startupOptions.measuredDecodeServiceAtMeasurement),
+            "Delayed measured decode activation occurs at IPC calibration end and requires TRT_EDGELLM_PHASE_IPC");
         bool const prefixReuseGate = std::getenv("TRT_EDGELLM_PREFIX_REUSE_GATE") != nullptr;
         char const* visionImagePath = std::getenv("TRT_EDGELLM_VISION_IMAGE");
         char const* encoderCalibrationImage = std::getenv("TRT_EDGELLM_PHASE_ENCODER_CALIBRATION_IMAGE");

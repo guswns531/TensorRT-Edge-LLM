@@ -683,6 +683,13 @@ PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key
     return key;
 }
 
+bool phaseGlobalSameActionShape(PhaseGlobalActionKey left, PhaseGlobalActionKey right) noexcept
+{
+    left.externalEncoderBackground = false;
+    right.externalEncoderBackground = false;
+    return left == right;
+}
+
 size_t PhaseGlobalCostModel::KeyHash::operator()(PhaseGlobalActionKey const& key) const noexcept
 {
     size_t result = static_cast<size_t>(key.kind);

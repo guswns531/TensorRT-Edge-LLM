@@ -122,6 +122,10 @@ struct PhaseGlobalActionKey
 //! upper buckets. Candidate identity and TensorRT bindings retain exact shapes.
 PhaseGlobalActionKey phaseGlobalCanonicalOverlapCostKey(PhaseGlobalActionKey key) noexcept;
 
+//! Compare action shape while ignoring the encoder-background context, which is
+//! planned at selection time but realized only after the action executes.
+bool phaseGlobalSameActionShape(PhaseGlobalActionKey left, PhaseGlobalActionKey right) noexcept;
+
 //! One direct CUDA-event observation for a single action key.
 struct PhaseGlobalCostObservation
 {

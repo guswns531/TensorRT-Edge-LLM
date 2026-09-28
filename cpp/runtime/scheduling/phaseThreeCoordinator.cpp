@@ -1715,7 +1715,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseThreeCoordinator::globalCalibrati
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mRuntimeCostTracker->overlapDiagnostic(key), opportunities,
+        result.push_back({key, mRuntimeCostTracker->overlapCalibrationDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;
@@ -3368,7 +3368,8 @@ bool PhaseThreeCoordinator::dispatchGlobalAction()
         bool calibrationTarget = !mGlobalWarmupProbeMode;
         if (mGlobalWarmupProbeMode)
         {
-            PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
+            PhaseGlobalActionKey calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
+            calibrationKey.externalEncoderBackground = false;
             auto const tracked
                 = std::find(mGlobalCalibrationKeys.begin(), mGlobalCalibrationKeys.end(), calibrationKey);
             if (tracked != mGlobalCalibrationKeys.end())

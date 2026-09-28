@@ -78,6 +78,9 @@ public:
         PhaseGlobalActionKey const& key) const;
     std::optional<PhaseGlobalCostEstimate> trustedEstimateCoveringOverlap(PhaseGlobalActionKey const& key) const;
     PhaseGlobalOverlapCostDiagnostic overlapDiagnostic(PhaseGlobalActionKey const& key) const;
+    //! Calibration coverage for an overlap shape: a planned encoder context is not
+    //! guaranteed to realize, so a resolved diagnostic in either context counts.
+    PhaseGlobalOverlapCostDiagnostic overlapCalibrationDiagnostic(PhaseGlobalActionKey const& shapeKey) const;
     size_t sampleCount(PhaseGlobalActionKey const& key) const;
     PhaseRuntimeCostConfidence confidence(PhaseGlobalActionKey const& key) const;
     bool overlapEligible(PhaseGlobalActionKey const& key) const;

@@ -120,6 +120,10 @@ public:
     std::vector<PhaseActivitySegment> segments() const;
     PhaseActivitySummary summary() const;
     std::optional<bool> overlaps(PhaseActivityKind kind, cudaEvent_t start, cudaEvent_t end);
+    //! Drop completed intervals that end at or before a completed action-start event from
+    //! the overlap window. Valid only for a single overlap consumer whose later actions
+    //! start after that event; export history is unaffected.
+    void retireOverlapWindow(cudaEvent_t earliestActionStart);
     size_t pendingCount() const;
 
     //! Write <prefix>-intervals.csv, <prefix>-segments.csv, and <prefix>-summary.csv.
@@ -147,7 +151,15 @@ private:
     cudaEvent_t mEpoch{};
     uint8_t mCaptureMask{kPHASE_ACTIVITY_ALL_MASK};
     std::unordered_map<Token, PendingInterval> mPending;
+    struct OverlapInterval
+    {
+        PhaseActivityKind kind{PhaseActivityKind::kEncoder};
+        float startMs{};
+        float endMs{};
+    };
+
     std::vector<PhaseActivityInterval> mIntervals;
+    std::vector<OverlapInterval> mOverlapWindow;
     Token mNextToken{1U};
 };
 

@@ -970,6 +970,17 @@ TEST(PhaseGlobalCostModelTest, CopyOnWritePreservesPreviewIsolation)
     EXPECT_TRUE(original.estimate(prefill).has_value());
 }
 
+TEST(PhaseGlobalCostModelTest, ActionShapeIgnoresOnlyEncoderBackground)
+{
+    PhaseGlobalActionKey planned{PhaseGlobalActionKind::kPrefillDecode, 2, 16, 128, 0, 512};
+    PhaseGlobalActionKey realized = planned;
+    realized.externalEncoderBackground = true;
+    EXPECT_FALSE(planned == realized);
+    EXPECT_TRUE(phaseGlobalSameActionShape(planned, realized));
+    realized.secondaryBatchSize = 8;
+    EXPECT_FALSE(phaseGlobalSameActionShape(planned, realized));
+}
+
 TEST(PhaseGlobalCostModelTest, RejectsOverlapWithoutRobustGain)
 {
     PhaseGlobalCostModel model({8U, 2U, 0.0F, 0.02F});

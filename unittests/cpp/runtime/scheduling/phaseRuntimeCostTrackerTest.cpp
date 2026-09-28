@@ -44,6 +44,24 @@ TEST(PhaseRuntimeCostTrackerTest, MovesFromUnknownThroughWarmingToReady)
     EXPECT_TRUE(tracker.trustedEstimate(key).has_value());
 }
 
+TEST(PhaseRuntimeCostTrackerTest, OverlapCalibrationAcceptsEitherRealizedEncoderContext)
+{
+    PhaseRuntimeCostTrackerConfig config;
+    config.action = {8U, 2U, 0.0F, 0.02F};
+    PhaseRuntimeCostTracker tracker(config);
+    PhaseGlobalActionKey planned{PhaseGlobalActionKind::kPrefillDecode, 2, 16, 128, 0, 512};
+    planned.externalEncoderBackground = true;
+    PhaseGlobalActionKey realized = planned;
+    realized.externalEncoderBackground = false;
+
+    EXPECT_EQ(tracker.overlapCalibrationDiagnostic(planned).status, PhaseGlobalOverlapCostStatus::kNoSamples);
+    tracker.observe(realized, {30.0F, 20.0F});
+    tracker.observe(realized, {30.0F, 21.0F});
+    EXPECT_EQ(tracker.overlapDiagnostic(planned).status, PhaseGlobalOverlapCostStatus::kNoSamples);
+    EXPECT_EQ(tracker.overlapCalibrationDiagnostic(planned).status, PhaseGlobalOverlapCostStatus::kEligible);
+    EXPECT_EQ(tracker.overlapCalibrationDiagnostic(realized).status, PhaseGlobalOverlapCostStatus::kEligible);
+}
+
 TEST(PhaseRuntimeCostTrackerTest, ReplacesOldActionObservationsBySampleCount)
 {
     PhaseRuntimeCostTrackerConfig config;

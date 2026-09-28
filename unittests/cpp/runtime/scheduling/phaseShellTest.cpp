@@ -153,8 +153,7 @@ TEST(PhaseActivityTimelineTest, EncoderOnlyCaptureSkipsPDCEventAllocation)
     ASSERT_TRUE(realizedOverlap.has_value());
     EXPECT_TRUE(*realizedOverlap);
     recorder.drain();
-    ASSERT_EQ(recorder.intervals().size(), 1U);
-    EXPECT_EQ(recorder.intervals().front().kind, rt::PhaseActivityKind::kEncoder);
+    EXPECT_TRUE(recorder.intervals().empty());
 
     cudaEvent_t afterStart{};
     cudaEvent_t afterEnd{};
@@ -177,6 +176,71 @@ TEST(PhaseActivityTimelineTest, EncoderOnlyCaptureSkipsPDCEventAllocation)
     CUDA_CHECK(cudaStreamDestroy(epochStream));
     CUDA_CHECK(cudaStreamDestroy(encoderStream));
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
+}
+
+TEST(PhaseActivityTimelineTest, OverlapQueriesKeepEncoderIntervalsUntilActionRetires)
+{
+    cudaStream_t epochStream{};
+    cudaStream_t encoderStream{};
+    cudaStream_t prefillStream{};
+    cudaStream_t decodeStream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&epochStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&encoderStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
+    rt::PhaseActivityTimelineRecorder recorder(epochStream, rt::kPHASE_ACTIVITY_ENCODER_MASK);
+    int32_t* marker{};
+    CUDA_CHECK(cudaMalloc(&marker, 3 * sizeof(int32_t)));
+    cudaEvent_t decodeStart{};
+    cudaEvent_t decodeEnd{};
+    cudaEvent_t prefillStart{};
+    cudaEvent_t prefillEnd{};
+    CUDA_CHECK(cudaEventCreate(&decodeStart));
+    CUDA_CHECK(cudaEventCreate(&decodeEnd));
+    CUDA_CHECK(cudaEventCreate(&prefillStart));
+    CUDA_CHECK(cudaEventCreate(&prefillEnd));
+
+    // D->P+D augmentation: decode starts, E runs and ends, then residual prefill starts.
+    CUDA_CHECK(cudaEventRecord(decodeStart, decodeStream));
+    CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+    auto const encoder = recorder.begin(rt::PhaseActivityKind::kEncoder, encoderStream, "encoder");
+    CUDA_CHECK(cudaMemsetAsync(marker, 1, sizeof(int32_t), encoderStream));
+    recorder.end(encoder, encoderStream);
+    CUDA_CHECK(cudaStreamSynchronize(encoderStream));
+    CUDA_CHECK(cudaEventRecord(prefillStart, prefillStream));
+    CUDA_CHECK(cudaMemsetAsync(marker + 1, 2, sizeof(int32_t), prefillStream));
+    CUDA_CHECK(cudaEventRecord(prefillEnd, prefillStream));
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
+    CUDA_CHECK(cudaMemsetAsync(marker + 2, 3, sizeof(int32_t), decodeStream));
+    CUDA_CHECK(cudaEventRecord(decodeEnd, decodeStream));
+    CUDA_CHECK(cudaStreamSynchronize(decodeStream));
+    EXPECT_EQ(recorder.poll(), 1U);
+
+    std::optional<bool> const prefillOverlap
+        = recorder.overlaps(rt::PhaseActivityKind::kEncoder, prefillStart, prefillEnd);
+    ASSERT_TRUE(prefillOverlap.has_value());
+    EXPECT_FALSE(*prefillOverlap);
+    std::optional<bool> const decodeOverlap
+        = recorder.overlaps(rt::PhaseActivityKind::kEncoder, decodeStart, decodeEnd);
+    ASSERT_TRUE(decodeOverlap.has_value());
+    EXPECT_TRUE(*decodeOverlap);
+
+    recorder.retireOverlapWindow(decodeStart);
+    EXPECT_TRUE(recorder.overlaps(rt::PhaseActivityKind::kEncoder, decodeStart, decodeEnd).value_or(false));
+    recorder.retireOverlapWindow(prefillStart);
+    std::optional<bool> const retired = recorder.overlaps(rt::PhaseActivityKind::kEncoder, decodeStart, decodeEnd);
+    ASSERT_TRUE(retired.has_value());
+    EXPECT_FALSE(*retired);
+
+    CUDA_CHECK(cudaEventDestroy(prefillEnd));
+    CUDA_CHECK(cudaEventDestroy(prefillStart));
+    CUDA_CHECK(cudaEventDestroy(decodeEnd));
+    CUDA_CHECK(cudaEventDestroy(decodeStart));
+    CUDA_CHECK(cudaFree(marker));
+    CUDA_CHECK(cudaStreamDestroy(epochStream));
+    CUDA_CHECK(cudaStreamDestroy(encoderStream));
+    CUDA_CHECK(cudaStreamDestroy(prefillStream));
+    CUDA_CHECK(cudaStreamDestroy(decodeStream));
 }
 
 TEST(PhaseActivityTimelineTest, CountsCopyOnlyTimeAsEpdIdle)

@@ -349,7 +349,12 @@ bool PhaseActivityTimelineRecorder::collect(PendingInterval& pending, bool synch
     interval.name = std::move(pending.name);
     CUDA_CHECK(cudaEventElapsedTime(&interval.startMs, mEpoch, pending.start));
     CUDA_CHECK(cudaEventElapsedTime(&interval.endMs, mEpoch, pending.end));
-    mIntervals.push_back(std::move(interval));
+    mOverlapWindow.push_back({interval.kind, interval.startMs, interval.endMs});
+    // Encoder-only capture serves online cost labels and never exports history.
+    if (mCaptureMask != kPHASE_ACTIVITY_ENCODER_MASK)
+    {
+        mIntervals.push_back(std::move(interval));
+    }
     destroy(pending);
     return true;
 }
@@ -390,6 +395,7 @@ void PhaseActivityTimelineRecorder::reset(cudaStream_t epochStream)
     drain();
     std::lock_guard<std::mutex> lock(mMutex);
     mIntervals.clear();
+    mOverlapWindow.clear();
     mNextToken = 1U;
     if (mEpoch != nullptr)
     {
@@ -428,14 +434,7 @@ std::optional<bool> PhaseActivityTimelineRecorder::overlaps(PhaseActivityKind ki
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
-    if (mCaptureMask == kPHASE_ACTIVITY_ENCODER_MASK)
-    {
-        mIntervals.erase(
-            std::remove_if(mIntervals.begin(), mIntervals.end(),
-                [actionStartMs](PhaseActivityInterval const& interval) { return interval.endMs <= actionStartMs; }),
-            mIntervals.end());
-    }
-    for (PhaseActivityInterval const& interval : mIntervals)
+    for (OverlapInterval const& interval : mOverlapWindow)
     {
         if (interval.kind == kind
             && phaseActivityIntervalsOverlap(interval.startMs, interval.endMs, actionStartMs, actionEndMs))
@@ -489,6 +488,18 @@ std::optional<bool> PhaseActivityTimelineRecorder::overlaps(PhaseActivityKind ki
         }
     }
     return pendingOverlapUnknown ? std::nullopt : std::optional<bool>{false};
+}
+
+void PhaseActivityTimelineRecorder::retireOverlapWindow(cudaEvent_t earliestActionStart)
+{
+    ELLM_CHECK(earliestActionStart != nullptr, "Overlap-window retirement requires an action-start event");
+    CUDA_CHECK(cudaEventQuery(earliestActionStart));
+    float watermarkMs{};
+    CUDA_CHECK(cudaEventElapsedTime(&watermarkMs, mEpoch, earliestActionStart));
+    std::lock_guard<std::mutex> lock(mMutex);
+    mOverlapWindow.erase(std::remove_if(mOverlapWindow.begin(), mOverlapWindow.end(),
+                             [watermarkMs](OverlapInterval const& interval) { return interval.endMs <= watermarkMs; }),
+        mOverlapWindow.end());
 }
 
 std::vector<PhaseActivitySegment> PhaseActivityTimelineRecorder::segments() const

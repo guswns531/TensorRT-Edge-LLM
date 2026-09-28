@@ -902,6 +902,18 @@ void PhaseDispatchWorker::collectMetrics()
         {
             includeEncoderOverlap(mActivityTimeline->overlaps(PhaseActivityKind::kEncoder, mDecodeStart, mDecodeDone));
         }
+        // Residual augmentation can start either phase first; retire only behind the earlier one.
+        cudaEvent_t earliestStart = mCurrentMetrics.prefillBatchSize > 0 ? mPrefillStart : mDecodeStart;
+        if (mCurrentMetrics.prefillBatchSize > 0 && mCurrentMetrics.decodeBatchSize > 0)
+        {
+            float decodeAfterPrefillMs{};
+            CUDA_CHECK(cudaEventElapsedTime(&decodeAfterPrefillMs, mPrefillStart, mDecodeStart));
+            earliestStart = decodeAfterPrefillMs < 0.0F ? mDecodeStart : mPrefillStart;
+        }
+        if (mCurrentMetrics.prefillBatchSize > 0 || mCurrentMetrics.decodeBatchSize > 0)
+        {
+            mActivityTimeline->retireOverlapWindow(earliestStart);
+        }
         mCurrentMetrics.externalEncoderOverlapObservationValid
             = externalEncoderOverlap || !externalEncoderObservationUnknown;
         mCurrentMetrics.externalEncoderOverlapObserved = externalEncoderOverlap;

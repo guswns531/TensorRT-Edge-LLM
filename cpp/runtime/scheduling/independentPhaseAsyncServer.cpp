@@ -2348,6 +2348,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
         mLatestPhaseDispatchStartHostNs = std::max(mLatestPhaseDispatchStartHostNs, metrics.hostDispatchStartNs);
         if (!mCoordinator.scheduler().observesDecodeService() || metrics.kind != PhaseDispatchKind::kDecode
             || metrics.externalEncoderActive || metrics.externalEncoderOverlapObservationDeferred
+            || (metrics.externalEncoderOverlapObservationValid && metrics.externalEncoderOverlapObserved)
             || metrics.concurrentPrefillActive)
         {
             return;
@@ -2355,7 +2356,7 @@ IndependentPhaseCoordinatorCallbacks IndependentPhaseAsyncServer::makeCallbacks(
         PhaseGlobalActionKey const key = mCoordinator.scheduler().globalActionKey(metrics);
         if (metrics.globalDecisionApplied
             && (!metrics.globalCandidateParity || !metrics.globalActionFidelity
-                || !(metrics.globalSelectedAction == key)))
+                || !phaseGlobalSameActionShape(metrics.globalSelectedAction, key)))
         {
             return;
         }

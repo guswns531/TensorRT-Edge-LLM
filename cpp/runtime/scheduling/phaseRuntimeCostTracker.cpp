@@ -145,6 +145,26 @@ PhaseGlobalOverlapCostDiagnostic PhaseRuntimeCostTracker::overlapDiagnostic(Phas
     return mActions.overlapDiagnostic(key);
 }
 
+PhaseGlobalOverlapCostDiagnostic PhaseRuntimeCostTracker::overlapCalibrationDiagnostic(
+    PhaseGlobalActionKey const& shapeKey) const
+{
+    auto resolved = [](PhaseGlobalOverlapCostDiagnostic const& diagnostic) {
+        return diagnostic.status == PhaseGlobalOverlapCostStatus::kEligible
+            || diagnostic.status == PhaseGlobalOverlapCostStatus::kUnprofitable;
+    };
+    PhaseGlobalActionKey isolatedKey = shapeKey;
+    isolatedKey.externalEncoderBackground = false;
+    PhaseGlobalOverlapCostDiagnostic const isolated = mActions.overlapDiagnostic(isolatedKey);
+    if (resolved(isolated))
+    {
+        return isolated;
+    }
+    PhaseGlobalActionKey contendedKey = shapeKey;
+    contendedKey.externalEncoderBackground = true;
+    PhaseGlobalOverlapCostDiagnostic const contended = mActions.overlapDiagnostic(contendedKey);
+    return resolved(contended) ? contended : isolated;
+}
+
 size_t PhaseRuntimeCostTracker::sampleCount(PhaseGlobalActionKey const& key) const
 {
     std::optional<PhaseGlobalCostEstimate> const estimateValue = mActions.estimate(key);

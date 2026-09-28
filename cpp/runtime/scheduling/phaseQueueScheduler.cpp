@@ -1055,7 +1055,7 @@ int32_t PhaseQueueScheduler::selectPrefillBatchSize(std::vector<PhaseWorkItem co
     int32_t chunkLength, bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize,
     int32_t plannedDecodeMaxContextLength, PhaseQueueSnapshot const& state, bool preferMaximumProgress,
     float& predictedGpuMs, float& predictedDecodeSlowdownMs, bool& costCoverageMiss,
-    std::vector<PhaseGlobalSelectionAudit::PrefillShapeCandidate>* diagnostics) const noexcept
+    std::vector<PhaseGlobalSelectionAudit::PrefillShapeCandidate>* diagnostics) const
 {
     if (candidates.empty())
     {
@@ -2605,7 +2605,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
         bool calibrationTarget = !mGlobalWarmupProbeMode;
         if (mGlobalWarmupProbeMode)
         {
-            PhaseGlobalActionKey const calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
+            PhaseGlobalActionKey calibrationKey = phaseGlobalCanonicalOverlapCostKey(overlapKey);
+            calibrationKey.externalEncoderBackground = false;
             auto const tracked
                 = std::find(mGlobalCalibrationKeys.begin(), mGlobalCalibrationKeys.end(), calibrationKey);
             if (tracked != mGlobalCalibrationKeys.end())
@@ -3824,9 +3825,9 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
             for (int32_t batch = 1; batch <= static_cast<int32_t>(plan.predictedDecodeFrontierLengths.size()); ++batch)
             {
                 PhaseGlobalActionKey key{PhaseGlobalActionKind::kDecode, batch, 0, 1, bucket, 0};
-                key.externalEncoderBackground = plan.externalEncoderActive;
                 key.executionVariant = executionVariantFor(key, 0);
                 auto const service = mRuntimeCostTracker->decodeServiceEstimate(key);
+                key.externalEncoderBackground = plan.externalEncoderActive;
                 auto gpu = mRuntimeCostTracker->trustedEstimate(key);
                 bool const coveringGpu = !gpu.has_value();
                 if (coveringGpu)
@@ -4757,12 +4758,7 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
     {
         PhaseGlobalActionKey observedKey = globalActionKey(metrics);
         observedKey.externalEncoderBackground = externalEncoderObserved;
-        auto sameActionExceptEncoderBackground = [](PhaseGlobalActionKey left, PhaseGlobalActionKey right) {
-            left.externalEncoderBackground = false;
-            right.externalEncoderBackground = false;
-            return left == right;
-        };
-        bool const actionShapeParity = sameActionExceptEncoderBackground(metrics.globalSelectedAction, observedKey);
+        bool const actionShapeParity = phaseGlobalSameActionShape(metrics.globalSelectedAction, observedKey);
         if (metrics.externalEncoderOverlapObservationDeferred)
         {
             ++mTelemetry.globalCostEncoderContextDeferredCount;
@@ -4794,7 +4790,8 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             mTelemetry.globalCostExternalEncoderContextObservationCount
                 += observedKey.externalEncoderBackground ? 1U : 0U;
             float referenceWorkMs = metrics.prefillGpuMs + metrics.decodeGpuMs;
-            if (metrics.globalReferenceWorkMs > 0.0 && actionShapeParity)
+            // The planned serial reference was priced under the planned encoder context.
+            if (metrics.globalReferenceWorkMs > 0.0 && metrics.globalSelectedAction == observedKey)
             {
                 referenceWorkMs = static_cast<float>(metrics.globalReferenceWorkMs);
             }
@@ -4842,7 +4839,7 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseQueueScheduler::globalCalibration
     {
         PhaseGlobalActionKey const& key = mGlobalCalibrationKeys[index];
         size_t const opportunities = mGlobalCalibrationOpportunities[index];
-        result.push_back({key, mRuntimeCostTracker->overlapDiagnostic(key), opportunities,
+        result.push_back({key, mRuntimeCostTracker->overlapCalibrationDiagnostic(key), opportunities,
             opportunities >= mConfig.globalCostModelConfig.overlapMinSamples});
     }
     return result;

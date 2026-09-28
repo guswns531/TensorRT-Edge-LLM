@@ -213,6 +213,8 @@ struct PhaseDispatchMetrics
     //! Encoder GPU activity overlapping this dispatch, when a CUDA-interval observer is attached.
     bool externalEncoderOverlapObserved{};
     bool externalEncoderOverlapObservationValid{};
+    //! An encoder interval was still open when the dispatch completed. The cost sample is
+    //! discarded, not replayed later; the name is kept for telemetry compatibility.
     bool externalEncoderOverlapObservationDeferred{};
     //! True when the decode cost was observed concurrently with prefill.
     bool concurrentPrefillActive{};
@@ -965,7 +967,7 @@ private:
         bool initialChunk, bool overlap, int32_t plannedDecodeBatchSize, int32_t plannedDecodeMaxContextLength,
         PhaseQueueSnapshot const& snapshot, bool preferMaximumProgress, float& predictedGpuMs,
         float& predictedDecodeSlowdownMs, bool& costCoverageMiss,
-        std::vector<PhaseGlobalSelectionAudit::PrefillShapeCandidate>* diagnostics = nullptr) const noexcept;
+        std::vector<PhaseGlobalSelectionAudit::PrefillShapeCandidate>* diagnostics = nullptr) const;
     PhaseQueueSnapshot snapshot(bool includeReadyDetails = false) const;
     int32_t prefillBatchLimit(PhasePrefillClass prefillClass) const noexcept;
     int32_t dispatchedPrefillTokens(PhaseWorkItem const& item) const noexcept;
