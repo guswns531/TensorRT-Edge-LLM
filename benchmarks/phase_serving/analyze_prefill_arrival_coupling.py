@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Compare client ingress and prefill formation in paired HTTP phase traces."""
 
 import argparse
@@ -35,6 +32,14 @@ def percentile(values, fraction):
                              ordered[lower]) * (position - lower)
 
 
+def open_gateway_log(cell):
+    # gzip removes the plain log only after a complete write.
+    log = cell / "gateway.log"
+    if log.is_file():
+        return log.open(encoding="utf-8")
+    return gzip.open(cell / "gateway.log.gz", "rt", encoding="utf-8")
+
+
 def load_cell(cell, measurement_epoch):
     requests_path = cell / "client/run-001/requests.csv"
     with requests_path.open(encoding="utf-8") as stream:
@@ -42,11 +47,7 @@ def load_cell(cell, measurement_epoch):
             int(row["request_id"]): row
             for row in csv.DictReader(stream)
         }
-    log = cell / "gateway.log.gz"
-    if log.is_file():
-        stream = gzip.open(log, "rt", encoding="utf-8")
-    else:
-        stream = (cell / "gateway.log").open(encoding="utf-8")
+    stream = open_gateway_log(cell)
     metrics = []
     events = []
     with stream:
@@ -66,9 +67,7 @@ def load_server_timeline(cell, metrics):
             "Measurement metrics are required to isolate the timeline epoch")
     start_us = min(x["host_dispatch_start_us"] for x in metrics) - 100000.0
     end_us = max(x["host_completion_us"] for x in metrics) + 100000.0
-    log = cell / "gateway.log.gz"
-    stream = gzip.open(log, "rt", encoding="utf-8") if log.is_file() else (
-        cell / "gateway.log").open(encoding="utf-8")
+    stream = open_gateway_log(cell)
     stages = collections.defaultdict(dict)
     with stream:
         for line in stream:
@@ -290,6 +289,18 @@ def analyze_pair(left_requests, left_metrics, left_events, right_requests,
                 } for request_id in involved]
             }
             break
+    shared = min(len(left_prefill), len(right_prefill))
+    if first_mismatch is None and len(left_prefill) != len(right_prefill):
+        extra_side = "left" if len(left_prefill) > shared else "right"
+        extra = (left_prefill
+                 if extra_side == "left" else right_prefill)[shared]
+        first_mismatch = {
+            "index": shared,
+            "length_mismatch": True,
+            "extra_side": extra_side,
+            "extra_dispatch_index": extra["dispatch_index"],
+            "extra_request_ids": extra["prefill_request_ids"],
+        }
     send_deltas = [
         abs(
             float(left_requests[index]["send_us"]) -

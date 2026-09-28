@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Deterministic phase IPC submission gate contracts."""
 
 import contextlib
@@ -80,3 +77,23 @@ class OrderedPhaseGatewayTest(unittest.TestCase):
         broker = G_TOOL.ordered_broker_type(FakeBroker)([], .001)
         with self.assertRaises(ValueError):
             broker.submit(1, {})
+
+    def test_order_failure_fails_successors_until_reset(self):
+
+        class RejectingBroker(FakeBroker):
+
+            def submit(self, request_index, request):
+                if request_index == 0:
+                    raise RuntimeError("rejected")
+                return super().submit(request_index, request)
+
+        broker = G_TOOL.ordered_broker_type(RejectingBroker)([], 60.0)
+        with self.assertRaises(RuntimeError):
+            broker.submit(0, {})
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            broker.submit(1, {})
+        self.assertLess(time.monotonic() - started, 1.0)
+        broker.control("begin", 1.0)
+        with self.assertRaises(RuntimeError):
+            broker.submit(0, {})

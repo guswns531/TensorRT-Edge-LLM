@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Paired HTTP ingress and prefill formation analysis contracts."""
 
 import importlib.util
@@ -84,6 +81,17 @@ class PrefillArrivalCouplingTest(unittest.TestCase):
         self.assertEqual(mismatch["right_ready_prefill_ids"], [0])
         self.assertEqual(mismatch["left_prefill_formation"]["seed_request_id"],
                          0)
+
+    def test_reports_extra_prefill_dispatch_after_identical_prefix(self):
+        result = G_TOOL.analyze_pair(
+            self.requests([0, 1000]), [self.metric(1, [0])], [],
+            self.requests([0, 1000]),
+            [self.metric(1, [0]), self.metric(2, [1])], [])
+        mismatch = result["first_prefill_mismatch"]
+        self.assertTrue(mismatch["length_mismatch"])
+        self.assertEqual(mismatch["index"], 1)
+        self.assertEqual(mismatch["extra_side"], "right")
+        self.assertEqual(mismatch["extra_request_ids"], [1])
 
     def test_rejects_different_scheduled_work(self):
         left = self.requests([0, 1000])

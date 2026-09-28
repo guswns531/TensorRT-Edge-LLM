@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Controlled async decode report validation."""
 
 import importlib.util
@@ -180,6 +177,12 @@ class AsyncDecodeTrialTest(unittest.TestCase):
         self.assertEqual(result["dense"]["branch_tick_ms"], .1)
         self.assertEqual(result["split"]["branch_tick_ms"], .3)
         self.assertEqual(result["singleton"]["branch_gpu_ms"], 3.0)
+        self.assertFalse(
+            result["split"]["branch_timing_includes_logit_inspection"])
+        raw["config"]["branch_turn"] = 2
+        with self.assertRaisesRegex(ValueError, "successor decode turn"):
+            G_TOOL.summarize(raw)
+        raw["config"]["branch_turn"] = 1
         raw["episodes"][0]["dispatches"][1]["graph"] = True
         with self.assertRaises(ValueError):
             G_TOOL.summarize(raw)

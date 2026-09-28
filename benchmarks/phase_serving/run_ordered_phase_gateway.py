@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Opt-in HTTP gateway that submits one trace to phase IPC in request order."""
 
 import argparse
@@ -33,18 +30,33 @@ def ordered_broker_type(base_broker_type):
             self.order_timeout = timeout
             self.order_condition = threading.Condition()
             self.next_request_index = 0
+            self.order_failure = None
 
         def submit(self, request_index, request):
             deadline = time.monotonic() + self.order_timeout
             with self.order_condition:
-                while request_index != self.next_request_index:
+                while (request_index != self.next_request_index
+                       and self.order_failure is None):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise ValueError(
-                            f"ordered ingress waited for request {self.next_request_index}"
-                        )
+                        # A missing predecessor can never arrive later; fail
+                        # every queued successor instead of timing out each.
+                        self.order_failure = (
+                            "ordered ingress waited for request "
+                            f"{self.next_request_index}")
+                        self.order_condition.notify_all()
+                        break
                     self.order_condition.wait(remaining)
-                result = super().submit(request_index, request)
+                if self.order_failure is not None:
+                    raise ValueError(self.order_failure)
+                try:
+                    result = super().submit(request_index, request)
+                except Exception as error:
+                    self.order_failure = (
+                        f"ordered ingress submit failed for request "
+                        f"{request_index}: {error}")
+                    self.order_condition.notify_all()
+                    raise
                 self.next_request_index += 1
                 self.order_condition.notify_all()
                 return result
@@ -54,6 +66,7 @@ def ordered_broker_type(base_broker_type):
             if action in ("begin", "status", "end"):
                 with self.order_condition:
                     self.next_request_index = 0
+                    self.order_failure = None
                     self.order_condition.notify_all()
             return result
 

@@ -35,12 +35,13 @@ def _run_number(aggregate: Path) -> int:
 
 def _event_path(aggregate: Path) -> Path:
     run = aggregate.parents[1]
-    compressed = run / "gateway.log.gz"
-    if compressed.is_file():
-        return compressed
+    # gzip removes the plain log only after a complete write.
     gateway = run / "gateway.log"
     if gateway.is_file():
         return gateway
+    compressed = run / "gateway.log.gz"
+    if compressed.is_file():
+        return compressed
     variant = aggregate.parents[2]
     return variant / "activity" / f"run-{_run_number(aggregate):03d}-events.jsonl"
 

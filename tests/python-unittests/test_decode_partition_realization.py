@@ -54,6 +54,18 @@ class DecodePartitionRealizationTest(unittest.TestCase):
         self.assertEqual(report["complete_commit_horizons"], 1)
         self.assertEqual(report["matched_commit_horizon_mean_ms"], 1.5)
 
+    def test_orders_by_dispatch_start_and_skips_prefill_only_metrics(self):
+        prefill_only = [{
+            "dispatch_index": 10 + index,
+            "host_dispatch_start_us": 1500.0,
+            "decode_request_ids": []
+        } for index in range(8)]
+        metrics = [self.metric(2, [3, 4])
+                   ] + prefill_only + [self.metric(1, [1, 2], [1, 2, 3, 4])]
+        commits = {request_id: [2500.0] for request_id in range(1, 5)}
+        report = G_TOOL.analyze(metrics, commits)
+        self.assertEqual(report["same_frontier_realized"], 1)
+
     def test_requeued_rows_can_overtake_the_residual(self):
         metrics = [
             self.metric(1, [1, 2], [1, 2, 3, 4]),

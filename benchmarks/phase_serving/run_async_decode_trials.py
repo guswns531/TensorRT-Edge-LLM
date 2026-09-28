@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Controlled async-server decode transitions and batch-dependent token checks."""
 
 import argparse
@@ -50,6 +47,9 @@ def summarize(raw):
     if {(e["round"], e["variant"])
             for e in episodes} != expected or len(episodes) != len(expected):
         raise ValueError("Missing or duplicate episodes")
+    if "branch_turn" in cfg and not 0 <= cfg[
+            "branch_turn"] < cfg["output_tokens"] - 2:
+        raise ValueError("branch_turn must leave a successor decode turn")
     result = {}
     for round_index in range(cfg["rounds"]):
         if {e["order"]
@@ -151,6 +151,9 @@ def summarize(raw):
             result[name]["branch_two_tick_ms"] = statistics.mean(
                 successor_ticks)
             result[name]["branch_gpu_ms"] = statistics.mean(branch_gpu)
+            # Host logit copy and top-k scan run inside the inspected turn.
+            result[name]["branch_timing_includes_logit_inspection"] = cfg.get(
+                "inspect_turn", -1) == branch
     reference = result["singleton"]["reference_tokens"]
     for variant, name in enumerate(("dense", "split", "singleton")):
         tokens = [

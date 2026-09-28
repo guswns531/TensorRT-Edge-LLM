@@ -218,10 +218,16 @@ def main():
         serving.digest(pathlib.Path(__file__)),
         "container":
         serving.IMAGE,
+        "mode":
+        args.mode,
         "repeat_contract":
         "5 in-process blocks, 20 warmup + 50 paired trials each",
         "note_references":
-        ["notes/343-startup-decode-equal-work-trials-20260927.md"],
+        ["notes/343-startup-decode-equal-work-trials-20260927.md"]
+        if args.mode == "dense_split" else [
+            "notes/357-decode-row-order-ablation-20260927.md",
+            "notes/359-fixed-kv-decode-row-permutation-20260927.md"
+        ],
         "summary_path":
         str(root / "summary.json"),
         "cells": [],

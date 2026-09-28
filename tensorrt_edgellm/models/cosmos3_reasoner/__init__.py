@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Cosmos3-Edge reasoner (multimodal reasoning VLM) for Edge-LLM."""
 from .modeling_cosmos3_reasoner_text import (Cosmos3ReasonerCausalLM,
                                              build_cosmos3_reasoner_text)

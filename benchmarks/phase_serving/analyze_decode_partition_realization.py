@@ -17,6 +17,7 @@
 import argparse
 import collections
 import gzip
+import itertools
 import json
 import pathlib
 import statistics
@@ -48,6 +49,10 @@ def analyze(metrics, commits):
                               for metric in metrics):
         raise ValueError(
             "Full decode partition diagnostic metrics are required")
+    metrics = sorted(
+        metrics,
+        key=lambda metric:
+        (metric["host_dispatch_start_us"], metric["dispatch_index"]))
     results = []
     covered_decisions = 0
     service_density_agreements = 0
@@ -92,10 +97,12 @@ def analyze(metrics, commits):
         outsiders = set()
         duplicate_dispatch_rows = 0
         actual_dispatch_rows = 0
-        for following in metrics[start:start + len(frontier) + 4]:
-            ids = following.get("decode_request_ids", [])
-            if not ids:
-                continue
+        decode_window = itertools.islice(
+            (following for following in metrics[start:]
+             if following.get("decode_request_ids")),
+            len(frontier) + 4)
+        for following in decode_window:
+            ids = following["decode_request_ids"]
             current = set(ids)
             actual_dispatch_rows += len(ids)
             duplicate_dispatch_rows += len(current & frontier_set & seen)
