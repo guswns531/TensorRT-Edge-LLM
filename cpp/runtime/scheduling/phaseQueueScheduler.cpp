@@ -2742,7 +2742,8 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
                 = !contextual.ready && probeIntervalReady && (probeSlackSafe || deadlineRecoveryProbe);
             bool const producerCriticalPath = phaseContextualPdProducerCriticalPath(
                 mExternalEncoderActive || state.prefillPendingProducerRows > 0U, false);
-            if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready
+            // A directly measured overlap cost outranks the learned head; the head prices unmeasured shapes only.
+            if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready && !overlapMeasured
                 && phaseContextualPdControlsDecision(producerCriticalPath))
             {
                 candidate.decisionCostKnown = true;
@@ -3439,7 +3440,7 @@ std::optional<PhaseGlobalResidualSelection> PhaseQueueScheduler::previewGlobalRe
         overlap.contextualPdUncertainty = contextual.uncertainty;
         overlap.contextualPdLowerConfidenceBound = contextual.lowerConfidenceBound;
         overlap.contextualPdExploration = !contextual.ready && probeIntervalReady && (deadlineRecovery || slackSafe);
-        if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready)
+        if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready && !overlapKnown)
         {
             overlap.decisionCostKnown = true;
             overlap.contextualScalarAuthorityApplied = true;

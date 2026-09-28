@@ -2770,7 +2770,7 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
         overlap.contextualPdExploration = !contextual.ready && probeIntervalReady
             && (protectedSlackUs >= static_cast<double>(mConfig.globalSafeProbeSlackMultiplier) * robustSerialUs
                 || protectedSlackUs < robustSerialUs);
-        if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready
+        if (contextualMode == PhaseContextualPdMode::kActive && contextual.ready && !overlapMeasured
             && phaseContextualPdControlsDecision(producerCriticalPath))
         {
             overlap.decisionCostKnown = true;

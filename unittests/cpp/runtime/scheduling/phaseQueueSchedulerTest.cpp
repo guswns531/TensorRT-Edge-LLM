@@ -771,6 +771,73 @@ TEST(PhaseQueueSchedulerTest, CompletePrefillDecodeReusesResidualCompressionOfTh
     EXPECT_LT(warm.predictedMakespanUs, warm.referenceWorkUs);
 }
 
+TEST(PhaseQueueSchedulerTest, MeasuredOverlapCostOutranksContextualAuthority)
+{
+    PhaseRuntimeCostTrackerConfig trackerConfig;
+    trackerConfig.policyMode = PhasePolicyMode::kContextualScalar;
+    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kActive;
+    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    config.runtimeCostTracker = tracker;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+    auto completeOverlap = [&scheduler]() {
+        EXPECT_TRUE(scheduler.previewGlobalAction().has_value());
+        auto const& frontier = scheduler.lastGlobalPreviewCandidates();
+        auto const overlap = std::find_if(frontier.begin(), frontier.end(),
+            [](auto const& action) { return action.key.kind == PhaseGlobalActionKind::kPrefillDecode; });
+        EXPECT_NE(overlap, frontier.end());
+        return *overlap;
+    };
+    PhaseGlobalActionCandidate const cold = completeOverlap();
+    ASSERT_TRUE(cold.contextualPdFeatureValid);
+    PhaseContextualPairDirection const direction = phaseContextualPairDirection(cold.key.kind, cold.key.residualAnchor);
+    for (size_t sample{}; sample < trackerConfig.contextualPd.minimumObservations; ++sample)
+    {
+        tracker->observeContextualDirection(direction, cold.contextualPdFeatures, -0.1);
+    }
+    PhaseGlobalActionCandidate const pessimistic = completeOverlap();
+    ASSERT_TRUE(pessimistic.contextualScalarAuthorityApplied);
+    EXPECT_GT(pessimistic.decisionMakespanUs, pessimistic.referenceWorkUs);
+
+    int32_t const width = std::max(1, config.runtimeDecodeContextBucketTokens);
+    PhaseDispatchMetrics residual;
+    residual.kind = PhaseDispatchKind::kOverlap;
+    residual.prefillBatchSize = cold.key.primaryBatchSize;
+    residual.decodeBatchSize = cold.key.secondaryBatchSize;
+    residual.prefillPaddedTokens = cold.key.chunkLength * cold.key.primaryBatchSize;
+    residual.prefillPastKVMax = cold.key.primaryContextBucket * width;
+    residual.plannedDecodeMaxContextLength = cold.key.secondaryContextBucket * width;
+    residual.prefillClass = static_cast<PhasePrefillClass>(cold.key.primaryWorkClass);
+    residual.globalExecutionVariant = cold.key.executionVariant;
+    residual.prefillGpuMs = 5.0F;
+    residual.decodeGpuMs = 5.0F;
+    residual.makespanGpuMs = 5.0F;
+    residual.globalReferenceWorkMs = 10.0;
+    residual.globalDecisionApplied = true;
+    residual.globalCandidateParity = true;
+    residual.globalActionFidelity = true;
+    residual.globalSelectedAction = cold.key;
+    residual.globalSelectedAction.residualAugmentation = true;
+    residual.globalSelectedAction.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    residual.globalObservedResidualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    for (size_t sample{}; sample < config.globalCostModelConfig.overlapMinSamples; ++sample)
+    {
+        scheduler.observeMetrics(residual);
+    }
+
+    PhaseGlobalActionCandidate const measured = completeOverlap();
+    EXPECT_EQ(measured.predictedCostSource, PhaseServiceReferenceSource::kRuntimeResidual);
+    EXPECT_FALSE(measured.contextualScalarAuthorityApplied);
+    EXPECT_FALSE(measured.decisionCostKnown);
+    EXPECT_LT(measured.predictedMakespanUs, measured.referenceWorkUs);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillFormation)
 {
     PhaseQueueSchedulerConfig config;
