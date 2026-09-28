@@ -714,6 +714,63 @@ TEST(PhaseQueueSchedulerTest, GlobalPreviewRetainsTheCompletePolicyNeutralCandid
     }));
 }
 
+TEST(PhaseQueueSchedulerTest, CompletePrefillDecodeReusesResidualCompressionOfTheSameShape)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.globalSafeProbeSlackMultiplier = 0.0F;
+    config.prefillQueueWaitTargetUs = 1.0e9;
+    config.decodeQueueWaitTargetUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+    auto completeOverlap = [&scheduler]() {
+        EXPECT_TRUE(scheduler.previewGlobalAction().has_value());
+        auto const& frontier = scheduler.lastGlobalPreviewCandidates();
+        auto const overlap = std::find_if(frontier.begin(), frontier.end(),
+            [](auto const& action) { return action.key.kind == PhaseGlobalActionKind::kPrefillDecode; });
+        EXPECT_NE(overlap, frontier.end());
+        return *overlap;
+    };
+    PhaseGlobalActionCandidate const cold = completeOverlap();
+    ASSERT_FALSE(cold.key.residualAugmentation);
+    EXPECT_EQ(cold.predictedCostSource, PhaseServiceReferenceSource::kDerivedIsolated);
+    EXPECT_FALSE(cold.overlapCostKnown);
+
+    int32_t const width = std::max(1, config.runtimeDecodeContextBucketTokens);
+    PhaseDispatchMetrics residual;
+    residual.kind = PhaseDispatchKind::kOverlap;
+    residual.prefillBatchSize = cold.key.primaryBatchSize;
+    residual.decodeBatchSize = cold.key.secondaryBatchSize;
+    residual.prefillPaddedTokens = cold.key.chunkLength * cold.key.primaryBatchSize;
+    residual.prefillPastKVMax = cold.key.primaryContextBucket * width;
+    residual.plannedDecodeMaxContextLength = cold.key.secondaryContextBucket * width;
+    residual.prefillClass = static_cast<PhasePrefillClass>(cold.key.primaryWorkClass);
+    residual.globalExecutionVariant = cold.key.executionVariant;
+    residual.prefillGpuMs = 5.0F;
+    residual.decodeGpuMs = 5.0F;
+    residual.makespanGpuMs = 5.0F;
+    residual.globalReferenceWorkMs = 10.0;
+    residual.globalDecisionApplied = true;
+    residual.globalCandidateParity = true;
+    residual.globalActionFidelity = true;
+    residual.globalSelectedAction = cold.key;
+    residual.globalSelectedAction.residualAugmentation = true;
+    residual.globalSelectedAction.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    residual.globalObservedResidualAnchor = PhaseGlobalResidualAnchor::kPrefill;
+    for (size_t sample{}; sample < config.globalCostModelConfig.overlapMinSamples; ++sample)
+    {
+        scheduler.observeMetrics(residual);
+    }
+    ASSERT_EQ(scheduler.telemetry().globalCostKeyParityViolationCount, 0U);
+
+    PhaseGlobalActionCandidate const warm = completeOverlap();
+    EXPECT_EQ(warm.predictedCostSource, PhaseServiceReferenceSource::kRuntimeResidual);
+    EXPECT_TRUE(warm.overlapCostKnown);
+    EXPECT_TRUE(warm.overlapCostProfitable);
+    EXPECT_LT(warm.predictedMakespanUs, warm.referenceWorkUs);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillFormation)
 {
     PhaseQueueSchedulerConfig config;

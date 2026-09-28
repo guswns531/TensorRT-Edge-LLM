@@ -2567,6 +2567,36 @@ std::optional<PhaseQueueScheduler::GlobalQueueSelection> PhaseQueueScheduler::se
             overlap.referenceSource = PhaseServiceReferenceSource::kDerivedIsolated;
             overlapMeasured = selected != nullptr;
             overlapProfitable = selected != nullptr;
+            if (selected == nullptr)
+            {
+                // Residual augmentation measures makespan from its own start, so only its compression
+                // (serial reference / robust makespan) transfers to a complete P+D of the same shape.
+                std::optional<PhaseGlobalOverlapCostDiagnostic> transferred;
+                for (PhaseGlobalResidualAnchor const anchor :
+                    {PhaseGlobalResidualAnchor::kPrefill, PhaseGlobalResidualAnchor::kDecode})
+                {
+                    PhaseGlobalActionKey residualKey = overlapKey;
+                    residualKey.residualAugmentation = true;
+                    residualKey.residualAnchor = anchor;
+                    PhaseGlobalOverlapCostDiagnostic const residual
+                        = mRuntimeCostTracker->overlapDiagnostic(residualKey);
+                    bool const resolved = residual.status == PhaseGlobalOverlapCostStatus::kEligible
+                        || residual.status == PhaseGlobalOverlapCostStatus::kUnprofitable;
+                    if (resolved && residual.robustCompression > 0.0F
+                        && (!transferred.has_value() || residual.robustCompression < transferred->robustCompression))
+                    {
+                        transferred = residual;
+                    }
+                }
+                if (transferred.has_value())
+                {
+                    overlap.makespanUs = overlap.referenceWorkUs / static_cast<double>(transferred->robustCompression);
+                    overlap.uncertaintyUs = 0.0;
+                    overlap.costSource = PhaseServiceReferenceSource::kRuntimeResidual;
+                    overlapMeasured = true;
+                    overlapProfitable = transferred->status == PhaseGlobalOverlapCostStatus::kEligible;
+                }
+            }
         }
         if (!overlapMeasured && mRuntimeCostTracker->contextualPdConfig().mode == PhaseContextualPdMode::kDisabled)
         {

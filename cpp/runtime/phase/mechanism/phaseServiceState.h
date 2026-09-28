@@ -34,6 +34,8 @@ enum class PhaseServiceReferenceSource
     kStaticProfile,
     kColdFallback,
     kDerivedIsolated,
+    //! Complete P+D priced from residual-augmentation compression of the same shape.
+    kRuntimeResidual,
 };
 
 inline char const* phaseServiceReferenceSourceName(PhaseServiceReferenceSource source) noexcept
@@ -47,6 +49,7 @@ inline char const* phaseServiceReferenceSourceName(PhaseServiceReferenceSource s
     case PhaseServiceReferenceSource::kStaticProfile: return "static_profile";
     case PhaseServiceReferenceSource::kColdFallback: return "cold_fallback";
     case PhaseServiceReferenceSource::kDerivedIsolated: return "derived_isolated";
+    case PhaseServiceReferenceSource::kRuntimeResidual: return "runtime_residual";
     }
     return "unknown";
 }
