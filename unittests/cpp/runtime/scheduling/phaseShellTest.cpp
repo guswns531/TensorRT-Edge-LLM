@@ -18,9 +18,12 @@
 #include "common/checkMacros.h"
 #include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
+#include "runtime/scheduling/phaseHostWakeup.h"
 #include "runtime/scheduling/phaseKernelGroupRecorder.h"
 
 #include <gtest/gtest.h>
+
+#include <chrono>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -241,6 +244,21 @@ TEST(PhaseActivityTimelineTest, OverlapQueriesKeepEncoderIntervalsUntilActionRet
     CUDA_CHECK(cudaStreamDestroy(encoderStream));
     CUDA_CHECK(cudaStreamDestroy(prefillStream));
     CUDA_CHECK(cudaStreamDestroy(decodeStream));
+}
+
+TEST(PhaseHostWakeupTest, TimesOutWithoutNotifyAndKeepsEarlyNotifications)
+{
+    rt::PhaseHostWakeup wakeup;
+    uint64_t const initial = wakeup.generation();
+    auto const timedStart = std::chrono::steady_clock::now();
+    EXPECT_FALSE(wakeup.waitFor(initial, std::chrono::microseconds(2000)));
+    EXPECT_GE(std::chrono::steady_clock::now() - timedStart, std::chrono::microseconds(1500));
+
+    // A notification published before the wait must still end it immediately.
+    wakeup.notify();
+    auto const earlyStart = std::chrono::steady_clock::now();
+    EXPECT_TRUE(wakeup.waitFor(initial, std::chrono::seconds(5)));
+    EXPECT_LT(std::chrono::steady_clock::now() - earlyStart, std::chrono::seconds(1));
 }
 
 TEST(PhaseActivityTimelineTest, CountsCopyOnlyTimeAsEpdIdle)

@@ -33,6 +33,7 @@
 #include "runtime/scheduling/phaseActivityTimeline.h"
 #include "runtime/scheduling/phaseContinuousLoadGenerator.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
+#include "runtime/scheduling/phaseHostWakeup.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
 #include "runtime/scheduling/phaseServingExecutionOptions.h"
 #include "runtime/scheduling/phaseThreeCoordinator.h"
@@ -725,6 +726,14 @@ int main(int argc, char** argv)
     rt::LLMEngineConfig const config = rt::parseEngineConfig(engineDir / "config.json");
     char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
 
+    rt::PhaseHostWakeup hostWakeup;
+    bool const hostWaitEnabled = std::getenv("TRT_EDGELLM_DISABLE_HOST_WAIT") == nullptr;
+    auto const envMicros = [](char const* name, int64_t fallback) {
+        char const* value = std::getenv(name);
+        return std::chrono::microseconds(value != nullptr ? std::stoll(value) : fallback);
+    };
+    std::chrono::microseconds const hostWaitSpin = envMicros("TRT_EDGELLM_HOST_WAIT_SPIN_US", 200);
+    std::chrono::microseconds const hostWaitTimeout = envMicros("TRT_EDGELLM_HOST_WAIT_TIMEOUT_US", 1000);
     cudaStream_t setupStream{};
     cudaStream_t prefillStream{};
     cudaStream_t decodeStream{};
@@ -2091,6 +2100,7 @@ int main(int argc, char** argv)
             LOG_INFO("Phase encoder-only activity observer enabled");
         }
         bool const ipcMode = std::getenv("TRT_EDGELLM_PHASE_IPC") != nullptr;
+
         ELLM_CHECK(ipcMode
                 || (!startupOptions.measuredDecodeAtMeasurement && !startupOptions.measuredDecodeServiceAtMeasurement),
             "Delayed measured decode activation occurs at IPC calibration end and requires TRT_EDGELLM_PHASE_IPC");
@@ -3207,6 +3217,7 @@ int main(int argc, char** argv)
                 }
                 ipcThreePhase
                     = std::make_unique<rt::PhaseThreeCoordinator>(*ipcVisionAdapter, semanticServer, threePhaseConfig);
+
                 if (activityTimeline != nullptr)
                 {
                     ipcThreePhase->setActivityTimeline(activityTimeline.get());
@@ -3513,13 +3524,14 @@ int main(int argc, char** argv)
                             pendingInputTasks.push_back({orderingClass,
                                 std::async(std::launch::async,
                                     [line = std::move(line), sequence,
-                                        defaultMaxOutputTokens = serverConfig.defaultMaxOutputTokens]() {
+                                        defaultMaxOutputTokens = serverConfig.defaultMaxOutputTokens, &hostWakeup]() {
                                         auto const adapterStart = std::chrono::steady_clock::now();
                                         PhaseIpcInput input = parsePhaseIpcInput(line, defaultMaxOutputTokens);
                                         input.ingressSequence = sequence;
                                         input.adapterUs = std::chrono::duration<double, std::micro>(
                                             std::chrono::steady_clock::now() - adapterStart)
                                                               .count();
+                                        hostWakeup.notify();
                                         return input;
                                     })});
                         }
@@ -3528,10 +3540,14 @@ int main(int argc, char** argv)
                             std::lock_guard<std::mutex> lock(pendingMutex);
                             pendingLines.push_back(std::move(line));
                         }
+                        hostWakeup.notify();
                     }
                 }
-                std::lock_guard<std::mutex> lock(pendingMutex);
-                inputClosed = true;
+                {
+                    std::lock_guard<std::mutex> lock(pendingMutex);
+                    inputClosed = true;
+                }
+                hostWakeup.notify();
             });
             emitEvent({{"type", "ready"}, {"startup_calibration", startupReport}});
             size_t emittedMetrics = semanticCoordinator.metrics().size();
@@ -3540,8 +3556,13 @@ int main(int argc, char** argv)
             double ipcPollUs{};
             double ipcSerializationUs{};
             size_t ipcPollCalls{};
+            size_t ipcHostWaits{};
+            size_t ipcHostWaitTimeouts{};
+            auto lastProgressAt = std::chrono::steady_clock::now();
             while (true)
             {
+                // Read before draining input and polling completions so a wakeup in between is not lost.
+                uint64_t const wakeSeen = hostWakeup.generation();
                 std::deque<std::string> lines;
                 std::deque<PhaseIpcInput> inputs;
                 {
@@ -5055,6 +5076,9 @@ int main(int argc, char** argv)
                 {
                     break;
                 }
+                // Only an idle server sleeps: while requests are live, completions and time-based scheduler
+                // waits have no wake source and a sleep would add latency to every step.
+                bool const idle = serverEmpty && lines.empty() && inputs.empty() && noPendingInput;
                 if (!lines.empty())
                 {
                     std::lock_guard<std::mutex> lock(pendingMutex);
@@ -5073,7 +5097,17 @@ int main(int argc, char** argv)
                         inputs.pop_back();
                     }
                 }
-                if (!madeProgress)
+                auto const iterationEnd = std::chrono::steady_clock::now();
+                if (madeProgress)
+                {
+                    lastProgressAt = iterationEnd;
+                }
+                else if (hostWaitEnabled && idle && iterationEnd - lastProgressAt >= hostWaitSpin)
+                {
+                    ipcHostWaitTimeouts += hostWakeup.waitFor(wakeSeen, hostWaitTimeout) ? 0U : 1U;
+                    ++ipcHostWaits;
+                }
+                else
                 {
                     std::this_thread::yield();
                 }
@@ -5250,14 +5284,15 @@ int main(int argc, char** argv)
             LOG_INFO("Phase IPC token text cache: entries=%zu hits=%zu misses=%zu", decodedTokenTextCache.size(),
                 decodedTokenTextCacheHits, decodedTokenTextCacheMisses);
             LOG_INFO(
-                "Phase IPC host cost: polls=%zu ingress=%.3f ms adapter_workers=%zu adapter_inputs=%zu "
+                "Phase IPC host cost: polls=%zu host_waits=%zu host_wait_timeouts=%zu ingress=%.3f ms "
+                "adapter_workers=%zu adapter_inputs=%zu "
                 "adapter=%.3f ms "
                 "poll=%.3f ms serialize=%.3f ms output_serialize=%.3f ms output_batches=%zu output_records=%zu "
                 "output_bytes=%zu telemetry_bytes=%zu",
-                ipcPollCalls, ipcIngressUs / 1000.0, asyncRequestAdapter ? requestAdapterWorkers : 0U,
-                ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0, ipcPollUs / 1000.0, ipcSerializationUs / 1000.0,
-                outputSerializationUs / 1000.0, outputWriteBatches, outputWriteRecords, outputWriteBytes,
-                telemetryWriteBytes);
+                ipcPollCalls, ipcHostWaits, ipcHostWaitTimeouts, ipcIngressUs / 1000.0,
+                asyncRequestAdapter ? requestAdapterWorkers : 0U, ipcRequestAdapterInputs, ipcRequestAdapterUs / 1000.0,
+                ipcPollUs / 1000.0, ipcSerializationUs / 1000.0, outputSerializationUs / 1000.0, outputWriteBatches,
+                outputWriteRecords, outputWriteBytes, telemetryWriteBytes);
             auto const prefillGraphStats = semanticCoordinator.prefillGraphCacheStats();
             auto const decodeGraphStats = semanticCoordinator.decodeGraphCacheStats();
             LOG_INFO(
