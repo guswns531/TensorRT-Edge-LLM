@@ -40,13 +40,14 @@ constexpr char const* kINT4_GEMM_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_PLUGIN_NAME{"Int4GroupwiseGemmPlugin"};
 
 //! GEMV and GEMM accumulate in FP16 in different orders, so a row's output depends on which path its batch took.
-//! TRT_EDGELLM_INT4_GEMV_MAX_M raises the GEMV bound (in kGemvMaxM-row chunks) to make decode batch-invariant.
+//! TRT_EDGELLM_INT4_GEMV_MAX_M overrides the GEMV bound for batch-invariance diagnostics: 0 routes every
+//! CTA-aligned shape to the GEMM, whose per-row result does not depend on M; larger values chunk GEMV by
+//! kGemvMaxM rows.
 int32_t gemvMaxM()
 {
     static int32_t const value = [] {
         char const* env = std::getenv("TRT_EDGELLM_INT4_GEMV_MAX_M");
-        return env != nullptr ? std::max(trt_edgellm::kernel::kGemvMaxM, std::atoi(env))
-                              : trt_edgellm::kernel::kGemvMaxM;
+        return env != nullptr ? std::max(0, std::atoi(env)) : trt_edgellm::kernel::kGemvMaxM;
     }();
     return value;
 }
