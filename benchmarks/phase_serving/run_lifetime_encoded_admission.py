@@ -585,6 +585,14 @@ def parse_args(argv=None):
         "Additional backend environment for explicit ablations; recorded in the manifest"
     )
     parser.add_argument(
+        "--trace-file",
+        action="append",
+        default=[],
+        metavar="WORKLOAD=PATH",
+        help=
+        "Replace one workload's trace (e.g. an accuracy dataset); the trace digest is recorded in the manifest"
+    )
+    parser.add_argument(
         "--activity-observer",
         choices=("full", "encoder", "off"),
         default="full",
@@ -630,6 +638,12 @@ def parse_args(argv=None):
         parser.error("Repeat count must be positive and budgets non-negative")
     if args.diagnostic_logit_request_id is not None and args.diagnostic_logit_request_id < 0:
         parser.error("Diagnostic logit request ID must be non-negative")
+    for item in args.trace_file:
+        workload, _, path = item.partition("=")
+        if workload not in WORKLOADS or not path:
+            parser.error(
+                "--trace-file expects WORKLOAD=PATH with WORKLOAD in " +
+                ", ".join(WORKLOADS))
     if args.diagnostic_logit_step is not None and (
             args.diagnostic_logit_step < 0
             or args.diagnostic_logit_request_id is None):
@@ -684,6 +698,10 @@ def main():
             for key, value in paths[model_name].items() if value is not None
         }
         configs[model_name] = model_config(repo, model_name, overrides)
+        for item in args.trace_file:
+            workload, path = item.split("=", 1)
+            configs[model_name]["traces"][workload] = pathlib.Path(
+                path).resolve()
     build = args.build_root.resolve()
     binary_source = frozen_binary_source(build, args.binary_source_commit)
     binary = build / "examples/llm/llm_phase_context_smoke"
