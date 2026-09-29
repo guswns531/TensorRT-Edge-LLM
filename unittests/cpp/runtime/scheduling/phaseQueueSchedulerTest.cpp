@@ -838,6 +838,33 @@ TEST(PhaseQueueSchedulerTest, MeasuredOverlapCostOutranksContextualAuthority)
     EXPECT_LT(measured.predictedMakespanUs, measured.referenceWorkUs);
 }
 
+TEST(PhaseQueueSchedulerTest, ElidesRepeatedNoActionDecisionsUntilStateChanges)
+{
+    PhaseQueueSchedulerConfig config;
+    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
+    config.elideRepeatedNoActionDecisions = true;
+    config.noActionRevisitUs = 1.0e9;
+    PhaseQueueScheduler scheduler(config);
+    scheduler.enqueuePrefill({1, 128});
+    scheduler.enqueueDecode({2, 128});
+    scheduler.setDispatchBlocked(true);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    size_t const evaluated = scheduler.telemetry().globalDecisionCount;
+    EXPECT_EQ(scheduler.telemetry().globalElidedDecisionCount, 0U);
+
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
+    EXPECT_EQ(scheduler.telemetry().globalDecisionCount, evaluated);
+    EXPECT_EQ(scheduler.telemetry().globalElidedDecisionCount, 2U);
+
+    scheduler.setDispatchBlocked(false);
+    PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_NE(plan.kind, PhaseDispatchKind::kNone);
+    EXPECT_GT(scheduler.telemetry().globalDecisionCount, evaluated);
+    EXPECT_EQ(scheduler.telemetry().globalElidedDecisionCount, 2U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillFormation)
 {
     PhaseQueueSchedulerConfig config;

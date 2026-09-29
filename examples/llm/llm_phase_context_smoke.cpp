@@ -5161,12 +5161,14 @@ int main(int argc, char** argv)
                     visionMetrics.globalHostDecisionSamples, visionMetrics.globalHostDecisionMeanUs,
                     visionMetrics.globalHostDecisionP95Us, visionMetrics.globalHostDecisionMaxUs);
                 LOG_INFO(
-                    "Phase global scheduler summary: decisions=%zu active=%zu overlaps=%zu known_profitable=%zu "
+                    "Phase global scheduler summary: decisions=%zu active=%zu elided=%zu overlaps=%zu "
+                    "known_profitable=%zu "
                     "known_unprofitable_selected=%zu safe_probes=%zu wait_decisions=%zu wait_selected=%zu "
                     "contextual_predictions=%zu contextual_ready=%zu contextual_disagreements=%zu "
                     "action_fidelity_violations=%zu",
                     schedulerMetrics.globalDecisionCount, schedulerMetrics.globalActiveDecisionCount,
-                    schedulerMetrics.globalOverlapSelectionCount, schedulerMetrics.globalKnownOverlapPriorityCount,
+                    schedulerMetrics.globalElidedDecisionCount, schedulerMetrics.globalOverlapSelectionCount,
+                    schedulerMetrics.globalKnownOverlapPriorityCount,
                     schedulerMetrics.globalMeasuredUnprofitableOverlapSelectionCount,
                     schedulerMetrics.globalSafeProbeCount, schedulerMetrics.globalWaitDecisionCount,
                     schedulerMetrics.globalWaitSelectedCount, schedulerMetrics.contextualPdPredictionCount,

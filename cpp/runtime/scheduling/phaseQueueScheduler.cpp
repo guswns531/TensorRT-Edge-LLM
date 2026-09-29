@@ -262,6 +262,7 @@ void validateSchedulingHints(PhaseSchedulingHints const& hints, int32_t maxPrior
 
 void PhaseQueueScheduler::enqueuePrefill(PhaseWorkItem item)
 {
+    markStateChanged();
     check::check(item.tokenCount > 0, "Prefill tokenCount must be positive");
     check::check(item.tokenOffset >= 0, "Prefill tokenOffset must be non-negative");
     validateSchedulingHints(item.scheduling, mConfig.maxPriority);
@@ -277,6 +278,7 @@ void PhaseQueueScheduler::enqueuePrefill(PhaseWorkItem item)
 
 void PhaseQueueScheduler::enqueueDecode(PhaseWorkItem item)
 {
+    markStateChanged();
     check::check(item.tokenCount >= 0, "Decode tokenCount must be non-negative");
     validateSchedulingHints(item.scheduling, mConfig.maxPriority);
     check::check(mActiveRequestIds.insert(item.requestId).second, "Request is already active");
@@ -448,6 +450,7 @@ void PhaseQueueScheduler::resetDecodeServiceEpoch(PhaseWorkItem const& item)
 
 void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
 {
+    markStateChanged();
     if (item.scheduling.submittedAt == std::chrono::steady_clock::time_point{})
     {
         item.scheduling.submittedAt = std::chrono::steady_clock::now();
@@ -459,6 +462,7 @@ void PhaseQueueScheduler::enqueueKnownPrefill(PhaseWorkItem item)
 
 void PhaseQueueScheduler::enqueueKnownDecode(PhaseWorkItem item)
 {
+    markStateChanged();
     if (item.scheduling.submittedAt == std::chrono::steady_clock::time_point{})
     {
         item.scheduling.submittedAt = std::chrono::steady_clock::now();
@@ -721,26 +725,31 @@ bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) co
 
 void PhaseQueueScheduler::setPrefillDispatchBlocked(bool blocked) noexcept
 {
+    markStateChanged();
     mPrefillDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setDecodeDispatchBlocked(bool blocked) noexcept
 {
+    markStateChanged();
     mDecodeDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setDispatchBlocked(bool blocked) noexcept
 {
+    markStateChanged();
     mDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setExternalEncoderActive(bool active) noexcept
 {
+    markStateChanged();
     mExternalEncoderActive = active;
 }
 
 void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t rows) noexcept
 {
+    markStateChanged();
     mPendingPrefillProducerRows = rows;
     mPendingTextPrefillProducerRows = rows;
     mPendingExternalPrefillProducerRows = rows;
@@ -753,6 +762,7 @@ void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t rows) noexcept
 void PhaseQueueScheduler::setPendingPrefillProducerRows(
     size_t textRows, size_t externalRows, double predictedWaitUs, double waitUncertaintyUs, uint64_t eventId) noexcept
 {
+    markStateChanged();
     mPendingPrefillProducerRows = textRows + externalRows;
     mPendingTextPrefillProducerRows = textRows;
     mPendingExternalPrefillProducerRows = externalRows;
@@ -3610,6 +3620,7 @@ PhaseGlobalCostEstimate PhaseQueueScheduler::estimateGlobalPrefillDrainCost(
 void PhaseQueueScheduler::setNextGlobalAction(
     PhaseGlobalActionCandidate candidate, uint64_t planId, uint64_t snapshotEpoch)
 {
+    markStateChanged();
     check::check(!mNextGlobalAction.has_value(), "A global P/D action is already pending dispatch");
     check::check(!mNextGlobalDispatchPlan.has_value(), "A global P/D execution lease is already pending dispatch");
     check::check(candidate.key.kind == PhaseGlobalActionKind::kPrefill
@@ -3702,6 +3713,11 @@ size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t
     return limit;
 }
 
+void PhaseQueueScheduler::markStateChanged() noexcept
+{
+    ++mStateEpoch;
+}
+
 PhaseDispatchPlan PhaseQueueScheduler::next()
 {
     auto const decisionStart = std::chrono::steady_clock::now();
@@ -3774,6 +3790,19 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         kind = state.prefillQueued > 0U ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
         drainPreferenceApplied = false;
     }
+    else if (mConfig.elideRepeatedNoActionDecisions && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
+        && mLastNoActionEpoch == mStateEpoch
+        && std::chrono::duration<double, std::micro>(decisionStart - mLastNoActionAt).count()
+            < mConfig.noActionRevisitUs)
+    {
+        // Nothing the selector reads has changed since it last found no action.
+        kind = PhaseDispatchKind::kNone;
+        plan.globalDecisionEvaluated = true;
+        plan.globalDecisionApplied = true;
+        plan.globalDecisionReason = PhaseGlobalDecisionReason::kNoHardFeasibleCandidate;
+        ++mTelemetry.globalElidedDecisionCount;
+        drainPreferenceApplied = false;
+    }
     else if (std::optional<GlobalQueueSelection> const global
         = selectGlobalQueueAction(state, !mPrefillDispatchBlocked, !mDecodeDispatchBlocked, true))
     {
@@ -3813,6 +3842,8 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalDecisionApplied = true;
         plan.globalDecisionReason = PhaseGlobalDecisionReason::kNoHardFeasibleCandidate;
         drainPreferenceApplied = false;
+        mLastNoActionEpoch = mStateEpoch;
+        mLastNoActionAt = decisionStart;
     }
     check::check(kind != PhaseDispatchKind::kPrefill || state.prefillQueued > 0,
         "Scheduling policy selected an empty prefill queue");
@@ -4561,6 +4592,7 @@ std::optional<float> PhaseQueueScheduler::estimateGlobalDecodeComponentP95(
 
 void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
 {
+    markStateChanged();
     check::check(
         mInFlightRequestIds.erase(item.requestId) == 1, "Completed prefill request is not currently in flight");
     check::check(item.tokenCount > 0, "Completed prefill chunk must contain tokens");
@@ -4593,6 +4625,7 @@ void PhaseQueueScheduler::completePrefill(PhaseWorkItem item, int32_t resultingK
 
 void PhaseQueueScheduler::completeDecode(PhaseWorkItem item, int32_t resultingKVLength, bool finished)
 {
+    markStateChanged();
     check::check(mInFlightRequestIds.erase(item.requestId) == 1, "Completed decode request is not currently in flight");
     check::check(resultingKVLength >= item.tokenCount, "Resulting KV length cannot move backwards");
     if (finished)
@@ -4684,6 +4717,7 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
 
 void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
 {
+    markStateChanged();
     auto updateEwma = [alpha = mConfig.metricsEwmaAlpha](float& average, float sample) {
         average = average > 0.0F ? alpha * sample + (1.0F - alpha) * average : sample;
     };
@@ -4878,16 +4912,19 @@ std::vector<PhaseGlobalOverlapCostRecord> PhaseQueueScheduler::globalCalibration
 
 void PhaseQueueScheduler::setDecodeComponentObservationActive(bool active) noexcept
 {
+    markStateChanged();
     mDecodeComponentObservationActive = mConfig.enableDecodeComponentObservation && active;
 }
 
 void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
 {
+    markStateChanged();
     mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
 }
 
 void PhaseQueueScheduler::useMeasuredDecodeCosts()
 {
+    markStateChanged();
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Decode cost source can only change on an idle scheduler");
     mConfig.decodeBatchCosts.clear();
@@ -4896,6 +4933,7 @@ void PhaseQueueScheduler::useMeasuredDecodeCosts()
 
 void PhaseQueueScheduler::useMeasuredDecodeServiceCosts()
 {
+    markStateChanged();
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Decode service cost source can only change on an idle scheduler");
     mConfig.decodeBatchCosts.clear();
@@ -4916,6 +4954,7 @@ bool PhaseQueueScheduler::observesDecodeService() const noexcept
 
 void PhaseQueueScheduler::observeDecodeService(PhaseGlobalActionKey const& key, float milliseconds)
 {
+    markStateChanged();
     if (observesDecodeService())
     {
         mRuntimeCostTracker->observeDecodeService(key, milliseconds);
@@ -4934,6 +4973,7 @@ std::optional<PhaseGlobalCostEstimate> PhaseQueueScheduler::decodeServiceEstimat
 
 void PhaseQueueScheduler::resetSchedulingHistory()
 {
+    markStateChanged();
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Scheduling history can only be reset while the scheduler is idle");
     mTelemetry = {};
@@ -4961,6 +5001,7 @@ void PhaseQueueScheduler::resetSchedulingHistory()
 
 void PhaseQueueScheduler::resetPolicyPosterior()
 {
+    markStateChanged();
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Policy posterior can only be reset while the scheduler is idle");
     mRuntimeCostTracker->resetPolicyPosterior();
@@ -4968,6 +5009,7 @@ void PhaseQueueScheduler::resetPolicyPosterior()
 
 void PhaseQueueScheduler::resetExecutionCostHistory()
 {
+    markStateChanged();
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Execution cost history can only be reset while the scheduler is idle");
     mRuntimeCostTracker->resetExecutionCostHistory();
@@ -4975,6 +5017,7 @@ void PhaseQueueScheduler::resetExecutionCostHistory()
 
 void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
 {
+    markStateChanged();
     resetSchedulingHistory();
     if (!preserveRuntimeCosts)
     {
@@ -4984,6 +5027,7 @@ void PhaseQueueScheduler::resetHistory(bool preserveRuntimeCosts)
 
 void PhaseQueueScheduler::setGlobalWarmupProbeMode(bool active)
 {
+    markStateChanged();
     check::check(empty() && mActiveRequestIds.empty() && mInFlightRequestIds.empty(),
         "Global warmup probe mode can only change while the scheduler is idle");
     if (active)
