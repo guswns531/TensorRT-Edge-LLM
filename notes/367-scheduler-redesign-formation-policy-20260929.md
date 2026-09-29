@@ -134,6 +134,30 @@ P+D counts are unchanged (155/151, 98/92, 35/34). The host poll loop still spins
 is unchanged; the saving is work per poll. Replacing the yield loop with an event wait is the remaining part of
 event-driven decisions.
 
+## Separate complete-P+D contextual model (`1055f0e`, reverted)
+
+Hypothesis (note 365): complete P+D and D-attached-to-running-P residual augmentation share the P->D contextual
+model; complete observations are rare, so complete P+D is priced from residual rewards that are low for late
+attaches. `1055f0e` routed complete P+D to its own model behind `TRT_EDGELLM_CONTEXTUAL_SEPARATE_COMPLETE_PD`.
+Same-binary A/B (`separate-complete-pd-ab-20260929`, 6 blocks):
+
+| Workload | Separate vs shared | P+D dispatches |
+|---|---:|---:|
+| Gemma long-prefill | -4.9%, all 6 runs lower (575-593 vs 614-627) | 24 vs 100 |
+| Cosmos balanced | +1.6% (ranges overlap) | 147 vs 151 |
+| Gemma mixed | +0.1% | 26 vs 32 |
+| Gemma vision-heavy | -0.5% | 30 vs 30 |
+
+Full telemetry (`separate-complete-pd-fulltel-20260929`) falsifies the hypothesis: the separate complete model becomes
+ready from 88 warmup calibration observations of complete P+D and still refuses complete P+D (2 of 166 authority
+candidates selected; 3 of 181 in the shared arm). The pessimism is learned from complete samples, not borrowed from
+residual ones. Every offered residual augmentation is selected in both arms (20/20, 90/90; measured cost has
+authority after `c7a1b71`); the loss comes from fewer residual opportunities, which is the low mode of note 365.
+
+Remaining contradiction: measured complete P+D on long-prefill compresses about 2x (note 365), yet the head's
+complete-P+D posterior is non-positive. Most of its observations come from the generic VLM warmup trace, so the
+likely issue is distribution shift between warmup and serving shapes, not reward contamination. Reverted.
+
 ## Revised next steps
 
 1. Validate Stage 1 elision (A/B on/off, same binary): decisions must fall, throughput and output must not move.
