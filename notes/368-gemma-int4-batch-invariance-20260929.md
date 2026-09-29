@@ -40,6 +40,19 @@ Remaining 22 under forced GEMM:
 Forced GEMM costs 4-8% tok/s against the `c7a1b71` full24 medians (balanced -4.7%, poisson -7.2%, short -8.2%);
 a GEMV bound of 24 costs 3-5%.
 
+## Vision encoder batch shape (`vision-encoder-batch1-20260929`)
+
+Forced-GEMM serving with `TRT_EDGELLM_VISION_ENCODER_BATCH_SIZE=1`, compared with the same forced-GEMM batch-1
+reference on the six vision-bearing workloads: 293/296 (99.0%). vision-heavy 64/64, multi-image 20/20, wave-drain
+20/20, text-heavy 64/64 (were 58, 18, 17, 61). The deterministic vision divergences come from the Gemma vision
+encoder engine's image-batch shape (encoder batch 4 in serving, per-request in the reference). The remaining three
+(bimodal 21 and 41 text, mixed 49 vision) are different requests from the four text divergences of the previous
+forced-GEMM run (bimodal 16/43/60, mixed 38), so the last ~1% moves between runs and is not a fixed per-prompt
+source.
+
+Attribution of the default-mode 40% divergence: INT4 GEMV/GEMM switch (bulk), vision encoder batch shape (vision
+requests), and a run-varying residual of about 1% not yet localized.
+
 ## Gate proposal
 
 1. **Scheduler correctness (bit-exact):** in forced-GEMM mode, serving must match its batch-1 reference except for
@@ -50,7 +63,8 @@ a GEMV bound of 24 costs 3-5%.
 
 ## Next work
 
-1. Vision encoder batch-shape test for the two deterministic vision divergences.
-2. Localize the 4 text divergences (other FP16 TensorRT layers such as PLE projection or LM head by M).
+1. Localize the run-varying ~1% residual (other FP16 TensorRT layers such as PLE projection or LM head by M).
+2. Vision encoder engine: identify the batch-dependent layer (TensorRT tactic by batch) if batch-invariant vision
+   output is required.
 3. Measure vLLM run-to-run token-ID stability under the same traces to calibrate what a production gate can require.
 4. Upstream note: FP16 accumulation in both INT4 kernels loses precision relative to FP32-accumulating kernels.
