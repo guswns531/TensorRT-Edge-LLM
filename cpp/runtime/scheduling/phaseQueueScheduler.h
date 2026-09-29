@@ -301,6 +301,9 @@ struct PhaseSchedulerTelemetry
     size_t contextualPdDecisionDisagreementCount{};
     size_t contextualPdObservationCount{};
     size_t contextualPdRejectedObservationCount{};
+    //! Complete P+D labels priced from measured standalone phases, and those skipped for lack of them.
+    size_t contextualPdMeasuredReferenceCount{};
+    size_t contextualPdUnmeasuredReferenceSkipCount{};
     size_t contextualPdPositiveSelectionCount{};
     size_t contextualPdNegativeSelectionCount{};
     size_t contextualPdExplorationCount{};
@@ -906,6 +909,8 @@ public:
     std::optional<PhaseGlobalCostEstimate> decodeServiceEstimate(int32_t batchSize, int32_t maxContextLength) const;
     //! Canonical execution key shared by CUDA and separately stored host-service observations.
     PhaseGlobalActionKey globalActionKey(PhaseDispatchMetrics const& metrics) const noexcept;
+    //! Measured standalone prefill and decode medians for the components of a complete P+D key.
+    std::optional<std::pair<float, float>> measuredSerialComponentsMs(PhaseGlobalActionKey const& overlapKey) const;
     //! Reset only the contextual online policy posterior. The scheduler must
     //! be idle; exact CUDA execution observations remain available.
     void resetPolicyPosterior();

@@ -4725,6 +4725,34 @@ PhaseGlobalActionKey PhaseQueueScheduler::globalActionKey(PhaseDispatchMetrics c
     return {};
 }
 
+std::optional<std::pair<float, float>> PhaseQueueScheduler::measuredSerialComponentsMs(
+    PhaseGlobalActionKey const& overlapKey) const
+{
+    auto const variant
+        = [](bool graph) { return graph ? PhaseExecutionVariant::kPrimaryGraph : PhaseExecutionVariant::kEager; };
+    bool const prefillGraph = overlapKey.executionVariant == PhaseExecutionVariant::kPrimaryGraph
+        || overlapKey.executionVariant == PhaseExecutionVariant::kBothGraph;
+    bool const decodeGraph = overlapKey.executionVariant == PhaseExecutionVariant::kSecondaryGraph
+        || overlapKey.executionVariant == PhaseExecutionVariant::kBothGraph;
+    auto const measured = [this, &variant](PhaseGlobalActionKey key, bool graph) -> std::optional<float> {
+        key.executionVariant = variant(graph);
+        std::optional<PhaseGlobalCostEstimate> const estimate = mRuntimeCostTracker->trustedEstimate(key);
+        return estimate.has_value() ? std::optional<float>{estimate->makespanMedianMs} : std::nullopt;
+    };
+    PhaseGlobalActionKey prefillKey{PhaseGlobalActionKind::kPrefill, overlapKey.primaryBatchSize, 0,
+        overlapKey.chunkLength, overlapKey.primaryContextBucket, 0, PhaseExecutionVariant::kEager};
+    prefillKey.primaryWorkClass = overlapKey.primaryWorkClass;
+    PhaseGlobalActionKey const decodeKey{PhaseGlobalActionKind::kDecode, overlapKey.secondaryBatchSize, 0, 1,
+        overlapKey.secondaryContextBucket, 0, PhaseExecutionVariant::kEager};
+    std::optional<float> const prefillMs = measured(prefillKey, prefillGraph);
+    std::optional<float> const decodeMs = measured(decodeKey, decodeGraph);
+    if (!prefillMs.has_value() || !decodeMs.has_value() || *prefillMs <= 0.0F || *decodeMs <= 0.0F)
+    {
+        return std::nullopt;
+    }
+    return std::make_pair(*prefillMs, *decodeMs);
+}
+
 void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
 {
     markStateChanged();
@@ -4874,17 +4902,38 @@ void PhaseQueueScheduler::observeMetrics(PhaseDispatchMetrics const& metrics)
             if (observedKey.kind == PhaseGlobalActionKind::kPrefillDecode && metrics.contextualPdFeatureValid
                 && referenceWorkMs > 0.0F && !observedKey.externalEncoderBackground)
             {
-                double const reward = (static_cast<double>(referenceWorkMs) - metrics.makespanGpuMs)
+                double reward = (static_cast<double>(referenceWorkMs) - metrics.makespanGpuMs)
                     / static_cast<double>(referenceWorkMs);
+                PhaseContextualPdModelConfig const& contextualConfig = mRuntimeCostTracker->contextualPdConfig();
+                bool labelValid = true;
+                if (contextualConfig.measuredReference && !observedKey.residualAugmentation)
+                {
+                    std::optional<std::pair<float, float>> const serial = measuredSerialComponentsMs(observedKey);
+                    labelValid = serial.has_value();
+                    if (labelValid)
+                    {
+                        double const serialMs = static_cast<double>(serial->first) + serial->second;
+                        reward = (serialMs - metrics.makespanGpuMs) / serialMs;
+                        ++mTelemetry.contextualPdMeasuredReferenceCount;
+                    }
+                    else
+                    {
+                        ++mTelemetry.contextualPdUnmeasuredReferenceSkipCount;
+                    }
+                }
                 PhaseContextualPairDirection const direction
                     = phaseContextualPairDirection(observedKey.kind, observedKey.residualAnchor);
-                if (mRuntimeCostTracker->observeContextualDirection(direction, metrics.contextualPdFeatures, reward))
+                if (labelValid)
                 {
-                    ++mTelemetry.contextualPdObservationCount;
-                }
-                else
-                {
-                    ++mTelemetry.contextualPdRejectedObservationCount;
+                    if (mRuntimeCostTracker->observeContextualDirection(
+                            direction, metrics.contextualPdFeatures, reward))
+                    {
+                        ++mTelemetry.contextualPdObservationCount;
+                    }
+                    else
+                    {
+                        ++mTelemetry.contextualPdRejectedObservationCount;
+                    }
                 }
             }
         }

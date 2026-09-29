@@ -129,6 +129,9 @@ struct PhaseContextualPdModelConfig
     double initialResidualVariance{0.04};
     double forgettingFactor{1.0};
     double rewardClip{1.0};
+    //! Label complete P+D against measured single-phase costs instead of the planned serial reference, which can
+    //! come from cold fallback prices several times below the real work.
+    bool measuredReference{};
 };
 
 struct PhaseContextualPdEstimate
