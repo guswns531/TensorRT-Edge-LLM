@@ -48,7 +48,6 @@ PhaseRuntimeCostTracker::PhaseRuntimeCostTracker(PhaseRuntimeCostTrackerConfig c
     , mActions(mConfig.action)
     , mDecodeService(mConfig.action)
     , mContextualPd(mConfig.contextualPd)
-    , mContextualPdComplete(mConfig.contextualPd)
     , mContextualDp(mConfig.contextualPd)
     , mContextualEp(mConfig.contextualEp)
     , mContextualPe(mConfig.contextualEp)
@@ -310,21 +309,12 @@ PhaseContextualPdTelemetry PhaseRuntimeCostTracker::contextualPairTelemetry(Phas
     return mContextualPd.telemetry();
 }
 
-PhaseContextualPdModel& PhaseRuntimeCostTracker::prefillToDecodeModel(
-    PhaseContextualPdFeatures const& features) noexcept
-{
-    // Feature 11 is the residual-augmentation indicator (phaseContextualPairFeatures).
-    constexpr size_t kResidualFeature{11U};
-    return mConfig.separateCompletePairModel && features[kResidualFeature] == 0.0 ? mContextualPdComplete
-                                                                                  : mContextualPd;
-}
-
 PhaseContextualPdEstimate PhaseRuntimeCostTracker::predictContextualDirection(
     PhaseContextualPairDirection direction, PhaseContextualPdFeatures const& features)
 {
     switch (direction)
     {
-    case PhaseContextualPairDirection::kPrefillToDecode: return prefillToDecodeModel(features).predict(features);
+    case PhaseContextualPairDirection::kPrefillToDecode: return mContextualPd.predict(features);
     case PhaseContextualPairDirection::kDecodeToPrefill: return mContextualDp.predict(features);
     case PhaseContextualPairDirection::kEncoderToPrefill: return mContextualEp.predict(features);
     case PhaseContextualPairDirection::kPrefillToEncoder: return mContextualPe.predict(features);
@@ -340,7 +330,7 @@ bool PhaseRuntimeCostTracker::observeContextualDirection(PhaseContextualPairDire
     switch (direction)
     {
     case PhaseContextualPairDirection::kPrefillToDecode:
-        return prefillToDecodeModel(features).observe(features, normalizedAdvantage, weight);
+        return mContextualPd.observe(features, normalizedAdvantage, weight);
     case PhaseContextualPairDirection::kDecodeToPrefill:
         return mContextualDp.observe(features, normalizedAdvantage, weight);
     case PhaseContextualPairDirection::kEncoderToPrefill:
@@ -476,7 +466,6 @@ void PhaseRuntimeCostTracker::resetExecutionCostHistory()
 void PhaseRuntimeCostTracker::resetPolicyPosterior()
 {
     mContextualPd.reset();
-    mContextualPdComplete.reset();
     mContextualDp.reset();
     mContextualEp.reset();
     mContextualPe.reset();

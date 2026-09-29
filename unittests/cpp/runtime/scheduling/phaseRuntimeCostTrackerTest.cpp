@@ -62,33 +62,6 @@ TEST(PhaseRuntimeCostTrackerTest, OverlapCalibrationAcceptsEitherRealizedEncoder
     EXPECT_EQ(tracker.overlapCalibrationDiagnostic(realized).status, PhaseGlobalOverlapCostStatus::kEligible);
 }
 
-TEST(PhaseRuntimeCostTrackerTest, SeparateCompletePairModelIgnoresResidualObservations)
-{
-    PhaseRuntimeCostTrackerConfig config;
-    config.policyMode = PhasePolicyMode::kContextualScalar;
-    config.contextualPd.mode = PhaseContextualPdMode::kActive;
-    PhaseContextualPdInput completeInput{
-        8000.0, 6000.0, 1.0e6, 1, 8, 128, 1, 1, PhaseExecutionVariant::kEager, false, PhaseGlobalResidualAnchor::kNone};
-    PhaseContextualPdInput residualInput = completeInput;
-    residualInput.residualAugmentation = true;
-    residualInput.residualAnchor = PhaseGlobalResidualAnchor::kPrefill;
-    PhaseContextualPdFeatures const complete = phaseContextualPdFeatures(completeInput);
-    PhaseContextualPdFeatures const residual = phaseContextualPdFeatures(residualInput);
-    auto const direction = PhaseContextualPairDirection::kPrefillToDecode;
-
-    for (bool const separate : {false, true})
-    {
-        config.separateCompletePairModel = separate;
-        PhaseRuntimeCostTracker tracker(config);
-        for (size_t sample{}; sample < config.contextualPd.minimumObservations; ++sample)
-        {
-            tracker.observeContextualDirection(direction, residual, -0.1);
-        }
-        EXPECT_TRUE(tracker.predictContextualDirection(direction, residual).ready);
-        EXPECT_EQ(tracker.predictContextualDirection(direction, complete).ready, !separate);
-    }
-}
-
 TEST(PhaseRuntimeCostTrackerTest, ReplacesOldActionObservationsBySampleCount)
 {
     PhaseRuntimeCostTrackerConfig config;

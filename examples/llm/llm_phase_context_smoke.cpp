@@ -1862,8 +1862,6 @@ int main(int argc, char** argv)
             runtimeCostConfig.contextualEp.mode = rt::PhaseContextualPdMode::kDisabled;
             runtimeCostConfig.contextualEd.mode = rt::PhaseContextualPdMode::kDisabled;
         }
-        runtimeCostConfig.separateCompletePairModel
-            = std::getenv("TRT_EDGELLM_CONTEXTUAL_SEPARATE_COMPLETE_PD") != nullptr;
         auto runtimeCostTracker = std::make_shared<rt::PhaseRuntimeCostTracker>(runtimeCostConfig);
         semanticSchedulerConfig.runtimeCostTracker = runtimeCostTracker;
         rt::PhaseDecodeRowOrderMode decodeRowOrderMode = rt::PhaseDecodeRowOrderMode::kRetainAffinity;
