@@ -198,6 +198,34 @@ the time (259 and 64 of 479 decisions) because admission (24 stable slots) gates
 batch 2+ are already formed when 2+ requests are ready. A merge wait has no arrivals to wait for. Prefill us/token
 differences between runs track P+D interference, not batch size.
 
+## Measured-reference contextual labels (`50cf646`, reverted)
+
+Offline relabeling of `separate-complete-pd-fulltel-20260929` (Gemma long-prefill, 34 complete P+D) showed the
+head's complete-P+D label `(planned reference - makespan) / reference` is dominated by cold planned prices: e.g.
+8x1024 prefill + decode priced at 26 ms while the same prefill alone measures 73 ms. Planned-reference labels:
+median -0.09, 62% negative. Re-priced with measured standalone medians of the same shapes: median +0.16, 0%
+negative. The same rows show decode stretching from 14 ms alone to about 44 ms under overlap (decode stretch /
+serial median 0.33); a TPOT penalty was considered and dropped.
+
+`50cf646` priced complete-P+D labels from trusted exact-shape standalone prefill/decode medians behind
+`TRT_EDGELLM_CONTEXTUAL_MEASURED_REFERENCE`, skipping the label when either was unmeasured. Same-binary A/B
+(`measured-reference-ab-20260929`, 6 blocks):
+
+| Workload | base tok/s | flag tok/s | Change | P+D dispatches |
+|---|---:|---:|---:|---:|
+| Gemma long-prefill | 614.0 (612-619) | 586.7 (575-595) | -4.4%, all 6 lower | 128 -> 52 |
+| Gemma mixed | 764.3 | 768.3 | +0.5% | 61 -> 51 |
+| Gemma vision-heavy | 575.1 | 574.4 | -0.1% | |
+| Cosmos balanced | 4457.9 | 4490.9 | +0.7% (overlap) | |
+| Cosmos poisson | 2093.2 | 2058.8 | -1.6% (overlap) | |
+
+Full telemetry (`measured-reference-fulltel-20260929`) explains it: 0 measured-reference labels and 2 skips in the
+measured window; P+D observations 22 vs 101, posterior mean -0.04 vs +0.12, complete P+D selections 2 vs 15. Exact
+standalone shapes are almost never trusted for the shapes that run as complete P+D, so the flag removed complete
+labels and left the head on residual labels. Reverted (`a48513d`). The label bias itself is real; a fix needs a
+standalone cost that exists for those shapes (covering/interpolated estimates or a per-token prefill and
+decode-bucket model), not exact-key medians.
+
 ## Revised next steps
 
 1. Validate Stage 1 elision (A/B on/off, same binary): decisions must fall, throughput and output must not move.
