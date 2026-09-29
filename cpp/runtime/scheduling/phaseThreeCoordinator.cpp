@@ -2601,6 +2601,14 @@ bool PhaseThreeCoordinator::dispatchGlobalPrefillDecodeResidual(
     {
         return false;
     }
+    // An unchanged scheduler epoch reproduces the same missing-phase candidate, which the
+    // candidate-id check below would reject; skip rebuilding the preview on every poll.
+    uint64_t const stateEpoch = mServer.schedulerStateEpoch();
+    if (stateEpoch == mActiveGlobalPdExecution->lastResidualPreviewEpoch)
+    {
+        return false;
+    }
+    mActiveGlobalPdExecution->lastResidualPreviewEpoch = stateEpoch;
     std::optional<PhaseGlobalActionCandidate> missing
         = addDecode ? mServer.previewGlobalDecodeAction() : mServer.previewGlobalPrefillAction();
     if (!missing.has_value())

@@ -283,7 +283,6 @@ struct PhaseSchedulerTelemetry
     PhaseDrainPreference activeDrainPreference{PhaseDrainPreference::kNone};
     size_t globalDecisionCount{};
     size_t globalActiveDecisionCount{};
-    size_t globalElidedDecisionCount{};
     size_t globalNoFeasibleDecisionCount{};
     size_t globalSafeProbeCount{};
     size_t globalOverlapOpportunityCount{};
@@ -632,10 +631,6 @@ struct PhaseQueueSchedulerConfig
     //! pre-reserved ownership contract. The mechanism batch and online
     //! observation paths remain unchanged.
     bool elideVacuousGlobalDecisions{};
-    //! Reuse a no-action global outcome until scheduler state changes or the
-    //! revisit interval elapses. Time-derived slack still gets a bounded re-check.
-    bool elideRepeatedNoActionDecisions{};
-    double noActionRevisitUs{1000.0};
     //! Include final-P rows in a bounded prediction of the immediately following D cohort.
     bool enableDecodeFormationHorizon{};
     double prefillQueueWaitTargetUs{5000.0};
@@ -921,6 +916,10 @@ public:
     //! true, both execution and policy observations survive.
     void resetHistory(bool preserveRuntimeCosts = false);
 
+    //! Monotonic counter of mutations the global selector can observe. Equal values
+    //! guarantee an unchanged candidate frontier apart from time-derived slack.
+    uint64_t stateEpoch() const noexcept;
+
     //! Permit deterministic synthetic startup traffic to collect unknown P+D
     //! costs without applying production-request slack. Disable before serving.
     void setGlobalWarmupProbeMode(bool active);
@@ -1039,8 +1038,6 @@ private:
     uint64_t mGlobalSnapshotEpoch{};
     //! Bumped by every mutation the global selector can observe; see markStateChanged().
     uint64_t mStateEpoch{1U};
-    uint64_t mLastNoActionEpoch{};
-    std::chrono::steady_clock::time_point mLastNoActionAt{};
     size_t mLastGlobalSafeProbeSequence{};
     bool mGlobalWarmupProbeMode{};
     std::vector<PhaseGlobalActionKey> mGlobalCalibrationKeys;

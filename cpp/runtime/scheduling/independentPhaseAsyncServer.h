@@ -427,6 +427,7 @@ public:
     std::vector<PhaseGlobalActionCandidate> const& lastGlobalPreviewCandidates() const noexcept;
     std::optional<PhaseGlobalActionCandidate> previewGlobalPrefillAction();
     std::optional<PhaseGlobalActionCandidate> previewGlobalDecodeAction();
+    uint64_t schedulerStateEpoch() const noexcept;
     PhaseGlobalCostEstimate estimateGlobalPrefillCost(
         int32_t batchSize, int32_t chunkLength, int32_t pastKVLength, PhasePrefillClass prefillClass) const;
     PhaseGlobalCostEstimate estimateGlobalPrefillDrainCost(

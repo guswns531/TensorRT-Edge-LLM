@@ -1097,6 +1097,11 @@ std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGl
     return mCoordinator.scheduler().previewGlobalPrefillAction();
 }
 
+uint64_t IndependentPhaseAsyncServer::schedulerStateEpoch() const noexcept
+{
+    return mCoordinator.scheduler().stateEpoch();
+}
+
 std::optional<PhaseGlobalActionCandidate> IndependentPhaseAsyncServer::previewGlobalDecodeAction()
 {
     if (mCoordinator.busy() && mCoordinator.inFlightKind() != PhaseDispatchKind::kPrefill)

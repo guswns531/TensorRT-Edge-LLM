@@ -817,6 +817,7 @@ private:
         //! One live P/D lease evaluates a given missing P or D cohort once.
         //! Repeated host polls are not new GPU scheduling boundaries.
         uint64_t lastResidualPdCandidateId{};
+        uint64_t lastResidualPreviewEpoch{};
     };
     std::optional<PendingGlobalOverlapObservation> mPendingGlobalOverlapObservation;
     std::optional<PhaseGlobalDispatchPlan> mGlobalExecutionLease;

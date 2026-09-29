@@ -130,12 +130,6 @@
         }
         semanticSchedulerConfig.elideVacuousGlobalDecisions
             = std::getenv("TRT_EDGELLM_DISABLE_VACUOUS_GLOBAL_ELISION") == nullptr;
-        semanticSchedulerConfig.elideRepeatedNoActionDecisions
-            = std::getenv("TRT_EDGELLM_DISABLE_DECISION_ELISION") == nullptr;
-        if (char const* value = std::getenv("TRT_EDGELLM_DECISION_REVISIT_US"))
-        {
-            semanticSchedulerConfig.noActionRevisitUs = std::stod(value);
-        }
         semanticSchedulerConfig.enableDecodeFormationHorizon
             = std::getenv("TRT_EDGELLM_DISABLE_DECODE_FORMATION_HORIZON") == nullptr;
         semanticSchedulerConfig.enableExternalDrainPreference

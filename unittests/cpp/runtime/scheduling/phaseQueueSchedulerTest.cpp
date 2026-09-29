@@ -838,31 +838,29 @@ TEST(PhaseQueueSchedulerTest, MeasuredOverlapCostOutranksContextualAuthority)
     EXPECT_LT(measured.predictedMakespanUs, measured.referenceWorkUs);
 }
 
-TEST(PhaseQueueSchedulerTest, ElidesRepeatedNoActionDecisionsUntilStateChanges)
+TEST(PhaseQueueSchedulerTest, StateEpochIgnoresRedundantSettersAndTimeDerivedWaits)
 {
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.elideRepeatedNoActionDecisions = true;
-    config.noActionRevisitUs = 1.0e9;
-    PhaseQueueScheduler scheduler(config);
-    scheduler.enqueuePrefill({1, 128});
+    PhaseQueueScheduler scheduler;
+    scheduler.setPendingPrefillProducerRows(1U, 0U, 100.0, 10.0, 7U);
+    scheduler.setExternalEncoderActive(true);
+    scheduler.setPrefillDispatchBlocked(true);
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kNone);
+    uint64_t const settled = scheduler.stateEpoch();
+
+    scheduler.setPendingPrefillProducerRows(1U, 0U, 40.0, 3.0, 7U);
+    scheduler.setExternalEncoderActive(true);
+    scheduler.setPrefillDispatchBlocked(true);
+    scheduler.setExternalDrainPreference(PhaseDrainPreference::kNone);
+    EXPECT_EQ(scheduler.stateEpoch(), settled);
+
+    scheduler.setPendingPrefillProducerRows(2U, 0U, 40.0, 3.0, 7U);
+    uint64_t const moreRows = scheduler.stateEpoch();
+    EXPECT_GT(moreRows, settled);
+    scheduler.setExternalEncoderActive(false);
+    EXPECT_GT(scheduler.stateEpoch(), moreRows);
+    uint64_t const encoderIdle = scheduler.stateEpoch();
     scheduler.enqueueDecode({2, 128});
-    scheduler.setDispatchBlocked(true);
-
-    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
-    size_t const evaluated = scheduler.telemetry().globalDecisionCount;
-    EXPECT_EQ(scheduler.telemetry().globalElidedDecisionCount, 0U);
-
-    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
-    EXPECT_EQ(scheduler.next().kind, PhaseDispatchKind::kNone);
-    EXPECT_EQ(scheduler.telemetry().globalDecisionCount, evaluated);
-    EXPECT_EQ(scheduler.telemetry().globalElidedDecisionCount, 2U);
-
-    scheduler.setDispatchBlocked(false);
-    PhaseDispatchPlan const plan = scheduler.next();
-    EXPECT_NE(plan.kind, PhaseDispatchKind::kNone);
-    EXPECT_GT(scheduler.telemetry().globalDecisionCount, evaluated);
-    EXPECT_EQ(scheduler.telemetry().globalElidedDecisionCount, 2U);
+    EXPECT_GT(scheduler.stateEpoch(), encoderIdle);
 }
 
 TEST(PhaseQueueSchedulerTest, GlobalPricesKnownProducerAsIncrementalPrefillFormation)

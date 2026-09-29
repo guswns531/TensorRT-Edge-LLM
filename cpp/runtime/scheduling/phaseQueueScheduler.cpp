@@ -725,31 +725,46 @@ bool PhaseQueueScheduler::isEligible(PhaseWorkItem const& item, bool prefill) co
 
 void PhaseQueueScheduler::setPrefillDispatchBlocked(bool blocked) noexcept
 {
-    markStateChanged();
+    if (mPrefillDispatchBlocked != blocked)
+    {
+        markStateChanged();
+    }
     mPrefillDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setDecodeDispatchBlocked(bool blocked) noexcept
 {
-    markStateChanged();
+    if (mDecodeDispatchBlocked != blocked)
+    {
+        markStateChanged();
+    }
     mDecodeDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setDispatchBlocked(bool blocked) noexcept
 {
-    markStateChanged();
+    if (mDispatchBlocked != blocked)
+    {
+        markStateChanged();
+    }
     mDispatchBlocked = blocked;
 }
 
 void PhaseQueueScheduler::setExternalEncoderActive(bool active) noexcept
 {
-    markStateChanged();
+    if (mExternalEncoderActive != active)
+    {
+        markStateChanged();
+    }
     mExternalEncoderActive = active;
 }
 
 void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t rows) noexcept
 {
-    markStateChanged();
+    if (mPendingPrefillProducerRows != rows || mPendingPrefillProducerRowsClassified)
+    {
+        markStateChanged();
+    }
     mPendingPrefillProducerRows = rows;
     mPendingTextPrefillProducerRows = rows;
     mPendingExternalPrefillProducerRows = rows;
@@ -762,7 +777,12 @@ void PhaseQueueScheduler::setPendingPrefillProducerRows(size_t rows) noexcept
 void PhaseQueueScheduler::setPendingPrefillProducerRows(
     size_t textRows, size_t externalRows, double predictedWaitUs, double waitUncertaintyUs, uint64_t eventId) noexcept
 {
-    markStateChanged();
+    // Wait estimates drift with wall time on every poll; only row identity changes the candidate frontier.
+    if (mPendingTextPrefillProducerRows != textRows || mPendingExternalPrefillProducerRows != externalRows
+        || mPendingPrefillProducerEventId != eventId || !mPendingPrefillProducerRowsClassified)
+    {
+        markStateChanged();
+    }
     mPendingPrefillProducerRows = textRows + externalRows;
     mPendingTextPrefillProducerRows = textRows;
     mPendingExternalPrefillProducerRows = externalRows;
@@ -3718,6 +3738,11 @@ void PhaseQueueScheduler::markStateChanged() noexcept
     ++mStateEpoch;
 }
 
+uint64_t PhaseQueueScheduler::stateEpoch() const noexcept
+{
+    return mStateEpoch;
+}
+
 PhaseDispatchPlan PhaseQueueScheduler::next()
 {
     auto const decisionStart = std::chrono::steady_clock::now();
@@ -3790,19 +3815,6 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         kind = state.prefillQueued > 0U ? PhaseDispatchKind::kPrefill : PhaseDispatchKind::kDecode;
         drainPreferenceApplied = false;
     }
-    else if (mConfig.elideRepeatedNoActionDecisions && mConfig.globalSchedulerMode == PhaseGlobalSchedulerMode::kActive
-        && mLastNoActionEpoch == mStateEpoch
-        && std::chrono::duration<double, std::micro>(decisionStart - mLastNoActionAt).count()
-            < mConfig.noActionRevisitUs)
-    {
-        // Nothing the selector reads has changed since it last found no action.
-        kind = PhaseDispatchKind::kNone;
-        plan.globalDecisionEvaluated = true;
-        plan.globalDecisionApplied = true;
-        plan.globalDecisionReason = PhaseGlobalDecisionReason::kNoHardFeasibleCandidate;
-        ++mTelemetry.globalElidedDecisionCount;
-        drainPreferenceApplied = false;
-    }
     else if (std::optional<GlobalQueueSelection> const global
         = selectGlobalQueueAction(state, !mPrefillDispatchBlocked, !mDecodeDispatchBlocked, true))
     {
@@ -3842,8 +3854,6 @@ PhaseDispatchPlan PhaseQueueScheduler::next()
         plan.globalDecisionApplied = true;
         plan.globalDecisionReason = PhaseGlobalDecisionReason::kNoHardFeasibleCandidate;
         drainPreferenceApplied = false;
-        mLastNoActionEpoch = mStateEpoch;
-        mLastNoActionAt = decisionStart;
     }
     check::check(kind != PhaseDispatchKind::kPrefill || state.prefillQueued > 0,
         "Scheduling policy selected an empty prefill queue");
@@ -4918,8 +4928,13 @@ void PhaseQueueScheduler::setDecodeComponentObservationActive(bool active) noexc
 
 void PhaseQueueScheduler::setExternalDrainPreference(PhaseDrainPreference preference) noexcept
 {
-    markStateChanged();
-    mRequestedDrainPreference = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
+    PhaseDrainPreference const requested
+        = mConfig.enableExternalDrainPreference ? preference : PhaseDrainPreference::kNone;
+    if (mRequestedDrainPreference != requested)
+    {
+        markStateChanged();
+    }
+    mRequestedDrainPreference = requested;
 }
 
 void PhaseQueueScheduler::useMeasuredDecodeCosts()
