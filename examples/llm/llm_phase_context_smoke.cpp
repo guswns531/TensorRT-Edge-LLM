@@ -1866,8 +1866,6 @@ int main(int argc, char** argv)
             runtimeCostConfig.contextualEp.confidenceBeta = confidenceBeta;
             runtimeCostConfig.contextualEd.confidenceBeta = confidenceBeta;
         }
-        runtimeCostConfig.contextualPd.measuredReference
-            = std::getenv("TRT_EDGELLM_CONTEXTUAL_MEASURED_REFERENCE") != nullptr;
         if (policyWarmupMode == PhasePolicyWarmupMode::kGraphOnly)
         {
             runtimeCostConfig.contextualPd.mode = rt::PhaseContextualPdMode::kDisabled;
@@ -4197,10 +4195,6 @@ int main(int argc, char** argv)
                             semanticCoordinator.scheduler().telemetry().contextualPdObservationCount},
                         {"contextual_pd_rejected_observations",
                             semanticCoordinator.scheduler().telemetry().contextualPdRejectedObservationCount},
-                        {"contextual_pd_measured_reference_labels",
-                            semanticCoordinator.scheduler().telemetry().contextualPdMeasuredReferenceCount},
-                        {"contextual_pd_unmeasured_reference_skips",
-                            semanticCoordinator.scheduler().telemetry().contextualPdUnmeasuredReferenceSkipCount},
                         {"contextual_pd_positive_selections",
                             semanticCoordinator.scheduler().telemetry().contextualPdPositiveSelectionCount},
                         {"contextual_pd_negative_selections",

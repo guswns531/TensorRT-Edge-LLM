@@ -838,65 +838,6 @@ TEST(PhaseQueueSchedulerTest, MeasuredOverlapCostOutranksContextualAuthority)
     EXPECT_LT(measured.predictedMakespanUs, measured.referenceWorkUs);
 }
 
-TEST(PhaseQueueSchedulerTest, ContextualLabelUsesMeasuredSerialReference)
-{
-    PhaseRuntimeCostTrackerConfig trackerConfig;
-    trackerConfig.policyMode = PhasePolicyMode::kContextualScalar;
-    trackerConfig.contextualPd.mode = PhaseContextualPdMode::kActive;
-    trackerConfig.contextualPd.measuredReference = true;
-    auto tracker = std::make_shared<PhaseRuntimeCostTracker>(trackerConfig);
-    PhaseQueueSchedulerConfig config;
-    config.globalSchedulerMode = PhaseGlobalSchedulerMode::kActive;
-    config.runtimeCostTracker = tracker;
-    PhaseQueueScheduler scheduler(config);
-
-    int32_t const width = std::max(1, config.runtimeDecodeContextBucketTokens);
-    PhaseGlobalActionKey overlapKey{PhaseGlobalActionKind::kPrefillDecode, 1, 4, 128, 1, 1};
-    overlapKey.primaryWorkClass = 1;
-    PhaseDispatchMetrics complete;
-    complete.kind = PhaseDispatchKind::kOverlap;
-    complete.prefillBatchSize = overlapKey.primaryBatchSize;
-    complete.decodeBatchSize = overlapKey.secondaryBatchSize;
-    complete.prefillPaddedTokens = overlapKey.chunkLength;
-    complete.prefillPastKVMax = width;
-    complete.plannedDecodeMaxContextLength = width;
-    complete.prefillClass = static_cast<PhasePrefillClass>(overlapKey.primaryWorkClass);
-    complete.prefillGpuMs = 20.0F;
-    complete.decodeGpuMs = 15.0F;
-    complete.decodeCompletionMs = 15.0F;
-    complete.makespanGpuMs = 20.0F;
-    // Cold planned reference far below the real serial work.
-    complete.globalReferenceWorkMs = 10.0;
-    complete.contextualPdFeatureValid = true;
-    complete.contextualPdFeatures[0] = 1.0;
-
-    scheduler.observeMetrics(complete);
-    EXPECT_EQ(scheduler.telemetry().contextualPdObservationCount, 0U);
-    EXPECT_EQ(scheduler.telemetry().contextualPdUnmeasuredReferenceSkipCount, 1U);
-    EXPECT_EQ(scheduler.telemetry().contextualPdRejectedObservationCount, 0U);
-
-    PhaseGlobalActionKey prefillKey{PhaseGlobalActionKind::kPrefill, 1, 0, 128, 1, 0};
-    prefillKey.primaryWorkClass = 1;
-    PhaseGlobalActionKey const decodeKey{PhaseGlobalActionKind::kDecode, 4, 0, 1, 1, 0};
-    for (size_t sample{}; sample < trackerConfig.actionMinimumSamples; ++sample)
-    {
-        tracker->observe(prefillKey, {20.0F, 20.0F});
-        tracker->observe(decodeKey, {10.0F, 10.0F});
-    }
-
-    // Eager standalone samples must not price a graph-replayed decode component.
-    complete.globalExecutionVariant = PhaseExecutionVariant::kSecondaryGraph;
-    scheduler.observeMetrics(complete);
-    EXPECT_EQ(scheduler.telemetry().contextualPdUnmeasuredReferenceSkipCount, 2U);
-    EXPECT_EQ(scheduler.telemetry().contextualPdObservationCount, 0U);
-
-    complete.globalExecutionVariant = PhaseExecutionVariant::kEager;
-    scheduler.observeMetrics(complete);
-    EXPECT_EQ(scheduler.telemetry().contextualPdObservationCount, 1U);
-    EXPECT_EQ(scheduler.telemetry().contextualPdMeasuredReferenceCount, 1U);
-    EXPECT_NEAR(scheduler.telemetry().contextualPdLastReward, (30.0 - 20.0) / 30.0, 1.0e-6);
-}
-
 TEST(PhaseQueueSchedulerTest, StateEpochIgnoresRedundantSettersAndTimeDerivedWaits)
 {
     PhaseQueueScheduler scheduler;
