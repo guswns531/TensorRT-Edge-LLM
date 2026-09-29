@@ -577,6 +577,14 @@ def parse_args(argv=None):
         default="dispatch",
         help="Full causal diagnostics or compact dispatch metrics")
     parser.add_argument(
+        "--extra-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=
+        "Additional backend environment for explicit ablations; recorded in the manifest"
+    )
+    parser.add_argument(
         "--activity-observer",
         choices=("full", "encoder", "off"),
         default="full",
@@ -801,6 +809,8 @@ def main():
                             "startup_budget_ms":
                             args.startup_budget_ms,
                             "environment": {
+                                **dict(
+                                    item.split("=", 1) for item in args.extra_env),
                                 "TRT_EDGELLM_ENABLE_TRANSITION_PREDICTOR":
                                 "1" if predictor == "on" else "0",
                                 "TRT_EDGELLM_SHARED_EP_SINGLE_STORAGE":

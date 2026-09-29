@@ -245,6 +245,16 @@ class LifetimeEncodedAdmissionContractTest(unittest.TestCase):
         self.assertEqual(full.pop("TRT_EDGELLM_PHASE_TELEMETRY_LEVEL"), "full")
         self.assertEqual(default, full)
 
+    def test_extra_env_is_parsed_into_backend_environment(self):
+        args = G_RUNNER.parse_args([
+            "--extra-env", "TRT_EDGELLM_CONTEXTUAL_MIN_OBSERVATIONS=1000000",
+            "--extra-env", "A=b=c"
+        ])
+        self.assertEqual(dict(item.split("=", 1) for item in args.extra_env), {
+            "TRT_EDGELLM_CONTEXTUAL_MIN_OBSERVATIONS": "1000000",
+            "A": "b=c"
+        })
+
     def test_activity_observer_changes_only_activity_recording(self):
         default = environment(self.command("independent"))
         for mode, added in (("encoder", {
