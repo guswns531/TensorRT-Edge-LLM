@@ -53,6 +53,38 @@ source.
 Attribution of the default-mode 40% divergence: INT4 GEMV/GEMM switch (bulk), vision encoder batch shape (vision
 requests), and a run-varying residual of about 1% not yet localized.
 
+## vLLM run-to-run stability (`vllm-determinism-20260929`)
+
+Same vLLM v0.28.0 server contract as the frozen Gemma baseline (CUDA graphs 1-24, async scheduling, seed 0,
+temperature 0, ignore EOS), token IDs captured with `return_token_ids`. Twelve traces, serving x2 at 24 in flight and
+one batch-1 run (`--max-in-flight 1`):
+
+| Comparison | vLLM | TensorRT Edge-LLM (default) |
+|---|---:|---:|
+| Serving run 1 vs run 2 | 562/632 (88.9%) | 588/632 (93.0%, note 364) |
+| Serving vs own batch-1 | 1032/1264 (81.6%) | 1137/1896 (60%, note 364) |
+
+vLLM is neither run-to-run deterministic nor batch-invariant under serving load (decode-heavy 48/64 run-to-run,
+39-41/64 against batch-1). Bit-equality to batch-1 is therefore not an industry-standard serving property; our serving
+is more run-to-run stable than vLLM and further from its own batch-1 output because of the INT4 path switch above.
+
+## MMLU accuracy gate (`mmlu-serving-accuracy-20260929`)
+
+Zero-shot MMLU test split (14,031 of 14,042 questions; 11 over the 1024-token engine input limit dropped),
+`benchmarks/phase_serving/mmlu_serving_accuracy.py`, 4 output tokens, default numerics (no INT4 override), binary
+`int4-force-gemm-863a6d4`, harness `--trace-file short=...`:
+
+| Run | Accuracy |
+|---|---:|
+| Batch-1 reference (`--client-max-in-flight 1 --ordered-backend-ingress`) | 7065/14031 (50.35%) |
+| Serving repeat 1 | 7066/14031 (50.36%) |
+| Serving repeat 2 | 7066/14031 (50.36%) |
+
+Predicted letters agree on 14030/14031 (reference vs serving) and 14031/14031 (serving vs serving); exact token
+agreement 13980-13987/14031. 1,336 outputs name no option within 4 tokens ("The correct option is", ...) identically
+in every run, so the absolute accuracy is understated but the comparison is unaffected. Default serving passes the
+accuracy gate: batch-shape numerics do not change task accuracy.
+
 ## Gate proposal
 
 1. **Scheduler correctness (bit-exact):** in forced-GEMM mode, serving must match its batch-1 reference except for
@@ -66,5 +98,4 @@ requests), and a run-varying residual of about 1% not yet localized.
 1. Localize the run-varying ~1% residual (other FP16 TensorRT layers such as PLE projection or LM head by M).
 2. Vision encoder engine: identify the batch-dependent layer (TensorRT tactic by batch) if batch-invariant vision
    output is required.
-3. Measure vLLM run-to-run token-ID stability under the same traces to calibrate what a production gate can require.
 4. Upstream note: FP16 accumulation in both INT4 kernels loses precision relative to FP32-accumulating kernels.
