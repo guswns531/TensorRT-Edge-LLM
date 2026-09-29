@@ -171,7 +171,9 @@ no wake source, so every such wait paid up to 1 ms.
 arrival, adapter completion, and stdin EOF. Stream callbacks and their plumbing were removed. A/B against `41f287f`
 (`idle-host-wait-ab-20260929`, 4 blocks): tok/s within 0.2% on Gemma long-prefill/poisson/wave-drain and Cosmos
 poisson/wave-drain; TPOT unchanged. Cosmos wave-drain TTFT mean +4% (261-272 vs 248-266 ms, ranges overlap, n=4) is
-unresolved; wave-drain is the trace that idles between waves, so a CPU wake/C-state cost is plausible. After the
+confirmed by an 8-block recheck (`wave-drain-idle-recheck-20260929`): +5.0% (265.5 vs 253.0 ms), pooled 12 vs 12
+blocks +4.5% with Mann-Whitney z=3.18; p95 +2.3%, tok/s -0.1%. Wave-drain is the trace that idles between waves.
+The idle wait is therefore opt-in (`TRT_EDGELLM_HOST_WAIT=1`) rather than default. After the
 measurement run ends the backend drops from 100% to 5% CPU while the harness shuts down.
 
 ## Warmup mismatch (`policy_reset`, no code change)

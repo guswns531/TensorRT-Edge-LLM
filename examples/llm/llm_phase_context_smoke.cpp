@@ -727,7 +727,8 @@ int main(int argc, char** argv)
     char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
 
     rt::PhaseHostWakeup hostWakeup;
-    bool const hostWaitEnabled = std::getenv("TRT_EDGELLM_DISABLE_HOST_WAIT") == nullptr;
+    // Opt-in: idle sleep saves a core but added 4.5% mean TTFT on bursty wave-drain arrivals (note 367).
+    bool const hostWaitEnabled = std::getenv("TRT_EDGELLM_HOST_WAIT") != nullptr;
     auto const envMicros = [](char const* name, int64_t fallback) {
         char const* value = std::getenv(name);
         return std::chrono::microseconds(value != nullptr ? std::stoll(value) : fallback);
