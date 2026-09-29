@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <mutex>
 #include <optional>
@@ -37,6 +38,18 @@ namespace
 {
 constexpr char const* kINT4_GEMM_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_PLUGIN_NAME{"Int4GroupwiseGemmPlugin"};
+
+//! GEMV and GEMM accumulate in FP16 in different orders, so a row's output depends on which path its batch took.
+//! TRT_EDGELLM_INT4_GEMV_MAX_M raises the GEMV bound (in kGemvMaxM-row chunks) to make decode batch-invariant.
+int32_t gemvMaxM()
+{
+    static int32_t const value = [] {
+        char const* env = std::getenv("TRT_EDGELLM_INT4_GEMV_MAX_M");
+        return env != nullptr ? std::max(trt_edgellm::kernel::kGemvMaxM, std::atoi(env))
+                              : trt_edgellm::kernel::kGemvMaxM;
+    }();
+    return value;
+}
 
 } // namespace
 
@@ -259,7 +272,7 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         // TODO: Iteration causes overhead. Need optimization if M is small and not divisible by 128. Possible
         // solutions: 1) Add more GEMV instantiations for larger M (e.g. 8, 16, 32). 2) Add a fallback GEMV kernel that
         // can handle arbitrary M without template instantiation (e.g. using dynamic shared memory).
-        bool const useGemv = (M <= trt_edgellm::kernel::kGemvMaxM) || (mGemmN % trt_edgellm::kernel::kGemmCtaN != 0);
+        bool const useGemv = (M <= gemvMaxM()) || (mGemmN % trt_edgellm::kernel::kGemmCtaN != 0);
         if (useGemv)
         {
             for (int32_t m_start = 0; m_start < M; m_start += trt_edgellm::kernel::kGemvMaxM)
