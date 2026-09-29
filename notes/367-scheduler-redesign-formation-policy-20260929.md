@@ -158,6 +158,44 @@ Remaining contradiction: measured complete P+D on long-prefill compresses about 
 complete-P+D posterior is non-positive. Most of its observations come from the generic VLM warmup trace, so the
 likely issue is distribution shift between warmup and serving shapes, not reward contamination. Reverted.
 
+## Idle-only host wait (`519ddb6`)
+
+The IPC loop spun on `yield()` at 100% of a core for the whole process lifetime. A first version slept whenever a poll
+made no progress, woken by `cudaLaunchHostFunc` callbacks on prefill, decode, sampling, and encoder completion plus
+input arrival, with a 1 ms timeout. It cut CPU from 100% to 5% but lost 7-13% tok/s: 93% of sleeps (9,077 of 9,771)
+ended on the timeout. Callbacks alone were not the cost (callbacks enqueued but never sleeping: 631 tok/s, normal);
+the scheduler also waits on time-based conditions (decode refill, WAIT decisions, producer wait estimates) that have
+no wake source, so every such wait paid up to 1 ms.
+
+`519ddb6` keeps only the safe half: the loop sleeps only when the server and input queues are empty, woken by input
+arrival, adapter completion, and stdin EOF. Stream callbacks and their plumbing were removed. A/B against `41f287f`
+(`idle-host-wait-ab-20260929`, 4 blocks): tok/s within 0.2% on Gemma long-prefill/poisson/wave-drain and Cosmos
+poisson/wave-drain; TPOT unchanged. Cosmos wave-drain TTFT mean +4% (261-272 vs 248-266 ms, ranges overlap, n=4) is
+unresolved; wave-drain is the trace that idles between waves, so a CPU wake/C-state cost is plausible. After the
+measurement run ends the backend drops from 100% to 5% CPU while the harness shuts down.
+
+## Warmup mismatch (`policy_reset`, no code change)
+
+Hypothesis: the contextual head's pessimism on complete P+D comes from warmup (generic VLM) observations that do not
+match serving shapes. `TRT_EDGELLM_POLICY_WARMUP_MODE=policy_reset` resets the contextual posterior at the measurement
+boundary while keeping measured execution costs. A/B on `519ddb6` (`policy-reset-ab-20260929`, 6 blocks):
+
+| Workload | policy_reset vs generic | P+D |
+|---|---:|---:|
+| Gemma long-prefill | +1.1% (ranges overlap) | 136 vs 97 |
+| Gemma mixed | -3.5%, all 6 runs lower, TPOT +5.4% | 38 vs 29 |
+| Gemma vision-heavy | -2.3% (overlap) | 17 vs 30 |
+| Cosmos balanced | -1.5% (overlap) | 166 vs 147 |
+
+Warmup-trained posterior helps on most workloads; the hypothesis is rejected.
+
+## Prefill merge-wait (analysis only, not implemented)
+
+Gemma long-prefill's 64 requests all arrive within 74 ms. At decision time 0-1 requests have ready prefill most of
+the time (259 and 64 of 479 decisions) because admission (24 stable slots) gates supply, and prefill candidates of
+batch 2+ are already formed when 2+ requests are ready. A merge wait has no arrivals to wait for. Prefill us/token
+differences between runs track P+D interference, not batch size.
+
 ## Revised next steps
 
 1. Validate Stage 1 elision (A/B on/off, same binary): decisions must fall, throughput and output must not move.
