@@ -44,6 +44,9 @@ struct PhaseRuntimeCostTrackerConfig
     PhaseContextualPdModelConfig contextualPd;
     PhaseContextualPdModelConfig contextualEp;
     PhaseContextualPdModelConfig contextualEd;
+    //! Learn complete P+D (no residual anchor) separately from D-attached-to-running-P
+    //! residual augmentation, whose remaining-work reward is not comparable.
+    bool separateCompletePairModel{};
 };
 
 enum class PhaseRuntimeCostConfidence
@@ -148,11 +151,13 @@ private:
 
     DecodeKey decodeKey(
         int32_t batchSize, int32_t maxContextLength, bool encoderActive, bool prefillActive) const noexcept;
+    PhaseContextualPdModel& prefillToDecodeModel(PhaseContextualPdFeatures const& features) noexcept;
 
     PhaseRuntimeCostTrackerConfig mConfig;
     PhaseGlobalCostModel mActions;
     PhaseGlobalCostModel mDecodeService;
     PhaseContextualPdModel mContextualPd;
+    PhaseContextualPdModel mContextualPdComplete;
     PhaseContextualPdModel mContextualDp;
     PhaseContextualPdModel mContextualEp;
     PhaseContextualPdModel mContextualPe;
