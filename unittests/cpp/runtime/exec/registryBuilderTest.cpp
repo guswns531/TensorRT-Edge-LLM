@@ -113,8 +113,10 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kExecutionPhaseMarker));
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kContextSequenceCountCarrier));
     EXPECT_FALSE(hasName(names, "context_lengths"));
-    EXPECT_FALSE(hasName(names, "last_token_ids"));
-    EXPECT_FALSE(hasName(names, "kvcache_start_index"));
+    // last_token_ids and kvcache_start_index are always-present ragged/token-major ABI tensors
+    // for non-diffusion configs (see buildRegistryForLLM), not diffusion- or spec-decode-only.
+    EXPECT_TRUE(hasName(names, "last_token_ids"));
+    EXPECT_TRUE(hasName(names, "kvcache_start_index"));
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kKVPageTable));
     EXPECT_TRUE(hasName(names, "rope_rotary_cos_sin"));
 
@@ -124,7 +126,7 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     EXPECT_TRUE(hasName(names, "present_key_values_0"));
     EXPECT_TRUE(hasName(names, "present_key_values_31"));
 
-    EXPECT_EQ(names.size(), 77u);
+    EXPECT_EQ(names.size(), 79u);
 }
 
 TEST(RegistryBuilderTest, RaggedLLMUsesTokenMajorAbiBindings)
@@ -167,7 +169,8 @@ TEST(RegistryBuilderTest, RaggedLLMUsesTokenMajorAbiBindings)
     }
 
     EXPECT_EQ(find(bn::kContextLengths), specs.end());
-    EXPECT_EQ(find(bn::kLastTokenIds), specs.end());
+    // Non-diffusion configs always carry last_token_ids (see buildRegistryForLLM).
+    EXPECT_NE(find(bn::kLastTokenIds), specs.end());
     auto const pageTable = find(bn::kKVPageTable);
     ASSERT_NE(pageTable, specs.end());
     ASSERT_EQ(pageTable->shape.size(), 3U);
@@ -310,7 +313,7 @@ TEST(RegistryBuilderTest, DeepstackAddsExtraTensors)
     EXPECT_TRUE(hasName(names, "deepstack_embeds_1"));
     EXPECT_TRUE(hasName(names, "deepstack_embeds_2"));
 
-    EXPECT_EQ(names.size(), 20u);
+    EXPECT_EQ(names.size(), 22u);
 }
 
 TEST(RegistryBuilderTest, DeepstackShapeMatchesConfig)
@@ -370,7 +373,7 @@ TEST(RegistryBuilderTest, SpecDecodeBaseAddsProposalTensors)
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kAttentionMask));
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kAttentionPosId));
 
-    EXPECT_EQ(names.size(), 20u);
+    EXPECT_EQ(names.size(), 22u);
 }
 
 TEST(RegistryBuilderTest, SpecDecodeBaseUsesConfiguredOutputHiddenDim)
@@ -440,7 +443,7 @@ TEST(RegistryBuilderTest, MambaStateAddsRecurrentAndConvTensors)
     EXPECT_TRUE(hasName(names, "present_conv_state_0"));
     EXPECT_TRUE(hasName(names, "present_conv_state_1"));
 
-    EXPECT_EQ(names.size(), 25u);
+    EXPECT_EQ(names.size(), 27u);
 }
 
 TEST(RegistryBuilderTest, RecurrentStateShapeMatchesConfig)
@@ -517,7 +520,7 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
     auto reg = buildRegistryForLLM(cfg);
     auto names = reg.allTensorNames();
 
-    EXPECT_EQ(names.size(), 34u);
+    EXPECT_EQ(names.size(), 36u);
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kExecutionPhaseMarker));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_0"));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_1"));
@@ -915,7 +918,7 @@ TEST(RegistryBuilderTest, HybridModelKVCacheCountMatchesAttentionLayers)
     EXPECT_TRUE(hasName(names, "past_key_values_9"));
     EXPECT_FALSE(hasName(names, "past_key_values_10"));
 
-    EXPECT_EQ(names.size(), 33u);
+    EXPECT_EQ(names.size(), 35u);
 }
 
 // Heterogeneous-KV models (Gemma-4, Qwen3-Next, etc.) give each attention
