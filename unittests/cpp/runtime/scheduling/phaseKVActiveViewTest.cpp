@@ -166,6 +166,8 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
             config.maxSupportedBatchSize = 2;
             config.maxSupportedInputLength = 128;
             config.maxKVCacheCapacity = 512;
+            config.maxPhysicalTokens = 256;
+            config.maxNumSequences = 2;
             config.hiddenSize = 8;
             config.outputVocabSize = 16;
             config.numDeepstackFeatures = 0;
@@ -184,6 +186,8 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
             config.maxSupportedBatchSize = 2;
             config.maxSupportedInputLength = 128;
             config.maxKVCacheCapacity = 512;
+            config.maxPhysicalTokens = 256;
+            config.maxNumSequences = 2;
             config.hiddenSize = 8;
             config.outputVocabSize = 16;
             config.numDeepstackFeatures = 0;
@@ -218,6 +222,8 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
             config.maxSupportedBatchSize = 2;
             config.maxSupportedInputLength = 128;
             config.maxKVCacheCapacity = 512;
+            config.maxPhysicalTokens = 256;
+            config.maxNumSequences = 2;
             config.hiddenSize = 8;
             config.outputVocabSize = 16;
             return config;
