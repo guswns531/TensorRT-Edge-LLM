@@ -779,6 +779,13 @@ class AttentionPluginRunner:
         self._scatter_cache(pool, kv_cache, page_table)
         batch_size, seq_len = qkv.shape[:2]
         physical_tokens = batch_size * seq_len
+        # Packed-prefill calls flatten all logical sequences into a single
+        # physical batch row (batch_size == 1); the logical per-sequence
+        # length is then physical_tokens / len(context_lengths), not the
+        # physical seq_len itself.
+        logical_batch = context_lengths.numel()
+        per_seq_len = (physical_tokens //
+                       logical_batch if logical_batch else seq_len)
         empty_cache_indices = (cache_indices.numel() == 0
                                or input_shapes is not None and
                                input_shapes.get("kv_cache_indices") == (0, ))
@@ -787,17 +794,20 @@ class AttentionPluginRunner:
         if has_token_positions:
             positions = position_ids.reshape(-1).to(torch.int32)
         else:
-            starts = (cache_indices if not empty_cache_indices else
-                      torch.zeros(batch_size, dtype=torch.int32, device=DEV))
-            positions = (starts[:, None] + torch.arange(
-                seq_len, dtype=torch.int32, device=DEV)[None, :]).reshape(-1)
+            starts = (cache_indices
+                      if not empty_cache_indices else torch.zeros(
+                          logical_batch, dtype=torch.int32, device=DEV))
+            positions = (
+                starts[:, None] +
+                torch.arange(per_seq_len, dtype=torch.int32,
+                             device=DEV)[None, :]).reshape(-1)
         rope_rows = rope_cos_sin[0].index_select(0, positions.to(torch.int64))
         query_start_offsets = torch.arange(0,
                                            physical_tokens + 1,
-                                           seq_len,
+                                           per_seq_len,
                                            dtype=torch.int32,
                                            device=DEV)
-        query_lengths = context_lengths.clamp(min=0, max=seq_len)
+        query_lengths = context_lengths.clamp(min=0, max=per_seq_len)
         tree_step = self.tree and has_token_positions
         if execution_phase is None:
             if tree_step:
@@ -813,7 +823,7 @@ class AttentionPluginRunner:
         execution_phase_marker = torch.zeros(phase,
                                              dtype=torch.int32,
                                              device=DEV)
-        context_sequences = batch_size if phase in (1, 2) else 0
+        context_sequences = logical_batch if phase in (1, 2) else 0
         context_sequence_count_carrier = torch.empty(max(1, context_sequences),
                                                      dtype=torch.int32,
                                                      device=DEV)

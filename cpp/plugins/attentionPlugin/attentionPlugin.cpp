@@ -1967,8 +1967,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 denseAttentionOutput = assignTensorFromWorkspace(
                     alignedWorkspacePtr, {runtimeBatchSize, denseSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
                 CUDA_CHECK(cudaMemsetAsync(qInputTensor.rawPointer(), 0, qInputTensor.getMemoryCapacity(), stream));
+                // launchApplyRopeQOnlyPackedToDense expects a flat [1, totalTokens, Hq, D] packed
+                // Q; packedQKVTensor is shaped [logicalBatch, seqLen, Hq, D] under the ragged ABI
+                // but shares the same contiguous memory, so reinterpret it here.
+                rt::Tensor const packedQOnlyTensor(packedQKVTensor.rawPointer(),
+                    rt::Coords{1, runtimeBatchSize * runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    packedQKVTensor.getDataType());
                 kernel::launchApplyRopeQOnlyPackedToDense(
-                    ropeCosSinTensor, kvCacheEndIdxsTensor, packedQKVTensor, qInputTensor, cuQSeqLensTensor, stream);
+                    ropeCosSinTensor, kvCacheEndIdxsTensor, packedQOnlyTensor, qInputTensor, cuQSeqLensTensor, stream);
                 fmhaOutput = denseAttentionOutput.rawPointer();
             }
             else if (useExplicitPositionIds)
@@ -1992,18 +1998,18 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     useBoundedSwaCache ? kInputTensor.rawPointer() : nullptr,
                     useBoundedSwaCache ? vInputTensor.rawPointer() : nullptr, nullptr /* fp8QOut */, 1.0F /* qScale */,
-                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, qkNormPostRope,
-                    rt::OptionalInputTensor{cuQSeqLensTensor}, false /* writeKVCache */, enableRopePdl,
-                    true /* tokenAlignedRope */);
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, qkNormPostRope, std::nullopt,
+                    false /* writeKVCache */, enableRopePdl, true /* tokenAlignedRope */);
             }
             else
             {
                 check::check(!useBoundedSwaCache,
                     "Bounded shared-KV prefill requires the donor's current K/V in the packed input.");
                 // Shared-KV: RoPE Q in-place only; the donor layer's cache is already populated.
+                // rope_cos_sin rows are already token-aligned to absolute position by the caller
+                // (2D token-major ABI), so no kvCacheEndLens offset is needed here.
                 qInputTensor = aliasPackedAsQInput();
-                kernel::launchApplyRopeQOnly(
-                    ropeCosSinTensor, rt::OptionalInputTensor{kvCacheEndIdxsTensor}, qInputTensor, stream);
+                kernel::launchApplyRopeQOnly(ropeCosSinTensor, std::nullopt, qInputTensor, stream);
             }
 
             if (useBoundedSwaCache)
@@ -2126,7 +2132,13 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             }
             if (packedPrefill)
             {
-                kernel::gatherDenseRowsToPacked(denseAttentionOutput, cuQSeqLensTensor, attentionOutputTensor, stream);
+                // gatherDenseRowsToPacked expects a flat [1, totalTokens, Hq, D] destination;
+                // attentionOutputTensor is shaped [logicalBatch, seqLen, Hq, D] under the ragged
+                // ABI but shares the same contiguous memory, so reinterpret it for the gather.
+                rt::Tensor packedAttentionOutput(attentionOutputTensor.rawPointer(),
+                    rt::Coords{1, runtimeBatchSize * runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    attentionOutputTensor.getDataType());
+                kernel::gatherDenseRowsToPacked(denseAttentionOutput, cuQSeqLensTensor, packedAttentionOutput, stream);
             }
             return 0;
         }
@@ -2301,8 +2313,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 }
                 if (packedPrefill)
                 {
+                    // See the shared-KV packed-gather comment above: reinterpret the dense
+                    // [logicalBatch, seqLen, Hq, D] output as the flat [1, totalTokens, Hq, D]
+                    // shape gatherDenseRowsToPacked expects; same underlying contiguous memory.
+                    rt::Tensor packedAttentionOutput(attentionOutputTensor.rawPointer(),
+                        rt::Coords{1, runtimeBatchSize * runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU,
+                        attentionOutputTensor.getDataType());
                     kernel::gatherDenseRowsToPacked(
-                        denseAttentionOutput, cuQSeqLensTensor, attentionOutputTensor, stream);
+                        denseAttentionOutput, cuQSeqLensTensor, packedAttentionOutput, stream);
                 }
             }
             else
