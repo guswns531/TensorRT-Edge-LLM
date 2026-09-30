@@ -47,7 +47,9 @@ TEST(Gemma4EmbeddingPreprocessorTest, SharesImmutableTableAcrossPhaseLocalOutput
         ASSERT_NE(prefillOutput, nullptr);
         ASSERT_NE(decodeOutput, nullptr);
         EXPECT_NE(prefillOutput->rawPointer(), decodeOutput->rawPointer());
-        EXPECT_EQ(prefillOutput->getShape(), (Coords{2, 8, 4}));
-        EXPECT_EQ(decodeOutput->getShape(), (Coords{4, 1, 4}));
+        // Output views are token-major [physicalTokens, hidden] (upstream's ragged ABI), not
+        // batch-major [batch, seq, hidden].
+        EXPECT_EQ(prefillOutput->getShape(), (Coords{16, 4}));
+        EXPECT_EQ(decodeOutput->getShape(), (Coords{4, 4}));
     }
 }
