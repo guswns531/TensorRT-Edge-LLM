@@ -639,10 +639,13 @@ TEST(HybridCacheManagerTests, SharingOwnersDeduplicateCompactionAndPromptSnapsho
     auto mapping = uploadMapping({-1, 0, 1});
     cache.compactKVCacheLengths(mapping, 3, 2, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    // compactKVCacheLengths only reindexes the logical KV-length tracking tensor; physical rows are
+    // addressed by a stable resident/page identity and are not moved (see HasResidentMovementApi),
+    // so slot 0's physical content is whatever was last written there, not the survivor that mapped to it.
     for (int32_t layer = 0; layer < 4; ++layer)
     {
         int32_t const owner = cache.getKVCacheManager().physicalOwner(layer);
-        expectSlotTokenRangeEqNhd(cache, layer, 0, 0, 9, static_cast<float>(owner * 10 + 2), "shared compact");
+        expectSlotTokenRangeEqNhd(cache, layer, 0, 0, 9, static_cast<float>(owner * 10 + 1), "shared compact");
     }
     cache.restoreKVCache(saved, 0, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
