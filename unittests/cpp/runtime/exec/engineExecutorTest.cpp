@@ -172,10 +172,10 @@ TEST(EngineExecutorTest, GraphKeyIncludesEngineProfileShapesAndAddresses)
 
 TEST(EngineExecutorTest, RaggedDimensionRelations)
 {
-    InferenceDims dims{/*batch=*/3, /*seqLen=*/15, /*kvLen=*/128, /*selectLen=*/3, /*attnMaskSeqLen=*/15,
-        /*ropeBatch=*/1, /*packedMaskLen=*/1, /*contextMaskSelectorLen=*/0, /*startIndexLen=*/0,
-        /*executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kContextPrefill), /*skipSoftmaxScaleLen=*/0,
-        /*swaKVCacheModeLen=*/0, /*queryOffsetLen=*/4, /*contextSequenceCount=*/3};
+    InferenceDims dims{/*batch=*/3, /*tokenBatch=*/3, /*seqLen=*/15, /*kvLen=*/128, /*selectLen=*/3,
+        /*attnMaskSeqLen=*/15, /*ropeBatch=*/1, /*packedMaskLen=*/1, /*contextMaskSelectorLen=*/0,
+        /*startIndexLen=*/0, /*executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kContextPrefill),
+        /*skipSoftmaxScaleLen=*/0, /*swaKVCacheModeLen=*/0, /*queryOffsetLen=*/4, /*contextSequenceCount=*/3};
     EXPECT_TRUE(validateRaggedInferenceDims(dims, /*profileIndex=*/0));
     EXPECT_TRUE(validateRaggedInferenceDims(dims, /*profileIndex=*/1));
 
