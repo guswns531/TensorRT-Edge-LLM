@@ -27,8 +27,8 @@ message. Building with `-DENABLE_CUTE_DSL=ALL` and rebuilding the engines fixes 
 
 1. **No KV-pool undercommit.** `llm_build` rejects `--maxKVPoolPages 192` for Gemma batch 24 x 2048: "must be zero or
    at least the minimum active pages (384)". The fork builds and serves that contract with 192 pages.
-2. **Gemma fixed memory does not fit.** At runtime init the PLE table (4.7 GB) and a PLE output buffer sized
-   `layers x maxBatch x maxSeq x pleHidden` live on the GPU next to the 2.1 GB engine and 0.8 GB embedding table.
+2. **Gemma fixed memory does not fit.** At runtime init the PLE table (4.7 GB, GPU-resident in the fork too) and a
+   PLE output buffer sized `layers x maxBatch x maxSeq x pleHidden` live on the GPU next to the 2.1 GB engine and 0.8 GB embedding table.
    With the vision engine loaded, init fails with `cudaMalloc ... out of memory` at batch 24, 16, and 8.
 3. **Silent INT4 V2 failure without `-DENABLE_CUTE_DSL=ALL`.** Localized with a temporary instrumented plugin
    (`.local/worktrees/upstream-v0110-debug`): `CUTE_DSL_INT4_FP16_GEMM_ENABLED not compiled`. Neither the builder nor
@@ -90,8 +90,10 @@ wave-drain (both) and Cosmos multi-image (319 vs 314 tok/s, ahead of vLLM's 0.8x
 
 ## Implications for the port
 
-- Carry the fork's KV undercommit and host-resident PLE / external INT4 FFN weights; without them the ported
-  runtime cannot run the retained Gemma contract (batch 24) on this GPU.
+- Carry the fork's KV undercommit, phase-shaped Gemma4 PLE output buffers (`PhaseServingRuntime` builds one prefill
+  preprocessor sized to a packed chunk and one decode preprocessor sized to batch x 1, sharing one GPU PLE table,
+  instead of one `layers x maxBatch x maxSeq` buffer), and external INT4 FFN weights; without them the ported runtime
+  cannot run the retained Gemma contract (batch 24) on this GPU. The PLE table itself is GPU-resident in both.
 - Build the port with `-DENABLE_CUTE_DSL=ALL` (or at least `fmha;int4_fp16_gemm`) if its exporter emits the V2 INT4
   plugin; decide whether to keep V1 INT4 (note 368 numerics) or adopt V2.
 - Upstream fixed-output serving runs are possible through `EDGELLM_IGNORE_EOS=1` on the server process.
