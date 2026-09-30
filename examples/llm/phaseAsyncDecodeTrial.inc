@@ -25,7 +25,7 @@ ELLM_CHECK(!enablePrefixReuse && serverConfig.eosTokenIds.empty(), "Trial requir
 auto parsed = parsePhaseIpcInput(trial.at("request").dump(), outputs);
 ELLM_CHECK(parsed.valid && parsed.request.imageBuffers.empty(), "Trial requires a valid text request");
 rt::LLMGenerationRequest::FormattedRequest formatted;
-ELLM_CHECK(tokenizer.applyChatTemplate(parsed.request, formatted, true, true, false), "Trial chat template failed");
+ELLM_CHECK(chatTemplate.apply(parsed.request, formatted, {}), "Trial chat template failed");
 auto const prompt = tokenizer.encode(formatted.formattedCompleteRequest, false);
 ELLM_CHECK(!prompt.empty() && prompt.size() + outputs <= static_cast<size_t>(config.maxKVCacheCapacity),
     "Trial prompt exceeds KV capacity");

@@ -5524,7 +5524,7 @@ size_t PhaseThreeCoordinator::mediaInputBytes(PendingVisionRequest const& pendin
     {
         for (imageUtils::ImageData const& image : request.imageBuffers)
         {
-            int64_t const bytesPerFrame = image.bytesPerFrame();
+            int64_t const bytesPerFrame = image.frameBytes();
             if (bytesPerFrame <= 0 || image.frames <= 0)
             {
                 continue;

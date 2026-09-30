@@ -246,7 +246,8 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
         ? (auxiliaryPrefill && mConfig.hasVisionPrefillProfile()
                   ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens)
                   : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens))
-        : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength, initialPrefill);
+        : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength,
+              initialPrefill ? ExecutionPhase::kContextPrefill : ExecutionPhase::kContextChunk);
     ELLM_CHECK(executor.prepare(profileIndex, dims, mPrefillMap, stream), "Independent prefill prepare failed");
     int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;
     std::string const graphShape

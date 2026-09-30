@@ -174,8 +174,8 @@ public:
     virtual rt::Tensor& getOutputEmbedding();
 
     //! @brief Get deepstack features for Qwen3-VL models
-    //! @return Optional deepstack features vector (raw features before embedding lookup)
-    virtual rt::OptionalInputTensors getDeepstackFeatures();
+    //! @return Writable raw features before embedding lookup; empty when the model has no deepstack
+    virtual std::vector<std::reference_wrapper<rt::Tensor>> getDeepstackFeatures();
 
     //! Describe the active encoder outputs independently of their backing allocation.
     virtual MultimodalOutputSpec getOutputEmbeddingSpec() const;

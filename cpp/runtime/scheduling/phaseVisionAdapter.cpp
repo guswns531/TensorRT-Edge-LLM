@@ -272,9 +272,11 @@ bool phaseVisionSupportsPrefixBeforeVision(RopeType ropeType) noexcept
 }
 
 PhaseVisionAdapter::PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
-    LLMEngineConfig const& config, cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy, cudaStream_t copyStream)
+    chat_template::ChatTemplate const& chatTemplate, LLMEngineConfig const& config, cudaStream_t stream,
+    PhaseVisionStoragePolicy storagePolicy, cudaStream_t copyStream)
     : mRunner(runner)
     , mTokenizer(tokenizer)
+    , mChatTemplate(chatTemplate)
     , mConfig(config)
     , mStoragePolicy(storagePolicy)
     , mStream(stream)
@@ -353,7 +355,7 @@ size_t PhaseVisionAdapter::retainedStorageBatches() const noexcept
 }
 
 void PhaseVisionAdapter::copyRunnerOutputs(PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding,
-    OptionalInputTensors const& deepstackFeatures, cudaStream_t stream)
+    std::vector<std::reference_wrapper<Tensor>> const& deepstackFeatures, cudaStream_t stream)
 {
     auto retain = [&](Tensor const& source, Tensor& destination, std::string const& name) {
         resizeTensor(destination, {source.getShape(), source.getDataType()}, name);
@@ -432,11 +434,11 @@ std::shared_ptr<PhaseVisionPreparedBatch> PhaseVisionAdapter::prepare(std::vecto
     }
     batchedRequest.formattedRequests.resize(batchedRequest.requests.size());
     batchedRequest.streamChannels.clear();
+    chat_template::ChatTemplate::Options const options = chat_template::ChatTemplate::optionsFrom(batchedRequest);
     for (size_t index = 0; index < batchedRequest.requests.size(); ++index)
     {
         ELLM_CHECK(
-            mTokenizer.applyChatTemplate(batchedRequest.requests[index], batchedRequest.formattedRequests[index],
-                batchedRequest.applyChatTemplate, batchedRequest.addGenerationPrompt, batchedRequest.enableThinking),
+            mChatTemplate.apply(batchedRequest.requests[index], batchedRequest.formattedRequests[index], options),
             "Failed to format phase vision request");
     }
     prepared->payloads.reserve(prepared->submissions.size());
@@ -585,7 +587,7 @@ bool PhaseVisionAdapter::submitPrepared(std::shared_ptr<PhaseVisionPreparedBatch
         else
         {
             Tensor const& outputEmbedding = mRunner.getOutputEmbedding();
-            OptionalInputTensors const deepstackFeatures = mRunner.getDeepstackFeatures();
+            std::vector<std::reference_wrapper<Tensor>> const deepstackFeatures = mRunner.getDeepstackFeatures();
             CUDA_CHECK(cudaEventRecord(mEncoderDoneEvent, mStream));
             CUDA_CHECK(cudaStreamWaitEvent(mCopyStream, mEncoderDoneEvent));
             recordActivity(PhaseActivityKind::kCopy, "encoder_output_copy", correlationId, mCopyStream,
@@ -796,8 +798,8 @@ std::optional<PhaseVisionPrefixPlan> PhaseVisionAdapter::makePrefixPlan(LLMGener
     {
         formatted = request.formattedRequests.front();
     }
-    else if (!mTokenizer.applyChatTemplate(request.requests.front(), formatted, request.applyChatTemplate,
-                 request.addGenerationPrompt, request.enableThinking))
+    else if (!mChatTemplate.apply(
+                 request.requests.front(), formatted, chat_template::ChatTemplate::optionsFrom(request)))
     {
         return std::nullopt;
     }

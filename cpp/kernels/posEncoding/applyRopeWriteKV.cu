@@ -230,6 +230,52 @@ __device__ __forceinline__ DVec<T> vecApplyRmsNormAndRopeNonInterleave(T const* 
     return result;
 }
 
+//! Fused non-interleaved RoPE + post-rotation RMSNorm on one head (HunYuan V1 order:
+//! rotate first, then normalize the rotated head and multiply gamma). The RMS statistic
+//! is reduced over the rotated head with the same warp-shuffle butterfly as the
+//! pre-rotation path. Ghost lanes participate only in the reduction and return data the
+//! caller must NOT store.
+template <typename T>
+__device__ __forceinline__ DVec<T> vecApplyRopeThenRmsNormNonInterleave(T const* dataPtr, T const* gammaPtr,
+    DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim, uint32_t const headDim,
+    uint32_t const paddedLanesPerHead, float const rmsEps)
+{
+    uint32_t const vecOffset = threadIdx.x * DVec<T>::vec_size;
+    bool const isActiveLane = (vecOffset < headDim);
+
+    // Rotate the raw slice first; channels beyond rotaryDim pass through unchanged.
+    DVec<T> roped;
+    float partial = 0.f;
+    if (isActiveLane)
+    {
+        roped = vecApplyRopeNonInterleave(dataPtr, cosVec, sinVec, rotaryDim);
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            float const v = __half2float(roped[i]);
+            partial = __fmaf_rn(v, v, partial);
+        }
+    }
+    // Ghost lanes: partial stays 0; still participate in the warp-wide reduction below.
+    float const headSumSq = warpReduceHeadSumOfSquares(partial, paddedLanesPerHead);
+    float const meanSq = __fdiv_rn(headSumSq, static_cast<float>(headDim));
+    float const invRms = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(meanSq, rmsEps)));
+
+    if (isActiveLane)
+    {
+        DVec<T> gamma;
+        gamma.load(gammaPtr + vecOffset);
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            // Same backend-matching order as loadAndApplyRmsNorm: fp32 scale, cast to
+            // half, then half-precision gamma multiply.
+            roped[i] = __hmul(__float2half(__fmul_rn(__half2float(roped[i]), invRms)), gamma[i]);
+        }
+    }
+    return roped;
+}
+
 template <typename TCache>
 __device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> const& vec, float scaleQuantOrig)
 {
@@ -242,7 +288,8 @@ __device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> c
     {
         DVec<__nv_fp8_e4m3> out;
         assert(scaleQuantOrig > 0.0f);
-        float const invScale = 1.0f / scaleQuantOrig;
+        // An approximate reciprocal can move exact FP8 halfway cases into the adjacent bin.
+        float const invScale = __frcp_rn(scaleQuantOrig);
 #pragma unroll
         for (uint32_t i = 0; i < DVec<half>::vec_size; ++i)
         {
@@ -468,8 +515,10 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
     }
 }
 
+//! @p allowWiderPool: the packed variant's pool may be wider than @p headDim; see
+//! launchApplyRopeFromPackedToSplit.
 static void validatePagedKvPool(rt::Tensor const& kvCache, int64_t const numKVHeads, int64_t const headDim,
-    int32_t const* pageTable, int32_t const maxPagesPerSeq)
+    int32_t const* pageTable, int32_t const maxPagesPerSeq, bool const allowWiderPool = false)
 {
     rt::Coords const poolShape = kvCache.getShape();
     constexpr int32_t kPoolNumDims = 5;
@@ -477,11 +526,17 @@ static void validatePagedKvPool(rt::Tensor const& kvCache, int64_t const numKVHe
     check::check(poolShape.getNumDims() == kPoolNumDims, "KV cache pool shape shall be [2, numPages, 128, Hkv, D].");
     check::check(poolShape[0] == kKvPlanes && poolShape[1] > 0 && poolShape[2] == rt::kTOKENS_PER_PAGE,
         "KV cache pool shape shall be [2, numPages, 128, Hkv, D] with positive numPages.");
-    check::check(poolShape[3] == numKVHeads && poolShape[4] == headDim,
-        "KV cache pool Hkv and D shall match the input K/V tensors.");
+    check::check(poolShape[3] == numKVHeads, "KV cache pool Hkv shall match the input K/V tensors.");
+    if (allowWiderPool)
+    {
+        check::check(poolShape[4] >= headDim, "KV cache pool head dimension shall be at least the K/V head dimension.");
+    }
+    else
+    {
+        check::check(poolShape[4] == headDim, "KV cache pool D shall match the input K/V tensors.");
+    }
     check::check(pageTable != nullptr, "Paged KV writes require a page table.");
     check::check(maxPagesPerSeq > 0, "Paged KV writes require positive maxPagesPerSeq.");
-    check::check(poolShape[1] >= maxPagesPerSeq, "Paged KV writes require maxPagesPerSeq <= numPages.");
 }
 
 void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
@@ -707,21 +762,22 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 // =============================================================================
 // Packed QKV [B, S, Hq+2*Hkv, D] → RoPE Q/K → split outputs:
 //   - roped Q to qScratch (or FP8 Q to fp8QOut), always
-//   - roped K + V to kvCache, always
+//   - roped K + V to kvCache when writeKVCache is true
 //   - roped K + V to kScratch/vScratch when SEPARATE_Q_K_V FMHA needs them
 // Tree decoding via optional tokenPosIds (-1 = padding token).
 // =============================================================================
 
-template <typename T, typename TCache>
+template <typename T, typename TCache, bool kEnablePdl>
 __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV, T* __restrict__ qScratch,
     T* __restrict__ kScratch, T* __restrict__ vScratch, TCache* __restrict__ kvCache, void* __restrict__ fp8QOut,
     float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
     int32_t const* __restrict__ tokenPosIds, int32_t const* __restrict__ cuQSeqLens, T const* __restrict__ qNormGamma,
-    T const* __restrict__ kNormGamma, float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig,
-    float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t numPages, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq, int32_t logicalBatchSize, int32_t qScratchSeqLen,
-    bool packedPrefill)
+    T const* __restrict__ kNormGamma, float rmsNormEps, bool qkNormPostRope, float qScaleQuantOrig,
+    float kScaleQuantOrig, float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t numPages,
+    uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t poolHeadDim, uint32_t rotaryDim,
+    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, int32_t const* __restrict__ pageTable,
+    int32_t maxPagesPerSeq, int32_t logicalBatchSize, int32_t qScratchSeqLen, bool packedPrefill, bool writeKVCache,
+    bool tokenAlignedRope)
 {
     // Thread mapping (same as existing kernels for proven memory coalescing):
     //   blockDim.x = headDim / vec_size  (threads per token, cover head vector)
@@ -741,6 +797,15 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     // instead, and every global store below is gated on !isTailToken.
     bool const isTailToken = (tokenIdx >= static_cast<uint32_t>(totalNumTokens));
     uint32_t const clampedTokenIdx = isTailToken ? static_cast<uint32_t>(totalNumTokens - 1) : tokenIdx;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (kEnablePdl)
+    {
+        // Position metadata and packedQKV can be produced by the preceding grid.
+        // Keep only dependency-independent scalar setup above this wait.
+        asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    }
+#endif
 
     int32_t batchIdx{};
     int32_t rowInBatch{};
@@ -766,7 +831,8 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     int64_t const combinedHeads = static_cast<int64_t>(numQHead) + 2 * static_cast<int64_t>(numKVHead);
 
     // RoPE position: prefill (kvCacheEndLens - qSeqLen + offset), decode
-    // (kvCacheEndLens[b] - 1), or tree (tokenPosIds; -1 = padding token, zeroed).
+    // (kvCacheEndLens[b] - 1), or tree (token row for token-aligned RoPE, otherwise tokenPosIds;
+    // -1 remains the padding marker).
     // Ragged prefill padding must be identified before page-table or RoPE-cache
     // indexing. It cannot early-return because fused qk_norm uses warp collectives.
     int32_t sinCosCachePos{};
@@ -774,7 +840,7 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         || (cuQSeqLens != nullptr && rowInBatch >= actualQSeqLen);
     if (tokenPosIds != nullptr)
     {
-        sinCosCachePos = tokenPosIds[clampedTokenIdx];
+        sinCosCachePos = tokenAlignedRope ? rowInBatch : tokenPosIds[clampedTokenIdx];
         if (sinCosCachePos < 0)
         {
             sinCosCachePos = 0;
@@ -786,7 +852,7 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - insertedRowLen : 0;
         int32_t const maxActualRow = actualQSeqLen > 0 ? actualQSeqLen - 1 : 0;
         int32_t const ropeRow = isPaddingToken && rowInBatch > maxActualRow ? maxActualRow : rowInBatch;
-        sinCosCachePos = posStartId + ropeRow;
+        sinCosCachePos = tokenAlignedRope ? ropeRow : posStartId + ropeRow;
     }
 
     // Vectorized load cos/sin for this token's RoPE position.
@@ -824,8 +890,10 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         {
             // ALL lanes (ghosts and padding tokens included) must enter uniformly — the
             // call contains a warp-wide shfl. Padding tokens' qRoped is zeroed below.
-            qRoped = vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedQOffset, qNormGamma, cosVec, sinVec,
-                rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
+            qRoped = qkNormPostRope ? vecApplyRopeThenRmsNormNonInterleave(packedQKV + packedQOffset, qNormGamma,
+                                          cosVec, sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps)
+                                    : vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedQOffset, qNormGamma, cosVec,
+                                          sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
             if (isPaddingToken && isActiveLane)
             {
 #pragma unroll
@@ -880,8 +948,10 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         if (kNormGamma != nullptr)
         {
             // All lanes (including ghosts) participate in the fused-norm shfl reduction.
-            kRoped = vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedKOffset, kNormGamma, cosVec, sinVec,
-                rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
+            kRoped = qkNormPostRope ? vecApplyRopeThenRmsNormNonInterleave(packedQKV + packedKOffset, kNormGamma,
+                                          cosVec, sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps)
+                                    : vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedKOffset, kNormGamma, cosVec,
+                                          sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
         }
         else if (isActiveLane)
         {
@@ -894,10 +964,15 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
             vSrc.load(packedQKV + packedVOffset + vecBase);
         }
 
-        // Skip all K/V writes for padding tokens (tree decoding), tail tokens, and ghost lanes.
-        if (!isPaddingToken && isActiveLane && !isTailToken)
+        if (isActiveLane && !isTailToken)
         {
             int32_t const scratchKVOffset = clampedTokenIdx * numKVHead * headDim + kvHeadIdx * headDim;
+            // Dense FMHA can load masked padding V; zero its scratch to keep 0 * NaN out of valid outputs.
+            if (isPaddingToken)
+            {
+                kRoped.data = {};
+                vSrc.data = {};
+            }
 
             // Optionally write to scratch K/V (for SEPARATE_Q_K_V FMHA to read directly).
             if (kScratch != nullptr)
@@ -909,37 +984,53 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
                 vSrc.store(vScratch + scratchKVOffset + vecBase);
             }
 
-            // Always write K and V to the KV cache.
-            int32_t const insertedRowLen = packedPrefill ? actualQSeqLen : qSeqLen;
-            int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - insertedRowLen : 0;
-            int32_t const tokenIdxInCache = kvCacheStartIdx + rowInBatch;
-            int32_t const pageRow = tokenIdxInCache / rt::kTOKENS_PER_PAGE;
-            int32_t const inPage = tokenIdxInCache % rt::kTOKENS_PER_PAGE;
-            int32_t const kPage = pageTable[(batchIdx * 2 + 0) * maxPagesPerSeq + pageRow];
-            int32_t const vPage = pageTable[(batchIdx * 2 + 1) * maxPagesPerSeq + pageRow];
-            if (kPage >= 0 && kPage < numPages)
+            if (writeKVCache && !isPaddingToken)
             {
-                int64_t const kOffset
-                    = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
-                    + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
-                storeVec(kvCache, kOffset, kRoped, kScaleQuantOrig);
-            }
-            if (vPage >= numPages && static_cast<int64_t>(vPage) < 2 * static_cast<int64_t>(numPages))
-            {
-                int64_t const vOffset
-                    = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
-                    + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
-                storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+                int32_t const insertedRowLen = packedPrefill ? actualQSeqLen : qSeqLen;
+                int32_t const kvCacheStartIdx
+                    = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - insertedRowLen : 0;
+                int32_t const tokenIdxInCache = kvCacheStartIdx + rowInBatch;
+                int32_t const pageRow = tokenIdxInCache / rt::kTOKENS_PER_PAGE;
+                int32_t const inPage = tokenIdxInCache % rt::kTOKENS_PER_PAGE;
+                int32_t const kPage = pageTable[(batchIdx * 2 + 0) * maxPagesPerSeq + pageRow];
+                int32_t const vPage = pageTable[(batchIdx * 2 + 1) * maxPagesPerSeq + pageRow];
+                // Row stride is poolHeadDim, not headDim; see launchApplyRopeFromPackedToSplit.
+                if (kPage >= 0 && kPage < numPages)
+                {
+                    int64_t const kOffset
+                        = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * poolHeadDim
+                        + static_cast<int64_t>(kvHeadIdx) * poolHeadDim + vecBase;
+                    storeVec(kvCache, kOffset, kRoped, kScaleQuantOrig);
+                }
+                if (vPage >= numPages && static_cast<int64_t>(vPage) < 2 * static_cast<int64_t>(numPages))
+                {
+                    int64_t const vOffset
+                        = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * poolHeadDim
+                        + static_cast<int64_t>(kvHeadIdx) * poolHeadDim + vecBase;
+                    storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+                }
             }
         }
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (kEnablePdl)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+        {
+            asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+        }
+    }
+#endif
 }
 
 void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
     float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
     void* kScratchOut, void* vScratchOut, void* fp8QOut, float qScale, half const* qNormGamma, half const* kNormGamma,
-    float rmsNormEps, rt::OptionalInputTensor cuQSeqLens)
+    float rmsNormEps, bool qkNormPostRope, rt::OptionalInputTensor cuQSeqLens, bool writeKVCache, bool enablePdl,
+    bool tokenAlignedRope)
 {
     auto const dt = kvCache.getDataType();
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
@@ -949,7 +1040,8 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     int64_t const physicalBatchSize = packedQKV.getShape()[0];
     int64_t const runtimeSeqLen = packedQKV.getShape()[1];
     int64_t const combinedHeads = packedQKV.getShape()[2];
-    int64_t const headDim = kvCache.getShape()[4];
+    int64_t const headDim = packedQKV.getShape()[3];
+    int64_t const poolHeadDim = kvCache.getShape()[4];
     int64_t const numKVHeads = kvCache.getShape()[3];
     int64_t const numQHeads = combinedHeads - 2 * numKVHeads;
     int64_t const numPages = kvCache.getShape()[1];
@@ -963,9 +1055,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             && (!packedPrefill || physicalBatchSize == 1) && (packedPrefill || qScratch.getShape()[1] == runtimeSeqLen)
             && qScratch.getShape()[2] == numQHeads && qScratch.getShape()[3] == headDim,
         "qScratch shape shall be dense [logicalBatch, S, Hq, D].");
-    check::check(
-        packedQKV.getShape()[3] == headDim, "Head dimension shall be consistent between packed QKV and KV pool.");
-    validatePagedKvPool(kvCache, numKVHeads, headDim, pageTable, maxPagesPerSeq);
+    validatePagedKvPool(kvCache, numKVHeads, headDim, pageTable, maxPagesPerSeq, /*allowWiderPool=*/true);
 
     int64_t const cosSinCacheBatchSize = cosSinCache.getShape()[0];
     int64_t const cosSinCacheSeqLen = cosSinCache.getShape()[1];
@@ -1019,35 +1109,77 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     uint32_t const tokenPerCTA = kTHREADS_PER_CTA / bDimX;
     uint32_t const bDimY = tokenPerCTA;
     uint32_t const gDimX = (static_cast<uint32_t>(totalNumTokens) + tokenPerCTA - 1) / tokenPerCTA;
-    uint32_t const gDimY = static_cast<uint32_t>(numQHeads + numKVHeads);
+    bool const processKVHeads = writeKVCache || kScratchPtr != nullptr || vScratchPtr != nullptr;
+    uint32_t const gDimY = static_cast<uint32_t>(numQHeads + (processKVHeads ? numKVHeads : 0));
 
     dim3 grid(gDimX, gDimY);
     dim3 block(bDimX, bDimY);
 
+    auto const launchKernel = [&](auto* kvCachePtr, void* fp8QOutput, float qScaleOrig, auto pdlTag) {
+        using TCache = std::remove_pointer_t<decltype(kvCachePtr)>;
+        constexpr bool kEnablePdl = decltype(pdlTag)::value;
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+        cudaLaunchAttribute pdlAttribute{};
+        cudaLaunchConfig_t launchConfig{};
+        launchConfig.gridDim = grid;
+        launchConfig.blockDim = block;
+        launchConfig.dynamicSmemBytes = 0;
+        launchConfig.stream = stream;
+        launchConfig.attrs = kEnablePdl ? &pdlAttribute : nullptr;
+        launchConfig.numAttrs = kEnablePdl ? 1U : 0U;
+
+        if constexpr (kEnablePdl)
+        {
+            pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
+        }
+
+        CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl>,
+            packedPtr, qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
+            tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qkNormPostRope, qScaleOrig, kScale,
+            vScale, static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
+            static_cast<int32_t>(numPages), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
+            static_cast<uint32_t>(headDim), static_cast<uint32_t>(poolHeadDim), static_cast<uint32_t>(rotaryDim),
+            static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
+            maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize), static_cast<int32_t>(qScratch.getShape()[1]),
+            packedPrefill, writeKVCache, tokenAlignedRope));
+#else
+        applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
+            kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qkNormPostRope, qScaleOrig, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
+            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
+            static_cast<uint32_t>(poolHeadDim), static_cast<uint32_t>(rotaryDim),
+            static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
+            maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize), static_cast<int32_t>(qScratch.getShape()[1]),
+            packedPrefill, writeKVCache, tokenAlignedRope);
+#endif // SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+    };
+
     if (dt == nvinfer1::DataType::kHALF)
     {
         half* kvCachePtr = kvCache.dataPointer<half>();
-        applyRopeFromPackedToSplitKernel<half, half><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr, kScratchPtr,
-            vScratchPtr, kvCachePtr, nullptr /* fp8QOut */, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, 1.0f /* qScaleQuantOrig */, kScale, vScale,
-            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
-            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
-            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize),
-            static_cast<int32_t>(qScratch.getShape()[1]), packedPrefill);
+        if (enablePdl)
+        {
+            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::true_type{});
+        }
+        else
+        {
+            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::false_type{});
+        }
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
     {
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
-        applyRopeFromPackedToSplitKernel<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
-            kScratchPtr, vScratchPtr, kvCachePtr, fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScale, kScale, vScale,
-            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
-            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
-            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, static_cast<int32_t>(logicalBatchSize),
-            static_cast<int32_t>(qScratch.getShape()[1]), packedPrefill);
+        if (enablePdl)
+        {
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{});
+        }
+        else
+        {
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{});
+        }
     }
 #endif
     else
@@ -1077,8 +1209,10 @@ __global__ void applyRopeQOnlyKernel(T* __restrict__ q, float const* __restrict_
     }
 
     int32_t const batchIdx = tokenIdx / qSeqLen;
-    int32_t const posStartId = kvCacheEndLens[batchIdx] - qSeqLen;
-    int32_t const sinCosCachePos = posStartId + tokenIdx % qSeqLen;
+    // With kvCacheEndLens (decode/continuation), position resumes from the cache end; otherwise
+    // (prefill, e.g. tokenAlignedRope callers) position is local row-within-sequence.
+    int32_t const sinCosCachePos
+        = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen + tokenIdx % qSeqLen : tokenIdx % qSeqLen;
 
     // Load cos/sin
     uint32_t const sinOffset = rotaryDim / 2;
@@ -1099,7 +1233,7 @@ __global__ void applyRopeQOnlyKernel(T* __restrict__ q, float const* __restrict_
 }
 
 void launchApplyRopeQOnly(
-    rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream)
+    rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q, cudaStream_t stream)
 {
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
     constexpr uint32_t kTHREADS_PER_CTA = 128;
@@ -1114,9 +1248,16 @@ void launchApplyRopeQOnly(
     uint32_t const cosSinCacheSeqLen = static_cast<uint32_t>(cosSinCache.getShape()[1]);
     uint32_t const rotaryDim = static_cast<uint32_t>(cosSinCache.getShape()[2]);
 
+    if (kvCacheEndLens.has_value())
+    {
+        check::check(kvCacheEndLens.value().get().getShape()[0] == runtimeBatchSize,
+            "kvCacheEndLens shall have consistent batch size.");
+    }
+
     half* qPtr = q.dataPointer<half>();
     float const* cosSinCachePtr = cosSinCache.dataPointer<float>();
-    int32_t const* kvCacheEndLensPtr = kvCacheEndLens.dataPointer<int32_t>();
+    int32_t const* kvCacheEndLensPtr
+        = kvCacheEndLens.has_value() ? kvCacheEndLens.value().get().dataPointer<int32_t>() : nullptr;
 
     uint32_t const tokenPerCTA = kTHREADS_PER_CTA * kVEC_SIZE / headDim;
     uint32_t const bDimX = headDim / kVEC_SIZE;

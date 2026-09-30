@@ -31,7 +31,7 @@ class Qwen3VLViTRunner : public QwenViTRunner
 public:
     using QwenViTRunner::QwenViTRunner;
 
-    rt::OptionalInputTensors getDeepstackFeatures() override;
+    std::vector<std::reference_wrapper<rt::Tensor>> getDeepstackFeatures() override;
     std::vector<MultimodalOutputSpec> getDeepstackOutputSpecs() const override;
 
 protected:

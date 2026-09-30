@@ -32,6 +32,11 @@ namespace trt_edgellm::tokenizer
 class Tokenizer;
 }
 
+namespace trt_edgellm::chat_template
+{
+class ChatTemplate;
+}
+
 namespace trt_edgellm::rt
 {
 
@@ -143,7 +148,8 @@ public:
     static std::unique_ptr<PhaseServingRuntime> create(PhaseServingRuntimeConfig config,
         LLMEngineConfig const& engineConfig, std::unique_ptr<EngineExecutor> executor, SharedResources& resources,
         EmbeddingData const& embedding, std::shared_ptr<Tensor const> pleTable, cudaStream_t setupStream,
-        std::unique_ptr<MultimodalRunner> visionRunner = nullptr, tokenizer::Tokenizer const* tokenizer = nullptr);
+        std::unique_ptr<MultimodalRunner> visionRunner = nullptr, tokenizer::Tokenizer const* tokenizer = nullptr,
+        chat_template::ChatTemplate const* chatTemplate = nullptr);
 
     ~PhaseServingRuntime() noexcept;
 

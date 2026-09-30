@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "chatTemplate/chatTemplate.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
@@ -240,7 +241,7 @@ PhaseIpcInput parsePhaseIpcInput(std::string const& line, int32_t defaultMaxOutp
                                 return result;
                             }
                             parsedMessage.contents.push_back({"image", ""});
-                            result.request.imageBuffers.push_back(rt::imageUtils::loadImageFromFile(path));
+                            result.request.imageBuffers.push_back(rt::imageUtils::loadRgbImageFromFile(path));
                         }
                     }
                 }
@@ -972,7 +973,7 @@ int main(int argc, char** argv)
             rt::InferenceDims const prefillDims = config.packedPrefill
                 ? config.packedPrefillDims(
                       static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens, /*maxRowTokens=*/96)
-                : config.prefillDims(1, prefillTotalTokens, false);
+                : config.prefillDims(1, prefillTotalTokens, rt::ExecutionPhase::kContextChunk);
             ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
                 "Failed to bind the stable paged-KV prefill view");
             ELLM_CHECK(pair->decodeExecutor().prepare(
@@ -1278,6 +1279,8 @@ int main(int argc, char** argv)
         rt::EmbeddingPreprocessor embeddingPreprocessor(embedding, config);
         tokenizer::Tokenizer tokenizer;
         ELLM_CHECK(tokenizer.loadFromHF(engineDir), "Failed to load tokenizer for semantic phase requests");
+        chat_template::ChatTemplate chatTemplate;
+        ELLM_CHECK(chatTemplate.load(engineDir), "Failed to load chat template for semantic phase requests");
 
         std::vector<std::string> const prompts{
             "Give one practical tip for reducing latency in an online inference service.",
@@ -1293,8 +1296,7 @@ int main(int argc, char** argv)
             rt::LLMGenerationRequest::Request request;
             request.messages.push_back({"user", {{"text", prompts[index]}}});
             rt::LLMGenerationRequest::FormattedRequest formatted;
-            ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
-                "Failed to format semantic phase request");
+            ELLM_CHECK(chatTemplate.apply(request, formatted, {}), "Failed to format semantic phase request");
             semanticPrompts[requestId] = tokenizer.encode(formatted.formattedCompleteRequest, false);
             ELLM_CHECK(!semanticPrompts[requestId].empty(), "Semantic phase request tokenized to an empty prompt");
         }
@@ -2200,7 +2202,7 @@ int main(int argc, char** argv)
                     visionEngineDir, visionRunnerBatchSize, config.maxKVCacheCapacity, encoderStream, checkpointDir);
                 configureVisionContextMemory(*runner);
                 rt::PhaseVisionAdapter visionAdapter(
-                    *runner, tokenizer, phaseConfig, encoderStream, visionStoragePolicy, copyStream);
+                    *runner, tokenizer, chatTemplate, phaseConfig, encoderStream, visionStoragePolicy, copyStream);
                 rt::PhaseThreeCoordinator threePhase(visionAdapter, semanticServer);
                 if (activityTimeline != nullptr)
                 {
@@ -2211,7 +2213,7 @@ int main(int argc, char** argv)
                 rt::LLMGenerationRequest::Request logicalRequest;
                 logicalRequest.messages.push_back(
                     {"user", {{"image", visionImagePath}, {"text", "Describe the image briefly."}}});
-                logicalRequest.imageBuffers.push_back(rt::imageUtils::loadImageFromFile(visionImagePath));
+                logicalRequest.imageBuffers.push_back(rt::imageUtils::loadRgbImageFromFile(visionImagePath));
                 request.requests.push_back(std::move(logicalRequest));
                 request.temperature = 0.0F;
                 request.topP = 1.0F;
@@ -2249,8 +2251,7 @@ int main(int argc, char** argv)
             rt::LLMGenerationRequest::Request request;
             request.messages.push_back({"user", {{"text", longPrompt}}});
             rt::LLMGenerationRequest::FormattedRequest formatted;
-            ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
-                "Failed to format prefix reuse gate request");
+            ELLM_CHECK(chatTemplate.apply(request, formatted, {}), "Failed to format prefix reuse gate request");
             std::vector<int32_t> const tokenIds = tokenizer.encode(formatted.formattedCompleteRequest, false);
             auto const sourceSubmission = semanticServer.submit(22000, tokenIds, kSEMANTIC_OUTPUT_TOKENS);
             ELLM_CHECK(sourceSubmission.status == rt::IndependentPhaseServerStatus::kAdmitted
@@ -2713,8 +2714,8 @@ int main(int argc, char** argv)
             }
             if (visionEngineDir != nullptr)
             {
-                ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(
-                    *ipcVisionRunner, tokenizer, phaseConfig, ipcEncoderStream, visionStoragePolicy, copyStream);
+                ipcVisionAdapter = std::make_unique<rt::PhaseVisionAdapter>(*ipcVisionRunner, tokenizer, chatTemplate,
+                    phaseConfig, ipcEncoderStream, visionStoragePolicy, copyStream);
                 if (char const* value = std::getenv("TRT_EDGELLM_VISION_DEBUG_DIR"))
                 {
                     std::filesystem::path const debugDirectory(value);
@@ -3014,7 +3015,7 @@ int main(int argc, char** argv)
                     bool const calibrateEncoderDecode
                         = std::getenv("TRT_EDGELLM_DISABLE_PHASE_ENCODER_DECODE_CALIBRATION") == nullptr;
                     rt::imageUtils::ImageData const calibrationImage
-                        = rt::imageUtils::loadImageFromFile(encoderCalibrationImage);
+                        = rt::imageUtils::loadRgbImageFromFile(encoderCalibrationImage);
                     auto makeCalibrationRequest = [&]() {
                         rt::LLMGenerationRequest request{};
                         rt::LLMGenerationRequest::Request logicalRequest;
@@ -3983,8 +3984,7 @@ int main(int argc, char** argv)
                     else
                     {
                         rt::LLMGenerationRequest::FormattedRequest formatted;
-                        ELLM_CHECK(tokenizer.applyChatTemplate(request, formatted, true, true, false),
-                            "Failed to format IPC phase request");
+                        ELLM_CHECK(chatTemplate.apply(request, formatted, {}), "Failed to format IPC phase request");
                         std::vector<int32_t> const tokenIds
                             = tokenizer.encode(formatted.formattedCompleteRequest, false);
                         auto const submission

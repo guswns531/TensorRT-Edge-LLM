@@ -17,6 +17,7 @@
 
 #include "runtime/scheduling/phaseServingRuntime.h"
 
+#include "chatTemplate/chatTemplate.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
@@ -230,7 +231,8 @@ public:
     Impl(PhaseServingRuntimeConfig servingConfig, LLMEngineConfig const& engineConfig,
         std::unique_ptr<EngineExecutor> executor, SharedResources& resources, EmbeddingData const& embedding,
         std::shared_ptr<Tensor const> pleTable, cudaStream_t setupStream,
-        std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer)
+        std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer,
+        chat_template::ChatTemplate const* chatTemplate)
         : mServingConfig(std::move(servingConfig))
         , mEngineConfig(engineConfig)
         , mResources(resources)
@@ -254,6 +256,7 @@ public:
         if (mVisionRunner != nullptr)
         {
             ELLM_CHECK(tokenizer != nullptr, "Phase vision serving requires a tokenizer");
+            ELLM_CHECK(chatTemplate != nullptr, "Phase vision serving requires a chat template");
             CUDA_CHECK(cudaStreamCreateWithFlags(&mEncoderStream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaStreamCreateWithFlags(&mCopyStream, cudaStreamNonBlocking));
             if (mServingConfig.activityTimeline == nullptr)
@@ -519,7 +522,7 @@ public:
             PhaseVisionStoragePolicy storagePolicy;
             storagePolicy.splitMropeLease = engineConfig.ropeConfig.type == RopeType::kMRope;
             mVisionAdapter = std::make_unique<PhaseVisionAdapter>(
-                *mVisionRunner, *tokenizer, engineConfig, mEncoderStream, storagePolicy, mCopyStream);
+                *mVisionRunner, *tokenizer, *chatTemplate, engineConfig, mEncoderStream, storagePolicy, mCopyStream);
             PhaseThreeCoordinatorConfig visionConfig
                 = makeVisionConfig(mServingConfig, phaseEngineConfig, maxStableSlots, std::move(runtimeCostTracker));
             visionConfig.exclusiveEncoderInputTokenThreshold = exclusiveEncoderInputTokenThreshold;
@@ -825,11 +828,12 @@ public:
 std::unique_ptr<PhaseServingRuntime> PhaseServingRuntime::create(PhaseServingRuntimeConfig config,
     LLMEngineConfig const& engineConfig, std::unique_ptr<EngineExecutor> executor, SharedResources& resources,
     EmbeddingData const& embedding, std::shared_ptr<Tensor const> pleTable, cudaStream_t setupStream,
-    std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer)
+    std::unique_ptr<MultimodalRunner> visionRunner, tokenizer::Tokenizer const* tokenizer,
+    chat_template::ChatTemplate const* chatTemplate)
 {
     return std::unique_ptr<PhaseServingRuntime>(
         new PhaseServingRuntime(std::make_unique<Impl>(std::move(config), engineConfig, std::move(executor), resources,
-            embedding, std::move(pleTable), setupStream, std::move(visionRunner), tokenizer)));
+            embedding, std::move(pleTable), setupStream, std::move(visionRunner), tokenizer, chatTemplate)));
 }
 
 PhaseServingRuntime::PhaseServingRuntime(std::unique_ptr<Impl> impl)

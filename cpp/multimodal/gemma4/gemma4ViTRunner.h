@@ -27,69 +27,6 @@ namespace trt_edgellm
 namespace rt
 {
 
-//! Reusable image-resize scratch, independent of TensorRT activation and output storage.
-class Gemma4ResizeScratch
-{
-public:
-    struct Requirements
-    {
-        int64_t rawBytes{};
-        int64_t temporaryBytes{};
-    };
-
-    struct Metrics
-    {
-        int64_t rawAllocatedBytes{};
-        int64_t temporaryAllocatedBytes{};
-        int64_t allocatedHighWaterBytes{};
-        int64_t requiredHighWaterBytes{};
-        uint64_t growthCount{};
-        uint64_t poolUsedBytes{};
-        uint64_t poolReservedBytes{};
-        bool streamOrdered{};
-    };
-
-    Gemma4ResizeScratch() = default;
-    ~Gemma4ResizeScratch() noexcept;
-    Gemma4ResizeScratch(Gemma4ResizeScratch const&) = delete;
-    Gemma4ResizeScratch& operator=(Gemma4ResizeScratch const&) = delete;
-
-    //! Compute one-frame scratch requirements; identity copies need no scratch.
-    static Requirements requirements(
-        int64_t rawHeight, int64_t rawWidth, int64_t channels, int64_t outHeight, int64_t outWidth);
-
-    //! Initialize once before serving, retaining the startup-allocation fallback on devices without memory pools.
-    void initialize(int64_t channels, int64_t maxImagePixels, bool memoryPoolsSupported);
-    //! Grow transactionally on an explicit stream; failed allocation preserves previous capacities.
-    void reserve(Requirements required, cudaStream_t stream);
-    //! Record after the final scratch consumer, including partially submitted preprocessing on error.
-    void recordUse(cudaStream_t stream);
-
-    Tensor& raw() noexcept
-    {
-        return mRaw;
-    }
-    Tensor& temporary() noexcept
-    {
-        return mTemporary;
-    }
-    Metrics const& metrics() const noexcept
-    {
-        return mMetrics;
-    }
-
-private:
-    void logAllocation() noexcept;
-
-    Tensor mRaw;
-    Tensor mTemporary;
-    cudaEvent_t mLastUse{};
-    bool mUseRecorded{};
-    bool mCompletionUncertain{};
-    bool mInitialized{};
-    Metrics mMetrics{};
-};
-
 //! \brief Configuration for Gemma4 vision encoder preprocessing and runtime bindings.
 struct Gemma4ViTConfig
 {
@@ -176,11 +113,9 @@ private:
     rt::Tensor mCuSeqlensHost{};         //!< Cumulative sequence lengths host tensor
     rt::Tensor mKvLengths{};             //!< KV lengths for TRT-native attention
     rt::Tensor mMaxSeqLenCarrier{};      //!< Shape-only max sequence length carrier
-    rt::Tensor mImageMean{};             //!< Image mean tensor
-    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};           //!< Temporary image buffer (holds the GPU-resized image)
-    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
-    Gemma4ResizeScratch mResizeScratch;  //!< Stream-ordered raw upload and horizontal-pass scratch
+    std::array<float, 3> mImageMean{};   //!< Per-channel normalisation mean, RGB
+    std::array<float, 3> mImageStd{};    //!< Per-channel normalisation standard deviation, RGB
+    rt::Tensor mNormalizedImageDevice{}; //!< Preprocessed frame, [1, H, W, 3] HALF
     Coords mOutputEmbeddingShape{};      //!< Active output shape when request-owned storage is bound
 
     bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 instead of ViTAttentionPlugin

@@ -98,7 +98,7 @@ for (int32_t row{}; row < rows; ++row)
             true, prefillStream);
         trialPrefillKV.preparePrefillMetadata(*prefillIO, {chunk}, prefillStream, config.packedPrefill);
         auto const dims = config.packedPrefill ? config.packedPrefillDims(1, chunk, chunk)
-                                              : config.prefillDims(1, chunk, false);
+                                              : config.prefillDims(1, chunk, rt::ExecutionPhase::kContextChunk);
         ELLM_CHECK(pair->prefillExecutor().prepare(0, dims, prefillMap, prefillStream)
                 && pair->prefillExecutor().execute(prefillStream),
             "Trial prefix initialization failed");

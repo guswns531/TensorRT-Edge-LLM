@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "chatTemplate/chatTemplate.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "runtime/config/llmEngineConfig.h"
 
@@ -167,8 +168,9 @@ std::vector<int64_t> phaseVisionEmbeddingRows(std::vector<std::vector<int32_t>> 
 class PhaseVisionAdapter
 {
 public:
-    PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer, LLMEngineConfig const& config,
-        cudaStream_t stream, PhaseVisionStoragePolicy storagePolicy = {}, cudaStream_t copyStream = nullptr);
+    PhaseVisionAdapter(MultimodalRunner& runner, tokenizer::Tokenizer const& tokenizer,
+        chat_template::ChatTemplate const& chatTemplate, LLMEngineConfig const& config, cudaStream_t stream,
+        PhaseVisionStoragePolicy storagePolicy = {}, cudaStream_t copyStream = nullptr);
     ~PhaseVisionAdapter() noexcept;
 
     PhaseVisionAdapter(PhaseVisionAdapter const&) = delete;
@@ -210,7 +212,7 @@ private:
     static Tensor viewTensorRows(Tensor& source, int64_t rowOffset, int64_t rowCount, std::string const& name);
     std::shared_ptr<PhaseVisionBatchStorage> acquireBatchStorage();
     void copyRunnerOutputs(PhaseVisionBatchStorage& storage, Tensor const& outputEmbedding,
-        OptionalInputTensors const& deepstackFeatures, cudaStream_t stream);
+        std::vector<std::reference_wrapper<Tensor>> const& deepstackFeatures, cudaStream_t stream);
     void recordActivity(PhaseActivityKind kind, char const* name, uint64_t correlationId, cudaStream_t stream,
         std::function<void()> const& enqueue);
     void refreshIdleStorageStats() noexcept;
@@ -218,6 +220,7 @@ private:
 
     MultimodalRunner& mRunner;
     tokenizer::Tokenizer const& mTokenizer;
+    chat_template::ChatTemplate const& mChatTemplate;
     LLMEngineConfig mConfig;
     PhaseVisionStoragePolicy mStoragePolicy;
     cudaStream_t mStream{};
