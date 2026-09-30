@@ -41,10 +41,57 @@ message. Building with `-DENABLE_CUTE_DSL=ALL` and rebuilding the engines fixes 
    are rejected (HTTP 400), and it has no `/version` or `/metrics`. A fixed-output comparison with our traces is not
    possible against stock upstream; in-flight batching also joins only requests with equal `max_tokens`.
 
+## Upstream serving baseline (`v0110-upstream-serving-20260930`)
+
+Stock published wheel `tensorrt-edgellm[server]==0.11.0`, `--enable-in-flight-batching`, largest batch that fits
+(Gemma 4, Cosmos 8), `--max-queued-requests 256`, fixed output through the upstream runtime switch
+`EDGELLM_IGNORE_EOS=1` on the server process (the HTTP schema forbids `ignore_eos`; verified: a one-word prompt runs
+to exactly `max_tokens`). Client: the frozen vLLM trace client with `return_token_ids`/`ignore_eos` removed from the
+payload and `/version`/`/metrics` optional (`.local/scratch/v0110-upstream-serve-20260930/`), same traces, warmup,
+and in-flight limits as the frozen vLLM contract (Gemma 24 / warmup 8, Cosmos 64 / warmup 64). One run per cell;
+every request returned 200 at exactly its requested length. Seven Cosmos vision cells were rerun after a first pass
+rejected their absolute host image paths (media root allowed only under `/workspace`). "Ours" is the tip full24 x3
+median (note 369); vLLM is the frozen anchor.
+
+| Workload | Upstream tok/s | Ours tok/s | Ours / upstream | vLLM / upstream | Upstream TTFT mean | Fixed-length requests |
+|---|---:|---:|---:|---:|---:|---:|
+| Cosmos balanced | 150.6 | 4446.7 | 29.5x | 28.7x | 32127 ms | 288/288 |
+| Cosmos bimodal | 144.7 | 2018.6 | 14.0x | 12.9x | 59157 ms | 288/288 |
+| Cosmos decode-heavy | 156.4 | 5238.5 | 33.5x | 31.6x | 92234 ms | 288/288 |
+| Cosmos late-vision | 999.2 | 2517.9 | 2.5x | 2.2x | 2212 ms | 32/32 |
+| Cosmos long-prefill | 142.4 | 1315.9 | 9.2x | 7.9x | 33967 ms | 288/288 |
+| Cosmos mixed | 293.2 | 1181.0 | 4.0x | 3.1x | 6026 ms | 64/64 |
+| Cosmos multi-image | 319.1 | 313.6 | 1.0x | 0.8x | 256 ms | 5/5 |
+| Cosmos poisson | 153.6 | 2047.2 | 13.3x | 11.6x | 14152 ms | 64/64 |
+| Cosmos short | 197.6 | 2392.1 | 12.1x | 10.4x | 2454 ms | 48/48 |
+| Cosmos text-heavy | 293.2 | 2028.7 | 6.9x | 4.4x | 5918 ms | 64/64 |
+| Cosmos vision-heavy | 425.2 | 732.6 | 1.7x | 1.4x | 3501 ms | 64/64 |
+| Cosmos wave-drain | 99.0 | 98.0 | 1.0x | 1.0x | 199 ms | 20/20 |
+| Gemma balanced | 122.4 | 1262.6 | 10.3x | 6.3x | 12881 ms | 64/64 |
+| Gemma bimodal | 105.9 | 857.9 | 8.1x | 5.7x | 26587 ms | 64/64 |
+| Gemma decode-heavy | 125.7 | 1376.8 | 10.9x | 6.5x | 37350 ms | 64/64 |
+| Gemma late-vision | 425.8 | 1528.5 | 3.6x | 2.3x | 5345 ms | 32/32 |
+| Gemma long-prefill | 98.6 | 616.9 | 6.3x | 5.1x | 16286 ms | 64/64 |
+| Gemma mixed | 195.9 | 772.5 | 3.9x | 3.6x | 4647 ms | 64/64 |
+| Gemma multi-image | 249.4 | 411.7 | 1.7x | 1.5x | 889 ms | 20/20 |
+| Gemma poisson | 116.7 | 932.1 | 8.0x | 5.8x | 11364 ms | 64/64 |
+| Gemma short | 119.2 | 845.8 | 7.1x | 4.8x | 2955 ms | 48/48 |
+| Gemma text-heavy | 212.1 | 898.1 | 4.2x | 1.9x | 4509 ms | 64/64 |
+| Gemma vision-heavy | 209.4 | 573.2 | 2.7x | 2.7x | 3565 ms | 64/64 |
+| Gemma wave-drain | 93.1 | 97.2 | 1.0x | 1.0x | 285 ms | 20/20 |
+
+
+Geomean over 24 cells: ours 5.28x upstream, frozen vLLM 4.16x upstream.
+
+Upstream loses mainly through batch size (4/8 versus 24/64) and its in-flight admission rule: a request joins a
+running batch only with equal `max_tokens`, so heterogeneous traces stall (`stalls_incompatible` reached 164k on
+Cosmos decode-heavy) and TTFT means reach tens of seconds. It matches us only where batching does not matter:
+wave-drain (both) and Cosmos multi-image (319 vs 314 tok/s, ahead of vLLM's 0.8x).
+
 ## Implications for the port
 
 - Carry the fork's KV undercommit and host-resident PLE / external INT4 FFN weights; without them the ported
   runtime cannot run the retained Gemma contract (batch 24) on this GPU.
 - Build the port with `-DENABLE_CUTE_DSL=ALL` (or at least `fmha;int4_fp16_gemm`) if its exporter emits the V2 INT4
   plugin; decide whether to keep V1 INT4 (note 368 numerics) or adopt V2.
-- An upstream serving baseline must run with EOS allowed (both systems), since stock upstream cannot ignore EOS.
+- Upstream fixed-output serving runs are possible through `EDGELLM_IGNORE_EOS=1` on the server process.
