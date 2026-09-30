@@ -1511,8 +1511,13 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         const_cast<void*>(inputs[kIN_ROPE_COS_SIN_IDX]), ropeShape, rt::DeviceType::kGPU, posEncodingCosSinDesc.type);
 
     PluginTensorDesc const& kvCacheStartIdxInputDesc = inputDesc[kIN_KV_CACHE_START_IDX];
-    rt::Tensor const kvCacheStartIdxTensor(const_cast<void*>(inputs[kIN_KV_CACHE_START_IDX]),
-        rt::Coords{kvCacheStartIdxInputDesc.dims}, rt::DeviceType::kGPU, kvCacheStartIdxInputDesc.type);
+    rt::Coords const kvCacheStartIdxShape{kvCacheStartIdxInputDesc.dims};
+    // TensorRT may hand back a non-null pointer for a zero-volume optional binding; the shared
+    // sequence-length kernel uses pointer-nullness (not tensor volume) to detect absence.
+    bool const kvCacheStartIdxIsEmpty = kvCacheStartIdxShape.volume() == 0;
+    rt::Tensor const kvCacheStartIdxTensor(
+        kvCacheStartIdxIsEmpty ? nullptr : const_cast<void*>(inputs[kIN_KV_CACHE_START_IDX]), kvCacheStartIdxShape,
+        rt::DeviceType::kGPU, kvCacheStartIdxInputDesc.type);
 
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Coords const attentionOutputShape{runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize};
