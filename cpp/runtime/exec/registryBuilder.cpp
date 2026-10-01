@@ -133,22 +133,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
                 {sym(&InferenceDims::selectLen), fixed(cfg.hiddenSize)}});
         }
     }
-    else
-    {
-        // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
-        reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
-            {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::selectLen)}});
-    }
-
-    // kvcache_start_index: [start_index_len] INT32. The engine's context profile
-    // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
-    // chunked prefill, decode, and verification use [batch] start offsets.
-    // InferenceDims::startIndexLen carries this per-phase: prefillDims sets it to 0
-    // when kvCacheAllEmpty, else batch; all other recipes
-    // set it to batch. Shape 0 is engine-valid here — TRT reads 0 bytes from
-    // the bound address and the engine branches to the initial-prefill path.
-    reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
-        {sym(&InferenceDims::startIndexLen)}});
+    // last_token_ids / kvcache_start_index are fork-era legacy bindings not present on the
+    // upstream ragged ABI (query_start_offsets/past_lengths/logits_indices supersede them).
+    // Registered post-load in TrtEngineExecutor only when the engine actually exposes them
+    // (see engineExecutor.cpp's optional-metadata registration), so upstream-ABI engines never
+    // try to bind a tensor name TensorRT does not have.
 
     addKVPageTableSpec(reg, cfg);
     if (cfg.profileLocalPackedPrefillChunkLimit)

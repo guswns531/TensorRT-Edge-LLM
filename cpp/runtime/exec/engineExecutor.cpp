@@ -205,6 +205,21 @@ TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, Te
     };
     registerOptionalTreeMetadata(binding_names::kTreeParentIds);
     registerOptionalTreeMetadata(binding_names::kTreeDepths);
+
+    // Fork-era legacy bindings: present only on engines built against the fork's old ABI, absent
+    // on the upstream ragged ABI (query_start_offsets/past_lengths/logits_indices supersede them).
+    if (engineHasInputTensor(*mEngineState->engine, binding_names::kLastTokenIds)
+        && !mRegistry.contains(binding_names::kLastTokenIds))
+    {
+        mRegistry.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
+            {sym(&InferenceDims::tokenBatch), sym(&InferenceDims::selectLen)}});
+    }
+    if (engineHasInputTensor(*mEngineState->engine, binding_names::kKVCacheStartIndex)
+        && !mRegistry.contains(binding_names::kKVCacheStartIndex))
+    {
+        mRegistry.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::startIndexLen)}});
+    }
     if (engineHasInputTensor(*mEngineState->engine, binding_names::kValidTreeCounts)
         && !mRegistry.contains(binding_names::kValidTreeCounts))
     {
