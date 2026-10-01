@@ -343,21 +343,33 @@ def _canonicalize_tied_lm_head_input(onnx_model, tensor_name: str,
             f"Tied LM-head initializer {tensor_name!r} has shape "
             f"{current_shape}, expected {head_shape} or its transpose")
 
-    transpose_nodes = [
+    consumers = [
         node for node in onnx_model.graph.node if tensor_name in node.input
     ]
-    for node in transpose_nodes:
-        perm = next((list(attr.ints)
-                     for attr in node.attribute if attr.name == "perm"), [])
-        if node.op_type != "Transpose" or perm != [1, 0] or len(
-                node.output) != 1:
+    transpose_nodes = []
+    gemm_nodes = []
+    for node in consumers:
+        attrs = {attr.name: attr for attr in node.attribute}
+        if node.op_type == "Transpose" and len(node.output) == 1 and list(
+                attrs["perm"].ints if "perm" in attrs else []) == [1, 0]:
+            transpose_nodes.append(node)
+        elif (node.op_type == "Gemm"
+              and list(node.input).index(tensor_name) == 1
+              and "transB" in attrs and attrs["transB"].i == 1):
+            gemm_nodes.append(attrs["transB"])
+        else:
             raise ValueError(
                 f"Tied LM-head initializer {tensor_name!r} in embedding "
-                "layout must only feed 2D transpose nodes")
-    if not transpose_nodes:
+                "layout must only feed 2D transpose nodes or Gemm(transB=1)")
+    if not consumers:
         raise ValueError(
             f"Tied LM-head initializer {tensor_name!r} in embedding layout "
             "has no removable transpose consumer")
+
+    # Gemm(transB=1) over [vocab, hidden] equals Gemm(transB=0) over the
+    # [hidden, vocab] LM-head layout the runtime binds.
+    for trans_b in gemm_nodes:
+        trans_b.i = 0
 
     for transpose in transpose_nodes:
         transpose_output = transpose.output[0]

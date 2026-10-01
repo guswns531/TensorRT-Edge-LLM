@@ -508,3 +508,57 @@ def test_reuse_tied_lm_head_preserves_optimized_weight_layout(tmp_path):
     matmul = next(node for node in patched_model.graph.node
                   if node.op_type == "MatMul")
     assert list(matmul.input)[1] == weight_name
+
+
+def test_reuse_tied_lm_head_rewrites_transposed_gemm(tmp_path):
+    onnx_path = tmp_path / "model.onnx"
+    weight_name = "lm_head.weight"
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "Gemm", ["hidden_states", weight_name], ["logits"], transB=1)
+        ],
+        "transposed_gemm_tied_lm_head_test",
+        [
+            onnx.helper.make_tensor_value_info(
+                "hidden_states", onnx.TensorProto.FLOAT16, [1, 2])
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                "logits", onnx.TensorProto.FLOAT16, [1, 3])
+        ],
+        [
+            _make_initializer(weight_name,
+                              np.arange(6, dtype=np.float16).reshape(3, 2))
+        ],
+    )
+    onnx.save_model(
+        onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 24)]),
+        onnx_path)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            tie_word_embeddings=True,
+            hidden_size=2,
+            vocab_size=3,
+            reduced_vocab_size=None,
+            draft_vocab_size=None,
+        ),
+        lm_head=SimpleNamespace(weight=np.empty((3, 2))),
+    )
+
+    external_weights.externalize_model_weights(str(onnx_path),
+                                               model,
+                                               externalize_weights=["lm_head"],
+                                               reuse_tied_lm_head=True)
+
+    patched_model = onnx.load(onnx_path, load_external_data=False)
+    head_input = next(graph_input for graph_input in patched_model.graph.input
+                      if graph_input.name == weight_name)
+    assert [dim.dim_value
+            for dim in head_input.type.tensor_type.shape.dim] == [2, 3]
+    gemm = next(node for node in patched_model.graph.node
+                if node.op_type == "Gemm")
+    assert list(gemm.input)[1] == weight_name
+    trans_b = next(attr.i for attr in gemm.attribute if attr.name == "transB")
+    assert trans_b == 0
