@@ -1463,11 +1463,10 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         "owned KV, or Hq*head_dim / (Hq + 2*Hkv)*head_dim for shared KV.");
     int32_t const combinedHeads = sharedKVWithCurrent || !sharedKV ? (mNumQHeads + 2 * mNumKVHeads) : mNumQHeads;
 
-    // NOTE(pass-1 merge RISK): dense packed-prefill dispatch (packedPrefill) is now gated purely by
-    // mEnablePackedPrefill rather than by a physical-batch-size==1 shape inference, since the QKV
-    // binding is entry-padded [totalTokens, C] under the upstream ragged/phase model adopted here.
-    // A follow-up must audit whether this still exercises the dense single-physical-row Gemma4 path.
-    bool const packedPrefill = mEnablePackedPrefill != 0;
+    // Packed-prefill steps use the entry-padded carrier (T = N * W, checked above). The dense
+    // single-row packed dispatch assumes T = sum(q_i) and mis-addresses KV/RoPE/output rows for
+    // unequal q_i or nonzero past, so enable_packed_prefill only gates the chunk-limit input.
+    bool const packedPrefill = false;
     int32_t packedPrefillChunkLimit = mPackedPrefillMaxChunkTokens;
     if (mEnableProfileLocalPackedPrefill)
     {

@@ -227,6 +227,7 @@ set(PHASE_RUNTIME_CPP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseMemoryBroker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phasePrefixReuseCache.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseQueueScheduler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseRaggedMetadata.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseRuntimeCostTracker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseServingRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseThreeCoordinator.cpp"

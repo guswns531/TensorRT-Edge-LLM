@@ -21,6 +21,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/scheduling/phaseRaggedMetadata.h"
 #include "runtime/scheduling/phaseServingExecutionOptions.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/stableKVPageManager.h"
@@ -77,6 +78,9 @@ public:
 
     //! Replace request payload/completion hooks before the first dispatch.
     void setCallbacks(IndependentPhaseCoordinatorCallbacks callbacks);
+    //! Required before the first enqueuePrefill/enqueueDecode dispatch: backs the ragged RoPE gather
+    //! (prepareRaggedRope) that uploadPhaseRaggedMetadata runs for each phase step.
+    void setSharedResources(SharedResources& resources) noexcept;
 
     void enqueuePrefill(PhaseWorkItem item);
     void enqueueDecode(PhaseWorkItem item);
@@ -156,6 +160,9 @@ private:
     IndependentPhaseCoordinatorCallbacks mCallbacks;
     PhaseKVActiveView mPrefillKV;
     PhaseKVActiveView mDecodeKV;
+    PhaseRaggedMetadataBuilder mPrefillMetadata;
+    PhaseRaggedMetadataBuilder mDecodeMetadata;
+    SharedResources* mResources{};
     PhaseQueueScheduler mScheduler;
     std::unique_ptr<PhaseDispatchWorker> mWorker;
     std::vector<PhaseDispatchMetrics> mMetrics;

@@ -487,6 +487,7 @@ public:
         mCoordinator = std::make_unique<IndependentPhaseCoordinator>(phaseEngineConfig, std::move(schedulerConfig),
             *mExecutors, *mOwnership, *mPrefillIO, *mDecodeIO, mPrefillMap, mDecodeMap, mPrefillStream, mDecodeStream,
             std::move(seedCallbacks));
+        mCoordinator->setSharedResources(resources);
         mCoordinator->setPersistentDecodeSelectEnabled(mServingConfig.enablePersistentDecodeSelect);
         mCoordinator->setPersistentPageBindingsEnabled(mServingConfig.enablePersistentPageBindings);
 
@@ -592,35 +593,43 @@ public:
         cudaStream_t stream, bool prefill)
     {
         ELLM_CHECK(!views.empty(), "Phase token staging requires a non-empty batch");
-        int32_t totalTokens{};
-        for (IndependentPhaseRequestView const& view : views)
+        int32_t const numRows = static_cast<int32_t>(views.size());
+        // Entry-padded token layout: row i occupies [i*queryWidth, i*queryWidth + q_i); padding id
+        // is 0. queryWidth must match PhaseRaggedMetadataBuilder's W for the same step so token rows
+        // and ragged metadata rows agree.
+        int32_t queryWidth = 1;
+        if (prefill)
         {
-            totalTokens += prefill ? view.work.tokenCount : 1;
+            for (IndependentPhaseRequestView const& view : views)
+            {
+                queryWidth = std::max(queryWidth, view.work.tokenCount);
+            }
         }
-        Coords const tokenShape = prefill
-            ? (mEngineConfig.packedPrefill ? Coords{1, totalTokens}
-                                           : Coords{static_cast<int64_t>(views.size()), views.front().work.tokenCount})
-            : Coords{static_cast<int64_t>(views.size()), 1};
+        int32_t const totalTokens = numRows * queryWidth;
+        Coords const tokenShape = {numRows, queryWidth};
         Tensor& hostIds = prefill ? mHostPrefillIds : mHostDecodeIds;
         Tensor& deviceIds = prefill ? mDevicePrefillIds : mDeviceDecodeIds;
         ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape), "Phase token staging reshape failed");
 
         int32_t* destination = hostIds.dataPointer<int32_t>();
-        int32_t destinationOffset{};
-        for (IndependentPhaseRequestView const& view : views)
+        if (prefill && queryWidth > 1)
         {
+            std::fill_n(destination, static_cast<size_t>(totalTokens), 0);
+        }
+        for (int32_t row = 0; row < numRows; ++row)
+        {
+            IndependentPhaseRequestView const& view = views[static_cast<size_t>(row)];
             if (prefill)
             {
                 ELLM_CHECK(view.promptTokens != nullptr, "Phase prefill request has no prompt tokens");
                 std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
-                    destination + destinationOffset);
-                destinationOffset += view.work.tokenCount;
+                    destination + row * queryWidth);
             }
             else
             {
                 ELLM_CHECK(view.generatedTokens != nullptr && !view.generatedTokens->empty(),
                     "Phase decode request has no sampled input token");
-                destination[destinationOffset++] = view.generatedTokens->back();
+                destination[row] = view.generatedTokens->back();
             }
         }
         CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
@@ -628,7 +637,18 @@ public:
         Gemma4EmbeddingPreprocessor* const ple = prefill ? mPrefillPle.get() : mDecodePle.get();
         if (ple != nullptr)
         {
+            // The packed prefill PLE preprocessor is sized as one [1, maxBatch * chunk] token-major row;
+            // present the entry-padded [N, W] ids in that shape so its batch check holds.
+            bool const tokenMajorPle = prefill && mEngineConfig.packedPrefill;
+            if (tokenMajorPle)
+            {
+                ELLM_CHECK(deviceIds.reshape({1, totalTokens}), "Phase PLE token view reshape failed");
+            }
             ple->embed(deviceIds, stream);
+            if (tokenMajorPle)
+            {
+                ELLM_CHECK(deviceIds.reshape(tokenShape), "Phase PLE token view restore failed");
+            }
         }
 
         std::vector<Tensor> visionViews;
@@ -720,7 +740,9 @@ public:
                 auto const* sourceBytes = static_cast<std::byte const*>(source.rawPointer()) + copyOffset;
                 CUDA_CHECK(cudaMemcpyAsync(destination, sourceBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
             }
-            map.set(binding_names::kRopeCosSin, io.mropeCosSin);
+            // io.mropeCosSin is a per-row resident source for prepareRaggedRope's token-aligned gather
+            // (state_indices[i] = i); the engine binding stays io.raggedRopeCosSin and must not be
+            // rebound to the 3-D resident cache here.
         }
 
         if (!visionSegments.empty())

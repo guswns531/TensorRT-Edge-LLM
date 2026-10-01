@@ -3108,6 +3108,64 @@ def test_gemma4_packed_prefill_owned_and_shared_kv(head_size, sliding_window):
     _assert_cache_untouched("gemma4-packed-shared", packed_before, packed_kv)
 
 
+@pytest.mark.parametrize("head_size,sliding_window", [
+    pytest.param(256, 1024, id="gemma4-sliding-d256"),
+    pytest.param(512, -1, id="gemma4-global-d512"),
+])
+def test_gemma4_packed_prefill_unequal_entry_padded_rows(
+        head_size, sliding_window):
+    """Entry-padded unequal rows on a packed-prefill plugin match per-row runs."""
+    cfg = dict(BASE)
+    cfg.update(head_size=head_size,
+               num_q_heads=8,
+               num_kv_heads=1,
+               sliding_window_size=sliding_window,
+               kv_cache_capacity=128,
+               max_batch_size=4,
+               max_seq_len=16,
+               max_position_embeddings=128)
+    query_lengths = [3, 8, 5]
+    width = max(query_lengths)
+    p = AttentionParams(batch_size=len(query_lengths),
+                        seq_len=width,
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(4410 + head_size)
+    _, _, rope = _make_rope(p, gen)
+    qkv = torch.randn((p.batch_size, width, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV).to(torch.float16)
+    for row, length in enumerate(query_lengths):
+        qkv[row, length:] = 0
+    contexts = torch.tensor(query_lengths, dtype=torch.int32, device=DEV)
+    starts = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    _, _, packed_kv = _empty_caches(p)
+    packed = AttentionPluginRunner(p,
+                                   enable_packed_prefill=True,
+                                   packed_prefill_max_chunk_tokens=16)
+    packed_out, packed_kv = packed.run(qkv.clone(), packed_kv, contexts, rope,
+                                       starts)
+
+    for row, length in enumerate(query_lengths):
+        single = AttentionParams(batch_size=1,
+                                 seq_len=length,
+                                 is_prefill=True,
+                                 **cfg)
+        _, _, single_kv = _empty_caches(single)
+        single_out, single_kv = AttentionPluginRunner(single).run(
+            qkv[row:row + 1, :length].clone(),
+            single_kv,
+            torch.tensor([length], dtype=torch.int32, device=DEV),
+            rope,
+            torch.zeros(1, dtype=torch.int32, device=DEV),
+            input_shapes={"kv_cache_indices": (0, )})
+        assert_close(f"gemma4-unequal-row{row}-output", single_out[0],
+                     packed_out[row, :length])
+        assert_close(f"gemma4-unequal-row{row}-cache",
+                     single_kv[0, :, :, :length],
+                     packed_kv[row, :, :, :length])
+
+
 @pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [
     pytest.param(128, 8, 4, -1, id="head128_q8_kv4"),
     pytest.param(256, 16, 8, -1, id="head256_q16_kv8"),

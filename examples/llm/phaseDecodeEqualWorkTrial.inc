@@ -97,7 +97,7 @@ for (int32_t row{}; row < rows; ++row)
         stageTrialTokens(std::vector<int32_t>(static_cast<size_t>(chunk), firstIds.back()), *prefillIO, prefillPle.get(),
             true, prefillStream);
         trialPrefillKV.preparePrefillMetadata(*prefillIO, {chunk}, prefillStream, config.packedPrefill);
-        auto const dims = config.packedPrefill ? config.packedPrefillDims(1, chunk, chunk)
+        auto const dims = config.packedPrefill ? config.packedPrefillDims(1, chunk, chunk, rt::ExecutionPhase::kContextChunk)
                                               : config.prefillDims(1, chunk, rt::ExecutionPhase::kContextChunk);
         ELLM_CHECK(pair->prefillExecutor().prepare(0, dims, prefillMap, prefillStream)
                 && pair->prefillExecutor().execute(prefillStream),

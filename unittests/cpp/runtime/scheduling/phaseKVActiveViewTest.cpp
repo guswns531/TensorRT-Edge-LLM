@@ -146,7 +146,7 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     CUDA_CHECK(cudaStreamSynchronize(decodeStream));
 
     EXPECT_NE(prefillMap.get(binding_names::kKVPageTable), decodeMap.get(binding_names::kKVPageTable));
-    EXPECT_NE(prefillMap.get(binding_names::kKVCacheStartIndex), decodeMap.get(binding_names::kKVCacheStartIndex));
+    EXPECT_EQ(prefillMap.get(binding_names::kKVCacheStartIndex), &legacyLengths);
     EXPECT_EQ(prefill.pageTable().hostRow(0)[0], ownership.pages(slot2)[0]);
     EXPECT_EQ(decode.pageTable().hostRow(0)[0], ownership.pages(slot0)[0]);
     EXPECT_EQ(decode.pageTable().hostRow(1)[0], ownership.pages(slot1)[0]);

@@ -331,7 +331,7 @@ TEST_F(LLMEngineConfigTest, ParsesPackedPrefillContractAndDims)
     LLMEngineConfig const config = parseEngineConfig(path);
     EXPECT_TRUE(config.packedPrefill);
     EXPECT_EQ(config.maxPackedPrefillChunkTokens, 64);
-    InferenceDims const dims = config.packedPrefillDims(2, 96, 64);
+    InferenceDims const dims = config.packedPrefillDims(2, 96, 64, ExecutionPhase::kContextPrefill);
     EXPECT_EQ(dims.batch, 2);
     EXPECT_EQ(dims.tokenBatch, 1);
     EXPECT_EQ(dims.seqLen, 96);
@@ -362,10 +362,10 @@ TEST_F(LLMEngineConfigTest, ParsesDedicatedVisionPrefillProfileAndDims)
     EXPECT_EQ(config.visionPrefillProfile, 2);
     EXPECT_EQ(config.maxSupportedVisionPrefillBatchSize, 4);
     EXPECT_EQ(config.maxVisionPackedPrefillChunkTokens, 1024);
-    EXPECT_EQ(config.packedPrefillDims(8, 1024, 128).seqLen, 1024);
-    EXPECT_EQ(config.visionPackedPrefillDims(4, 4096, 1024).seqLen, 4096);
-    EXPECT_THROW(config.packedPrefillDims(1, 1025, 1025), std::runtime_error);
-    EXPECT_THROW(config.visionPackedPrefillDims(5, 1024, 1024), std::runtime_error);
+    EXPECT_EQ(config.packedPrefillDims(8, 1024, 128, ExecutionPhase::kContextPrefill).seqLen, 1024);
+    EXPECT_EQ(config.visionPackedPrefillDims(4, 4096, 1024, ExecutionPhase::kContextPrefill).seqLen, 4096);
+    EXPECT_THROW(config.packedPrefillDims(1, 1025, 1025, ExecutionPhase::kContextPrefill), std::runtime_error);
+    EXPECT_THROW(config.visionPackedPrefillDims(5, 1024, 1024, ExecutionPhase::kContextPrefill), std::runtime_error);
 }
 
 TEST_F(LLMEngineConfigTest, SelectsNarrowCompatibleAuxiliaryPackedPrefillProfile)
@@ -383,8 +383,8 @@ TEST_F(LLMEngineConfigTest, SelectsNarrowCompatibleAuxiliaryPackedPrefillProfile
     EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 129));
     EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(0, 128));
     EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 0));
-    EXPECT_EQ(config.visionPackedPrefillDims(8, 1024, 128).attnMaskSeqLen, 128);
-    EXPECT_EQ(config.packedPrefillDims(8, 4096, 512).attnMaskSeqLen, 512);
+    EXPECT_EQ(config.visionPackedPrefillDims(8, 1024, 128, ExecutionPhase::kContextPrefill).attnMaskSeqLen, 128);
+    EXPECT_EQ(config.packedPrefillDims(8, 4096, 512, ExecutionPhase::kContextPrefill).attnMaskSeqLen, 512);
 
     config.maxVisionPackedPrefillChunkTokens = 512;
     EXPECT_FALSE(config.prefersAuxiliaryPackedPrefillProfile(8, 128));
@@ -438,8 +438,8 @@ TEST_F(LLMEngineConfigTest, ParsesProfileLocalPackedPrefillChunkLimits)
 
     LLMEngineConfig const config = parseEngineConfig(path);
     EXPECT_TRUE(config.profileLocalPackedPrefillChunkLimit);
-    EXPECT_EQ(config.packedPrefillDims(8, 768, 96).attnMaskSeqLen, 128);
-    EXPECT_EQ(config.visionPackedPrefillDims(4, 3072, 768).attnMaskSeqLen, 1024);
+    EXPECT_EQ(config.packedPrefillDims(8, 768, 96, ExecutionPhase::kContextPrefill).attnMaskSeqLen, 128);
+    EXPECT_EQ(config.visionPackedPrefillDims(4, 3072, 768, ExecutionPhase::kContextPrefill).attnMaskSeqLen, 1024);
 }
 
 TEST_F(LLMEngineConfigTest, RejectsPartialVisionPrefillProfileMetadata)

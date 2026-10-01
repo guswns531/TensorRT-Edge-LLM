@@ -61,6 +61,10 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mCallbacks(std::move(callbacks))
     , mPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "independent_coordinator_prefill")
     , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
+    , mPrefillMetadata(std::max(config.maxSupportedPrefillBatchSize, config.maxSupportedVisionPrefillBatchSize),
+          std::max(config.maxSupportedPrefillBatchSize * std::max(config.maxPackedPrefillChunkTokens, 1),
+              config.maxSupportedVisionPrefillBatchSize * std::max(config.maxVisionPackedPrefillChunkTokens, 1)))
+    , mDecodeMetadata(config.maxSupportedDecodeBatchSize, config.maxSupportedDecodeBatchSize)
     , mScheduler(std::move(schedulerConfig))
 {
     ELLM_CHECK(config.kvPoolPages > 0, "Independent phase coordinator requires a paged-KV engine");
@@ -116,6 +120,11 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
         }
         return PhaseExecutionVariant::kEager;
     });
+}
+
+void IndependentPhaseCoordinator::setSharedResources(SharedResources& resources) noexcept
+{
+    mResources = &resources;
 }
 
 void IndependentPhaseCoordinator::setCallbacks(IndependentPhaseCoordinatorCallbacks callbacks)
@@ -192,19 +201,21 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
     ELLM_CHECK(std::all_of(batch.begin(), batch.end(),
                    [prefillClass](PhaseWorkItem const& item) { return item.prefillClass == prefillClass; }),
         "Independent prefill batch cannot mix producer classes");
+    ELLM_CHECK(mResources != nullptr, "Independent prefill enqueue requires setSharedResources() before dispatch");
     bool const externalPrefill = prefillClass == PhasePrefillClass::kExternal;
     std::vector<int32_t> slots;
     std::vector<int32_t> chunks;
-    int32_t totalTokens{};
+    std::vector<PhaseRaggedSequence> rows;
+    rows.reserve(batch.size());
     for (PhaseWorkItem const& item : batch)
     {
         slots.push_back(item.kvSlotId);
         chunks.push_back(item.tokenCount);
-        totalTokens += item.tokenCount;
+        rows.push_back(PhaseRaggedSequence{item.requestId, mOwnership.length(item.kvSlotId), item.tokenCount});
         mOwnership.ensureCapacity(item.kvSlotId, mOwnership.length(item.kvSlotId) + item.tokenCount);
     }
     mPrefillKV.prepare(slots, stream);
-    int32_t const chunkLength = chunks.front();
+    int32_t const numSequences = static_cast<int32_t>(batch.size());
     int32_t const maxRowTokens = *std::max_element(chunks.begin(), chunks.end());
     bool const auxiliaryProfileFits = mConfig.hasVisionPrefillProfile()
         && static_cast<int64_t>(batch.size()) <= mConfig.maxSupportedVisionPrefillBatchSize
@@ -220,16 +231,12 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
     ELLM_CHECK(profileIndex >= 0, "Selected prefill profile is not configured");
     EngineExecutor& executor
         = useExternalExecutor ? mExecutors.externalPrefillExecutor() : mExecutors.prefillExecutor();
-    if (!mConfig.packedPrefill)
-    {
-        ELLM_CHECK(
-            std::all_of(chunks.begin(), chunks.end(), [chunkLength](int32_t value) { return value == chunkLength; }),
-            "Independent dense prefill batch requires one uniform chunk length");
-    }
-    Coords const inputShape = mConfig.packedPrefill
-        ? Coords{1, totalTokens, mConfig.hiddenSize}
-        : Coords{static_cast<int64_t>(batch.size()), chunkLength, mConfig.hiddenSize};
-    ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape(inputShape), "Independent prefill embedding reshape failed");
+
+    // Entry-padded carrier: sequence i occupies physical rows [i*W, i*W + q_i) of T = N*W.
+    int32_t const queryWidth = phaseRaggedQueryWidth(rows);
+    int64_t const physicalTokens = static_cast<int64_t>(numSequences) * queryWidth;
+    ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape({physicalTokens, mConfig.hiddenSize}),
+        "Independent prefill embedding reshape failed");
     if (mCallbacks.stagePrefill)
     {
         mCallbacks.stagePrefill(batch, mPrefillIO, stream);
@@ -239,19 +246,19 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
         CUDA_CHECK(cudaMemsetAsync(
             mPrefillIO.inputsEmbeds.rawPointer(), 0, mPrefillIO.inputsEmbeds.getMemoryCapacity(), stream));
     }
-    mPrefillKV.preparePrefillMetadata(mPrefillIO, chunks, stream, mConfig.packedPrefill);
-    bool const initialPrefill
-        = std::all_of(batch.begin(), batch.end(), [](PhaseWorkItem const& item) { return item.tokenOffset == 0; });
+    RaggedExecutionBatch const& raggedBatch = mPrefillMetadata.build(SequenceWork::kContext, rows);
+    // The RoPE gather in uploadPhaseRaggedMetadata reads io.mropeCosSin, which the stage callback
+    // above fills per active row; it must run after staging, on the same stream.
+    uploadPhaseRaggedMetadata(mPrefillIO, *mResources, mConfig, raggedBatch, stream);
+    ExecutionPhase const phase = mPrefillMetadata.executionPhase();
     InferenceDims const dims = mConfig.packedPrefill
         ? (auxiliaryPrefill && mConfig.hasVisionPrefillProfile()
-                  ? mConfig.visionPackedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens)
-                  : mConfig.packedPrefillDims(static_cast<int64_t>(batch.size()), totalTokens, maxRowTokens))
-        : mConfig.prefillDims(static_cast<int64_t>(batch.size()), chunkLength,
-              initialPrefill ? ExecutionPhase::kContextPrefill : ExecutionPhase::kContextChunk);
+                  ? mConfig.visionPackedPrefillDims(numSequences, physicalTokens, queryWidth, phase)
+                  : mConfig.packedPrefillDims(numSequences, physicalTokens, queryWidth, phase))
+        : mConfig.prefillDims(numSequences, queryWidth, phase);
     ELLM_CHECK(executor.prepare(profileIndex, dims, mPrefillMap, stream), "Independent prefill prepare failed");
-    int32_t const graphTokens = mConfig.packedPrefill ? totalTokens : chunkLength;
     std::string const graphShape
-        = std::to_string(profileIndex) + ":" + std::to_string(batch.size()) + ":" + std::to_string(graphTokens);
+        = std::to_string(profileIndex) + ":" + std::to_string(numSequences) + ":" + std::to_string(physicalTokens);
     if (mGraphCaptureEnabled && mCapturedPrefillShapes.find(graphShape) == mCapturedPrefillShapes.end()
         && mCapturedPrefillShapes.size() < mMaxPrefillGraphs
         && ++mPrefillGraphShapeObservations[graphShape] >= mGraphCaptureMinObservations)

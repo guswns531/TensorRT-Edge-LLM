@@ -971,8 +971,8 @@ int main(int argc, char** argv)
             decodeKV.prepareDecodeMetadata(*decodeIO, decodeStream);
 
             rt::InferenceDims const prefillDims = config.packedPrefill
-                ? config.packedPrefillDims(
-                      static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens, /*maxRowTokens=*/96)
+                ? config.packedPrefillDims(static_cast<int64_t>(prefillSlots.size()), prefillTotalTokens,
+                      /*maxRowTokens=*/96, rt::ExecutionPhase::kContextPrefill)
                 : config.prefillDims(1, prefillTotalTokens, rt::ExecutionPhase::kContextChunk);
             ELLM_CHECK(pair->prefillExecutor().prepare(0, prefillDims, prefillMap, prefillStream),
                 "Failed to bind the stable paged-KV prefill view");
@@ -1065,8 +1065,10 @@ int main(int argc, char** argv)
                 }
                 prefillKV.preparePrefillMetadata(*prefillIO, {visionWarmupTokens}, prefillStream, true);
                 rt::InferenceDims const externalDims = config.hasVisionPrefillProfile()
-                    ? config.visionPackedPrefillDims(1, visionWarmupTokens, visionWarmupTokens)
-                    : config.packedPrefillDims(1, visionWarmupTokens, visionWarmupTokens);
+                    ? config.visionPackedPrefillDims(
+                          1, visionWarmupTokens, visionWarmupTokens, rt::ExecutionPhase::kContextPrefill)
+                    : config.packedPrefillDims(
+                          1, visionWarmupTokens, visionWarmupTokens, rt::ExecutionPhase::kContextPrefill);
                 ELLM_CHECK(pair->externalPrefillExecutor().prepare(
                                pair->externalPrefillProfile(), externalDims, prefillMap, prefillStream),
                     "Failed to prepare the external-prefill profile warmup");
@@ -1097,8 +1099,9 @@ int main(int argc, char** argv)
                         "Failed to reshape isolated external-prefill embeddings");
                     prefillKV.preparePrefillMetadata(*prefillIO, {benchTokens}, prefillStream, true);
                     rt::InferenceDims const benchDims = config.hasVisionPrefillProfile()
-                        ? config.visionPackedPrefillDims(1, benchTokens, benchTokens)
-                        : config.packedPrefillDims(1, benchTokens, benchTokens);
+                        ? config.visionPackedPrefillDims(
+                              1, benchTokens, benchTokens, rt::ExecutionPhase::kContextPrefill)
+                        : config.packedPrefillDims(1, benchTokens, benchTokens, rt::ExecutionPhase::kContextPrefill);
                     ELLM_CHECK(pair->externalPrefillExecutor().prepare(
                                    pair->externalPrefillProfile(), benchDims, prefillMap, prefillStream),
                         "Failed to prepare the isolated external-prefill benchmark");
