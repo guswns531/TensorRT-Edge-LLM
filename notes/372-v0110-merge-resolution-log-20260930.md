@@ -1654,3 +1654,76 @@ was filed against should be gone (registry and engine IO now match). However, gi
 above, decode continuation length and packed-prefill chunking are very likely to still be wrong — watch for
 wrong-length KV reads (garbage/short context) or wrong logits selection on packed prefill, rather than a
 crash, as the next failure mode.
+
+## W016 D: decode ragged wiring
+
+Package D (decode path) of the v0.11.0 ragged-ABI port, scoped to `cpp/runtime/scheduling/{phaseKVActiveView,
+independentPhaseCoordinator,phaseServingRuntime}.cpp` decode functions plus a new shared helper. Spec:
+`.local/scratch/W016-upstream-v0110-port/ragged-metadata-spec.md`. Did not touch prefill staging/
+`enqueuePrefillBatch`/`preparePrefillMetadata`/the attention plugin packed-prefill path (owned by the parallel
+prefill engineer).
+
+Commits: `8e7a4366` (`feat: Add phase ragged metadata builder`, new `cpp/runtime/scheduling/
+phaseRaggedMetadata.{h,cpp}` + `phaseRaggedMetadataTest.cpp` — intended to be cherry-picked by the prefill
+engineer too, since both phases need it), `7deba13a` (`fix: Fill decode ragged metadata and swap the SWA page
+table` — `PhaseKVActiveView`, `IndependentPhaseCoordinator` decode functions, `PhaseServingRuntime::Impl`
+constructor/`stageTokens` decode branch, `phaseKVActiveViewTest.cpp`).
+
+### Decode mapping table (ragged input -> formula/source)
+
+| input | decode formula | where it's written |
+|---|---|---|
+| `past_lengths` | `P_i = StableKVPageManager::length(slot_i)` captured before `ensureCapacity` | `PhaseRaggedSequence::pastLength` in `enqueueDecodeBatch`/`primeDecodeGraphs` |
+| `query_lengths` | `1` | `PhaseRaggedMetadataBuilder::build` (decode requires `q_i==1`) |
+| `attention_sequence_lengths` | `P_i + 1` | `build()` |
+| `positions` | `P_i` (one row per sequence, `W=1`) | `build()` |
+| `query_start_offsets` | `[0,1,...,N]` | `build()` |
+| `state_indices` | `i` (active row; phase page table and M-RoPE rows are active-row indexed) | `build()` |
+| `logits_indices` | `i` | `build()` |
+| `execution_phase_marker`, `context_sequence_count_carrier` | extents only, from `LLMEngineConfig::decodeDims(B)` (unchanged) | existing `decodeDims` recipe |
+| `kv_page_table` | `pages(slot_i)` via `StableKVPageManager::bindActiveRows` | `PhaseKVActiveView::prepare` (already correct pre-fix) |
+| `swa_kv_page_table` | same active-row table as `kv_page_table` (current engines run full-SWA, so the two names must alias the same rows) | `PhaseKVActiveView::prepare`/`restoreBindings`, now swapped/restored like `kv_page_table` when the map has that binding |
+| `rope_rotary_cos_sin[,_sliding,_full]` | token-aligned gather of the resident RoPE table/pool at position `P_i`, by `prepareRaggedRope` | `uploadPhaseRaggedMetadata` (calls `PipelineIO::uploadRaggedMetadata` + `prepareRaggedRope`), called after `stageDecode` so `io.mropeCosSin[row]` is already current for M-RoPE models |
+| `kvcache_start_index` (legacy fork ABI only) | unchanged (`P_i`) via `mDeviceLengths` | `PhaseKVActiveView::prepare`, now gated on `mTensorMap.get(kKVCacheStartIndex) != nullptr` instead of required |
+
+`IndependentPhaseCoordinator` now takes a `SharedResources&` (added to its constructor and
+`PhaseServingRuntime::Impl`'s single call site) to run `prepareRaggedRope`'s RoPE-pool gather. The engine's
+RoPE source tables are pre-created on `setupStream` in the constructor before the existing
+`cudaStreamSynchronize(setupStream)`, so decode's first step (including CUDA-graph warm-up) never creates one
+lazily on the decode stream. `stageTokens`'s decode branch no longer rebinds `rope_rotary_cos_sin` to the dense
+`io.mropeCosSin` resident cache (the ragged binding now stays on `io.raggedRopeCosSin`); the prefill branch is
+untouched and still does the old rebind, which is the prefill engineer's item to migrate per the spec.
+
+### Unit tests
+
+`unittests/cpp/runtime/scheduling/phaseRaggedMetadataTest.cpp` (new, 6 cases: decode per-row past lengths,
+entry-padded prefill rows, chunk-continuation phase selection, degenerate single-sequence prefill, input
+validation, query-width helper) and one new case in `phaseKVActiveViewTest.cpp`
+(`RaggedAbiMapNeedsNoKvcacheStartIndexAndSwapsSwaPageTable`: a map with only `kv_page_table` +
+`swa_kv_page_table` bound, no `kvcache_start_index`, two non-contiguous stable slots with different committed
+lengths — asserts `prepare()` does not require the legacy binding, both page-table names swap to the same
+active-row table, and `complete()` restores both). Existing `phaseKVActiveViewTest.cpp` legacy-ABI case
+(`GivesConcurrentPhasesIndependentBindingsOverSharedPages`, still using `kvcache_start_index`) is unchanged and
+still passes, confirming fork-ABI engines keep working.
+
+Built in-container exactly as specified (`cmake -DCMAKE_CUDA_ARCHITECTURES=86 ... -DBUILD_UNIT_TESTS=ON` +
+`cmake --build ... --target unitTests`), zero compiler errors. `unitTestRuntime --gtest_filter=
+"PhaseRaggedMetadataTest.*:PhaseKVActiveViewTest.*"`: 9 passed, 1 opt-in benchmark skipped. Ran the full
+`unitTests` target's executables; see the handback report for the aggregate pass/fail count (test run was
+in flight when this note was written).
+
+### What the coordinator should expect at serving time
+
+The decode CUDA-graph warm-up should no longer read undefined `logits_indices`/`past_lengths`/
+`attention_sequence_lengths`/RoPE rows/the SWA-aliased page table — the specific crash this package was filed
+against (Myelin "Platform (Cuda) error" for Gemma, illegal memory access for Cosmos, both at decode graph
+capture) should be gone for decode specifically. Caveats carried over from the spec that remain **prefill's**
+responsibility and are not fixed by this package: packed-prefill's physical layout vs. the entry-padded ABI
+(spec §5.7, P0 — this can still crash or corrupt prefill), the PLE token-major view under entry padding (§5.2),
+Cosmos's `rope_rotary_cos_sin` rebind in the prefill branch of `stageTokens` (§1.3, still present), and forcing
+full SWA storage mode for phase serving (§3 row 4, not done by D or P yet — today's Gemma engine happens to
+land in full mode only because `num_swa_pages 264 > max_kv_pool_pages 192`, not because the phase runtime
+enforces it). If the coordinator's serving run still crashes, the first place to look is whichever of those
+prefill-side gaps is still open, or `compute-sanitizer --tool memcheck` on the decode warm-up specifically to
+confirm no plugin kernel the test suite can't reach (XQA, RoPE-KV write) is still reading stale page-table
+content on real engines.
