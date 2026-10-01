@@ -183,6 +183,14 @@ TEST(EngineExecutorTest, PackedPrefillCarrierRelations)
     dims.queryOffsetLen = 3;
     EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, true));
     dims.queryOffsetLen = 4;
+    InferenceDims single = dims;
+    single.batch = 1;
+    single.seqLen = 37;
+    single.selectLen = 1;
+    single.startIndexLen = 1;
+    single.queryOffsetLen = 2;
+    single.contextSequenceCount = 1;
+    EXPECT_TRUE(validateRaggedInferenceDims(single, /*profileIndex=*/0, false, true));
     dims.seqLen = 2;
     EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, true));
     dims.seqLen = 50;

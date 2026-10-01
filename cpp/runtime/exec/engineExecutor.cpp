@@ -38,7 +38,7 @@ bool validateRaggedInferenceDims(InferenceDims const& dims, int32_t profileIndex
     bool packedPrefillCarrier) noexcept
 {
     auto const packedPhase = static_cast<ExecutionPhase>(dims.executionPhaseLen);
-    if (packedPrefillCarrier && dims.tokenBatch == 1 && dims.batch > 1
+    if (packedPrefillCarrier && dims.tokenBatch == 1 && dims.batch > 0
         && (packedPhase == ExecutionPhase::kContextPrefill || packedPhase == ExecutionPhase::kContextChunk))
     {
         return dims.seqLen >= dims.batch && dims.queryOffsetLen == dims.batch + 1 && dims.selectLen == dims.batch
@@ -313,7 +313,13 @@ bool TrtEngineExecutor::prepare(
         && !validateRaggedInferenceDims(
             dims, profileIndex, hasIndependentDeltaPortal, mRegistry.contains(binding_names::kPackedPrefillChunkLimit)))
     {
-        LOG_ERROR("EngineExecutor::prepare: inconsistent ragged step dimensions for profile %d", profileIndex);
+        LOG_ERROR(
+            "EngineExecutor::prepare: inconsistent ragged step dimensions for profile %d (batch=%lld tokenBatch=%lld "
+            "seqLen=%lld selectLen=%lld attnMaskSeqLen=%lld queryOffsetLen=%lld contextSequenceCount=%lld phase=%lld)",
+            profileIndex, static_cast<long long>(dims.batch), static_cast<long long>(dims.tokenBatch),
+            static_cast<long long>(dims.seqLen), static_cast<long long>(dims.selectLen),
+            static_cast<long long>(dims.attnMaskSeqLen), static_cast<long long>(dims.queryOffsetLen),
+            static_cast<long long>(dims.contextSequenceCount), static_cast<long long>(dims.executionPhaseLen));
         return false;
     }
     if (auto bad = firstInvalidMember(dims, mRegistry.referencedMembers()); bad != nullptr)
