@@ -1507,3 +1507,42 @@ unitTestKernelsMoe (skips only), unitTestKernelsSpeculative 114/114, unitTestKer
 only), unitTestPlugins 24/25 (1 skipped, NCCL multi-rank), unitTestCuteDslKernels 59/59,
 unitTestScheduler 59/59, unitTestExamples 3/3. 0 failures, all exit codes 0 — no regressions from
 this pass's fix.
+
+## Milestone 2: serving bring-up
+
+### Failure 1 (Gemma): PhaseKVActiveView "requires existing length and page-table bindings" — ROOT CAUSE FOUND, FIXED
+
+`PhaseKVActiveView::prepare()` (`cpp/runtime/scheduling/phaseKVActiveView.cpp:58-60`) does
+`mTensorMap.get(kKVCacheStartIndex)` / `get(kKVPageTable)` and requires both non-null before it swaps in the
+phase-local active view and restores them on `complete()`/dtor.
+
+Pre-port (`fca7bd0:cpp/runtime/state/pipelineIO.cpp:266`) the main-path `buildTensorMap` set both bindings:
+```
+map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
+map.set(binding_names::kKVPageTable, res.kvPageTables[kvCacheIndex]->kernelView());
+```
+During the Pass 2 merge of `pipelineIO.cpp` (documented in this note's PipelineIO section above), the ragged-ABI
+rewrite of `buildTensorMapImpl` kept the `kKVPageTable` set (now `io.raggedKVPageTable`) but silently dropped the
+`kKVCacheStartIndex` line — it was not called out as RISK in the original pass because `kKVCacheStartIndex` is
+still registered in the registry spec (`registryBuilder.cpp:150`) and still read/written inside
+`phaseKVActiveView.cpp`/`packedPrefillActiveView.cpp` themselves, so grepping for the name alone didn't surface
+the gap; only tracing what populates the TensorMap *before* those views' `prepare()` call did.
+
+Fix (commit `3c5e8841`, `cpp/runtime/state/pipelineIO.cpp`): re-added
+`map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());` in `buildTensorMapImpl`, immediately
+before the `kKVPageTable` set, using the same `cacheMgr` already in scope. This is the single call site that
+feeds the main LLM (Gemma) tensor map; spec-decode draft paths (`dflashDecoder.cpp`, `dsparkDecoder.cpp`) already
+set `kKVCacheStartIndex` directly into their own draft `TensorMap`s and were unaffected.
+
+Verified: full `cmake --build .local/builds/v0110-port -j16` in the TRT 26.06 container is clean (no errors,
+all 12 unit-test executables + `llm_phase_context_smoke` relink). Pre-commit (`clang-format`/`codespell`/license)
+passes on the changed file. Not yet re-run against a live GPU repro cell (budget-limited this pass) — next pass
+should run `benchmarks/phase_serving/run_lifetime_encoded_admission.py --models gemma --workloads short
+--variants independent ...` per the task's repro recipe against a fresh `--binary-source-commit 3c5e8841` build
+to confirm the active-view check no longer fires, then proceed to the Cosmos OOM (failure 2, not yet
+investigated this pass beyond the Pass 2 note's own flag that `createForLLMPhase` double-allocates dense +
+full-ragged `PipelineIO` buffers per phase context — that duplication is the prime suspect for failure 2 and is
+still open).
+
+Open for next pass: failure 2 (Cosmos `cudaMalloc` OOM) — not started. 12-executable unit-test run and
+per-cell gateway smoke (vs note 369 medians) also not run this pass.
