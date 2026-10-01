@@ -27,20 +27,21 @@ Keep `.local` bounded by reference- and state-driven retention (never age), whil
     `atomic-packed-vision-runtime-20260824` → `artifacts/legacy/` with compatibility links in `retention.json`;
     `notes/*.csv` → `results/legacy/notes-csv/`.
   - `.local/README.md` rewritten for the current store layout.
-- Note 371 cites `.local/scratch/v0110-upstream-serve-20260930/`; `v0110-*` scratch was left in place because the
-  v0.11.0 merge in `.local/worktrees/v0110-port` was still writing there.
+- Port scratch grouped into `scratch/W016-upstream-v0110-port/` (links kept for `v0110-port-dbg`, `v0110-port-m2`);
+  note 371's evidence promoted to `results/v0110-upstream-serving-20260930/driver/` with a link at the old path.
+- `results/v0101-forward-port/` has a store-level `manifest.json`: 64 entries cited (diagnostic), 99 uncited
+  (scratch, 224 MiB).
+- `scripts/write_result_manifest.py` (`start`/`finish`) writes the runner manifest schema for ad-hoc drivers.
 
 ## Conclusions
 - 309 — Retention classes and protected active artifacts defined; engines (not logs) were the disk driver; first allowlist cleanup and per-model `current` pointers.
 - 370 — Reference-driven latest-only cleanup with keep rules, plan, apply script and deletion record; older notes may cite deleted data.
 
 ## Open questions
-- After the v0.11.0 merge settles: move `scratch/v0110-*` into `scratch/W016-upstream-v0110-port/` and promote
-  `scratch/v0110-upstream-serve-20260930` (cited by note 371) into `.local/results/`.
-- Shared manifest writer in `scripts/` so ad-hoc campaign drivers record identity at start (skill rule; not built).
-- `results/v0101-forward-port/` (164 v0.10.1-era runs, no per-run manifests) and the incomplete
-  `cosmos-reason2-2b/v010-onnx-fp16-packed-tied-atomic1024/`: keep or delete needs a user decision.
-- Worktree `.local/worktrees/v0110-port` is a second development worktree, which `AGENTS.md` does not list.
+- Delete the 99 uncited `results/v0101-forward-port/` entries (224 MiB) and the incomplete
+  `cosmos-reason2-2b/v010-onnx-fp16-packed-tied-atomic1024/` (1.9 MiB)? Needs user approval.
+- `AGENTS.md` still names the repository root as the only active development worktree while
+  `.local/worktrees/v0110-port` is in active development; resolve when deciding whether to move work to v0.11.0.
 
 ## Artifacts
 - `.local/registry/cleanup-plan-20260930.json` (present)
@@ -50,5 +51,6 @@ Keep `.local` bounded by reference- and state-driven retention (never age), whil
 - `.local/current/active` (present; resolves to `.local/current/gemma4`)
 - `.local/README.md` (present; rewritten 2026-10-01)
 - `.local/registry/relocation-20261001.tsv` (present)
+- `scripts/write_result_manifest.py`, `.local/results/v0101-forward-port/manifest.json` (present)
 - `notes/work/README.md`, `.claude/skills/workspace-lifecycle/SKILL.md` (present)
 - `.local/results/cleanup-20260915` (deleted; note 370)

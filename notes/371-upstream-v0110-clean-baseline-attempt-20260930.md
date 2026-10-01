@@ -47,7 +47,7 @@ Stock published wheel `tensorrt-edgellm[server]==0.11.0`, `--enable-in-flight-ba
 (Gemma 4, Cosmos 8), `--max-queued-requests 256`, fixed output through the upstream runtime switch
 `EDGELLM_IGNORE_EOS=1` on the server process (the HTTP schema forbids `ignore_eos`; verified: a one-word prompt runs
 to exactly `max_tokens`). Client: the frozen vLLM trace client with `return_token_ids`/`ignore_eos` removed from the
-payload and `/version`/`/metrics` optional (`.local/scratch/v0110-upstream-serve-20260930/`), same traces, warmup,
+payload and `/version`/`/metrics` optional (`.local/results/v0110-upstream-serving-20260930/driver/`), same traces, warmup,
 and in-flight limits as the frozen vLLM contract (Gemma 24 / warmup 8, Cosmos 64 / warmup 64). One run per cell;
 every request returned 200 at exactly its requested length. Seven Cosmos vision cells were rerun after a first pass
 rejected their absolute host image paths (media root allowed only under `/workspace`). "Ours" is the tip full24 x3

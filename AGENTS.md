@@ -31,6 +31,9 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 - `.local/worktrees/v0100-reference` on `codex/v010-phase-forward-port` is the frozen modified-v0.10.0 reference.
   `.local/worktrees/upstream-v0101` is the detached clean-v0.10.1 baseline, and
   `.local/worktrees/upstream-v091` is the detached historical v0.9.1 baseline. Comparison worktrees are read-only.
+  `.local/worktrees/v0110-port` on `codex/v0110-phase-forward-port` is the in-progress v0.11.0 port, and
+  `.local/worktrees/upstream-v0110` is the detached clean-v0.11.0 baseline. Notes on all development branches share
+  one `NNN` sequence.
 - Treat source worktrees and generated artifacts as different retention classes. Everything under
   `.local/worktrees/` is protected from artifact cleanup. Keep modified lineages committed and pushed; never leave
   the only copy of a source change as untracked work under `.local/`.

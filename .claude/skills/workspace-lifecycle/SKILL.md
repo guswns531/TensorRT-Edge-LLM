@@ -96,7 +96,9 @@ Promotion changes a status or adds a record. It never moves a path that is alrea
 `state`, the command and config, source commit and dirty state, binary/runner/plugin and engine identity,
 workload, repeat count, and summary paths (see an existing manifest for the schema). Write the manifest when the
 campaign starts, not afterwards, and copy the driver script into the result directory (for example `run.sh`): a
-driver that exists only in scratch is lost at the next scratch cleanup. A result directory without a manifest is
+driver that exists only in scratch is lost at the next scratch cleanup. Runners in `benchmarks/phase_serving/`
+that write their own manifest need nothing more; an ad-hoc driver calls `scripts/write_result_manifest.py start`
+before its first measurement and `finish` after its last. A result directory without a manifest is
 treated as `scratch`. States follow
 `.local/registry/retention.json`: `scratch` → `diagnostic` → `validation` → `citable`. Promoting a result
 means raising `state` and, if it is part of the current reference set, adding a link under
