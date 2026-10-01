@@ -329,10 +329,12 @@ struct LLMEngineConfig
 
     //! Packed text prefill dims. Tokens use a [1,totalTokens,*] carrier while
     //! context lengths, page-table rows, and KV starts retain logicalBatch rows.
-    InferenceDims packedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
+    InferenceDims packedPrefillDims(
+        int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, ExecutionPhase phase) const;
 
     //! Packed prefill dims using the optional auxiliary profile's limits.
-    InferenceDims visionPackedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const;
+    InferenceDims visionPackedPrefillDims(
+        int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, ExecutionPhase phase) const;
 
     //! Whether a compatible auxiliary profile has a smaller maximum token carrier than the primary profile.
     bool prefersAuxiliaryPackedPrefillProfile(int64_t logicalBatch, int64_t maxRowTokens) const noexcept;
@@ -378,8 +380,8 @@ struct LLMEngineConfig
     InferenceDims resetDims() const;
 
 private:
-    InferenceDims packedPrefillDimsWithLimits(
-        int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const;
+    InferenceDims packedPrefillDimsWithLimits(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens,
+        int32_t batchLimit, int32_t chunkLimit, ExecutionPhase phase) const;
 };
 
 //! Parse a `config.json` file (the same format used by the existing runtime)

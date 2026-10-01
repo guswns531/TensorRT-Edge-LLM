@@ -159,6 +159,7 @@ private:
     PhaseKVActiveView mPrefillKV;
     PhaseKVActiveView mDecodeKV;
     SharedResources& mResources;
+    PhaseRaggedMetadataBuilder mPrefillRaggedMetadata;
     PhaseRaggedMetadataBuilder mDecodeRaggedMetadata;
     PhaseQueueScheduler mScheduler;
     std::unique_ptr<PhaseDispatchWorker> mWorker;

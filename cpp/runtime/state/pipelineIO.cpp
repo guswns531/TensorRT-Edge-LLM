@@ -559,8 +559,7 @@ static void buildTensorMapImpl(
         }
     }
 
-    // kvcache_start_index: PhaseKVActiveView::prepare() requires this binding to already be present
-    // (it swaps it out for the phase-local active-row view and restores it on complete()).
+    // Legacy fork-ABI binding: registered only when the engine exposes it (engineExecutor.cpp).
     map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
 
     // The full table is always present. Bounded mode uses the independent sparse SWA namespace;

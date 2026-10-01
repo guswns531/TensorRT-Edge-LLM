@@ -1727,3 +1727,129 @@ enforces it). If the coordinator's serving run still crashes, the first place to
 prefill-side gaps is still open, or `compute-sanitizer --tool memcheck` on the decode warm-up specifically to
 confirm no plugin kernel the test suite can't reach (XQA, RoPE-KV write) is still reading stale page-table
 content on real engines.
+
+## W016 P: prefill ragged wiring
+
+Branch `codex/v0110-port-prefill`, code commit `bcdf7be0` (on port HEAD `4bdb0c57`). Spec followed:
+`.local/scratch/W016-upstream-v0110-port/ragged-metadata-spec.md` §2.2, §3 rows 1-12, §4.2, §5.5-5.8.
+
+### Addressing decision: state_indices / kv_page_table / swa_kv_page_table
+
+**Compacted active rows, not stable-slot ids.** For a phase step whose batch lists stable slots
+`s_0..s_{N-1}` (scheduler order):
+
+- `kv_page_table` row `i` holds `StableKVPageManager::pages(s_i)` (written by
+  `PhaseKVActiveView::bindActiveRows` into the view's private `[maxActiveRows, 2, M]` table).
+- `swa_kv_page_table` is bound to that same active-row table (full SWA mode only; the phase runtime
+  has no bounded-SWA page manager).
+- `state_indices[i] = i`. The attention plugin indexes the page table by sequence index `i`
+  (`kvPageTable.d[0] == N`); `state_indices` is consumed only by `prepareRaggedRope`'s M-RoPE gather
+  from `io.mropeCosSin[i]`, which `stageTokens` fills per active row.
+- `logits_indices[i]` / logits row `i` belong to phase row `i`; `submitSampling` maps them back
+  through `phaseBatchRow`.
+
+The decode branch (`7deba13a`, note section from `15411914`) uses the same convention.
+
+### Prefill ragged-input mapping
+
+Layout: entry-padded. `W = max q_i`, `T = N*W`; sequence `i` owns physical rows `[i*W, i*W + q_i)`;
+padding rows have token id 0 and position -1. `P_i = StableKVPageManager::length(s_i)` is read
+before `ensureCapacity`; `q_i = PhaseWorkItem::tokenCount`.
+
+| Input | Semantics | (a) initial, unequal | (b) chunk continuation | (c) single sequence | (d) vision profile |
+|---|---|---|---|---|---|
+| `inputs_embeds` `[T,H]` | token-major embeddings | `T = N*W`, staged `{N,W}` ids | same | `T = q` | same; vision/deepstack segments counted from prompt tokens, so padding id 0 does not shift image rows |
+| `positions` `[T]` | absolute position per row | `t` / -1 | `P_i + t` / -1 | `P + t` | as (a)/(b) |
+| `query_start_offsets` `[N+1]` | row starts | `i*W`, last `T` | same | `{0, q}` | same |
+| `query_lengths` `[N]` | tokens executed | `q_i` | `q_i` | `q` | `q_i` |
+| `past_lengths` `[N]` | committed KV before step | 0 | `P_i` | `P` | `P_i` |
+| `attention_sequence_lengths` `[N]` | KV visible after step | `q_i` | `P_i + q_i` | `P + q` | `P_i + q_i` |
+| `state_indices` `[N]` | M-RoPE source row | `i` | `i` | 0 | `i` |
+| `execution_phase_marker` extent | phase carrier | 1 (context prefill) | 2 (context chunk if any `P_i > 0`) | 1 or 2 | 1 or 2 |
+| `context_sequence_count_carrier` extent | context sequences | `N` | `N` | 1 | `N` |
+| `logits_indices` `[N]` | last valid row per sequence | `i*W + q_i - 1` | same | `q - 1` | same |
+| `rope_rotary_cos_sin{,_sliding,_full}` `[T,rot]` | token-aligned rows | gathered by `positions` (`prepareRaggedRope`) | same | same | Cosmos: gathered from `io.mropeCosSin[i]`; the binding stays `io.raggedRopeCosSin` |
+| `kv_page_table`, `swa_kv_page_table` | page rows | active-row table (above) | same | same | same |
+| `swa_kv_cache_mode` | full/bounded shape | `[0]` (full) | same | same | same |
+| `packed_prefill_chunk_limit` extent | profile chunk cap | `maxPackedPrefillChunkTokens` | same | same | `maxVisionPackedPrefillChunkTokens` (profile `visionPrefillProfile`) |
+| `ple_token_embeds_*` | token-major PLE | `embed` on a `{1,T}` view of the padded ids | same | same | same |
+| `deepstack_embeds_*` | Cosmos deepstack | written from the `{N,W}` ids | same | same | same |
+| `kvcache_start_index`, `last_token_ids` | legacy fork ABI | not bound; registered only if the engine has them | | | |
+
+Order on the prefill stream: `PhaseKVActiveView::prepare` -> reshape `inputs_embeds` to `[T,H]` ->
+stage callback (ids, embeddings, PLE, M-RoPE rows) -> `build(kContext)` + `uploadPhaseRaggedMetadata`
+-> `packedPrefillDims` / `visionPackedPrefillDims(N, T, W, phase)` -> prepare/capture/execute.
+The graph key is `profile:N:T`.
+
+### Plugin change (spec §5.7 option A)
+
+`AttentionPlugin::enqueueImpl` sets `packedPrefill = false`; `enable_packed_prefill` now only gates the
+`packed_prefill_chunk_limit` input. The dense single-row packed branch (RoPE-by-row, dense gather,
+`kvEnd = P + q` with an inserted row length of `W`) mis-addressed rows for entry-padded steps.
+`getWorkspaceSize` still sizes for `maxPhysicalBatchSize = 1` when packed. That is the largest
+single-row sizing, so it is an over-allocation, but it was not re-derived.
+
+### Verification
+
+- New `test_gemma4_packed_prefill_unequal_entry_padded_rows` (q = {3, 8, 5}, packed-prefill plugin vs
+  per-row single-sequence runs, output and KV cache, d256 sliding and d512 global): passes on this
+  build; fails with `cos_sim=0.000000` on the pre-change `v0110-port` plugin.
+- Full `test_attention_plugin.py`: 146 passed, 13 skipped, 1 failed. The failure is
+  `test_head512_shared_vision_prefill_uses_token_aligned_rope` (cos 0.992559), which is pre-existing
+  and also fails on clean upstream.
+- C++ (12 executables, serial, TRT 26.06 container): Common 153, ContextCache 204, CuteDslKernels 59,
+  Examples 3, KernelsAttention 108 (+24 skipped), KernelsMisc 343 (+12), KernelsMoe 41 (+24),
+  KernelsSpeculative 114, Plugins 24 (+1), Runtime 1037 (+2), RuntimeState 131, Scheduler 59; 0 failures.
+
+### Reconciliation with the decode branch (open)
+
+The decode helper commit `8e7a4366` could not be cherry-picked here (permission denied in this
+session). This branch carries its own `phaseRaggedMetadata.{h,cpp}` with the identical interface;
+take `8e7a4366`'s files at merge. Remaining conflicts at merge:
+
+- `IndependentPhaseCoordinator`: D passes `SharedResources&` through the constructor
+  (`mResources`, `mDecodeRaggedMetadata`). This branch uses `setSharedResources()` +
+  `mPrefillMetadata`/`mDecodeMetadata`. Keep D's constructor and members, rename `mPrefillMetadata`
+  in `enqueuePrefillBatch`, and drop `setSharedResources` and `mDecodeMetadata`.
+- `PhaseKVActiveView::prepare`: D keeps the legacy `kvcache_start_index` swap when the binding exists
+  and swaps any SWA table. This branch drops the legacy swap and rejects a distinct (bounded) SWA
+  table. Recommended: D's legacy gating plus this branch's bounded-SWA rejection.
+- `stageTokens` M-RoPE rebind: D keeps `map.set(kRopeCosSin, io.mropeCosSin)` for prefill. It must be
+  removed for prefill too (this branch); otherwise Cosmos prefill reads resident row 0 as
+  token-aligned rows.
+- D pre-creates RoPE pool entries on `setupStream`. Keep that: this branch's prefill relies on it to
+  avoid lazy creation on the prefill stream.
+
+### Remaining risks
+
+- Not run on engines (no serving or engine builds in this task). Phase serving now requires full-mode
+  SWA (spec §3 S item 4, force full mode in `llmRankRuntime.cpp`, not done).
+- Prefill IO is sized `maxPrefillBatch x maxPrefillChunkTokens`. The scheduler caps every row at
+  `maxPrefillChunkTokens`, so `T` fits, but an unchunked row longer than that fails the
+  `inputs_embeds` reshape check rather than running.
+- `examples/llm/llm_phase_context_smoke.cpp` and `phaseDecodeEqualWorkTrial.inc` still use
+  `preparePrefillMetadata` (unbound legacy tensors); only their dims calls were updated.
+
+## W016 merge D+P
+
+Merge of `codex/v0110-port-prefill` (P, `bcdf7be0`/`12d7910b`) into the decode-first HEAD (D,
+`8e7a4366`/`7deba13a`/`15411914` plus coordinator fixes `d66f76bb`/`649c99b5`). Resolution decisions:
+
+- `phaseRaggedMetadata.{h,cpp}`: took D's implementation as the base (identical interface/semantics
+  to P's; only naming/namespace-style differences in the conflict hunks).
+- `IndependentPhaseCoordinator`: kept D's constructor-passed `SharedResources& mResources` member;
+  dropped P's `setSharedResources()` and its `SharedResources*` member. Kept both ragged-metadata
+  builders, renaming P's prefill member to `mPrefillRaggedMetadata` to match D's `mDecodeRaggedMetadata`
+  naming. Kept D's decode wiring (`enqueueDecodeBatch`, `primeDecodeGraphs`) and P's
+  `enqueuePrefillBatch` (entry-padded `RaggedExecutionBatch` build + upload, `packedPrefillDims`/
+  `visionPackedPrefillDims` with an explicit `ExecutionPhase`, graph key `profile:N:T`); P's prefill
+  branch already superseded the legacy `preparePrefillMetadata` call site.
+- `PhaseKVActiveView::prepare`/`restoreBindings`: kept D's optional `kvcache_start_index` swap (gated
+  on the binding existing, for fork-ABI engines) plus D's SWA page-table swap, and added P's check
+  that rejects a distinct (bounded) SWA page table — the phase runtime only supports full-mode SWA,
+  where `swa_kv_page_table` aliases `kv_page_table`.
+- `phaseServingRuntime.cpp` `stageTokens`: removed the `rope_rotary_cos_sin -> io.mropeCosSin` rebind
+  for both prefill and decode (P's finding that this rebind corrupts Cosmos MRoPE under the ragged
+  ABI); the engine binding now stays on `io.raggedRopeCosSin`, filled by `prepareRaggedRope`. Kept D's
+  constructor changes (`IndependentPhaseCoordinator` built with `resources` directly, no
+  `setSharedResources()` call).

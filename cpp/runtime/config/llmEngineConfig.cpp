@@ -1360,21 +1360,22 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, Execut
     };
 }
 
-InferenceDims LLMEngineConfig::packedPrefillDims(int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const
+InferenceDims LLMEngineConfig::packedPrefillDims(
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, ExecutionPhase phase) const
 {
     ELLM_CHECK(packedPrefill, "packedPrefillDims requires a packed-prefill engine");
     int32_t const prefillBatchLimit
         = maxSupportedPrefillBatchSize > 0 ? maxSupportedPrefillBatchSize : maxSupportedBatchSize;
     return packedPrefillDimsWithLimits(
-        logicalBatch, totalTokens, maxRowTokens, prefillBatchLimit, maxPackedPrefillChunkTokens);
+        logicalBatch, totalTokens, maxRowTokens, prefillBatchLimit, maxPackedPrefillChunkTokens, phase);
 }
 
 InferenceDims LLMEngineConfig::visionPackedPrefillDims(
-    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens) const
+    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, ExecutionPhase phase) const
 {
     ELLM_CHECK(hasVisionPrefillProfile(), "visionPackedPrefillDims requires an external-prefill profile");
-    return packedPrefillDimsWithLimits(
-        logicalBatch, totalTokens, maxRowTokens, maxSupportedVisionPrefillBatchSize, maxVisionPackedPrefillChunkTokens);
+    return packedPrefillDimsWithLimits(logicalBatch, totalTokens, maxRowTokens, maxSupportedVisionPrefillBatchSize,
+        maxVisionPackedPrefillChunkTokens, phase);
 }
 
 bool LLMEngineConfig::prefersAuxiliaryPackedPrefillProfile(int64_t logicalBatch, int64_t maxRowTokens) const noexcept
@@ -1393,9 +1394,11 @@ bool LLMEngineConfig::prefersAuxiliaryPackedPrefillProfile(int64_t logicalBatch,
     return auxiliaryCarrier < primaryCarrier;
 }
 
-InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(
-    int64_t logicalBatch, int64_t totalTokens, int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit) const
+InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(int64_t logicalBatch, int64_t totalTokens,
+    int64_t maxRowTokens, int32_t batchLimit, int32_t chunkLimit, ExecutionPhase phase) const
 {
+    ELLM_CHECK(phase == ExecutionPhase::kContextPrefill || phase == ExecutionPhase::kContextChunk,
+        "Packed prefill dimensions require a context-prefill or context-chunk phase");
     ELLM_CHECK(logicalBatch > 0 && logicalBatch <= batchLimit, "packed prefill logical batch is out of range");
     ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * chunkLimit,
         "packed prefill token carrier exceeds the configured profile limit");
@@ -1412,7 +1415,7 @@ InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/logicalBatch,
-        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kContextPrefill),
+        /*.executionPhaseLen=*/static_cast<int64_t>(phase),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
         /*.queryOffsetLen=*/logicalBatch + 1,

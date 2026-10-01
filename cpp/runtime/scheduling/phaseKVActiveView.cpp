@@ -61,7 +61,11 @@ void PhaseKVActiveView::prepare(std::vector<int32_t> const& activeStableSlots, c
     mPreviousLengths = mTensorMap.get(binding_names::kKVCacheStartIndex);
     mPreviousPageTable = mTensorMap.get(binding_names::kKVPageTable);
     ELLM_CHECK(mPreviousPageTable != nullptr, "Phase KV active view requires an existing page-table binding");
+    // Phase rows address StableKVPageManager pages, which only exist in the full KV namespace. Full SWA
+    // mode aliases swa_kv_page_table to kv_page_table; a distinct (bounded) SWA table cannot be served.
     mPreviousSwaPageTable = mTensorMap.get(binding_names::kSwaKVPageTable);
+    ELLM_CHECK(mPreviousSwaPageTable == nullptr || mPreviousSwaPageTable == mPreviousPageTable,
+        "Phase KV active view requires full-mode SWA KV storage");
     mSwapsSwaPageTable = mPreviousSwaPageTable != nullptr;
 
     bindActiveRows(activeStableSlots, stream);
