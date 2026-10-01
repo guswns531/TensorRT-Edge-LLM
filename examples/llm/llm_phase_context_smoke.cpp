@@ -1286,7 +1286,11 @@ int main(int argc, char** argv)
         tokenizer::Tokenizer tokenizer;
         ELLM_CHECK(tokenizer.loadFromHF(engineDir), "Failed to load tokenizer for semantic phase requests");
         chat_template::ChatTemplate chatTemplate;
-        ELLM_CHECK(chatTemplate.load(engineDir), "Failed to load chat template for semantic phase requests");
+        auto const tokenPiece = [&tokenizer](tokenizer::Rank tokenId) {
+            return tokenId >= 0 ? tokenizer.idToPiece(tokenId, false) : std::string{};
+        };
+        ELLM_CHECK(chatTemplate.load(engineDir, tokenPiece(tokenizer.getBosId()), tokenPiece(tokenizer.getEosId())),
+            "Failed to load chat template for semantic phase requests");
 
         std::vector<std::string> const prompts{
             "Give one practical tip for reducing latency in an online inference service.",
