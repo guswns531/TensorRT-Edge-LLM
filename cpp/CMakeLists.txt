@@ -223,6 +223,7 @@ set(PHASE_RUNTIME_CPP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseGlobalScheduler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseIncrementalAction.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseKVActiveView.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseRaggedMetadata.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseKernelGroupRecorder.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phaseMemoryBroker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scheduling/phasePrefixReuseCache.cpp"
