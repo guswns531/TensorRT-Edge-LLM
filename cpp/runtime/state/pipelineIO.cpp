@@ -324,11 +324,11 @@ void allocateRaggedRopeBuffers(PipelineIO& io, int32_t genericRows, int32_t dual
     }
 }
 
-void allocateRaggedRope(PipelineIO& io, LLMEngineConfig const& cfg)
+void allocateRaggedRope(PipelineIO& io, LLMEngineConfig const& cfg, int32_t maxTokens)
 {
-    allocateRaggedRopeBuffers(io, cfg.useDualRope ? 0 : cfg.maxPhysicalTokens,
-        cfg.useDualRope ? cfg.maxPhysicalTokens : 0, cfg.useDualRope ? 0 : cfg.rotaryDim,
-        cfg.useDualRope ? cfg.slidingRotaryDim : 0, cfg.useDualRope ? cfg.fullRotaryDim : 0);
+    allocateRaggedRopeBuffers(io, cfg.useDualRope ? 0 : maxTokens, cfg.useDualRope ? maxTokens : 0,
+        cfg.useDualRope ? 0 : cfg.rotaryDim, cfg.useDualRope ? cfg.slidingRotaryDim : 0,
+        cfg.useDualRope ? cfg.fullRotaryDim : 0);
 }
 
 void prepareRaggedRope(PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t physicalTokens,
@@ -756,13 +756,17 @@ PipelineIO PipelineIO::createForLLMPhase(
         "PipelineIO phase sequence length is outside the engine capacity");
     allocateBasicIO(io, maxBatchSize, maxSeqLen, cfg.hiddenSize, cfg.outputVocabSize, nvinfer1::DataType::kHALF);
 
-    // Ragged/entry-padded metadata sized at the engine's full capacity (independent of this phase's
-    // local batch/seqLen window) so shared ragged-execution helpers (prepareRaggedExecutionBindings)
-    // stay valid regardless of which phase-scoped PipelineIO they are called against.
-    int32_t const maxLogitsRows = cfg.isDiffusionBackbone ? cfg.maxPhysicalTokens : cfg.maxNumSequences;
+    // Ragged/entry-padded metadata sized by this phase's own batch/token window, capped at the
+    // engine's declared capacity. A phase-scoped PipelineIO (prefill, vision prefill, decode) never
+    // needs the full-engine-capacity ragged buffers; sizing by the phase shape is what avoids
+    // duplicating the engine-global allocation once per phase context.
+    int32_t const phaseMaxSequences = std::min(maxBatchSize, cfg.maxNumSequences);
+    int32_t const phaseMaxTokens = static_cast<int32_t>(
+        std::min(static_cast<int64_t>(cfg.maxPhysicalTokens), static_cast<int64_t>(maxBatchSize) * maxSeqLen));
+    int32_t const maxLogitsRows = cfg.isDiffusionBackbone ? phaseMaxTokens : phaseMaxSequences;
     allocateRaggedMetadata(
-        io, cfg.maxPhysicalTokens, cfg.maxNumSequences, maxLogitsRows, cfg.maxKVCacheCapacity, cfg.hiddenSize);
-    allocateRaggedRope(io, cfg);
+        io, phaseMaxTokens, phaseMaxSequences, maxLogitsRows, cfg.maxKVCacheCapacity, cfg.hiddenSize);
+    allocateRaggedRope(io, cfg, phaseMaxTokens);
 
     if (cfg.isDiffusionBackbone)
     {
