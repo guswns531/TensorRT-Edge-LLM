@@ -1157,7 +1157,8 @@ int main(int argc, char** argv)
             coordinatorCallbacks.isDecodeFinished
                 = [&](rt::PhaseWorkItem const& item, int32_t) { return ++decodeSteps[item.requestId] >= 2; };
             rt::IndependentPhaseCoordinator coordinator(phaseConfig, schedulerConfig, *pair, ownership, *prefillIO,
-                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks));
+                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(coordinatorCallbacks),
+                *resources);
 
             rt::PhaseSchedulingHints decodeHints;
             decodeHints.tpotTargetUs = 50000.0;
@@ -1210,7 +1211,7 @@ int main(int argc, char** argv)
                 return finished;
             };
             rt::IndependentPhaseCoordinator traceCoordinator(phaseConfig, schedulerConfig, *pair, ownership, *prefillIO,
-                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks));
+                *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(traceCallbacks), *resources);
 
             auto const traceStart = std::chrono::steady_clock::now();
             size_t loopIterations{};
@@ -1899,7 +1900,7 @@ int main(int argc, char** argv)
         }
         rt::IndependentPhaseCoordinator semanticCoordinator(phaseConfig, semanticSchedulerConfig, *pair, ownership,
             *prefillIO, *decodeIO, prefillMap, decodeMap, prefillStream, decodeStream, std::move(seedCallbacks),
-            decodeRowOrderMode);
+            *resources, decodeRowOrderMode);
         if (std::getenv("TRT_EDGELLM_ENABLE_PERSISTENT_DECODE_SELECT") != nullptr)
         {
             semanticCoordinator.setPersistentDecodeSelectEnabled(true);
