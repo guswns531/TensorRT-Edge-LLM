@@ -170,6 +170,27 @@ TEST(EngineExecutorTest, GraphKeyIncludesEngineProfileShapesAndAddresses)
     EXPECT_NE(base, computeExecutionGraphKey(0xA0, 0, snapshot));
 }
 
+TEST(EngineExecutorTest, PackedPrefillCarrierRelations)
+{
+    // Three sequences of unequal length packed into one physical row of 50 tokens.
+    InferenceDims dims{/*batch=*/3, /*tokenBatch=*/1, /*seqLen=*/50, /*kvLen=*/2048, /*selectLen=*/3,
+        /*attnMaskSeqLen=*/128, /*ropeBatch=*/1, /*packedMaskLen=*/1, /*contextMaskSelectorLen=*/0,
+        /*startIndexLen=*/3, /*executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kContextPrefill),
+        /*skipSoftmaxScaleLen=*/0, /*swaKVCacheModeLen=*/0, /*queryOffsetLen=*/4, /*contextSequenceCount=*/3};
+    EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0));
+    EXPECT_TRUE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, /*packedPrefillCarrier=*/true));
+
+    dims.queryOffsetLen = 3;
+    EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, true));
+    dims.queryOffsetLen = 4;
+    dims.seqLen = 2;
+    EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, true));
+    dims.seqLen = 50;
+    dims.executionPhaseLen = static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode);
+    dims.contextSequenceCount = 0;
+    EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, true));
+}
+
 TEST(EngineExecutorTest, RaggedDimensionRelations)
 {
     InferenceDims dims{/*batch=*/3, /*tokenBatch=*/3, /*seqLen=*/15, /*kvLen=*/128, /*selectLen=*/3,

@@ -34,9 +34,16 @@ namespace trt_edgellm
 {
 namespace rt
 {
-bool validateRaggedInferenceDims(
-    InferenceDims const& dims, int32_t profileIndex, bool allowSelectBeyondPhysicalTokens) noexcept
+bool validateRaggedInferenceDims(InferenceDims const& dims, int32_t profileIndex, bool allowSelectBeyondPhysicalTokens,
+    bool packedPrefillCarrier) noexcept
 {
+    auto const packedPhase = static_cast<ExecutionPhase>(dims.executionPhaseLen);
+    if (packedPrefillCarrier && dims.tokenBatch == 1 && dims.batch > 1
+        && (packedPhase == ExecutionPhase::kContextPrefill || packedPhase == ExecutionPhase::kContextChunk))
+    {
+        return dims.seqLen >= dims.batch && dims.queryOffsetLen == dims.batch + 1 && dims.selectLen == dims.batch
+            && dims.attnMaskSeqLen > 0 && dims.contextSequenceCount == dims.batch;
+    }
     if (dims.batch <= 0 || dims.seqLen <= 0 || dims.seqLen % dims.batch != 0 || dims.queryOffsetLen != dims.batch + 1
         || dims.selectLen <= 0 || (!allowSelectBeyondPhysicalTokens && dims.selectLen > dims.seqLen)
         || dims.attnMaskSeqLen != dims.seqLen || !isExecutionPhaseExtent(dims.executionPhaseLen)
@@ -303,7 +310,8 @@ bool TrtEngineExecutor::prepare(
     }
     bool const hasIndependentDeltaPortal = mRegistry.contains(binding_names::kDFlashTargetHiddenConcat);
     if (mRegistry.contains(binding_names::kPositions)
-        && !validateRaggedInferenceDims(dims, profileIndex, hasIndependentDeltaPortal))
+        && !validateRaggedInferenceDims(
+            dims, profileIndex, hasIndependentDeltaPortal, mRegistry.contains(binding_names::kPackedPrefillChunkLimit)))
     {
         LOG_ERROR("EngineExecutor::prepare: inconsistent ragged step dimensions for profile %d", profileIndex);
         return false;

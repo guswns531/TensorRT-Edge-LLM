@@ -40,8 +40,10 @@ namespace rt
 {
 
 //! Validate cross-binding relations that TensorRT optimization profiles cannot express.
-bool validateRaggedInferenceDims(
-    InferenceDims const& dims, int32_t profileIndex, bool allowSelectBeyondPhysicalTokens = false) noexcept;
+//! @param packedPrefillCarrier The engine binds packed_prefill_chunk_limit, so a context step may pack several
+//!        sequences of unequal length into one physical row and carry the chunk limit in attnMaskSeqLen.
+bool validateRaggedInferenceDims(InferenceDims const& dims, int32_t profileIndex,
+    bool allowSelectBeyondPhysicalTokens = false, bool packedPrefillCarrier = false) noexcept;
 
 /*!
  * @brief Engine execution interface with a prepare/execute split.
