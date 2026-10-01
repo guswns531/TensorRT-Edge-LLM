@@ -50,6 +50,8 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 - Do not move a Git worktree with plain `mv`; use `git worktree move/add/remove`. Do not move a CMake build tree;
   regenerate it at the canonical path and delete the old tree only after validation.
 - Put reproducible scripts in `benchmarks/` or `scripts/`, and numbered conclusions in `notes/NNN-topic-YYYYMMDD.md`.
+  Track each line of work in `notes/work/W###-<slug>.md` (index: `notes/work/README.md`) with scratch in
+  `.local/scratch/W###-<slug>/`; see `.claude/skills/workspace-lifecycle/SKILL.md`.
 - Use `.local/results/` as the index of retained experiments and `.local/scratch/` for disposable runs.
 - Compare V0/V1/V2 with the same binary, engine, requests, calibration, and memory limits. Reuse a frozen vLLM result
   when that contract is unchanged; rerun vLLM when it changes.
