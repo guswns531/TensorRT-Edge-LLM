@@ -843,7 +843,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     // Setup common profiles
     result &= setupCommonProfiles(*contextProfile, *generationProfile, network, maxPrefillBatchSize);
-    result &= setupRopeProfiles(*contextProfile, *generationProfile, network, maxPrefillBatchSize);
+    result
+        &= setupRopeProfiles(*contextProfile, *generationProfile, network, maxPrefillBatchSize, maxPrefillChunkTokens);
 
     // Setup model-specific profiles
     if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
@@ -907,7 +908,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
             return false;
         }
         result &= setupCommonProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
-        result &= setupRopeProfiles(*visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize);
+        result &= setupRopeProfiles(
+            *visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
         result &= setupVanillaProfiles(
             *visionPrefillProfile, *generationProfile, network, maxVisionPrefillBatchSize, maxVisionPrefillChunkTokens);
         result &= setupPleProfiles(
@@ -1038,14 +1040,15 @@ bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProf
 
 bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
     nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
-    int64_t maxPrefillBatchSize)
+    int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens)
 {
     bool result = true;
-    // maxPrefillBatchSize is retained in the signature for call-site symmetry with
-    // setupCommonProfiles; RoPE bindings are token-major and sized off physicalTokens
-    // ranges, which already upper-bound any independently sized vision prefill batch.
-    (void) maxPrefillBatchSize;
-    auto const [prefill, generation] = tokenAlignedProfileRanges();
+    // RoPE rows share the physical_tokens named dimension with the other token-major inputs of the same profile,
+    // so their ranges must come from the same profile-local batch/chunk caps.
+    bool const upstreamRanges = mBuilderConfig.specBase || mBuilderConfig.specDraft || mIsDiffusionBackbone;
+    auto const [prefill, generation] = upstreamRanges
+        ? tokenAlignedProfileRanges()
+        : tokenAlignedProfileRangesFor(maxPrefillBatchSize, maxPrefillChunkTokens);
     auto setRopeProfile = [&](char const* bindingName, int64_t rotaryDim) {
         if (getInputRank(network, bindingName) != 2)
         {

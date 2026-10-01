@@ -509,7 +509,7 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
         nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network,
-        int64_t maxPrefillBatchSize);
+        int64_t maxPrefillBatchSize, int64_t maxPrefillChunkTokens);
 
     std::pair<RaggedProfileRange, RaggedProfileRange> tokenAlignedProfileRanges() const;
 
