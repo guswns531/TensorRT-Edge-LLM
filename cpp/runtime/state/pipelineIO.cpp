@@ -559,6 +559,10 @@ static void buildTensorMapImpl(
         }
     }
 
+    // kvcache_start_index: PhaseKVActiveView::prepare() requires this binding to already be present
+    // (it swaps it out for the phase-local active-row view and restores it on complete()).
+    map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
+
     // The full table is always present. Bounded mode uses the independent sparse SWA namespace;
     // full mode aliases the SWA binding to the ordinary table so context reuse follows the existing
     // full-cache lifecycle. The shape-only mode input selects the matching plugin path.
