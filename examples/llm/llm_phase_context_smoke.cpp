@@ -724,7 +724,9 @@ int main(int argc, char** argv)
 
     std::filesystem::path const engineDir{argv[1]};
     std::string const checkpointDir = argc == kMAX_ARGUMENTS ? argv[2] : "";
-    rt::LLMEngineConfig const config = rt::parseEngineConfig(engineDir / "config.json");
+    rt::LLMEngineConfig config = rt::parseEngineConfig(engineDir / "config.json");
+    // Phase serving binds swa_kv_page_table to the active-row KV table, which requires full SWA storage.
+    config.setSwaKVCacheMode(rt::SwaKVCacheMode::kFull);
     char const* visionEngineDir = std::getenv("TRT_EDGELLM_VISION_ENGINE_DIR");
 
     rt::PhaseHostWakeup hostWakeup;
@@ -1602,17 +1604,19 @@ int main(int argc, char** argv)
                 {
                     mropeCopyTiming.end(stream);
                 }
-                map.set(binding_names::kRopeCosSin, io.mropeCosSin);
             }
-            int32_t totalTokens{};
-            for (rt::IndependentPhaseRequestView const& view : views)
+            // Entry-padded layout shared with PhaseRaggedMetadataBuilder: row i occupies
+            // [i*queryWidth, i*queryWidth + q_i) and padding ids are 0.
+            int32_t queryWidth = 1;
+            if (prefill)
             {
-                totalTokens += prefill ? view.work.tokenCount : 1;
+                for (rt::IndependentPhaseRequestView const& view : views)
+                {
+                    queryWidth = std::max(queryWidth, view.work.tokenCount);
+                }
             }
-            rt::Coords const tokenShape = prefill
-                ? (config.packedPrefill ? rt::Coords{1, totalTokens}
-                                        : rt::Coords{static_cast<int64_t>(views.size()), views.front().work.tokenCount})
-                : rt::Coords{static_cast<int64_t>(views.size()), 1};
+            int32_t const totalTokens = static_cast<int32_t>(views.size()) * queryWidth;
+            rt::Coords const tokenShape{static_cast<int64_t>(views.size()), queryWidth};
             bool const reuseDecodeSample = !prefill && lastDecodeSampleRequestIds.size() == views.size()
                 && std::equal(views.begin(), views.end(), lastDecodeSampleRequestIds.begin(),
                     [](rt::IndependentPhaseRequestView const& view, uint64_t requestId) {
@@ -1635,6 +1639,10 @@ int main(int argc, char** argv)
                 ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
                     "Semantic phase token staging reshape failed");
                 int32_t* destination = hostIds.dataPointer<int32_t>();
+                if (prefill && queryWidth > 1)
+                {
+                    std::fill_n(destination, static_cast<size_t>(totalTokens), 0);
+                }
                 int32_t destinationOffset{};
                 for (rt::IndependentPhaseRequestView const& view : views)
                 {
@@ -1642,7 +1650,7 @@ int main(int argc, char** argv)
                     {
                         std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
                             destination + destinationOffset);
-                        destinationOffset += view.work.tokenCount;
+                        destinationOffset += queryWidth;
                     }
                     else
                     {
@@ -1671,7 +1679,17 @@ int main(int argc, char** argv)
             rt::Gemma4EmbeddingPreprocessor* const ple = prefill ? prefillPle.get() : decodePle.get();
             if (ple != nullptr)
             {
+                // The packed prefill PLE preprocessor expects one token-major [1, T] row.
+                bool const tokenMajorPle = prefill && config.packedPrefill;
+                if (tokenMajorPle)
+                {
+                    ELLM_CHECK(stagedIds->reshape({1, totalTokens}), "Semantic PLE token view reshape failed");
+                }
                 ple->embed(*stagedIds, stream);
+                if (tokenMajorPle)
+                {
+                    ELLM_CHECK(stagedIds->reshape(tokenShape), "Semantic PLE token view restore failed");
+                }
             }
             if (prefill)
             {
