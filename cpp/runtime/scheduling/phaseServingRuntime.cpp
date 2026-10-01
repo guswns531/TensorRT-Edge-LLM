@@ -486,7 +486,7 @@ public:
         seedCallbacks.isDecodeFinished = [](PhaseWorkItem const&, int32_t) { return true; };
         mCoordinator = std::make_unique<IndependentPhaseCoordinator>(phaseEngineConfig, std::move(schedulerConfig),
             *mExecutors, *mOwnership, *mPrefillIO, *mDecodeIO, mPrefillMap, mDecodeMap, mPrefillStream, mDecodeStream,
-            std::move(seedCallbacks));
+            std::move(seedCallbacks), resources);
         mCoordinator->setPersistentDecodeSelectEnabled(mServingConfig.enablePersistentDecodeSelect);
         mCoordinator->setPersistentPageBindingsEnabled(mServingConfig.enablePersistentPageBindings);
 
@@ -506,6 +506,20 @@ public:
         graphOptions = resolvePhaseGraphExecutionOptions(graphOptions);
         mServer = std::make_unique<IndependentPhaseAsyncServer>(
             std::move(serverConfig), *mCoordinator, *mOwnership, std::move(adapter));
+        // Pre-create the ragged RoPE source tables on setupStream so the decode stream's first
+        // step (including CUDA graph warm-up) never lazily creates one on its own stream.
+        if (engineConfig.useDualRope)
+        {
+            resources.ropePool.getOrCreate(engineConfig.slidingRopeConfig, engineConfig.slidingRotaryDim,
+                engineConfig.maxKVCacheCapacity, setupStream);
+            resources.ropePool.getOrCreate(
+                engineConfig.fullRopeConfig, engineConfig.fullRotaryDim, engineConfig.maxKVCacheCapacity, setupStream);
+        }
+        else if (engineConfig.ropeConfig.type != RopeType::kMRope)
+        {
+            resources.ropePool.getOrCreate(
+                engineConfig.ropeConfig, engineConfig.rotaryDim, engineConfig.maxKVCacheCapacity, setupStream);
+        }
         CUDA_CHECK(cudaStreamSynchronize(setupStream));
         mCoordinator->prepareServingGraphs(
             graphOptions, decodeBatchCapacity, [this](int32_t batchSize, cudaStream_t stream) {
@@ -720,7 +734,13 @@ public:
                 auto const* sourceBytes = static_cast<std::byte const*>(source.rawPointer()) + copyOffset;
                 CUDA_CHECK(cudaMemcpyAsync(destination, sourceBytes, copyBytes, cudaMemcpyDeviceToDevice, stream));
             }
-            map.set(binding_names::kRopeCosSin, io.mropeCosSin);
+            // Decode's engine binding stays on the ragged ABI's io.raggedRopeCosSin, gathered by
+            // uploadPhaseRaggedMetadata/prepareRaggedRope from these resident rows after staging;
+            // only rebind for prefill, which still owns the dense io.mropeCosSin binding.
+            if (prefill)
+            {
+                map.set(binding_names::kRopeCosSin, io.mropeCosSin);
+            }
         }
 
         if (!visionSegments.empty())

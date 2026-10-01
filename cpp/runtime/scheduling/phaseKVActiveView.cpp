@@ -55,23 +55,35 @@ void PhaseKVActiveView::prepare(std::vector<int32_t> const& activeStableSlots, c
     ELLM_CHECK(static_cast<int32_t>(activeStableSlots.size()) <= mMaxActiveRows,
         "Phase KV active batch exceeds its configured capacity");
 
+    // kvcache_start_index only exists on fork-ABI (non-ragged) engines; the ragged ABI carries
+    // per-row committed KV length through past_lengths instead (uploaded alongside the rest of
+    // the ragged metadata, outside this view).
     mPreviousLengths = mTensorMap.get(binding_names::kKVCacheStartIndex);
     mPreviousPageTable = mTensorMap.get(binding_names::kKVPageTable);
-    ELLM_CHECK(mPreviousLengths != nullptr && mPreviousPageTable != nullptr,
-        "Phase KV active view requires existing length and page-table bindings");
+    ELLM_CHECK(mPreviousPageTable != nullptr, "Phase KV active view requires an existing page-table binding");
+    mPreviousSwaPageTable = mTensorMap.get(binding_names::kSwaKVPageTable);
+    mSwapsSwaPageTable = mPreviousSwaPageTable != nullptr;
 
     bindActiveRows(activeStableSlots, stream);
-    std::vector<int32_t> const lengths = mOwnership.makeActiveLengths(activeStableSlots);
-    ELLM_CHECK(mHostLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV host length reshape failed");
-    ELLM_CHECK(mDeviceLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV device length reshape failed");
-    std::copy(lengths.begin(), lengths.end(), mHostLengths.dataPointer<int32_t>());
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceLengths.rawPointer(), mHostLengths.rawPointer(), lengths.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice, stream));
-    ++mMemoryStats.lengthH2DOperations;
-    mMemoryStats.lengthH2DBytes += lengths.size() * sizeof(int32_t);
 
-    mTensorMap.set(binding_names::kKVCacheStartIndex, mDeviceLengths);
+    if (mPreviousLengths != nullptr)
+    {
+        std::vector<int32_t> const lengths = mOwnership.makeActiveLengths(activeStableSlots);
+        ELLM_CHECK(mHostLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV host length reshape failed");
+        ELLM_CHECK(
+            mDeviceLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV device length reshape failed");
+        std::copy(lengths.begin(), lengths.end(), mHostLengths.dataPointer<int32_t>());
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceLengths.rawPointer(), mHostLengths.rawPointer(),
+            lengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        ++mMemoryStats.lengthH2DOperations;
+        mMemoryStats.lengthH2DBytes += lengths.size() * sizeof(int32_t);
+        mTensorMap.set(binding_names::kKVCacheStartIndex, mDeviceLengths);
+    }
     mTensorMap.set(binding_names::kKVPageTable, mPageTable.kernelView());
+    if (mSwapsSwaPageTable)
+    {
+        mTensorMap.set(binding_names::kSwaKVPageTable, mPageTable.kernelView());
+    }
     mActiveStableSlots = activeStableSlots;
     mPrepared = true;
 }
@@ -296,10 +308,19 @@ void PhaseKVActiveView::restoreBindings() noexcept
     }
     try
     {
-        mTensorMap.set(binding_names::kKVCacheStartIndex, *mPreviousLengths);
+        if (mPreviousLengths != nullptr)
+        {
+            mTensorMap.set(binding_names::kKVCacheStartIndex, *mPreviousLengths);
+        }
         mTensorMap.set(binding_names::kKVPageTable, *mPreviousPageTable);
+        if (mSwapsSwaPageTable)
+        {
+            mTensorMap.set(binding_names::kSwaKVPageTable, *mPreviousSwaPageTable);
+        }
         mPreviousLengths = nullptr;
         mPreviousPageTable = nullptr;
+        mPreviousSwaPageTable = nullptr;
+        mSwapsSwaPageTable = false;
     }
     catch (...)
     {

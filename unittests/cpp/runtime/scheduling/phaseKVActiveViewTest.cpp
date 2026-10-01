@@ -282,3 +282,36 @@ TEST(PhaseKVActiveViewTest, RejectsNestedPrepareAndLengthMismatch)
     view.complete();
     EXPECT_THROW(view.complete(), std::runtime_error);
 }
+
+TEST(PhaseKVActiveViewTest, RaggedAbiMapNeedsNoKvcacheStartIndexAndSwapsSwaPageTable)
+{
+    rt::StableKVPageManager ownership({3, 2, 8, 512, 128});
+    int32_t const slot0 = ownership.reserve();
+    int32_t const slot1 = ownership.reserve();
+    ownership.ensureCapacity(slot0, 128);
+    ownership.ensureCapacity(slot1, 128);
+    ownership.setLength(slot0, 100);
+    ownership.setLength(slot1, 5);
+
+    rt::KVPageTable fullPageTable(2, 4, 8);
+    rt::TensorMap raggedMap;
+    raggedMap.set(binding_names::kKVPageTable, fullPageTable.kernelView());
+    // Full-SWA mode aliases swa_kv_page_table to the same table the engine ABI never swaps on
+    // its own; PhaseKVActiveView must swap both names to its own active-row table.
+    raggedMap.set(binding_names::kSwaKVPageTable, fullPageTable.kernelView());
+
+    rt::PhaseKVActiveView view(2, ownership, raggedMap, "ragged_decode");
+    EXPECT_EQ(raggedMap.get(binding_names::kKVCacheStartIndex), nullptr);
+
+    view.prepare({slot0, slot1}, nullptr);
+    EXPECT_EQ(raggedMap.get(binding_names::kKVCacheStartIndex), nullptr);
+    EXPECT_EQ(raggedMap.get(binding_names::kKVPageTable), &view.pageTable().kernelView());
+    EXPECT_EQ(raggedMap.get(binding_names::kSwaKVPageTable), &view.pageTable().kernelView());
+    EXPECT_EQ(view.pageTable().hostRow(0)[0], ownership.pages(slot0)[0]);
+    EXPECT_EQ(view.pageTable().hostRow(1)[0], ownership.pages(slot1)[0]);
+
+    view.complete();
+    EXPECT_EQ(raggedMap.get(binding_names::kKVPageTable), &fullPageTable.kernelView());
+    EXPECT_EQ(raggedMap.get(binding_names::kSwaKVPageTable), &fullPageTable.kernelView());
+    EXPECT_EQ(raggedMap.get(binding_names::kKVCacheStartIndex), nullptr);
+}

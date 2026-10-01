@@ -21,6 +21,7 @@
 #include "runtime/scheduling/independentEngineExecutorPair.h"
 #include "runtime/scheduling/phaseDispatchWorker.h"
 #include "runtime/scheduling/phaseKVActiveView.h"
+#include "runtime/scheduling/phaseRaggedMetadata.h"
 #include "runtime/scheduling/phaseServingExecutionOptions.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/stableKVPageManager.h"
@@ -38,6 +39,7 @@ namespace trt_edgellm::rt
 {
 
 class PhaseActivityTimelineRecorder;
+struct SharedResources;
 
 using IndependentPhaseInputCallback = std::function<void(std::vector<PhaseWorkItem> const&, PipelineIO&, cudaStream_t)>;
 using IndependentPhaseBatchCompletionCallback
@@ -68,7 +70,7 @@ public:
     IndependentPhaseCoordinator(LLMEngineConfig const& config, PhaseQueueSchedulerConfig schedulerConfig,
         IndependentEngineExecutorPair& executors, StableKVPageManager& ownership, PipelineIO& prefillIO,
         PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap, cudaStream_t prefillStream,
-        cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks,
+        cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks, SharedResources& resources,
         PhaseDecodeRowOrderMode decodeRowOrderMode = PhaseDecodeRowOrderMode::kRetainAffinity);
     ~IndependentPhaseCoordinator() noexcept = default;
 
@@ -156,6 +158,8 @@ private:
     IndependentPhaseCoordinatorCallbacks mCallbacks;
     PhaseKVActiveView mPrefillKV;
     PhaseKVActiveView mDecodeKV;
+    SharedResources& mResources;
+    PhaseRaggedMetadataBuilder mDecodeRaggedMetadata;
     PhaseQueueScheduler mScheduler;
     std::unique_ptr<PhaseDispatchWorker> mWorker;
     std::vector<PhaseDispatchMetrics> mMetrics;

@@ -113,6 +113,8 @@ private:
     std::vector<int32_t> mActiveStableSlots;
     Tensor* mPreviousLengths{};
     Tensor* mPreviousPageTable{};
+    Tensor* mPreviousSwaPageTable{};
+    bool mSwapsSwaPageTable{};
     bool mPrepared{};
     mutable void* mZeroedDecodeSelectTokenIndices{};
     mutable size_t mZeroedDecodeSelectTokenIndicesCapacity{};

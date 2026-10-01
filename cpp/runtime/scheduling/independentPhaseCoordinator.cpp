@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/logger.h"
+#include "runtime/state/sharedResources.h"
 
 #include <algorithm>
 #include <utility>
@@ -48,7 +49,7 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     PhaseQueueSchedulerConfig schedulerConfig, IndependentEngineExecutorPair& executors, StableKVPageManager& ownership,
     PipelineIO& prefillIO, PipelineIO& decodeIO, TensorMap& prefillMap, TensorMap& decodeMap,
     cudaStream_t prefillStream, cudaStream_t decodeStream, IndependentPhaseCoordinatorCallbacks callbacks,
-    PhaseDecodeRowOrderMode decodeRowOrderMode)
+    SharedResources& resources, PhaseDecodeRowOrderMode decodeRowOrderMode)
     : mConfig(config)
     , mExecutors(executors)
     , mOwnership(ownership)
@@ -61,6 +62,8 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mCallbacks(std::move(callbacks))
     , mPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "independent_coordinator_prefill")
     , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
+    , mResources(resources)
+    , mDecodeRaggedMetadata(config.maxSupportedDecodeBatchSize, config.maxSupportedDecodeBatchSize)
     , mScheduler(std::move(schedulerConfig))
 {
     ELLM_CHECK(config.kvPoolPages > 0, "Independent phase coordinator requires a paged-KV engine");
@@ -277,9 +280,13 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueueDecodeBatch(
     PhaseHostExecutionTiming timing;
     timing.prepareStartHostNs = phaseTimelineNowNs();
     std::vector<int32_t> slots;
+    std::vector<PhaseRaggedSequence> raggedRows;
+    slots.reserve(batch.size());
+    raggedRows.reserve(batch.size());
     for (PhaseWorkItem const& item : batch)
     {
         slots.push_back(item.kvSlotId);
+        raggedRows.push_back(PhaseRaggedSequence{item.requestId, mOwnership.length(item.kvSlotId), 1});
         mOwnership.ensureCapacity(item.kvSlotId, mOwnership.length(item.kvSlotId) + 1);
     }
     mDecodeKV.prepare(slots, stream);
@@ -294,7 +301,8 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueueDecodeBatch(
         CUDA_CHECK(cudaMemsetAsync(
             mDecodeIO.inputsEmbeds.rawPointer(), 0, mDecodeIO.inputsEmbeds.getMemoryCapacity(), stream));
     }
-    mDecodeKV.prepareDecodeMetadata(mDecodeIO, stream);
+    RaggedExecutionBatch const& raggedBatch = mDecodeRaggedMetadata.build(SequenceWork::kDecode, raggedRows);
+    uploadPhaseRaggedMetadata(mDecodeIO, mResources, mConfig, raggedBatch, stream);
     ELLM_CHECK(mExecutors.decodeExecutor().prepare(mExecutors.config().decodeProfile,
                    mConfig.decodeDims(static_cast<int64_t>(batch.size())), mDecodeMap, stream),
         "Independent decode prepare failed");
@@ -466,7 +474,17 @@ size_t IndependentPhaseCoordinator::primeDecodeGraphs(std::vector<int32_t> const
             CUDA_CHECK(cudaMemsetAsync(
                 mDecodeIO.inputsEmbeds.rawPointer(), 0, mDecodeIO.inputsEmbeds.getMemoryCapacity(), stream));
         }
-        mDecodeKV.prepareDecodeMetadata(mDecodeIO, stream);
+        // Synthetic warm-up rows: every reserved slot has length 0, so use non-zero synthetic
+        // request ids (the row index + 1) since request id 0 is reserved.
+        std::vector<PhaseRaggedSequence> raggedRows;
+        raggedRows.reserve(static_cast<size_t>(batchSize));
+        for (int32_t row = 0; row < batchSize; ++row)
+        {
+            raggedRows.push_back(PhaseRaggedSequence{
+                static_cast<uint64_t>(row + 1), mOwnership.length(slots[static_cast<size_t>(row)]), 1});
+        }
+        RaggedExecutionBatch const& raggedBatch = mDecodeRaggedMetadata.build(SequenceWork::kDecode, raggedRows);
+        uploadPhaseRaggedMetadata(mDecodeIO, mResources, mConfig, raggedBatch, stream);
         if (!mExecutors.decodeExecutor().prepare(mExecutors.config().decodeProfile,
                 mConfig.decodeDims(static_cast<int64_t>(batchSize)), mDecodeMap, stream))
         {
