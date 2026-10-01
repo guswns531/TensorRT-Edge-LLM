@@ -1431,7 +1431,8 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
         /*.seqLen=*/batch,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/batch,
-        /*.attnMaskSeqLen=*/batch,
+        // On packed-prefill engines this extent sizes packed_prefill_chunk_limit, which is [1] in decode.
+        /*.attnMaskSeqLen=*/profileLocalPackedPrefillChunkLimit ? 1 : batch,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,

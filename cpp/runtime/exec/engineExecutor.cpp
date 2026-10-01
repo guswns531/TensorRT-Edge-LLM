@@ -44,10 +44,14 @@ bool validateRaggedInferenceDims(InferenceDims const& dims, int32_t profileIndex
         return dims.seqLen >= dims.batch && dims.queryOffsetLen == dims.batch + 1 && dims.selectLen == dims.batch
             && dims.attnMaskSeqLen > 0 && dims.contextSequenceCount == dims.batch;
     }
+    // Packed-prefill engines size packed_prefill_chunk_limit from attnMaskSeqLen; decode binds it as [1].
+    bool const packedDecodeChunkLimit
+        = packedPrefillCarrier && packedPhase == ExecutionPhase::kAutoregressiveDecode && dims.attnMaskSeqLen == 1;
     if (dims.batch <= 0 || dims.seqLen <= 0 || dims.seqLen % dims.batch != 0 || dims.queryOffsetLen != dims.batch + 1
         || dims.selectLen <= 0 || (!allowSelectBeyondPhysicalTokens && dims.selectLen > dims.seqLen)
-        || dims.attnMaskSeqLen != dims.seqLen || !isExecutionPhaseExtent(dims.executionPhaseLen)
-        || dims.contextSequenceCount < 0 || dims.contextSequenceCount > dims.batch)
+        || (dims.attnMaskSeqLen != dims.seqLen && !packedDecodeChunkLimit)
+        || !isExecutionPhaseExtent(dims.executionPhaseLen) || dims.contextSequenceCount < 0
+        || dims.contextSequenceCount > dims.batch)
     {
         return false;
     }

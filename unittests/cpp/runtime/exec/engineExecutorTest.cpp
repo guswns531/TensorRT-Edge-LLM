@@ -197,6 +197,13 @@ TEST(EngineExecutorTest, PackedPrefillCarrierRelations)
     dims.executionPhaseLen = static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode);
     dims.contextSequenceCount = 0;
     EXPECT_FALSE(validateRaggedInferenceDims(dims, /*profileIndex=*/0, false, true));
+
+    InferenceDims decode{/*batch=*/4, /*tokenBatch=*/4, /*seqLen=*/4, /*kvLen=*/2048, /*selectLen=*/4,
+        /*attnMaskSeqLen=*/1, /*ropeBatch=*/1, /*packedMaskLen=*/1, /*contextMaskSelectorLen=*/0,
+        /*startIndexLen=*/4, /*executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode),
+        /*skipSoftmaxScaleLen=*/0, /*swaKVCacheModeLen=*/0, /*queryOffsetLen=*/5, /*contextSequenceCount=*/0};
+    EXPECT_FALSE(validateRaggedInferenceDims(decode, /*profileIndex=*/1));
+    EXPECT_TRUE(validateRaggedInferenceDims(decode, /*profileIndex=*/1, false, /*packedPrefillCarrier=*/true));
 }
 
 TEST(EngineExecutorTest, RaggedDimensionRelations)
