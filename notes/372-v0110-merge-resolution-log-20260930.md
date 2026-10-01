@@ -1546,3 +1546,111 @@ still open).
 
 Open for next pass: failure 2 (Cosmos `cudaMalloc` OOM) — not started. 12-executable unit-test run and
 per-cell gateway smoke (vs note 369 medians) also not run this pass.
+
+## Milestone 2: phase metadata on the ragged ABI
+
+Scope actually completed this pass: item 1 of the Milestone 2 task (registry/engine-IO matching) only.
+Items 2-3 (re-expressing `PhaseKVActiveView`'s per-row KV lengths and page-table swap in terms of
+`past_lengths`/`attention_sequence_lengths`/`state_indices`, and new packed-prefill/decode metadata unit
+tests) were investigated but not implemented this pass — see "Still open" below.
+
+### Root cause confirmed
+
+`buildRegistryForLLM` (`cpp/runtime/exec/registryBuilder.cpp`) registered `kLastTokenIds` and
+`kKVCacheStartIndex` unconditionally for every non-diffusion LLM engine. Neither binding exists on the
+upstream v0.11.0 ragged ABI (confirmed against the actual exported ONNX graphs for both
+`gemma-4-e2b-it-awq` and `cosmos-reason2-2b`, and against `git show v0.11.0:cpp/runtime/exec/
+registryBuilder.cpp`, which has neither). `TensorRegistry::bindAll` (`cpp/runtime/exec/tensorRegistry.cpp`)
+iterates the *registry's* spec list, not the engine's IO list, and errors with "tensor '...' not in
+tensorMap" the moment a registered spec has no tensor-map/engine counterpart — which is exactly the failure
+mode the task description quotes.
+
+Already-existing precedent for the right fix: `engineExecutor.cpp`'s `TrtEngineExecutor(enginePath,
+registry)` constructor already does post-load, `engineHasInputTensor()`-gated optional registration for
+`kTreeParentIds`/`kTreeDepths`/`kValidTreeCounts`/`kSkipSoftmaxScale`. `llmBuilder.cpp` (`hasInputBinding`
+at build time) and `llmEngineConfig.cpp`'s Gemma4-MTP-draft validation (`executor.hasIOTensor(...)` after
+load) already treat `kKVCacheStartIndex`/`kLastTokenIds` as presence-conditional elsewhere in the codebase —
+`registryBuilder.cpp` was the one place still assuming they are always there.
+
+### Fix (commit `27bc3b15`)
+
+- `registryBuilder.cpp`: removed the unconditional `kLastTokenIds` (non-diffusion else-branch) and
+  `kKVCacheStartIndex` registrations from `buildRegistryForLLM`.
+- `engineExecutor.cpp`: added the mirror-image optional registration next to the existing tree-metadata
+  block — `engineHasInputTensor(*mEngineState->engine, name) && !mRegistry.contains(name)` for both names,
+  with the same tensor specs (shapes/dtypes) that were removed from `registryBuilder.cpp`.
+- `unittests/cpp/runtime/exec/registryBuilderTest.cpp`: updated `StandardLLMHasExpectedTensors` to assert
+  `last_token_ids`/`kvcache_start_index` are *absent* from `buildRegistryForLLM`'s output (they are now
+  engine-conditional, added one layer up), and shrank the six hardcoded `names.size()` totals that counted
+  them (`MambaStateAddsRecurrentAndConvTensors`, `AllFeaturesEnabled`, `HybridModelKVCacheCountMatchesAttentionLayers`,
+  `DeepstackAddsExtraTensors`, `SpecDecodeBaseAddsProposalTensors`, plus the main test) by 2 each.
+
+### Binding mapping table (fork tensor -> engine input)
+
+| Fork/legacy tensor | Upstream ragged-ABI replacement | Status this pass |
+|---|---|---|
+| `kvcache_start_index` (per-row past KV length, shape `[batch]`/`[0]`) | `past_lengths` (`[batch]`, always present) | Registry no longer mis-registers it on upstream engines; `PhaseKVActiveView`/`packedPrefillActiveView` still *write* `kvcache_start_index` into the `TensorMap` (harmless — `bindAll` only binds registry-listed names) instead of `past_lengths`. **Not yet rewired.** |
+| `last_token_ids` (`[tokenBatch, selectLen]` INT64) | `logits_indices` (`[selectLen]` INT64, selects last token per logical sequence from the packed token-major layout) | Registry fix only; packed-prefill/decode logits-index population not audited this pass. |
+| per-row KV page-table swap in `PhaseKVActiveView::prepare()` (`kKVPageTable` only) | `kv_page_table` + `state_indices` (state_indices selects which page-table row an active stable slot maps to) | Unchanged this pass — `PhaseKVActiveView` still only swaps `kKVPageTable`; `state_indices` for the active rows is not derived from `StableKVPageManager` slot assignment yet. |
+| (none, fork had no separate carrier) | `attention_sequence_lengths`, `execution_phase_marker`, `context_sequence_count_carrier`, `query_start_offsets` | Filled by the already-upstream `addUnifiedDecoderMetadata`/ragged staging paths, independent of `PhaseKVActiveView`; not audited against phase prefill/decode chunk-continuation semantics this pass. |
+
+### Verification this pass
+
+- `cmake --build .local/builds/v0110-port -j16` in the `nvcr.io/nvidia/tensorrt:26.06-py3` container: clean,
+  no errors/warnings from the changed files.
+- All 11 `unitTest*` executables run serially in-container:
+
+| Executable | Result |
+|---|---|
+| unitTestCommon | 153/153 passed |
+| unitTestContextCache | 204/204 passed |
+| unitTestCuteDslKernels | 59/59 passed |
+| unitTestExamples | 3/3 passed |
+| unitTestKernelsAttention | passed (several platform-gated SKIPPED) |
+| unitTestKernelsMisc | passed (several platform-gated SKIPPED) |
+| unitTestKernelsMoe | passed (1 SKIPPED, 1 DISABLED) |
+| unitTestKernelsSpeculative | 114/114 passed (1 DISABLED) |
+| unitTestPlugins | 24/25 passed, 1 SKIPPED (NCCL multi-rank) |
+| unitTestRuntime | 1029/1031 passed, 2 SKIPPED (benchmark + NCCL) |
+| unitTestRuntimeState | 128/128 passed |
+| unitTestScheduler | 59/59 passed |
+
+  (No `unittests/cpp/runtime/scheduling/*`-specific test additions were made this pass — the
+  `RegistryBuilderTest` updates above are the only test changes.)
+- Did not run the attention-plugin pytest (no plugin ABI/kernel code touched this pass).
+- Did not run serving benchmarks or export/build engines, per task scope.
+
+### Still open (not done this pass — flagged for the next Milestone 2 pass)
+
+- `cpp/runtime/scheduling/phaseKVActiveView.cpp` and `packedPrefillActiveView.cpp` still read/write
+  `binding_names::kKVCacheStartIndex` exclusively. On an upstream-ABI engine this binding is now absent from
+  the registry, so `bindAll` silently ignores it — meaning **PhaseKVActiveView's per-active-row KV-length
+  adjustment currently reaches nowhere on the ragged ABI**: it is dead code with respect to what the engine
+  actually reads for decode continuation length. The engine's real per-row length input is `past_lengths`
+  (plus `state_indices` for which physical stable-slot/page-table row each active row maps to). This must be
+  rewired before decode over non-contiguous stable slots, or packed-prefill chunk continuation with nonzero
+  past, can be correct on an upstream-ABI engine — i.e. this pass's fix prevents the `bindAll`/TensorRT crash,
+  but does **not** make phase-serving numerically correct on the new engines. Expect serving to still fail or
+  produce wrong output at decode/continuation time until this is done.
+- `cpp/runtime/state/pipelineIO.cpp`'s `buildTensorMapImpl` still unconditionally does
+  `map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths())` (from commit `3c5e8841`). Now
+  harmless dead weight on upstream-ABI engines (same "registry ignores it" reasoning as above), but should be
+  revisited/removed once `past_lengths`/`state_indices` carry the real signal, to avoid two parallel
+  "KV length" tensors drifting out of sync in the code even though only one is engine-visible.
+  `kv_cache_start_index`'s continued presence here needs an explicit decision (keep for fork-ABI engines only,
+  gated the same way `engineExecutor.cpp` now gates it, or drop entirely) rather than silent dead-weight.
+  Not resolved this pass.
+- `cpp/runtime/scheduling/independentPhaseCoordinator.cpp` and `phaseServingRuntime.cpp`'s prefill/decode
+  staging were not audited against the ragged metadata contract this pass (`query_start_offsets`,
+  `logits_indices` selection for packed-prefill last-token-per-sequence, `execution_phase_marker`,
+  `context_sequence_count_carrier`) — only the registry mismatch that caused the immediate crash was fixed.
+- No new unit tests were added for packed-prefill-with-nonzero-past or decode-over-non-contiguous-stable-slots
+  metadata correctness (task item 3) — existing `PhaseKVActiveViewTest`/`PackedPrefillActiveViewTest` suites
+  still only exercise the old `kKVCacheStartIndex`-based contract and were left passing as-is, not extended.
+- Vision/auxiliary packed-prefill on the vision-prefill profile (task item (b)) not audited at all this pass.
+
+**Expectation for the parent's serving run**: the immediate `bindAll`/"invalid tensor name" crash this task
+was filed against should be gone (registry and engine IO now match). However, given the "still open" items
+above, decode continuation length and packed-prefill chunking are very likely to still be wrong — watch for
+wrong-length KV reads (garbage/short context) or wrong logits selection on packed prefill, rather than a
+crash, as the next failure mode.
