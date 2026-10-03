@@ -21,4 +21,4 @@ Update the row in the same commit as the item.
 | W013 | active | [Gemma batch-shape output divergence](W013-gemma-output-divergence.md) | 356–368 (5) |
 | W014 | active | [Realized overlap cost labels and scheduler redesign](W014-overlap-cost-scheduler.md) | 360–367 (8) |
 | W015 | active | [.local retention, cleanup, and workspace lifecycle](W015-local-artifact-lifecycle.md) | 309–370 (2) |
-| W016 | active | [Upstream v0.11.0 baseline and port](W016-upstream-v0110-port.md) | 371 (1) |
+| W016 | active | [Upstream v0.11.0 baseline and port](W016-upstream-v0110-port.md) | 371-374 (4) |
