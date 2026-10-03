@@ -144,6 +144,107 @@ TEST(PipelineIOSwaBindingTest, ReusablePinnedMetadataIsNotOverwrittenWhileUpload
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
+TEST(PipelineIOSwaBindingTest, PackedRaggedMetadataUploadMatchesBatchAcrossRowCountChanges)
+{
+    LLMEngineConfig cfg;
+    cfg.hiddenSize = 16;
+    cfg.outputVocabSize = 32;
+    cfg.maxSupportedBatchSize = 4;
+    cfg.maxSupportedInputLength = 4;
+    cfg.maxKVCacheCapacity = 8;
+    cfg.maxPhysicalTokens = 16;
+    cfg.maxNumSequences = 4;
+    cfg.recurrentPoolRows = 4;
+    cfg.rotaryDim = 8;
+    cfg.ropeConfig.type = RopeType::kNoRope;
+
+    // One wide prefill-shaped step, then a smaller decode-shaped step reusing fewer rows, then
+    // growing back to the full row count: the single combined H2D copy + unpack kernel must
+    // reproduce the reference per-field layout regardless of how the active row count moves.
+    auto makeBatch = [](int32_t numSequences, int32_t queryWidth, int32_t positionBase) {
+        RaggedExecutionBatch batch;
+        int32_t const physicalTokens = numSequences * queryWidth;
+        batch.shape = {numSequences, physicalTokens, physicalTokens, queryWidth, 0, 0, numSequences};
+        batch.positions.resize(static_cast<size_t>(physicalTokens));
+        batch.queryStartOffsets.resize(static_cast<size_t>(numSequences) + 1);
+        for (int32_t row = 0; row < numSequences; ++row)
+        {
+            batch.queryStartOffsets[static_cast<size_t>(row)] = row * queryWidth;
+            for (int32_t t = 0; t < queryWidth; ++t)
+            {
+                batch.positions[static_cast<size_t>(row * queryWidth + t)] = positionBase + row * 10 + t;
+            }
+            batch.queryLengths.push_back(queryWidth);
+            batch.pastLengths.push_back(positionBase + row);
+            batch.attentionSequenceLengths.push_back(positionBase + row + queryWidth);
+            batch.stateIndices.push_back(numSequences - 1 - row);
+            batch.logitsIndices.push_back(row * queryWidth + queryWidth - 1);
+        }
+        batch.queryStartOffsets[static_cast<size_t>(numSequences)] = physicalTokens;
+        return batch;
+    };
+
+    auto checkAgainstReference = [](PipelineIO& io, RaggedExecutionBatch const& batch, cudaStream_t stream) {
+        int32_t const tokens = batch.shape.physicalTokens;
+        int32_t const sequences = batch.shape.numSequences;
+        std::vector<int32_t> positions(static_cast<size_t>(tokens));
+        std::vector<int32_t> queryStartOffsets(static_cast<size_t>(sequences) + 1);
+        std::vector<int32_t> queryLengths(static_cast<size_t>(sequences));
+        std::vector<int32_t> pastLengths(static_cast<size_t>(sequences));
+        std::vector<int32_t> attentionSequenceLengths(static_cast<size_t>(sequences));
+        std::vector<int32_t> stateIndices(static_cast<size_t>(sequences));
+        std::vector<int64_t> logitsIndices(static_cast<size_t>(sequences));
+        ASSERT_EQ(cudaMemcpyAsync(positions.data(), io.positions.rawPointer(), positions.size() * sizeof(int32_t),
+                      cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(queryStartOffsets.data(), io.queryStartOffsets.rawPointer(),
+                      queryStartOffsets.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(queryLengths.data(), io.queryLengths.rawPointer(),
+                      queryLengths.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(pastLengths.data(), io.pastLengths.rawPointer(), pastLengths.size() * sizeof(int32_t),
+                      cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(attentionSequenceLengths.data(), io.attentionSequenceLengths.rawPointer(),
+                      attentionSequenceLengths.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(stateIndices.data(), io.stateIndices.rawPointer(),
+                      stateIndices.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(logitsIndices.data(), io.logitsIndices.rawPointer(),
+                      logitsIndices.size() * sizeof(int64_t), cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(positions, batch.positions);
+        EXPECT_EQ(queryStartOffsets, batch.queryStartOffsets);
+        EXPECT_EQ(queryLengths, batch.queryLengths);
+        EXPECT_EQ(pastLengths, batch.pastLengths);
+        EXPECT_EQ(attentionSequenceLengths, batch.attentionSequenceLengths);
+        EXPECT_EQ(stateIndices, batch.stateIndices);
+        EXPECT_EQ(logitsIndices, batch.logitsIndices);
+    };
+
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    {
+        PipelineIO io = PipelineIO::createForLLM(cfg, stream);
+
+        RaggedExecutionBatch const wide = makeBatch(4, 2, 0);
+        io.uploadRaggedMetadata(wide, stream);
+        checkAgainstReference(io, wide, stream);
+
+        RaggedExecutionBatch const narrow = makeBatch(1, 1, 100);
+        io.uploadRaggedMetadata(narrow, stream);
+        checkAgainstReference(io, narrow, stream);
+
+        RaggedExecutionBatch const regrown = makeBatch(4, 1, 200);
+        io.uploadRaggedMetadata(regrown, stream);
+        checkAgainstReference(io, regrown, stream);
+    }
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 TEST(PipelineIOSwaBindingTest, StateIndexOnlyUploadSharesRaggedMetadataStagingFence)
 {
     LLMEngineConfig cfg;

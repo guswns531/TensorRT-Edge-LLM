@@ -139,15 +139,11 @@ void allocateRaggedMetadata(PipelineIO& io, int32_t maxTokens, int32_t maxSequen
     io.contextSequenceCountCarrier = Tensor(
         {maxSequences}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextSequenceCountCarrier");
 
-    io.hostPositions = Tensor({maxTokens}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostPositions");
-    io.hostQueryStartOffsets
-        = Tensor({maxSequences + 1}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostQueryStartOffsets");
-    io.hostQueryLengths
-        = Tensor({maxSequences}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostQueryLengths");
-    io.hostPastLengths
-        = Tensor({maxSequences}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostPastLengths");
-    io.hostAttentionSequenceLengths = Tensor(
-        {maxSequences}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostAttentionSequenceLengths");
+    int32_t const packedCapacity = maxTokens + (maxSequences + 1) + 4 * maxSequences;
+    io.hostRaggedMetadataPacked = Tensor(
+        {packedCapacity}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostRaggedMetadataPacked");
+    io.raggedMetadataPackedDevice = Tensor(
+        {packedCapacity}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::raggedMetadataPackedDevice");
     io.hostStateIndices
         = Tensor({maxSequences}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostStateIndices");
     io.hostLogitsIndices
@@ -166,36 +162,30 @@ void PipelineIO::uploadRaggedMetadata(RaggedExecutionBatch const& batch, cudaStr
             && logitsIndices.reshape({logits})
             && contextSequenceCountCarrier.reshape({batch.shape.numContextSequences}),
         "Ragged device metadata reshape failed");
-    check::check(hostPositions.reshape({tokens}) && hostQueryStartOffsets.reshape({sequences + 1})
-            && hostQueryLengths.reshape({sequences}) && hostPastLengths.reshape({sequences})
-            && hostAttentionSequenceLengths.reshape({sequences}) && hostStateIndices.reshape({sequences})
+
+    // Packed order must match launchUnpackRaggedMetadata.
+    int32_t const packedCount = tokens + (sequences + 1) + 4 * sequences;
+    check::check(hostRaggedMetadataPacked.reshape({packedCount}) && raggedMetadataPackedDevice.reshape({packedCount})
             && hostLogitsIndices.reshape({logits}),
         "Ragged host metadata reshape failed");
 
-    auto stage = [](Tensor& destination, auto const& source) {
-        using Value = typename std::decay_t<decltype(source)>::value_type;
-        std::copy(source.begin(), source.end(), destination.dataPointer<Value>());
-    };
-    stage(hostPositions, batch.positions);
-    stage(hostQueryStartOffsets, batch.queryStartOffsets);
-    stage(hostQueryLengths, batch.queryLengths);
-    stage(hostPastLengths, batch.pastLengths);
-    stage(hostAttentionSequenceLengths, batch.attentionSequenceLengths);
-    stage(hostStateIndices, batch.stateIndices);
-    stage(hostLogitsIndices, batch.logitsIndices);
+    int32_t* packed = hostRaggedMetadataPacked.dataPointer<int32_t>();
+    packed = std::copy(batch.positions.begin(), batch.positions.end(), packed);
+    packed = std::copy(batch.queryStartOffsets.begin(), batch.queryStartOffsets.end(), packed);
+    packed = std::copy(batch.queryLengths.begin(), batch.queryLengths.end(), packed);
+    packed = std::copy(batch.pastLengths.begin(), batch.pastLengths.end(), packed);
+    packed = std::copy(batch.attentionSequenceLengths.begin(), batch.attentionSequenceLengths.end(), packed);
+    std::copy(batch.stateIndices.begin(), batch.stateIndices.end(), packed);
+    std::copy(batch.logitsIndices.begin(), batch.logitsIndices.end(), hostLogitsIndices.dataPointer<int64_t>());
 
-    auto upload = [stream](Tensor& destination, Tensor const& source) {
-        size_t const bytes = static_cast<size_t>(source.getShape().volume()) * utils::getTypeSize(source.getDataType());
-        CUDA_CHECK(
-            cudaMemcpyAsync(destination.rawPointer(), source.rawPointer(), bytes, cudaMemcpyHostToDevice, stream));
-    };
-    upload(positions, hostPositions);
-    upload(queryStartOffsets, hostQueryStartOffsets);
-    upload(queryLengths, hostQueryLengths);
-    upload(pastLengths, hostPastLengths);
-    upload(attentionSequenceLengths, hostAttentionSequenceLengths);
-    upload(stateIndices, hostStateIndices);
-    upload(logitsIndices, hostLogitsIndices);
+    CUDA_CHECK(cudaMemcpyAsync(raggedMetadataPackedDevice.rawPointer(), hostRaggedMetadataPacked.rawPointer(),
+        static_cast<size_t>(packedCount) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(logitsIndices.rawPointer(), hostLogitsIndices.rawPointer(),
+        static_cast<size_t>(logits) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    kernel::launchUnpackRaggedMetadata(raggedMetadataPackedDevice.dataPointer<int32_t>(),
+        positions.dataPointer<int32_t>(), queryStartOffsets.dataPointer<int32_t>(), queryLengths.dataPointer<int32_t>(),
+        pastLengths.dataPointer<int32_t>(), attentionSequenceLengths.dataPointer<int32_t>(),
+        stateIndices.dataPointer<int32_t>(), tokens, sequences, stream);
     mRaggedMetadataUploadFence.record(stream);
 }
 

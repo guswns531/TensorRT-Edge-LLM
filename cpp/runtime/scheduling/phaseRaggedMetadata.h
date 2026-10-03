@@ -66,10 +66,17 @@ public:
     RaggedExecutionBatch const& batch() const noexcept;
 
 private:
+    //! Same-row-count decode: offsets, lengths, state/logits indices, and sequenceWorks depend only on the
+    //! row index, so only positions, past/attention lengths, and sequenceOrder are rewritten.
+    RaggedExecutionBatch const& buildDecodeIncremental(std::vector<PhaseRaggedSequence> const& sequences);
+
     int32_t mMaxSequences{};
     int32_t mMaxPhysicalTokens{};
     RaggedExecutionBatch mBatch;
     ExecutionPhase mExecutionPhase{ExecutionPhase::kContextPrefill};
+    bool mHasPriorBuild{false};
+    SequenceWork mPriorWork{SequenceWork::kContext};
+    int32_t mPriorNumSequences{0};
 };
 
 //! Uploads batch metadata through io's pinned staging (PipelineIO::uploadRaggedMetadata) and gathers

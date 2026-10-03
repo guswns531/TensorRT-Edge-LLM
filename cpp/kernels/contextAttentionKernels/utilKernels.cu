@@ -470,6 +470,50 @@ __global__ void scatterActiveRowsKernel(
     }
 }
 
+__global__ void unpackRaggedMetadataKernel(int32_t const* packed, int32_t* positions, int32_t* queryStartOffsets,
+    int32_t* queryLengths, int32_t* pastLengths, int32_t* attentionSequenceLengths, int32_t* stateIndices,
+    int32_t tokens, int32_t sequences)
+{
+    int32_t const sequencesPlusOne = sequences + 1;
+    int32_t const total = tokens + sequencesPlusOne + 4 * sequences;
+    for (int32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x)
+    {
+        int32_t const value = packed[idx];
+        int32_t offset = idx;
+        if (offset < tokens)
+        {
+            positions[offset] = value;
+            continue;
+        }
+        offset -= tokens;
+        if (offset < sequencesPlusOne)
+        {
+            queryStartOffsets[offset] = value;
+            continue;
+        }
+        offset -= sequencesPlusOne;
+        if (offset < sequences)
+        {
+            queryLengths[offset] = value;
+            continue;
+        }
+        offset -= sequences;
+        if (offset < sequences)
+        {
+            pastLengths[offset] = value;
+            continue;
+        }
+        offset -= sequences;
+        if (offset < sequences)
+        {
+            attentionSequenceLengths[offset] = value;
+            continue;
+        }
+        offset -= sequences;
+        stateIndices[offset] = value;
+    }
+}
+
 } // namespace
 
 void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* contextLengths, int32_t* blockBegin,
@@ -495,6 +539,23 @@ void launchScatterActiveRows(void const* source, void* destination, int32_t cons
     check::check(activeRows > 0 && residentRows > 0 && rowBytes > 0, "Indexed row scatter received invalid extents");
     scatterActiveRowsKernel<<<activeRows, 256, 0, stream>>>(
         static_cast<uint8_t const*>(source), static_cast<uint8_t*>(destination), stateIndices, residentRows, rowBytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchUnpackRaggedMetadata(int32_t const* packed, int32_t* positions, int32_t* queryStartOffsets,
+    int32_t* queryLengths, int32_t* pastLengths, int32_t* attentionSequenceLengths, int32_t* stateIndices,
+    int32_t tokens, int32_t sequences, cudaStream_t stream)
+{
+    check::check(packed != nullptr && positions != nullptr && queryStartOffsets != nullptr && queryLengths != nullptr
+            && pastLengths != nullptr && attentionSequenceLengths != nullptr && stateIndices != nullptr,
+        "Ragged metadata unpack received a null pointer");
+    check::check(tokens > 0 && sequences > 0, "Ragged metadata unpack received invalid dimensions");
+
+    constexpr int32_t kUNPACK_THREADS = 256;
+    int32_t const total = tokens + (sequences + 1) + 4 * sequences;
+    int32_t const blocks = std::min(132, (total + kUNPACK_THREADS - 1) / kUNPACK_THREADS);
+    unpackRaggedMetadataKernel<<<std::max(blocks, 1), kUNPACK_THREADS, 0, stream>>>(packed, positions,
+        queryStartOffsets, queryLengths, pastLengths, attentionSequenceLengths, stateIndices, tokens, sequences);
     CUDA_CHECK(cudaGetLastError());
 }
 

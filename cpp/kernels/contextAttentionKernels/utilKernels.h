@@ -55,6 +55,14 @@ void launchGatherTokenAlignedRope(float const* source, float* output, int32_t co
 void launchScatterActiveRows(void const* source, void* destination, int32_t const* stateIndices, int32_t activeRows,
     int32_t residentRows, size_t rowBytes, cudaStream_t stream);
 
+//! Split one packed int32 staging buffer (uploaded with a single H2D copy) into the six stable
+//! ragged-metadata bindings. Packed layout: [positions(tokens), queryStartOffsets(sequences+1),
+//! queryLengths(sequences), pastLengths(sequences), attentionSequenceLengths(sequences),
+//! stateIndices(sequences)], matching the order consumed by PipelineIO::uploadRaggedMetadata.
+void launchUnpackRaggedMetadata(int32_t const* packed, int32_t* positions, int32_t* queryStartOffsets,
+    int32_t* queryLengths, int32_t* pastLengths, int32_t* attentionSequenceLengths, int32_t* stateIndices,
+    int32_t tokens, int32_t sequences, cudaStream_t stream);
+
 //! \brief Host-side wrapper that launches a lightweight CUDA kernel to compute prefix-sum of sequence lengths
 //! and KV cache end indices.
 //!

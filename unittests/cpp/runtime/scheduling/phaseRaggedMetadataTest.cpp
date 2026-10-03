@@ -105,6 +105,80 @@ TEST(PhaseRaggedMetadataTest, RejectsInvalidSteps)
     EXPECT_THROW(builder.build(SequenceWork::kContext, {{1, 0, 3}, {2, 0, 3}, {3, 0, 3}}), std::runtime_error);
 }
 
+TEST(PhaseRaggedMetadataTest, DecodeIncrementalStepMatchesFullRebuildWhenRowCountIsStable)
+{
+    PhaseRaggedMetadataBuilder reference(8, 8);
+    PhaseRaggedMetadataBuilder incremental(8, 8);
+
+    // Three decode steps at a stable row count (the common case the incremental path targets),
+    // each advancing every row's past length by one, as a real decode loop does.
+    std::vector<std::vector<int32_t>> const steps{{5, 130, 0}, {6, 131, 1}, {7, 132, 2}};
+    for (std::vector<int32_t> const& pastLengths : steps)
+    {
+        RaggedExecutionBatch const& expected = reference.build(SequenceWork::kDecode, makeRows(pastLengths, 1));
+        RaggedExecutionBatch const& actual = incremental.build(SequenceWork::kDecode, makeRows(pastLengths, 1));
+
+        EXPECT_EQ(actual.positions, expected.positions);
+        EXPECT_EQ(actual.queryStartOffsets, expected.queryStartOffsets);
+        EXPECT_EQ(actual.queryLengths, expected.queryLengths);
+        EXPECT_EQ(actual.pastLengths, expected.pastLengths);
+        EXPECT_EQ(actual.attentionSequenceLengths, expected.attentionSequenceLengths);
+        EXPECT_EQ(actual.stateIndices, expected.stateIndices);
+        EXPECT_EQ(actual.logitsIndices, expected.logitsIndices);
+        EXPECT_EQ(actual.sequenceOrder.size(), expected.sequenceOrder.size());
+        for (size_t row = 0; row < actual.sequenceOrder.size(); ++row)
+        {
+            EXPECT_EQ(actual.sequenceOrder[row].requestId, expected.sequenceOrder[row].requestId);
+            EXPECT_EQ(actual.sequenceOrder[row].resident.slot, expected.sequenceOrder[row].resident.slot);
+        }
+        EXPECT_EQ(incremental.executionPhase(), ExecutionPhase::kAutoregressiveDecode);
+    }
+}
+
+TEST(PhaseRaggedMetadataTest, DecodeRowCountChangeFallsBackToFullRebuild)
+{
+    PhaseRaggedMetadataBuilder builder(8, 8);
+
+    // Stable at N=3 primes the incremental path; dropping to N=2 and growing back to N=3 with
+    // different request ids must not leak stale rows from the N=3 incremental snapshot.
+    RaggedExecutionBatch const& wide = builder.build(SequenceWork::kDecode, makeRows({5, 130, 0}, 1));
+    EXPECT_EQ(wide.shape.numSequences, 3);
+
+    RaggedExecutionBatch const& narrow = builder.build(SequenceWork::kDecode, makeRows({42, 7}, 1));
+    EXPECT_EQ(narrow.shape.numSequences, 2);
+    EXPECT_EQ(narrow.positions, (std::vector<int32_t>{42, 7}));
+    EXPECT_EQ(narrow.queryStartOffsets, (std::vector<int32_t>{0, 1, 2}));
+    EXPECT_EQ(narrow.stateIndices, (std::vector<int32_t>{0, 1}));
+
+    RaggedExecutionBatch const& regrown = builder.build(SequenceWork::kDecode, makeRows({9, 9, 9}, 1));
+    EXPECT_EQ(regrown.shape.numSequences, 3);
+    EXPECT_EQ(regrown.positions, (std::vector<int32_t>{9, 9, 9}));
+    EXPECT_EQ(regrown.queryStartOffsets, (std::vector<int32_t>{0, 1, 2, 3}));
+    EXPECT_EQ(regrown.stateIndices, (std::vector<int32_t>{0, 1, 2}));
+    EXPECT_EQ(regrown.sequenceOrder[0].requestId, 1u);
+    EXPECT_EQ(regrown.sequenceOrder[1].requestId, 2u);
+    EXPECT_EQ(regrown.sequenceOrder[2].requestId, 3u);
+}
+
+TEST(PhaseRaggedMetadataTest, PrefillBetweenDecodeStepsForcesFullRebuild)
+{
+    PhaseRaggedMetadataBuilder builder(8, 32);
+
+    RaggedExecutionBatch const& decodeBefore = builder.build(SequenceWork::kDecode, makeRows({5, 130, 0}, 1));
+    EXPECT_EQ(decodeBefore.shape.numSequences, 3);
+
+    // A context step reusing the same builder (as a rebinding runtime might) must not be
+    // mistaken for a stable-row-count decode step.
+    RaggedExecutionBatch const& context = builder.build(SequenceWork::kContext, {{9, 0, 2}, {10, 0, 2}, {11, 0, 2}});
+    EXPECT_EQ(builder.executionPhase(), ExecutionPhase::kContextPrefill);
+    EXPECT_EQ(context.shape.queryWidth, 2);
+
+    RaggedExecutionBatch const& decodeAfter = builder.build(SequenceWork::kDecode, makeRows({1, 2, 3}, 1));
+    EXPECT_EQ(decodeAfter.positions, (std::vector<int32_t>{1, 2, 3}));
+    EXPECT_EQ(decodeAfter.queryStartOffsets, (std::vector<int32_t>{0, 1, 2, 3}));
+    EXPECT_EQ(builder.executionPhase(), ExecutionPhase::kAutoregressiveDecode);
+}
+
 TEST(PhaseRaggedMetadataTest, QueryWidthHelperMatchesMaxQueryLength)
 {
     std::vector<PhaseRaggedSequence> rows{{1, 0, 3}, {2, 0, 7}, {3, 0, 1}};

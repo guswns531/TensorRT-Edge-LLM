@@ -107,12 +107,14 @@ struct PipelineIO
     Tensor logitsIndices;
     Tensor raggedKVPageTable;
     Tensor raggedSwaKVPageTable;
-    Tensor hostPositions;
-    Tensor hostQueryStartOffsets;
-    Tensor hostQueryLengths;
-    Tensor hostPastLengths;
-    Tensor hostAttentionSequenceLengths;
-    Tensor hostStateIndices;
+    //! Pinned staging for one combined H2D copy covering positions, queryStartOffsets,
+    //! queryLengths, pastLengths, attentionSequenceLengths, and stateIndices (see
+    //! PipelineIO::uploadRaggedMetadata). Sized for the worst-case packed layout.
+    Tensor hostRaggedMetadataPacked;
+    //! Device mirror of hostRaggedMetadataPacked; split into the stable per-field
+    //! bindings above by a single unpack kernel after the combined H2D copy lands.
+    Tensor raggedMetadataPackedDevice;
+    Tensor hostStateIndices; //!< Pinned staging for the standalone uploadStateIndices() path.
     Tensor hostLogitsIndices;
     //! Gemma4 Unified block IDs, [physical_tokens] INT32; empty for other models.
     Tensor visionBlockIds;

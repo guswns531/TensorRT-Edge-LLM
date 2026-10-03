@@ -58,12 +58,36 @@ PhaseRaggedMetadataBuilder::PhaseRaggedMetadataBuilder(int32_t maxSequences, int
     mBatch.sequenceWorks.reserve(static_cast<size_t>(maxSequences));
 }
 
+RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::buildDecodeIncremental(
+    std::vector<PhaseRaggedSequence> const& sequences)
+{
+    int32_t const numSequences = static_cast<int32_t>(sequences.size());
+    for (int32_t row = 0; row < numSequences; ++row)
+    {
+        PhaseRaggedSequence const& sequence = sequences[static_cast<size_t>(row)];
+        ELLM_CHECK(sequence.queryLength == 1, "vanilla decode requires query length one");
+        ELLM_CHECK(sequence.pastLength >= 0, "phase ragged sequence past length must not be negative");
+        mBatch.positions[static_cast<size_t>(row)] = sequence.pastLength;
+        mBatch.pastLengths[static_cast<size_t>(row)] = sequence.pastLength;
+        mBatch.attentionSequenceLengths[static_cast<size_t>(row)] = sequence.pastLength + 1;
+        mBatch.sequenceOrder[static_cast<size_t>(row)] = SequenceIdentity{sequence.requestId, ResidentRef{row, 1}};
+    }
+    mExecutionPhase = ExecutionPhase::kAutoregressiveDecode;
+    return mBatch;
+}
+
 RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::build(
     SequenceWork work, std::vector<PhaseRaggedSequence> const& sequences)
 {
     ELLM_CHECK(!sequences.empty(), "phase ragged metadata builder requires a non-empty batch");
     int32_t const numSequences = static_cast<int32_t>(sequences.size());
     ELLM_CHECK(numSequences <= mMaxSequences, "phase ragged batch exceeds its configured sequence capacity");
+
+    if (work == SequenceWork::kDecode && mHasPriorBuild && mPriorWork == SequenceWork::kDecode
+        && mPriorNumSequences == numSequences)
+    {
+        return buildDecodeIncremental(sequences);
+    }
 
     int32_t queryWidth = 0;
     bool anyPastNonZero = false;
@@ -131,6 +155,9 @@ RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::build(
         ? ExecutionPhase::kAutoregressiveDecode
         : (anyPastNonZero ? ExecutionPhase::kContextChunk : ExecutionPhase::kContextPrefill);
 
+    mHasPriorBuild = true;
+    mPriorWork = work;
+    mPriorNumSequences = numSequences;
     return mBatch;
 }
 
