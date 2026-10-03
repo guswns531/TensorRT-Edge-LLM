@@ -68,20 +68,27 @@ KVPageTable::KVPageTable(int32_t maxBatch, int32_t maxPagesPerSeq, int32_t numPa
     mSparseLogicalPages.resize(static_cast<size_t>(maxBatch));
     mDevice = rt::Tensor(Coords{maxBatch, kKV_HALVES, maxPagesPerSeq}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
         "KVPageTable::kernelView");
-    mUploadStaging = rt::Tensor(Coords{maxBatch, kKV_HALVES, maxPagesPerSeq}, DeviceType::kCPU,
-        nvinfer1::DataType::kINT32, "KVPageTable::uploadStaging");
-    CUDA_CHECK(cudaEventCreateWithFlags(&mUploadComplete, cudaEventDisableTiming));
+    for (size_t slot{}; slot < kUPLOAD_STAGING_SLOTS; ++slot)
+    {
+        mUploadStaging[slot] = rt::Tensor(Coords{maxBatch, kKV_HALVES, maxPagesPerSeq}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "KVPageTable::uploadStaging");
+        CUDA_CHECK(cudaEventCreateWithFlags(&mUploadComplete[slot], cudaEventDisableTiming));
+    }
 }
 
 KVPageTable::~KVPageTable() noexcept
 {
-    if (mUploadComplete != nullptr)
+    for (size_t slot{}; slot < kUPLOAD_STAGING_SLOTS; ++slot)
     {
-        if (mUploadPending)
+        if (mUploadComplete[slot] == nullptr)
         {
-            (void) cudaEventSynchronize(mUploadComplete);
+            continue;
         }
-        (void) cudaEventDestroy(mUploadComplete);
+        if (mUploadPending[slot])
+        {
+            static_cast<void>(cudaEventSynchronize(mUploadComplete[slot]));
+        }
+        static_cast<void>(cudaEventDestroy(mUploadComplete[slot]));
     }
 }
 
@@ -292,6 +299,41 @@ bool KVPageTable::checkInvariants(std::string& error) const
     return true;
 }
 
+size_t KVPageTable::acquireUploadSlot(cudaStream_t stream)
+{
+    size_t slot = kUPLOAD_STAGING_SLOTS;
+    for (size_t offset{}; offset < kUPLOAD_STAGING_SLOTS; ++offset)
+    {
+        size_t const candidate = (mNextUploadSlot + offset) % kUPLOAD_STAGING_SLOTS;
+        if (!mUploadPending[candidate])
+        {
+            slot = candidate;
+            break;
+        }
+        cudaError_t const status = cudaEventQuery(mUploadComplete[candidate]);
+        if (status == cudaSuccess)
+        {
+            mUploadPending[candidate] = false;
+            slot = candidate;
+            break;
+        }
+        ELLM_CHECK(status == cudaErrorNotReady, "KVPageTable staging event query failed");
+    }
+    if (slot == kUPLOAD_STAGING_SLOTS)
+    {
+        slot = mNextUploadSlot;
+        CUDA_CHECK(cudaEventSynchronize(mUploadComplete[slot]));
+        mUploadPending[slot] = false;
+        ++mUploadStats.hostWaits;
+    }
+    if (mLastUploadSlot < kUPLOAD_STAGING_SLOTS && mUploadPending[mLastUploadSlot] && mLastUploadStream != stream)
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, mUploadComplete[mLastUploadSlot]));
+        ++mUploadStats.streamWaits;
+    }
+    return slot;
+}
+
 bool KVPageTable::upload(cudaStream_t stream)
 {
     ++mUploadStats.calls;
@@ -303,15 +345,9 @@ bool KVPageTable::upload(cudaStream_t stream)
     std::string error;
     ELLM_CHECK(checkInvariants(error), "KVPageTable::upload: " + error);
 
-    if (mUploadPending)
-    {
-        CUDA_CHECK(cudaEventSynchronize(mUploadComplete));
-        mUploadPending = false;
-        ++mUploadStats.hostWaits;
-    }
-
+    size_t const uploadSlot = acquireUploadSlot(stream);
     size_t const rowElements = static_cast<size_t>(kKV_HALVES * mMaxPagesPerSeq);
-    int32_t* const staging = mUploadStaging.dataPointer<int32_t>();
+    int32_t* const staging = mUploadStaging[uploadSlot].dataPointer<int32_t>();
     int32_t* const device = mDevice.dataPointer<int32_t>();
     size_t entryCount = 0;
     size_t rangeCount = 0;
@@ -345,8 +381,11 @@ bool KVPageTable::upload(cudaStream_t stream)
         rangeBegin = rangeEnd;
     }
 
-    CUDA_CHECK(cudaEventRecord(mUploadComplete, stream));
-    mUploadPending = true;
+    CUDA_CHECK(cudaEventRecord(mUploadComplete[uploadSlot], stream));
+    mUploadPending[uploadSlot] = true;
+    mLastUploadSlot = uploadSlot;
+    mLastUploadStream = stream;
+    mNextUploadSlot = (uploadSlot + 1U) % kUPLOAD_STAGING_SLOTS;
     mUploadedHost = mHost;
     mDirtyIndices.clear();
     ++mUploadStats.uploads;
@@ -373,17 +412,13 @@ void KVPageTable::uploadDirty(cudaStream_t stream)
         return;
     }
 
-    if (mUploadPending)
-    {
-        CUDA_CHECK(cudaEventSynchronize(mUploadComplete));
-        mUploadPending = false;
-    }
+    size_t const uploadSlot = acquireUploadSlot(stream);
     if (initializeDevice)
     {
         CUDA_CHECK(cudaMemsetAsync(mDevice.rawPointer(), 0xFF, mHost.size() * sizeof(int32_t), stream));
     }
 
-    int32_t* const staging = mUploadStaging.dataPointer<int32_t>();
+    int32_t* const staging = mUploadStaging[uploadSlot].dataPointer<int32_t>();
     for (size_t const index : mDirtyIndices)
     {
         staging[index] = mHost[index];
@@ -420,8 +455,11 @@ void KVPageTable::uploadDirty(cudaStream_t stream)
     mLastUploadRangeCount = rangeCount;
     if (initializeDevice || rangeCount > 0)
     {
-        CUDA_CHECK(cudaEventRecord(mUploadComplete, stream));
-        mUploadPending = true;
+        CUDA_CHECK(cudaEventRecord(mUploadComplete[uploadSlot], stream));
+        mUploadPending[uploadSlot] = true;
+        mLastUploadSlot = uploadSlot;
+        mLastUploadStream = stream;
+        mNextUploadSlot = (uploadSlot + 1U) % kUPLOAD_STAGING_SLOTS;
     }
 }
 

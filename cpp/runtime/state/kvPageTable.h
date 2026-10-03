@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -64,6 +65,10 @@ struct KVPageTableUploadStats
 class KVPageTable
 {
 public:
+    //! Pinned staging buffers rotated across H2D uploads so a new upload only blocks the host
+    //! when it wraps onto a slot whose previous copy has not yet retired.
+    static constexpr size_t kUPLOAD_STAGING_SLOTS = 3U;
+
     //! Row validation policy.
     enum class Mode : uint8_t
     {
@@ -191,6 +196,11 @@ private:
     void applyRows(KVPageTableRowUpdate const* updates, size_t count);
     void setHostValue(size_t index, int32_t value);
 
+    //! @brief Pick a staging slot free for reuse, waiting on the host only if every slot is
+    //!        still in flight. Also makes `stream` wait on the previous upload's event when the
+    //!        two differ, so kernels never read `mDevice` ahead of the copy that filled it.
+    size_t acquireUploadSlot(cudaStream_t stream);
+
     int32_t mMaxBatch{};
     int32_t mMaxPagesPerSeq{};
     int32_t mNumPages{};
@@ -209,10 +219,14 @@ private:
     size_t mLastUploadEntryCount{};
     size_t mLastUploadRangeCount{};
     mutable rt::Tensor mDevice;
-    //! Immutable pinned snapshot used by an in-flight H2D upload. Reuse waits for mUploadComplete.
-    rt::Tensor mUploadStaging;
-    cudaEvent_t mUploadComplete{};
-    bool mUploadPending{false};
+    //! Rotating pinned staging buffers; slot `s` is immutable while its H2D copy is in flight and
+    //! reusable once `mUploadComplete[s]` is signaled.
+    std::array<rt::Tensor, kUPLOAD_STAGING_SLOTS> mUploadStaging;
+    std::array<cudaEvent_t, kUPLOAD_STAGING_SLOTS> mUploadComplete{};
+    std::array<bool, kUPLOAD_STAGING_SLOTS> mUploadPending{};
+    size_t mNextUploadSlot{};
+    size_t mLastUploadSlot{kUPLOAD_STAGING_SLOTS};
+    cudaStream_t mLastUploadStream{};
     KVPageTableUploadStats mUploadStats;
 };
 

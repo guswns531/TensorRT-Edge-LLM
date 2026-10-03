@@ -512,6 +512,86 @@ TEST(KVPageTableTest, UploadDirtyValidatesAndCopiesOnlyChangedEntries)
     EXPECT_EQ(table.lastUploadRangeCount(), 0U);
 }
 
+TEST(KVPageTableTest, UploadReusesCompletedStagingSlotsWithoutHostWait)
+{
+    constexpr int32_t maxBatch = 1;
+    constexpr int32_t maxPagesPerSeq = 2;
+    constexpr int32_t numPages = 8;
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
+
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    constexpr size_t iterations = KVPageTable::kUPLOAD_STAGING_SLOTS * 3U;
+    for (size_t i = 0; i < iterations; ++i)
+    {
+        std::vector<int32_t> const row{static_cast<int32_t>(i % numPages)};
+        table.setRow(0, row.data(), static_cast<int32_t>(row.size()));
+        ASSERT_TRUE(table.upload(stream));
+        // Sync so the slot acquired on the next call is already complete: the host must not
+        // wait again once a slot's event has retired.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    EXPECT_EQ(table.uploadStats().hostWaits, 0U);
+    EXPECT_EQ(table.uploadStats().uploads, iterations);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(KVPageTableTest, UploadWrapsStagingSlotsAndKeepsLatestContents)
+{
+    constexpr int32_t maxBatch = 1;
+    constexpr int32_t maxPagesPerSeq = 2;
+    constexpr int32_t numPages = 8;
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
+
+    // No synchronization between back-to-back uploads: this exercises slot reuse while an
+    // earlier copy may still be in flight, without the test itself ever blocking indefinitely.
+    constexpr size_t iterations = KVPageTable::kUPLOAD_STAGING_SLOTS * 4U;
+    for (size_t i = 0; i < iterations; ++i)
+    {
+        std::vector<int32_t> const row{static_cast<int32_t>(i % numPages)};
+        table.setRow(0, row.data(), static_cast<int32_t>(row.size()));
+        ASSERT_TRUE(table.upload(/*stream=*/nullptr));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    std::vector<int32_t> const device = copyDeviceTable(table, maxBatch, maxPagesPerSeq);
+    int32_t const expectedK = static_cast<int32_t>((iterations - 1) % numPages);
+    EXPECT_EQ(device[0], expectedK);
+    EXPECT_EQ(device[static_cast<size_t>(maxPagesPerSeq)], expectedK + numPages);
+    EXPECT_EQ(table.uploadStats().uploads, iterations);
+}
+
+TEST(KVPageTableTest, UploadDirtyWrapsStagingSlotsAndKeepsLatestContents)
+{
+    if (!hasCudaDevice())
+    {
+        GTEST_SKIP() << "CUDA device required for dirty H2D copy accounting.";
+    }
+
+    constexpr int32_t maxBatch = 1;
+    constexpr int32_t maxPagesPerSeq = 4;
+    constexpr int32_t numPages = 8;
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages, KVPageTable::Mode::kSparseWindow);
+
+    constexpr size_t iterations = KVPageTable::kUPLOAD_STAGING_SLOTS * 4U;
+    for (size_t i = 0; i < iterations; ++i)
+    {
+        int32_t const kPageId = static_cast<int32_t>(i % numPages);
+        table.setEntry(/*slot=*/0, /*logicalPage=*/0, kPageId);
+        table.uploadDirty(/*stream=*/nullptr);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+
+    size_t const tableEntryCount = static_cast<size_t>(maxBatch) * 2 * maxPagesPerSeq;
+    std::vector<int32_t> deviceTable(tableEntryCount);
+    CUDA_CHECK(cudaMemcpy(deviceTable.data(), table.kernelView().rawPointer(), tableEntryCount * sizeof(int32_t),
+        cudaMemcpyDeviceToHost));
+    int32_t const expectedK = static_cast<int32_t>((iterations - 1) % numPages);
+    EXPECT_EQ(deviceTable[0], expectedK);
+    EXPECT_EQ(deviceTable[static_cast<size_t>(maxPagesPerSeq)], expectedK + numPages);
+}
+
 TEST(KVPageTableTest, GatherUsesResidentOrderAndKeepsDestinationAddressStable)
 {
     constexpr int32_t maxBatch = 4;
