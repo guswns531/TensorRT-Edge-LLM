@@ -23,6 +23,14 @@ else()
   set(_EDGELLM_PROJECT_LANGUAGES C CXX CUDA)
 endif()
 
+# Capture whether the caller explicitly set CMAKE_CUDA_ARCHITECTURES before
+# project(CUDA) runs compiler detection and populates it with a default.
+if(DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
+  set(_EDGELLM_USER_SET_CUDA_ARCHITECTURES TRUE)
+else()
+  set(_EDGELLM_USER_SET_CUDA_ARCHITECTURES FALSE)
+endif()
+
 project(
   tensorrt_edgellm_sdk
   VERSION 0.11.0
@@ -120,7 +128,7 @@ set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 # Explicit single-SM builds must not inherit the multi-architecture default.
 if(NOT DEFINED EDGELLM_WHEEL_PAYLOAD_DIR
    AND NOT AARCH64_BUILD
-   AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+   AND NOT _EDGELLM_USER_SET_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89;90)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)

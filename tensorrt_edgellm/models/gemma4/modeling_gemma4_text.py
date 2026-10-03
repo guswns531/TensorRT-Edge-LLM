@@ -816,7 +816,11 @@ class Gemma4Attention(Attention):
             "enable_packed_prefill": int(self.enable_packed_prefill),
             "packed_prefill_max_chunk_tokens":
             self.packed_prefill_max_chunk_tokens,
-            "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
+            # Gemma4's ragged forward never threads a skip_softmax_scale
+            # carrier input (see forward() above), so this must stay 0.0
+            # regardless of the configured factor, or the attention plugin
+            # reserves an input slot that the exported graph never supplies.
+            "skip_softmax_scale_factor": 0.0,
             "qkv_scales": getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0]),
             "query_start_offsets": query_start_offsets,
             "attention_sequence_lengths": attention_sequence_lengths,

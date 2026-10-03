@@ -96,6 +96,32 @@ def test_gemma4_tiny_onnx_connects_ragged_vision_metadata(tmp_path):
         }
 
 
+def test_gemma4_ragged_positive_skip_softmax_factor_omits_unwired_carrier(
+        tmp_path):
+    # Gemma4's ragged forward never threads a skip_softmax_scale carrier
+    # input, so a positive configured factor must not reach the exported
+    # AttentionPlugin attribute: the plugin reserves an input slot whenever
+    # the attribute is > 0, and the exported graph never supplies it.
+    config = _config()
+    config.skip_softmax_scale_factor = 0.1
+    output = tmp_path / "gemma4-ragged-skip-softmax.onnx"
+
+    _export_model(Gemma4ForCausalLM(config), str(output), optimize=False)
+
+    graph = onnx.load(str(output), load_external_data=False).graph
+    attention_nodes = [
+        node for node in graph.node if node.op_type == "AttentionPlugin"
+    ]
+    assert attention_nodes
+    graph_input_names = {tensor.name for tensor in graph.input}
+    for node in attention_nodes:
+        factor = next(a.f for a in node.attribute
+                      if a.name == "skip_softmax_scale_factor")
+        has_carrier = "skip_softmax_scale" in node.input
+        assert not (factor > 0.0 and not has_carrier)
+        assert "skip_softmax_scale" not in graph_input_names
+
+
 def test_gemma4_tree_base_logits_selection_has_independent_dynamic_axis(
         tmp_path):
     config = _config()
