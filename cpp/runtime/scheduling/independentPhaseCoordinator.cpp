@@ -64,8 +64,13 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "independent_coordinator_prefill")
     , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
     , mResources(resources)
+    // Primary profile's per-row token width: the packed chunk cap when packed (maxPackedPrefillChunkTokens
+    // is 0 otherwise), or the full non-packed input length when not — matches how mPrefillIO itself is
+    // sized in PhaseServingRuntime (prefillSequenceCapacity).
     , mPrefillRaggedMetadata(std::max(config.maxSupportedPrefillBatchSize, config.maxSupportedVisionPrefillBatchSize),
-          std::max(config.maxSupportedPrefillBatchSize * std::max(config.maxPackedPrefillChunkTokens, 1),
+          std::max(config.maxSupportedPrefillBatchSize
+                  * (config.packedPrefill ? std::max(config.maxPackedPrefillChunkTokens, 1)
+                                          : config.maxSupportedInputLength),
               config.maxSupportedVisionPrefillBatchSize * std::max(config.maxVisionPackedPrefillChunkTokens, 1)))
     , mDecodeRaggedMetadata(config.maxSupportedDecodeBatchSize, config.maxSupportedDecodeBatchSize)
     , mScheduler(std::move(schedulerConfig))

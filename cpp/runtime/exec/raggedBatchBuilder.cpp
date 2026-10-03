@@ -84,12 +84,14 @@ constexpr int32_t kPaddingSentinel = -1;
 
 void validateContract(RaggedEngineContract const& contract)
 {
-    ELLM_CHECK(contract.backend == TokenLayoutBackend::kEntryPaddedCompatibility, "unsupported token layout backend");
+    ELLM_CHECK(contract.backend == TokenLayoutBackend::kEntryPaddedCompatibility
+            || contract.backend == TokenLayoutBackend::kNativeCompactRagged,
+        "unsupported token layout backend");
     ELLM_CHECK(contract.maxNumSequences > 0, "maxNumSequences must be positive");
     ELLM_CHECK(contract.maxQueryLength > 0, "maxQueryLength must be positive");
     ELLM_CHECK(contract.maxPhysicalTokens > 0, "maxPhysicalTokens must be positive");
     ELLM_CHECK(contract.recurrentPoolRows > 0, "recurrentPoolRows must be positive");
-    ELLM_CHECK(!contract.mixedStepSupported, "mixed execution is not supported by the entry-padded ragged backend");
+    ELLM_CHECK(!contract.mixedStepSupported, "mixed execution is not supported by this ragged backend");
 }
 
 int32_t checkedInt32(int64_t value, char const* description)
@@ -173,7 +175,12 @@ void RaggedBatchBuilder::buildInto(ScheduledStep const& step, RaggedExecutionBat
         ELLM_CHECK(mResidentSlotScratch.insert(static_cast<uint64_t>(sequence.identity.resident.slot)),
             "duplicate resident slot in scheduled step");
         ELLM_CHECK(sequence.queryLength > 0, "query length must be positive");
-        ELLM_CHECK(sequence.queryLength <= mContract.maxQueryLength, "query length exceeds engine capacity");
+        ELLM_CHECK(sequence.queryLength <= mContract.maxQueryLength,
+            mContract.backend == TokenLayoutBackend::kNativeCompactRagged
+                ? "prompt row of " + std::to_string(sequence.queryLength)
+                    + " tokens exceeds the packed-prefill chunk cap of " + std::to_string(mContract.maxQueryLength)
+                    + " tokens; this runtime path does not chunk packed-prefill rows"
+                : "query length exceeds engine capacity");
         ELLM_CHECK(sequence.pastLength >= 0, "past length must not be negative");
         ELLM_CHECK(sequence.queryTokens.data != nullptr, "token range data must not be null");
         ELLM_CHECK(
@@ -206,7 +213,9 @@ void RaggedBatchBuilder::buildInto(ScheduledStep const& step, RaggedExecutionBat
     }
 
     ELLM_CHECK(numContextSequences == 0 || numDecodeSequences == 0, "mixed context and decode steps are not supported");
-    int64_t const physicalTokens64 = static_cast<int64_t>(numSequences) * queryWidth;
+    bool const packed = mContract.backend == TokenLayoutBackend::kNativeCompactRagged;
+    // Packed rows have no padding (T=sum q_i); entry-padded rows share one width W (T=N*W).
+    int64_t const physicalTokens64 = packed ? validTokens : static_cast<int64_t>(numSequences) * queryWidth;
     int32_t const physicalTokens = checkedInt32(physicalTokens64, "physical token count");
     ELLM_CHECK(physicalTokens <= mContract.maxPhysicalTokens, "scheduled step exceeds physical token capacity");
 
@@ -229,11 +238,13 @@ void RaggedBatchBuilder::buildInto(ScheduledStep const& step, RaggedExecutionBat
     batch.positions.assign(static_cast<size_t>(physicalTokens), kPaddingSentinel);
     batch.queryStartOffsets.resize(static_cast<size_t>(numSequences) + 1);
 
+    int32_t packedCursor = 0;
     for (int32_t forwardIndex = 0; forwardIndex < numSequences; ++forwardIndex)
     {
         ScheduledSequence const& sequence = step.sequences[static_cast<size_t>(forwardIndex)];
 
-        int32_t const physicalStart = forwardIndex * queryWidth;
+        int32_t const physicalStart = packed ? packedCursor : forwardIndex * queryWidth;
+        packedCursor += sequence.queryLength;
         batch.queryStartOffsets[static_cast<size_t>(forwardIndex)] = physicalStart;
         batch.queryLengths.push_back(sequence.queryLength);
         batch.pastLengths.push_back(sequence.pastLength);
@@ -397,10 +408,19 @@ void RaggedBatchBuilder::validateExecutionBatch(RaggedExecutionBatch const& batc
         "execution sequence count is outside engine capacity");
     ELLM_CHECK(shape.queryWidth > 0 && shape.queryWidth <= contract.maxQueryLength,
         "execution query width is outside engine capacity");
-    int32_t const expectedPhysical
-        = checkedInt32(static_cast<int64_t>(shape.numSequences) * shape.queryWidth, "execution physical token count");
-    ELLM_CHECK(shape.physicalTokens == expectedPhysical && expectedPhysical <= contract.maxPhysicalTokens,
-        "execution physical token shape is invalid");
+    bool const packed = batch.layout == TokenLayoutBackend::kNativeCompactRagged;
+    if (!packed)
+    {
+        int32_t const expectedPhysical = checkedInt32(
+            static_cast<int64_t>(shape.numSequences) * shape.queryWidth, "execution physical token count");
+        ELLM_CHECK(shape.physicalTokens == expectedPhysical && expectedPhysical <= contract.maxPhysicalTokens,
+            "execution physical token shape is invalid");
+    }
+    else
+    {
+        ELLM_CHECK(shape.physicalTokens == shape.validTokens && shape.physicalTokens <= contract.maxPhysicalTokens,
+            "packed execution physical token shape is invalid");
+    }
 
     size_t const numSequences = static_cast<size_t>(shape.numSequences);
     size_t const physicalTokens = static_cast<size_t>(shape.physicalTokens);
@@ -421,12 +441,16 @@ void RaggedBatchBuilder::validateExecutionBatch(RaggedExecutionBatch const& batc
     int64_t validTokens = 0;
     int32_t numContextSequences = 0;
     int64_t numContextTokens = 0;
+    int32_t packedCursor = 0;
     for (int32_t sequenceIndex = 0; sequenceIndex < shape.numSequences; ++sequenceIndex)
     {
         size_t const index = static_cast<size_t>(sequenceIndex);
-        int32_t const start = sequenceIndex * shape.queryWidth;
         int32_t const queryLength = batch.queryLengths[index];
-        ELLM_CHECK(batch.queryStartOffsets[index] == start, "query offset is not an entry-padded physical start");
+        int32_t const start = packed ? packedCursor : sequenceIndex * shape.queryWidth;
+        packedCursor += queryLength;
+        ELLM_CHECK(batch.queryStartOffsets[index] == start,
+            packed ? "query offset is not a packed prefix-sum physical start"
+                   : "query offset is not an entry-padded physical start");
         ELLM_CHECK(queryLength > 0 && queryLength <= shape.queryWidth, "query length is invalid");
         ELLM_CHECK(batch.pastLengths[index] >= 0, "past length is invalid");
         ELLM_CHECK(
@@ -461,7 +485,8 @@ void RaggedBatchBuilder::validateExecutionBatch(RaggedExecutionBatch const& batc
         }
         validTokens += queryLength;
 
-        for (int32_t tokenIndex = 0; tokenIndex < shape.queryWidth; ++tokenIndex)
+        int32_t const rowSpan = packed ? queryLength : shape.queryWidth;
+        for (int32_t tokenIndex = 0; tokenIndex < rowSpan; ++tokenIndex)
         {
             size_t const physicalIndex = static_cast<size_t>(start + tokenIndex);
             if (tokenIndex < queryLength)

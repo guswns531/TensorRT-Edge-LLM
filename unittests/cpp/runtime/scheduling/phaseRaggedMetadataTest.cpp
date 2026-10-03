@@ -19,6 +19,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 using namespace trt_edgellm::rt;
 
 namespace
@@ -248,4 +250,22 @@ TEST(PhaseRaggedMetadataTest, PackedAndEntryPaddedDecodeFormulasCoincide)
     EXPECT_EQ(entryPadded.positions, packed.positions);
     EXPECT_EQ(entryPadded.logitsIndices, packed.logitsIndices);
     EXPECT_EQ(entryPadded.shape.physicalTokens, packed.shape.physicalTokens);
+}
+
+// IndependentPhaseCoordinator sizes mPrefillRaggedMetadata as
+// maxSupportedPrefillBatchSize * (packed ? chunkCap : maxSupportedInputLength); a non-packed
+// engine has maxPackedPrefillChunkTokens == 0, so using that term directly (pre-fix) collapsed the
+// capacity to batch*1 and any multi-token prompt overflowed it.
+TEST(PhaseRaggedMetadataTest, NonPackedCoordinatorCapacityFormulaFitsAMultiTokenPrompt)
+{
+    int32_t const prefillBatch = 8;
+    int32_t const maxSupportedInputLength = 1024;
+    int32_t const maxPackedPrefillChunkTokens = 0; // non-packed engines serialize this as zero.
+    bool const packedPrefill = false;
+
+    int32_t const capacity
+        = prefillBatch * (packedPrefill ? std::max(maxPackedPrefillChunkTokens, 1) : maxSupportedInputLength);
+    PhaseRaggedMetadataBuilder builder(prefillBatch, capacity);
+
+    EXPECT_NO_THROW(builder.build(SequenceWork::kContext, makeRows({0}, 128)));
 }

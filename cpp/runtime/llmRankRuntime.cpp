@@ -77,6 +77,27 @@ namespace rt
 
 namespace
 {
+//! Ordinary (non-phase) runtime contract for the shared prefill/decode ragged scratch. Packed
+//! engines bind packed_prefill_chunk_limit to the per-row chunk cap (not the total token count),
+//! so maxQueryLength here must be that cap, and no row may exceed it (see
+//! RaggedBatchBuilder::buildInto); this runtime path does not chunk an over-cap prompt.
+RaggedEngineContract makeOrdinaryRaggedContract(LLMEngineConfig const& config)
+{
+    if (!config.packedPrefill)
+    {
+        return RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility, config.maxNumSequences,
+            config.maxQueryLength, config.maxPhysicalTokens, config.recurrentPoolRows,
+            /* mixedStepSupported = */ false};
+    }
+    int32_t const prefillBatchLimit
+        = config.maxSupportedPrefillBatchSize > 0 ? config.maxSupportedPrefillBatchSize : config.maxSupportedBatchSize;
+    int64_t const packedCapacity = static_cast<int64_t>(prefillBatchLimit) * config.maxPackedPrefillChunkTokens;
+    int32_t const physicalTokens = static_cast<int32_t>(std::max<int64_t>(packedCapacity, config.maxPhysicalTokens));
+    return RaggedEngineContract{TokenLayoutBackend::kNativeCompactRagged, config.maxNumSequences,
+        config.maxPackedPrefillChunkTokens, physicalTokens, config.recurrentPoolRows,
+        /* mixedStepSupported = */ false};
+}
+
 bool needsCachedBlockDraftTreeHybridBindings(DeploymentConfig const& deployment)
 {
     if (!deployment.specConfig.has_value() || deployment.base.numLinearAttnLayers == 0)
@@ -1876,9 +1897,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         ELLM_CHECK(activeBatchSize == 1, "Stepped execution requires a single-sequence founder.");
         context.requestIds.front() = founderRequestId;
     }
-    context.initializeRaggedScratch(RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility,
-        mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
-        mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
+    context.initializeRaggedScratch(makeOrdinaryRaggedContract(mDeployment.base));
     context.layerDebugger = LayerDebugger::fromEnv();
     bool const supportsMultimodalInput
         = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
@@ -3205,6 +3224,13 @@ bool LLMRankRuntime::runBaseModelPrefill(
         context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.begin() + activeBatchSize);
     int32_t const baseOutputHiddenDim
         = mDeployment.specConfig.has_value() ? mDeployment.specConfig->baseOutputHiddenDim : 0;
+    if (mDeployment.base.packedPrefill && (context.visualEmbeddings.has_value() || context.audioEmbeddings.has_value()))
+    {
+        // The multimodal index path below strides rows by a fixed inputIdsLength and is not
+        // packed-row-aware; reject rather than mis-address until that path is ported.
+        LOG_ERROR("Packed-prefill engines do not support multimodal input on the ordinary inference path.");
+        return false;
+    }
     StepId raggedStepId{0};
     context.scheduledStep.id = context.nextStepId++;
     context.scheduledStep.sequences.resize(static_cast<size_t>(activeBatchSize));
@@ -3231,10 +3257,22 @@ bool LLMRankRuntime::runBaseModelPrefill(
     std::copy(batch.pastLengths.begin(), batch.pastLengths.end(), context.prefillStartLengths.begin());
     raggedStepId = context.scheduledStep.id;
 
+    // Packed engines have no padding rows (T=sum q_i), so the dense [batch, seqLen] token/embedding
+    // staging used by the entry-padded path collapses to one row of T tokens; the multimodal-index
+    // path below indexes rows by a fixed `inputIdsLength` stride and is not packed-aware, so it is
+    // rejected earlier (multiModalRuntimePreprocess guard) rather than silently mis-addressed here.
+    bool const packedOrdinaryPrefill = mDeployment.base.packedPrefill;
+    int32_t const stagingTokenCount
+        = packedOrdinaryPrefill ? batch.shape.physicalTokens : activeBatchSize * inputIdsLength;
+
     // Reshape IO tensors for this step.
-    check::check(mIdsInput.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+    check::check(mIdsInput.reshape(
+                     packedOrdinaryPrefill ? Coords{1, stagingTokenCount} : Coords{activeBatchSize, inputIdsLength}),
+        "Tensor reshape failed");
     check::check(mPipelineIO->hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    check::check(mPipelineIO->inputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDeployment.base.hiddenSize}),
+    check::check(mPipelineIO->inputsEmbeds.reshape(packedOrdinaryPrefill
+                         ? Coords{1, stagingTokenCount, mDeployment.base.hiddenSize}
+                         : Coords{activeBatchSize, inputIdsLength, mDeployment.base.hiddenSize}),
         "Tensor reshape failed");
     if (mDeployment.base.isDiffusionBackbone)
     {
@@ -3283,7 +3321,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
     }
 
     CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), batch.hostTokenIds.rawPointer(),
-        activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        static_cast<size_t>(stagingTokenCount) * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
     mPipelineIO->recordStepHostUploads(context.stream);
 
     bool const executionKVAllEmpty
@@ -3522,8 +3560,15 @@ bool LLMRankRuntime::runBaseModelPrefill(
     }
 
     ExecutionPhase const prefillPhase = decoder_utils::contextPrefillPhase(batch.pastLengths, batch.shape.numSequences);
-    auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength,
-        mDeployment.base.isDiffusionBackbone ? ExecutionPhase::kDiffusionCommit : prefillPhase);
+    ExecutionPhase const resolvedPrefillPhase
+        = mDeployment.base.isDiffusionBackbone ? ExecutionPhase::kDiffusionCommit : prefillPhase;
+    // Packed engines bind packed_prefill_chunk_limit to the profile chunk cap, not the batch's
+    // physical-token count; reuse the same dims recipe phase-serving uses for a packed step
+    // instead of prefillDims(), which would bind that carrier to T=batch*seqLen (finding #1).
+    auto const prefillDims = mDeployment.base.packedPrefill
+        ? mDeployment.base.packedPrefillDims(
+              activeBatchSize, batch.shape.physicalTokens, batch.shape.queryWidth, resolvedPrefillPhase)
+        : mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, resolvedPrefillPhase);
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
@@ -3961,9 +4006,7 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& con
     // Temporary single-batch context to reuse the existing prefill functions.
     DecodingInferenceContext tempContext;
     tempContext.initialize(1, 1, context.visualEmbeddings, context.deepstackFeatures, loraWeightsName, context.stream);
-    tempContext.initializeRaggedScratch(RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility,
-        mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
-        mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
+    tempContext.initializeRaggedScratch(makeOrdinaryRaggedContract(mDeployment.base));
     tempContext.systemPrompts[0] = prompt;
     tempContext.rawBatchedInputIds.push_back(tokenizedPrompt);
     tempContext.tokenIds[0] = tokenizedPrompt;

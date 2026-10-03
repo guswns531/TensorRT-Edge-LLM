@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace trt_edgellm::rt;
@@ -245,6 +246,47 @@ TEST(RaggedBatchBuilderTest, ValidatesCompletionIdentityEpochAndPastLength)
     EXPECT_NO_THROW(batch.validateCommitSnapshot(69, current));
     current[0].resident.epoch = 8;
     EXPECT_THROW(batch.validateCommitSnapshot(69, current), std::runtime_error);
+}
+
+RaggedEngineContract makePackedContract()
+{
+    // maxQueryLength carries the packed-prefill chunk cap; maxPhysicalTokens the profile's
+    // batch*cap token carrier (see LLMRankRuntime's makeOrdinaryRaggedContract).
+    return {TokenLayoutBackend::kNativeCompactRagged, 8, 4, 32, 8, false};
+}
+
+TEST(RaggedBatchBuilderTest, PackedLayoutUsesPrefixSumAddressingForUnequalRows)
+{
+    RaggedBatchBuilder builder{makePackedContract()};
+    std::vector<std::vector<int32_t>> const tokens{{10, 11, 12}, {20}, {30, 31}};
+    auto batch = buildBatch(builder, 55,
+        {makeSequence(101, 2, 7, SequenceWork::kContext, tokens[0]),
+            makeSequence(102, 0, 4, SequenceWork::kContext, tokens[1]),
+            makeSequence(103, 5, 9, SequenceWork::kContext, tokens[2])});
+
+    // T = sum(q_i) = 6, not N*W = 9; no padding rows.
+    EXPECT_EQ(batch.shape.physicalTokens, 6);
+    EXPECT_EQ(batch.shape.validTokens, 6);
+    EXPECT_EQ(batch.queryStartOffsets, (std::vector<int32_t>{0, 3, 4, 6}));
+    EXPECT_EQ(hostTokens(batch), (std::vector<int32_t>{10, 11, 12, 20, 30, 31}));
+    EXPECT_EQ(batch.positions, (std::vector<int32_t>{0, 1, 2, 0, 0, 1}));
+    EXPECT_EQ(batch.logitsIndices, (std::vector<int64_t>{2, 3, 5}));
+    EXPECT_NO_THROW(RaggedBatchBuilder::validateExecutionBatch(batch, makePackedContract()));
+}
+
+TEST(RaggedBatchBuilderTest, PackedLayoutRejectsRowOverTheChunkCapWithACapNamingError)
+{
+    RaggedBatchBuilder builder{makePackedContract()};
+    std::vector<int32_t> const overCap{1, 2, 3, 4, 5};
+    try
+    {
+        buildBatch(builder, 1, {makeSequence(201, 0, 1, SequenceWork::kContext, overCap)});
+        FAIL() << "expected an over-cap row to be rejected";
+    }
+    catch (std::runtime_error const& error)
+    {
+        EXPECT_NE(std::string(error.what()).find("chunk cap of 4"), std::string::npos);
+    }
 }
 
 } // namespace
