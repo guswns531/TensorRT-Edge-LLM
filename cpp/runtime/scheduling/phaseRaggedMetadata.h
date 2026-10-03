@@ -56,9 +56,14 @@ public:
     //! Reserves every host vector once; build() never allocates when within these capacities.
     PhaseRaggedMetadataBuilder(int32_t maxSequences, int32_t maxPhysicalTokens);
 
+    //! layout selects the physical token addressing: kEntryPaddedCompatibility (default) keeps
+    //! T=N*W with row i at i*W; kNativeCompactRagged packs T=sum(q_i) with row i at the prefix
+    //! sum of query lengths (no padding rows). Decode always collapses to the same values under
+    //! either layout (W=1), so its call sites may leave this at the default.
     //! @throws std::runtime_error on empty input, non-positive q, decode q != 1, past < 0,
-    //!         N > maxSequences, or N*W > maxPhysicalTokens.
-    RaggedExecutionBatch const& build(SequenceWork work, std::vector<PhaseRaggedSequence> const& sequences);
+    //!         N > maxSequences, or physicalTokens > maxPhysicalTokens.
+    RaggedExecutionBatch const& build(SequenceWork work, std::vector<PhaseRaggedSequence> const& sequences,
+        TokenLayoutBackend layout = TokenLayoutBackend::kEntryPaddedCompatibility);
 
     //! kAutoregressiveDecode for decode; kContextChunk if any pastLength > 0, else kContextPrefill.
     ExecutionPhase executionPhase() const noexcept;

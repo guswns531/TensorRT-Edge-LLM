@@ -278,6 +278,55 @@ TEST(PhasePrefillRaggedMetadataTest, UploadFillsEngineInputsAndTokenAlignedRope)
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
+// Packed-layout counterpart of UploadFillsEngineInputsAndTokenAlignedRope: unequal rows with
+// nonzero past, T=sum(q_i), confirming the host formulas reach the device unchanged under
+// kNativeCompactRagged.
+TEST(PhasePrefillRaggedMetadataTest, PackedUploadFillsEngineInputsAndTokenAlignedRope)
+{
+    LLMEngineConfig const cfg = makePrefillConfig();
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    {
+        std::unordered_map<std::string, std::string> const noLoraWeights;
+        std::unique_ptr<SharedResources> resources = SharedResources::createForLLM(cfg, noLoraWeights, nullptr);
+        PipelineIO io = PipelineIO::createForLLMPhase(cfg, cfg.maxSupportedPrefillBatchSize, 8, stream);
+        TensorMap map;
+        buildTensorMap(map, io, *resources, cfg, /*kvCacheIndex=*/0);
+
+        PhaseRaggedMetadataBuilder builder(4, 32);
+        RaggedExecutionBatch const& batch
+            = builder.build(SequenceWork::kContext, {{1, 5, 3}, {2, 0, 2}}, TokenLayoutBackend::kNativeCompactRagged);
+        EXPECT_EQ(batch.layout, TokenLayoutBackend::kNativeCompactRagged);
+        EXPECT_EQ(batch.shape.physicalTokens, 5);
+        uploadPhaseRaggedMetadata(io, *resources, cfg, batch, stream);
+
+        EXPECT_EQ(readInt32(io.positions, stream), (std::vector<int32_t>{5, 6, 7, 0, 1}));
+        EXPECT_EQ(readInt32(io.queryStartOffsets, stream), (std::vector<int32_t>{0, 3, 5}));
+        EXPECT_EQ(readInt32(io.queryLengths, stream), (std::vector<int32_t>{3, 2}));
+        EXPECT_EQ(readInt32(io.pastLengths, stream), (std::vector<int32_t>{5, 0}));
+        EXPECT_EQ(readInt32(io.attentionSequenceLengths, stream), (std::vector<int32_t>{8, 2}));
+        EXPECT_EQ(readInt64(io.logitsIndices, stream), (std::vector<int64_t>{2, 4}));
+
+        Tensor const& fullPool
+            = resources->ropePool.getOrCreate(cfg.fullRopeConfig, cfg.fullRotaryDim, cfg.maxKVCacheCapacity, stream);
+        ASSERT_EQ(io.raggedRopeCosSinFull.getShape(), Coords({5, cfg.fullRotaryDim}));
+        std::vector<float> const gathered = readFloat(io.raggedRopeCosSinFull, 5 * cfg.fullRotaryDim, stream);
+        std::vector<float> const pool
+            = readFloat(fullPool, static_cast<size_t>(cfg.maxKVCacheCapacity) * cfg.fullRotaryDim, stream);
+        std::vector<int32_t> const expectedPositions{5, 6, 7, 0, 1};
+        for (size_t row = 0; row < expectedPositions.size(); ++row)
+        {
+            for (int32_t d = 0; d < cfg.fullRotaryDim; ++d)
+            {
+                EXPECT_EQ(gathered[row * cfg.fullRotaryDim + d],
+                    pool[static_cast<size_t>(expectedPositions[row]) * cfg.fullRotaryDim + d])
+                    << "row " << row << " dim " << d;
+            }
+        }
+    }
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 // kv_page_table and swa_kv_page_table rows are indexed by active phase row: row i holds the pages of
 // the stable slot of sequence i. No kvcache_start_index binding is required.
 TEST(PhasePrefillRaggedMetadataTest, ActiveViewSwapsKvAndSwaTablesByActiveRow)

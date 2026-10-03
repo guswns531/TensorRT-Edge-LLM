@@ -753,7 +753,8 @@ class AttentionPluginRunner:
             input_shapes=None,
             context_mask_selector=None,
             attention_output=None,
-            execution_phase=None):
+            execution_phase=None,
+            true_packed=False):
         """Execute; returns (attn_output fp16, kv_cache after update).
 
         ``qkv`` is the packed [B, S, (Hq+2*Hkv)*D] input, or a Q-only
@@ -771,6 +772,12 @@ class AttentionPluginRunner:
 
         ``attention_output`` optionally supplies the output buffer so failure
         tests can verify that enqueue returned before any output write.
+
+        ``true_packed=True`` selects the T = sum(q_i) physical layout (no
+        padding rows): ``qkv`` must already be the flat concatenated
+        [1, sum(q_i), C] carrier (row i at offset sum(q_j for j<i), q_i real
+        tokens, no padding); ``context_lengths`` (== q_i per row, same
+        convention as the entry-padded path) must sum to that T.
         """
         p = self.p
         batch = kv_cache.shape[0]
@@ -791,8 +798,32 @@ class AttentionPluginRunner:
                                input_shapes.get("kv_cache_indices") == (0, ))
         has_token_positions = (position_ids is not None
                                and position_ids.numel() == physical_tokens)
-        if has_token_positions:
+        if true_packed:
+            query_lengths = context_lengths.to(torch.int32)
+            assert int(query_lengths.sum()) == physical_tokens
+            starts = (cache_indices
+                      if not empty_cache_indices else torch.zeros(
+                          logical_batch, dtype=torch.int32, device=DEV))
+            # True packing has no padding rows: row i occupies exactly q_i
+            # real tokens at offset sum(q_j for j<i); positions are per real
+            # token (past_i + t), not a uniform-stride [N,W] grid.
+            positions = torch.cat([
+                starts[i] + torch.arange(
+                    int(query_lengths[i]), dtype=torch.int32, device=DEV)
+                for i in range(logical_batch)
+            ])
+            query_start_offsets = torch.zeros(logical_batch + 1,
+                                              dtype=torch.int32,
+                                              device=DEV)
+            torch.cumsum(query_lengths, dim=0, out=query_start_offsets[1:])
+        elif has_token_positions:
             positions = position_ids.reshape(-1).to(torch.int32)
+            query_start_offsets = torch.arange(0,
+                                               physical_tokens + 1,
+                                               per_seq_len,
+                                               dtype=torch.int32,
+                                               device=DEV)
+            query_lengths = context_lengths.clamp(min=0, max=per_seq_len)
         else:
             starts = (cache_indices
                       if not empty_cache_indices else torch.zeros(
@@ -801,13 +832,13 @@ class AttentionPluginRunner:
                 starts[:, None] +
                 torch.arange(per_seq_len, dtype=torch.int32,
                              device=DEV)[None, :]).reshape(-1)
+            query_start_offsets = torch.arange(0,
+                                               physical_tokens + 1,
+                                               per_seq_len,
+                                               dtype=torch.int32,
+                                               device=DEV)
+            query_lengths = context_lengths.clamp(min=0, max=per_seq_len)
         rope_rows = rope_cos_sin[0].index_select(0, positions.to(torch.int64))
-        query_start_offsets = torch.arange(0,
-                                           physical_tokens + 1,
-                                           per_seq_len,
-                                           dtype=torch.int32,
-                                           device=DEV)
-        query_lengths = context_lengths.clamp(min=0, max=per_seq_len)
         tree_step = self.tree and has_token_positions
         if execution_phase is None:
             if tree_step:
@@ -3038,6 +3069,65 @@ def _assert_cache_untouched(name: str, before: "torch.Tensor",
         f"{name}: shared-KV call must not modify the donor KV cache"
 
 
+def test_full_swa_packed_workspace_large_chunk_cap():
+    """Full-mode SWA packed prefill with a chunk cap much larger than the
+    sliding window must not overflow its advertised workspace.
+
+    Regression test for getSwaKVCacheWorkspaceSize() sizing one dense Q
+    buffer + K/V scratch + window buffer (the bounded-SWA shape) while
+    packed full-mode execution allocates two dense Q-sized buffers
+    (qInputTensor, denseAttentionOutput) at the packed chunk-cap width:
+    cap=1024, window=512, Hq=8, Hkv=1, D=256 needs 8 MiB of dense Q scratch
+    but the old helper only advertised 6.5 MiB."""
+    cfg = dict(BASE)
+    cfg.update(head_size=256,
+               num_q_heads=8,
+               num_kv_heads=1,
+               sliding_window_size=512,
+               kv_cache_capacity=1024,
+               max_batch_size=1,
+               max_seq_len=1024,
+               max_position_embeddings=2048)
+    total_tokens = 1024
+    p = AttentionParams(batch_size=1,
+                        seq_len=total_tokens,
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(9001)
+    _, _, rope = _make_rope(p, gen)
+    qkv = torch.randn((1, total_tokens, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV).to(torch.float16)
+    contexts = torch.tensor([total_tokens], dtype=torch.int32, device=DEV)
+    starts = torch.zeros(1, dtype=torch.int32, device=DEV)
+
+    _, _, ref_kv = _empty_caches(p)
+    reference = AttentionPluginRunner(p,
+                                      enable_packed_prefill=True,
+                                      packed_prefill_max_chunk_tokens=1024)
+    ref_out, ref_kv = reference.run(qkv.clone().reshape(
+        1, total_tokens, p.qkv_hidden_size),
+                                    ref_kv,
+                                    contexts,
+                                    rope,
+                                    starts,
+                                    input_shapes={"kv_cache_indices": (0, )})
+
+    _, _, swa_kv = _empty_caches(p)
+    swa = AttentionPluginRunner(p,
+                                enable_packed_prefill=True,
+                                packed_prefill_max_chunk_tokens=1024,
+                                swa_cache_mode="full")
+    swa_out, swa_kv = swa.run(qkv.clone().reshape(1, total_tokens,
+                                                  p.qkv_hidden_size),
+                              swa_kv,
+                              contexts,
+                              rope,
+                              starts,
+                              input_shapes={"kv_cache_indices": (0, )})
+    assert_close("full-swa-packed-large-chunk-cap-output", ref_out, swa_out)
+
+
 # Shared-KV prefill. head 128 runs the CuTe DSL FMHA path where available
 # (SM100+) and FMHA-v2 elsewhere; head 256 uses native-paged FMHA-v2 where
 # supported. FP16 head 512 runs native-paged common FMHA on SM100/101/110 and
@@ -3112,9 +3202,23 @@ def test_gemma4_packed_prefill_owned_and_shared_kv(head_size, sliding_window):
     pytest.param(256, 1024, id="gemma4-sliding-d256"),
     pytest.param(512, -1, id="gemma4-global-d512"),
 ])
-def test_gemma4_packed_prefill_unequal_entry_padded_rows(
-        head_size, sliding_window):
-    """Entry-padded unequal rows on a packed-prefill plugin match per-row runs."""
+@pytest.mark.parametrize("past", [0, 6], ids=["past0", "pastchunk"])
+@pytest.mark.parametrize("query_lengths", [[3, 8, 5], [7], [16]],
+                         ids=["rows3", "n1", "n1_chunkcap"])
+def test_gemma4_true_packed_prefill_unequal_rows_owned_kv(
+        head_size, sliding_window, past, query_lengths):
+    """True packing (T = sum(q_i), no padding rows) on owned-KV prefill
+    matches the dense per-sequence reference for unequal lengths q={3,8,5}
+    as well as single-sequence steps (q={7}, below the 16-token chunk cap,
+    and q={16}, exactly at the chunk cap), including chunk continuation
+    from a nonzero past (regression test for the token-aligned RoPE
+    row-indexing bug under true packing, design §4.2/§5.5: a packed row
+    i>0 with past>0 previously read cos/sin at absolute position
+    past_i+row instead of the packed token index o_i+row, and regression
+    test for the N=1 packed-vs-dense misclassification in
+    launchApplyRopeFromPackedToSplit, design note on commit 9f911c16: a
+    single-sequence packed step has the same cuQSeqLens extent as a dense
+    batch and was mistaken for one)."""
     cfg = dict(BASE)
     cfg.update(head_size=head_size,
                num_q_heads=8,
@@ -3124,46 +3228,348 @@ def test_gemma4_packed_prefill_unequal_entry_padded_rows(
                max_batch_size=4,
                max_seq_len=16,
                max_position_embeddings=128)
-    query_lengths = [3, 8, 5]
-    width = max(query_lengths)
-    p = AttentionParams(batch_size=len(query_lengths),
-                        seq_len=width,
+    total_tokens = sum(query_lengths)
+    n = len(query_lengths)
+    p = AttentionParams(batch_size=n,
+                        seq_len=total_tokens,
                         is_prefill=True,
                         **cfg)
-    gen = torch.Generator().manual_seed(4410 + head_size)
+    gen = torch.Generator().manual_seed(5520 + head_size + past)
     _, _, rope = _make_rope(p, gen)
-    qkv = torch.randn((p.batch_size, width, p.qkv_hidden_size),
-                      generator=gen,
-                      dtype=torch.float32).to(DEV).to(torch.float16)
-    for row, length in enumerate(query_lengths):
-        qkv[row, length:] = 0
-    contexts = torch.tensor(query_lengths, dtype=torch.int32, device=DEV)
-    starts = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
-    _, _, packed_kv = _empty_caches(p)
     packed = AttentionPluginRunner(p,
                                    enable_packed_prefill=True,
                                    packed_prefill_max_chunk_tokens=16)
-    packed_out, packed_kv = packed.run(qkv.clone(), packed_kv, contexts, rope,
-                                       starts)
+    _, _, packed_kv = _empty_caches(p)
+    starts = torch.full((n, ), past, dtype=torch.int32, device=DEV)
 
+    if past > 0:
+        # Build the past prefix in one uniform-width (every row == past)
+        # prefill: entry-padded and true-packed formulas coincide for equal
+        # lengths, so this call exercises the plugin's ordinary path.
+        prefix_qkv = torch.randn((n, past, p.qkv_hidden_size),
+                                 generator=gen,
+                                 dtype=torch.float32).to(DEV).to(torch.float16)
+        prefix_contexts = torch.full((n, ),
+                                     past,
+                                     dtype=torch.int32,
+                                     device=DEV)
+        _, packed_kv = packed.run(prefix_qkv,
+                                  packed_kv,
+                                  prefix_contexts,
+                                  rope,
+                                  torch.zeros(n, dtype=torch.int32,
+                                              device=DEV),
+                                  input_shapes={"kv_cache_indices": (0, )})
+
+    current_qkv_rows = [
+        torch.randn((length, p.qkv_hidden_size),
+                    generator=gen,
+                    dtype=torch.float32).to(DEV).to(torch.float16)
+        for length in query_lengths
+    ]
+    current_qkv_flat = torch.cat(current_qkv_rows,
+                                 dim=0).reshape(1, total_tokens,
+                                                p.qkv_hidden_size)
+    contexts = torch.tensor(query_lengths, dtype=torch.int32, device=DEV)
+    packed_out, packed_kv = packed.run(current_qkv_flat,
+                                       packed_kv,
+                                       contexts,
+                                       rope,
+                                       starts,
+                                       true_packed=True)
+    packed_out = packed_out.reshape(total_tokens, p.q_hidden)
+
+    offset = 0
     for row, length in enumerate(query_lengths):
         single = AttentionParams(batch_size=1,
-                                 seq_len=length,
+                                 seq_len=max(past, length, 1),
                                  is_prefill=True,
                                  **cfg)
+        single_runner = AttentionPluginRunner(single)
         _, _, single_kv = _empty_caches(single)
-        single_out, single_kv = AttentionPluginRunner(single).run(
-            qkv[row:row + 1, :length].clone(),
+        if past > 0:
+            _, single_kv = single_runner.run(
+                prefix_qkv[row:row + 1].clone(),
+                single_kv,
+                torch.tensor([past], dtype=torch.int32, device=DEV),
+                rope,
+                torch.zeros(1, dtype=torch.int32, device=DEV),
+                input_shapes={"kv_cache_indices": (0, )})
+        single_out, single_kv = single_runner.run(
+            current_qkv_rows[row].reshape(1, length, p.qkv_hidden_size),
             single_kv,
             torch.tensor([length], dtype=torch.int32, device=DEV),
             rope,
-            torch.zeros(1, dtype=torch.int32, device=DEV),
-            input_shapes={"kv_cache_indices": (0, )})
-        assert_close(f"gemma4-unequal-row{row}-output", single_out[0],
-                     packed_out[row, :length])
-        assert_close(f"gemma4-unequal-row{row}-cache",
-                     single_kv[0, :, :, :length],
-                     packed_kv[row, :, :, :length])
+            torch.tensor([past], dtype=torch.int32, device=DEV),
+            input_shapes=None if past > 0 else {"kv_cache_indices": (0, )})
+        assert_close(f"gemma4-true-packed-row{row}-output", single_out[0],
+                     packed_out[offset:offset + length])
+        assert_close(f"gemma4-true-packed-row{row}-cache",
+                     single_kv[0, :, :, :past + length],
+                     packed_kv[row, :, :, :past + length])
+        offset += length
+
+
+@pytest.mark.parametrize("head_size,sliding_window", [
+    pytest.param(256, 1024, id="gemma4-sliding-d256"),
+    pytest.param(512, -1, id="gemma4-global-d512"),
+])
+@pytest.mark.parametrize("past", [0, 6], ids=["past0", "pastchunk"])
+@pytest.mark.parametrize("query_lengths", [[3, 8, 5], [7], [16]],
+                         ids=["rows3", "n1", "n1_chunkcap"])
+def test_gemma4_true_packed_prefill_unequal_rows_shared_kv(
+        head_size, sliding_window, past, query_lengths):
+    """True packing on shared-KV (donor-cache) prefill matches the dense
+    per-sequence reference for unequal lengths as well as single-sequence
+    steps (q={7}, below the 16-token chunk cap, and q={16}, exactly at the
+    chunk cap), including chunk continuation from a nonzero past; the
+    donor cache is fully populated (past + current tokens) by an owned-KV
+    run before the shared pass reads it, mirroring
+    test_gemma4_packed_prefill_owned_and_shared_kv. The N=1 cases are a
+    regression test for the packed-vs-dense misclassification in
+    launchApplyRopeFromPackedToSplit fixed by commit 9f911c16."""
+    cfg = dict(BASE)
+    cfg.update(head_size=head_size,
+               num_q_heads=8,
+               num_kv_heads=1,
+               sliding_window_size=sliding_window,
+               kv_cache_capacity=128,
+               max_batch_size=4,
+               max_seq_len=16,
+               max_position_embeddings=128)
+    total_tokens = sum(query_lengths)
+    n = len(query_lengths)
+    p = AttentionParams(batch_size=n,
+                        seq_len=total_tokens,
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(6630 + head_size + past)
+    _, _, rope = _make_rope(p, gen)
+    owned = AttentionPluginRunner(p,
+                                  enable_packed_prefill=True,
+                                  packed_prefill_max_chunk_tokens=16)
+    _, _, donor_kv = _empty_caches(p)
+    starts = torch.full((n, ), past, dtype=torch.int32, device=DEV)
+
+    if past > 0:
+        prefix_qkv = torch.randn((n, past, p.qkv_hidden_size),
+                                 generator=gen,
+                                 dtype=torch.float32).to(DEV).to(torch.float16)
+        prefix_contexts = torch.full((n, ),
+                                     past,
+                                     dtype=torch.int32,
+                                     device=DEV)
+        _, donor_kv = owned.run(prefix_qkv,
+                                donor_kv,
+                                prefix_contexts,
+                                rope,
+                                torch.zeros(n, dtype=torch.int32, device=DEV),
+                                input_shapes={"kv_cache_indices": (0, )})
+
+    current_qkv_rows = [
+        torch.randn((length, p.qkv_hidden_size),
+                    generator=gen,
+                    dtype=torch.float32).to(DEV).to(torch.float16)
+        for length in query_lengths
+    ]
+    current_qkv_flat = torch.cat(current_qkv_rows,
+                                 dim=0).reshape(1, total_tokens,
+                                                p.qkv_hidden_size)
+    contexts = torch.tensor(query_lengths, dtype=torch.int32, device=DEV)
+    _, donor_kv = owned.run(current_qkv_flat,
+                            donor_kv,
+                            contexts,
+                            rope,
+                            starts,
+                            true_packed=True)
+
+    q_only_rows = [
+        torch.randn((length, p.q_hidden), generator=gen,
+                    dtype=torch.float32).to(DEV).to(torch.float16)
+        for length in query_lengths
+    ]
+    q_only_flat = torch.cat(q_only_rows,
+                            dim=0).reshape(1, total_tokens, p.q_hidden)
+    shared = AttentionPluginRunner(p,
+                                   enable_kv_shared=1,
+                                   enable_packed_prefill=True,
+                                   packed_prefill_max_chunk_tokens=16)
+    donor_before = donor_kv.clone()
+    shared_out, donor_kv = shared.run(q_only_flat,
+                                      donor_kv,
+                                      contexts,
+                                      rope,
+                                      starts,
+                                      true_packed=True)
+    shared_out = shared_out.reshape(total_tokens, p.q_hidden)
+    _assert_cache_untouched("gemma4-true-packed-shared", donor_before,
+                            donor_kv)
+
+    offset = 0
+    for row, length in enumerate(query_lengths):
+        single = AttentionParams(batch_size=1,
+                                 seq_len=max(past, length, 1),
+                                 is_prefill=True,
+                                 **cfg)
+        single_owned = AttentionPluginRunner(single)
+        _, _, single_donor = _empty_caches(single)
+        if past > 0:
+            _, single_donor = single_owned.run(
+                prefix_qkv[row:row + 1].clone(),
+                single_donor,
+                torch.tensor([past], dtype=torch.int32, device=DEV),
+                rope,
+                torch.zeros(1, dtype=torch.int32, device=DEV),
+                input_shapes={"kv_cache_indices": (0, )})
+        _, single_donor = single_owned.run(
+            current_qkv_rows[row].reshape(1, length, p.qkv_hidden_size),
+            single_donor,
+            torch.tensor([length], dtype=torch.int32, device=DEV),
+            rope,
+            torch.tensor([past], dtype=torch.int32, device=DEV),
+            input_shapes=None if past > 0 else {"kv_cache_indices": (0, )})
+        single_shared = AttentionPluginRunner(single, enable_kv_shared=1)
+        single_out, _ = single_shared.run(
+            q_only_rows[row].reshape(1, length, p.q_hidden),
+            single_donor,
+            torch.tensor([length], dtype=torch.int32, device=DEV),
+            rope,
+            torch.tensor([past], dtype=torch.int32, device=DEV),
+            input_shapes=None if past > 0 else {"kv_cache_indices": (0, )})
+        assert_close(f"gemma4-true-packed-shared-row{row}-output",
+                     single_out[0], shared_out[offset:offset + length])
+        offset += length
+
+
+@pytest.mark.parametrize("head_size,sliding_window", [
+    pytest.param(256, 1024, id="gemma4-sliding-d256"),
+    pytest.param(512, -1, id="gemma4-global-d512"),
+])
+@pytest.mark.parametrize("past", [0, 6], ids=["past0", "pastchunk"])
+@pytest.mark.parametrize("query_lengths", [[3, 8, 5], [7], [16]],
+                         ids=["rows3", "n1", "n1_chunkcap"])
+def test_gemma4_true_packed_prefill_shared_current_kv(head_size,
+                                                      sliding_window, past,
+                                                      query_lengths):
+    """True-packed shared-KV-with-current prefill (carrier is Q+K+V, not
+    Q-only) must match the dense per-sequence shared_current_kv reference.
+
+    Regression test for the packed shared-with-current RoPE kernel reading
+    Q heads of later tokens from the carrier's K/V slots: the packed path
+    reinterpreted the Q+K+V carrier as a contiguous Q-only
+    [1, totalTokens, Hq, D] view, so every token after the first was roped
+    from the wrong offset."""
+    cfg = dict(BASE)
+    cfg.update(head_size=head_size,
+               num_q_heads=8,
+               num_kv_heads=1,
+               sliding_window_size=sliding_window,
+               kv_cache_capacity=128,
+               max_batch_size=4,
+               max_seq_len=16,
+               max_position_embeddings=128)
+    total_tokens = sum(query_lengths)
+    n = len(query_lengths)
+    p = AttentionParams(batch_size=n,
+                        seq_len=total_tokens,
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(7740 + head_size + past)
+    _, _, rope = _make_rope(p, gen)
+    owned = AttentionPluginRunner(p,
+                                  enable_packed_prefill=True,
+                                  packed_prefill_max_chunk_tokens=16)
+    _, _, donor_kv = _empty_caches(p)
+    starts = torch.full((n, ), past, dtype=torch.int32, device=DEV)
+
+    if past > 0:
+        prefix_qkv = torch.randn((n, past, p.qkv_hidden_size),
+                                 generator=gen,
+                                 dtype=torch.float32).to(DEV).to(torch.float16)
+        prefix_contexts = torch.full((n, ),
+                                     past,
+                                     dtype=torch.int32,
+                                     device=DEV)
+        _, donor_kv = owned.run(prefix_qkv,
+                                donor_kv,
+                                prefix_contexts,
+                                rope,
+                                torch.zeros(n, dtype=torch.int32, device=DEV),
+                                input_shapes={"kv_cache_indices": (0, )})
+
+    # Shared-current-kv carries the donor's QKV layout (Q heads, then K, then
+    # V heads per token), not a Q-only carrier.
+    current_qkv_rows = [
+        torch.randn((length, p.qkv_hidden_size),
+                    generator=gen,
+                    dtype=torch.float32).to(DEV).to(torch.float16)
+        for length in query_lengths
+    ]
+    current_qkv_flat = torch.cat(current_qkv_rows,
+                                 dim=0).reshape(1, total_tokens,
+                                                p.qkv_hidden_size)
+    contexts = torch.tensor(query_lengths, dtype=torch.int32, device=DEV)
+    # Populate the donor cache up to past+current for every row, same as the
+    # owned-KV test, so the shared pass reads a fully populated donor cache.
+    _, donor_kv = owned.run(current_qkv_flat,
+                            donor_kv,
+                            contexts,
+                            rope,
+                            starts,
+                            true_packed=True)
+
+    shared = AttentionPluginRunner(p,
+                                   enable_kv_shared=1,
+                                   shared_current_kv=True,
+                                   enable_packed_prefill=True,
+                                   packed_prefill_max_chunk_tokens=16)
+    donor_before = donor_kv.clone()
+    shared_out, donor_kv = shared.run(current_qkv_flat,
+                                      donor_kv,
+                                      contexts,
+                                      rope,
+                                      starts,
+                                      true_packed=True)
+    shared_out = shared_out.reshape(total_tokens, p.q_hidden)
+    _assert_cache_untouched("gemma4-true-packed-shared-current", donor_before,
+                            donor_kv)
+
+    offset = 0
+    for row, length in enumerate(query_lengths):
+        single = AttentionParams(batch_size=1,
+                                 seq_len=max(past, length, 1),
+                                 is_prefill=True,
+                                 **cfg)
+        single_owned = AttentionPluginRunner(single)
+        _, _, single_donor = _empty_caches(single)
+        if past > 0:
+            _, single_donor = single_owned.run(
+                prefix_qkv[row:row + 1].clone(),
+                single_donor,
+                torch.tensor([past], dtype=torch.int32, device=DEV),
+                rope,
+                torch.zeros(1, dtype=torch.int32, device=DEV),
+                input_shapes={"kv_cache_indices": (0, )})
+        _, single_donor = single_owned.run(
+            current_qkv_rows[row].reshape(1, length, p.qkv_hidden_size),
+            single_donor,
+            torch.tensor([length], dtype=torch.int32, device=DEV),
+            rope,
+            torch.tensor([past], dtype=torch.int32, device=DEV),
+            input_shapes=None if past > 0 else {"kv_cache_indices": (0, )})
+        single_shared = AttentionPluginRunner(single,
+                                              enable_kv_shared=1,
+                                              shared_current_kv=True)
+        single_out, _ = single_shared.run(
+            current_qkv_rows[row].reshape(1, length, p.qkv_hidden_size),
+            single_donor,
+            torch.tensor([length], dtype=torch.int32, device=DEV),
+            rope,
+            torch.tensor([past], dtype=torch.int32, device=DEV),
+            input_shapes=None if past > 0 else {"kv_cache_indices": (0, )})
+        assert_close(f"gemma4-true-packed-shared-current-row{row}-output",
+                     single_out[0], shared_out[offset:offset + length])
+        offset += length
 
 
 @pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [

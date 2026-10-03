@@ -83,7 +83,9 @@ inline RaggedPluginMetadata decodeRaggedPluginMetadata(char const* pluginName,
         }
         fail("phase 8 mixed prefill/decode is reserved but unsupported");
     }
-    if (texec % n != 0)
+    // Context-phase steps may be truly packed (T_exec = sum(q_i), not necessarily a multiple of
+    // N); only non-context phases carry the entry-padded homogeneity invariant.
+    if (!contextPhase && texec % n != 0)
     {
         fail("entry-padded homogeneous execution requires T_exec divisible by N");
     }

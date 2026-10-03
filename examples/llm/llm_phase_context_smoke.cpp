@@ -1610,7 +1610,9 @@ int main(int argc, char** argv)
                 }
             }
             // Entry-padded layout shared with PhaseRaggedMetadataBuilder: row i occupies
-            // [i*queryWidth, i*queryWidth + q_i) and padding ids are 0.
+            // [i*queryWidth, i*queryWidth + q_i) and padding ids are 0. Packed-prefill engines
+            // instead carry T=sum(q_i) with row i at the prefix sum of query lengths.
+            bool const packed = prefill && config.packedPrefill;
             int32_t queryWidth = 1;
             if (prefill)
             {
@@ -1619,8 +1621,17 @@ int main(int argc, char** argv)
                     queryWidth = std::max(queryWidth, view.work.tokenCount);
                 }
             }
-            int32_t const totalTokens = static_cast<int32_t>(views.size()) * queryWidth;
-            rt::Coords const tokenShape{static_cast<int64_t>(views.size()), queryWidth};
+            int32_t totalTokens = static_cast<int32_t>(views.size()) * queryWidth;
+            if (packed)
+            {
+                totalTokens = 0;
+                for (rt::IndependentPhaseRequestView const& view : views)
+                {
+                    totalTokens += view.work.tokenCount;
+                }
+            }
+            rt::Coords const tokenShape
+                = packed ? rt::Coords{1, totalTokens} : rt::Coords{static_cast<int64_t>(views.size()), queryWidth};
             bool const reuseDecodeSample = !prefill && lastDecodeSampleRequestIds.size() == views.size()
                 && std::equal(views.begin(), views.end(), lastDecodeSampleRequestIds.begin(),
                     [](rt::IndependentPhaseRequestView const& view, uint64_t requestId) {
@@ -1643,7 +1654,7 @@ int main(int argc, char** argv)
                 ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape),
                     "Semantic phase token staging reshape failed");
                 int32_t* destination = hostIds.dataPointer<int32_t>();
-                if (prefill && queryWidth > 1)
+                if (prefill && queryWidth > 1 && !packed)
                 {
                     std::fill_n(destination, static_cast<size_t>(totalTokens), 0);
                 }
@@ -1654,7 +1665,7 @@ int main(int argc, char** argv)
                     {
                         std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
                             destination + destinationOffset);
-                        destinationOffset += queryWidth;
+                        destinationOffset += packed ? view.work.tokenCount : queryWidth;
                     }
                     else
                     {
@@ -1683,8 +1694,9 @@ int main(int argc, char** argv)
             rt::Gemma4EmbeddingPreprocessor* const ple = prefill ? prefillPle.get() : decodePle.get();
             if (ple != nullptr)
             {
-                // The packed prefill PLE preprocessor expects one token-major [1, T] row.
-                bool const tokenMajorPle = prefill && config.packedPrefill;
+                // The packed prefill PLE preprocessor expects one token-major [1, T] row; packed
+                // stagedIds are already in that shape.
+                bool const tokenMajorPle = prefill && config.packedPrefill && !packed;
                 if (tokenMajorPle)
                 {
                     ELLM_CHECK(stagedIds->reshape({1, totalTokens}), "Semantic PLE token view reshape failed");

@@ -607,9 +607,11 @@ public:
     {
         ELLM_CHECK(!views.empty(), "Phase token staging requires a non-empty batch");
         int32_t const numRows = static_cast<int32_t>(views.size());
+        bool const packed = prefill && mEngineConfig.packedPrefill;
         // Entry-padded token layout: row i occupies [i*queryWidth, i*queryWidth + q_i); padding id
         // is 0. queryWidth must match PhaseRaggedMetadataBuilder's W for the same step so token rows
-        // and ragged metadata rows agree.
+        // and ragged metadata rows agree. Packed-prefill engines instead carry T=sum(q_i) with row i
+        // at the prefix sum of query lengths and no padding rows.
         int32_t queryWidth = 1;
         if (prefill)
         {
@@ -618,25 +620,36 @@ public:
                 queryWidth = std::max(queryWidth, view.work.tokenCount);
             }
         }
-        int32_t const totalTokens = numRows * queryWidth;
-        Coords const tokenShape = {numRows, queryWidth};
+        int32_t totalTokens = numRows * queryWidth;
+        if (packed)
+        {
+            totalTokens = 0;
+            for (IndependentPhaseRequestView const& view : views)
+            {
+                totalTokens += view.work.tokenCount;
+            }
+        }
+        Coords const tokenShape = packed ? Coords{1, totalTokens} : Coords{numRows, queryWidth};
         Tensor& hostIds = prefill ? mHostPrefillIds : mHostDecodeIds;
         Tensor& deviceIds = prefill ? mDevicePrefillIds : mDeviceDecodeIds;
         ELLM_CHECK(hostIds.reshape(tokenShape) && deviceIds.reshape(tokenShape), "Phase token staging reshape failed");
 
         int32_t* destination = hostIds.dataPointer<int32_t>();
-        if (prefill && queryWidth > 1)
+        if (prefill && queryWidth > 1 && !packed)
         {
             std::fill_n(destination, static_cast<size_t>(totalTokens), 0);
         }
+        int32_t rowOffset = 0;
         for (int32_t row = 0; row < numRows; ++row)
         {
             IndependentPhaseRequestView const& view = views[static_cast<size_t>(row)];
             if (prefill)
             {
                 ELLM_CHECK(view.promptTokens != nullptr, "Phase prefill request has no prompt tokens");
+                int32_t const physicalStart = packed ? rowOffset : row * queryWidth;
                 std::copy_n(view.promptTokens->begin() + view.work.tokenOffset, view.work.tokenCount,
-                    destination + row * queryWidth);
+                    destination + physicalStart);
+                rowOffset += view.work.tokenCount;
             }
             else
             {
@@ -650,9 +663,9 @@ public:
         Gemma4EmbeddingPreprocessor* const ple = prefill ? mPrefillPle.get() : mDecodePle.get();
         if (ple != nullptr)
         {
-            // The packed prefill PLE preprocessor is sized as one [1, maxBatch * chunk] token-major row;
-            // present the entry-padded [N, W] ids in that shape so its batch check holds.
-            bool const tokenMajorPle = prefill && mEngineConfig.packedPrefill;
+            // The PLE preprocessor is sized as one [1, maxBatch * chunk] token-major row; packed
+            // deviceIds are already in that shape, but entry-padded [N, W] ids still need the view.
+            bool const tokenMajorPle = prefill && mEngineConfig.packedPrefill && !packed;
             if (tokenMajorPle)
             {
                 ELLM_CHECK(deviceIds.reshape({1, totalTokens}), "Phase PLE token view reshape failed");

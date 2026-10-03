@@ -23,6 +23,7 @@
 #include "runtime/state/sharedResources.h"
 
 #include <algorithm>
+#include <numeric>
 #include <utility>
 
 namespace trt_edgellm::rt
@@ -228,9 +229,13 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
     EngineExecutor& executor
         = useExternalExecutor ? mExecutors.externalPrefillExecutor() : mExecutors.prefillExecutor();
 
-    // Entry-padded carrier: sequence i occupies physical rows [i*W, i*W + q_i) of T = N*W.
+    // Packed-prefill engines carry T = sum(q_i) (no padding rows); other engines keep the
+    // entry-padded T = N*W carrier. queryWidth (W = max q_i) is still needed by both for dims.
+    TokenLayoutBackend const layout = mConfig.packedPrefill ? TokenLayoutBackend::kNativeCompactRagged
+                                                            : TokenLayoutBackend::kEntryPaddedCompatibility;
     int32_t const queryWidth = phaseRaggedQueryWidth(rows);
-    int64_t const physicalTokens = static_cast<int64_t>(numSequences) * queryWidth;
+    int64_t const physicalTokens = mConfig.packedPrefill ? std::accumulate(chunks.begin(), chunks.end(), int64_t{0})
+                                                         : static_cast<int64_t>(numSequences) * queryWidth;
     ELLM_CHECK(mPrefillIO.inputsEmbeds.reshape({physicalTokens, mConfig.hiddenSize}),
         "Independent prefill embedding reshape failed");
     if (mCallbacks.stagePrefill)
@@ -242,7 +247,9 @@ PhaseHostExecutionTiming IndependentPhaseCoordinator::enqueuePrefillBatch(
         CUDA_CHECK(cudaMemsetAsync(
             mPrefillIO.inputsEmbeds.rawPointer(), 0, mPrefillIO.inputsEmbeds.getMemoryCapacity(), stream));
     }
-    RaggedExecutionBatch const& raggedBatch = mPrefillRaggedMetadata.build(SequenceWork::kContext, rows);
+    RaggedExecutionBatch const& raggedBatch = mPrefillRaggedMetadata.build(SequenceWork::kContext, rows, layout);
+    ELLM_CHECK(raggedBatch.shape.physicalTokens == physicalTokens,
+        "Independent prefill physical token count disagrees with ragged metadata builder");
     // The RoPE gather in uploadPhaseRaggedMetadata reads io.mropeCosSin, which the stage callback
     // above fills per active row; it must run after staging, on the same stream.
     uploadPhaseRaggedMetadata(mPrefillIO, mResources, mConfig, raggedBatch, stream);

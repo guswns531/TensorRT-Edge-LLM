@@ -1052,6 +1052,122 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
     }
 }
 
+//! Regression test for commit 9f911c16: a single-sequence (N=1) true-packed prefill step has
+//! cuQSeqLens extent 2, identical to a dense batch of size physicalBatchSize+1=2, so the
+//! launcher must fall back to qScratch's chunk-cap-vs-runtimeSeqLen mismatch to detect packing.
+//! Without that fallback this call previously failed the "qScratch shape shall be dense" check.
+TEST(RopePackedSingleSequence, TruePackedPrefillNEqualsOneDoesNotThrow)
+{
+    cudaStream_t stream{nullptr};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    int32_t constexpr numQHeads = 4;
+    int32_t constexpr numKVHeads = 1;
+    int32_t constexpr headDim = 64;
+    int32_t constexpr rotaryDim = 64;
+    int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
+    int32_t constexpr totalTokens = 7;
+    int32_t constexpr chunkCap = 16;
+    int32_t constexpr kvCacheCapacity = 128;
+    int32_t const maxPagesPerSeq = getMaxPagesPerSeq(kvCacheCapacity);
+    int32_t const numPages = maxPagesPerSeq;
+
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, rotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, rotaryDim, kvCacheCapacity, stream);
+
+    std::vector<half> packedInput(static_cast<size_t>(totalTokens) * combinedHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    rt::Tensor packedTensor(
+        rt::Coords{1, totalTokens, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packedInput);
+
+    rt::Tensor qScratchTensor(
+        rt::Coords{1, chunkCap, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    std::vector<half> const qScratchInit(static_cast<size_t>(chunkCap) * numQHeads * headDim, __float2half(0.0F));
+    copyHostToDevice(qScratchTensor, qScratchInit);
+
+    half const sentinel = __float2half(777.0F);
+    std::vector<half> const kvCacheInit(
+        static_cast<size_t>(2) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
+    rt::Tensor kvCacheTensor(rt::Coords{2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    copyHostToDevice(kvCacheTensor, kvCacheInit);
+
+    std::vector<int32_t> const pageTableHost = makeIdentityPageTable(/*batchSize=*/1, maxPagesPerSeq);
+    rt::Tensor pageTableTensor(rt::Coords{1, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableTensor, pageTableHost);
+
+    rt::Tensor cuQSeqLensTensor({2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(cuQSeqLensTensor, std::vector<int32_t>{0, totalTokens});
+
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, rt::OptionalInputTensor{}, rt::OptionalInputTensor{},
+        packedTensor, qScratchTensor, kvCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(),
+        maxPagesPerSeq, nullptr, nullptr, nullptr, 1.0F, nullptr, nullptr, 1e-6F, false,
+        rt::OptionalInputTensor{cuQSeqLensTensor});
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    bool const permuteRope = true;
+    std::vector<half> qReference(static_cast<size_t>(totalTokens) * numQHeads * headDim);
+    std::vector<half> kReference(static_cast<size_t>(totalTokens) * numKVHeads * headDim);
+    std::vector<half> vReference(static_cast<size_t>(totalTokens) * numKVHeads * headDim);
+    for (int32_t row = 0; row < totalTokens; ++row)
+    {
+        size_t const rowOffset = static_cast<size_t>(row) * combinedHeads * headDim;
+        std::vector<half> const qRow(
+            packedInput.begin() + rowOffset, packedInput.begin() + rowOffset + numQHeads * headDim);
+        std::vector<half> const kRow(packedInput.begin() + rowOffset + static_cast<size_t>(numQHeads) * headDim,
+            packedInput.begin() + rowOffset + static_cast<size_t>(numQHeads + numKVHeads) * headDim);
+        std::vector<half> const vRow(
+            packedInput.begin() + rowOffset + static_cast<size_t>(numQHeads + numKVHeads) * headDim,
+            packedInput.begin() + rowOffset + static_cast<size_t>(combinedHeads) * headDim);
+
+        std::vector<half> const qRoped = ropeRef(qRow, numQHeads, headDim, rotaryDim, row, 1.0F, 10000.0F, permuteRope);
+        std::vector<half> const kRoped
+            = ropeRef(kRow, numKVHeads, headDim, rotaryDim, row, 1.0F, 10000.0F, permuteRope);
+
+        std::copy(qRoped.begin(), qRoped.end(), qReference.begin() + static_cast<size_t>(row) * numQHeads * headDim);
+        std::copy(kRoped.begin(), kRoped.end(), kReference.begin() + static_cast<size_t>(row) * numKVHeads * headDim);
+        std::copy(vRow.begin(), vRow.end(), vReference.begin() + static_cast<size_t>(row) * numKVHeads * headDim);
+    }
+
+    auto const qOut = copyDeviceToHost<half>(qScratchTensor);
+    for (int32_t row = 0; row < chunkCap; ++row)
+    {
+        for (int32_t idx = 0; idx < numQHeads * headDim; ++idx)
+        {
+            size_t const outIdx = static_cast<size_t>(row) * numQHeads * headDim + idx;
+            if (row < totalTokens)
+            {
+                ASSERT_TRUE(isclose(qOut[outIdx], qReference[outIdx], 1e-3, 1e-3))
+                    << "Q mismatch at row " << row << " idx " << idx;
+            }
+            else
+            {
+                EXPECT_EQ(__half2float(qOut[outIdx]), 0.0F) << "qScratch tail row " << row << " must stay unwritten";
+            }
+        }
+    }
+
+    auto const kvOut = copyDeviceToHost<half>(kvCacheTensor);
+    for (int32_t row = 0; row < totalTokens; ++row)
+    {
+        int32_t const page = row / rt::kTOKENS_PER_PAGE;
+        int32_t const token = row % rt::kTOKENS_PER_PAGE;
+        for (int32_t d = 0; d < headDim; ++d)
+        {
+            half const kRefVal = kReference[static_cast<size_t>(row) * headDim + d];
+            half const vRefVal = vReference[static_cast<size_t>(row) * headDim + d];
+            half const kCacheVal = kvOut[pagedKvIndex(0, page, token, 0, d, numPages, numKVHeads, headDim)];
+            half const vCacheVal = kvOut[pagedKvIndex(1, page, token, 0, d, numPages, numKVHeads, headDim)];
+            ASSERT_TRUE(isclose(kCacheVal, kRefVal, 1e-3, 1e-3)) << "K cache mismatch at row " << row;
+            ASSERT_TRUE(isclose(vCacheVal, vRefVal, 1e-3, 1e-3)) << "V cache mismatch at row " << row;
+        }
+    }
+}
+
 void TestRopeQOnlyPackedToDense(int32_t headDim, int32_t rotaryDim)
 {
     cudaStream_t stream{nullptr};
@@ -1071,17 +1187,21 @@ void TestRopeQOnlyPackedToDense(int32_t headDim, int32_t rotaryDim)
     std::vector<half> packedInput(static_cast<size_t>(totalTokens) * numQHeads * headDim);
     uniformFloatInitialization(packedInput);
     std::vector<half> reference(static_cast<size_t>(batchSize) * denseSeqLen * numQHeads * headDim, __float2half(0.0F));
+    // The cos/sin carrier here is token-major [1, maxPosition, rot] (batch size 1), matching
+    // true packing's ABI: its row index is the flat packed token position (cuQSeqLens[batch] +
+    // row), not a kvEndLens-derived absolute position — kvEndLens is only consulted when the
+    // carrier instead has one row-table per batch entry.
     for (int32_t batch{}; batch < batchSize; ++batch)
     {
         int32_t const rowLen = cuQSeqLens[batch + 1] - cuQSeqLens[batch];
-        int32_t const positionBegin = kvEndLens[batch] - rowLen;
         for (int32_t row{}; row < rowLen; ++row)
         {
-            size_t const packedOffset = static_cast<size_t>(cuQSeqLens[batch] + row) * numQHeads * headDim;
+            int32_t const tokenIdx = cuQSeqLens[batch] + row;
+            size_t const packedOffset = static_cast<size_t>(tokenIdx) * numQHeads * headDim;
             std::vector<half> token(
                 packedInput.begin() + packedOffset, packedInput.begin() + packedOffset + numQHeads * headDim);
             std::vector<half> const roped
-                = ropeRef(token, numQHeads, headDim, rotaryDim, positionBegin + row, 1.0F, 10000.0F, true);
+                = ropeRef(token, numQHeads, headDim, rotaryDim, tokenIdx, 1.0F, 10000.0F, true);
             size_t const denseOffset = (static_cast<size_t>(batch) * denseSeqLen + row) * numQHeads * headDim;
             std::copy(roped.begin(), roped.end(), reference.begin() + denseOffset);
         }

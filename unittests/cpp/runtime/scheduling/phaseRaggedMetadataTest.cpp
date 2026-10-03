@@ -184,3 +184,68 @@ TEST(PhaseRaggedMetadataTest, QueryWidthHelperMatchesMaxQueryLength)
     std::vector<PhaseRaggedSequence> rows{{1, 0, 3}, {2, 0, 7}, {3, 0, 1}};
     EXPECT_EQ(phaseRaggedQueryWidth(rows), 7);
 }
+
+TEST(PhaseRaggedMetadataTest, PackedPrefillUsesPrefixSumOffsets)
+{
+    PhaseRaggedMetadataBuilder builder(8, 32);
+    std::vector<PhaseRaggedSequence> rows{{1, 0, 3}, {2, 0, 5}, {3, 0, 1}};
+    RaggedExecutionBatch const& batch
+        = builder.build(SequenceWork::kContext, rows, TokenLayoutBackend::kNativeCompactRagged);
+
+    EXPECT_EQ(batch.layout, TokenLayoutBackend::kNativeCompactRagged);
+    EXPECT_EQ(batch.shape.queryWidth, 5);
+    EXPECT_EQ(batch.shape.physicalTokens, 9);
+    EXPECT_EQ(batch.queryStartOffsets, (std::vector<int32_t>{0, 3, 8, 9}));
+    std::vector<int32_t> const expectedPositions{0, 1, 2, 0, 1, 2, 3, 4, 0};
+    EXPECT_EQ(batch.positions, expectedPositions);
+    EXPECT_EQ(batch.logitsIndices, (std::vector<int64_t>{2, 7, 8}));
+    EXPECT_EQ(builder.executionPhase(), ExecutionPhase::kContextPrefill);
+}
+
+TEST(PhaseRaggedMetadataTest, PackedChunkContinuationUsesPrefixSumWithPast)
+{
+    PhaseRaggedMetadataBuilder builder(4, 512);
+    std::vector<PhaseRaggedSequence> rows{{1, 128, 64}, {2, 0, 32}};
+    RaggedExecutionBatch const& batch
+        = builder.build(SequenceWork::kContext, rows, TokenLayoutBackend::kNativeCompactRagged);
+
+    EXPECT_EQ(batch.shape.physicalTokens, 96);
+    EXPECT_EQ(batch.queryStartOffsets, (std::vector<int32_t>{0, 64, 96}));
+    for (int32_t t = 0; t < 64; ++t)
+    {
+        EXPECT_EQ(batch.positions[static_cast<size_t>(t)], 128 + t);
+    }
+    for (int32_t t = 0; t < 32; ++t)
+    {
+        EXPECT_EQ(batch.positions[static_cast<size_t>(64 + t)], t);
+    }
+    EXPECT_EQ(batch.logitsIndices, (std::vector<int64_t>{63, 95}));
+    EXPECT_EQ(builder.executionPhase(), ExecutionPhase::kContextChunk);
+}
+
+TEST(PhaseRaggedMetadataTest, PackedSingleSequenceMatchesEntryPadded)
+{
+    PhaseRaggedMetadataBuilder builder(1, 16);
+    RaggedExecutionBatch const& batch
+        = builder.build(SequenceWork::kContext, {{1, 0, 7}}, TokenLayoutBackend::kNativeCompactRagged);
+
+    EXPECT_EQ(batch.shape.queryWidth, 7);
+    EXPECT_EQ(batch.shape.physicalTokens, 7);
+    EXPECT_EQ(batch.queryStartOffsets, (std::vector<int32_t>{0, 7}));
+}
+
+TEST(PhaseRaggedMetadataTest, PackedAndEntryPaddedDecodeFormulasCoincide)
+{
+    PhaseRaggedMetadataBuilder entryPaddedBuilder(8, 8);
+    PhaseRaggedMetadataBuilder packedBuilder(8, 8);
+    std::vector<PhaseRaggedSequence> rows = makeRows({5, 130, 0}, 1);
+
+    RaggedExecutionBatch const& entryPadded = entryPaddedBuilder.build(SequenceWork::kDecode, rows);
+    RaggedExecutionBatch const& packed
+        = packedBuilder.build(SequenceWork::kDecode, rows, TokenLayoutBackend::kNativeCompactRagged);
+
+    EXPECT_EQ(entryPadded.queryStartOffsets, packed.queryStartOffsets);
+    EXPECT_EQ(entryPadded.positions, packed.positions);
+    EXPECT_EQ(entryPadded.logitsIndices, packed.logitsIndices);
+    EXPECT_EQ(entryPadded.shape.physicalTokens, packed.shape.physicalTokens);
+}

@@ -77,19 +77,22 @@ RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::buildDecodeIncremental(
 }
 
 RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::build(
-    SequenceWork work, std::vector<PhaseRaggedSequence> const& sequences)
+    SequenceWork work, std::vector<PhaseRaggedSequence> const& sequences, TokenLayoutBackend layout)
 {
     ELLM_CHECK(!sequences.empty(), "phase ragged metadata builder requires a non-empty batch");
     int32_t const numSequences = static_cast<int32_t>(sequences.size());
     ELLM_CHECK(numSequences <= mMaxSequences, "phase ragged batch exceeds its configured sequence capacity");
 
     if (work == SequenceWork::kDecode && mHasPriorBuild && mPriorWork == SequenceWork::kDecode
-        && mPriorNumSequences == numSequences)
+        && mPriorNumSequences == numSequences && mBatch.layout == layout)
     {
         return buildDecodeIncremental(sequences);
     }
 
+    bool const packed = layout == TokenLayoutBackend::kNativeCompactRagged;
+
     int32_t queryWidth = 0;
+    int64_t sumQueryLengths = 0;
     bool anyPastNonZero = false;
     for (PhaseRaggedSequence const& sequence : sequences)
     {
@@ -101,15 +104,16 @@ RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::build(
         }
         anyPastNonZero = anyPastNonZero || sequence.pastLength > 0;
         queryWidth = std::max(queryWidth, sequence.queryLength);
+        sumQueryLengths += sequence.queryLength;
     }
 
-    int64_t const physicalTokens64 = static_cast<int64_t>(numSequences) * queryWidth;
+    int64_t const physicalTokens64 = packed ? sumQueryLengths : static_cast<int64_t>(numSequences) * queryWidth;
     ELLM_CHECK(physicalTokens64 <= mMaxPhysicalTokens, "phase ragged batch exceeds its configured token capacity");
     int32_t const physicalTokens = static_cast<int32_t>(physicalTokens64);
 
     int32_t const numContextSequences = (work == SequenceWork::kContext) ? numSequences : 0;
 
-    mBatch.layout = TokenLayoutBackend::kEntryPaddedCompatibility;
+    mBatch.layout = layout;
     mBatch.sequenceOrder.clear();
     mBatch.positions.clear();
     mBatch.queryStartOffsets.clear();
@@ -121,14 +125,16 @@ RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::build(
     mBatch.logitsToSequence.clear();
     mBatch.sequenceWorks.clear();
 
-    mBatch.positions.assign(static_cast<size_t>(physicalTokens), -1);
+    // Packed rows are contiguous [o_i, o_i+q_i) with no padding; nothing needs an init sentinel.
+    mBatch.positions.assign(static_cast<size_t>(physicalTokens), packed ? 0 : -1);
     mBatch.queryStartOffsets.resize(static_cast<size_t>(numSequences) + 1);
 
     int64_t numContextTokens = 0;
+    int32_t runningOffset = 0;
     for (int32_t row = 0; row < numSequences; ++row)
     {
         PhaseRaggedSequence const& sequence = sequences[static_cast<size_t>(row)];
-        int32_t const physicalStart = row * queryWidth;
+        int32_t const physicalStart = packed ? runningOffset : row * queryWidth;
         mBatch.queryStartOffsets[static_cast<size_t>(row)] = physicalStart;
         mBatch.queryLengths.push_back(sequence.queryLength);
         mBatch.pastLengths.push_back(sequence.pastLength);
@@ -144,6 +150,7 @@ RaggedExecutionBatch const& PhaseRaggedMetadataBuilder::build(
         mBatch.logitsIndices.push_back(physicalStart + sequence.queryLength - 1);
         mBatch.logitsToSequence.push_back(row);
         numContextTokens += sequence.queryLength;
+        runningOffset += sequence.queryLength;
     }
     mBatch.queryStartOffsets[static_cast<size_t>(numSequences)] = physicalTokens;
 

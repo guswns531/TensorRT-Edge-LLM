@@ -321,8 +321,10 @@ TEST(RaggedPluginMetadataTest, RejectsCarrierMismatchInvalidExtentAndReservedMix
                      descriptor(static_cast<int32_t>(ExecutionPhase::kAutoregressiveDecode)), descriptor(0)),
         std::runtime_error);
 
+    // Non-context phases still require T_exec divisible by N (homogeneous decode); context
+    // phases may be truly packed (T_exec = sum(q_i), not necessarily a multiple of N).
     EXPECT_THROW(trt_edgellm::plugins::decodeRaggedPluginMetadata("test", descriptor(10), queryLengths, offsets,
-                     descriptor(static_cast<int32_t>(ExecutionPhase::kContextPrefill)), descriptor(3)),
+                     descriptor(static_cast<int32_t>(ExecutionPhase::kAutoregressiveDecode)), descriptor(0)),
         std::runtime_error);
 
     auto invalidRank = descriptor(3);
@@ -330,6 +332,27 @@ TEST(RaggedPluginMetadataTest, RejectsCarrierMismatchInvalidExtentAndReservedMix
     EXPECT_THROW(trt_edgellm::plugins::decodeRaggedPluginMetadata("test", activation, invalidRank, offsets,
                      descriptor(static_cast<int32_t>(ExecutionPhase::kContextPrefill)), descriptor(3)),
         std::runtime_error);
+}
+
+TEST(RaggedPluginMetadataTest, AcceptsTruePackedContextExtentNotDivisibleByN)
+{
+    auto descriptor = [](int32_t extent) {
+        nvinfer1::PluginTensorDesc desc{};
+        desc.dims.nbDims = 1;
+        desc.dims.d[0] = extent;
+        return desc;
+    };
+    // T_exec=10 = sum(q_i) for unequal q={3,5,2} over N=3 sequences; not a multiple of N, which
+    // a context-phase true-packed step must tolerate (see design doc's F2b deviation #1).
+    auto const activation = descriptor(10);
+    auto const queryLengths = descriptor(3);
+    auto const offsets = descriptor(4);
+    auto const result = trt_edgellm::plugins::decodeRaggedPluginMetadata("test", activation, queryLengths, offsets,
+        descriptor(static_cast<int32_t>(ExecutionPhase::kContextPrefill)), descriptor(3));
+    EXPECT_EQ(result.numSequences, 3);
+    EXPECT_EQ(result.numContextSequences, 3);
+    EXPECT_EQ(result.physicalTokens, 10);
+    EXPECT_EQ(result.contextExecutionRows, 10);
 }
 
 TEST(RaggedPluginMetadataTest, ValidatesIndexedResidentStateDescriptors)

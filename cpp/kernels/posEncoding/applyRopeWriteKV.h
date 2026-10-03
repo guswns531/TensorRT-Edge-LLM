@@ -125,12 +125,19 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 void launchApplyRopeQOnly(
     rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q, cudaStream_t stream);
 
-//! Apply RoPE to `[1, totalTokens, Hq, D]` Q and scatter logical rows into dense Q.
+//! Apply RoPE to packed Q and scatter logical rows into dense Q.
 //!
 //! `cuQSeqLens` maps the packed token carrier to `denseQ` shaped
 //! `[logicalBatch, maxRowTokens, Hq, D]`. The caller must zero dense padding.
+//!
+//! @param[in] packedQ Token-major carrier `[1, totalTokens, packedHeadStride, D]`, where
+//!            `packedHeadStride >= Hq`. Pass `Hq` (default, 0) for a Q-only carrier, or the
+//!            donor's `Hq + 2*Hkv` combined-head count when the carrier interleaves Q with the
+//!            donor's current K/V per token (shared-KV-with-current prefill); only the leading
+//!            `Hq` heads of each token are read in that case.
 void launchApplyRopeQOnlyPackedToDense(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor const& packedQ, rt::Tensor& denseQ, rt::Tensor const& cuQSeqLens, cudaStream_t stream);
+    rt::Tensor const& packedQ, rt::Tensor& denseQ, rt::Tensor const& cuQSeqLens, cudaStream_t stream,
+    int32_t packedHeadStride = 0);
 
 //! @brief Launch kernel to apply RoPE to Q only, using per-token position IDs (tree decoding).
 //!
