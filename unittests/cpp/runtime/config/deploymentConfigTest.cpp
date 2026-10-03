@@ -19,6 +19,7 @@
 
 #include "common/pagedKvTypes.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
+#include "runtime/kvCacheManager.h"
 #include "testUtils.h"
 #include <filesystem>
 #include <fstream>
@@ -2155,4 +2156,34 @@ TEST_F(DeploymentConfigTest, DFlash2AcceptsRuntimeBlockOverrideWithinEngineProfi
     EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
     EXPECT_EQ(bundle.specConfig->verifySize, 16);
     EXPECT_EQ(bundle.maxAcceptedTokensPerRound(), 16);
+}
+
+// PhaseKVActiveView aliases the active-row KV table and requires full-mode SWA; selectSwaKVCacheMode
+// must therefore pick full mode whenever the caller signals an upcoming full-mode requirement (context
+// reuse today, phase serving as well), even though bounded mode would otherwise save memory.
+TEST(SelectSwaKVCacheModeTest, FullModeRequirementForcesFullDespiteMemorySavings)
+{
+    DeploymentConfig bundle;
+    bundle.base.maxKVCacheCapacity = 256;
+    bundle.base.kvLayerConfigs = {KVLayerConfig(4, 64, /*kvCacheCapacity=*/64)};
+    bundle.base.numSwaPages = 1;
+    bundle.base.kvPoolPages = 4;
+
+    bundle.selectSwaKVCacheMode(/*requiresFullSwaMode=*/false);
+    EXPECT_EQ(bundle.base.swaKVCacheMode, SwaKVCacheMode::kBounded);
+
+    bundle.selectSwaKVCacheMode(/*requiresFullSwaMode=*/true);
+    EXPECT_EQ(bundle.base.swaKVCacheMode, SwaKVCacheMode::kFull);
+}
+
+TEST(SelectSwaKVCacheModeTest, NoBoundedCapabilityStaysFull)
+{
+    DeploymentConfig bundle;
+    bundle.base.maxKVCacheCapacity = 256;
+    bundle.base.kvLayerConfigs = {KVLayerConfig(4, 64, /*kvCacheCapacity=*/256)};
+    bundle.base.numSwaPages = 4;
+    bundle.base.kvPoolPages = 4;
+
+    bundle.selectSwaKVCacheMode(/*requiresFullSwaMode=*/false);
+    EXPECT_EQ(bundle.base.swaKVCacheMode, SwaKVCacheMode::kFull);
 }

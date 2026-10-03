@@ -142,9 +142,11 @@ struct DeploymentConfig
     //! Return the concrete speculative decoding mode declared by the engine bundle.
     SpecDecodeMode specDecodeMode() const noexcept;
 
-    //! Select bounded SWA storage only when context reuse is off and its page budget is smaller than full storage.
+    //! Select bounded SWA storage only when `requiresFullSwaMode` is false and its page budget is
+    //! smaller than full storage. Callers pass true for context reuse or phase serving, both of
+    //! which need full-mode SWA storage (e.g. PhaseKVActiveView aliases the active-row KV table).
     //! Exported SWA capability metadata remains unchanged; full storage wins on equal page counts.
-    void selectSwaKVCacheMode(bool contextReuseEnabled) noexcept;
+    void selectSwaKVCacheMode(bool requiresFullSwaMode) noexcept;
 };
 
 //! Create a `DeploymentConfig` from engine config paths and optional user-side drafting.

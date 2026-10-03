@@ -94,7 +94,9 @@ void AsyncHostStagingFence::release() noexcept
 void allocateBasicIO(
     PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype)
 {
-    io.inputsEmbeds = Tensor({maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::inputsEmbeds");
+    // inputsEmbeds is allocated by allocateRaggedMetadata (token-major [maxTokens, hiddenSize], the
+    // shape the engine actually binds); allocateBasicIO does not allocate it to avoid a throwaway
+    // dense [maxBatch, maxSeq, hiddenSize] buffer that every caller immediately overwrites.
     // Standard LLM logits are FLOAT for the sampler. DiffusionGemma keeps the
     // same dtype for canvas logits because final logit softcapping exports an
     // F32 logits binding.

@@ -539,13 +539,5 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
 rt::Tensor generateMultimodalIndices(
     rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId);
 
-/*! \brief Build Gemma4 block IDs from host token IDs.
- *
- * Image placeholders form one block for each contiguous run.  Such positions
- * receive a non-negative run ID; text, audio, and padding receive -1.  This
- * matches Transformers' get_block_sequence_ids_for_mask semantics.
- */
-rt::Tensor generateVisionBlockIds(rt::Tensor const& inputIds, int32_t imageTokenId);
-
 } // namespace rt
 } // namespace trt_edgellm

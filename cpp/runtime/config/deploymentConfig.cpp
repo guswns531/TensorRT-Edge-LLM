@@ -280,12 +280,12 @@ int32_t resolveDFlashBlockSize(
 
 } // namespace
 
-void DeploymentConfig::selectSwaKVCacheMode(bool contextReuseEnabled) noexcept
+void DeploymentConfig::selectSwaKVCacheMode(bool requiresFullSwaMode) noexcept
 {
-    auto selectMode = [contextReuseEnabled](LLMEngineConfig& config) {
+    auto selectMode = [requiresFullSwaMode](LLMEngineConfig& config) {
         bool const boundedSavesMemory = config.supportsBoundedSwaKVCache() && config.numSwaPages < config.kvPoolPages;
         config.setSwaKVCacheMode(
-            !contextReuseEnabled && boundedSavesMemory ? SwaKVCacheMode::kBounded : SwaKVCacheMode::kFull);
+            !requiresFullSwaMode && boundedSavesMemory ? SwaKVCacheMode::kBounded : SwaKVCacheMode::kFull);
     };
 
     selectMode(base);

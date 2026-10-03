@@ -1010,47 +1010,5 @@ rt::Tensor generateMultimodalIndices(
     return multimodalIndices;
 }
 
-rt::Tensor generateVisionBlockIds(rt::Tensor const& inputIds, int32_t imageTokenId)
-{
-    auto const shape = inputIds.getShape();
-    check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
-    check::check(inputIds.getDeviceType() == rt::DeviceType::kCPU, "inputIds must be a host tensor");
-    check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must have INT32 dtype");
-    check::check(imageTokenId >= 0, "imageTokenId must be non-negative");
-
-    int64_t const batchSize = shape[0];
-    int64_t const seqLen = shape[1];
-    rt::Tensor blockIds({batchSize, seqLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
-    int32_t const* tokens = inputIds.dataPointer<int32_t>();
-    int32_t* blocks = blockIds.dataPointer<int32_t>();
-
-    for (int64_t b = 0; b < batchSize; ++b)
-    {
-        bool previousWasVision = false;
-        int32_t nextBlockId = 0;
-        int32_t currentBlockId = -1;
-        for (int64_t s = 0; s < seqLen; ++s)
-        {
-            int64_t const offset = b * seqLen + s;
-            int32_t const token = tokens[offset];
-            bool const isVision = token == imageTokenId;
-            if (isVision)
-            {
-                if (!previousWasVision)
-                {
-                    currentBlockId = nextBlockId++;
-                }
-                blocks[offset] = currentBlockId;
-            }
-            else
-            {
-                blocks[offset] = -1;
-            }
-            previousWasVision = isVision;
-        }
-    }
-    return blockIds;
-}
-
 } // namespace rt
 } // namespace trt_edgellm

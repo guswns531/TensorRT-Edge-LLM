@@ -247,8 +247,10 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     artifacts.deployment
         = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig, globalRank, worldSize);
     // EngineExecutor captures the active KV-pool geometry in its tensor registry.
-    // Select the immutable runtime policy before constructing that registry.
-    artifacts.deployment.selectSwaKVCacheMode(contextCacheConfig.enabled);
+    // Select the immutable runtime policy before constructing that registry. Phase serving's
+    // PhaseKVActiveView aliases the active-row KV table and requires full-mode SWA, so treat an
+    // upcoming phase-serving session like context reuse for this decision.
+    artifacts.deployment.selectSwaKVCacheMode(contextCacheConfig.enabled || phaseServingConfig.has_value());
     if (draftingConfig.has_value() && artifacts.deployment.specDecodeMode() == SpecDecodeMode::kMTP)
     {
         ELLM_CHECK(artifacts.draftCheckpointDir.empty(),
@@ -348,8 +350,10 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     auto pleEmbedding = std::move(artifacts.pleEmbedding);
     auto vocabMap = std::move(artifacts.vocabMap);
 
-    // The same engine uses bounded SWA pages when they save memory and its full KV profile otherwise or for reuse.
-    mDeployment.selectSwaKVCacheMode(contextCacheConfig.enabled);
+    // The same engine uses bounded SWA pages when they save memory and its full KV profile
+    // otherwise, for context reuse, or when phase serving will be enabled (PhaseKVActiveView
+    // requires full-mode SWA).
+    mDeployment.selectSwaKVCacheMode(contextCacheConfig.enabled || phaseServingConfig.has_value());
     if (mDeployment.base.supportsBoundedSwaKVCache())
     {
         LOG_INFO("SWA KV cache storage mode: %s (context reuse %s, bounded pages %d, full pages %d).",
