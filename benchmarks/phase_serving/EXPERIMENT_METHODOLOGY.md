@@ -11,9 +11,12 @@ The campaign quantifies decode throughput, latency (TTFT/TPOT/E2E), and GPU memo
 encoder/prefill/decode (E/P/D) serving runtime under 12 synthetic-but-request-shaped workloads, for two models
 (Gemma-4-E2B-it INT4-AWQ and Cosmos-Reason2-2B), against a frozen vLLM v0.28.0 reference and (for the v0.11.0 port)
 an upstream clean-build baseline — all on one GPU, with byte-identical traces, a fixed-output (`ignore_eos`)
-contract, three repeats aggregated to a per-workload median, and a cryptographic identity record (source commit,
-binary, plugin, engine, trace hashes) written to `manifest.json` for every run
-(`benchmarks/phase_serving/run_lifetime_encoded_admission.py`).
+contract, three repeats, and a cryptographic identity record (source commit, binary, plugin, engine, trace hashes)
+written to `manifest.json` for every run (`benchmarks/phase_serving/run_lifetime_encoded_admission.py`). The
+runner's own `summary.json` aggregates the three repeat cells' rates with the arithmetic mean
+(`statistics.mean`, despite several of its field names containing "median" — see §6); the per-workload tables
+published in this document instead take the **median** of the three cell rates (§9/Results). These are two
+different reducers over the same three values, not a restatement of the same number.
 
 ## 2. Hardware and software
 
@@ -25,7 +28,8 @@ binary, plugin, engine, trace hashes) written to `manifest.json` for every run
 | TensorRT container (port build) | "TensorRT 26.06 container" | `.local/baselines/v0110-port-38dac48d-20261001/manifest.json` (`build_contract`) |
 | CUDA | 13.3 | `.local/baselines/v0110-port-*/manifest.json` (`build_contract`) |
 | Build flags | `-DENABLE_CUTE_DSL=ALL -DCUTE_DSL_ARTIFACT_TAG=sm_86` | same `manifest.json`; rationale in `notes/371...md` ("Silent INT4 V2 failure without `-DENABLE_CUTE_DSL=ALL`") |
-| vLLM (frozen reference) | v0.28.0 | `.local/results/gemma4-vllm-capacity-sweep-20260912/.../server.log:3` |
+| vLLM (frozen reference, Gemma) | v0.28.0 | `.local/results/gemma4-vllm-capacity-sweep-20260912/.../server.log:3` |
+| vLLM (frozen reference, Cosmos) | v0.27.1 (all 35 retained successful raw origins) | `.local/results/review-correction-20260926/cosmos-vllm-frozen-raw-corrected.json` `raw_origins[].version` |
 | Driver version | 610.57.04 (RTX 3080, 10240 MiB) | `nvidia-smi` on the measurement host, 2026-10-03 |
 
 ## 3. Models, engines and build contract
@@ -142,7 +146,7 @@ reads from the canonical commands recorded in
 | vision-heavy | 64 | 16 text / 48 vision | 32 / 32 / 64 | 2 | 0.06 s |
 | poisson | 64 | 48 text / 16 vision | 32 / 64 / 128 | 2 | 0.87 s |
 | wave-drain | 20 | 20 vision | 32 / 32 / 32 | 2 | 6.03 s |
-| multi-image | 5 | 5 vision | 32 / 32 / 32 | 2 | ~0 s |
+| multi-image | 5 | 5 vision (4 single-image + 1 two-image) | 32 / 32 / 32 | 2 | ~0 s |
 | late-vision | 32 | unlabeled | 1 / 192 / 192 | 1 | 0.5 s |
 
 Notes: Cosmos's `balanced`/`decode-heavy`/`long-prefill`/`bimodal` traces are far larger (288 requests) than the
@@ -154,10 +158,16 @@ What each workload stresses (names are self-describing and consistent with the r
 above): `short` = minimal decode (24-token median output, smallest trace) exercising TTFT-dominated small requests;
 `balanced`/`text-heavy` = mixed text-biased prefill/decode; `long-prefill` = larger prompts with moderate output;
 `bimodal`/`decode-heavy` = long-output decode-bound load (up to 384 tokens); `mixed`/`vision-heavy` = text+vision
-request mixes with up to 2 images/request, differing only in the text:vision ratio; `multi-image` = requests that
-are all multi-image; `poisson`/`wave-drain` = the only traces with non-trivial arrival spans (0.9 s and 6 s), i.e.
-genuine arrival-process stress rather than a near-simultaneous burst; `late-vision` = a trace mixing a 1-token
-output request against 192-token vision/text requests, stressing late-arriving vision admission.
+request mixes with up to 2 images/request. They differ not only in text:vision ratio but also in output-length
+histogram: Gemma `mixed` is 35 requests × 32 tokens, 3 × 48, 26 × 64; `vision-heavy` is 50 × 32, 2 × 48, 12 × 64
+(measured from the trace JSON `max_generate_length` field). `multi-image` = requests that are mostly
+**single**-image, not all multi-image — Gemma is 16 single-image + 4 two-image requests, Cosmos is 4 single-image
++ 1 two-image request (measured per-request `image_url` counts); `poisson`/`wave-drain` = the only traces with
+non-trivial arrival spans (0.9 s and 6 s), i.e. genuine arrival-process stress rather than a near-simultaneous
+burst; `late-vision` = **24 text requests producing 192-token output and 8 vision requests producing 1-token
+output** (Gemma trace; measured directly) — there are no 192-token vision requests in this trace, so this stresses
+late-arriving low-output vision admission against long-running text decode, not a 1-token-vs-192-token split
+within either class.
 
 **Generation of traces.** The runner never regenerates traces; it replays retained, content-hash-named files. Lineage
 of the 24 files used by the v0.11.0 port campaigns:
@@ -174,15 +184,28 @@ suite is capability-scaled rather than load-identical (632 measured requests). `
 (`scale_trace`, divides `arrival_offset_us` by `--multiplier`) and `build_scaled_request_waves.py` (`build_waves`) are
 available for load and wave ablations; they were not used to build the retained full12 set.
 
-**Load level vs. capacity.** Each model's `in_flight` / client concurrency equals its serving decode-batch capacity:
-Gemma `in_flight=24`, `decode_batch=24`, `stable_slots=24` (confirmed: `model_config`, and the full24 `run.sh`
-comment "Port full24 x3"); Cosmos `in_flight=64`, `decode_batch=64`, `stable_slots=80`. Both models' client
-concurrency (`--max-workers`/`--max-in-flight`, derived from `config["in_flight"]`) is driven at the full capacity
-limit, i.e. the campaigns measure saturated throughput at each model's maximum concurrent-request admission, not a
-below-capacity load point. The TensorRT runs warm up with a generic calibration trace of
-`config["calibration_requests"]` requests (49 Gemma, 239 Cosmos) unless `calibration["compact_http"]` selects a
-1-request warmup. The "warmup 8 / warmup 64" figures belong to the frozen vLLM and upstream-server contracts
-(Gemma in-flight 24 / warmup 8, Cosmos in-flight 64 / warmup 64; note 371), not to the TensorRT runner.
+**Load level vs. capacity — concurrency ceiling, not achieved concurrency.** Each model's `in_flight` / client
+concurrency setting equals its serving decode-batch capacity: Gemma `in_flight=24`, `decode_batch=24`,
+`stable_slots=24` (confirmed: `model_config`, and the full24 `run.sh` comment "Port full24 x3"); Cosmos
+`in_flight=64`, `decode_batch=64`, `stable_slots=80`. Both models' client concurrency
+(`--max-workers`/`--max-in-flight`, derived from `config["in_flight"]`) is set to the full capacity limit, but
+this is a **ceiling**, not the concurrency the workload actually reaches — a short or sparsely-arriving trace can
+finish, or drain to near-zero in-flight requests, well before saturating that ceiling. Maximum observed HTTP
+concurrency per workload, computed from each final cell's `requests.csv` (`send_us`/`completed_us`) in
+`.local/results/v0110-port-final-full24-3x-20261003` (repeat 1):
+
+| Model | Ceiling | Workloads at ceiling | Workloads below ceiling |
+|---|---:|---|---|
+| Gemma | 24 | balanced, bimodal, decode-heavy, late-vision, long-prefill, mixed, poisson, short, text-heavy, vision-heavy | multi-image 20/24, wave-drain 5/24 |
+| Cosmos | 64 | balanced, bimodal, decode-heavy, long-prefill, mixed, poisson, text-heavy, vision-heavy | short 48/64, late-vision 32/64, multi-image 5/64, wave-drain 5/64 |
+
+`multi-image`, `wave-drain` (both models), and Cosmos `short`/`late-vision` measure finite-trace completion or
+spaced-wave behavior rather than saturated admission; results for those workloads should not be read as capacity
+measurements. The TensorRT runs warm up with a generic calibration trace of `config["calibration_requests"]`
+requests (49 Gemma, 239 Cosmos) unless `calibration["compact_http"]` selects a 1-request warmup. The "warmup 8 /
+warmup 64" figures belong to the frozen vLLM and upstream-server contracts (Gemma in-flight 24 / warmup 8, Cosmos
+in-flight 64 / warmup 64 for the upstream-server baseline; note 371), not to the TensorRT runner. The frozen vLLM
+Cosmos warmup is not uniformly 64 either — see §7.
 
 ## 6. Measurement protocol
 
@@ -190,12 +213,18 @@ below-capacity load point. The TensorRT runs warm up with a generic calibration 
   `--phase-calibration-min-requests` are all set to `config["calibration_requests"]` (Gemma 49, Cosmos 239) against
   a separate calibration trace (`config["calibration"]`, a "generic" policy-calibration trace, e.g.
   `gemma4-packed-prefill-g4-20260912/generic-p8-d24-e4.json`), unless the policy-warmup variant requests a
-  "compact_http" 1-request warmup (`command_for`, `calibration_contract`). `guarded_trace_client.py` additionally
-  validates that every warmup response is HTTP 200 with no error and tracks calibration-round convergence
-  (`calibration_signature`), requiring `PHASE_CALIBRATION_STABLE_ROUNDS` (default 1) consecutive converged rounds
-  before treating calibration as complete. Separately, `TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES` primes CUDA-graph
-  capture for a fixed decode-batch schedule `(1,2,4,8,12,...)` up to the model's decode batch, independent of HTTP
-  warmup (`WARMUP_DECODE_BATCHES`/`warmup_decode_batches`).
+  "compact_http" 1-request warmup (`command_for`, `calibration_contract`). `command_for` passes
+  `run_vllm_trace_bench.py` as `--client-script` (`run_lifetime_encoded_admission.py:449`); it does **not** invoke
+  `guarded_trace_client.py`, so that script's warmup-response validation and calibration-round convergence guard
+  (`calibration_signature`, `PHASE_CALIBRATION_STABLE_ROUNDS`) are not in effect for these campaigns. Warmup is a
+  fixed request budget: warmup responses are discarded and `completed_warmup` is incremented by the number
+  submitted, regardless of their HTTP status or whether calibration converged. In the final retained artifacts
+  (`.local/results/v0110-port-final-full24-3x-20261003`), **36/36 Gemma cells and 4/36 Cosmos cells** end warmup
+  with `calibration_converged=false` in their `calibration.json`, and no cell contains a `warmup-validation.json`
+  (verified by counting `calibration.json` files per model). Separately,
+  `TRT_EDGELLM_IPC_WARMUP_DECODE_BATCHES` primes CUDA-graph capture for a fixed decode-batch schedule
+  `(1,2,4,8,12,...)` up to the model's decode batch, independent of HTTP warmup
+  (`WARMUP_DECODE_BATCHES`/`warmup_decode_batches`).
 - **Client concurrency / in-flight limit.** `--max-workers` and `--max-in-flight` are both set to
   `config["in_flight"]` (Gemma 24, Cosmos 64) unless overridden by `--client-max-in-flight`.
 - **Fixed-length output (ignore EOS).** `--ignore-eos` is always passed to the client, and
@@ -222,10 +251,17 @@ below-capacity load point. The TensorRT runs warm up with a generic calibration 
   per-run means; raw values are unchanged" — i.e., the field name is historical and the actual reducer is
   `statistics.median`, except `achieved_req_s`/`generated_token_s` style fields, which are medians of per-run
   medians).
-- **GPU memory.** `gpu_memory_peak_mib` is tracked by a `memory_sampler` inside `run_vllm_trace_bench.py`
-  (`summary["gpu_memory_peak_mib"] = memory_sampler.peak_mib`); the per-cell aggregate reduces to
-  `gpu_memory_peak_mib_median` across repeats. Exact sampling mechanism/interval of `memory_sampler` was not
-  inspected beyond this attribute in this pass — **Unknown** (not read in `run_vllm_trace_bench.py`'s class body).
+- **GPU memory — TensorRT and vLLM peaks are not comparable.** `run_vllm_trace_bench.py` (used as the HTTP client
+  for both TensorRT and vLLM) has its own `GpuMemorySampler`, but the TensorRT runner never passes
+  `--sample-gpu-memory` to it, so that inner sampler is disabled for TensorRT cells
+  (`command_for` sets `"sample_gpu_memory": args.sample_gpu_memory` to `False`). TensorRT's reported
+  `gpu_memory_peak_mib` instead comes from the **outer** `GpuMemoryMonitor` in `run_phase_http_trace_bench.py`,
+  which starts (default 100 ms interval) **before** launching the client subprocess — covering HTTP warmup,
+  calibration, and measurement — and stops only after the client returns. vLLM's own client-side sampler, when
+  enabled, starts only after warmup, inside the per-run measurement loop, with a default 50 ms interval. The two
+  "peak" numbers therefore cover different windows (TensorRT: warmup+calibration+measurement at 100 ms; vLLM:
+  measurement only at 50 ms) and must not be read as peaks over the same interval. The per-cell aggregate reduces
+  to `gpu_memory_peak_mib_median` across repeats in both cases.
 - **Token-trace determinism.** `token_repeatability()` collects `token_trace_sha256_per_run` hashes across the three
   repeat aggregates and reports `observed_equal` / `observed_different` / `not_tested` (fewer than 2 observations).
   This is recorded per `model/workload/variant` group in `summary.json` but is informational — it does not gate
@@ -247,7 +283,7 @@ below-capacity load point. The TensorRT runs warm up with a generic calibration 
 | Baseline | Version/build | Flags held identical to ours | What differs |
 |---|---|---|---|
 | Frozen vLLM (Gemma) | v0.28.0, server log `.local/results/gemma4-vllm-capacity-sweep-20260912/selected-seq24-kv480-p4096-g24-full12/server.log` | Same traces (byte-identical, hash-checked); same `--max-in-flight`/`--trace` per case via `build_vllm_equal_contract.py`; same `ignore_eos` presence (synced per-record); CUDA graphs enabled for sizes `[1,2,4,8,16,24]`, async scheduling on, seed 0, temperature 0 | vLLM: `enable_chunked_prefill=True`, `max_num_batched_tokens=4096`, `max_model_len=2048`, `kv_cache_memory_bytes=503316480` (480 MiB fixed KV), `enable_prefix_caching=False`; served model is a vLLM-0.28-compatibility-repacked checkpoint (`gemma-4-e2b-it-awq-vllm028-compat`) |
-| Frozen vLLM (Cosmos) | `.local/results/review-correction-20260926/cosmos-vllm-frozen-raw-corrected.json` | Same contract pattern as Gemma, per `build_vllm_equal_contract.py` | Not independently re-inspected in this pass beyond the config path reference in `model_config` |
+| Frozen vLLM (Cosmos) | v0.27.1 (all 35 retained successful raw origins); `.local/results/review-correction-20260926/cosmos-vllm-frozen-raw-corrected.json` | Same contract pattern as Gemma, per `build_vllm_equal_contract.py` | Warmup requests are **not uniform across workloads**: `short`/`balanced`/`decode-heavy`/`long-prefill`/`bimodal`/`text-heavy`/`mixed` use warmup 64; `vision-heavy`/`poisson`/`wave-drain`/`multi-image`/`late-vision` use warmup 16 (per-workload `contract.warmup_requests` in the raw-origins file). The upstream-server baseline (row below) instead used warmup 64 for every Cosmos workload, so the two baselines are not on an equal warmup contract per workload. `vision-heavy` has only 2 successful runs (1 failed attempt) versus 3 for the other workloads; Gemma's frozen baseline has 1 run per workload. |
 | vLLM re-derivation | `rederive_frozen_vllm.py` | Requires the current canonical trace hash to equal the one recorded when the frozen baseline ran (`"Canonical workload has conflicting trace hashes"` otherwise); requires `repeats == 1` per raw aggregate and a complete set of previously-successful runs | It only re-aggregates already-captured raw per-request data ("no_new_gpu_measurement"); it does not rerun vLLM |
 | v0.10.1 tip | **Not directly inspected in this pass** — referenced by the AGENTS.md workflow description ("v0.10.1 phase forward port") but no specific full12 campaign for it was opened here | — | — |
 | Upstream v0.11.0 clean baseline | Published wheel `tensorrt-edgellm[server]==0.11.0`, commit `95515c2` for the from-source build | Same traces, same `ignore_eos` semantics (via `EDGELLM_IGNORE_EOS=1` on the server since the HTTP schema forbids the field), same warmup/in-flight limits as the frozen vLLM contract per workload (`notes/371...md`, "Upstream serving baseline" section) | Batch size: Gemma 4 vs fork's 24; Cosmos 8 vs fork's 64 (upstream OOMs above these on the 10 GiB card); upstream's in-flight batching requires equal `max_tokens` to join a batch, so heterogeneous-output traces stall; one run per cell (not x3) |
@@ -267,7 +303,13 @@ identity does not establish equal runtime configuration or identical generated o
   multiple `requests.csv` runs. Per note 368: 14,031/14,042 questions used (11 exceed the 1024-token engine input
   limit and are dropped); batch-1 reference 7065/14031 = 50.35%, serving repeat 1 = 7066/14031 = 50.36% — serving
   accuracy is statistically indistinguishable from the batch-1 reference despite token-level divergence (see next
-  bullet). The port's MMLU gate run is `.local/results/v0110-port-fix-mmlu-20261001/run.sh`, invoking the `short`
+  bullet). **Parser caveat.** `\b([ABCD])\b` accepts any standalone letter, including non-answer prefixes such as
+  `Let $A$`, `Let $D$`, and `The area $A`. In the final MMLU gate artifacts
+  (`.local/results/v0110-port-final-mmlu-20261003/serving` and `.local/results/v0110-port-mmlu-20261001/reference`),
+  both runs contain the same 11 such non-answer outputs (8 `Let $A$`, 2 `Let $D$`, 1 `The area $A`); excluding them
+  changes final serving from 7193 to 7191 correct (51.27% → 51.25%) and reference from 7194 to 7192 correct
+  (51.27% → 51.26%) — the corrected figures (51.25% vs 51.26%) no longer round to the same value, though the gap
+  remains small. The port's MMLU gate run is `.local/results/v0110-port-fix-mmlu-20261001/run.sh`, invoking the `short`
   workload slot with `--trace-file short=.local/artifacts/datasets/mmlu/mmlu-zero-shot-trace.json`, `--repeats 1`,
   same binary/engine/build-root as the full24 x3 campaign.
 - **Batch-invariance / output audit.** Note 368 found Gemma's INT4 `Int4GroupwiseGemmPlugin` switches between a
