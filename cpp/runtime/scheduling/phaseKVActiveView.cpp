@@ -27,14 +27,15 @@ namespace trt_edgellm
 namespace rt
 {
 
-PhaseKVActiveView::PhaseKVActiveView(
-    int32_t maxActiveRows, StableKVPageManager& ownership, TensorMap& tensorMap, std::string const& name)
+PhaseKVActiveView::PhaseKVActiveView(int32_t maxActiveRows, StableKVPageManager& ownership, TensorMap& tensorMap,
+    std::string const& name, bool legacyKvLengthsBound)
     : mMaxActiveRows(maxActiveRows)
     , mOwnership(ownership)
     , mTensorMap(tensorMap)
     , mPageTable(maxActiveRows, ownership.maxPagesPerSequence(), ownership.config().numPages)
     , mHostLengths({maxActiveRows}, DeviceType::kCPU, nvinfer1::DataType::kINT32, name + "_host_active_kv_lengths")
     , mDeviceLengths({maxActiveRows}, DeviceType::kGPU, nvinfer1::DataType::kINT32, name + "_active_kv_lengths")
+    , mLegacyKvLengthsBound(legacyKvLengthsBound)
     , mPageBindingSignatures(static_cast<size_t>(maxActiveRows))
     , mSlotSeenEpochs(static_cast<size_t>(ownership.config().maxStableSlots), 0U)
 {
@@ -70,7 +71,7 @@ void PhaseKVActiveView::prepare(std::vector<int32_t> const& activeStableSlots, c
 
     bindActiveRows(activeStableSlots, stream);
 
-    if (mPreviousLengths != nullptr)
+    if (mPreviousLengths != nullptr && mLegacyKvLengthsBound)
     {
         std::vector<int32_t> const lengths = mOwnership.makeActiveLengths(activeStableSlots);
         ELLM_CHECK(mHostLengths.reshape({static_cast<int64_t>(lengths.size())}), "Phase KV host length reshape failed");

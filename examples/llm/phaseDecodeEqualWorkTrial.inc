@@ -45,8 +45,10 @@ rt::Tensor hostTokens({std::max(rows, past)}, rt::DeviceType::kCPU, nvinfer1::Da
 rt::Tensor deviceTokens({std::max(rows, past)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "trial_ids");
 rt::Tensor sampledIds({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "trial_samples");
 rt::Tensor hostSamples({rows}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "trial_host_samples");
-rt::PhaseKVActiveView trialPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "trial_p");
-rt::PhaseKVActiveView trialDecodeKV(decodeBatchCapacity, ownership, decodeMap, "trial_d");
+rt::PhaseKVActiveView trialPrefillKV(
+    config.maxSupportedPrefillBatchSize, ownership, prefillMap, "trial_p", /*legacyKvLengthsBound=*/true);
+rt::PhaseKVActiveView trialDecodeKV(
+    decodeBatchCapacity, ownership, decodeMap, "trial_d", /*legacyKvLengthsBound=*/true);
 trialDecodeKV.setPersistentDecodeSelectEnabled(true);
 trialDecodeKV.setPersistentPageBindingsEnabled(true);
 if (config.ropeConfig.type == rt::RopeType::kMRope)

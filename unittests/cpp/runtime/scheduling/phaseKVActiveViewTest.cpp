@@ -60,7 +60,7 @@ TEST(PhaseKVActiveViewTest, IsolatedMetadataCostBenchmark)
                 rt::KVPageTable table(64, 16, 256);
                 map.set(binding_names::kKVCacheStartIndex, lengths);
                 map.set(binding_names::kKVPageTable, table.kernelView());
-                rt::PhaseKVActiveView view(64, ownership, map, "metadata_bench");
+                rt::PhaseKVActiveView view(64, ownership, map, "metadata_bench", /*legacyKvLengthsBound=*/true);
                 view.setPersistentPageBindingsEnabled(persistent);
                 std::vector<double> hostUs, leaseUs, gpuUs;
                 for (int32_t step{}; step < 1100; ++step)
@@ -136,8 +136,8 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
     CUDA_CHECK(cudaStreamCreateWithFlags(&prefillStream, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&decodeStream, cudaStreamNonBlocking));
 
-    rt::PhaseKVActiveView prefill(2, ownership, prefillMap, "prefill");
-    rt::PhaseKVActiveView decode(2, ownership, decodeMap, "decode");
+    rt::PhaseKVActiveView prefill(2, ownership, prefillMap, "prefill", /*legacyKvLengthsBound=*/true);
+    rt::PhaseKVActiveView decode(2, ownership, decodeMap, "decode", /*legacyKvLengthsBound=*/true);
     decode.setPersistentDecodeSelectEnabled(true);
     decode.setPersistentPageBindingsEnabled(true);
     prefill.prepare({slot2}, prefillStream);
@@ -274,13 +274,43 @@ TEST(PhaseKVActiveViewTest, RejectsNestedPrepareAndLengthMismatch)
     rt::TensorMap tensorMap;
     tensorMap.set(binding_names::kKVCacheStartIndex, legacyLengths);
     tensorMap.set(binding_names::kKVPageTable, legacyPageTable.kernelView());
-    rt::PhaseKVActiveView view(1, ownership, tensorMap, "phase");
+    rt::PhaseKVActiveView view(1, ownership, tensorMap, "phase", /*legacyKvLengthsBound=*/true);
 
     view.prepare({slot}, nullptr);
     EXPECT_THROW(view.prepare({slot}, nullptr), std::runtime_error);
     EXPECT_THROW(view.commitLengths({1, 2}), std::runtime_error);
     view.complete();
     EXPECT_THROW(view.complete(), std::runtime_error);
+}
+
+TEST(PhaseKVActiveViewTest, SkipsLegacyLengthUploadWhenEngineLacksTheBinding)
+{
+    // buildTensorMap() installs kKVCacheStartIndex unconditionally even on ragged engines that
+    // never bind it; PhaseKVActiveView must gate the upload on legacyKvLengthsBound, not on the
+    // TensorMap entry's mere presence.
+    rt::StableKVPageManager ownership({2, 1, 4, 512, 128});
+    int32_t const slot = ownership.reserve();
+    ownership.ensureCapacity(slot, 128);
+    ownership.setLength(slot, 64);
+    rt::Tensor legacyLengths({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "legacy_lengths");
+    rt::KVPageTable legacyPageTable(1, 4, 4);
+    rt::TensorMap tensorMap;
+    tensorMap.set(binding_names::kKVCacheStartIndex, legacyLengths);
+    tensorMap.set(binding_names::kKVPageTable, legacyPageTable.kernelView());
+
+    rt::PhaseKVActiveView view(1, ownership, tensorMap, "unbound_legacy", /*legacyKvLengthsBound=*/false);
+    view.prepare({slot}, nullptr);
+    // The map entry must stay bound to the caller's original tensor — no upload rebinds it.
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &legacyLengths);
+    EXPECT_EQ(view.memoryStats().lengthH2DOperations, 0U);
+    view.complete();
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &legacyLengths);
+
+    rt::PhaseKVActiveView boundView(1, ownership, tensorMap, "bound_legacy", /*legacyKvLengthsBound=*/true);
+    boundView.prepare({slot}, nullptr);
+    EXPECT_EQ(tensorMap.get(binding_names::kKVCacheStartIndex), &boundView.activeLengths());
+    EXPECT_EQ(boundView.memoryStats().lengthH2DOperations, 1U);
+    boundView.complete();
 }
 
 TEST(PhaseKVActiveViewTest, RaggedAbiMapNeedsNoKvcacheStartIndexAndSwapsSwaPageTable)
@@ -300,7 +330,7 @@ TEST(PhaseKVActiveViewTest, RaggedAbiMapNeedsNoKvcacheStartIndexAndSwapsSwaPageT
     // its own; PhaseKVActiveView must swap both names to its own active-row table.
     raggedMap.set(binding_names::kSwaKVPageTable, fullPageTable.kernelView());
 
-    rt::PhaseKVActiveView view(2, ownership, raggedMap, "ragged_decode");
+    rt::PhaseKVActiveView view(2, ownership, raggedMap, "ragged_decode", /*legacyKvLengthsBound=*/false);
     EXPECT_EQ(raggedMap.get(binding_names::kKVCacheStartIndex), nullptr);
 
     view.prepare({slot0, slot1}, nullptr);

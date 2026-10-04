@@ -933,8 +933,10 @@ int main(int argc, char** argv)
                 ownership.ensureCapacity(slot, 129);
                 ownership.setLength(slot, 128);
             }
-            rt::PhaseKVActiveView prefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "prefill");
-            rt::PhaseKVActiveView decodeKV(decodeBatchCapacity, ownership, decodeMap, "decode");
+            rt::PhaseKVActiveView prefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "prefill",
+                /*legacyKvLengthsBound=*/true);
+            rt::PhaseKVActiveView decodeKV(
+                decodeBatchCapacity, ownership, decodeMap, "decode", /*legacyKvLengthsBound=*/true);
             std::vector<int32_t> const prefillSlots = config.packedPrefill
                 ? std::vector<int32_t>{prefillSlot0, prefillSlot1}
                 : std::vector<int32_t>{prefillSlot0};

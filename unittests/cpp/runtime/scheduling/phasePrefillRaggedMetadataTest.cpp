@@ -346,7 +346,7 @@ TEST(PhasePrefillRaggedMetadataTest, ActiveViewSwapsKvAndSwaTablesByActiveRow)
         KVPageTable resident(4, 16, 64);
         map.set(binding_names::kKVPageTable, resident.kernelView());
         map.set(binding_names::kSwaKVPageTable, resident.kernelView());
-        PhaseKVActiveView view(4, ownership, map, "prefill_view_test");
+        PhaseKVActiveView view(4, ownership, map, "prefill_view_test", /*legacyKvLengthsBound=*/false);
         view.prepare({slotC, slotA}, stream);
 
         EXPECT_EQ(map.get(binding_names::kKVPageTable), &view.pageTable().kernelView());
@@ -371,7 +371,7 @@ TEST(PhasePrefillRaggedMetadataTest, ActiveViewSwapsKvAndSwaTablesByActiveRow)
 
         KVPageTable boundedSwa(4, 16, 64);
         map.set(binding_names::kSwaKVPageTable, boundedSwa.kernelView());
-        PhaseKVActiveView boundedView(4, ownership, map, "bounded_prefill_view_test");
+        PhaseKVActiveView boundedView(4, ownership, map, "bounded_prefill_view_test", /*legacyKvLengthsBound=*/false);
         EXPECT_THROW(boundedView.prepare({slotA}, stream), std::runtime_error);
     }
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);

@@ -57,8 +57,11 @@ struct PhaseKVMemoryStats
 class PhaseKVActiveView
 {
 public:
-    PhaseKVActiveView(
-        int32_t maxActiveRows, StableKVPageManager& ownership, TensorMap& tensorMap, std::string const& name);
+    //! `legacyKvLengthsBound` must reflect whether the engine actually exposes the fork-ABI
+    //! `kvcache_start_index` binding (e.g. `executor.hasIOTensor(...)`) — the TensorMap entry
+    //! buildTensorMap() installs is unconditional and not a reliable signal on its own.
+    PhaseKVActiveView(int32_t maxActiveRows, StableKVPageManager& ownership, TensorMap& tensorMap,
+        std::string const& name, bool legacyKvLengthsBound);
     ~PhaseKVActiveView() noexcept;
 
     PhaseKVActiveView(PhaseKVActiveView const&) = delete;
@@ -114,6 +117,7 @@ private:
     Tensor* mPreviousLengths{};
     Tensor* mPreviousPageTable{};
     Tensor* mPreviousSwaPageTable{};
+    bool const mLegacyKvLengthsBound{};
     bool mSwapsSwaPageTable{};
     bool mPrepared{};
     mutable void* mZeroedDecodeSelectTokenIndices{};

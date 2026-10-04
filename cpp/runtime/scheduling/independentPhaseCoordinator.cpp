@@ -17,6 +17,7 @@
 
 #include "runtime/scheduling/independentPhaseCoordinator.h"
 
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/logger.h"
@@ -61,8 +62,10 @@ IndependentPhaseCoordinator::IndependentPhaseCoordinator(LLMEngineConfig const& 
     , mPrefillStream(prefillStream)
     , mDecodeStream(decodeStream)
     , mCallbacks(std::move(callbacks))
-    , mPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "independent_coordinator_prefill")
-    , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode")
+    , mPrefillKV(config.maxSupportedPrefillBatchSize, ownership, prefillMap, "independent_coordinator_prefill",
+          executors.prefillExecutor().hasIOTensor(binding_names::kKVCacheStartIndex))
+    , mDecodeKV(config.maxSupportedDecodeBatchSize, ownership, decodeMap, "independent_coordinator_decode",
+          executors.decodeExecutor().hasIOTensor(binding_names::kKVCacheStartIndex))
     , mResources(resources)
     // Primary profile's per-row token width: the packed chunk cap when packed (maxPackedPrefillChunkTokens
     // is 0 otherwise), or the full non-packed input length when not — matches how mPrefillIO itself is
