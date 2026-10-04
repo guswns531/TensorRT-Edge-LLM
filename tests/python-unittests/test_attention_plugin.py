@@ -3128,6 +3128,66 @@ def test_full_swa_packed_workspace_large_chunk_cap():
     assert_close("full-swa-packed-large-chunk-cap-output", ref_out, swa_out)
 
 
+def test_full_swa_packed_workspace_narrow_token_profile():
+    """Full-mode SWA packed prefill whose token-profile maximum (Tmax) is far
+    below max_batch_size * packed_prefill_max_chunk_tokens must not overflow
+    its advertised workspace.
+
+    Regression test: getWorkspaceSize() used to derive the packed dense
+    scratch width from Tmax / maxPhysicalBatchSize, while enqueue allocates
+    two dense {runtimeBatchSize, packedPrefillChunkLimit, Hq, D} buffers. A
+    profile with Bmax=1, Tmax=16, chunk cap=1024 advertises scratch sized for
+    16 tokens while enqueue needs scratch sized for the 1024-token chunk cap."""
+    cfg = dict(BASE)
+    cfg.update(head_size=256,
+               num_q_heads=8,
+               num_kv_heads=1,
+               sliding_window_size=512,
+               kv_cache_capacity=1024,
+               max_batch_size=1,
+               max_seq_len=16,
+               max_position_embeddings=2048)
+    total_tokens = 16
+    p = AttentionParams(batch_size=1,
+                        seq_len=total_tokens,
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(9002)
+    _, _, rope = _make_rope(p, gen)
+    qkv = torch.randn((1, total_tokens, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV).to(torch.float16)
+    contexts = torch.tensor([total_tokens], dtype=torch.int32, device=DEV)
+    starts = torch.zeros(1, dtype=torch.int32, device=DEV)
+
+    _, _, ref_kv = _empty_caches(p)
+    reference = AttentionPluginRunner(p,
+                                      enable_packed_prefill=True,
+                                      packed_prefill_max_chunk_tokens=1024)
+    ref_out, ref_kv = reference.run(qkv.clone().reshape(
+        1, total_tokens, p.qkv_hidden_size),
+                                    ref_kv,
+                                    contexts,
+                                    rope,
+                                    starts,
+                                    input_shapes={"kv_cache_indices": (0, )})
+
+    _, _, swa_kv = _empty_caches(p)
+    swa = AttentionPluginRunner(p,
+                                enable_packed_prefill=True,
+                                packed_prefill_max_chunk_tokens=1024,
+                                swa_cache_mode="full")
+    swa_out, swa_kv = swa.run(qkv.clone().reshape(1, total_tokens,
+                                                  p.qkv_hidden_size),
+                              swa_kv,
+                              contexts,
+                              rope,
+                              starts,
+                              input_shapes={"kv_cache_indices": (0, )})
+    assert_close("full-swa-packed-narrow-token-profile-output", ref_out,
+                 swa_out)
+
+
 # Shared-KV prefill. head 128 runs the CuTe DSL FMHA path where available
 # (SM100+) and FMHA-v2 elsewhere; head 256 uses native-paged FMHA-v2 where
 # supported. FP16 head 512 runs native-paged common FMHA on SM100/101/110 and

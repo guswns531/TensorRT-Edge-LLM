@@ -166,6 +166,12 @@ private:
     float const* resolveAttentionSinkInput(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
 
+    //! Workspace upper bound for one optimization profile; @p packedPrefillChunkLimitIdx is the
+    //! profile-local packed_prefill_chunk_limit input index (-1 when not present).
+    size_t computeWorkspaceSizeForProfile(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs, int32_t expectedNbInputs,
+        int32_t packedPrefillChunkLimitIdx) const noexcept;
+
 protected:
     trt_edgellm::XQAJitKey getXQAJitKey() const noexcept;
     bool canCompileXQAJitKernel() const noexcept;

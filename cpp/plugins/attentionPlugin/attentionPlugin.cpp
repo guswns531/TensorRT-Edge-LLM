@@ -369,9 +369,9 @@ std::vector<uint8_t> parsePluginBytesField(char const* fieldName, PluginFieldCol
 //     vision-block attention respectively).
 //
 // Total allocation is the sum of all conditional slots (safe upper bound).
-size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t physicalBatchSize, int64_t seqLen, int64_t kvCacheCapacity,
-    int32_t numQHeads, int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache,
-    bool enableVisionBlockAttention, bool enablePackedPrefill)
+size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCacheCapacity, int32_t numQHeads,
+    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache, bool enableVisionBlockAttention,
+    bool enablePackedPrefill, int64_t packedChunkLimit)
 {
     size_t workspaceSize = 0;
 
@@ -385,13 +385,13 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t physicalBatchSize, i
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
 
     // Packed FP16 prefill and XQA decode do not consume the dense split-K/V carrier below.
-    // P has one packed physical row; D retains its physical batch dimension.
+    // Packed prefill computes on dense {logicalBatch, chunkLimit, Hq, D} scratch, not on the T-token carrier.
     if (enablePackedPrefill)
     {
-        int64_t const scratchTokens = packedAttentionScratchTokens(physicalBatchSize, seqLen);
-        workspaceSize
-            = accumulateWorkspaceSize(workspaceSize, rt::Coords{scratchTokens, numQHeads, headSize}, DataType::kHALF);
-        return accumulateWorkspaceSize(workspaceSize, rt::Coords{scratchTokens, numQHeads, headSize}, DataType::kHALF);
+        workspaceSize = accumulateWorkspaceSize(
+            workspaceSize, rt::Coords{batchSize, packedChunkLimit, numQHeads, headSize}, DataType::kHALF);
+        return accumulateWorkspaceSize(
+            workspaceSize, rt::Coords{batchSize, packedChunkLimit, numQHeads, headSize}, DataType::kHALF);
     }
 
     workspaceSize = accumulateWorkspaceSize(
@@ -424,7 +424,8 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t physicalBatchSize, i
 }
 
 size_t getSwaKVCacheWorkspaceSize(int64_t batchSize, int64_t seqLen, int32_t slidingWindowSize, int32_t numQHeads,
-    int32_t numKVHeads, int32_t headSize, bool enableVisionBlockAttention, bool enablePackedPrefill)
+    int32_t numKVHeads, int32_t headSize, bool enableVisionBlockAttention, bool enablePackedPrefill,
+    int64_t packedChunkLimit)
 {
     size_t workspaceSize = 0;
     workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize + 1}, DataType::kINT32);
@@ -451,10 +452,11 @@ size_t getSwaKVCacheWorkspaceSize(int64_t batchSize, int64_t seqLen, int32_t sli
     size_t packedWorkspaceSize = 0;
     if (enablePackedPrefill)
     {
-        packedWorkspaceSize
-            = accumulateWorkspaceSize(packedWorkspaceSize, {1, seqLen, numQHeads, headSize}, DataType::kHALF);
-        packedWorkspaceSize
-            = accumulateWorkspaceSize(packedWorkspaceSize, {1, seqLen, numQHeads, headSize}, DataType::kHALF);
+        // Dense packed scratch is {logicalBatch, chunkLimit, Hq, D}, not the T-token carrier.
+        packedWorkspaceSize = accumulateWorkspaceSize(
+            packedWorkspaceSize, {batchSize, packedChunkLimit, numQHeads, headSize}, DataType::kHALF);
+        packedWorkspaceSize = accumulateWorkspaceSize(
+            packedWorkspaceSize, {batchSize, packedChunkLimit, numQHeads, headSize}, DataType::kHALF);
     }
     workspaceSize += std::max(denseWorkspaceSize, packedWorkspaceSize);
 
@@ -1340,7 +1342,14 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
         = resolveAttentionInputLayout(mEnableQKNorm != 0, mEnableContextMaskSelector != 0, mEnableTreeAttention != 0,
             mEnableVisionBlockAttention != 0, mEnableProfileLocalPackedPrefill != 0, mSkipSoftmaxScaleFactor > 0.F,
             mSupportsBoundedKVCache, mEnableAttentionSink != 0);
-    int32_t const expectedNbInputs = inputLayout.numInputs;
+    return computeWorkspaceSizeForProfile(
+        inputs, nbInputs, outputs, nbOutputs, inputLayout.numInputs, inputLayout.packedPrefillChunkLimit);
+}
+
+size_t AttentionPlugin::computeWorkspaceSizeForProfile(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+    DynamicPluginTensorDesc const* outputs, int32_t nbOutputs, int32_t expectedNbInputs,
+    int32_t packedPrefillChunkLimitIdx) const noexcept
+{
     if (inputs == nullptr || outputs == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR(
@@ -1356,23 +1365,28 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     int64_t const maxBatchSize = inputs[kIN_QUERY_LENGTH_IDX].max.d[0];
     int64_t const maxPhysicalBatchSize = mEnablePackedPrefill ? 1 : maxBatchSize;
     int64_t const maxSeqLen = maxTotalTokens / maxPhysicalBatchSize;
+    // A profile-local carrier bounds the chunk limit by this profile's packed_prefill_chunk_limit extent.
+    int64_t maxPackedChunkLimit = mPackedPrefillMaxChunkTokens;
+    if (mEnablePackedPrefill && mEnableProfileLocalPackedPrefill)
+    {
+        maxPackedChunkLimit = inputs[packedPrefillChunkLimitIdx].max.d[0];
+    }
     if (mSupportsBoundedKVCache)
     {
         // Both runtime policies use FMHA-v2/XQA. Full-cache mode stays native-paged, while the bounded path and
         // vision-block fallback need at most W + current-sequence scratch, so neither policy needs a dense
         // max-sequence KV workspace.
         size_t const workspaceSize = getSwaKVCacheWorkspaceSize(maxBatchSize, maxSeqLen, mSlidingWindowSize, mNumQHeads,
-            mNumKVHeads, mHeadSize, mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0);
+            mNumKVHeads, mHeadSize, mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0, maxPackedChunkLimit);
         LOG_DEBUG("AttentionPlugin dual-mode SWA workspace size: %zu bytes", workspaceSize);
         return workspaceSize;
     }
     // KV binding is the paged pool [2, numPages, 128, Hkv, D]; the per-slot padded capacity is the
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
-    size_t const workspaceSize
-        = getAttentionWorkspaceSize(maxBatchSize, maxPhysicalBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
-            mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL,
-            mEnableFp8KVCache, mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0);
+    size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
+        mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
+        mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0, maxPackedChunkLimit);
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
     return workspaceSize;
@@ -1674,26 +1688,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         return 1;
     }
 
-    // Upper bound for this exact invocation, computed with the same formulas getWorkspaceSize()
-    // uses but fed this call's actual dims instead of the per-profile max; every workspace
-    // carve-out below is checked against it so a future sizing/enqueue mismatch fails loudly
-    // instead of corrupting whatever follows the buffer.
-    int32_t const workspaceSizingSeqLen = packedPrefill ? packedPrefillChunkLimit : runtimeSeqLen;
-    size_t const expectedWorkspaceSize = mSupportsBoundedKVCache
-        ? getSwaKVCacheWorkspaceSize(runtimeBatchSize, workspaceSizingSeqLen, mSlidingWindowSize, mNumQHeads,
-              mNumKVHeads, mHeadSize, mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0)
-        : getAttentionWorkspaceSize(runtimeBatchSize, packedPrefill ? 1 : runtimeBatchSize, workspaceSizingSeqLen,
-              kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize,
-              mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
-              mEnableVisionBlockAttention != 0, mEnablePackedPrefill != 0);
-    std::byte const* const workspaceEnd = static_cast<std::byte const*>(workspace) + expectedWorkspaceSize;
-    auto assignTensorFromWorkspaceChecked = [&](rt::Coords const& shape, DataType dtype) {
-        rt::Tensor tensor = assignTensorFromWorkspace(alignedWorkspacePtr, shape, dtype);
-        check::check(alignedWorkspacePtr <= workspaceEnd,
-            "AttentionPlugin: enqueue workspace usage exceeds the size advertised by getWorkspaceSize().");
-        return tensor;
-    };
-
     // Gamma engine-weight inputs are device-resident at engine load. Models without
     // qk_norm do not wire them ⇒ nullptr ⇒ the kernel takes the RoPE-only path.
     half const* qNormGammaDevicePtr
@@ -1800,11 +1794,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 return -1;
             }
 
-            rt::Tensor cuQSeqLensTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize + 1}, DataType::kINT32);
-            rt::Tensor cuKVSeqLensTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize + 1}, DataType::kINT32);
-            rt::Tensor kvCacheEndIdxsTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize}, DataType::kINT32);
+            rt::Tensor cuQSeqLensTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+            rt::Tensor cuKVSeqLensTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+            rt::Tensor kvCacheEndIdxsTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
             rt::Tensor paddedCuKVSeqLensTensor
-                = assignTensorFromWorkspaceChecked({runtimeBatchSize + 1}, DataType::kINT32);
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
             kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
                 cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
 
@@ -1822,9 +1819,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
                 if (useBoundedSwaCache)
                 {
-                    kInputTensor = assignTensorFromWorkspaceChecked(
+                    kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
-                    vInputTensor = assignTensorFromWorkspaceChecked(
+                    vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
                 }
                 kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
@@ -1992,12 +1989,16 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         }
 
         // Allocate workspace tensors for cumulative sequence lengths.
-        rt::Tensor cuQSeqLensTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize + 1}, DataType::kINT32);
-        rt::Tensor cuKVSeqLensTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize + 1}, DataType::kINT32);
-        rt::Tensor kvCacheEndIdxsTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize}, DataType::kINT32);
+        rt::Tensor cuQSeqLensTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+        rt::Tensor cuKVSeqLensTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+        rt::Tensor kvCacheEndIdxsTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
 
         // Padded cu_kv_seqlens for CuTe DSL FMHA bottom_right_align (see utilKernels.h for details).
-        rt::Tensor paddedCuKVSeqLensTensor = assignTensorFromWorkspaceChecked({runtimeBatchSize + 1}, DataType::kINT32);
+        rt::Tensor paddedCuKVSeqLensTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
             cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream, packedPrefill);
 
@@ -2049,9 +2050,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
                 if (useBoundedSwaCache)
                 {
-                    kInputTensor = assignTensorFromWorkspaceChecked(
+                    kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
-                    vInputTensor = assignTensorFromWorkspaceChecked(
+                    vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
                 }
                 kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
@@ -2425,9 +2426,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 else
                 {
                     // Normal bounded/FP8 prefill keeps the dense FP16 scratch contract.
-                    kInputTensor = assignTensorFromWorkspaceChecked(
+                    kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
-                    vInputTensor = assignTensorFromWorkspaceChecked(
+                    vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
                     kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
                         rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
