@@ -24,8 +24,16 @@ else()
 endif()
 
 # Capture whether the caller explicitly set CMAKE_CUDA_ARCHITECTURES before
-# project(CUDA) runs compiler detection and populates it with a default.
-if(DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
+# project(CUDA) runs compiler detection and populates it with a default. A cache
+# entry that merely echoes the multi-SM default we forced on a prior configure
+# (recorded below in _EDGELLM_CUDA_ARCH_DEFAULT_APPLIED) is not a user override;
+# only a cache value that differs from that record is. On a truly fresh cache
+# (no entry yet) there is nothing to compare, so it is not a user override
+# either.
+if(DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES}
+   AND (NOT DEFINED CACHE{_EDGELLM_CUDA_ARCH_DEFAULT_APPLIED}
+        OR NOT "$CACHE{CMAKE_CUDA_ARCHITECTURES}" STREQUAL
+           "$CACHE{_EDGELLM_CUDA_ARCH_DEFAULT_APPLIED}"))
   set(_EDGELLM_USER_SET_CUDA_ARCHITECTURES TRUE)
 else()
   set(_EDGELLM_USER_SET_CUDA_ARCHITECTURES FALSE)
@@ -125,14 +133,28 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-# Explicit single-SM builds must not inherit the multi-architecture default.
+# Explicit single-SM builds must not inherit the multi-architecture default. The
+# result is forced into the cache (not just a local set()) so that a later
+# reconfigure sees the same value we applied here rather than the
+# compiler-detected default that project(CUDA) wrote on the first configure;
+# _EDGELLM_CUDA_ARCH_DEFAULT_APPLIED records that value for the comparison
+# above. Once the user passes an explicit -DCMAKE_CUDA_ARCHITECTURES=..., it
+# sticks in the cache across plain reconfigures (no -D); reverting to the
+# multi-SM default requires `-UCMAKE_CUDA_ARCHITECTURES`.
 if(NOT DEFINED EDGELLM_WHEEL_PAYLOAD_DIR
    AND NOT AARCH64_BUILD
    AND NOT _EDGELLM_USER_SET_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 80;86;89;90)
+  set(_edgellm_cuda_archs 80;86;89;90)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
-    list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
+    list(APPEND _edgellm_cuda_archs 100a 120)
   endif()
+  set(CMAKE_CUDA_ARCHITECTURES
+      "${_edgellm_cuda_archs}"
+      CACHE STRING "CUDA architectures" FORCE)
+  set(_EDGELLM_CUDA_ARCH_DEFAULT_APPLIED
+      "${_edgellm_cuda_archs}"
+      CACHE INTERNAL "" FORCE)
+  unset(_edgellm_cuda_archs)
 endif()
 
 # Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
