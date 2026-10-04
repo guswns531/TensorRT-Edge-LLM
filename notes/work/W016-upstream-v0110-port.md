@@ -1,8 +1,8 @@
 ---
 id: W016
 status: active
-updated: 2026-10-03
-notes: [371, 372, 373, 374, 375]
+updated: 2026-10-04
+notes: [371, 372, 373, 374, 375, 376]
 ---
 
 # Upstream v0.11.0 baseline and port
@@ -16,8 +16,8 @@ Establish what stock upstream v0.11.0 achieves on the RTX 3080 (SM86, 10 GiB) wi
 - `llm_build` rejects `--maxKVPoolPages 192` at batch 24 x 2048 (minimum 384); the fork builds that contract (note 371).
 - Upstream serving baseline (published `tensorrt-edgellm[server]==0.11.0`, in-flight batching, `EDGELLM_IGNORE_EOS=1`, one run per cell, all requests fixed-length): our tip full24 x3 median is 5.28x upstream geomean over 24 cells, frozen vLLM 4.16x; parity only on wave-drain and Cosmos multi-image (319 vs 314 tok/s). Loss drivers: batch size 4/8 vs 24/64, and in-flight joining only with equal `max_tokens` (note 371).
 - Port requirements (note 371): fork KV undercommit, phase-shaped Gemma4 PLE output buffers, external INT4 FFN weights; build with `-DENABLE_CUTE_DSL=ALL` (or `fmha;int4_fp16_gemm`).
-- Port on branch `codex/v0110-phase-forward-port` (`.local/worktrees/v0110-port`; notes 372-374 live on that branch): merge `83f5f768` of v0.11.0 into fork tip `fca7bd0`, ragged-ABI rewiring, and the W016 recovery fixes, regrouped into six commits on top of `f6c2f094`, HEAD `10194199` with notes 374-375 and `benchmarks/phase_serving/EXPERIMENT_METHODOLOGY.md`.
-- Port serving, final tree `f0849333` (full24 x3): geomean +28.0% vs frozen vLLM (Gemma +40.4%, Cosmos +16.6%) and +0.7% vs the v0.10.1 tip (Gemma +2.5%, Cosmos -1.1%); 23 of 24 cells faster than vLLM. Cosmos balanced is 1.5% below vLLM (all 3 runs) and 4.4% below v0.10.1, having declined at every port step (note 375; `9f911c16` numbers in note 374).
+- Port on branch `codex/v0110-phase-forward-port` (`.local/worktrees/v0110-port`; notes 372-374 live on that branch): merge `83f5f768` of v0.11.0 into fork tip `fca7bd0`, ragged-ABI rewiring, and the W016 recovery fixes, regrouped into six commits on top of `f6c2f094`, HEAD `8ffeb163` with notes 374-376 and `benchmarks/phase_serving/EXPERIMENT_METHODOLOGY.md`.
+- Port serving, final tree `f0849333` (full24 x3): geomean +28.0% vs frozen vLLM (Gemma +40.4%, Cosmos +16.6%) and +0.7% vs the v0.10.1 tip (Gemma +2.5%, Cosmos -1.1%); 23 of 24 cells faster than vLLM. On `f0849333` Cosmos balanced was 1.5% below vLLM (note 375); after the second-review fixes a same-day interleaved A/B puts `d075df4d` at 4448.8 tok/s, +3.1% vs vLLM and level with v0.10.1, with the earlier 1.9% step mostly day-to-day variance (note 376).
 - Port output quality: MMLU zero-shot serving 51.27% on both `9f911c16` and the final tree, equal to the port batch-1 reference; above v0.10.1's 50.36% because the doubled Gemma `<bos>` is fixed (note 374).
 - Recovery fixes (multi-slot KV page-table upload, one-copy ragged metadata, true packed prefill) recovered Gemma and Cosmos prefill-heavy cells but not the Cosmos decode-heavy gap of 1.7-2.7% to v0.10.1 (note 374).
 - External Codex review found no defect on the validated phase-serving path; six port-introduced defects on other paths are fixed, four fork-inherited ones are left open by decision (note 374).
@@ -27,10 +27,11 @@ Establish what stock upstream v0.11.0 achieves on the RTX 3080 (SM86, 10 GiB) wi
 - 372 — Merge resolution log for the v0.11.0 port (branch `codex/v0110-phase-forward-port`).
 - 373 — Port milestone 1: all targets build, C++ unit tests pass; no engines yet (same branch).
 - 374 — Port recovery fixes and external review: all 24 cells faster than vLLM (+27.9%) on `9f911c16`, +0.7% vs v0.10.1 with Cosmos -1.3%, MMLU parity, six review defects fixed (same branch; limits revised by 375).
-- 375 — Final-tree validation: MMLU parity, +28.0% vs vLLM, but Cosmos balanced 1.5% below vLLM (same branch).
+- 375 — Final-tree validation: MMLU parity, +28.0% vs vLLM, but Cosmos balanced 1.5% below vLLM (same branch; revised by 376).
+- 376 — Second external review fixes; Cosmos balanced back to +3.1% vs vLLM in a same-day A/B; 21 inherited scheduler/front-end defects recorded and left open (same branch).
 
 ## Open questions
-- Cosmos balanced is below vLLM (-1.5%) and v0.10.1 (-4.4%) and dropped 1.9% between `9f911c16` and the final tree; a same-day A/B of the two binaries on that cell, then a decode-step profile, would attribute it (note 375).
+- `d075df4d` has only the Cosmos balanced A/B and two output smokes; a full24 x3 and MMLU rerun would make it the measured port binary (note 376).
 - Ordinary `llm_inference` on packed engines rejects rows above the chunk cap and multimodal input instead of chunking them (note 374).
 - Choose V1 versus V2 INT4 for the port, in light of the GEMV/GEMM numerics -> W013 (note 368).
 - Exercise the published server wheel at larger batch (the 24-cell baseline ran only at Gemma 4 / Cosmos 8; note 371).
@@ -46,5 +47,6 @@ Establish what stock upstream v0.11.0 achieves on the RTX 3080 (SM86, 10 GiB) wi
 - `.local/artifacts/v0110-port` (present; port Gemma and Cosmos ONNX and engines)
 - `.local/baselines/v0110-port-f6c2f094-20261001`, `.local/baselines/v0110-port-9f911c16-20261001` (present)
 - `.local/results/v0110-port-full24-3x-20261001`, `v0110-port-fix-full24-3x-20261001`, `v0110-port-mmlu-20261001`, `v0110-port-fix-mmlu-20261001`, `v0110-port-codex-review-20261003`, `v0110-port-final-full24-3x-20261003`, `v0110-port-final-mmlu-20261003` (present, diagnostic)
-- `.local/baselines/v0110-port-f0849333-20261003` (present; final binary)
+- `.local/baselines/v0110-port-f0849333-20261003`, `.local/baselines/v0110-port-d075df4d-20261004` (present)
+- `.local/results/v0110-port-codex-review2-20261004`, `v0110-port-cosmos-balanced-ab-20261004` (present, diagnostic)
 - `.local/worktrees/upstream-v0110-debug` (not present)
