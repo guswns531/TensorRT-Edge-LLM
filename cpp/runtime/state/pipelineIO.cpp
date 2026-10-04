@@ -416,7 +416,8 @@ void bindUnifiedDecoderMetadata(TensorMap& map, PipelineIO& io)
 } // namespace
 
 void StreamingPrefillBuffers::populateFromPrefill(Tensor const& liveInputEmbeds, Tensor const& liveEngineHiddenStates,
-    int32_t batch, int32_t prefillLen, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq, cudaStream_t stream)
+    int32_t batch, std::vector<int32_t> const& sequenceLengths, bool packed, int32_t hiddenSize, int32_t maxBatch,
+    int32_t maxSeq, cudaStream_t stream)
 {
     auto const dtype = nvinfer1::DataType::kHALF;
     if (inputEmbeds.isEmpty())
@@ -426,14 +427,44 @@ void StreamingPrefillBuffers::populateFromPrefill(Tensor const& liveInputEmbeds,
         engineHiddenStates = Tensor(
             {maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::streamingPrefill.engineHiddenStates");
     }
+    int32_t const prefillLen = *std::max_element(sequenceLengths.begin(), sequenceLengths.begin() + batch);
     check::check(inputEmbeds.reshape({batch, prefillLen, hiddenSize}), "Tensor reshape failed");
     check::check(engineHiddenStates.reshape({batch, prefillLen, hiddenSize}), "Tensor reshape failed");
 
-    size_t const bytes = static_cast<size_t>(batch) * prefillLen * hiddenSize * sizeof(__half);
-    CUDA_CHECK(cudaMemcpyAsync(
-        inputEmbeds.rawPointer(), liveInputEmbeds.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        engineHiddenStates.rawPointer(), liveEngineHiddenStates.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+    size_t const rowBytes = static_cast<size_t>(hiddenSize) * sizeof(__half);
+    if (!packed)
+    {
+        size_t const bytes = static_cast<size_t>(batch) * prefillLen * rowBytes;
+        CUDA_CHECK(cudaMemcpyAsync(
+            inputEmbeds.rawPointer(), liveInputEmbeds.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(engineHiddenStates.rawPointer(), liveEngineHiddenStates.rawPointer(), bytes,
+            cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
+
+    // Packed rows are compact ([o_i, o_i + q_i)); consumers expect zero-padded {batch, prefillLen, hidden}.
+    size_t const destBytes = static_cast<size_t>(batch) * prefillLen * rowBytes;
+    CUDA_CHECK(cudaMemsetAsync(inputEmbeds.rawPointer(), 0, destBytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(engineHiddenStates.rawPointer(), 0, destBytes, stream));
+
+    auto* const destInputBytes = static_cast<std::byte*>(inputEmbeds.rawPointer());
+    auto* const destHiddenBytes = static_cast<std::byte*>(engineHiddenStates.rawPointer());
+    auto const* const srcInputBytes = static_cast<std::byte const*>(liveInputEmbeds.rawPointer());
+    auto const* const srcHiddenBytes = static_cast<std::byte const*>(liveEngineHiddenStates.rawPointer());
+
+    size_t srcOffsetRows = 0;
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        int32_t const qLen = sequenceLengths[static_cast<size_t>(i)];
+        size_t const seqBytes = static_cast<size_t>(qLen) * rowBytes;
+        size_t const destOffsetBytes = static_cast<size_t>(i) * prefillLen * rowBytes;
+        size_t const srcOffsetBytes = srcOffsetRows * rowBytes;
+        CUDA_CHECK(cudaMemcpyAsync(destInputBytes + destOffsetBytes, srcInputBytes + srcOffsetBytes, seqBytes,
+            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(destHiddenBytes + destOffsetBytes, srcHiddenBytes + srcOffsetBytes, seqBytes,
+            cudaMemcpyDeviceToDevice, stream));
+        srcOffsetRows += static_cast<size_t>(qLen);
+    }
 }
 
 void bindRopeTensors(TensorMap& map, PipelineIO& io, [[maybe_unused]] SharedResources& res, LLMEngineConfig const& cfg)

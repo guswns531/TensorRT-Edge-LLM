@@ -69,12 +69,17 @@ struct StreamingPrefillBuffers
     Tensor engineHiddenStates; //!< Prefill-time engine hidden_states output.
 
     //! Allocate on first call (sized to the worst case `{maxBatch, maxSeq, hiddenSize}`),
-    //! reshape to the current request's `{batch, prefillLen, hiddenSize}`, and copy
+    //! reshape to `{batch, maxLen, hiddenSize}` (maxLen = max of `sequenceLengths`), and copy
     //! from the live PipelineIO buffers on `stream`. Subsequent calls reuse the same
     //! allocation. Must be invoked after prefill and before the first decode step on
     //! the same stream so the copies precede any overwrite of `outputHiddenStates`.
+    //! When `packed` is true, the live buffers hold compact rows (sum of `sequenceLengths`,
+    //! concatenated per sequence in order) rather than `{batch, maxLen, hiddenSize}`; each
+    //! sequence's rows are gathered into its own `[0, sequenceLengths[i])` slice and the
+    //! remaining tail is zero-padded.
     void populateFromPrefill(Tensor const& liveInputEmbeds, Tensor const& liveEngineHiddenStates, int32_t batch,
-        int32_t prefillLen, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq, cudaStream_t stream);
+        std::vector<int32_t> const& sequenceLengths, bool packed, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq,
+        cudaStream_t stream);
 };
 
 //! All tensors flowing through the inference pipeline.
