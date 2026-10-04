@@ -409,6 +409,7 @@ Final tree `f0849333`, full24 ×3 and MMLU on 2026-10-03 (notes 374 and 375).
 | Runs below vLLM | 0/36 | 3/36 (all Cosmos balanced) | 3/72 |
 
 - MMLU zero-shot through serving: 51.27%, equal to the batch-1 reference; same prediction on 14029/14031.
-- Cosmos balanced is the one cell below vLLM (4251.9 vs 4315.8 tok/s, −1.5%); see note 375.
+- Cosmos balanced is the one cell below vLLM on `f0849333` (4251.9 vs 4315.8 tok/s, −1.5%; note 375). After the second
+  review fixes, a same-day interleaved A/B puts `d075df4d` at 4448.8 tok/s (+3.1% vs vLLM; note 376).
 - Per-cell table: note 375. Result directories: `.local/results/v0110-port-final-full24-3x-20261003`,
   `.local/results/v0110-port-final-mmlu-20261003`.
