@@ -175,6 +175,7 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
         }(),
         prefillStream);
     prefill.preparePrefillMetadata(prefillIO, {32}, prefillStream);
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
     std::vector<int32_t> prefillContextLength(1);
     CUDA_CHECK(cudaMemcpy(
         prefillContextLength.data(), prefillIO.contextLengths.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost));
@@ -195,6 +196,7 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
         }(),
         decodeStream);
     decode.prepareDecodeMetadata(decodeIO, decodeStream);
+    CUDA_CHECK(cudaStreamSynchronize(decodeStream));
     std::vector<int32_t> decodeContextLengths(2);
     CUDA_CHECK(cudaMemcpy(decodeContextLengths.data(), decodeIO.contextLengths.rawPointer(), 2 * sizeof(int32_t),
         cudaMemcpyDeviceToHost));
@@ -230,6 +232,7 @@ TEST(PhaseKVActiveViewTest, GivesConcurrentPhasesIndependentBindingsOverSharedPa
         }(),
         prefillStream);
     prefill.preparePrefillMetadata(packedIO, {3, 2}, prefillStream, true);
+    CUDA_CHECK(cudaStreamSynchronize(prefillStream));
     std::vector<int64_t> packedSelectIndices(2);
     CUDA_CHECK(cudaMemcpy(packedSelectIndices.data(), packedIO.selectTokenIndices.rawPointer(),
         packedSelectIndices.size() * sizeof(int64_t), cudaMemcpyDeviceToHost));
