@@ -3703,7 +3703,13 @@ size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t
     {
         return static_cast<size_t>(mConfig.maxDecodeBatchSize);
     }
+    // The static table is a portable profile measured on one GPU up to its own batch size. Rows above that
+    // size inherit the verdict of the largest covered batch, so a larger engine is not capped at the
+    // profile's maximum batch; a context length the profile never covers stays conservative.
+    bool const contextCovered = std::any_of(mConfig.decodeBatchCosts.begin(), mConfig.decodeBatchCosts.end(),
+        [maxContextLength](PhaseDecodeBatchCost const& cost) { return cost.maxContextLength >= maxContextLength; });
     size_t limit{1U};
+    bool coveredWithinTarget{contextCovered};
     for (int32_t rows = 1; rows <= mConfig.maxDecodeBatchSize; ++rows)
     {
         PhaseDecodeBatchCost const* selected{};
@@ -3725,7 +3731,11 @@ size_t PhaseQueueScheduler::decodeAdmissionLimitForTpot(double targetUs, int32_t
                 selected = &cost;
             }
         }
-        if (selected != nullptr && static_cast<double>(selected->p95GpuMs) * 1000.0 <= targetUs)
+        if (selected != nullptr)
+        {
+            coveredWithinTarget = static_cast<double>(selected->p95GpuMs) * 1000.0 <= targetUs;
+        }
+        if (coveredWithinTarget)
         {
             limit = static_cast<size_t>(rows);
         }
@@ -4322,21 +4332,17 @@ int32_t PhaseQueueScheduler::selectDecodeBatchSize(PhaseQueueSnapshot const& sta
             }
         }
     }
+    // When no profiled batch covers every ready row (a larger engine than the profile's GPU), the profile
+    // carries no evidence for splitting the rows, so the largest-shape check below keeps one dispatch.
     int32_t coveringConfiguredBatch{std::numeric_limits<int32_t>::max()};
-    int32_t largestConfiguredBatch{};
     if (!measuredCoverage)
     {
         for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {
-            largestConfiguredBatch = std::max(largestConfiguredBatch, cost.batchSize);
             if (cost.batchSize >= available)
             {
                 coveringConfiguredBatch = std::min(coveringConfiguredBatch, cost.batchSize);
             }
-        }
-        if (coveringConfiguredBatch == std::numeric_limits<int32_t>::max())
-        {
-            coveringConfiguredBatch = largestConfiguredBatch;
         }
         for (PhaseDecodeBatchCost const& cost : mConfig.decodeBatchCosts)
         {

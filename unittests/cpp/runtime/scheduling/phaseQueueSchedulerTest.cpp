@@ -1359,6 +1359,19 @@ TEST(PhaseQueueSchedulerTest, GlobalAdmissionUsesCoveredDecodeP95)
     EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 4096), 1U);
 }
 
+TEST(PhaseQueueSchedulerTest, DecodeAdmissionExtendsBeyondProfiledBatch)
+{
+    PhaseQueueSchedulerConfig config;
+    config.maxDecodeBatchSize = 16;
+    config.decodeBatchCosts = {{1, 2048, 1.0F}, {4, 2048, 1.8F}};
+    PhaseQueueScheduler scheduler(config);
+
+    // Rows above the profiled batch inherit the largest covered verdict.
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 1024), 16U);
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(1500.0, 1024), 1U);
+    EXPECT_EQ(scheduler.decodeAdmissionLimitForTpot(2000.0, 4096), 1U);
+}
+
 TEST(PhaseQueueSchedulerTest, GlobalFuturePrefillEstimateCoversCompleteChunkedCriticalPath)
 {
     PhaseQueueSchedulerConfig config;
@@ -1472,6 +1485,23 @@ TEST(PhaseQueueSchedulerTest, ExternalDeadlineBlockWaitsAtDispatchBoundary)
 
     scheduler.setDispatchBlocked(false);
     EXPECT_NE(scheduler.next().kind, PhaseDispatchKind::kNone);
+}
+
+TEST(PhaseQueueSchedulerTest, DynamicDecodeKeepsRowsBeyondTheProfiledBatchTogether)
+{
+    rt::PhaseQueueSchedulerConfig config;
+    config.maxPrefillBatchSize = 1;
+    config.maxDecodeBatchSize = 8;
+    config.enableDynamicDecodeBatching = true;
+    config.decodeBatchCosts = {{1, 4096, 1.0F}, {4, 4096, 1.2F}};
+    rt::PhaseQueueScheduler scheduler(config);
+
+    for (uint64_t requestId = 1; requestId <= 8; ++requestId)
+    {
+        scheduler.enqueueDecode({requestId, 128});
+    }
+    rt::PhaseDispatchPlan const plan = scheduler.next();
+    EXPECT_EQ(plan.decodeBatch.size(), 8U);
 }
 
 TEST(PhaseQueueSchedulerTest, DecodeReplacementCostPreservesWarmRowsWhenBatchGrowthIsTransientlyExpensive)
