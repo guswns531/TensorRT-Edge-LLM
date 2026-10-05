@@ -836,9 +836,8 @@ int main(int argc, char** argv)
         ELLM_CHECK(decodeBatchCapacity > 0, "Phase decode capacity must be positive");
         rt::LLMEngineConfig phaseConfig = config;
         phaseConfig.maxSupportedDecodeBatchSize = decodeBatchCapacity;
-        int32_t const prefillSequenceCapacity = config.packedPrefill
-            ? std::min(config.maxPackedPrefillChunkTokens, config.maxSupportedInputLength)
-            : config.maxSupportedInputLength;
+        int32_t const prefillSequenceCapacity = config.phasePrefillRowCapacity(
+            std::min(config.maxPackedPrefillChunkTokens, config.maxSupportedInputLength));
         auto prefillIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLMPhase(
             phaseConfig, config.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
         auto decodeIO = std::make_unique<rt::PipelineIO>(
@@ -1682,6 +1681,12 @@ int main(int argc, char** argv)
                 ++tokenH2DOperations;
                 tokenH2DBytes += copyBytes;
                 stagedIds = &deviceIds;
+            }
+            if (prefill)
+            {
+                bool const requestLocal = std::all_of(views.begin(), views.end(),
+                    [](rt::IndependentPhaseRequestView const& view) { return view.work.tokenOffset == 0; });
+                rt::preparePrefillVisionBlockIds(io, *stagedIds, config.imageTokenId, requestLocal, stream);
             }
             if (!segmentedVisionSegments.empty())
             {

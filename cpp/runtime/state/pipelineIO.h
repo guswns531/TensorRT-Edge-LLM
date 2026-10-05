@@ -228,6 +228,11 @@ void allocateMRope(
 
 void prepareTextOnlyMRope(PipelineIO& io, LLMEngineConfig const& cfg, int32_t activeRows, cudaStream_t stream);
 
+//! Fill vision-block IDs for an entry-padded [rows, width] prefill when the engine uses Gemma4 bidirectional image
+//! attention; no-op otherwise. Block IDs are request-local, so every row must start its prompt in this dispatch.
+void preparePrefillVisionBlockIds(
+    PipelineIO& io, Tensor const& inputIds, int32_t imageTokenId, bool requestLocal, cudaStream_t stream);
+
 //! Gather the current ragged step's token-aligned RoPE inputs after metadata upload.
 void prepareRaggedRope(PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t physicalTokens,
     int32_t numSequences, cudaStream_t stream);

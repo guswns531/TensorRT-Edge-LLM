@@ -24,6 +24,7 @@
 #include "common/pagedKvTypes.h"
 #include "common/stringUtils.h"
 #include "kernels/contextAttentionKernels/utilKernels.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 
 #include <algorithm>
@@ -284,6 +285,19 @@ void allocateMRope(
         "PipelineIO::mropeCosSin");
     io.mropeActiveCosSin = Tensor({activeRows, maxKVCacheCapacity, rotaryDim}, DeviceType::kGPU,
         nvinfer1::DataType::kFLOAT, "PipelineIO::mropeActiveCosSin");
+}
+
+void preparePrefillVisionBlockIds(
+    PipelineIO& io, Tensor const& inputIds, int32_t imageTokenId, bool requestLocal, cudaStream_t stream)
+{
+    if (io.visionBlockIds.isEmpty())
+    {
+        return;
+    }
+    ELLM_CHECK(requestLocal,
+        "Gemma4 vision bidirectional attention does not support prefix-continued or chunked prefill rows");
+    ELLM_CHECK(io.visionBlockIds.reshape(inputIds.getShape()), "Vision-block ID reshape failed");
+    kernel::generateVisionBlockIds(inputIds, io.visionBlockIds, imageTokenId, stream);
 }
 
 void prepareTextOnlyMRope(PipelineIO& io, LLMEngineConfig const& cfg, int32_t activeRows, cudaStream_t stream)

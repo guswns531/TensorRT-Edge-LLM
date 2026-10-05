@@ -117,7 +117,8 @@ PhaseQueueSchedulerConfig makeSchedulerConfig(PhaseServingRuntimeConfig const& s
     int32_t const engineChunkLimit
         = engine.packedPrefill ? engine.maxPackedPrefillChunkTokens : engine.maxSupportedInputLength;
     config.maxPrefillChunkTokens = std::min(serving.maxPrefillChunkTokens, engineChunkLimit);
-    config.enableRaggedPrefillBatching = engine.packedPrefill;
+    // Entry-padded engines right-pad mixed lengths; packed engines carry them without padding.
+    config.enableRaggedPrefillBatching = true;
     config.enablePackedPrefillTokenLayout = engine.packedPrefill;
     config.enableWavefrontPrefillBatching = true;
     config.enablePrefillCohortRefill = serving.enablePrefillCohortRefill;
@@ -408,7 +409,7 @@ public:
         phaseEngineConfig.maxSupportedDecodeBatchSize = decodeBatchCapacity;
         PhaseQueueSchedulerConfig schedulerConfig = makeSchedulerConfig(mServingConfig, phaseEngineConfig);
         int32_t const prefillSequenceCapacity
-            = engineConfig.packedPrefill ? schedulerConfig.maxPrefillChunkTokens : engineConfig.maxSupportedInputLength;
+            = engineConfig.phasePrefillRowCapacity(schedulerConfig.maxPrefillChunkTokens);
         mPrefillIO = std::make_unique<PipelineIO>(PipelineIO::createForLLMPhase(
             engineConfig, engineConfig.maxSupportedPrefillBatchSize, prefillSequenceCapacity, setupStream));
         mDecodeIO = std::make_unique<PipelineIO>(
@@ -660,6 +661,12 @@ public:
         }
         CUDA_CHECK(cudaMemcpyAsync(deviceIds.rawPointer(), hostIds.rawPointer(),
             static_cast<size_t>(totalTokens) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (prefill)
+        {
+            bool const requestLocal = std::all_of(views.begin(), views.end(),
+                [](IndependentPhaseRequestView const& view) { return view.work.tokenOffset == 0; });
+            preparePrefillVisionBlockIds(io, deviceIds, mEngineConfig.imageTokenId, requestLocal, stream);
+        }
         Gemma4EmbeddingPreprocessor* const ple = prefill ? mPrefillPle.get() : mDecodePle.get();
         if (ple != nullptr)
         {

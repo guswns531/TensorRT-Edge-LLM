@@ -96,7 +96,7 @@
             semanticSchedulerConfig.largePrefillChunkQueueThreshold = static_cast<size_t>(std::stoull(value));
         }
         semanticSchedulerConfig.maxPrefillBatchTokens = prefillBatchTokenBudget;
-        semanticSchedulerConfig.enableRaggedPrefillBatching = config.packedPrefill;
+        semanticSchedulerConfig.enableRaggedPrefillBatching = true;
         semanticSchedulerConfig.enablePackedPrefillTokenLayout = config.packedPrefill;
         semanticSchedulerConfig.enableWavefrontPrefillBatching
             = std::getenv("TRT_EDGELLM_DISABLE_WAVEFRONT_PREFILL") == nullptr;

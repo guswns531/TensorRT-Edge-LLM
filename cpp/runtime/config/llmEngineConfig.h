@@ -344,6 +344,10 @@ struct LLMEngineConfig
         return visionPrefillProfile >= 0;
     }
 
+    //! Per-row length for a phase prefill PipelineIO with maxSupportedPrefillBatchSize rows. Packed engines size the
+    //! shared carrier for the larger of the primary and vision-prefill profiles; others use the full input length.
+    int32_t phasePrefillRowCapacity(int32_t primaryChunkTokens) const noexcept;
+
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).
     InferenceDims decodeDims(int64_t batch) const;

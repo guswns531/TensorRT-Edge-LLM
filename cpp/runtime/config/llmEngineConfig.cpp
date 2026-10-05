@@ -1286,6 +1286,22 @@ bool LLMEngineConfig::supportsBoundedSwaKVCache() const
     });
 }
 
+int32_t LLMEngineConfig::phasePrefillRowCapacity(int32_t primaryChunkTokens) const noexcept
+{
+    if (!packedPrefill)
+    {
+        return maxSupportedInputLength;
+    }
+    int64_t tokens = static_cast<int64_t>(maxSupportedPrefillBatchSize) * primaryChunkTokens;
+    if (hasVisionPrefillProfile())
+    {
+        tokens = std::max(
+            tokens, static_cast<int64_t>(maxSupportedVisionPrefillBatchSize) * maxVisionPackedPrefillChunkTokens);
+    }
+    int64_t const rows = std::max<int64_t>(1, maxSupportedPrefillBatchSize);
+    return static_cast<int32_t>(std::min<int64_t>((tokens + rows - 1) / rows, maxSupportedInputLength));
+}
+
 bool LLMEngineConfig::usesBoundedSwaKVCache() const
 {
     return swaKVCacheMode == SwaKVCacheMode::kBounded && supportsBoundedSwaKVCache();
@@ -1401,7 +1417,9 @@ InferenceDims LLMEngineConfig::packedPrefillDimsWithLimits(int64_t logicalBatch,
         "Packed prefill dimensions require a context-prefill or context-chunk phase");
     ELLM_CHECK(logicalBatch > 0 && logicalBatch <= batchLimit, "packed prefill logical batch is out of range");
     ELLM_CHECK(totalTokens > 0 && totalTokens <= logicalBatch * chunkLimit,
-        "packed prefill token carrier exceeds the configured profile limit");
+        "packed prefill token carrier exceeds the configured profile limit: batch=" + std::to_string(logicalBatch)
+            + " tokens=" + std::to_string(totalTokens) + " maxRow=" + std::to_string(maxRowTokens)
+            + " chunkLimit=" + std::to_string(chunkLimit));
     ELLM_CHECK(maxRowTokens > 0 && maxRowTokens <= chunkLimit && maxRowTokens <= totalTokens,
         "packed prefill maximum row length is out of range");
     return InferenceDims{
