@@ -210,9 +210,7 @@ def _validate(
                     f"{event['_source']}: incremental_action_id must be a positive integer"
                 )
             if event.get("requested_action_direction"
-                         ) not in ACTION_DIRECTIONS | {
-                             "idle_launch", "none"
-                         }:
+                         ) not in ACTION_DIRECTIONS | {"idle_launch", "none"}:
                 errors.append(
                     f"{event['_source']}: invalid requested_action_direction")
             if event.get(

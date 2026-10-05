@@ -120,7 +120,7 @@ def mixed_suite(factory,
     return requests
 
 
-def build(tokenizer, images, seed, bulk_requests=64):
+def build(tokenizer, images, seed, bulk_requests=64, mix_scale=1):
     suites = {}
     for name in ("short", "balanced", "long-prefill", "bimodal",
                  "decode-heavy", "text-heavy", "mixed", "vision-heavy",
@@ -156,14 +156,19 @@ def build(tokenizer, images, seed, bulk_requests=64):
                 for t in burst(bulk_requests, 100_000 * bulk_requests // 64)
             ]
         elif name == "text-heavy":
-            requests = mixed_suite(factory, rng, images, 48, 13, 3,
-                                   (32, 64, 64), burst(64, 100_000))
+            requests = mixed_suite(factory, rng, images, 48 * mix_scale,
+                                   13 * mix_scale, 3 * mix_scale, (32, 64, 64),
+                                   burst(64 * mix_scale, 100_000 * mix_scale))
         elif name == "mixed":
-            requests = mixed_suite(factory, rng, images, 32, 26, 6,
-                                   (32, 32, 48, 64), burst(64, 100_000))
+            requests = mixed_suite(factory, rng, images, 32 * mix_scale,
+                                   26 * mix_scale, 6 * mix_scale,
+                                   (32, 32, 48, 64),
+                                   burst(64 * mix_scale, 100_000 * mix_scale))
         elif name == "vision-heavy":
-            requests = mixed_suite(factory, rng, images, 16, 39, 9,
-                                   (32, 32, 32, 48, 64), burst(64, 100_000))
+            requests = mixed_suite(factory, rng, images, 16 * mix_scale,
+                                   39 * mix_scale, 9 * mix_scale,
+                                   (32, 32, 32, 48, 64),
+                                   burst(64 * mix_scale, 100_000 * mix_scale))
         elif name == "multi-image":
             arrivals = [
                 wave * 200_000 + slot * 1_000 for wave in range(4)
@@ -173,10 +178,11 @@ def build(tokenizer, images, seed, bulk_requests=64):
                                    arrivals)
         elif name == "poisson":
             arrivals, now = [], 0.0
-            for _ in range(64):
+            for _ in range(64 * mix_scale):
                 arrivals.append(now)
-                now += rng.expovariate(16.0) * 1e6
-            requests = mixed_suite(factory, rng, images, 48, 13, 3,
+                now += rng.expovariate(16.0 * mix_scale) * 1e6
+            requests = mixed_suite(factory, rng, images, 48 * mix_scale,
+                                   13 * mix_scale, 3 * mix_scale,
                                    (32, 64, 64, 128), arrivals)
         elif name == "wave-drain":
             arrivals = [
@@ -213,6 +219,13 @@ def main():
         help=
         "Requests in balanced, long-prefill, bimodal and decode-heavy (288 for D64 engines)"
     )
+    parser.add_argument(
+        "--mix-scale",
+        type=int,
+        default=1,
+        help=
+        "Request-count multiplier for text-heavy, mixed, vision-heavy and poisson"
+    )
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -224,13 +237,14 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "bulk_requests": args.bulk_requests,
+        "mix_scale": args.mix_scale,
         "seed": args.seed,
         "tokenizer": args.tokenizer,
         "images": images,
         "workloads": {}
     }
-    for name, suite in build(tokenizer, images, args.seed,
-                             args.bulk_requests).items():
+    for name, suite in build(tokenizer, images, args.seed, args.bulk_requests,
+                             args.mix_scale).items():
         path = args.output_dir / (name + ".json")
         path.write_text(json.dumps(suite, indent=1) + "\n")
         requests = suite["requests"]

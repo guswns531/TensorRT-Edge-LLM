@@ -30,7 +30,8 @@ def build_waves(source: dict[str, Any], waves: int,
     if not isinstance(requests, list) or not requests:
         raise ValueError("source trace must contain a non-empty requests list")
     if waves < 1 or wave_interval_us < 0:
-        raise ValueError("waves must be positive and wave interval non-negative")
+        raise ValueError(
+            "waves must be positive and wave interval non-negative")
     result = copy.deepcopy(source)
     result["workload"] = f"{source.get('workload', 'trace')}-waves-{waves}"
     result["source_workload"] = source.get("workload", "")
@@ -40,8 +41,9 @@ def build_waves(source: dict[str, Any], waves: int,
     for wave in range(waves):
         for source_index, original in enumerate(requests):
             request = copy.deepcopy(original)
-            request["arrival_offset_us"] = (int(
-                request.get("arrival_offset_us", 0)) + wave * wave_interval_us)
+            request["arrival_offset_us"] = (
+                int(request.get("arrival_offset_us", 0)) +
+                wave * wave_interval_us)
             semantic_id = request.get("semantic_id")
             if semantic_id:
                 request["semantic_id"] = f"{semantic_id}-wave-{wave:03d}"

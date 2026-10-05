@@ -61,7 +61,8 @@ def _vision_request(image_url: str, output_tokens: int, arrival_us: int,
     }
 
 
-def _coverage_rows(limit: int, legacy_rows: tuple[int, ...]) -> tuple[int, ...]:
+def _coverage_rows(limit: int, legacy_rows: tuple[int,
+                                                  ...]) -> tuple[int, ...]:
     if limit <= 0:
         raise ValueError("phase batch capacities must be positive")
     values = [value for value in legacy_rows if value <= limit]
@@ -153,10 +154,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.cycles <= 0 or args.cycle_interval_us <= 0:
         parser.error("cycles and cycle interval must be positive")
-    trace = build_trace(args.image_url, args.cycles,
-                        args.cycle_interval_us, args.max_prefill_batch,
-                        args.max_decode_batch, args.max_encoder_batch,
-                        args.prefill_tokens)
+    trace = build_trace(args.image_url, args.cycles, args.cycle_interval_us,
+                        args.max_prefill_batch, args.max_decode_batch,
+                        args.max_encoder_batch, args.prefill_tokens)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(trace, indent=2) + "\n",
                            encoding="utf-8")

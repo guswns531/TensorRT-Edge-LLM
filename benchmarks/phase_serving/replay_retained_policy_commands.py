@@ -195,9 +195,9 @@ def enable_automatic_calibration(command, max_cycles):
         raise ValueError("Generic calibration trace contains no requests")
     cycle_requests = len(requests)
     result[result.index("--warmup-requests") + 1] = str(cycle_requests *
-                                                         max_cycles)
-    result[result.index("--phase-calibration-round-requests") + 1] = str(
-        cycle_requests)
+                                                        max_cycles)
+    result[result.index("--phase-calibration-round-requests") +
+           1] = str(cycle_requests)
     result[result.index("--phase-calibration-min-requests") + 1] = "0"
     return result
 
@@ -417,7 +417,8 @@ def main():
                 "case": case,
                 "command": command,
                 "environment": {
-                    "PHASE_TRACE_CLIENT_IMPL": client_implementation,
+                    "PHASE_TRACE_CLIENT_IMPL":
+                    client_implementation,
                     **({
                         "PHASE_CALIBRATION_STABLE_ROUNDS":
                         str(args.calibration_stable_rounds)
@@ -428,8 +429,9 @@ def main():
      "commands.json").write_text(json.dumps(planned, indent=2) + "\n")
     repository = pathlib.Path(__file__).resolve().parents[2]
     executable = args.build_cache.parent / "examples/llm/llm_phase_context_smoke"
-    source_commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+    source_commit = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                            cwd=repository,
+                                            text=True).strip()
     source_dirty = bool(
         subprocess.check_output(["git", "status", "--porcelain"],
                                 cwd=repository,

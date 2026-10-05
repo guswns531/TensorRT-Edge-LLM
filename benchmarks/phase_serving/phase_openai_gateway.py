@@ -121,6 +121,12 @@ class EventBroker:
             self.telemetry.close()
 
 
+class GatewayServer(ThreadingHTTPServer):
+    # The default listen backlog (5) resets connections when hundreds of clients connect at once.
+    request_queue_size = 4096
+    daemon_threads = True
+
+
 def make_handler(broker, model, timeout):
 
     class Handler(BaseHTTPRequestHandler):
@@ -317,9 +323,8 @@ def main():
     if not command:
         parser.error("backend command is required after --")
     broker = EventBroker(command, args.telemetry_log)
-    server = ThreadingHTTPServer((args.host, args.port),
-                                 make_handler(broker, args.model,
-                                              args.timeout))
+    server = GatewayServer((args.host, args.port),
+                           make_handler(broker, args.model, args.timeout))
     server.daemon_threads = True
     print("gateway listening on %s:%d" % (args.host, args.port),
           file=sys.stderr,

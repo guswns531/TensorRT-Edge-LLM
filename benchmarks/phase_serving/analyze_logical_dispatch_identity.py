@@ -49,26 +49,27 @@ def _candidate(candidate: dict[str, Any]) -> tuple[Any, ...]:
     return (str(candidate.get("action_kind", "none")),
             str(candidate.get("action_direction", "none")),
             int(candidate.get("primary_batch_size", 0)),
-            int(candidate.get("secondary_batch_size", 0)),
-            int(candidate.get("chunk_length", 0)),
+            int(candidate.get("secondary_batch_size",
+                              0)), int(candidate.get("chunk_length", 0)),
             int(candidate.get("primary_context_bucket", 0)),
             int(candidate.get("secondary_context_bucket", 0)),
             str(candidate.get("execution_variant", "eager")),
             int(candidate.get("primary_work_class", 0)),
             tuple(int(value) for value in candidate.get("request_ids", [])),
             str(candidate.get("residual_anchor", "none")),
-            bool(candidate.get("residual_augmentation", False)),
-            bool(candidate.get("legal", True)))
+            bool(candidate.get("residual_augmentation",
+                               False)), bool(candidate.get("legal", True)))
 
 
 def _decision(event: dict[str, Any]) -> tuple[Any, ...]:
-    candidates = tuple(sorted(_candidate(item)
-                              for item in event.get("candidates", [])))
-    return (int(event.get("strict_snapshot_signature",
-                          event.get("snapshot_signature", 0))),
-            int(event.get("kv_ownership_signature", 0)),
-            int(event.get("vision_lease_signature", 0)),
-            str(event.get("action_kind", "none")),
+    candidates = tuple(
+        sorted(_candidate(item) for item in event.get("candidates", [])))
+    return (int(
+        event.get("strict_snapshot_signature",
+                  event.get("snapshot_signature",
+                            0))), int(event.get("kv_ownership_signature", 0)),
+            int(event.get("vision_lease_signature",
+                          0)), str(event.get("action_kind", "none")),
             tuple(int(value) for value in event.get("request_ids", [])),
             _cohort(event.get("selected_cohort")),
             str(event.get("dispatch_mode", "none")), candidates)
@@ -78,11 +79,11 @@ def _dispatch(event: dict[str, Any]) -> tuple[Any, ...]:
     return (str(event.get("phase", "none")),
             tuple(int(value) for value in event.get("request_ids", [])),
             _cohort(event.get("cohort")),
-            str(event.get("action_direction", "none")),
-            str(event.get("dispatch_mode", "none")),
+            str(event.get("action_direction",
+                          "none")), str(event.get("dispatch_mode", "none")),
             int(event.get("requested_start_skew_percent", -1)),
-            int(event.get("observed_start_skew_percent", -1)),
-            int(event.get("planned_outstanding_mask", 0)))
+            int(event.get("observed_start_skew_percent",
+                          -1)), int(event.get("planned_outstanding_mask", 0)))
 
 
 def _signature(records: list[tuple[Any, ...]]) -> str:
@@ -149,8 +150,10 @@ def _compare_sequence(left: list[tuple[Any, ...]],
         if lhs != rhs:
             break
         common_prefix += 1
-    mismatches = [index for index, (lhs, rhs) in enumerate(zip(left, right))
-                  if lhs != rhs]
+    mismatches = [
+        index for index, (lhs, rhs) in enumerate(zip(left, right))
+        if lhs != rhs
+    ]
     return {
         "left_count": len(left),
         "right_count": len(right),
@@ -159,7 +162,8 @@ def _compare_sequence(left: list[tuple[Any, ...]],
         "aligned_mismatches": len(mismatches),
         "first_mismatch": mismatches[0] if mismatches else None,
         "exact": left == right,
-        "multiset_equal": collections.Counter(left) == collections.Counter(right),
+        "multiset_equal":
+        collections.Counter(left) == collections.Counter(right),
     }
 
 
@@ -180,46 +184,66 @@ def main() -> int:
         right = load(right_path)
         runs.append({
             args.left_name: {
-                "path": left["path"],
-                "decision_cost": left["decision_cost"],
-                "scalar_selection_comparisons": left[
-                    "scalar_selection_comparisons"],
-                "scalar_selection_mismatches": left[
-                    "scalar_selection_mismatches"],
-                "logical_decision_signature": left["decision_signature"],
-                "logical_dispatch_signature": left["dispatch_signature"],
+                "path":
+                left["path"],
+                "decision_cost":
+                left["decision_cost"],
+                "scalar_selection_comparisons":
+                left["scalar_selection_comparisons"],
+                "scalar_selection_mismatches":
+                left["scalar_selection_mismatches"],
+                "logical_decision_signature":
+                left["decision_signature"],
+                "logical_dispatch_signature":
+                left["dispatch_signature"],
             },
             args.right_name: {
-                "path": right["path"],
-                "decision_cost": right["decision_cost"],
-                "scalar_selection_comparisons": right[
-                    "scalar_selection_comparisons"],
-                "scalar_selection_mismatches": right[
-                    "scalar_selection_mismatches"],
-                "logical_decision_signature": right["decision_signature"],
-                "logical_dispatch_signature": right["dispatch_signature"],
+                "path":
+                right["path"],
+                "decision_cost":
+                right["decision_cost"],
+                "scalar_selection_comparisons":
+                right["scalar_selection_comparisons"],
+                "scalar_selection_mismatches":
+                right["scalar_selection_mismatches"],
+                "logical_decision_signature":
+                right["decision_signature"],
+                "logical_dispatch_signature":
+                right["dispatch_signature"],
             },
-            "decisions": _compare_sequence(left["decisions"],
-                                           right["decisions"]),
-            "dispatches": _compare_sequence(left["dispatches"],
-                                            right["dispatches"]),
+            "decisions":
+            _compare_sequence(left["decisions"], right["decisions"]),
+            "dispatches":
+            _compare_sequence(left["dispatches"], right["dispatches"]),
         })
     artifact = {
-        "schema_version": 1,
-        "left": args.left_name,
-        "right": args.right_name,
-        "run_pairs": len(runs),
-        "exact_decision_pairs": sum(run["decisions"]["exact"] for run in runs),
-        "exact_dispatch_pairs": sum(run["dispatches"]["exact"] for run in runs),
-        "multiset_dispatch_pairs": sum(
-            run["dispatches"]["multiset_equal"] for run in runs),
-        "runs": runs,
+        "schema_version":
+        1,
+        "left":
+        args.left_name,
+        "right":
+        args.right_name,
+        "run_pairs":
+        len(runs),
+        "exact_decision_pairs":
+        sum(run["decisions"]["exact"] for run in runs),
+        "exact_dispatch_pairs":
+        sum(run["dispatches"]["exact"] for run in runs),
+        "multiset_dispatch_pairs":
+        sum(run["dispatches"]["multiset_equal"] for run in runs),
+        "runs":
+        runs,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(artifact, indent=2) + "\n",
                            encoding="utf-8")
-    print(json.dumps({key: value for key, value in artifact.items()
-                      if key != "runs"}, indent=2))
+    print(
+        json.dumps(
+            {
+                key: value
+                for key, value in artifact.items() if key != "runs"
+            },
+            indent=2))
     return 0
 
 

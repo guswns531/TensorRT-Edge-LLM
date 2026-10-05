@@ -98,7 +98,8 @@ def request_count(result: dict) -> int:
     if "requests_per_run" in result:
         return int(result["requests_per_run"])
     return int(
-        sum(float(values["requests"])
+        sum(
+            float(values["requests"])
             for values in result.get("by_request_class", {}).values()))
 
 

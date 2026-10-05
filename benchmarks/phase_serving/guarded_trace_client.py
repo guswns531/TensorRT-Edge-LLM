@@ -91,10 +91,10 @@ def main():
             stable_signature = signature
             result["raw_calibration_converged"] = raw_converged
             result["calibration_stable_rounds"] = stable_rounds
-            result["calibration_required_stable_rounds"] = required_stable_rounds
-            result["calibration_converged"] = (
-                raw_converged
-                and stable_rounds >= required_stable_rounds)
+            result[
+                "calibration_required_stable_rounds"] = required_stable_rounds
+            result["calibration_converged"] = (raw_converged and stable_rounds
+                                               >= required_stable_rounds)
         if action in ("begin", "end"):
             calibrating = action == "begin"
         return result

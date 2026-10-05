@@ -42,8 +42,11 @@ WORKLOADS = ("balanced", "mixed", "vision-heavy", "multi-image",
 
 
 def warmup_decode_batches(maximum):
-    sizes = (1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
-             64)
+    """Retained 1..64 graph schedule, then every 16 rows up to the decode capacity."""
+    sizes = [1, 2, 4] + list(range(8, 65, 4)) + list(range(
+        80, maximum + 1, 16))
+    if maximum not in sizes:
+        sizes.append(maximum)
     return ",".join(str(size) for size in sizes if size <= maximum)
 
 
@@ -237,10 +240,12 @@ def server_environment(system, config):
             key: str(value)
             for key, value in phase_environment(config).items()
         })
-        environment.update({
-            key: str(value)
-            for key, value in config.get("trt_environment", {}).items()
-        })
+        # A null value removes a contract variable (e.g. to ablate a retained feature flag).
+        for key, value in config.get("trt_environment", {}).items():
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = str(value)
     else:
         # vLLM JIT-compiles kernels with tools (ninja) installed next to its interpreter.
         environment["PATH"] = str(pathlib.Path(
