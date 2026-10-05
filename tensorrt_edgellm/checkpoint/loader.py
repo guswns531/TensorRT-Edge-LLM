@@ -162,6 +162,7 @@ def load_weights(
         return key
 
     loaded = skipped = 0
+    lm_head_loaded = False
     for shard_path, keys in path_to_keys.items():
         if shard_path.endswith(".bin"):
             # PyTorch pickle shard -- load all at once, then iterate keys.
@@ -185,6 +186,7 @@ def load_weights(
                         continue
                 if _set_tensor(model, mapped_key, tensor, mapping=mapping):
                     loaded += 1
+                    lm_head_loaded |= mapped_key == "lm_head.weight"
                 elif _try_split_fused_tensor(model,
                                              mapped_key,
                                              tensor,
@@ -208,6 +210,7 @@ def load_weights(
                             continue
                     if _set_tensor(model, mapped_key, tensor, mapping=mapping):
                         loaded += 1
+                        lm_head_loaded |= mapped_key == "lm_head.weight"
                     elif _try_split_fused_tensor(model,
                                                  mapped_key,
                                                  tensor,
@@ -226,9 +229,14 @@ def load_weights(
     apply_all_repacking(model)
     # Post-process: apply tied embeddings (HF tie_word_embeddings=True models
     # omit lm_head.weight from the checkpoint; tie_weights() restores the share).
+    # Like transformers 5.x, keep a distinct lm_head.weight that the checkpoint
+    # does ship despite the flag (e.g. nvidia/Cosmos-Reason2-2B).
     config = getattr(model, "config", None)
-    if (hasattr(model, "tie_weights") and config is not None
-            and getattr(config, "tie_word_embeddings", False)):
+    if lm_head_loaded and getattr(config, "tie_word_embeddings", False):
+        logger.info("Keeping checkpoint lm_head.weight despite "
+                    "tie_word_embeddings=True")
+    elif (hasattr(model, "tie_weights") and config is not None
+          and getattr(config, "tie_word_embeddings", False)):
         from ..models.linear import FP16Linear
         if isinstance(getattr(model, "lm_head", None), FP16Linear):
             model.tie_weights()
