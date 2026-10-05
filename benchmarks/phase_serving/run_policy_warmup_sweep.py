@@ -36,9 +36,11 @@ def _parse_budgets(value: str) -> tuple[int, ...]:
 
 
 def prepare_budget_command(entry: dict[str, Any], budget: int,
-                           output_dir: Path, repeats: int, generic_text: Path,
-                           generic_vlm: Path, backend_build_root: str,
-                           backend_engine_dir: str, policy_variant: str,
+                           output_dir: Path, repeats: int,
+                           generic_text: Path, generic_vlm: Path,
+                           backend_build_root: str,
+                           backend_engine_dir: str,
+                           policy_variant: str,
                            backend_environment: tuple[str, ...],
                            client_max_in_flight: int) -> list[str]:
     """Materialize one exact-budget command without convergence early stop."""
@@ -57,9 +59,8 @@ def prepare_budget_command(entry: dict[str, Any], budget: int,
     )
     run_policy_warmup_matrix._set_option(command, "--warmup-requests",
                                          str(budget))
-    run_policy_warmup_matrix._set_option(command,
-                                         "--phase-calibration-min-requests",
-                                         str(budget))
+    run_policy_warmup_matrix._set_option(
+        command, "--phase-calibration-min-requests", str(budget))
     if budget > 0:
         calibration = generic_vlm if run_policy_warmup_matrix._is_vision_trace(
             Path(command[command.index("--trace") + 1])) else generic_text
@@ -103,9 +104,8 @@ def main() -> int:
     entries = json.loads(args.base_commands.read_text(encoding="utf-8"))
     selected_cases = {item for item in args.cases.split(",") if item}
     if selected_cases:
-        entries = [
-            entry for entry in entries if str(entry["case"]) in selected_cases
-        ]
+        entries = [entry for entry in entries
+                   if str(entry["case"]) in selected_cases]
     if not entries:
         parser.error("no selected base commands")
 
@@ -132,11 +132,9 @@ def main() -> int:
         json.dumps(commands, indent=2) + "\n", encoding="utf-8")
     if not args.dry_run:
         for item in commands:
-            print(json.dumps({
-                key: item[key]
-                for key in ("warmup_requests", "case", "variant")
-            }),
-                  flush=True)
+            print(json.dumps({key: item[key]
+                              for key in ("warmup_requests", "case",
+                                          "variant")}), flush=True)
             subprocess.run(item["command"], check=True)
     return 0
 

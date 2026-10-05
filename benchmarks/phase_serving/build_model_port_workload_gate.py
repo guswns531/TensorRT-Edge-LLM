@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+
 CASE_LIMITS = {
     "short": 48,
     "balanced": 64,
@@ -54,8 +55,7 @@ def _containerize_image_urls(value: Any) -> None:
                 marker = "/examples/multimodal/"
                 if isinstance(url, str) and marker in url:
                     suffix = url.split(marker, 1)[1]
-                    image_url[
-                        "url"] = f"file:///workspace/examples/multimodal/{suffix}"
+                    image_url["url"] = f"file:///workspace/examples/multimodal/{suffix}"
         for nested in value.values():
             _containerize_image_urls(nested)
     elif isinstance(value, list):
@@ -65,16 +65,16 @@ def _containerize_image_urls(value: Any) -> None:
 
 def _repeat_requests(requests: list[dict[str, Any]], count: int,
                      interval_us: int) -> list[dict[str, Any]]:
-    source_span = max(
-        int(request.get("arrival_offset_us", 0)) for request in requests)
+    source_span = max(int(request.get("arrival_offset_us", 0))
+                      for request in requests)
     wave_stride = max(source_span + interval_us, interval_us)
     result: list[dict[str, Any]] = []
     for index in range(count):
         source_index = index % len(requests)
         wave = index // len(requests)
         request = copy.deepcopy(requests[source_index])
-        request["arrival_offset_us"] = (
-            int(request.get("arrival_offset_us", 0)) + wave * wave_stride)
+        request["arrival_offset_us"] = (int(
+            request.get("arrival_offset_us", 0)) + wave * wave_stride)
         request["source_request_index"] = source_index
         request["wave_index"] = wave
         semantic_id = request.get("semantic_id")
@@ -91,8 +91,7 @@ def materialize_trace(source: dict[str, Any], case: str, request_limit: int,
     if not isinstance(requests, list) or not requests:
         raise ValueError(f"{case}: source trace has no requests")
     if request_limit <= 0 or repeat_interval_us < 0:
-        raise ValueError(
-            "request limit must be positive and interval non-negative")
+        raise ValueError("request limit must be positive and interval non-negative")
     result = copy.deepcopy(source)
     result["workload"] = f"{case}-model-port"
     result["source_workload"] = source.get("workload", case)
@@ -150,9 +149,8 @@ def build_gate(commands: list[dict[str, Any]], output_dir: Path,
         "kind": "model_port_full12_workload_gate",
         "cases": manifest_cases,
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) +
-                                              "\n",
-                                              encoding="utf-8")
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 
 
@@ -170,15 +168,12 @@ def main() -> int:
                               args.repeat_interval_us)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         parser.error(str(error))
-    print(
-        json.dumps({
-            "output_dir":
-            str(args.output_dir),
-            "cases":
-            len(manifest["cases"]),
-            "requests":
-            sum(case["role_request_count"] for case in manifest["cases"]),
-        }))
+    print(json.dumps({
+        "output_dir": str(args.output_dir),
+        "cases": len(manifest["cases"]),
+        "requests": sum(case["role_request_count"]
+                        for case in manifest["cases"]),
+    }))
     return 0
 
 

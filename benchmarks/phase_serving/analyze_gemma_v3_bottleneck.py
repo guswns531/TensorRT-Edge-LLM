@@ -224,11 +224,11 @@ def analyze_cell(cell):
             "prefill_refill_dispatches":
             len(prefill_refills),
             "prefill_refill_rows":
-            sum(
-                m.get("prefill_cohort_refill_rows", 0)
+            sum(m.get("prefill_cohort_refill_rows", 0)
                 for m in prefill_refills),
             "prefill_refill_batch":
-            distribution([m.get("prefill_batch", 0) for m in prefill_refills]),
+            distribution([m.get("prefill_batch", 0)
+                          for m in prefill_refills]),
         },
         "cuda_graphs": {
             "prefill_entries":
