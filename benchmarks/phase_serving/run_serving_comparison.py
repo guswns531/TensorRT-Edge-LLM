@@ -16,7 +16,9 @@
 
 Each (system, workload) cell starts a fresh server, warms it with the shared calibration trace,
 replays the workload ``--repeats`` times with ``openai_trace_client.py`` and stops the server.
-A JSON config supplies paths and capacities, e.g. ``{"model": ..., "hf_dir": ..., "engine_dir": ...,
+``--reuse-server`` instead starts and calibrates one server per system and replays every workload
+against it, each after a short unmeasured warmup of its own trace; workload order is the same for
+both systems, but scheduler state carries across workloads. A JSON config supplies paths and capacities, e.g. ``{"model": ..., "hf_dir": ..., "engine_dir": ...,
 "vision_dir": ..., "build_dir": ..., "inputs": ..., "calibration_trace": ..., "in_flight": 24,
 "prefill_batch": 8, "decode_batch": 24, "vision_batch": 4, "encoder_input_tokens": 1120,
 "prefill_chunk": 512, "prefill_batch_tokens": 2048, "vllm_python": ..., "vllm_args": [...]}``.
@@ -228,14 +230,7 @@ def wait_gpu_idle(limit_mib=1024, timeout=120):
         time.sleep(2)
 
 
-def run_cell(system, config, workload, args):
-    cell = args.output_dir / system / workload
-    summary_path = cell / "summary.json"
-    if summary_path.exists() and not args.force:
-        print("skip completed", cell, flush=True)
-        return json.loads(summary_path.read_text())
-    cell.mkdir(parents=True, exist_ok=True)
-    trace = pathlib.Path(config["inputs"]) / (workload + ".json")
+def server_environment(system, config):
     environment = dict(os.environ)
     if system == "trt":
         environment.update({
@@ -250,8 +245,15 @@ def run_cell(system, config, workload, args):
         # vLLM JIT-compiles kernels with tools (ninja) installed next to its interpreter.
         environment["PATH"] = str(pathlib.Path(
             config["vllm_python"]).parent) + os.pathsep + environment["PATH"]
-    command = server_command(system, config, args.port, cell)
-    (cell / "command.json").write_text(
+    return environment
+
+
+def start_server(system, config, args, directory):
+    """Launch one server; its command, filtered environment and log live in ``directory``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    environment = server_environment(system, config)
+    command = server_command(system, config, args.port, directory)
+    (directory / "server-command.json").write_text(
         json.dumps(
             {
                 "server": command,
@@ -259,55 +261,130 @@ def run_cell(system, config, workload, args):
                     key: environment[key]
                     for key in environment
                     if key.startswith(("TRT_EDGELLM_", "VLLM_"))
-                },
-                "trace": str(trace),
-                "trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest()
+                }
             },
             indent=2) + "\n")
     wait_gpu_idle()
-    with (cell / "server.log").open("w") as log:
-        server = subprocess.Popen(command,
-                                  env=environment,
-                                  stdout=log,
+    log = (directory / "server.log").open("w")
+    return subprocess.Popen(command,
+                            env=environment,
+                            stdout=log,
+                            stderr=subprocess.STDOUT)
+
+
+def run_client(system, config, workload, args, server, warmup_trace,
+               warmup_requests, phase_calibration):
+    """Replay one workload against a running server and record the cell summary."""
+    cell = args.output_dir / system / workload
+    cell.mkdir(parents=True, exist_ok=True)
+    trace = pathlib.Path(config["inputs"]) / (workload + ".json")
+    (cell / "command.json").write_text(
+        json.dumps(
+            {
+                "trace": str(trace),
+                "trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
+                "warmup_trace": str(warmup_trace),
+                "warmup_requests": warmup_requests,
+                "reuse_server": args.reuse_server
+            },
+            indent=2) + "\n")
+    client = [
+        sys.executable,
+        str(HERE / "openai_trace_client.py"), "--endpoint",
+        "http://127.0.0.1:%d" % args.port, "--model", config["model"],
+        "--trace",
+        str(trace), "--output-dir",
+        str(cell), "--max-in-flight",
+        str(config["in_flight"]), "--repeats",
+        str(args.repeats), "--warmup-trace",
+        str(warmup_trace), "--warmup-requests",
+        str(warmup_requests), "--ignore-eos"
+    ]
+    if phase_calibration:
+        client.append("--phase-calibration")
+    with GpuMemorySampler() as sampler, (cell /
+                                         "client.log").open("w") as client_log:
+        runner = subprocess.Popen(client,
+                                  stdout=client_log,
                                   stderr=subprocess.STDOUT)
-        try:
-            client = [
-                sys.executable,
-                str(HERE / "openai_trace_client.py"), "--endpoint",
-                "http://127.0.0.1:%d" % args.port, "--model", config["model"],
-                "--trace",
-                str(trace), "--output-dir",
-                str(cell), "--max-in-flight",
-                str(config["in_flight"]), "--repeats",
-                str(args.repeats), "--warmup-trace",
-                config["calibration_trace"], "--warmup-requests",
-                str(config["warmup_requests"]), "--ignore-eos"
-            ]
-            if system == "trt":
-                client.append("--phase-calibration")
-            with GpuMemorySampler() as sampler, (
-                    cell / "client.log").open("w") as client_log:
-                runner = subprocess.Popen(client,
-                                          stdout=client_log,
-                                          stderr=subprocess.STDOUT)
-                while runner.poll() is None:
-                    if server.poll() is not None:
-                        runner.kill()
-                        runner.wait()
-                        raise RuntimeError(
-                            "server exited with %s during %s/%s" %
-                            (server.returncode, system, workload))
-                    time.sleep(1)
-            print((cell / "client.log").read_text().strip(), flush=True)
-            if runner.returncode != 0:
-                raise RuntimeError("client failed for %s/%s (see %s)" %
-                                   (system, workload, cell / "client.log"))
-        finally:
-            stop(server)
+        while runner.poll() is None:
+            if server.poll() is not None:
+                runner.kill()
+                runner.wait()
+                raise RuntimeError("server exited with %s during %s/%s" %
+                                   (server.returncode, system, workload))
+            time.sleep(1)
+    print((cell / "client.log").read_text().strip(), flush=True)
+    if runner.returncode != 0:
+        raise RuntimeError("client failed for %s/%s (see %s)" %
+                           (system, workload, cell / "client.log"))
+    summary_path = cell / "summary.json"
     summary = json.loads(summary_path.read_text())
     summary["gpu_memory_peak_mib"] = sampler.peak
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     return summary
+
+
+def completed(args, system, workload):
+    return (args.output_dir / system / workload /
+            "summary.json").exists() and not args.force
+
+
+def run_cell(system, config, workload, args):
+    """Fresh-server cell: start, calibrate with the shared warmup trace, replay, stop."""
+    if completed(args, system, workload):
+        print("skip completed", system, workload, flush=True)
+        return
+    cell = args.output_dir / system / workload
+    server = start_server(system, config, args, cell)
+    try:
+        run_client(system, config, workload, args, server,
+                   config["calibration_trace"], config["warmup_requests"],
+                   system == "trt")
+    finally:
+        stop(server)
+
+
+def run_system(system, config, args, failures):
+    """Shared-server mode: one server and one calibration per system, then every workload in order.
+
+    Each workload is preceded by an unmeasured warmup of its own first requests so that
+    the measurement does not start on state left by the previous trace."""
+    pending = [
+        workload for workload in args.workloads
+        if not completed(args, system, workload)
+    ]
+    if not pending:
+        return
+    server = start_server(system, config, args, args.output_dir / system)
+    calibrated = False
+    try:
+        for workload in pending:
+            print("=== %s / %s" % (system, workload), flush=True)
+            try:
+                if calibrated:
+                    run_client(
+                        system, config, workload, args, server,
+                        pathlib.Path(config["inputs"]) / (workload + ".json"),
+                        args.workload_warmup_requests, False)
+                else:
+                    run_client(system, config, workload, args, server,
+                               config["calibration_trace"],
+                               config["warmup_requests"], system == "trt")
+                    calibrated = True
+            except Exception as error:  # noqa: BLE001 - keep the campaign running, record the failure
+                failures.append({
+                    "system": system,
+                    "workload": workload,
+                    "error": str(error)
+                })
+                print("FAILED", system, workload, error, flush=True)
+                if server.poll() is not None:
+                    server = start_server(system, config, args,
+                                          args.output_dir / system)
+                    calibrated = False
+    finally:
+        stop(server)
 
 
 def main():
@@ -325,6 +402,12 @@ def main():
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--reuse-server",
+        action="store_true",
+        help="Start one server per system and replay every workload against it"
+    )
+    parser.add_argument("--workload-warmup-requests", type=int, default=16)
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text())
@@ -332,18 +415,22 @@ def main():
     (args.output_dir /
      "config.json").write_text(json.dumps(config, indent=2) + "\n")
     failures = []
-    for workload in args.workloads:
+    if args.reuse_server:
         for system in args.systems:
-            print("=== %s / %s" % (system, workload), flush=True)
-            try:
-                run_cell(system, config, workload, args)
-            except Exception as error:  # noqa: BLE001 - keep the campaign running, record the failure
-                failures.append({
-                    "system": system,
-                    "workload": workload,
-                    "error": str(error)
-                })
-                print("FAILED", system, workload, error, flush=True)
+            run_system(system, config, args, failures)
+    else:
+        for workload in args.workloads:
+            for system in args.systems:
+                print("=== %s / %s" % (system, workload), flush=True)
+                try:
+                    run_cell(system, config, workload, args)
+                except Exception as error:  # noqa: BLE001 - keep the campaign running, record the failure
+                    failures.append({
+                        "system": system,
+                        "workload": workload,
+                        "error": str(error)
+                    })
+                    print("FAILED", system, workload, error, flush=True)
     rows = []
     for workload in args.workloads:
         row = {"workload": workload}
