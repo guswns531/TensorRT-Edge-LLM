@@ -268,9 +268,10 @@ bool VisualBuilder::parseConfig()
 bool VisualBuilder::setupVisualOptimizationProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
-    if (mBuilderConfig.smallProfileMaxImageTokens > 0 && mModelType != multimodal::ModelType::GEMMA4_VISION)
+    if (mBuilderConfig.smallProfileMaxImageTokens > 0 && mModelType != multimodal::ModelType::GEMMA4_VISION
+        && mModelType != multimodal::ModelType::QWEN3_VL)
     {
-        LOG_ERROR("A smaller visual optimization profile is currently supported only for Gemma4 vision engines");
+        LOG_ERROR("A smaller visual optimization profile is supported only for Gemma4 and Qwen3-VL vision engines");
         return false;
     }
     auto addProfile = [&](int64_t maxImageTokens, std::string const& name) {

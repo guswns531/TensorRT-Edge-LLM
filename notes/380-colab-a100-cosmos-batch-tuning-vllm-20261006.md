@@ -28,7 +28,10 @@ traffic; it does not establish a global optimum or a production latency SLO.
 
 The FP16 export uses packed prefill with a 1024-token export chunk budget. All runtime engines use 512-token
 uniform chunks, input limit 1024, KV capacity 8192 and 1536 KV pool pages with undercommit explicitly enabled.
-The visual engine has 22528 total image tokens and 2816 tokens per image; its runtime directory ends in `/visual`.
+The visual engine has 22528 total merged image tokens and 2816 merged tokens per image; its runtime directory
+ends in `/visual`. Qwen's spatial merge factor is four: the corresponding engine input bounds are 90112
+patches total and 11264 patches per image. The serving encoder limit of 22528 is in input patches, not merged
+tokens. Note 383 tests an engine sized to that serving limit.
 The `vision-e4` directory name does not impose an E4 runtime limit.
 
 | LLM engine | Build batch | Build prefill | Build decode | Purpose |

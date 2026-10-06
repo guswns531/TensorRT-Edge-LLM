@@ -138,6 +138,9 @@ public:
     //! \return True if inference succeeded, false otherwise
     bool infer(cudaStream_t stream) noexcept override;
 
+    //! Select the workspace-backed visual profile for the prepared input batch.
+    bool prepareInference(cudaStream_t stream) override;
+
     //! \brief Validate and load configuration from JSON file
     //! \param[in] engineDir Path to engine directory
     //! \return True if configuration is valid and loaded successfully, false otherwise

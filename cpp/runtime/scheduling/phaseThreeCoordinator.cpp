@@ -4502,6 +4502,20 @@ bool PhaseThreeCoordinator::submitPreparedEncoder()
     return true;
 }
 
+void PhaseThreeCoordinator::releaseEncoderWorkspaceOwnership()
+{
+    if (mExclusiveEncoderPrefillInFlight)
+    {
+        mServer.setPrefillDispatchBlocked(false);
+        mExclusiveEncoderPrefillInFlight = false;
+    }
+    if (mExclusiveEncoderDecodeInFlight)
+    {
+        mServer.setDecodeDispatchBlocked(false);
+        mExclusiveEncoderDecodeInFlight = false;
+    }
+}
+
 bool PhaseThreeCoordinator::completeEncoder()
 {
     if (mConfig.enableDirectEventHandoff && !mConfig.serializeAllEncoderPrefill)
@@ -4547,6 +4561,7 @@ bool PhaseThreeCoordinator::completeEncoder()
             {
                 mExternalEncoderActive = false;
                 mServer.setExternalEncoderActive(false);
+                releaseEncoderWorkspaceOwnership();
             }
             return true;
         }
@@ -4555,6 +4570,7 @@ bool PhaseThreeCoordinator::completeEncoder()
         {
             mExternalEncoderActive = false;
             mServer.setExternalEncoderActive(false);
+            releaseEncoderWorkspaceOwnership();
             if (mVision.startEvent() != nullptr && mVision.encoderDoneEvent() != nullptr)
             {
                 float encoderGpuMs{};
@@ -4621,18 +4637,7 @@ bool PhaseThreeCoordinator::completeEncoder()
     }
     mExternalEncoderActive = false;
     mServer.setExternalEncoderActive(false);
-    if (mExclusiveEncoderPrefillInFlight)
-    {
-        // ready() is driven by the encoder CUDA completion event, so the
-        // overlapping arena is safe for the next prefill enqueue now.
-        mServer.setPrefillDispatchBlocked(false);
-        mExclusiveEncoderPrefillInFlight = false;
-    }
-    if (mExclusiveEncoderDecodeInFlight)
-    {
-        mServer.setDecodeDispatchBlocked(false);
-        mExclusiveEncoderDecodeInFlight = false;
-    }
+    releaseEncoderWorkspaceOwnership();
     size_t const batchSize = mEncoding.size();
     for (PendingVisionRequest& encoding : mEncoding)
     {

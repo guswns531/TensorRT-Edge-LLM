@@ -223,16 +223,24 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     mConfig.imageStd = imageProcessorConfig["image_std"].get<std::vector<float>>();
 
     // Get config from engine shapes
-    nvinfer1::Dims const inputShapeMax
-        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMAX);
-    nvinfer1::Dims const inputShapeMin
-        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN);
-    mConfig.maxHW = inputShapeMax.d[0];
-    mConfig.minHW = inputShapeMin.d[0];
+    mConfig.maxHW = 0;
+    mConfig.minHW
+        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN).d[0];
     // One cu_seqlens entry per image, or per video temporal group. Read the capacity from the engine's own
     // cu_seqlens profile so the runtime bound always matches the built engine.
-    mConfig.maxNumImages
-        = mVisualEngine->getProfileShape(binding_names::kCuSeqlens, 0, nvinfer1::OptProfileSelector::kMAX).d[0] - 1;
+    mConfig.maxNumImages = 0;
+    for (int32_t profile = 0; profile < mVisualEngine->getNbOptimizationProfiles(); ++profile)
+    {
+        mConfig.maxHW = std::max(mConfig.maxHW,
+            mVisualEngine->getProfileShape(binding_names::kVisualInput, profile, nvinfer1::OptProfileSelector::kMAX)
+                .d[0]);
+        mConfig.minHW = std::min(mConfig.minHW,
+            mVisualEngine->getProfileShape(binding_names::kVisualInput, profile, nvinfer1::OptProfileSelector::kMIN)
+                .d[0]);
+        mConfig.maxNumImages = std::max(mConfig.maxNumImages,
+            mVisualEngine->getProfileShape(binding_names::kCuSeqlens, profile, nvinfer1::OptProfileSelector::kMAX).d[0]
+                - 1);
+    }
     mConfig.inputDim = mVisualContext->getTensorShape(binding_names::kVisualInput).d[1];
     // Whether the ViT consumes a rotary_pos_emb input is a fixed per-model property (see usesRotaryPosEmb),
     // not something to read off the engine. Take it from that hook and validate the loaded engine agrees.
@@ -907,6 +915,11 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
     return true;
 }
 
+bool QwenViTRunner::prepareInference(cudaStream_t stream)
+{
+    return mVitInput.getShape()[0] == 0 || selectVisualProfileForInputTokens(mVitInput.getShape()[0], stream);
+}
+
 bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 {
     // Skip VIT inference if there are no images to process
@@ -914,6 +927,11 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
     if (mVitInput.getShape()[0] == 0)
     {
         return true;
+    }
+
+    if (!prepareInference(stream))
+    {
+        return false;
     }
 
     // Profile ViT inference with automatic cleanup

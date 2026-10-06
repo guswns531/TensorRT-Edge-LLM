@@ -722,6 +722,7 @@ private:
     void completeGlobalOverlapObservation();
     void recordGlobalDecisionCost(std::chrono::steady_clock::time_point startedAt) noexcept;
     bool completeEncoder();
+    void releaseEncoderWorkspaceOwnership();
     bool completeEncoderPreparation();
     bool encoderPreparationActive() const noexcept;
     float lastEncoderActionGpuMs() const noexcept;

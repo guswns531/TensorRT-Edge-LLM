@@ -192,3 +192,7 @@ its stall. RLS updates are real, but serving error and sparse E observations do 
 claim of stable learning. Carried-setting screens and higher external load do not reveal a large
 hidden throughput gain. The retained FP16/KV-matched TRT advantage remains modest and its peak
 memory higher. No runtime promotion or output-quality waiver follows from these diagnostics.
+
+Follow-up [note 383](383-cosmos-tiered-shared-memory-20261006.md) identifies and repairs the direct-event
+workspace ownership retirement bug behind the E/D stall. It also separates the full-sharing penalty
+from the single-retained-batch storage policy, and tests compact Qwen3-VL tiered profiles.
