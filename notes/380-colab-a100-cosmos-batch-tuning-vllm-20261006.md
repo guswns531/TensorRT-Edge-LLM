@@ -3,6 +3,10 @@
 
 # 380 — Cosmos-Reason2-2B on A100: batch tuning and optimized vLLM (2026-10-06)
 
+Primary matched-precision and matched-KV-budget results are in
+[note 381](381-cosmos-matched-fp16-kv-budget-20261006.md). The FP16/BF16 and native-cache
+results below remain historical references with different contracts.
+
 ## Scope and evidence
 
 Resumes the Cosmos capacity sweep left unmeasured in note 379. Only Cosmos-Reason2-2B was downloaded,
